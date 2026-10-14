@@ -62,3 +62,20 @@ export interface AudioSettings {
   gain: number // ×10（10 = 1.0）
   vad_sens: number // 0 低 / 1 中 / 2 高
 }
+
+// ServerDTO 服务器（与 Go 侧 state.ServerDTO 对齐）。
+export interface ServerDTO {
+  id: number
+  name: string
+  owner_id: number
+  icon_name: string
+  icon_color: string
+}
+
+// ChannelDTO 频道（与 Go 侧 state.ChannelDTO 对齐）。
+export interface ChannelDTO {
+  id: number
+  server_id: number
+  name: string
+  type: 'text' | 'voice'
+}

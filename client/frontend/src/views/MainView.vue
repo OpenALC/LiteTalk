@@ -15,6 +15,7 @@ import SettingsView from '../components/SettingsView.vue'
 import { useVoiceStore } from '../stores/voice'
 import { useChatStore } from '../stores/chat'
 import { useAuthStore } from '../stores/auth'
+import { useServersStore, useSettingsStore } from '../stores/data'
 import { useHibernateStore } from '../stores/hibernate'
 import { useHotkeys } from '../composables/useHotkeys'
 import { goApp } from '../api/bridge'
@@ -22,10 +23,12 @@ import { goApp } from '../api/bridge'
 const voice = useVoiceStore()
 const chat = useChatStore()
 const auth = useAuthStore()
+const servers = useServersStore()
+const settings = useSettingsStore()
 const hibernate = useHibernateStore()
 
 const tab = ref<'voice' | 'chat'>('voice')
-const showSettings = ref(false)
+// 设置浮层开关已入 settings store（panelOpen）：频道栏齿轮与快捷键共用入口。
 const showFriends = ref(true)
 
 // 快捷键：休眠态全部禁用。
@@ -43,7 +46,7 @@ useHotkeys(
       const el = document.querySelector<HTMLInputElement>('.f-search input')
       el?.focus()
     },
-    settings: () => (showSettings.value = true),
+    settings: () => settings.openPanel(),
   },
   hotkeysActive,
 )
@@ -63,6 +66,11 @@ onMounted(() => {
   })
   hibernate.init()
   goApp().GetHibernateOnMinimize().then((v) => hibernate.setEnabled(v))
+  // 登录态下并入真实服务器列表（REST；内置示例保留作语音演练场）。
+  // 失败静默：服务器列表不可用不阻断主界面。
+  if (auth.loggedIn) {
+    servers.loadRemoteServers().catch(() => {})
+  }
 })
 
 async function leave() {
@@ -122,7 +130,7 @@ async function leave() {
             </div>
           </div>
 
-          <SettingsView v-if="showSettings" @close="showSettings = false" />
+          <SettingsView v-if="settings.panelOpen" @close="settings.closePanel()" />
         </div>
       </main>
 

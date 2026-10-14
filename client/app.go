@@ -499,10 +499,23 @@ func (a *App) connectSession(token, nickname string) error {
 	if err := sess.ApplyAudio(a.runtimeAudio()); err != nil {
 		log.Printf("apply audio settings: %v", err)
 	}
-	sess.ChatHandler(func(channelID, userID, nick, content, ts string) {
+	// 连接即应用持久化的设备选择（设置页未连接时仅落盘，此处补应用）。
+	c := a.cfg.Get()
+	if c.AudioCapture != "" || c.AudioPlayback != "" {
+		if err := sess.RestartDevices(c.AudioCapture, c.AudioPlayback); err != nil {
+			log.Printf("apply audio devices: %v", err)
+		}
+	}
+	sess.ChatHandler(func(channelID, msgID, userID, nick, content, ts string) {
 		runtime.EventsEmit(a.ctx, "chat:message", map[string]string{
-			"channel_id": channelID, "user_id": userID,
+			"id": msgID, "channel_id": channelID, "user_id": userID,
 			"nickname": nick, "content": content, "ts": ts,
+		})
+	})
+	// 服务端 error 帧转发前端（B1：此前未订阅，服务端拒收时消息凭空消失）。
+	sess.ErrorHandler(func(code, message string) {
+		runtime.EventsEmit(a.ctx, "chat:error", map[string]string{
+			"code": code, "message": message,
 		})
 	})
 	a.mu.Lock()
@@ -578,6 +591,59 @@ func (a *App) SetDeafen(deafened bool) {
 	}
 }
 
+// ---------- 服务器 / 频道 / 好友（REST CRUD） ----------
+// 以下方法直接代理 state.APIClient；令牌已由登录/注册/游客/刷新路径注入。
+
+// ListServers 列出当前用户加入的服务器。
+func (a *App) ListServers() ([]state.ServerDTO, error) {
+	return a.api.ListServers()
+}
+
+// CreateServer 创建服务器（名称为唯一必填项）。
+func (a *App) CreateServer(name string) (*state.ServerDTO, error) {
+	return a.api.CreateServer(name)
+}
+
+// JoinServerByCode 凭邀请码加入服务器。
+func (a *App) JoinServerByCode(code string) (*state.ServerDTO, error) {
+	return a.api.JoinServer(code)
+}
+
+// RenameServer 重命名服务器（owner/admin）。
+func (a *App) RenameServer(id int64, name string) error {
+	return a.api.RenameServer(id, name)
+}
+
+// DeleteServer 删除服务器（仅 owner）。
+func (a *App) DeleteServer(id int64) error {
+	return a.api.DeleteServer(id)
+}
+
+// CreateInviteCode 为服务器生成邀请码（admin 及以上），返回纯 code。
+func (a *App) CreateInviteCode(serverID int64) (string, error) {
+	return a.api.CreateInvite(serverID)
+}
+
+// CreateChannel 新建频道（typ: text / voice）。
+func (a *App) CreateChannel(serverID int64, name, typ string) (*state.ChannelDTO, error) {
+	return a.api.CreateChannel(serverID, name, typ)
+}
+
+// RenameChannel 重命名频道（owner/admin）。
+func (a *App) RenameChannel(id int64, name string) error {
+	return a.api.RenameChannel(id, name)
+}
+
+// DeleteChannel 删除频道（owner/admin）。
+func (a *App) DeleteChannel(id int64) error {
+	return a.api.DeleteChannel(id)
+}
+
+// SendFriendRequest 发送好友请求（target 形如 "昵称#1234"）。
+func (a *App) SendFriendRequest(target string) error {
+	return a.api.SendFriendRequest(target)
+}
+
 // SetPeerVolume 调整某远端成员音量（0.0–2.0）。
 func (a *App) SetPeerVolume(userID string, gain float64) {
 	a.mu.Lock()
@@ -588,15 +654,25 @@ func (a *App) SetPeerVolume(userID string, gain float64) {
 	}
 }
 
-// SetAudioDevices 热切换采集/播放设备（设置页下拉即时应用）。
-// selector 为设备 ID 十六进制串或名称子串；空 = 默认设备。
-// 设备消失/失效时管线自动回退默认设备。
+// SetAudioDevices 切换采集/播放设备（设置页下拉即时应用）。
+// selector 为设备 ID 十六进制串或名称子串；空 = 默认设备；设备消失时管线自动回退默认。
+// 未连接时仅持久化到 config.json，下次连接时由 connectSession 的 RestartDevices 应用；
+// 已连接则立即热重启设备流。
 func (a *App) SetAudioDevices(captureID, playbackID string) error {
+	// 先落盘（无论是否连接，配置不丢）
+	if err := a.cfg.Update(func(c *config.Config) error {
+		c.AudioCapture = captureID
+		c.AudioPlayback = playbackID
+		return nil
+	}); err != nil {
+		return err
+	}
+
 	a.mu.Lock()
 	s := a.sess
 	a.mu.Unlock()
 	if s == nil {
-		return fmt.Errorf("not connected")
+		return nil // 未连接：仅落盘，连接后应用
 	}
 	return s.RestartDevices(captureID, playbackID)
 }

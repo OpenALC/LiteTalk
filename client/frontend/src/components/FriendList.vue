@@ -1,12 +1,20 @@
 <script setup lang="ts">
 // FriendList 好友栏（对齐 Main.html：搜索过滤、在线/离线分组、状态点、无头像）。
+// 批次①：添加好友弹层（REST 真实请求）；私聊为占位提示（服务端无私聊实体）；
+// 「加入TA的频道」按好友所在频道名查找并加入语音频道。
 import { computed, ref } from 'vue'
 import {
   ChevronDown, MessageCircle, Search, UserPlus, AudioLines,
 } from 'lucide-vue-next'
-import { useFriendsStore } from '../stores/data'
+import { useFriendsStore, useServersStore, type Friend } from '../stores/data'
+import { useVoiceStore } from '../stores/voice'
+import { useNotifyStore } from '../stores/notify'
+import PromptDialog from './PromptDialog.vue'
 
 const friends = useFriendsStore()
+const servers = useServersStore()
+const voice = useVoiceStore()
+const notify = useNotifyStore()
 const query = ref('')
 const onlineClosed = ref(false)
 const offlineClosed = ref(true)
@@ -15,6 +23,46 @@ const filteredOnline = computed(() =>
   friends.online.filter((f) => f.name.toLowerCase().includes(query.value.toLowerCase())))
 const filteredOffline = computed(() =>
   friends.offline.filter((f) => f.name.toLowerCase().includes(query.value.toLowerCase())))
+
+// ---- 添加好友（REST）----
+const adding = ref(false)
+
+async function onAddConfirm(target: string) {
+  adding.value = false
+  try {
+    await friends.sendRequest(target)
+    notify.show('好友请求已发送')
+  } catch (e) {
+    notify.fromErr(e)
+  }
+}
+
+// ---- 私聊：服务端无私聊频道实体，占位提示（不假装已实现）----
+function messageFriend() {
+  notify.show('私聊即将上线')
+}
+
+// joinFriendChannel 按好友所在频道名（f.sub）跨服务器查找语音频道并加入。
+async function joinFriendChannel(f: Friend) {
+  for (const s of servers.servers) {
+    const ch = s.channels.find((c) => c.type === 'voice' && c.name === f.sub)
+    if (ch) {
+      servers.selectServer(s.id)
+      servers.selectChannel(ch.id)
+      if (voice.channelId !== ch.id) {
+        try {
+          await voice.join(ch.id)
+        } catch (e) {
+          notify.fromErr(e, '加入频道失败')
+          return
+        }
+      }
+      notify.show(`已加入「${ch.name}」`)
+      return
+    }
+  }
+  notify.show('找不到TA所在的频道', true)
+}
 </script>
 
 <template>
@@ -22,7 +70,7 @@ const filteredOffline = computed(() =>
     <div class="friends-inner">
       <div class="f-head">
         <b>好友列表</b>
-        <button class="icon-btn" title="添加好友"><UserPlus :size="17" /></button>
+        <button class="icon-btn" title="添加好友" @click="adding = true"><UserPlus :size="17" /></button>
       </div>
 
       <div class="f-search">
@@ -42,8 +90,9 @@ const filteredOffline = computed(() =>
               <div class="fs" :class="{ 'in-chan': f.inChannel }">{{ f.sub }}</div>
             </div>
             <div class="f-act">
-              <button class="icon-btn" title="私聊"><MessageCircle :size="14" /></button>
-              <button v-if="f.inChannel" class="icon-btn" title="加入TA的频道">
+              <button class="icon-btn" title="私聊" @click="messageFriend"><MessageCircle :size="14" /></button>
+              <button v-if="f.inChannel" class="icon-btn" title="加入TA的频道"
+                      @click="joinFriendChannel(f)">
                 <AudioLines :size="14" />
               </button>
             </div>
@@ -64,6 +113,10 @@ const filteredOffline = computed(() =>
         </template>
       </div>
     </div>
+
+    <!-- 添加好友弹层（昵称#tag，服务端拆分） -->
+    <PromptDialog v-if="adding" title="添加好友" placeholder="昵称#1234" cta="发送请求"
+                  @confirm="onAddConfirm" @close="adding = false" />
   </aside>
 </template>
 
@@ -135,8 +188,9 @@ const filteredOffline = computed(() =>
 }
 .f-info .fs.in-chan { color: var(--brand-600); font-weight: 500; }
 .f-row.offline .fn, .f-row.offline .fs { color: var(--ink-300); }
-.f-act { display: none; gap: 2px; }
-.f-row:hover .f-act { display: flex; }
-.f-row:hover .f-info .fs { display: none; }
+/* 操作按钮恒在但透明，hover 仅显色——避免显隐切换导致布局抖动（鼠标在两卡片间反复触发） */
+.f-act { display: flex; gap: 2px; opacity: 0; transition: opacity 0.15s; }
+/* hover 与键盘 focus-within 双通道显形：操作按钮透明时仍可 Tab 聚焦（可访问性） */
+.f-row:hover .f-act, .f-row:focus-within .f-act { opacity: 1; }
 .f-act .icon-btn { width: 28px; height: 28px; }
 </style>

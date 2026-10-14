@@ -1,6 +1,6 @@
 // bridge 封装 Wails Go 绑定（window.go.main.App.*）。
 // 浏览器独立开发（vite dev 无 Go 后端）时走 mock 桩，行为可联调 UI。
-import type { AudioSettings, AuthResult, ConnConfigView, ConnTestResult, PeerView, ServerConfig, UserProfile } from './types'
+import type { AudioSettings, AuthResult, ChannelDTO, ConnConfigView, ConnTestResult, PeerView, ServerConfig, ServerDTO, UserProfile } from './types'
 
 type GoApp = {
   GetVersion(): Promise<string>
@@ -39,6 +39,17 @@ type GoApp = {
   SendChat(channelID: string, content: string): Promise<void>
   GetVoiceMembers(): Promise<PeerView[]>
   LogFromWeb(level: string, msg: string): Promise<void>
+  // 服务器/频道/好友 REST CRUD（服务端已有端点；批次①接线）
+  ListServers(): Promise<ServerDTO[]>
+  CreateServer(name: string): Promise<ServerDTO>
+  JoinServerByCode(code: string): Promise<ServerDTO>
+  RenameServer(id: number, name: string): Promise<void>
+  DeleteServer(id: number): Promise<void>
+  CreateInviteCode(serverID: number): Promise<string>
+  CreateChannel(serverID: number, name: string, typ: string): Promise<ChannelDTO>
+  RenameChannel(id: number, name: string): Promise<void>
+  DeleteChannel(id: number): Promise<void>
+  SendFriendRequest(target: string): Promise<void>
 }
 
 export interface AudioDeviceDTO {
@@ -126,6 +137,23 @@ const mockApp: GoApp = {
   async SetPeerVolume() {},
   async SendChat() {},
   async GetVoiceMembers() { return [] },
+  // 以下为批次①新增的服务器/频道/好友桩：返回可联调 UI 的假数据。
+  async ListServers() { return [] },
+  async CreateServer(name: string) {
+    return { id: Date.now(), name, owner_id: 1, icon_name: 'messages-square', icon_color: '#4FA4F3' }
+  },
+  async JoinServerByCode() {
+    return { id: Date.now(), name: '加入的服务器', owner_id: 2, icon_name: 'messages-square', icon_color: '#4FA4F3' }
+  },
+  async RenameServer() {},
+  async DeleteServer() {},
+  async CreateInviteCode() { return 'mock-invite-code' },
+  async CreateChannel(serverID: number, name: string, typ: string) {
+    return { id: Date.now(), server_id: serverID, name, type: typ as 'text' | 'voice' }
+  },
+  async RenameChannel() {},
+  async DeleteChannel() {},
+  async SendFriendRequest() {},
 }
 
 export function goApp(): GoApp {

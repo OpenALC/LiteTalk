@@ -99,6 +99,47 @@ func (c *APIClient) get(path string) (int, []byte, error) {
 	return resp.StatusCode, data, nil
 }
 
+// patch JSON PATCH（带 Bearer，管理端点：服务器/频道重命名等）。
+func (c *APIClient) patch(path string, body any) (int, []byte, error) {
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return 0, nil, fmt.Errorf("marshal %s: %w", path, err)
+	}
+	req, err := http.NewRequest(http.MethodPatch, c.base+"/api/v1"+path, bytes.NewReader(raw))
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.access != "" {
+		req.Header.Set("Authorization", "Bearer "+c.access)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("patch %s: %w", path, err)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, data, nil
+}
+
+// del JSON DELETE（带 Bearer，管理端点：删除服务器/频道等）。
+func (c *APIClient) del(path string) (int, []byte, error) {
+	req, err := http.NewRequest(http.MethodDelete, c.base+"/api/v1"+path, nil)
+	if err != nil {
+		return 0, nil, err
+	}
+	if c.access != "" {
+		req.Header.Set("Authorization", "Bearer "+c.access)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("delete %s: %w", path, err)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, data, nil
+}
+
 // APIError 服务端错误响应 {code,message}。
 type APIError struct {
 	Code    string `json:"code"`
@@ -307,3 +348,167 @@ func (c *APIClient) RTCCredentials() (*ICEServersResponse, error) {
 	}
 	return &r, nil
 }
+
+// ---------- 服务器 / 频道 / 好友（REST CRUD，服务端已有端点） ----------
+
+// ServerDTO 服务器（与 store.Server wire 对齐；图标为 Lucide 预设名）。
+type ServerDTO struct {
+	ID        int64  `json:"id"`
+	Name      string `json:"name"`
+	OwnerID   int64  `json:"owner_id"`
+	IconName  string `json:"icon_name"`
+	IconColor string `json:"icon_color"`
+}
+
+// ChannelDTO 频道（与 store.Channel wire 对齐）。
+type ChannelDTO struct {
+	ID       int64  `json:"id"`
+	ServerID int64  `json:"server_id"`
+	Name     string `json:"name"`
+	Type     string `json:"type"` // text | voice
+}
+
+// ListServers 列出当前用户加入的服务器。
+func (c *APIClient) ListServers() ([]ServerDTO, error) {
+	status, data, err := c.get("/servers")
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, decodeError(status, data)
+	}
+	var list []ServerDTO
+	if err := json.Unmarshal(data, &list); err != nil {
+		return nil, fmt.Errorf("decode servers: %w", err)
+	}
+	return list, nil
+}
+
+// CreateServer 创建服务器（图标走服务端默认；创建者为 owner）。成功返回 201。
+func (c *APIClient) CreateServer(name string) (*ServerDTO, error) {
+	status, data, err := c.post("/servers", map[string]string{"name": name}, true)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK && status != http.StatusCreated {
+		return nil, decodeError(status, data)
+	}
+	var s ServerDTO
+	if err := json.Unmarshal(data, &s); err != nil {
+		return nil, fmt.Errorf("decode server: %w", err)
+	}
+	return &s, nil
+}
+
+// JoinServer 凭邀请码加入服务器（已是成员时服务端原样返回服务器）。
+func (c *APIClient) JoinServer(code string) (*ServerDTO, error) {
+	status, data, err := c.post("/servers/join", map[string]string{"code": code}, true)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, decodeError(status, data)
+	}
+	var s ServerDTO
+	if err := json.Unmarshal(data, &s); err != nil {
+		return nil, fmt.Errorf("decode joined server: %w", err)
+	}
+	return &s, nil
+}
+
+// RenameServer 重命名服务器（owner/admin）。
+func (c *APIClient) RenameServer(id int64, name string) error {
+	status, data, err := c.patch(fmt.Sprintf("/servers/%d", id), map[string]string{"name": name})
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return decodeError(status, data)
+	}
+	return nil
+}
+
+// DeleteServer 删除服务器（仅 owner）。
+func (c *APIClient) DeleteServer(id int64) error {
+	status, data, err := c.del(fmt.Sprintf("/servers/%d", id))
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return decodeError(status, data)
+	}
+	return nil
+}
+
+// CreateInvite 为服务器生成邀请码（admin 及以上）。返回 code 字符串。
+func (c *APIClient) CreateInvite(serverID int64) (string, error) {
+	status, data, err := c.post(fmt.Sprintf("/servers/%d/invites", serverID),
+		map[string]int{}, true)
+	if err != nil {
+		return "", err
+	}
+	if status != http.StatusOK && status != http.StatusCreated {
+		return "", decodeError(status, data)
+	}
+	var inv struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(data, &inv); err != nil {
+		return "", fmt.Errorf("decode invite: %w", err)
+	}
+	return inv.Code, nil
+}
+
+// CreateChannel 在服务器下新建频道（owner/admin）。typ 为 text / voice。成功返回 201。
+func (c *APIClient) CreateChannel(serverID int64, name, typ string) (*ChannelDTO, error) {
+	status, data, err := c.post(fmt.Sprintf("/servers/%d/channels", serverID),
+		map[string]string{"name": name, "type": typ}, true)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK && status != http.StatusCreated {
+		return nil, decodeError(status, data)
+	}
+	var ch ChannelDTO
+	if err := json.Unmarshal(data, &ch); err != nil {
+		return nil, fmt.Errorf("decode channel: %w", err)
+	}
+	return &ch, nil
+}
+
+// RenameChannel 重命名频道（owner/admin）。
+func (c *APIClient) RenameChannel(id int64, name string) error {
+	status, data, err := c.patch(fmt.Sprintf("/channels/%d", id), map[string]string{"name": name})
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return decodeError(status, data)
+	}
+	return nil
+}
+
+// DeleteChannel 删除频道（owner/admin）。
+func (c *APIClient) DeleteChannel(id int64) error {
+	status, data, err := c.del(fmt.Sprintf("/channels/%d", id))
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return decodeError(status, data)
+	}
+	return nil
+}
+
+// SendFriendRequest 发送好友请求（target 形如 "昵称#1234"，服务端负责拆分）。
+func (c *APIClient) SendFriendRequest(target string) error {
+	status, data, err := c.post("/friends/requests", map[string]string{"nickname": target}, true)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK && status != http.StatusCreated {
+		return decodeError(status, data)
+	}
+	return nil
+}
+
