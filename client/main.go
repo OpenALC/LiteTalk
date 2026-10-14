@@ -20,8 +20,8 @@ func main() {
 
 	err := wails.Run(&options.App{
 		Title:     "轻音 LiteTalk",
-		Width:     1280,
-		Height:    800,
+		Width:     1080,
+		Height:    680,
 		MinWidth:  1080,
 		MinHeight: 680,
 		// 无边框窗口 + 自定义标题栏
