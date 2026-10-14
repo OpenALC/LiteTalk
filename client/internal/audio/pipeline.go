@@ -31,11 +31,61 @@ type PipelineConfig struct {
 
 	DSP DSPConfig // 降噪/增益/说话判定
 
+	// Opus 编码参数（零值回落 ResolveOpusConfig 默认；运行时可用 setter 热调）。
+	Opus OpusConfig
+
 	// OnPacket 每个 Opus 包编码完成时回调（M2 对接 RTP 发送的接口）。
 	// 注意：pkt 底层缓冲随下一帧复用，需要保留必须自行拷贝。
 	OnPacket func(pkt []byte)
 	// OnLatency 回环模式下的端到端延迟估计回调（节流 ~200ms）。
 	OnLatency func(d time.Duration)
+}
+
+// OpusConfig Opus 编码参数。零值字段由 ResolveOpusConfig 回落为管线默认值
+//（32kbps / VBR / DTX / FEC 开，丢包率告知 10%）。
+type OpusConfig struct {
+	BitrateKbps int   // 目标码率 kbps（16/24/32/48/64；0 → 32）
+	VBR         *bool // 可变码率（nil → true）
+	DTX         *bool // 静音期非连续传输（nil → true）
+	FEC         *bool // 带内前向纠错（nil → true）
+	PacketLoss  int   // 告知编码器的预期丢包率 %（0 → 10；FEC 关闭时无意义）
+}
+
+// DefaultOpusConfig 管线默认 Opus 参数（与既有硬编码等价）。
+func DefaultOpusConfig() OpusConfig {
+	return OpusConfig{BitrateKbps: 32, VBR: boolPtr(true), DTX: boolPtr(true), FEC: boolPtr(true), PacketLoss: 10}
+}
+
+// ResolveOpusConfig 把零值字段回落为默认值，返回可直接应用的有效配置。
+func ResolveOpusConfig(c OpusConfig) OpusConfig {
+	d := DefaultOpusConfig()
+	if c.BitrateKbps <= 0 {
+		c.BitrateKbps = d.BitrateKbps
+	}
+	if c.VBR == nil {
+		c.VBR = d.VBR
+	}
+	if c.DTX == nil {
+		c.DTX = d.DTX
+	}
+	if c.FEC == nil {
+		c.FEC = d.FEC
+	}
+	if c.PacketLoss <= 0 {
+		c.PacketLoss = d.PacketLoss
+	}
+	return c
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+// RuntimeSettings 应用层下发的运行时音频设置（Opus 须先经 ResolveOpusConfig）。
+// 由 Session.ApplyAudio 一次性热应用到管线。
+type RuntimeSettings struct {
+	Opus    OpusConfig
+	Denoise bool
+	Gain    float64 // 线性增益，1.0 为不变
+	VADSens int     // 0 低 / 1 中 / 2 高
 }
 
 // DefaultPipelineConfig 返回默认管线配置（声卡回环、降噪开、增益 1）。
@@ -134,11 +184,13 @@ func (s *Stats) Snapshot() StatsSnapshot {
 //   - 算法链路测试/离线处理：NewPipeline 后直接 ProcessPCM 注入（不要 Start）。
 type Pipeline struct {
 	cfg      PipelineConfig
+	opus     OpusConfig // 已解析的生效 Opus 配置（setter 同步维护）
 	capRing  *RingBuffer
 	playRing *RingBuffer
 	dsp      *DSP
 	enc      *codec.Encoder
 	dec      *codec.Decoder
+	encMu    sync.Mutex // 保护 enc：opus_encoder_ctl 不得并发 opus_encode
 	stats    Stats
 
 	ctx      *Context
@@ -198,16 +250,10 @@ func NewPipeline(cfg PipelineConfig) (*Pipeline, error) {
 	if err != nil {
 		return nil, fmt.Errorf("init opus encoder: %w", err)
 	}
-	for name, fn := range map[string]func() error{
-		"SetBitrate":   func() error { return enc.SetBitrate(32000) },
-		"SetInBandFEC": func() error { return enc.SetInBandFEC(true) },
-		"SetDTX":       func() error { return enc.SetDTX(true) },
-		"SetPacketLossPerc": func() error { return enc.SetPacketLossPerc(10) },
-	} {
-		if err := fn(); err != nil {
-			enc.Close()
-			return nil, fmt.Errorf("opus encoder %s: %w", name, err)
-		}
+	p.opus = ResolveOpusConfig(cfg.Opus)
+	if err := p.applyOpusConfig(enc, p.opus); err != nil {
+		enc.Close()
+		return nil, fmt.Errorf("opus encoder 参数: %w", err)
 	}
 	p.enc = enc
 
@@ -342,16 +388,22 @@ func (p *Pipeline) Stop() {
 }
 
 // Close 停止管线并释放 codec 资源。幂等。
+// 释放编码器须持 encMu：运行时 setter（SetOpus*）可能正卡在 ctl 内，
+// 并发 destroy 同一个 OpusEncoder* 是 C 堆 use-after-free。
 func (p *Pipeline) Close() error {
 	if !p.closed.CompareAndSwap(false, true) {
 		return nil
 	}
 	p.Stop()
+	p.encMu.Lock()
 	if p.enc != nil {
-		p.enc.Close()
+		_ = p.enc.Close()
+		p.enc = nil // 让 setter 的 nil 检查生效（返回 ErrClosed）
 	}
+	p.encMu.Unlock()
 	if p.dec != nil {
-		p.dec.Close()
+		_ = p.dec.Close()
+		p.dec = nil
 	}
 	return nil
 }
@@ -364,6 +416,101 @@ func (p *Pipeline) SetGain(g float64) { p.dsp.SetGain(g) }
 
 // SetDenoise 运行时开关降噪。
 func (p *Pipeline) SetDenoise(on bool) { p.dsp.SetDenoise(on) }
+
+// SetVADSensitivity 运行时调整 VAD 灵敏度档位（低/中/高）。
+func (p *Pipeline) SetVADSensitivity(level int) { p.dsp.SetVADSensitivity(level) }
+
+// applyOpusConfig 把已解析的 Opus 配置刷到编码器（持锁，可在运行中调用）。
+func (p *Pipeline) applyOpusConfig(enc *codec.Encoder, c OpusConfig) error {
+	for name, fn := range map[string]func() error{
+		"SetBitrate":        func() error { return enc.SetBitrate(c.BitrateKbps * 1000) },
+		"SetVBR":            func() error { return enc.SetVBR(*c.VBR) },
+		"SetDTX":            func() error { return enc.SetDTX(*c.DTX) },
+		"SetInBandFEC":      func() error { return enc.SetInBandFEC(*c.FEC) },
+		"SetPacketLossPerc": func() error { return enc.SetPacketLossPerc(c.PacketLoss) },
+	} {
+		if err := fn(); err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// SetOpusBitrate 热调码率（kbps）。编码中调用安全（内部持锁）。
+func (p *Pipeline) SetOpusBitrate(kbps int) error {
+	if kbps <= 0 {
+		return fmt.Errorf("码率非法: %d", kbps)
+	}
+	p.encMu.Lock()
+	defer p.encMu.Unlock()
+	if p.enc == nil {
+		return codec.ErrClosed
+	}
+	if err := p.enc.SetBitrate(kbps * 1000); err != nil {
+		return err
+	}
+	p.opus.BitrateKbps = kbps
+	return nil
+}
+
+// SetOpusVBR 热调可变码率开关。
+func (p *Pipeline) SetOpusVBR(on bool) error {
+	p.encMu.Lock()
+	defer p.encMu.Unlock()
+	if p.enc == nil {
+		return codec.ErrClosed
+	}
+	if err := p.enc.SetVBR(on); err != nil {
+		return err
+	}
+	p.opus.VBR = boolPtr(on)
+	return nil
+}
+
+// SetOpusDTX 热调静音期非连续传输开关。
+func (p *Pipeline) SetOpusDTX(on bool) error {
+	p.encMu.Lock()
+	defer p.encMu.Unlock()
+	if p.enc == nil {
+		return codec.ErrClosed
+	}
+	if err := p.enc.SetDTX(on); err != nil {
+		return err
+	}
+	p.opus.DTX = boolPtr(on)
+	return nil
+}
+
+// SetOpusFEC 热调带内前向纠错开关。
+func (p *Pipeline) SetOpusFEC(on bool) error {
+	p.encMu.Lock()
+	defer p.encMu.Unlock()
+	if p.enc == nil {
+		return codec.ErrClosed
+	}
+	if err := p.enc.SetInBandFEC(on); err != nil {
+		return err
+	}
+	p.opus.FEC = boolPtr(on)
+	return nil
+}
+
+// SetOpusPacketLoss 热调告知编码器的预期丢包率 %（5–20）。
+func (p *Pipeline) SetOpusPacketLoss(pct int) error {
+	if pct < 0 || pct > 100 {
+		return fmt.Errorf("丢包率非法: %d", pct)
+	}
+	p.encMu.Lock()
+	defer p.encMu.Unlock()
+	if p.enc == nil {
+		return codec.ErrClosed
+	}
+	if err := p.enc.SetPacketLossPerc(pct); err != nil {
+		return err
+	}
+	p.opus.PacketLoss = pct
+	return nil
+}
 
 // Speaking 当前说话状态。
 func (p *Pipeline) Speaking() bool { return p.dsp.Speaking() }
@@ -482,7 +629,11 @@ func (p *Pipeline) processFrame(frame []int16) {
 	}
 	p.opusHalf = 0
 
-	n, err := p.enc.Encode(p.opusFrame[:], p.pktBuf[:])
+	n, err := func() (int, error) {
+		p.encMu.Lock()
+		defer p.encMu.Unlock()
+		return p.enc.Encode(p.opusFrame[:], p.pktBuf[:])
+	}()
 	if err != nil {
 		p.stats.EncodeErrors.Add(1)
 		return

@@ -5,6 +5,7 @@
 import { onMounted, ref } from 'vue'
 import { X, LogOut } from 'lucide-vue-next'
 import { goApp, type AudioDeviceDTO } from '../api/bridge'
+import type { AudioSettings } from '../api/types'
 import { useAuthStore } from '../stores/auth'
 import { useSettingsStore } from '../stores/data'
 import { useHibernateStore } from '../stores/hibernate'
@@ -22,12 +23,22 @@ const caps = ref<AudioDeviceDTO[]>([])
 const plays = ref<AudioDeviceDTO[]>([])
 const toast = ref<InstanceType<typeof Toast>>()
 
+// 语音设置（码率/VBR/DTX/FEC/丢包率/降噪/增益/VAD 灵敏度），
+// 打开设置页时从 Go 侧读持久化值，改动即热应用 + 落盘 config.json。
+const audio = ref<AudioSettings>({
+  bitrate_kbps: 32, vbr: true, dtx: true, fec: true,
+  packet_loss: 10, denoise: true, gain: 10, vad_sens: 1,
+})
+const BITRATES = [16, 24, 32, 48, 64]
+const VAD_LABELS = ['低', '中', '高']
+
 const emit = defineEmits<{ (e: 'close'): void }>()
 
 onMounted(async () => {
   version.value = await goApp().GetVersion()
   hibernate.value = await goApp().GetHibernateOnMinimize()
   closeToTray.value = await goApp().GetCloseToTray()
+  audio.value = await goApp().GetAudioSettings()
   const devs = await goApp().ListAudioDevices()
   caps.value = devs.capture
   plays.value = devs.playback
@@ -48,6 +59,15 @@ async function toggleHibernate(v: boolean) {
 // 设备下拉即时应用：切换即热重启设备流（编解码/混音状态保留）。
 async function applyDevice() {
   await goApp().SetAudioDevices(settings.captureDevice, settings.playbackDevice)
+}
+
+// 语音设置改动：热应用到当前会话（未连接仅落盘），失败弹提示。
+async function applyAudio() {
+  try {
+    await goApp().SetAudioSettings({ ...audio.value })
+  } catch (e) {
+    toast.value?.show(`语音设置保存失败：${e}`, true)
+  }
 }
 </script>
 
@@ -115,15 +135,60 @@ async function applyDevice() {
       <section class="s-sec">
         <h3>语音</h3>
         <div class="s-row">
-          <div class="k">降噪</div>
+          <div class="k">麦克风降噪</div>
           <label class="switch">
-            <input v-model="settings.denoise" type="checkbox"><i />
+            <input v-model="audio.denoise" type="checkbox" @change="applyAudio"><i />
           </label>
         </div>
         <div class="s-row">
           <div class="k">输入增益</div>
-          <input v-model.number="settings.gain" type="range" min="0" max="2" step="0.1">
-          <span class="v">{{ settings.gain.toFixed(1) }}</span>
+          <!-- min=0.1：0 与「未设置」在存储层同为 0 无法区分（omitempty），全静音用麦克风静音 -->
+          <input v-model.number="audio.gain" type="range" min="1" max="20" step="1" @change="applyAudio">
+          <span class="v">{{ (audio.gain / 10).toFixed(1) }}</span>
+        </div>
+        <div class="s-row">
+          <div class="k">语音检测灵敏度</div>
+          <div class="seg-mini">
+            <button
+              v-for="(label, i) in VAD_LABELS" :key="i"
+              :class="{ on: audio.vad_sens === i }"
+              @click="audio.vad_sens = i; applyAudio()"
+            >{{ label }}</button>
+          </div>
+        </div>
+        <div class="s-row">
+          <div class="k">码率</div>
+          <div class="seg-mini">
+            <button
+              v-for="b in BITRATES" :key="b"
+              :class="{ on: audio.bitrate_kbps === b }"
+              @click="audio.bitrate_kbps = b; applyAudio()"
+            >{{ b }}k</button>
+          </div>
+        </div>
+        <div class="s-row">
+          <div class="k">VBR 可变码率</div>
+          <label class="switch">
+            <input v-model="audio.vbr" type="checkbox" @change="applyAudio"><i />
+          </label>
+        </div>
+        <div class="s-row">
+          <div class="k">DTX 静音省流</div>
+          <label class="switch">
+            <input v-model="audio.dtx" type="checkbox" @change="applyAudio"><i />
+          </label>
+        </div>
+        <div class="s-row">
+          <div class="k">FEC 丢包补偿</div>
+          <label class="switch">
+            <input v-model="audio.fec" type="checkbox" @change="applyAudio"><i />
+          </label>
+        </div>
+        <!-- 仅 FEC 开启时显示：告知编码器的预期丢包率，影响纠错强度 -->
+        <div v-if="audio.fec" class="s-row">
+          <div class="k">预期丢包率</div>
+          <input v-model.number="audio.packet_loss" type="range" min="5" max="20" step="5" @change="applyAudio">
+          <span class="v">{{ audio.packet_loss }}%</span>
         </div>
       </section>
 

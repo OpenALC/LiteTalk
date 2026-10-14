@@ -389,6 +389,35 @@ func (s *Session) RestartDevices(captureID, playbackID string) error {
 	return s.pipe.RestartDevices(captureID, playbackID)
 }
 
+// ApplyAudio 把运行时音频设置热应用到媒体管线（通话中可调，未 Connect 时空操作）。
+// Opus 参数经 ResolveOpusConfig 回落默认；逐项应用，返回首个错误（不中断）。
+func (s *Session) ApplyAudio(rs audio.RuntimeSettings) error {
+	if s.pipe == nil {
+		return nil
+	}
+	rs.Opus = audio.ResolveOpusConfig(rs.Opus)
+	steps := []struct {
+		name string
+		fn   func() error
+	}{
+		{"bitrate", func() error { return s.pipe.SetOpusBitrate(rs.Opus.BitrateKbps) }},
+		{"vbr", func() error { return s.pipe.SetOpusVBR(*rs.Opus.VBR) }},
+		{"dtx", func() error { return s.pipe.SetOpusDTX(*rs.Opus.DTX) }},
+		{"fec", func() error { return s.pipe.SetOpusFEC(*rs.Opus.FEC) }},
+		{"packet_loss", func() error { return s.pipe.SetOpusPacketLoss(rs.Opus.PacketLoss) }},
+	}
+	var firstErr error
+	for _, st := range steps {
+		if err := st.fn(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("audio %s: %w", st.name, err)
+		}
+	}
+	s.pipe.SetDenoise(rs.Denoise)
+	s.pipe.SetGain(rs.Gain)
+	s.pipe.SetVADSensitivity(rs.VADSens)
+	return firstErr
+}
+
 // Muted / Deafened 本地状态查询。
 func (s *Session) Muted() bool    { return s.muted.Load() }
 func (s *Session) Deafened() bool { return s.deafened.Load() }

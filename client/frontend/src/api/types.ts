@@ -50,3 +50,15 @@ export interface ConnTestResult {
   version: string
   error: string
 }
+
+// AudioSettings 语音设置（与 Go 侧 config.AudioSettings 对齐；指针字段未设置即默认）。
+export interface AudioSettings {
+  bitrate_kbps: number // 16/24/32/48/64
+  vbr: boolean
+  dtx: boolean
+  fec: boolean
+  packet_loss: number // 5–20
+  denoise: boolean
+  gain: number // ×10（10 = 1.0）
+  vad_sens: number // 0 低 / 1 中 / 2 高
+}

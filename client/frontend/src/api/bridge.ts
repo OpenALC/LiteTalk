@@ -1,6 +1,6 @@
 // bridge 封装 Wails Go 绑定（window.go.main.App.*）。
 // 浏览器独立开发（vite dev 无 Go 后端）时走 mock 桩，行为可联调 UI。
-import type { AuthResult, ConnConfigView, ConnTestResult, PeerView, ServerConfig, UserProfile } from './types'
+import type { AudioSettings, AuthResult, ConnConfigView, ConnTestResult, PeerView, ServerConfig, UserProfile } from './types'
 
 type GoApp = {
   GetVersion(): Promise<string>
@@ -29,6 +29,8 @@ type GoApp = {
   GetMe(): Promise<UserProfile>
   ListAudioDevices(): Promise<{ capture: AudioDeviceDTO[]; playback: AudioDeviceDTO[] }>
   SetAudioDevices(captureID: string, playbackID: string): Promise<void>
+  GetAudioSettings(): Promise<AudioSettings>
+  SetAudioSettings(s: AudioSettings): Promise<void>
   JoinChannel(channelID: string): Promise<void>
   LeaveChannel(): Promise<void>
   SetMute(muted: boolean): Promise<void>
@@ -105,6 +107,10 @@ const mockApp: GoApp = {
     return { id: 'dev', nickname: 'dev', tag: '0001', email: 'dev@example.com' }
   },
   async SetAudioDevices() {},
+  async GetAudioSettings() {
+    return { bitrate_kbps: 32, vbr: true, dtx: true, fec: true, packet_loss: 10, denoise: true, gain: 10, vad_sens: 1 }
+  },
+  async SetAudioSettings() {},
   async ListAudioDevices() {
     return {
       capture: [{ id: 'default', name: '默认麦克风', is_default: true }],

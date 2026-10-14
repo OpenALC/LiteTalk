@@ -92,10 +92,8 @@ export const useFriendsStore = defineStore('friends', () => {
 
 export const useSettingsStore = defineStore('settings', () => {
   const hibernateOnMinimize = ref(false)
-  const denoise = ref(true)
-  const gain = ref(1)
   const captureDevice = ref('')
   const playbackDevice = ref('')
 
-  return { hibernateOnMinimize, denoise, gain, captureDevice, playbackDevice }
+  return { hibernateOnMinimize, captureDevice, playbackDevice }
 })

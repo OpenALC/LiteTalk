@@ -48,14 +48,16 @@ func DefaultDSPConfig() DSPConfig {
 }
 
 // DSP 封装 RNNoise 降噪 + VAD + 增益 + 说话状态机。
-// Process 零分配；仅允许单 goroutine 调用（增益/开关可跨 goroutine 原子修改）。
+// Process 零分配；仅允许单 goroutine 调用（增益/开关/门限可跨 goroutine 原子修改）。
 type DSP struct {
 	cfg      DSPConfig
 	denoiser *rnnoise.Denoiser
 
-	gainBits  atomic.Uint64 // math.Float64bits(Gain)
-	denoiseOn atomic.Bool
-	speaking  atomic.Bool
+	gainBits     atomic.Uint64 // math.Float64bits(Gain)
+	denoiseOn    atomic.Bool
+	speaking     atomic.Bool
+	vadEnterBits atomic.Uint64 // math.Float32bits(VADEnter)，热可调
+	vadExitBits  atomic.Uint64 // math.Float32bits(VADExit)，热可调
 
 	// 处理 goroutine 私有状态
 	enterRun int
@@ -93,6 +95,8 @@ func NewDSP(cfg DSPConfig) (*DSP, error) {
 	d := &DSP{cfg: cfg, denoiser: dn}
 	d.gainBits.Store(math.Float64bits(cfg.Gain))
 	d.denoiseOn.Store(cfg.Denoise)
+	d.vadEnterBits.Store(uint64(math.Float32bits(cfg.VADEnter)))
+	d.vadExitBits.Store(uint64(math.Float32bits(cfg.VADExit)))
 	return d, nil
 }
 
@@ -114,6 +118,49 @@ func (d *DSP) SetDenoise(on bool) { d.denoiseOn.Store(on) }
 
 // Denoise 返回降噪开关状态。
 func (d *DSP) Denoise() bool { return d.denoiseOn.Load() }
+
+// VAD 灵敏度档位（设置页「低/中/高」）。
+const (
+	VADSensLow  = 0 // 迟钝：enter 0.7 / exit 0.5（嘈杂环境防误触发）
+	VADSensMid  = 1 // 默认：enter 0.6 / exit 0.4（DefaultDSPConfig 校准值）
+	VADSensHigh = 2 // 灵敏：enter 0.5 / exit 0.3（轻声说话也能触发）
+)
+
+// SetVADSensitivity 按档位调整 VAD 双门限（原子写，回差恒 ≥0.2）。
+// 非法档位按 VADSensMid 处理。
+func (d *DSP) SetVADSensitivity(level int) {
+	var enter, exit float32
+	switch level {
+	case VADSensLow:
+		enter, exit = 0.7, 0.5
+	case VADSensHigh:
+		enter, exit = 0.5, 0.3
+	default:
+		enter, exit = 0.6, 0.4
+	}
+	d.vadEnterBits.Store(uint64(math.Float32bits(enter)))
+	d.vadExitBits.Store(uint64(math.Float32bits(exit)))
+}
+
+// SetVADThresholds 直接指定 VAD 双门限（原子写）。exit > enter-0.1 时强制
+// exit = enter-0.2，保证回差。设置页用 SetVADSensitivity 档位即可。
+func (d *DSP) SetVADThresholds(enter, exit float32) {
+	if exit > enter-0.1 {
+		exit = enter - 0.2
+	}
+	d.vadEnterBits.Store(uint64(math.Float32bits(enter)))
+	d.vadExitBits.Store(uint64(math.Float32bits(exit)))
+}
+
+// VADEnter / VADExit 返回当前门限（原子读）。
+func (d *DSP) VADEnter() float32 {
+	return math.Float32frombits(uint32(d.vadEnterBits.Load()))
+}
+
+// VADExit 返回当前退出门限。
+func (d *DSP) VADExit() float32 {
+	return math.Float32frombits(uint32(d.vadExitBits.Load()))
+}
 
 // Speaking 返回当前说话状态。
 func (d *DSP) Speaking() bool { return d.speaking.Load() }
@@ -145,7 +192,7 @@ func (d *DSP) updateSpeaking(vad float32, rms float64) {
 	speaking := d.speaking.Load()
 
 	if !speaking {
-		enterOK := rms >= d.cfg.RMSEnter && (!vadAvailable || vad > d.cfg.VADEnter)
+		enterOK := rms >= d.cfg.RMSEnter && (!vadAvailable || vad > d.VADEnter())
 		if enterOK {
 			d.enterRun++
 			if d.enterRun >= d.cfg.EnterFrames {
@@ -162,7 +209,7 @@ func (d *DSP) updateSpeaking(vad float32, rms float64) {
 		return
 	}
 
-	exitNow := rms < d.cfg.RMSExit || (vadAvailable && vad < d.cfg.VADExit)
+	exitNow := rms < d.cfg.RMSExit || (vadAvailable && vad < d.VADExit())
 	if exitNow {
 		d.exitRun++
 		if d.exitRun >= d.cfg.ExitFrames {

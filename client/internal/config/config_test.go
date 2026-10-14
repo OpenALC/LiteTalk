@@ -43,6 +43,51 @@ func TestCloseToTray(t *testing.T) {
 	}
 }
 
+// TestAudioSettings 语音设置：默认值回落 + 持久化往返（含低灵敏度档 0）。
+func TestAudioSettings(t *testing.T) {
+	m := tmpManager(t)
+
+	// 未设置：全部回落默认。
+	d := m.GetAudioSettings()
+	if d.BitrateKbps != 32 || !*d.VBR || !*d.DTX || !*d.FEC {
+		t.Fatalf("默认 Opus 参数异常: %+v", d)
+	}
+	if d.PacketLoss != 10 || !*d.Denoise || d.Gain != 10 || *d.VADSens != 1 {
+		t.Fatalf("默认 DSP 参数异常: %+v", d)
+	}
+
+	// 写入自定义值（灵敏度 0=低 需能往返，不能用零值当"未设置"）。
+	f, tr := false, true
+	low := 0
+	custom := AudioSettings{
+		BitrateKbps: 48, VBR: &f, DTX: &tr, FEC: &f,
+		PacketLoss: 15, Denoise: &f, Gain: 15, VADSens: &low,
+	}
+	if err := m.SetAudioSettings(custom); err != nil {
+		t.Fatalf("SetAudioSettings: %v", err)
+	}
+	m2 := NewWithPath(m.Path())
+	got := m2.GetAudioSettings()
+	if got.BitrateKbps != 48 || *got.VBR || !*got.DTX || *got.FEC {
+		t.Fatalf("Opus 设置未持久化: %+v", got)
+	}
+	if got.PacketLoss != 15 || *got.Denoise || got.Gain != 15 || *got.VADSens != 0 {
+		t.Fatalf("DSP 设置未持久化: %+v", got)
+	}
+
+	// 读路径收敛：手改 config.json 的越界值回落默认（写路径白名单只在 SetAudioSettings）。
+	if err := m.Update(func(c *Config) error {
+		c.Audio = &AudioSettings{BitrateKbps: 999, PacketLoss: 250, Gain: 999}
+		return nil
+	}); err != nil {
+		t.Fatalf("注入越界值: %v", err)
+	}
+	got = m.GetAudioSettings()
+	if got.BitrateKbps != 32 || got.PacketLoss != 10 || got.Gain != 10 {
+		t.Fatalf("越界值未收敛: %+v", got)
+	}
+}
+
 // TestSavedCredentials 凭据存取与清除（问题 6b）。
 // Windows 上密码经 DPAPI 往返还原；非 Windows 只记邮箱（密码为空）。
 func TestSavedCredentials(t *testing.T) {

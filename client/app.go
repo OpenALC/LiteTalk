@@ -456,6 +456,10 @@ func (a *App) connectSession(token, nickname string) error {
 	if err := sess.Connect(server); err != nil {
 		return err
 	}
+	// 连接即应用持久化的语音设置（码率/VBR/DTX/FEC/丢包率/降噪/增益/VAD 灵敏度）。
+	if err := sess.ApplyAudio(a.runtimeAudio()); err != nil {
+		log.Printf("apply audio settings: %v", err)
+	}
 	sess.ChatHandler(func(channelID, userID, nick, content, ts string) {
 		runtime.EventsEmit(a.ctx, "chat:message", map[string]string{
 			"channel_id": channelID, "user_id": userID,
@@ -556,6 +560,59 @@ func (a *App) SetAudioDevices(captureID, playbackID string) error {
 		return fmt.Errorf("not connected")
 	}
 	return s.RestartDevices(captureID, playbackID)
+}
+
+// ---------- 语音设置（Opus 编码参数 + DSP；持久化 config.json，通话中热生效） ----------
+
+// runtimeAudio 把持久化语音设置转成管线的运行时设置。
+func (a *App) runtimeAudio() audio.RuntimeSettings {
+	as := a.cfg.GetAudioSettings()
+	return audio.RuntimeSettings{
+		Opus: audio.OpusConfig{
+			BitrateKbps: as.BitrateKbps,
+			VBR:         as.VBR, DTX: as.DTX, FEC: as.FEC,
+			PacketLoss: as.PacketLoss,
+		},
+		Denoise: as.Denoise != nil && *as.Denoise,
+		Gain:    float64(as.Gain) / 10,
+		VADSens: derefInt(as.VADSens, 1),
+	}
+}
+
+func derefInt(p *int, def int) int {
+	if p == nil {
+		return def
+	}
+	return *p
+}
+
+// GetAudioSettings 读取持久化语音设置（设置页初始化用；未设置字段回落默认值）。
+func (a *App) GetAudioSettings() config.AudioSettings { return a.cfg.GetAudioSettings() }
+
+// SetAudioSettings 持久化语音设置，并对当前会话热应用（未连接时仅持久化，
+// 下次 Connect 后经 connectSession 的 ApplyAudio 生效）。
+func (a *App) SetAudioSettings(s config.AudioSettings) error {
+	switch s.BitrateKbps {
+	case 0, 16, 24, 32, 48, 64: // 0 = 回落默认
+	default:
+		return fmt.Errorf("码率非法: %d", s.BitrateKbps)
+	}
+	if s.PacketLoss < 0 || s.PacketLoss > 100 {
+		return fmt.Errorf("丢包率非法: %d", s.PacketLoss)
+	}
+	if s.Gain < 0 || s.Gain > 20 {
+		return fmt.Errorf("增益非法: %d", s.Gain)
+	}
+	if err := a.cfg.SetAudioSettings(s); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	sess := a.sess
+	a.mu.Unlock()
+	if sess != nil {
+		return sess.ApplyAudio(a.runtimeAudio())
+	}
+	return nil
 }
 
 // SendChat 发送文字消息。

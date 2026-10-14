@@ -251,3 +251,47 @@ func BenchmarkDSPProcess(b *testing.B) {
 		}
 	}
 }
+
+// TestSetVADSensitivity 灵敏度三档映射到 VAD 双门限，非法档回落中档。
+func TestSetVADSensitivity(t *testing.T) {
+	d, err := NewDSP(DSPConfig{Denoise: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		level     int
+		wantEnter float32
+		wantExit  float32
+	}{
+		{VADSensLow, 0.7, 0.5},
+		{VADSensMid, 0.6, 0.4},
+		{VADSensHigh, 0.5, 0.3},
+		{99, 0.6, 0.4}, // 非法档 → 中
+	}
+	for _, c := range cases {
+		d.SetVADSensitivity(c.level)
+		if e, x := d.VADEnter(), d.VADExit(); e != c.wantEnter || x != c.wantExit {
+			t.Fatalf("level %d: enter=%.2f exit=%.2f, want %.2f/%.2f", c.level, e, x, c.wantEnter, c.wantExit)
+		}
+	}
+}
+
+// TestSetVADThresholds 直接指定门限时强制 ≥0.2 回差。
+func TestSetVADThresholds(t *testing.T) {
+	d, err := NewDSP(DSPConfig{Denoise: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	approx := func(a, b float32) bool {
+		d := a - b
+		return d < 0.01 && d > -0.01
+	}
+	d.SetVADThresholds(0.6, 0.55) // 回差不足 → exit 强制 0.4
+	if e, x := d.VADEnter(), d.VADExit(); !approx(e, 0.6) || !approx(x, 0.4) {
+		t.Fatalf("enter=%.4f exit=%.4f, want ≈0.60/0.40", e, x)
+	}
+	d.SetVADThresholds(0.8, 0.5) // 合法回差 → 原样
+	if e, x := d.VADEnter(), d.VADExit(); !approx(e, 0.8) || !approx(x, 0.5) {
+		t.Fatalf("enter=%.4f exit=%.4f, want ≈0.80/0.50", e, x)
+	}
+}

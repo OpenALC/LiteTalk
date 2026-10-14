@@ -1,6 +1,7 @@
 package audio
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -236,4 +237,82 @@ func TestNullBackendRun(t *testing.T) {
 	}
 	t.Logf("null backend 500ms: frames=%d pkts=%d played=%d samples, latency avg %dµs",
 		st.FramesProcessed, st.PacketsEncoded, st.PlaybackSamples, st.LatencyAvgUS)
+}
+
+// TestOpusSettersSmoke Opus 参数热调：合法值生效并可继续编码，非法值报错。
+func TestOpusSettersSmoke(t *testing.T) {
+	p := newLoopbackPipeline(t, func(c *PipelineConfig) { c.DSP.Denoise = false })
+	if err := p.SetOpusBitrate(64); err != nil {
+		t.Fatalf("SetOpusBitrate: %v", err)
+	}
+	if err := p.SetOpusVBR(false); err != nil {
+		t.Fatalf("SetOpusVBR: %v", err)
+	}
+	if err := p.SetOpusDTX(false); err != nil {
+		t.Fatalf("SetOpusDTX: %v", err)
+	}
+	if err := p.SetOpusFEC(false); err != nil {
+		t.Fatalf("SetOpusFEC: %v", err)
+	}
+	if err := p.SetOpusPacketLoss(20); err != nil {
+		t.Fatalf("SetOpusPacketLoss: %v", err)
+	}
+	if p.opus.BitrateKbps != 64 || *p.opus.VBR || *p.opus.DTX || *p.opus.FEC || p.opus.PacketLoss != 20 {
+		t.Fatalf("opus 配置未同步: %+v", p.opus)
+	}
+	if err := p.SetOpusBitrate(0); err == nil {
+		t.Fatal("SetOpusBitrate(0) 应报错")
+	}
+	if err := p.SetOpusPacketLoss(101); err == nil {
+		t.Fatal("SetOpusPacketLoss(101) 应报错")
+	}
+
+	// 热调后管线仍可编码（2 个 10ms 帧 = 1 个 20ms Opus 包）。
+	in := make([]int16, FrameSize)
+	var phase float64
+	var rng uint32 = 7
+	for i := 0; i < 2; i++ {
+		sineNoiseFrame(in, &phase, 8000, 1000, &rng)
+		if err := p.ProcessPCM(in); err != nil {
+			t.Fatalf("ProcessPCM after setters: %v", err)
+		}
+	}
+	if p.Stats().PacketsEncoded == 0 {
+		t.Fatal("热调后未编码出包")
+	}
+}
+
+// TestOpusSetterAfterClose 关闭后所有热调 setter 返回 ErrClosed（钉住 Close 置 nil 行为）。
+func TestOpusSetterAfterClose(t *testing.T) {
+	p := newLoopbackPipeline(t, func(c *PipelineConfig) { c.DSP.Denoise = false })
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := p.SetOpusBitrate(64); !errors.Is(err, codec.ErrClosed) {
+		t.Fatalf("SetOpusBitrate after Close: %v", err)
+	}
+	if err := p.SetOpusVBR(false); !errors.Is(err, codec.ErrClosed) {
+		t.Fatalf("SetOpusVBR after Close: %v", err)
+	}
+	if err := p.SetOpusDTX(false); !errors.Is(err, codec.ErrClosed) {
+		t.Fatalf("SetOpusDTX after Close: %v", err)
+	}
+	if err := p.SetOpusFEC(false); !errors.Is(err, codec.ErrClosed) {
+		t.Fatalf("SetOpusFEC after Close: %v", err)
+	}
+	if err := p.SetOpusPacketLoss(20); !errors.Is(err, codec.ErrClosed) {
+		t.Fatalf("SetOpusPacketLoss after Close: %v", err)
+	}
+}
+
+// TestOpusConfigResolve 零值字段回落默认。
+func TestOpusConfigResolve(t *testing.T) {	r := ResolveOpusConfig(OpusConfig{})
+	if r.BitrateKbps != 32 || !*r.VBR || !*r.DTX || !*r.FEC || r.PacketLoss != 10 {
+		t.Fatalf("ResolveOpusConfig 零值回落异常: %+v", r)
+	}
+	custom := OpusConfig{BitrateKbps: 48, PacketLoss: 15}
+	r = ResolveOpusConfig(custom)
+	if r.BitrateKbps != 48 || r.PacketLoss != 15 || !*r.VBR {
+		t.Fatalf("ResolveOpusConfig 应保留显式值: %+v", r)
+	}
 }

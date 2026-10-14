@@ -43,6 +43,81 @@ type Config struct {
 	SavedEmail          string `json:"saved_email,omitempty"`            // 记住的登录邮箱
 	EncPassword         string `json:"enc_password,omitempty"`           // 记住的密码（DPAPI 密文 base64；非 Windows 恒空）
 	EncGuestRefresh     string `json:"enc_guest_refresh,omitempty"`      // 记住的游客 refresh_token（DPAPI 密文 base64；非 Windows 恒空）
+	Audio               *AudioSettings `json:"audio,omitempty"`          // 语音设置（码率/VBR/DTX/FEC/丢包率/降噪/增益/VAD 灵敏度）
+}
+
+// AudioSettings 语音设置。指针/零值字段在读取时回落 DefaultAudioSettings。
+type AudioSettings struct {
+	BitrateKbps int   `json:"bitrate_kbps,omitempty"` // Opus 目标码率 kbps：16/24/32/48/64（0 → 32）
+	VBR         *bool `json:"vbr,omitempty"`          // 可变码率（nil → true）
+	DTX         *bool `json:"dtx,omitempty"`          // 静音期非连续传输（nil → true）
+	FEC         *bool `json:"fec,omitempty"`          // 带内前向纠错（nil → true）
+	PacketLoss  int   `json:"packet_loss,omitempty"`  // 告知编码器的预期丢包率 %（0 → 10；FEC 关闭时无意义）
+	Denoise     *bool `json:"denoise,omitempty"`      // RNNoise 降噪（nil → true）
+	Gain        int   `json:"gain,omitempty"`         // 输入增益 ×10（0 → 10 = 1.0；范围 0–20）
+	VADSens     *int  `json:"vad_sens,omitempty"`     // VAD 灵敏度：0 低 / 1 中 / 2 高（nil → 1）
+}
+
+// DefaultAudioSettings 语音设置出厂值（与管线既有硬编码一致）。
+func DefaultAudioSettings() AudioSettings {
+	t := true
+	one := 1
+	return AudioSettings{
+		BitrateKbps: 32, VBR: &t, DTX: &t, FEC: &t,
+		PacketLoss: 10, Denoise: &t, Gain: 10, VADSens: &one,
+	}
+}
+
+// GetAudioSettings 读取语音设置，未设置字段回落默认值。
+func (m *Manager) GetAudioSettings() AudioSettings {
+	c := m.Get()
+	if c.Audio == nil {
+		return DefaultAudioSettings()
+	}
+	s := *c.Audio
+	d := DefaultAudioSettings()
+	// 读路径收敛：手改 config.json 的越界值回落默认（写路径白名单只在 SetAudioSettings）
+	switch s.BitrateKbps {
+	case 16, 24, 32, 48, 64:
+	default:
+		s.BitrateKbps = d.BitrateKbps
+	}
+	if s.VBR == nil {
+		s.VBR = d.VBR
+	}
+	if s.DTX == nil {
+		s.DTX = d.DTX
+	}
+	if s.FEC == nil {
+		s.FEC = d.FEC
+	}
+	if s.PacketLoss <= 0 || s.PacketLoss > 100 {
+		s.PacketLoss = d.PacketLoss
+	}
+	if s.Denoise == nil {
+		s.Denoise = d.Denoise
+	}
+	if s.Gain < 0 || s.Gain > 200 { // 0 视为未设置（omitempty 吞掉），与 0.1 最小档区分
+		s.Gain = d.Gain
+	}
+	if s.VADSens == nil {
+		s.VADSens = d.VADSens
+	}
+	switch *s.VADSens {
+	case 0, 1, 2:
+	default:
+		one := 1
+		s.VADSens = &one
+	}
+	return s
+}
+
+// SetAudioSettings 持久化语音设置（调用方传 GetAudioSettings 回落后的完整值）。
+func (m *Manager) SetAudioSettings(s AudioSettings) error {
+	return m.Update(func(c *Config) error {
+		c.Audio = &s
+		return nil
+	})
 }
 
 // Manager 读写配置文件（路径：os.UserConfigDir()/LiteTalk/config.json）。
