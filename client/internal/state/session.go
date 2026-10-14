@@ -436,13 +436,18 @@ func (s *Session) Members() []PeerView {
 // Stats 统计快照（JSON 给 UI）。
 func (s *Session) Stats() string {
 	vs := VoiceStats{PeerIDs: s.remoteMgr.PeerIDs()}
-	if s.pipe != nil {
-		ps := s.pipe.Stats()
-		vs.EncPackets = ps.PacketsEncoded
-		vs.LatencyMS = int(ps.LatencyAvgUS / 1000)
-	}
 	if p := s.peerRef.Load(); p != nil {
 		vs.RtpSent = p.Stats.PacketsSent.Load()
+		// 延迟优先取 WebRTC 选中 ICE pair 的真实 RTT（问题：此前恒 0ms——
+		// 管线回环估计只在 Loopback 模式有样本，真实通话不产样本）。
+		// 用 ok 作哨兵而非值——RTT 真实但 <1ms 时会被错误覆盖（S1）。
+		if rtt, ok := p.RTT(); ok {
+			vs.LatencyMS = int(rtt.Milliseconds())
+		} else if s.pipe != nil {
+			// 无 RTT 样本时回落管线回环估计（本机联调场景）。
+			vs.EncPackets = s.pipe.Stats().PacketsEncoded
+			vs.LatencyMS = int(s.pipe.Stats().LatencyAvgUS / 1000)
+		}
 	}
 	s.mu.Lock()
 	vs.Members = len(s.members)
@@ -463,7 +468,9 @@ func (s *Session) SendChat(channelID, content string) error {
 }
 
 // ChatHandler 注入 chat.message 处理（app 层补挂）。
-func (s *Session) ChatHandler(fn func(channelID, userID, nickname, content, ts string)) {
+// msgID 为服务端消息 ID（文字消息按频道隔离与去重需要真实 ID，
+// 此前回调丢弃了 ID，前端只能拿时间戳当 key，无法可靠去重）。
+func (s *Session) ChatHandler(fn func(channelID, msgID, userID, nickname, content, ts string)) {
 	if s.ws == nil {
 		return
 	}
@@ -481,7 +488,26 @@ func (s *Session) ChatHandler(fn func(channelID, userID, nickname, content, ts s
 		if env.Decode(&d) != nil {
 			return
 		}
-		fn(d.ChannelID, d.User.ID, d.User.Nickname, d.Content, fmt.Sprintf("%d", d.TS))
+		fn(d.ChannelID, d.ID, d.User.ID, d.User.Nickname, d.Content, fmt.Sprintf("%d", d.TS))
+	})
+}
+
+// ErrorHandler 注入服务端 error 帧处理（app 层补挂）。
+// 服务端对 chat.send 等消息的校验/拒收是异步 error 帧回落，
+// 此前未订阅导致服务端拒收时消息凭空消失且无提示（阻断 B1）。
+func (s *Session) ErrorHandler(fn func(code, message string)) {
+	if s.ws == nil {
+		return
+	}
+	s.ws.On(signal.TypeError, func(env signal.Envelope) {
+		var d struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		}
+		if env.Decode(&d) != nil {
+			return
+		}
+		fn(d.Code, d.Message)
 	})
 }
 

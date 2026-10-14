@@ -1,26 +1,81 @@
 <script setup lang="ts">
 // VoiceRoom 语音房间网格（对齐 Main.html：卡片网格 + 声波球 + 状态胶囊 + 邀请卡）。
 // 声波球四态见 SoundOrb.vue；双关态胶囊在此（.chip.red.dual）。
-import { AudioLines, MicOff, HeadphoneOff, MoreHorizontal, UserPlus } from 'lucide-vue-next'
+// 批次①：成员卡片「更多」弹层（音量调节/查看资料）；邀请卡点击生成邀请码并复制。
+import { ref } from 'vue'
+import {
+  AudioLines, MicOff, HeadphoneOff, MoreHorizontal, UserPlus, Volume2, Info,
+} from 'lucide-vue-next'
 import SoundOrb from '../components/SoundOrb.vue'
 import { useVoiceStore } from '../stores/voice'
+import { useServersStore } from '../stores/data'
+import { useNotifyStore } from '../stores/notify'
+import { goApp } from '../api/bridge'
 
 const voice = useVoiceStore()
+const servers = useServersStore()
+const notify = useNotifyStore()
 
 // 状态胶囊（双关态优先——用户要求的合并样式）。
+// 文案约定（实测走查 16）：麦克风关闭 = 已闭麦；扬声器关闭 = 已静音。
 function chipFor(m: { mute: boolean; deafen: boolean; speaking: boolean }) {
-  if (m.mute && m.deafen) return { cls: 'red dual', text: '已静音 已耳聋', dual: true }
-  if (m.mute) return { cls: 'red', text: '已静音', icon: MicOff }
-  if (m.deafen) return { cls: 'red', text: '已耳聋', icon: HeadphoneOff }
+  if (m.mute && m.deafen) return { cls: 'red dual', text: '已闭麦 已静音', dual: true }
+  if (m.mute) return { cls: 'red', text: '已闭麦', icon: MicOff }
+  if (m.deafen) return { cls: 'red', text: '已静音', icon: HeadphoneOff }
   if (m.speaking) return { cls: 'brand', text: '正在说话', icon: AudioLines }
   return null
+}
+
+// ---- 成员「更多」弹层（音量滑杆 + 查看资料） ----
+// moreFor 记录打开弹层的成员 user_id；弹层挂在该卡片内（绝对定位右上角）。
+const moreFor = ref('')
+const volumePct = ref(100) // 本地音量 0–200%（无读取端点，默认 100 起步）
+
+function toggleMore(userID: string) {
+  moreFor.value = moreFor.value === userID ? '' : userID
+  volumePct.value = 100
+}
+
+// applyVolume 拖动结束时应用（@change 而非 @input，避免高频调 Go 侧）。
+async function applyVolume(userID: string) {
+  try {
+    await voice.setPeerVolume(userID, volumePct.value / 100)
+  } catch (e) {
+    notify.fromErr(e, '音量调节失败')
+  }
+}
+
+function showProfile(m: { user_id: string; nickname: string }) {
+  moreFor.value = ''
+  notify.show(`${m.nickname}（ID: ${m.user_id}）`)
+}
+
+// ---- 邀请卡：为当前服务器生成邀请码并复制（对齐原型：点击即复制） ----
+async function invite() {
+  const s = servers.currentServer
+  if (s.builtin) {
+    // 内置示例服务器不是服务端实体，无法签发邀请码。
+    notify.show('示例服务器暂不支持邀请，请先通过 + 创建服务器', true)
+    return
+  }
+  try {
+    const code = await goApp().CreateInviteCode(Number(s.id))
+    await navigator.clipboard.writeText(code)
+    notify.show('邀请码已复制，发给朋友吧')
+  } catch (e) {
+    notify.fromErr(e)
+  }
 }
 </script>
 
 <template>
   <div class="voice-grid">
     <div v-for="m in voice.members" :key="m.user_id" class="vcard">
-      <button class="more" title="更多"><MoreHorizontal :size="16" /></button>
+      <!-- 自己的卡片不弹「更多」（音量调节/资料都对他人有意义） -->
+      <button v-if="m.user_id !== voice.selfId()" class="more" title="更多"
+              @click="toggleMore(m.user_id)">
+        <MoreHorizontal :size="16" />
+      </button>
       <SoundOrb :user-id="m.user_id" :speaking="m.speaking"
                 :muted="m.mute" :deafen="m.deafen" />
       <div class="vname">
@@ -29,15 +84,31 @@ function chipFor(m: { mute: boolean; deafen: boolean; speaking: boolean }) {
       </div>
       <span v-if="chipFor(m)" class="chip" :class="chipFor(m)!.cls">
         <template v-if="chipFor(m)!.dual">
-          <MicOff :size="12" />已静音<HeadphoneOff :size="12" />已耳聋
+          <MicOff :size="12" />已闭麦<HeadphoneOff :size="12" />已静音
         </template>
         <template v-else>
           <component :is="chipFor(m)!.icon" :size="12" />{{ chipFor(m)!.text }}
         </template>
       </span>
+
+      <!-- 成员操作弹层：音量滑杆 + 查看资料 -->
+      <template v-if="moreFor === m.user_id">
+        <div class="more-mask" @click="moreFor = ''" />
+        <div class="more-pop">
+          <div class="mp-row">
+            <Volume2 :size="14" />
+            <input v-model.number="volumePct" type="range" min="0" max="200" step="10"
+                   @change="applyVolume(m.user_id)">
+            <span class="mp-v">{{ volumePct }}%</span>
+          </div>
+          <button class="mp-item" @click="showProfile(m)">
+            <Info :size="14" />查看资料
+          </button>
+        </div>
+      </template>
     </div>
 
-    <div class="vcard invite">
+    <div class="vcard invite" @click="invite">
       <div class="i-circle"><UserPlus :size="20" /></div>
       <span>邀请朋友加入频道</span>
     </div>
@@ -103,4 +174,26 @@ function chipFor(m: { mute: boolean; deafen: boolean; speaking: boolean }) {
 }
 .vcard.invite:hover .i-circle { transform: scale(1.08); }
 .vcard.invite span { font-size: 13px; font-weight: 500; }
+
+/* 成员「更多」弹层 */
+.more-mask { position: fixed; inset: 0; z-index: 25; }
+.more-pop {
+  position: absolute; top: 42px; right: 10px; z-index: 30;
+  width: 200px; padding: 10px;
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: 12px; box-shadow: var(--shadow-2);
+}
+.mp-row { display: flex; align-items: center; gap: 8px; padding: 2px 4px 8px; }
+.mp-row :deep(svg) { color: var(--ink-400); flex: none; }
+.mp-row input[type="range"] {
+  flex: 1; min-width: 0; accent-color: var(--brand-500);
+}
+.mp-v { font-size: 11.5px; color: var(--ink-400); width: 36px; text-align: right; }
+.mp-item {
+  width: 100%; height: 32px; padding: 0 8px; border-radius: 8px;
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px; font-weight: 500; color: var(--ink-600);
+  transition: background 0.15s, color 0.15s;
+}
+.mp-item:hover { background: var(--brand-50); color: var(--ink-900); }
 </style>

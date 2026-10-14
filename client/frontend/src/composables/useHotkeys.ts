@@ -13,9 +13,10 @@ export interface HotkeyDef {
   key: string // KeyboardEvent.key，小写比较
 }
 
+// 文案约定（实测走查 16）：麦克风=闭麦，扬声器=静音。
 export const HOTKEYS: HotkeyDef[] = [
-  { id: 'mute', label: '静音 / 取消静音', combo: 'Ctrl + M', ctrl: true, key: 'm' },
-  { id: 'deafen', label: '耳聋 / 取消耳聋', combo: 'Ctrl + D', ctrl: true, key: 'd' },
+  { id: 'mute', label: '闭麦 / 取消闭麦', combo: 'Ctrl + M', ctrl: true, key: 'm' },
+  { id: 'deafen', label: '静音 / 取消静音', combo: 'Ctrl + D', ctrl: true, key: 'd' },
   { id: 'dual', label: '全关 / 全开', combo: 'Ctrl + Shift + M', ctrl: true, shift: true, key: 'm' },
   { id: 'search', label: '聚焦搜索', combo: 'Ctrl + K', ctrl: true, key: 'k' },
   { id: 'settings', label: '打开设置', combo: 'Ctrl + ,', ctrl: true, key: ',' },

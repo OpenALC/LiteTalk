@@ -10,6 +10,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/pion/interceptor"
 	"github.com/pion/rtp"
@@ -312,6 +313,37 @@ func (p *Peer) ConnectionState() webrtc.PeerConnectionState { return p.pc.Connec
 
 // LocalSSRC 上行轨 SSRC（调试用）。
 func (p *Peer) LocalSSRC() uint32 { return p.pkt.SSRC }
+
+// RTT 返回当前选中 ICE candidate pair 的最新往返时延
+//（WebRTC stats 的 currentRoundTripTime，真实网络 RTT）。
+// 此前 UI 的延迟恒为 0：Session.Stats 取的是管线回环延迟估计，
+// 而回环估计只在 Loopback 模式（M1 试听）有样本，真实通话 Loopback=false。
+// ok=false 表示连接未建立或尚无 RTT 样本（此时调用方应保留上一次值或显示 --）。
+func (p *Peer) RTT() (time.Duration, bool) {
+	if p.closed.Load() {
+		return 0, false
+	}
+	var best float64
+	found := false
+	for _, s := range p.pc.GetStats() {
+		pair, ok := s.(webrtc.ICECandidatePairStats)
+		if !ok {
+			continue
+		}
+		// 只采纳已 nominated 且检查成功的 pair（媒体实际走的通路）
+		if !pair.Nominated || pair.State != webrtc.StatsICECandidatePairStateSucceeded {
+			continue
+		}
+		if pair.CurrentRoundTripTime > 0 && (!found || pair.CurrentRoundTripTime < best) {
+			best = pair.CurrentRoundTripTime
+			found = true
+		}
+	}
+	if !found {
+		return 0, false
+	}
+	return time.Duration(best * float64(time.Second)), true
+}
 
 // Close 关闭 PeerConnection（幂等）。
 func (p *Peer) Close() error {

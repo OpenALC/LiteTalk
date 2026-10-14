@@ -1,6 +1,8 @@
 <script setup lang="ts">
 // TextChat 文字频道视图（对齐 Main.html：消息列表 + 输入发送）。
-import { ref } from 'vue'
+// 消息只渲染当前频道（store 按 channel_id 分桶，问题：此前跨频道串消息）；
+// 不做本地乐观回显——服务端会把广播发回发送者，本地再插一条即双显。
+import { computed, ref } from 'vue'
 import { Hash, Send } from 'lucide-vue-next'
 import { useChatStore } from '../stores/chat'
 import { useServersStore } from '../stores/data'
@@ -9,20 +11,24 @@ const chat = useChatStore()
 const servers = useServersStore()
 const text = ref('')
 
+// 当前频道的消息列表（随频道切换与消息到达自动更新）。
+const messages = computed(() => chat.messagesFor(servers.currentChannelId))
+
+// fmtTime 把服务端毫秒时间戳格式化为 HH:MM（此前直接显示原始 epoch 数字）。
+function fmtTime(ts: string): string {
+  const n = Number(ts)
+  if (!Number.isFinite(n) || n <= 0) return ''
+  const d = new Date(n)
+  const hh = String(d.getHours()).padStart(2, '0')
+  const mm = String(d.getMinutes()).padStart(2, '0')
+  return `${hh}:${mm}`
+}
+
 async function send() {
   const v = text.value.trim()
   if (!v) return
   try {
     await chat.send(servers.currentChannelId, v)
-    // 本地回显（服务端广播 chat.message 到达后由 store 去重；M3 服务端就绪后移除）。
-    chat.messages.push({
-      id: String(Date.now()),
-      channel_id: servers.currentChannelId,
-      user_id: 'me',
-      nickname: '我',
-      content: v,
-      ts: String(Date.now()),
-    })
     text.value = ''
   } catch { /* 发送失败静默，服务端 error 消息另行提示 */ }
 }
@@ -36,10 +42,10 @@ async function send() {
     </div>
 
     <div class="chat-list">
-      <div v-for="m in chat.messages" :key="m.id" class="msg">
+      <div v-for="m in messages" :key="m.id" class="msg">
         <div class="m-head">
           <span class="m-name">{{ m.nickname }}</span>
-          <span class="m-time">{{ m.ts }}</span>
+          <span class="m-time">{{ fmtTime(m.ts) }}</span>
         </div>
         <p class="m-text">{{ m.content }}</p>
       </div>
