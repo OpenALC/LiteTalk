@@ -1,6 +1,6 @@
 // 类型定义（与 Go 侧 state 包对齐）。
 export interface UserProfile {
-  id: string
+  id: number
   nickname: string
   tag: string
   email: string

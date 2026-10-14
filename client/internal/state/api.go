@@ -20,8 +20,10 @@ type AuthTokens struct {
 }
 
 // UserProfile 用户档案（无头像——硬性约束）。
+// id 与服务端 store.User 一致为数字（曾误声明 string，导致登录/注册/游客
+// 响应解码全部失败——服务端 wire 是 int64）。
 type UserProfile struct {
-	ID       string `json:"id"`
+	ID       int64  `json:"id"`
 	Nickname string `json:"nickname"`
 	Tag      string `json:"tag"`
 	Email    string `json:"email"`

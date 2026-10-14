@@ -1,6 +1,7 @@
 <script setup lang="ts">
 // TitleBar 自定义标题栏（无边框窗口拖拽区 + 最小化/最大化/关闭）。
-// Wails v2 无边框窗口：CSS -webkit-app-region: drag。
+// Wails v2 无边框窗口：拖拽用 --wails-draggable（WebView2 不认 Electron 的
+// -webkit-app-region）。
 // 关闭走 useWindowClose：首次关窗提示「已最小化到托盘」（问题 4d）。
 import { ref } from 'vue'
 import { Minus, Square, X, AudioWaveform } from 'lucide-vue-next'
@@ -31,7 +32,7 @@ const toast = ref<InstanceType<typeof Toast>>()
   padding: 0 6px 0 14px;
   background: var(--surface);
   border-bottom: 1px solid var(--line);
-  -webkit-app-region: drag;
+  --wails-draggable: drag;
   user-select: none;
   z-index: 30;
 }
@@ -43,7 +44,7 @@ const toast = ref<InstanceType<typeof Toast>>()
 }
 .tb-logo :deep(svg) { color: #fff; }
 .tb-name { font-size: 12px; font-weight: 600; color: var(--ink-600); letter-spacing: 0.4px; }
-.tb-controls { margin-left: auto; display: flex; -webkit-app-region: no-drag; }
+.tb-controls { margin-left: auto; display: flex; --wails-draggable: no-drag; }
 .tb-controls button {
   width: 42px; height: 38px;
   display: flex; align-items: center; justify-content: center;

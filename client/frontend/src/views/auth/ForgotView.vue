@@ -29,12 +29,13 @@ function validate(): boolean {
   return !(invalid.email || invalid.code || invalid.password)
 }
 
-function friendlyErr(e: unknown): string {
+// fallback 默认按发码场景取文案；提交动作应显式传业务兜底（发信通道与重置无关）。
+function friendlyErr(e: unknown, fallback = auth.mailConfigured ? '操作失败，请稍后再试' : '发送失败：服务未配置发信通道'): string {
   const s = String(e)
   if (s.includes('too_frequent') || s.includes('发送过于频繁')) return '发送过于频繁，请稍后再试'
   if (s.includes('daily_limit') || s.includes('上限')) return '今日发送次数已达上限'
   if (s.includes('not_found') || s.includes('未注册')) return '邮箱未注册'
-  return auth.mailConfigured ? '操作失败，请稍后再试' : '发送失败：服务未配置发信通道'
+  return fallback
 }
 
 async function sendCode() {
@@ -61,7 +62,7 @@ async function submit() {
     toast.value?.show('密码已重置')
     router.push('/login')
   } catch (e) {
-    toast.value?.show(friendlyErr(e), true)
+    toast.value?.show(friendlyErr(e, '重置失败，请稍后再试'), true)
   } finally {
     loading.value = false
   }

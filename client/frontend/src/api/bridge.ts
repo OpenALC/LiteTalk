@@ -38,6 +38,7 @@ type GoApp = {
   SetPeerVolume(userID: string, gain: number): Promise<void>
   SendChat(channelID: string, content: string): Promise<void>
   GetVoiceMembers(): Promise<PeerView[]>
+  LogFromWeb(level: string, msg: string): Promise<void>
 }
 
 export interface AudioDeviceDTO {
@@ -89,7 +90,7 @@ const mockApp: GoApp = {
   async Login(email: string) {
     return {
       access_token: 'dev-token', refresh_token: 'dev-refresh',
-      user: { id: email.split('@')[0] || 'dev', nickname: email.split('@')[0] || 'dev', tag: '0001', email },
+      user: { id: 1, nickname: email.split('@')[0] || 'dev', tag: '0001', email },
     }
   },
   async Register(_n: string, email: string) {
@@ -100,12 +101,13 @@ const mockApp: GoApp = {
   async LoginAsGuest() {
     return {
       access_token: 'dev-token', refresh_token: 'dev-refresh',
-      user: { id: 'guest-dev', nickname: '游客-0000', tag: '0000', email: '', is_guest: true },
+      user: { id: 2, nickname: '游客-0000', tag: '0000', email: '', is_guest: true },
     }
   },
   async GetMe() {
-    return { id: 'dev', nickname: 'dev', tag: '0001', email: 'dev@example.com' }
+    return { id: 1, nickname: 'dev', tag: '0001', email: 'dev@example.com' }
   },
+  async LogFromWeb() {},
   async SetAudioDevices() {},
   async GetAudioSettings() {
     return { bitrate_kbps: 32, vbr: true, dtx: true, fec: true, packet_loss: 10, denoise: true, gain: 10, vad_sens: 1 }

@@ -41,13 +41,14 @@ function validate(): boolean {
 }
 
 // friendlyErr 发码/注册失败的友好提示（不暴露内部错误）。
-function friendlyErr(e: unknown): string {
+// fallback 默认按发码场景取文案；提交动作应显式传业务兜底（发信通道与注册无关）。
+function friendlyErr(e: unknown, fallback = auth.mailConfigured ? '操作失败，请稍后再试' : '发送失败：服务未配置发信通道'): string {
   const s = String(e)
   if (s.includes('too_frequent') || s.includes('发送过于频繁')) return '发送过于频繁，请稍后再试'
   if (s.includes('daily_limit') || s.includes('上限')) return '今日发送次数已达上限'
   if (s.includes('email_taken') || s.includes('已注册')) return '邮箱已注册'
   if (s.includes('bad_credentials') || s.includes('密码错误')) return '邮箱或密码错误'
-  return auth.mailConfigured ? '操作失败，请稍后再试' : '发送失败：服务未配置发信通道'
+  return fallback
 }
 
 async function sendCode() {
@@ -75,7 +76,7 @@ async function submit() {
     toast.value?.show('注册成功')
     router.push('/')
   } catch (e) {
-    toast.value?.show(friendlyErr(e), true)
+    toast.value?.show(friendlyErr(e, '注册失败，请稍后再试'), true)
   } finally {
     loading.value = false
   }

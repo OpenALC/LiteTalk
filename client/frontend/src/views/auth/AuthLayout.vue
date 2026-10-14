@@ -81,13 +81,14 @@ onMounted(async () => {
 .auth-wrap {
   height: 100vh; display: grid; grid-template-columns: 1fr 460px;
   background: var(--surface);
-  /* 整页可拖拽窗口（问题 5b）；交互元素在下方统一 no-drag */
-  -webkit-app-region: drag;
+  /* 整页可拖拽窗口（问题 5b）；交互元素在下方统一 no-drag。
+     Wails v2 拖拽属性为 --wails-draggable（WebView2 不认 -webkit-app-region） */
+  --wails-draggable: drag;
 }
 /* 悬浮窗控（问题 5a/5c）：与 MainView TitleBar 同款反馈，不占布局 */
 .win-controls {
   position: fixed; top: 0; right: 0; z-index: 40;
-  display: flex; -webkit-app-region: no-drag;
+  display: flex; --wails-draggable: no-drag;
 }
 .win-controls button {
   width: 42px; height: 38px;
@@ -103,7 +104,7 @@ onMounted(async () => {
 .auth-wrap :deep(a),
 .auth-wrap :deep(label),
 .auth-wrap :deep(select),
-.conn-overlay { -webkit-app-region: no-drag; }
+.conn-overlay { --wails-draggable: no-drag; }
 .brand {
   position: relative; padding: 56px 48px;
   display: flex; flex-direction: column;

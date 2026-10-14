@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -59,9 +62,45 @@ func newAppWithConfig(m *config.Manager) *App {
 	return &App{cfg: m}
 }
 
+// initLogging 把全局 log 输出重定向到文件：os.UserConfigDir()/LiteTalk/app.log
+// （与 config.json 同目录）。GUI 子系统无控制台，stdout/stderr 不可见，排障
+// 全依赖此文件；超过 5MB 启动时截断。文件排 MultiWriter 首位——无控制台时
+// stderr 写入会失败并短路 MultiWriter，放前面会吞掉文件写入。
+func initLogging() {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return
+	}
+	logDir := filepath.Join(dir, "LiteTalk")
+	_ = os.MkdirAll(logDir, 0o755)
+	f, err := os.OpenFile(filepath.Join(logDir, "app.log"),
+		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	if fi, err := f.Stat(); err == nil && fi.Size() > 5<<20 {
+		_ = f.Truncate(0)
+		_, _ = f.Seek(0, 0)
+	}
+	log.SetOutput(io.MultiWriter(f, os.Stderr))
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+}
+
+// LogFromWeb 前端 console/异常转发入口（前端 main.ts 拦截 console.*、
+// window.onerror、unhandledrejection 后调用），与后端日志同落 app.log。
+func (a *App) LogFromWeb(level, msg string) {
+	const maxLen = 2000
+	if len(msg) > maxLen {
+		msg = msg[:maxLen] + "…(截断)"
+	}
+	log.Printf("[web:%s] %s", level, msg)
+}
+
 // startup 启动回调：保存上下文、创建 API 客户端、启动系统托盘。
 // 服务器地址优先级：环境变量 LITETALK_API > config.json > 默认本机（运维/调试最高）。
 func (a *App) startup(ctx context.Context) {
+	initLogging()
+	log.Printf("=== LiteTalk %s 启动 (pid=%d) ===", version, os.Getpid())
 	a.ctx = ctx
 	r := a.cfg.Resolve()
 	base := r.BaseURL
@@ -374,7 +413,7 @@ func (a *App) GetMe() (*state.UserProfile, error) {
 	a.mu.Lock()
 	u := a.user
 	a.mu.Unlock()
-	if u.ID != "" {
+	if u.ID != 0 {
 		return &u, nil
 	}
 	return a.api.Me()
