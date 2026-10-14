@@ -2,9 +2,10 @@
 // LoginView 登录页（对齐 Auth.html：分段切换登录/注册、记住密码、忘记密码）。
 // 记住密码（问题 6）：启动自动填充（不自动登录）；成功登录且勾选→保存；
 // 取消勾选→清除已存凭据。密码经 DPAPI 加密落盘（Go 侧）。
+// 游客进入（simple 模式）：一键游客登录，Go 侧复用已记住的游客身份。
 import { onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { Eye, EyeOff, LockKeyhole, Mail, Check } from 'lucide-vue-next'
+import { Eye, EyeOff, LockKeyhole, Mail, Check, UserRound } from 'lucide-vue-next'
 import AuthLayout from './AuthLayout.vue'
 import Toast from '../../components/Toast.vue'
 import { goApp } from '../../api/bridge'
@@ -19,10 +20,12 @@ const form = reactive({ email: '', password: '', remember: true })
 const invalid = reactive({ email: false, password: false })
 const showPwd = ref(false)
 const loading = ref(false)
+const guestLoading = ref(false)
 
 const emailRe = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
 onMounted(async () => {
+  auth.loadConfig() // 拉服务端能力开关（simple 模式显示「游客进入」）
   // 自动填充记住的凭据（不自动登录，用户手动点登录）。
   try {
     const c = await goApp().GetSavedCredentials()
@@ -64,6 +67,20 @@ async function submit() {
     toast.value?.show(String(e), true)
   } finally {
     loading.value = false
+  }
+}
+
+// 游客一键进入：身份由 Go 侧维持（已记住则续期同一游客）。
+async function guestEnter() {
+  if (guestLoading.value) return
+  guestLoading.value = true
+  try {
+    await auth.guest()
+    router.push('/')
+  } catch (e) {
+    toast.value?.show(String(e), true)
+  } finally {
+    guestLoading.value = false
   }
 }
 </script>
@@ -115,6 +132,14 @@ async function submit() {
         <span class="btn-text">登录</span>
       </button>
     </form>
+
+    <!-- 游客一键进入：仅 simple 模式（服务端能力开关下发） -->
+    <button v-if="auth.simpleMode" type="button" class="btn-ghost"
+            :class="{ loading: guestLoading }" :disabled="guestLoading"
+            @click="guestEnter">
+      <UserRound :size="15" />
+      <span class="btn-text">游客进入</span>
+    </button>
 
     <Toast ref="toast" />
   </AuthLayout>

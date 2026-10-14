@@ -145,9 +145,9 @@ func splitSQL(s string) []string {
 
 func (m *MySQL) CreateUser(ctx context.Context, u *User) error {
 	res, err := m.db.ExecContext(ctx,
-		`INSERT INTO users (email, nickname, tag, password_hash, email_verified, status)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		u.Email, u.Nickname, u.Tag, u.PasswordHash, u.EmailVerified, u.Status)
+		`INSERT INTO users (email, nickname, tag, password_hash, email_verified, is_guest, status)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		u.Email, u.Nickname, u.Tag, u.PasswordHash, u.EmailVerified, u.IsGuest, u.Status)
 	if err != nil {
 		if isDup(err) {
 			return ErrConflict
@@ -166,7 +166,7 @@ func (m *MySQL) CreateUser(ctx context.Context, u *User) error {
 func (m *MySQL) scanUser(row interface{ Scan(...any) error }) (*User, error) {
 	var u User
 	err := row.Scan(&u.ID, &u.Email, &u.Nickname, &u.Tag, &u.PasswordHash,
-		&u.EmailVerified, &u.Status, &u.CreatedAt, &u.UpdatedAt)
+		&u.EmailVerified, &u.IsGuest, &u.Status, &u.CreatedAt, &u.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -176,7 +176,7 @@ func (m *MySQL) scanUser(row interface{ Scan(...any) error }) (*User, error) {
 	return &u, nil
 }
 
-const userCols = `id, email, nickname, tag, password_hash, email_verified, status, created_at, updated_at`
+const userCols = `id, email, nickname, tag, password_hash, email_verified, is_guest, status, created_at, updated_at`
 
 func (m *MySQL) UserByID(ctx context.Context, id int64) (*User, error) {
 	return m.scanUser(m.db.QueryRowContext(ctx, `SELECT `+userCols+` FROM users WHERE id = ?`, id))

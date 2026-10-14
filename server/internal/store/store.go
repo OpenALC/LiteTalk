@@ -24,6 +24,7 @@ type User struct {
 	Tag           string    `json:"tag" db:"tag"`
 	PasswordHash  string    `json:"-" db:"password_hash"`
 	EmailVerified bool      `json:"email_verified" db:"email_verified"`
+	IsGuest       bool      `json:"is_guest" db:"is_guest"`
 	Status        int8      `json:"status" db:"status"`
 	CreatedAt     time.Time `json:"created_at" db:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at" db:"updated_at"`

@@ -32,6 +32,13 @@ export const useAuthStore = defineStore('auth', () => {
     loggedIn.value = true
   }
 
+  // 游客一键进入（simple 模式）。Go 侧负责复用已记住的游客身份（refresh 轮换）。
+  async function guest() {
+    const r = await goApp().LoginAsGuest()
+    user.value = r.user
+    loggedIn.value = true
+  }
+
   async function sendEmailCode(email: string, purpose: 'register' | 'reset') {
     await goApp().SendEmailCode(email, purpose)
   }
@@ -53,6 +60,6 @@ export const useAuthStore = defineStore('auth', () => {
 
   return {
     user, loggedIn, serverCfg, simpleMode, mailConfigured,
-    loadConfig, login, register, sendEmailCode, resetPassword, logout, fetchMe,
+    loadConfig, login, register, guest, sendEmailCode, resetPassword, logout, fetchMe,
   }
 })

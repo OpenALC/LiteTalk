@@ -1,7 +1,10 @@
 package api
 
 import (
+	"crypto/rand"
 	"errors"
+	"fmt"
+	"math/big"
 	"net/http"
 	"net/mail"
 	"strconv"
@@ -149,6 +152,64 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.issueTokens(w, r, user, http.StatusCreated)
+}
+
+// handleGuest POST /api/v1/auth/guest（simple 模式专属，免注册一键进入）。
+// 生成临时身份：游客-XXXX + 占位邮箱 + 空密码哈希（无法密码登录），
+// 签发与普通注册同构的令牌对；客户端靠 refresh_token 维持身份。
+func (s *Server) handleGuest(w http.ResponseWriter, r *http.Request) {
+	if !s.simpleMode() {
+		writeErr(w, http.StatusForbidden, "guest_disabled", "游客登录仅在 simple 模式开放")
+		return
+	}
+	ok, err := s.limits.Allow(r.Context(), "guest:"+clientIP(r), 5, time.Minute)
+	if err != nil || !ok {
+		writeErr(w, http.StatusTooManyRequests, "rate_limited", "操作过于频繁，请稍后再试")
+		return
+	}
+
+	// 昵称/邮箱/标签全部随机，冲突重试（同 handleRegister 模式）
+	var user *store.User
+	for i := 0; i < 5; i++ {
+		user = &store.User{
+			Email:         fmt.Sprintf("guest-%s@guest.local", randHex(8)),
+			Nickname:      "游客-" + randDigits(4),
+			Tag:           randDigits(4),
+			PasswordHash:  "", // 空哈希：bcrypt 校验必失败，无法密码登录
+			EmailVerified: false,
+			IsGuest:       true,
+		}
+		err = s.store.CreateUser(r.Context(), user)
+		if errors.Is(err, store.ErrConflict) {
+			continue // 昵称+tag 或占位邮箱撞车，重摇
+		}
+		break
+	}
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	s.log.Printf("[audit] guest created user=%d ip=%s", user.ID, clientIP(r))
+	s.issueTokens(w, r, user, http.StatusCreated)
+}
+
+// randDigits 返回 n 位随机数字串（crypto/rand；前导零保留）。
+func randDigits(n int) string {
+	max := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(n)), nil)
+	v, err := rand.Int(rand.Reader, max)
+	if err != nil { // crypto/rand 不可用时退化为时间散列（仍保证非空）
+		return fmt.Sprintf("%0*d", n, time.Now().UnixNano()%max.Int64())
+	}
+	return fmt.Sprintf("%0*d", n, v.Int64())
+}
+
+// randHex 返回 n 字节随机量的 hex 串（占位邮箱唯一性）。
+func randHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%x", time.Now().UnixNano())
+	}
+	return fmt.Sprintf("%x", b)
 }
 
 // handleLogin POST /api/v1/auth/login（限流 5 次/min/IP）

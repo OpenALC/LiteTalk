@@ -25,6 +25,7 @@ type UserProfile struct {
 	Nickname string `json:"nickname"`
 	Tag      string `json:"tag"`
 	Email    string `json:"email"`
+	IsGuest  bool   `json:"is_guest"`
 }
 
 // AuthResult 登录/注册成功后的载荷。
@@ -161,12 +162,30 @@ func (c *APIClient) Register(nickname, email, password, code string) (*AuthResul
 	if err != nil {
 		return nil, err
 	}
-	if status != http.StatusOK {
+	// 服务端注册成功返回 201 Created（历史实现客户端只认 200，注册必失败——一并修复）。
+	if status != http.StatusOK && status != http.StatusCreated {
 		return nil, decodeError(status, data)
 	}
 	var r AuthResult
 	if err := json.Unmarshal(data, &r); err != nil {
 		return nil, fmt.Errorf("decode register: %w", err)
+	}
+	c.access = r.AccessToken
+	return &r, nil
+}
+
+// Guest 游客一键进入（仅 simple 模式）。成功返回 201。
+func (c *APIClient) Guest() (*AuthResult, error) {
+	status, data, err := c.post("/auth/guest", nil, false)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK && status != http.StatusCreated {
+		return nil, decodeError(status, data)
+	}
+	var r AuthResult
+	if err := json.Unmarshal(data, &r); err != nil {
+		return nil, fmt.Errorf("decode guest: %w", err)
 	}
 	c.access = r.AccessToken
 	return &r, nil

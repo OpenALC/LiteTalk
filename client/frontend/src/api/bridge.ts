@@ -22,6 +22,7 @@ type GoApp = {
   ClearSavedCredentials(): Promise<void>
   SendEmailCode(email: string, purpose: string): Promise<void>
   Login(email: string, password: string): Promise<AuthResult>
+  LoginAsGuest(): Promise<AuthResult>
   Register(nickname: string, email: string, password: string, code: string): Promise<AuthResult>
   ResetPassword(email: string, code: string, newPassword: string): Promise<void>
   Logout(): Promise<void>
@@ -94,6 +95,12 @@ const mockApp: GoApp = {
   },
   async ResetPassword() {},
   async Logout() {},
+  async LoginAsGuest() {
+    return {
+      access_token: 'dev-token', refresh_token: 'dev-refresh',
+      user: { id: 'guest-dev', nickname: '游客-0000', tag: '0000', email: '', is_guest: true },
+    }
+  },
   async GetMe() {
     return { id: 'dev', nickname: 'dev', tag: '0001', email: 'dev@example.com' }
   },

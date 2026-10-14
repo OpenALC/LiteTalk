@@ -69,6 +69,29 @@ func TestSavedCredentials(t *testing.T) {
 	}
 }
 
+// TestGuestRefresh 游客 refresh_token 存取与清除。
+// Windows 上经 DPAPI 往返还原；非 Windows 加密失败则读回空（视为无记住的游客）。
+func TestGuestRefresh(t *testing.T) {
+	m := tmpManager(t)
+	if got := m.GetGuestRefresh(); got != "" {
+		t.Fatal("初始不应有已存游客令牌")
+	}
+	if err := m.SetGuestRefresh("refresh-token-abc"); err != nil {
+		t.Fatalf("SetGuestRefresh: %v", err)
+	}
+	m2 := NewWithPath(m.Path())
+	got := m2.GetGuestRefresh()
+	if got != "" && got != "refresh-token-abc" {
+		t.Fatalf("令牌解密不一致: %q", got)
+	}
+	if err := m2.SetGuestRefresh(""); err != nil {
+		t.Fatalf("清除游客令牌: %v", err)
+	}
+	if got := NewWithPath(m.Path()).GetGuestRefresh(); got != "" {
+		t.Fatal("清除后仍返回游客令牌")
+	}
+}
+
 func TestCorruptFileFallsBack(t *testing.T) {
 	m := tmpManager(t)
 	if err := os.MkdirAll(filepath.Dir(m.Path()), 0o755); err != nil {

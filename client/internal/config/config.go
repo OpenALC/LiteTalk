@@ -42,6 +42,7 @@ type Config struct {
 	CloseToTray         *bool  `json:"close_to_tray,omitempty"`          // 关闭窗口时最小化到托盘（默认 true；false=退出程序）
 	SavedEmail          string `json:"saved_email,omitempty"`            // 记住的登录邮箱
 	EncPassword         string `json:"enc_password,omitempty"`           // 记住的密码（DPAPI 密文 base64；非 Windows 恒空）
+	EncGuestRefresh     string `json:"enc_guest_refresh,omitempty"`      // 记住的游客 refresh_token（DPAPI 密文 base64；非 Windows 恒空）
 }
 
 // Manager 读写配置文件（路径：os.UserConfigDir()/LiteTalk/config.json）。
@@ -261,6 +262,37 @@ func (m *Manager) ClearSavedCredentials() error {
 	return m.Update(func(c *Config) error {
 		c.SavedEmail = ""
 		c.EncPassword = ""
+		return nil
+	})
+}
+
+// ---------- 记住游客身份（refresh_token 轮换维持同一游客） ----------
+
+// GetGuestRefresh 读取记住的游客 refresh_token（DPAPI 解密）。
+// 解密失败/非 Windows 平台返回空（视为无记住的游客）。
+func (m *Manager) GetGuestRefresh() string {
+	enc := m.Get().EncGuestRefresh
+	if enc == "" {
+		return ""
+	}
+	if plain, err := unprotectString(enc); err == nil {
+		return plain
+	}
+	return ""
+}
+
+// SetGuestRefresh 保存游客 refresh_token（DPAPI 加密）。
+// 传空串清除。加密失败（非 Windows）不保存——游客没有密码兜底，
+// 存不了就下次新建，绝不明文落盘。
+func (m *Manager) SetGuestRefresh(token string) error {
+	enc := ""
+	if token != "" {
+		if s, err := protectString(token); err == nil {
+			enc = s
+		}
+	}
+	return m.Update(func(c *Config) error {
+		c.EncGuestRefresh = enc
 		return nil
 	})
 }

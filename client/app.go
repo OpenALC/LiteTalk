@@ -316,6 +316,41 @@ func (a *App) Register(nickname, email, password, code string) (*state.AuthResul
 	return r, nil
 }
 
+// LoginAsGuest 游客一键进入（simple 模式）。优先复用记住的游客身份：
+// 已存 refresh_token 先走 /auth/refresh 续期（rotation 写回持久化），
+// 失败/过期再新建游客。游客身份跨启动保持同一账号，避免账号堆积。
+func (a *App) LoginAsGuest() (*state.AuthResult, error) {
+	if saved := a.cfg.GetGuestRefresh(); saved != "" {
+		if t, err := a.api.Refresh(saved); err == nil {
+			if u, merr := a.api.Me(); merr == nil {
+				_ = a.cfg.SetGuestRefresh(t.RefreshToken) // 轮换写回（guest 无密码兜底，丢了就变新号）
+				a.mu.Lock()
+				a.refreshTok = t.RefreshToken
+				a.user = *u
+				a.mu.Unlock()
+				_ = a.connectSession(t.AccessToken, u.Nickname)
+				return &state.AuthResult{
+					AccessToken: t.AccessToken, RefreshToken: t.RefreshToken, User: *u,
+				}, nil
+			}
+		}
+		// 已存令牌失效（过期/被吊销/服务端迁移）：清掉走新建。
+		_ = a.cfg.SetGuestRefresh("")
+	}
+
+	r, err := a.api.Guest()
+	if err != nil {
+		return nil, err
+	}
+	_ = a.cfg.SetGuestRefresh(r.RefreshToken)
+	a.mu.Lock()
+	a.refreshTok = r.RefreshToken
+	a.user = r.User
+	a.mu.Unlock()
+	_ = a.connectSession(r.AccessToken, r.User.Nickname)
+	return r, nil
+}
+
 // ResetPassword 邮箱验证码重置密码。
 func (a *App) ResetPassword(email, code, newPassword string) error {
 	return a.api.ResetPassword(email, code, newPassword)

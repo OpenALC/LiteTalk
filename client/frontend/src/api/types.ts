@@ -4,6 +4,7 @@ export interface UserProfile {
   nickname: string
   tag: string
   email: string
+  is_guest?: boolean
 }
 
 export interface AuthResult {
