@@ -92,4 +92,11 @@ curl -X POST https://你的域名/api/v1/rtc/credentials \
   -H "Authorization: Bearer <access_token>"   # 返回 iceServers JSON
 ```
 
+全链路端到端拨测（simple 模式；在任意可达机器上执行，自动注册两个探测
+账号并双向打流，覆盖 REST/WS/ICE/UDP/SFU 转发）：
+
+```bash
+go run ./cmd/e2eprobe -addr <公网IP或域名>:8077   # 结论 PASS = 全链路通
+```
+
 上线自查：`LITETALK_DEV_AUTH` 未开启；`LITETALK_TURN_SECRET`/`LITETALK_JWT_SECRET`/数据库密码均为强随机值；`LITETALK_SFU_IP` 为公网 IP。

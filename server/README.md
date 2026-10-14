@@ -112,6 +112,32 @@ curl -X POST "http://127.0.0.1:8077/api/v1/rtc/credentials?token=dev-alice"
 
 鉴权：`Authorization: Bearer <token>` 或 `?token=`。需先配置 `LITETALK_TURN_SECRET`（与 coturn 的 `static-auth-secret` 一致）。
 
+## 端到端拨测（部署验证）
+
+`cmd/e2eprobe` 以真实客户端身份走完整链路：REST 注册/登录 → 取 TURN/STUN 凭证
+→ WS 信令入房 → Pion PeerConnection 完整 ICE → 50pps 哑 RTP 双向收发计数。
+用于部署后或防火墙/网络变更后验证全链路；与 `cmd/loadtest` 的区别是走真实
+JWT 鉴权（loadtest 走 dev-token，仅限 `LITETALK_DEV_AUTH=1` 的测试实例），
+可对公网生产实例直接拨测。
+
+```bash
+# 对公网实例拨测（simple 模式服务端，自动注册两个探测账号）
+go run ./cmd/e2eprobe -addr 203.0.113.10:8077
+
+# 对本机服务端拨测（SFU 宣告 127.0.0.1，需放开环回候选）
+LITETALK_AUTH_MODE=simple go run ./cmd/server
+go run ./cmd/e2eprobe -addr 127.0.0.1:8077 -loopback
+```
+
+- 输出 `结论: PASS` = REST/WS/UDP 全链路正常；`iceServers=N 条` 顺带验证
+  rtc/credentials 签发在工作
+- `上行包/下行包` 接近相等且 `媒体错误=0` = SFU 双向转发正常
+  （末尾少量缺失为停包排空，属正常）
+- 需要 simple 模式（依赖免验证码注册）；full 模式服务端请用 wscat 或真实客户端验证
+
+常用参数：`-users N`（同房人数，默认 2）、`-duration 8s`（发包时长）、
+`-loopback`（测本机服务端时必开，对应 pion 环回候选）。
+
 ## 自验
 
 ```bash
