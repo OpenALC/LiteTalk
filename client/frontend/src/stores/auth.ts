@@ -51,6 +51,12 @@ export const useAuthStore = defineStore('auth', () => {
     await goApp().Logout()
     user.value = null
     loggedIn.value = false
+    // 清理各业务 store 的本地缓存（B2：chat.clear 此前是死代码，
+    // 登出后换账号登录会继承上一账号的聊天记录）。
+    const { useChatStore } = await import('./chat')
+    const { useVoiceStore } = await import('./voice')
+    useChatStore().clear()
+    useVoiceStore().$reset()
   }
 
   async function fetchMe() {

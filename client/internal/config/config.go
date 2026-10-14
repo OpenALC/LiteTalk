@@ -44,6 +44,8 @@ type Config struct {
 	EncPassword         string `json:"enc_password,omitempty"`           // 记住的密码（DPAPI 密文 base64；非 Windows 恒空）
 	EncGuestRefresh     string `json:"enc_guest_refresh,omitempty"`      // 记住的游客 refresh_token（DPAPI 密文 base64；非 Windows 恒空）
 	Audio               *AudioSettings `json:"audio,omitempty"`          // 语音设置（码率/VBR/DTX/FEC/丢包率/降噪/增益/VAD 灵敏度）
+	AudioCapture        string `json:"audio_capture,omitempty"`        // 采集设备 ID（空=默认）
+	AudioPlayback       string `json:"audio_playback,omitempty"`       // 播放设备 ID（空=默认）
 }
 
 // AudioSettings 语音设置。指针/零值字段在读取时回落 DefaultAudioSettings。

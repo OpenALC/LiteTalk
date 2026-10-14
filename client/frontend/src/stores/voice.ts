@@ -27,8 +27,9 @@ export const useVoiceStore = defineStore('voice', () => {
   }
 
   async function join(id: string) {
-    channelId.value = id
+    // 先不写 channelId——JoinChannel 失败时不置位，守卫不会拦死重试（B1）
     await goApp().JoinChannel(id)
+    channelId.value = id
     members.value = await goApp().GetVoiceMembers()
   }
 
