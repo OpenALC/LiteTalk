@@ -502,6 +502,48 @@ func (c *APIClient) DeleteChannel(id int64) error {
 	return nil
 }
 
+// CategoryDTO 频道分类（与服务端 store.Category 对齐）。
+type CategoryDTO struct {
+	ID       int64  `json:"id"`
+	ServerID int64  `json:"server_id"`
+	Name     string `json:"name"`
+	Position int    `json:"position"`
+}
+
+// CreateCategory 创建频道分类（owner/admin；1–32 字）。
+func (c *APIClient) CreateCategory(serverID int64, name string) (*CategoryDTO, error) {
+	status, data, err := c.post(fmt.Sprintf("/servers/%d/categories", serverID),
+		map[string]string{"name": name}, true)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK && status != http.StatusCreated {
+		return nil, decodeError(status, data)
+	}
+	var cat CategoryDTO
+	if err := json.Unmarshal(data, &cat); err != nil {
+		return nil, fmt.Errorf("decode category: %w", err)
+	}
+	return &cat, nil
+}
+
+// DeleteCategory 删除分类；withChannels=true 时级联删除其下全部频道
+// （服务端单事务；分类非空且未带参会 409 category_not_empty，由 UI 二次确认后传 true）。
+func (c *APIClient) DeleteCategory(id int64, withChannels bool) error {
+	path := fmt.Sprintf("/categories/%d", id)
+	if withChannels {
+		path += "?with_channels=1"
+	}
+	status, data, err := c.del(path)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return decodeError(status, data)
+	}
+	return nil
+}
+
 // SendFriendRequest 发送好友请求（target 形如 "昵称#1234"，服务端负责拆分）。
 func (c *APIClient) SendFriendRequest(target string) error {
 	status, data, err := c.post("/friends/requests", map[string]string{"nickname": target}, true)

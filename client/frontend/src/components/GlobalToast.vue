@@ -10,10 +10,14 @@ const notify = useNotifyStore()
 
 <template>
   <Transition name="toast">
-    <div v-if="notify.visible" class="toast" :class="{ err: notify.isError }">
+    <div v-if="notify.visible" class="toast" :class="{ err: notify.isError, actionable: !!notify.actionLabel }">
       <CircleAlert v-if="notify.isError" :size="16" />
       <CircleCheck v-else :size="16" />
       <span>{{ notify.text }}</span>
+      <!-- 操作按钮（如「请求静音 → 接受」）：仅在 showAction 时渲染，恢复可点击 -->
+      <button v-if="notify.actionLabel" class="toast-act" @click="notify.runAction()">
+        {{ notify.actionLabel }}
+      </button>
     </div>
   </Transition>
 </template>
@@ -28,6 +32,16 @@ const notify = useNotifyStore()
   box-shadow: var(--shadow-2);
   pointer-events: none; /* 全局常驻：绝不拦截点击 */
 }
+/* actionable：带操作按钮时恢复可点击（按钮自身也设 pointer-events 双保险） */
+.toast.actionable { pointer-events: auto; }
+.toast-act {
+  padding: 4px 12px; border-radius: 7px; margin-left: 4px;
+  background: var(--brand-500); color: #fff;
+  font-size: 12.5px; font-weight: 600;
+  pointer-events: auto;
+  transition: background 0.15s;
+}
+.toast-act:hover { background: var(--brand-600); }
 .toast svg { color: var(--green); }
 .toast.err svg { color: var(--red); }
 .toast-enter-active, .toast-leave-active {

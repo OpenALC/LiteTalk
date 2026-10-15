@@ -39,6 +39,9 @@ export function isRealID(id: string): boolean {
   return /^\d+$/.test(id)
 }
 
+// INTRO_ID 介绍页伪服务器 ID：不是服务端实体，无频道栏（v0.1.2 首页体系）。
+export const INTRO_ID = '__intro__'
+
 // iconFromServer 服务端 icon_name（kebab-case 预设名）→ 前端 Lucide 注册键。
 // 与 server/internal/api/servers.go 的 allowedIcons 保持一致。
 function iconFromServer(name: string): string {
@@ -83,8 +86,34 @@ export const useServersStore = defineStore('servers', () => {
     { id: 'design', name: '设计工坊', icon: 'Palette', builtin: true, channels: [] },
     { id: 'book', name: '读书会', icon: 'BookOpen', builtin: true, channels: [] },
   ])
-  const currentServerId = ref('hq')
-  const currentChannelId = ref('ch-hall')
+  const currentServerId = ref('')
+  const currentChannelId = ref('')
+
+  // ---- 首页 / 介绍页（客户端级偏好，持久化 config.json；v0.1.2） ----
+  // homeId：进入应用默认选中的服务器（'' / INTRO_ID 表示介绍页为首页）。
+  // introHidden：介绍页被用户从服务器栏删除（可恢复）。
+  const homeId = ref(INTRO_ID)
+  const introHidden = ref(false)
+
+  async function initHome() {
+    try {
+      const h = await goApp().GetHomeServer()
+      homeId.value = h || INTRO_ID
+      introHidden.value = await goApp().GetIntroHidden()
+    } catch {
+      // 读取失败保持默认：介绍页为首页、未隐藏。
+    }
+  }
+
+  async function setHome(id: string) {
+    await goApp().SetHomeServer(id === INTRO_ID ? '' : id)
+    homeId.value = id
+  }
+
+  async function setIntroHidden(v: boolean) {
+    await goApp().SetIntroHidden(v)
+    introHidden.value = v
+  }
 
   const currentServer = computed(() =>
     servers.value.find((s) => s.id === currentServerId.value) ?? servers.value[0])
@@ -93,6 +122,10 @@ export const useServersStore = defineStore('servers', () => {
 
   function selectServer(id: string) {
     currentServerId.value = id
+    if (id === INTRO_ID) {
+      currentChannelId.value = '' // 介绍页无频道
+      return
+    }
     const first = servers.value.find((s) => s.id === id)?.channels[0]
     currentChannelId.value = first?.id ?? ''
   }
@@ -193,11 +226,65 @@ export const useServersStore = defineStore('servers', () => {
     }
   }
 
+  // ---- 频道分类（v0.1.2：服务端 categories 实体 + 内置示例本地语义） ----
+  // extraGroups：服务器 ID → 分类列表（含空分类；内置服务器 id 为 'local-<name>'）。
+  const extraGroups = ref<Record<string, { id: string; name: string }[]>>({})
+
+  // groupsOf 某服务器的全部分类（频道 group 并集 + 空分类），保持首次出现序。
+  function groupsOf(serverId: string, channels: Channel[]): { id: string; name: string }[] {
+    const out: { id: string; name: string }[] = []
+    const seen = new Set<string>()
+    const put = (id: string, name: string) => {
+      if (seen.has(name)) return
+      seen.add(name)
+      out.push({ id, name })
+    }
+    for (const c of channels) put(`chan:${c.group}`, c.group)
+    for (const g of extraGroups.value[serverId] ?? []) put(g.id, g.name)
+    return out
+  }
+
+  // createCategory 新建分类：真实服务器走 REST；内置示例仅本地（重启还原，注释已注明）。
+  async function createCategory(serverId: string, name: string) {
+    const s = findServer(serverId)
+    if (!s) return
+    if (s.builtin) {
+      const list = extraGroups.value[serverId] ?? []
+      extraGroups.value = { ...extraGroups.value, [serverId]: [...list, { id: `local-${name}`, name }] }
+      return
+    }
+    const c = await goApp().CreateCategory(Number(serverId), name)
+    const list = extraGroups.value[serverId] ?? []
+    extraGroups.value = { ...extraGroups.value, [serverId]: [...list, { id: String(c.id), name: c.name }] }
+  }
+
+  // deleteCategory 删除分类及其下频道（二次确认由 UI 负责）：
+  // 真实服务器走 REST 级联删除；内置示例逐频道本地删 + 移除空分类。
+  async function deleteCategory(serverId: string, catId: string, catName: string) {
+    const s = findServer(serverId)
+    if (!s) return
+    if (!s.builtin && isRealID(catId)) {
+      await goApp().DeleteCategory(Number(catId), true) // with_channels=1 级联
+      s.channels = s.channels.filter((c) => c.group !== catName)
+    } else {
+      for (const ch of [...s.channels.filter((c) => c.group === catName)]) {
+        await deleteChannel(serverId, ch.id)
+      }
+    }
+    const list = (extraGroups.value[serverId] ?? []).filter((g) => g.name !== catName)
+    extraGroups.value = { ...extraGroups.value, [serverId]: list }
+    if (currentChannelId.value && !s.channels.some((c) => c.id === currentChannelId.value)) {
+      currentChannelId.value = s.channels[0]?.id ?? ''
+    }
+  }
+
   return {
     servers, currentServerId, currentChannelId, currentServer, currentChannel,
+    homeId, introHidden, initHome, setHome, setIntroHidden,
     selectServer, selectChannel, findServer,
     loadRemoteServers, createServer, joinServer, renameServer, removeServer,
     createChannel, renameChannel, deleteChannel,
+    extraGroups, groupsOf, createCategory, deleteCategory,
   }
 })
 
@@ -230,10 +317,6 @@ export const useSettingsStore = defineStore('settings', () => {
   const captureDevice = ref('')
   const playbackDevice = ref('')
 
-  // panelOpen 设置浮层开关（ChannelList 底部齿轮 / MainView 快捷键共用入口）。
-  const panelOpen = ref(false)
-  function openPanel() { panelOpen.value = true }
-  function closePanel() { panelOpen.value = false }
-
-  return { hibernateOnMinimize, captureDevice, playbackDevice, panelOpen, openPanel, closePanel }
+  // v0.1.2：设置改为独立路由页 /settings，原 panelOpen 浮层开关已移除。
+  return { hibernateOnMinimize, captureDevice, playbackDevice }
 })

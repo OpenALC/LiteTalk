@@ -1,44 +1,66 @@
 <script setup lang="ts">
-// SettingsView 设置页（§9.3：连接/账号/常规/音频设备/语音/快捷键/关于）。
-// 「最小化时休眠界面」→ GetHibernateOnMinimize / SetHibernateOnMinimize（app.go 已有）。
-// 「连接」→ ServerConnPanel 共享组件（与登录页弹层同源）。
+// SettingsView 设置页（独立路由 /settings，v0.1.2 起不再复用语音/文字舞台区域）。
+// 分区：连接/账号/常规/音频设备/语音/快捷键/关于；改动即热应用 + 落盘 config.json。
+// 语音默认值全部由 Go 侧 GetAudioSettings 回落（零值 → 默认），UI 只消费完整值。
 import { onMounted, ref } from 'vue'
-import { X, LogOut } from 'lucide-vue-next'
+import { ArrowLeft, LogOut } from 'lucide-vue-next'
+import { useRouter } from 'vue-router'
 import { goApp, type AudioDeviceDTO } from '../api/bridge'
-import type { AudioSettings } from '../api/types'
 import { useAuthStore } from '../stores/auth'
 import { useSettingsStore } from '../stores/data'
 import { useHibernateStore } from '../stores/hibernate'
 import { HOTKEYS } from '../composables/useHotkeys'
-import ServerConnPanel from './ServerConnPanel.vue'
-import Toast from './Toast.vue'
+import ServerConnPanel from '../components/ServerConnPanel.vue'
+import Toast from '../components/Toast.vue'
 
+const router = useRouter()
 const auth = useAuthStore()
 const settings = useSettingsStore()
 const hibernateStore = useHibernateStore()
 const version = ref('dev')
 const hibernate = ref(false)
+const uiDestroy = ref(false)
 const closeToTray = ref(true)
 const caps = ref<AudioDeviceDTO[]>([])
 const plays = ref<AudioDeviceDTO[]>([])
 const toast = ref<InstanceType<typeof Toast>>()
 
-// 语音设置（码率/VBR/DTX/FEC/丢包率/降噪/增益/VAD 灵敏度），
-// 打开设置页时从 Go 侧读持久化值，改动即热应用 + 落盘 config.json。
-const audio = ref<AudioSettings>({
+// 语音设置：Go 侧返回已回落默认的完整值（码率/VBR/DTX/FEC/丢包/降噪强度/AGC/
+// 麦克风/扬声器音量/VAD 五档/Opus 复杂度）。
+const audio = ref({
   bitrate_kbps: 32, vbr: true, dtx: true, fec: true,
-  packet_loss: 10, denoise: true, gain: 10, vad_sens: 1,
+  packet_loss: 10, denoise: true, denoise_strength: 2, agc: false,
+  mic_volume: 100, playback_volume: 100, vad_sens: 2, opus_complexity: 9,
 })
 const BITRATES = [16, 24, 32, 48, 64]
-const VAD_LABELS = ['低', '中', '高']
+// VAD 五档（v0.1.2 扩展；旧三档由 Go 侧映射 0/2/4）。
+const VAD_LABELS = ['很低', '低', '中', '高', '很高']
+// 降噪强度四档：关（denoise=false）/弱/中/强（denoise_strength=1/2/3，
+// Go 侧映射 rnnoise Aggressiveness 1.0/1.5/2.0）。
+const DENOISE_LABELS = ['关', '弱', '中', '强']
 
-const emit = defineEmits<{ (e: 'close'): void }>()
+// denoiseIdx 降噪强度当前档位（computed 双向：关↔denoise=false，其余↔strength）。
+const denoiseIdx = ref(2)
+function syncDenoiseIdx() {
+  denoiseIdx.value = audio.value.denoise ? audio.value.denoise_strength : 0
+}
+function applyDenoiseIdx(i: number) {
+  if (i === 0) {
+    audio.value.denoise = false
+  } else {
+    audio.value.denoise = true
+    audio.value.denoise_strength = i
+  }
+  void applyAudio()
+}
 
 onMounted(async () => {
   version.value = await goApp().GetVersion()
   hibernate.value = await goApp().GetHibernateOnMinimize()
+  try { uiDestroy.value = await goApp().GetUIDestroyOnHibernate() } catch { /* 方法未就绪保持默认 */ }
   closeToTray.value = await goApp().GetCloseToTray()
   audio.value = await goApp().GetAudioSettings()
+  syncDenoiseIdx()
   const devs = await goApp().ListAudioDevices()
   caps.value = devs.capture
   plays.value = devs.playback
@@ -54,6 +76,13 @@ async function toggleHibernate(v: boolean) {
   hibernate.value = v
   hibernateStore.setEnabled(v)
   await goApp().SetHibernateOnMinimize(v)
+}
+
+// toggleUIDestroy 休眠时卸载界面：最小化隐藏后整页重载释放 JS 堆，
+// 唤醒时凭 Go 侧状态重建（实验性；依赖 sys:hibernate/sys:wake 链路）。
+async function toggleUIDestroy(v: boolean) {
+  uiDestroy.value = v
+  await goApp().SetUIDestroyOnHibernate(v)
 }
 
 // 设备下拉即时应用：切换即热重启设备流（编解码/混音状态保留）。
@@ -72,10 +101,13 @@ async function applyAudio() {
 </script>
 
 <template>
-  <div class="settings">
+  <div class="settings-page">
     <div class="s-head">
+      <button class="icon-btn" title="返回" @click="router.push('/')">
+        <ArrowLeft :size="18" />
+      </button>
       <b>设置</b>
-      <button class="icon-btn" title="关闭" @click="emit('close')"><X :size="18" /></button>
+      <span class="s-ver">{{ version }}</span>
     </div>
 
     <div class="s-body">
@@ -98,6 +130,13 @@ async function applyAudio() {
           <div class="k">最小化时休眠界面（省内存）</div>
           <label class="switch">
             <input type="checkbox" :checked="hibernate" @change="toggleHibernate(($event.target as HTMLInputElement).checked)">
+            <i />
+          </label>
+        </div>
+        <div class="s-row">
+          <div class="k">休眠时卸载界面（彻底释放内存，实验性）</div>
+          <label class="switch">
+            <input type="checkbox" :checked="uiDestroy" @change="toggleUIDestroy(($event.target as HTMLInputElement).checked)">
             <i />
           </label>
         </div>
@@ -135,16 +174,28 @@ async function applyAudio() {
       <section class="s-sec">
         <h3>语音</h3>
         <div class="s-row">
-          <div class="k">麦克风降噪</div>
-          <label class="switch">
-            <input v-model="audio.denoise" type="checkbox" @change="applyAudio"><i />
-          </label>
+          <div class="k">麦克风降噪强度（RNNoise）</div>
+          <div class="seg-mini">
+            <button v-for="(label, i) in DENOISE_LABELS" :key="i"
+                    :class="{ on: denoiseIdx === i }"
+                    @click="applyDenoiseIdx(i)">{{ label }}</button>
+          </div>
         </div>
         <div class="s-row">
-          <div class="k">输入增益</div>
-          <!-- min=0.1：0 与「未设置」在存储层同为 0 无法区分（omitempty），全静音用麦克风静音 -->
-          <input v-model.number="audio.gain" type="range" min="1" max="20" step="1" @change="applyAudio">
-          <span class="v">{{ (audio.gain / 10).toFixed(1) }}</span>
+          <div class="k">麦克风音量</div>
+          <input v-model.number="audio.mic_volume" type="range" min="0" max="120" step="5" @change="applyAudio">
+          <span class="v">{{ audio.mic_volume }}</span>
+        </div>
+        <div class="s-row">
+          <div class="k">扬声器音量</div>
+          <input v-model.number="audio.playback_volume" type="range" min="0" max="120" step="5" @change="applyAudio">
+          <span class="v">{{ audio.playback_volume }}</span>
+        </div>
+        <div class="s-row">
+          <div class="k">自动增益 AGC（实验性）</div>
+          <label class="switch">
+            <input v-model="audio.agc" type="checkbox" @change="applyAudio"><i />
+          </label>
         </div>
         <div class="s-row">
           <div class="k">语音检测灵敏度</div>
@@ -155,6 +206,11 @@ async function applyAudio() {
               @click="audio.vad_sens = i; applyAudio()"
             >{{ label }}</button>
           </div>
+        </div>
+        <div class="s-row">
+          <div class="k">Opus 复杂度（0 最省 CPU，10 最佳质量）</div>
+          <input v-model.number="audio.opus_complexity" type="range" min="0" max="10" step="1" @change="applyAudio">
+          <span class="v">{{ audio.opus_complexity }}</span>
         </div>
         <div class="s-row">
           <div class="k">码率</div>
@@ -209,17 +265,19 @@ async function applyAudio() {
 </template>
 
 <style scoped>
-.settings {
-  position: absolute; inset: 0; z-index: 25;
-  background: var(--surface);
+/* 独立页：占满 TitleBar 之下的全部区域（不再是 stage 浮层） */
+.settings-page {
+  flex: 1; min-height: 0;
   display: flex; flex-direction: column;
+  background: var(--surface);
 }
 .s-head {
   height: 56px; flex: none;
-  display: flex; align-items: center; justify-content: space-between;
+  display: flex; align-items: center; gap: 12px;
   padding: 0 22px; border-bottom: 1px solid var(--line);
 }
 .s-head b { font-size: 15px; }
+.s-ver { margin-left: auto; font-size: 12px; color: var(--ink-300); }
 .icon-btn {
   width: 32px; height: 32px;
   display: flex; align-items: center; justify-content: center;
@@ -262,11 +320,11 @@ input[type="range"] { flex: 0 0 140px; accent-color: var(--brand-500); }
 .switch input:checked + i { background: var(--brand-500); }
 .switch input:checked + i::after { transform: translateX(16px); }
 
-/* 关闭窗口时：迷你二选一（问题 4b） */
 .seg-mini {
   display: flex; gap: 2px; padding: 3px;
   background: var(--brand-50); border-radius: 9px;
 }
+.s-body .seg-mini { background: rgba(79, 164, 243, 0.08); }
 .seg-mini button {
   height: 28px; padding: 0 12px; border-radius: 7px;
   font-size: 12.5px; font-weight: 600; color: var(--ink-400);
@@ -274,7 +332,6 @@ input[type="range"] { flex: 0 0 140px; accent-color: var(--brand-500); }
 }
 .seg-mini button.on { background: var(--surface); color: var(--brand-700); box-shadow: var(--shadow-1); }
 
-/* 退出程序（不依赖托盘的显式出口，问题 4b） */
 .quit-btn {
   display: inline-flex; align-items: center; gap: 6px;
   height: 32px; padding: 0 14px; border-radius: 8px;

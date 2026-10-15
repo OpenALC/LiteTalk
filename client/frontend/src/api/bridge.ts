@@ -1,12 +1,14 @@
 // bridge 封装 Wails Go 绑定（window.go.main.App.*）。
 // 浏览器独立开发（vite dev 无 Go 后端）时走 mock 桩，行为可联调 UI。
-import type { AudioSettings, AuthResult, ChannelDTO, ConnConfigView, ConnTestResult, PeerView, ServerConfig, ServerDTO, UserProfile } from './types'
+import type { AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ConnConfigView, ConnTestResult, FriendDTO, PeerView, ServerConfig, ServerDTO, UserProfile, VoiceStateView } from './types'
 
 type GoApp = {
   GetVersion(): Promise<string>
   GetAuthConfig(): Promise<ServerConfig>
   GetHibernateOnMinimize(): Promise<boolean>
   SetHibernateOnMinimize(enabled: boolean): Promise<void>
+  GetUIDestroyOnHibernate(): Promise<boolean>
+  SetUIDestroyOnHibernate(v: boolean): Promise<void>
   GetServerConfig(): Promise<ConnConfigView>
   SetServerConfig(baseURL: string): Promise<void>
   TestServerConnection(baseURL: string): Promise<ConnTestResult>
@@ -36,6 +38,10 @@ type GoApp = {
   SetMute(muted: boolean): Promise<void>
   SetDeafen(deafened: boolean): Promise<void>
   SetPeerVolume(userID: string, gain: number): Promise<void>
+  // GetVoiceState UI 销毁重载后的语音态恢复（Go 会话未断，前端重建后回填）。
+  GetVoiceState(): Promise<VoiceStateView>
+  // RequestVoiceState 「请求静音」：请目标闭麦/静音（对方接受后生效，无强制）。
+  RequestVoiceState(channelID: string, targetID: string, mute: boolean, deafen: boolean): Promise<void>
   SendChat(channelID: string, content: string): Promise<void>
   GetVoiceMembers(): Promise<PeerView[]>
   LogFromWeb(level: string, msg: string): Promise<void>
@@ -49,7 +55,19 @@ type GoApp = {
   CreateChannel(serverID: number, name: string, typ: string): Promise<ChannelDTO>
   RenameChannel(id: number, name: string): Promise<void>
   DeleteChannel(id: number): Promise<void>
+  CreateCategory(serverID: number, name: string): Promise<CategoryDTO>
+  DeleteCategory(id: number, withChannels: boolean): Promise<void>
   SendFriendRequest(target: string): Promise<void>
+  // 好友真实 REST（v0.1.2 批次③消费）
+  ListFriends(): Promise<FriendDTO[]>
+  AcceptFriend(id: number): Promise<void>
+  RemoveFriend(id: number): Promise<void>
+  UpdateFriend(id: number, remark: string, group: string): Promise<void>
+  // 介绍页/首页（v0.1.2：客户端级偏好，存 config.json）
+  GetHomeServer(): Promise<string>
+  SetHomeServer(id: string): Promise<void>
+  GetIntroHidden(): Promise<boolean>
+  SetIntroHidden(v: boolean): Promise<void>
 }
 
 export interface AudioDeviceDTO {
@@ -80,6 +98,8 @@ const mockApp: GoApp = {
   async GetAuthConfig() { return { auth_mode: 'full', mail_configured: false } },
   async GetHibernateOnMinimize() { return false },
   async SetHibernateOnMinimize() {},
+  async GetUIDestroyOnHibernate() { return false },
+  async SetUIDestroyOnHibernate() {},
   async QuitApp() {},
   async TrayReady() { return true },
   async GetCloseToTray() { return true },
@@ -121,7 +141,11 @@ const mockApp: GoApp = {
   async LogFromWeb() {},
   async SetAudioDevices() {},
   async GetAudioSettings() {
-    return { bitrate_kbps: 32, vbr: true, dtx: true, fec: true, packet_loss: 10, denoise: true, gain: 10, vad_sens: 1 }
+    return {
+      bitrate_kbps: 32, vbr: true, dtx: true, fec: true, packet_loss: 10,
+      denoise: true, denoise_strength: 2, agc: false, gain: 10,
+      mic_volume: 100, playback_volume: 100, vad_sens: 2, opus_complexity: 9,
+    }
   },
   async SetAudioSettings() {},
   async ListAudioDevices() {
@@ -137,6 +161,8 @@ const mockApp: GoApp = {
   async SetPeerVolume() {},
   async SendChat() {},
   async GetVoiceMembers() { return [] },
+  async GetVoiceState() { return { channel_id: '', muted: false, deafened: false } },
+  async RequestVoiceState() {},
   // 以下为批次①新增的服务器/频道/好友桩：返回可联调 UI 的假数据。
   async ListServers() { return [] },
   async CreateServer(name: string) {
@@ -153,7 +179,21 @@ const mockApp: GoApp = {
   },
   async RenameChannel() {},
   async DeleteChannel() {},
+  async CreateCategory(serverID: number, name: string) {
+    return { id: Date.now(), server_id: serverID, name, position: 0 }
+  },
+  async DeleteCategory() {},
   async SendFriendRequest() {},
+  // 好友真实 REST 桩：空列表（浏览器开发环境无可联调数据）。
+  async ListFriends() { return [] },
+  async AcceptFriend() {},
+  async RemoveFriend() {},
+  async UpdateFriend() {},
+  // 介绍页/首页桩：默认介绍页为首页、未隐藏。
+  async GetHomeServer() { return '' },
+  async SetHomeServer() {},
+  async GetIntroHidden() { return false },
+  async SetIntroHidden() {},
 }
 
 export function goApp(): GoApp {

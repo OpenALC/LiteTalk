@@ -2,8 +2,9 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { eventsOff, eventsOn, goApp } from '../api/bridge'
 import type { PeerView } from '../api/types'
+import { useNotifyStore } from './notify'
 
-// voice 语音房状态：房间成员、说话/静音/耳聋、统计。
+// voice 语音房状态：房间成员、说话/闭麦/静音、统计。
 export const useVoiceStore = defineStore('voice', () => {
   const channelId = ref('') // 当前所在语音频道
   const members = ref<PeerView[]>([]) // 含自己
@@ -12,8 +13,12 @@ export const useVoiceStore = defineStore('voice', () => {
   const latencyMs = ref(0)
   const connected = ref(false)
 
-  // 双关态（静音+耳聋同时开启）——用户要求的独立样式依据
+  // 双关态（闭麦+静音同时开启）——用户要求的独立样式依据
   const dualOff = computed(() => muted.value && deafened.value)
+
+  // peerVolumes 本机各成员播放音量缓存（0.0–2.0）：无读取端点，
+  // 打开「更多」弹层时以本缓存为初值，不再每次重置 100（走查建议）。
+  const peerVolumes = ref<Record<string, number>>({})
 
   function selfId(): string {
     // 由 channel.joined 的 self 事件回填；此处从 members 里没有 self 字段，
@@ -62,10 +67,33 @@ export const useVoiceStore = defineStore('voice', () => {
 
   async function setPeerVolume(userId: string, gain: number) {
     await goApp().SetPeerVolume(userId, gain)
+    peerVolumes.value = { ...peerVolumes.value, [userId]: gain }
+  }
+
+  // requestVoiceState 「请求静音」：请目标闭麦/静音（定向信令，对方接受后生效，无强制）。
+  async function requestVoiceState(targetId: string, mute: boolean, deafen: boolean) {
+    if (!channelId.value) return
+    await goApp().RequestVoiceState(channelId.value, targetId, mute, deafen)
+  }
+
+  // restoreFromGo UI 销毁重载后回填语音态（Go 侧会话未断；未连接时为空态）。
+  async function restoreFromGo() {
+    try {
+      const st = await goApp().GetVoiceState()
+      if (!st.channel_id) return
+      channelId.value = st.channel_id
+      muted.value = st.muted
+      deafened.value = st.deafened
+      members.value = await goApp().GetVoiceMembers()
+      applySelf()
+    } catch {
+      // 未连接或方法未就绪：保持空态。
+    }
   }
 
   // 事件订阅（app 层 EventsEmit）。
   function bindEvents() {
+    const notify = useNotifyStore()
     eventsOn('voice:self', (id) => {
       _selfId = id as string
     })
@@ -93,17 +121,28 @@ export const useVoiceStore = defineStore('voice', () => {
         latencyMs.value = st.latency_ms ?? 0
       } catch { /* 忽略坏包 */ }
     })
+    // voice.state_request：他人请求我闭麦/静音——toast 带「接受」按钮，由我决定执行。
+    eventsOn('voice:state_request', (d) => {
+      const req = d as { nickname?: string; mute?: boolean; deafen?: boolean }
+      const name = req.nickname ?? '有成员'
+      const what = req.mute ? '闭麦' : req.deafen ? '静音' : '调整状态'
+      notify.showAction(`${name} 请求你${what}`, '接受', () => {
+        if (req.mute) void setMute(true)
+        if (req.deafen) void setDeafen(true)
+      })
+    })
   }
 
   // unbindEvents 休眠态清理：解除全部事件订阅。
   function unbindEvents() {
-    for (const n of ['voice:self', 'voice:peer-join', 'voice:peer-leave', 'voice:speaking', 'voice:stats']) {
+    for (const n of ['voice:self', 'voice:peer-join', 'voice:peer-leave', 'voice:speaking', 'voice:stats', 'voice:state_request']) {
       eventsOff(n)
     }
   }
 
   return {
-    channelId, members, muted, deafened, dualOff, latencyMs, connected,
-    selfId, setSelf, join, leave, setMute, setDeafen, setPeerVolume, bindEvents, unbindEvents,
+    channelId, members, muted, deafened, dualOff, latencyMs, connected, peerVolumes,
+    selfId, setSelf, join, leave, setMute, setDeafen, setPeerVolume,
+    requestVoiceState, restoreFromGo, bindEvents, unbindEvents,
   }
 })

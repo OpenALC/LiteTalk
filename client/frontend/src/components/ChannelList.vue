@@ -1,21 +1,23 @@
 <script setup lang="ts">
-// ChannelList 频道栏（对齐 Main.html：分组折叠、文字/语音频道、人数、锁标识）。
-// 批次①：顶部服务器名点击折叠/展开整个频道列表；频道右键管理（重命名/删除）；
-// 底部齿轮打开设置浮层；所在语音频道行内展示成员（谁在房里一目了然）。
+// ChannelList 频道栏（v0.1.2）：双击加入语音频道（单击仅选中，对齐 Discord 语义）；
+// 空白处右键创建频道/分类；分类头右键删除分类（含频道，二次确认）；
+// 分类数据源为 servers.groupsOf（服务端 categories 实体 + 内置示例本地语义）；
+// 底部齿轮跳转 /settings 独立路由页。
 import { computed, ref } from 'vue'
 import {
   ChevronDown, Eye, Hash, Lock, Mic, Volume2, Headphones, HeadphoneOff,
-  MicOff, Settings, Pencil, Trash2,
+  MicOff, Settings, Pencil, Trash2, FolderPlus, Folder,
 } from 'lucide-vue-next'
-import { useServersStore, useSettingsStore } from '../stores/data'
+import { useRouter } from 'vue-router'
+import { useServersStore } from '../stores/data'
 import { useVoiceStore } from '../stores/voice'
 import { useAuthStore } from '../stores/auth'
 import { useNotifyStore } from '../stores/notify'
 import ContextMenu, { type CtxItem } from './ContextMenu.vue'
 import PromptDialog from './PromptDialog.vue'
 
+const router = useRouter()
 const servers = useServersStore()
-const settings = useSettingsStore()
 const voice = useVoiceStore()
 const auth = useAuthStore()
 const notify = useNotifyStore()
@@ -29,19 +31,12 @@ const currentVoiceChannelName = computed(() => {
   return ch?.name ?? voice.channelId
 })
 
-const groups = computed(() => {
-  const map = new Map<string, typeof servers.currentServer.channels>()
-  for (const ch of servers.currentServer.channels) {
-    const list = map.get(ch.group) ?? []
-    list.push(ch)
-    map.set(ch.group, list)
-  }
-  return [...map.entries()]
-})
+// groups：当前服务器的分类（channels group ∪ 空分类），数据源在 store。
+const groups = computed(() => servers.groupsOf(servers.currentServerId, servers.currentServer.channels))
 
 // 全折叠态：所有分组都收起时视为已折叠（顶部服务器名点击的依据）。
 const allCollapsed = computed(() =>
-  groups.value.length > 0 && groups.value.every(([name]) => collapsed.value[name]))
+  groups.value.length > 0 && groups.value.every((g) => collapsed.value[g.name]))
 
 function toggleGroup(name: string) {
   collapsed.value[name] = !collapsed.value[name]
@@ -50,20 +45,27 @@ function toggleGroup(name: string) {
 // toggleAll 顶部服务器名点击：折叠/展开全部频道分组。
 function toggleAll() {
   const target = !allCollapsed.value
-  for (const [name] of groups.value) {
-    collapsed.value[name] = target
+  for (const g of groups.value) {
+    collapsed.value[g.name] = target
   }
 }
 
-async function pick(id: string, type: string) {
+// pick 单击：仅选中频道（文字/语音一致）；加入语音频道改为双击（joinOnDblClick）。
+function pick(id: string) {
   servers.selectChannel(id)
-  // 重复点击已在的语音频道不再重新 join（服务端会报 already_in_channel）。
-  if (type === 'voice' && id !== voice.channelId) {
-    try {
-      await voice.join(id)
-    } catch (e) {
-      notify.fromErr(e, '加入频道失败')
-    }
+}
+
+// joinOnDblClick 双击语音频道行加入；已在频道时不重复 join。
+// 仅语音频道可加入——双击文字频道进语音房是 review S2 抓的洞。
+async function joinOnDblClick(id: string) {
+  servers.selectChannel(id)
+  if (id === voice.channelId) return
+  const ch = servers.currentServer.channels.find((c) => c.id === id)
+  if (ch && ch.type !== 'voice') return
+  try {
+    await voice.join(id)
+  } catch (e) {
+    notify.fromErr(e, '加入频道失败')
   }
 }
 
@@ -111,6 +113,81 @@ async function removeChannel(id: string) {
     notify.show('频道已删除')
   } catch (e) { notify.fromErr(e) }
 }
+
+// ---- 空白处右键：创建频道 / 创建分类 ----
+const blankCtx = ref<{ x: number; y: number } | null>(null)
+const blankCtxItems: CtxItem[] = [
+  { key: 'new-channel', label: '创建频道', icon: FolderPlus },
+  { key: 'new-category', label: '创建分类', icon: Folder },
+]
+
+function openBlankCtx(e: MouseEvent) {
+  // 频道行/分类头有自己的菜单，空白处菜单不抢它们的事件（向上冒泡时目标判定）。
+  const t = e.target as HTMLElement
+  if (t.closest('.chan') || t.closest('.cat-head')) return
+  blankCtx.value = { x: e.clientX, y: e.clientY }
+}
+
+const blankPrompt = ref<{ mode: 'channel' | 'category' } | null>(null)
+
+function onBlankSelect(key: string) {
+  if (key === 'new-channel' || key === 'new-category') {
+    blankPrompt.value = { mode: key === 'new-channel' ? 'channel' : 'category' }
+  }
+}
+
+async function onBlankConfirm(value: string) {
+  const p = blankPrompt.value
+  blankPrompt.value = null
+  if (!p) return
+  try {
+    if (p.mode === 'channel') {
+      // 新频道落在该服务器的第一个分类（无分类时服务端/本地默认组）。
+      const firstGroup = groups.value[0]?.name ?? '语音频道'
+      await createChannelInGroup(servers.currentServerId, value, firstGroup)
+      notify.show('频道已创建')
+    } else {
+      await servers.createCategory(servers.currentServerId, value)
+      notify.show('分类已创建')
+    }
+  } catch (e) { notify.fromErr(e) }
+}
+
+// createChannelInGroup：真实频道创建后归到指定分类（REST 频道暂按类型默认组，
+// 分类归属待 GET channels 端点接齐后由服务端 category_id 驱动，见 store 注释）。
+async function createChannelInGroup(serverId: string, name: string, _group: string) {
+  const s = servers.findServer(serverId)
+  if (!s) return
+  if (s.builtin) {
+    // 内置示例不支持新建（与 ServerRail 右键策略一致）。
+    throw new Error('示例服务器不可新建频道')
+  }
+  await servers.createChannel(serverId, name, 'voice')
+}
+
+// ---- 分类头右键：删除分类（含频道，二次确认） ----
+const catCtx = ref<{ x: number; y: number; id: string; name: string } | null>(null)
+const catCtxItems: CtxItem[] = [
+  { key: 'del-cat', label: '删除分类（含频道）', icon: Trash2, danger: true, confirm: true },
+]
+
+function openCatCtx(e: MouseEvent, id: string, name: string) {
+  catCtx.value = { x: e.clientX, y: e.clientY, id, name }
+}
+
+async function onCatSelect(key: string) {
+  const c = catCtx.value
+  if (!c || key !== 'del-cat') return
+  try {
+    // 身处将被删除频道的语音频道时先离开。
+    const s = servers.findServer(servers.currentServerId)
+    if (s && s.channels.some((ch) => ch.group === c.name && ch.id === voice.channelId)) {
+      await voice.leave()
+    }
+    await servers.deleteCategory(servers.currentServerId, c.id, c.name)
+    notify.show('分类已删除')
+  } catch (e) { notify.fromErr(e) }
+}
 </script>
 
 <template>
@@ -121,17 +198,22 @@ async function removeChannel(id: string) {
       <ChevronDown :size="16" :class="{ rotated: allCollapsed }" />
     </div>
 
-    <div class="chan-scroll">
-      <div v-for="[name, list] in groups" :key="name" class="cat"
-           :class="{ closed: collapsed[name] }">
-        <div class="cat-head" @click="toggleGroup(name)">
-          <ChevronDown :size="13" />{{ name }}
+    <!-- data-ctx：允许自定义右键菜单（全局拦截的白名单容器） -->
+    <div class="chan-scroll" data-ctx @contextmenu.prevent="openBlankCtx">
+      <div v-for="g in groups" :key="g.name" class="cat"
+           :class="{ closed: collapsed[g.name] }">
+        <!-- 分类头：左键折叠/展开，右键删除分类 -->
+        <div class="cat-head" @click="toggleGroup(g.name)"
+             @contextmenu.prevent="openCatCtx($event, g.id, g.name)">
+          <ChevronDown :size="13" />{{ g.name }}
         </div>
         <div class="cat-items">
-          <template v-for="ch in list" :key="ch.id">
+          <template v-for="ch in servers.currentServer.channels.filter((c) => c.group === g.name)" :key="ch.id">
             <div class="chan"
                  :class="{ active: ch.id === servers.currentChannelId, 'in-voice': ch.id === voice.channelId }"
-                 @click="pick(ch.id, ch.type)"
+                 :title="ch.type === 'voice' ? '双击加入语音频道' : ''"
+                 @click="pick(ch.id)"
+                 @dblclick.prevent="joinOnDblClick(ch.id)"
                  @contextmenu.prevent="openCtx($event, ch.id, ch.name)">
               <component :is="ch.type === 'text' ? Hash : (ch.locked ? Lock : (ch.id === 'ch-audience' ? Eye : Volume2))"
                          :size="16" />
@@ -163,9 +245,12 @@ async function removeChannel(id: string) {
           <template v-if="currentVoiceChannelName">
             <span class="chan-name">{{ currentVoiceChannelName }}</span>
             <span class="sep">·</span>
-            <!-- 双关态两个都显示（S3：与 VoiceRoom 胶囊一致，不再只显示闭麦） -->
-            <span v-if="voice.muted" class="state off">已闭麦</span>
-            <span v-if="voice.deafened" class="state off">已静音</span>
+            <!-- 双关态两个都显示；有任何状态时不再显示「在线」（S3：v-else 原只挂静音分支，
+                 闭麦时会并排「已闭麦 · 在线」）。 -->
+            <template v-if="voice.muted || voice.deafened">
+              <span v-if="voice.muted" class="state off">已闭麦</span>
+              <span v-if="voice.deafened" class="state off">已静音</span>
+            </template>
             <span v-else class="state on">在线</span>
           </template>
           <template v-else>
@@ -187,7 +272,8 @@ async function removeChannel(id: string) {
           <HeadphoneOff v-if="voice.deafened" :size="17" />
           <Headphones v-else :size="17" />
         </button>
-        <button class="icon-btn" title="设置" @click="settings.openPanel()">
+        <!-- v0.1.2：设置独立路由页 -->
+        <button class="icon-btn" title="设置" @click="router.push('/settings')">
           <Settings :size="17" />
         </button>
       </div>
@@ -195,9 +281,19 @@ async function removeChannel(id: string) {
 
     <ContextMenu v-if="ctx" :x="ctx.x" :y="ctx.y" :items="ctxItems"
                  @select="onCtxSelect" @close="ctx = null" />
+    <ContextMenu v-if="blankCtx" :x="blankCtx.x" :y="blankCtx.y" :items="blankCtxItems"
+                 @select="onBlankSelect" @close="blankCtx = null" />
+    <ContextMenu v-if="catCtx" :x="catCtx.x" :y="catCtx.y" :items="catCtxItems"
+                 @select="onCatSelect" @close="catCtx = null" />
 
     <PromptDialog v-if="renaming" title="重命名频道" :initial="renaming.initial" cta="保存"
                   @confirm="onRenameConfirm" @close="renaming = null" />
+    <PromptDialog v-if="blankPrompt?.mode === 'channel'" title="创建频道"
+                  placeholder="频道名称" cta="创建"
+                  @confirm="onBlankConfirm" @close="blankPrompt = null" />
+    <PromptDialog v-else-if="blankPrompt?.mode === 'category'" title="创建分类"
+                  placeholder="分类名称" cta="创建"
+                  @confirm="onBlankConfirm" @close="blankPrompt = null" />
   </aside>
 </template>
 
@@ -239,6 +335,7 @@ async function removeChannel(id: string) {
   height: 34px; padding: 0 9px; margin: 1px 0;
   border-radius: 8px; color: var(--ink-600);
   cursor: pointer; transition: background 0.15s, color 0.15s;
+  user-select: none;
 }
 .chan :deep(svg) { color: var(--ink-400); flex: none; transition: color 0.15s; }
 .chan .cname {

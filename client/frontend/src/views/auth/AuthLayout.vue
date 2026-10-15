@@ -1,11 +1,11 @@
 <script setup lang="ts">
 // AuthLayout 认证壳：左品牌区（logo+标语+声波装饰）+ 右表单区（铺满窗口，无外层浮卡）。
-// 右上角悬浮窗控（最小化/关闭，问题 5）；品牌区/表单空白可拖拽窗口。
+// v0.1.2：窗口控制已统一上收 App.vue 全局 TitleBar（原悬浮窗控移除，见模板注释）；
+// 品牌区/表单空白仍可拖拽窗口。
 // 首装引导：自动探活默认地址，连不上时展开「连接服务器」弹层（全 auth 页面共享一次探测）。
 import { onMounted, ref } from 'vue'
-import { AudioWaveform, Minus, Server, X } from 'lucide-vue-next'
+import { AudioWaveform, Server, X } from 'lucide-vue-next'
 import { goApp } from '../../api/bridge'
-import { closeWithHint } from '../../composables/useWindowClose'
 import ServerConnPanel from '../../components/ServerConnPanel.vue'
 import Toast from '../../components/Toast.vue'
 
@@ -31,11 +31,8 @@ onMounted(async () => {
 
 <template>
   <div class="auth-wrap">
-    <!-- 悬浮窗控（问题 5：登录页也能最小化/关闭；close 走问题 4 兜底链） -->
-    <div class="win-controls">
-      <button title="最小化" @click="goApp().WindowMinimize()"><Minus :size="15" /></button>
-      <button class="wc-close" title="关闭" @click="closeWithHint()"><X :size="15" /></button>
-    </div>
+    <!-- v0.1.2：窗口控制（最小化/关闭）与拖拽已统一上收到 App.vue 的全局 TitleBar，
+         此处不再保留悬浮窗控，避免双份按钮 -->
     <Toast ref="toast" />
 
     <aside class="brand">
@@ -85,19 +82,7 @@ onMounted(async () => {
      Wails v2 拖拽属性为 --wails-draggable（WebView2 不认 -webkit-app-region） */
   --wails-draggable: drag;
 }
-/* 悬浮窗控（问题 5a/5c）：与 MainView TitleBar 同款反馈，不占布局 */
-.win-controls {
-  position: fixed; top: 0; right: 0; z-index: 40;
-  display: flex; --wails-draggable: no-drag;
-}
-.win-controls button {
-  width: 42px; height: 38px;
-  display: flex; align-items: center; justify-content: center;
-  color: var(--ink-400);
-  transition: background 0.15s, color 0.15s;
-}
-.win-controls button:hover { background: var(--brand-50); color: var(--ink-900); }
-.win-controls .wc-close:hover { background: var(--red); color: #fff; }
+/* 悬浮窗控样式已随 v0.1.2 全局 TitleBar 移除（win-controls 块删除） */
 /* 交互元素一律 no-drag（输入/按钮/链接/勾选/分段/弹层遮罩） */
 .auth-wrap :deep(input),
 .auth-wrap :deep(button),

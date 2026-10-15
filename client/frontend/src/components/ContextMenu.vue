@@ -1,7 +1,9 @@
 <script setup lang="ts">
 // ContextMenu 通用右键菜单：光标处弹出，点击外部 / Esc / 再次右键关闭。
 // 危险项（danger）首次点击变为「再次点击确认」二次确认态，避免误删。
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+// 视口收拢：挂载后实测菜单宽高再定位（v0.1.2 修走查建议——此前 w=180 写死，
+// 长标签会溢出右缘）。
+import { onBeforeUnmount, onMounted, ref } from 'vue'
 import type { Component } from 'vue'
 
 export interface CtxItem {
@@ -19,14 +21,17 @@ const emit = defineEmits<{ (e: 'select', key: string): void; (e: 'close'): void 
 // 二次确认态：记录待确认的 danger 项 key（确认态下标签变为「再次点击确认」）。
 const confirming = ref('')
 
-// 视口内收拢：菜单贴右/下边缘时向左/上偏移，防止溢出屏幕。
-const pos = computed(() => {
-  const w = 180
-  const h = props.items.length * 36 + 12
-  return {
-    left: Math.min(props.x, window.innerWidth - w - 8) + 'px',
-    top: Math.min(props.y, window.innerHeight - h - 8) + 'px',
-  }
+const menuEl = ref<HTMLElement>()
+const pos = ref({ left: '0px', top: '0px' })
+
+// onMounted 实测菜单尺寸后贴边收拢：右/下溢出时向左/上偏移，最小留 8px 边距。
+onMounted(() => {
+  const el = menuEl.value
+  if (!el) return
+  const r = el.getBoundingClientRect()
+  const left = Math.max(8, Math.min(props.x, window.innerWidth - r.width - 8))
+  const top = Math.max(8, Math.min(props.y, window.innerHeight - r.height - 8))
+  pos.value = { left: left + 'px', top: top + 'px' }
 })
 
 function onItem(it: CtxItem) {
@@ -49,7 +54,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 <template>
   <!-- 透明遮罩：点击任意处关闭；拦截 contextmenu 防止菜单内再右键弹系统菜单 -->
   <div class="ctx-mask" @click="emit('close')" @contextmenu.prevent="emit('close')">
-    <div class="ctx-menu" :style="pos" @click.stop>
+    <div ref="menuEl" class="ctx-menu" :style="pos" @click.stop>
       <button v-for="it in items" :key="it.key" class="ctx-item"
               :class="{ danger: it.danger, armed: confirming === it.key }"
               :disabled="it.disabled" @click="onItem(it)">

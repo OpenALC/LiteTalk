@@ -658,6 +658,16 @@ func (a *App) DeleteChannel(id int64) error {
 	return a.api.DeleteChannel(id)
 }
 
+// CreateCategory 创建频道分类（owner/admin；1–32 字）。
+func (a *App) CreateCategory(serverID int64, name string) (*state.CategoryDTO, error) {
+	return a.api.CreateCategory(serverID, name)
+}
+
+// DeleteCategory 删除分类；withChannels=true 级联删除其下频道（服务端单事务）。
+func (a *App) DeleteCategory(id int64, withChannels bool) error {
+	return a.api.DeleteCategory(id, withChannels)
+}
+
 // SendFriendRequest 发送好友请求（target 形如 "昵称#1234"）。
 func (a *App) SendFriendRequest(target string) error {
 	return a.api.SendFriendRequest(target)
