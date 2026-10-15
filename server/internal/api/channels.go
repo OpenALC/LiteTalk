@@ -7,9 +7,10 @@ import (
 )
 
 type createChannelReq struct {
-	Name     string            `json:"name"`
-	Type     store.ChannelType `json:"type"`
-	Position *int              `json:"position"`
+	Name       string            `json:"name"`
+	Type       store.ChannelType `json:"type"`
+	CategoryID *int64            `json:"category_id"` // v0.1.2 分类归属（可空）
+	Position   *int              `json:"position"`
 }
 
 func validChannelName(s string) bool {
@@ -39,10 +40,19 @@ func (s *Server) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_type", "类型必须是 text 或 voice")
 		return
 	}
+	// 分类归属校验（与 PATCH 同规则）：存在且属于本服务器，防止跨服挂载/悬空 id。
+	if req.CategoryID != nil && *req.CategoryID != 0 {
+		cat, err := s.store.CategoryByID(r.Context(), *req.CategoryID)
+		if err != nil || cat.ServerID != serverID {
+			writeErr(w, http.StatusBadRequest, "bad_category", "分类不存在或不属于该服务器")
+			return
+		}
+	}
 	ch := &store.Channel{
-		ServerID: serverID,
-		Name:     req.Name,
-		Type:     req.Type,
+		ServerID:   serverID,
+		Name:       req.Name,
+		Type:       req.Type,
+		CategoryID: req.CategoryID,
 	}
 	if req.Position != nil {
 		ch.Position = *req.Position
@@ -55,9 +65,10 @@ func (s *Server) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 }
 
 type patchChannelReq struct {
-	Name     *string            `json:"name"`
-	Type     *store.ChannelType `json:"type"`
-	Position *int               `json:"position"`
+	Name       *string            `json:"name"`
+	Type       *store.ChannelType `json:"type"`
+	CategoryID *int64             `json:"category_id"` // v0.1.2 改分类归属（null 显式移出分类）
+	Position   *int               `json:"position"`
 }
 
 // handlePatchChannel PATCH /api/v1/channels/{id}（owner/admin）
@@ -93,6 +104,19 @@ func (s *Server) handlePatchChannel(w http.ResponseWriter, r *http.Request) {
 		}
 		ch.Type = *req.Type
 	}
+	if req.CategoryID != nil {
+		if *req.CategoryID == 0 {
+			ch.CategoryID = nil // 显式移出分类（0 = 无分类）
+		} else {
+			// 校验分类归属本服务器，防止跨服挂载。
+			cat, err := s.store.CategoryByID(r.Context(), *req.CategoryID)
+			if err != nil || cat.ServerID != ch.ServerID {
+				writeErr(w, http.StatusBadRequest, "bad_category", "分类不存在或不属于该服务器")
+				return
+			}
+			ch.CategoryID = req.CategoryID
+		}
+	}
 	if req.Position != nil {
 		ch.Position = *req.Position
 	}
@@ -123,4 +147,36 @@ func (s *Server) handleDeleteChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleListChannels GET /api/v1/servers/{id}/channels（v0.1.2 补缺口）。
+// 返回分类与频道两个数组，频道带 category_id；前端按分类归组渲染。
+// 任意服务器成员可读。
+func (s *Server) handleListChannels(w http.ResponseWriter, r *http.Request) {
+	c := currentUser(r)
+	serverID, ok := pathID(w, r, "id")
+	if !ok {
+		return
+	}
+	if _, err := s.store.Member(r.Context(), serverID, c.UserID); err != nil {
+		writeErr(w, http.StatusForbidden, "forbidden", "不是该服务器成员")
+		return
+	}
+	channels, err := s.store.ChannelsOfServer(r.Context(), serverID)
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	categories, err := s.store.CategoriesOfServer(r.Context(), serverID)
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	if channels == nil {
+		channels = []store.Channel{}
+	}
+	if categories == nil {
+		categories = []store.Category{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"categories": categories, "channels": channels})
 }

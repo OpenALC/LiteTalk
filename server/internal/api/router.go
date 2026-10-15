@@ -101,6 +101,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/friends/requests", s.auth(s.handleFriendRequest))
 	mux.HandleFunc("POST /api/v1/friends/requests/{id}/accept", s.auth(s.handleFriendAccept))
 	mux.HandleFunc("DELETE /api/v1/friends/{id}", s.auth(s.handleFriendDelete))
+	mux.HandleFunc("PATCH /api/v1/friends/{id}", s.auth(s.handlePatchFriend))
 	// servers
 	mux.HandleFunc("POST /api/v1/servers", s.auth(s.handleCreateServer))
 	mux.HandleFunc("GET /api/v1/servers", s.auth(s.handleListServers))
@@ -111,8 +112,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/servers/{id}/invites", s.auth(s.handleCreateInvite))
 	// channels
 	mux.HandleFunc("POST /api/v1/servers/{id}/channels", s.auth(s.handleCreateChannel))
+	mux.HandleFunc("GET /api/v1/servers/{id}/channels", s.auth(s.handleListChannels))
 	mux.HandleFunc("PATCH /api/v1/channels/{id}", s.auth(s.handlePatchChannel))
 	mux.HandleFunc("DELETE /api/v1/channels/{id}", s.auth(s.handleDeleteChannel))
+	// categories（v0.1.2 迁移 0003）
+	mux.HandleFunc("POST /api/v1/servers/{id}/categories", s.auth(s.handleCreateCategory))
+	mux.HandleFunc("DELETE /api/v1/categories/{id}", s.auth(s.handleDeleteCategory))
 	// messages
 	mux.HandleFunc("GET /api/v1/channels/{id}/messages", s.auth(s.handleListMessages))
 	mux.HandleFunc("POST /api/v1/channels/{id}/messages", s.auth(s.handleCreateMessage))

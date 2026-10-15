@@ -225,13 +225,13 @@ func (m *MySQL) CreateFriendship(ctx context.Context, f *Friendship) error {
 		Scan(&f.CreatedAt)
 }
 
-const friendshipCols = `id, user_id, friend_id, status, created_at`
+const friendshipCols = `id, user_id, friend_id, status, remark, group_name, created_at`
 
 func (m *MySQL) FriendshipByID(ctx context.Context, id int64) (*Friendship, error) {
 	var f Friendship
 	err := m.db.QueryRowContext(ctx,
 		`SELECT `+friendshipCols+` FROM friendships WHERE id = ?`, id).
-		Scan(&f.ID, &f.UserID, &f.FriendID, &f.Status, &f.CreatedAt)
+		Scan(&f.ID, &f.UserID, &f.FriendID, &f.Status, &f.Remark, &f.GroupName, &f.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -251,7 +251,7 @@ func (m *MySQL) FriendshipsOfUser(ctx context.Context, userID int64) ([]Friendsh
 	out := []Friendship{}
 	for rows.Next() {
 		var f Friendship
-		if err := rows.Scan(&f.ID, &f.UserID, &f.FriendID, &f.Status, &f.CreatedAt); err != nil {
+		if err := rows.Scan(&f.ID, &f.UserID, &f.FriendID, &f.Status, &f.Remark, &f.GroupName, &f.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, f)
@@ -264,7 +264,7 @@ func (m *MySQL) FriendshipBetween(ctx context.Context, a, b int64) (*Friendship,
 	err := m.db.QueryRowContext(ctx,
 		`SELECT `+friendshipCols+` FROM friendships
 		 WHERE (user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?)`, a, b, b, a).
-		Scan(&f.ID, &f.UserID, &f.FriendID, &f.Status, &f.CreatedAt)
+		Scan(&f.ID, &f.UserID, &f.FriendID, &f.Status, &f.Remark, &f.GroupName, &f.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -276,7 +276,8 @@ func (m *MySQL) FriendshipBetween(ctx context.Context, a, b int64) (*Friendship,
 
 func (m *MySQL) UpdateFriendship(ctx context.Context, f *Friendship) error {
 	res, err := m.db.ExecContext(ctx,
-		`UPDATE friendships SET status = ? WHERE id = ?`, f.Status, f.ID)
+		`UPDATE friendships SET status = ?, remark = ?, group_name = ? WHERE id = ?`,
+		f.Status, f.Remark, f.GroupName, f.ID)
 	if err != nil {
 		return err
 	}
@@ -363,6 +364,9 @@ func (m *MySQL) DeleteServer(ctx context.Context, id int64) error {
 	if _, err := m.db.ExecContext(ctx, `DELETE FROM channels WHERE server_id = ?`, id); err != nil {
 		return err
 	}
+	if _, err := m.db.ExecContext(ctx, `DELETE FROM categories WHERE server_id = ?`, id); err != nil {
+		return err
+	}
 	if _, err := m.db.ExecContext(ctx, `DELETE FROM invites WHERE server_id = ?`, id); err != nil {
 		return err
 	}
@@ -438,8 +442,8 @@ func (m *MySQL) MembersOfServer(ctx context.Context, serverID int64) ([]ServerMe
 
 func (m *MySQL) CreateChannel(ctx context.Context, c *Channel) error {
 	res, err := m.db.ExecContext(ctx,
-		`INSERT INTO channels (server_id, name, type, position) VALUES (?, ?, ?, ?)`,
-		c.ServerID, c.Name, c.Type, c.Position)
+		`INSERT INTO channels (server_id, name, type, category_id, position) VALUES (?, ?, ?, ?, ?)`,
+		c.ServerID, c.Name, c.Type, c.CategoryID, c.Position)
 	if err != nil {
 		return err
 	}
@@ -452,19 +456,28 @@ func (m *MySQL) CreateChannel(ctx context.Context, c *Channel) error {
 		Scan(&c.CreatedAt)
 }
 
-const channelCols = `id, server_id, name, type, position, created_at`
+const channelCols = `id, server_id, name, type, category_id, position, created_at`
 
-func (m *MySQL) ChannelByID(ctx context.Context, id int64) (*Channel, error) {
+// scanChannel 扫描一行频道（category_id 可空）。
+func scanChannel(rows interface{ Scan(...any) error }) (*Channel, error) {
 	var c Channel
-	err := m.db.QueryRowContext(ctx, `SELECT `+channelCols+` FROM channels WHERE id = ?`, id).
-		Scan(&c.ID, &c.ServerID, &c.Name, &c.Type, &c.Position, &c.CreatedAt)
+	var catID sql.NullInt64
+	err := rows.Scan(&c.ID, &c.ServerID, &c.Name, &c.Type, &catID, &c.Position, &c.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	if catID.Valid {
+		c.CategoryID = &catID.Int64
+	}
 	return &c, nil
+}
+
+func (m *MySQL) ChannelByID(ctx context.Context, id int64) (*Channel, error) {
+	return scanChannel(m.db.QueryRowContext(ctx,
+		`SELECT `+channelCols+` FROM channels WHERE id = ?`, id))
 }
 
 func (m *MySQL) ChannelsOfServer(ctx context.Context, serverID int64) ([]Channel, error) {
@@ -476,19 +489,19 @@ func (m *MySQL) ChannelsOfServer(ctx context.Context, serverID int64) ([]Channel
 	defer rows.Close()
 	out := []Channel{}
 	for rows.Next() {
-		var c Channel
-		if err := rows.Scan(&c.ID, &c.ServerID, &c.Name, &c.Type, &c.Position, &c.CreatedAt); err != nil {
+		c, err := scanChannel(rows)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, c)
+		out = append(out, *c)
 	}
 	return out, rows.Err()
 }
 
 func (m *MySQL) UpdateChannel(ctx context.Context, c *Channel) error {
 	res, err := m.db.ExecContext(ctx,
-		`UPDATE channels SET name = ?, type = ?, position = ? WHERE id = ?`,
-		c.Name, c.Type, c.Position, c.ID)
+		`UPDATE channels SET name = ?, type = ?, category_id = ?, position = ? WHERE id = ?`,
+		c.Name, c.Type, c.CategoryID, c.Position, c.ID)
 	if err != nil {
 		return err
 	}
@@ -504,6 +517,86 @@ func (m *MySQL) DeleteChannel(ctx context.Context, id int64) error {
 		return err
 	}
 	return checkAffected(res)
+}
+
+// ---- categories（v0.1.2 迁移 0003） ----
+
+func (m *MySQL) CreateCategory(ctx context.Context, c *Category) error {
+	res, err := m.db.ExecContext(ctx,
+		`INSERT INTO categories (server_id, name, position) VALUES (?, ?, ?)`,
+		c.ServerID, c.Name, c.Position)
+	if err != nil {
+		return err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return err
+	}
+	c.ID = id
+	return m.db.QueryRowContext(ctx, `SELECT created_at FROM categories WHERE id = ?`, id).
+		Scan(&c.CreatedAt)
+}
+
+const categoryCols = `id, server_id, name, position, created_at`
+
+func scanCategory(rows interface{ Scan(...any) error }) (*Category, error) {
+	var c Category
+	err := rows.Scan(&c.ID, &c.ServerID, &c.Name, &c.Position, &c.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+func (m *MySQL) CategoryByID(ctx context.Context, id int64) (*Category, error) {
+	return scanCategory(m.db.QueryRowContext(ctx,
+		`SELECT `+categoryCols+` FROM categories WHERE id = ?`, id))
+}
+
+func (m *MySQL) CategoriesOfServer(ctx context.Context, serverID int64) ([]Category, error) {
+	rows, err := m.db.QueryContext(ctx,
+		`SELECT `+categoryCols+` FROM categories WHERE server_id = ? ORDER BY position, id`, serverID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Category{}
+	for rows.Next() {
+		c, err := scanCategory(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *c)
+	}
+	return out, rows.Err()
+}
+
+// DeleteCategoryWithChannels 单事务删除分类及其下全部频道（含各频道消息）。
+// 调用方须先确认分类存在（checkAffected 在事务内同样生效）。
+func (m *MySQL) DeleteCategoryWithChannels(ctx context.Context, id int64) error {
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM messages WHERE channel_id IN (SELECT id FROM channels WHERE category_id = ?)`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM channels WHERE category_id = ?`, id); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM categories WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	if err := checkAffected(res); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ---- messages ----

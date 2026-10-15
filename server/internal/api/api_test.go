@@ -69,6 +69,50 @@ func getJSON(t *testing.T, h http.Handler, path, token string, wantStatus int) a
 	return out
 }
 
+// patchJSON / delJSON PATCH 与 DELETE 变体（v0.1.2 好友备注/分组等管理端点测试用）。
+func patchJSON(t *testing.T, h http.Handler, path, token string, body any, wantStatus int) map[string]any {
+	t.Helper()
+	var buf bytes.Buffer
+	if body != nil {
+		if err := json.NewEncoder(&buf).Encode(body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	req := httptest.NewRequest(http.MethodPatch, path, &buf)
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != wantStatus {
+		t.Fatalf("%s: 期望 %d 实际 %d body=%s", path, wantStatus, rec.Code, rec.Body.String())
+	}
+	out := map[string]any{}
+	if rec.Body.Len() > 0 {
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	}
+	return out
+}
+
+func delJSON(t *testing.T, h http.Handler, path, token string, wantStatus int) map[string]any {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodDelete, path, nil)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != wantStatus {
+		t.Fatalf("%s: 期望 %d 实际 %d body=%s", path, wantStatus, rec.Code, rec.Body.String())
+	}
+	out := map[string]any{}
+	if rec.Body.Len() > 0 {
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	}
+	return out
+}
+
 // registerUser 注册一个测试用户并返回 (access, refresh)。
 func registerUser(t *testing.T, h http.Handler, mem *store.Mem, email, nickname, password string) (string, string) {
 	t.Helper()

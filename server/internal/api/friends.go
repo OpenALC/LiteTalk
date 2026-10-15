@@ -7,11 +7,15 @@ import (
 	"github.com/OpenALC/LiteTalk/server/internal/store"
 )
 
-// friendView 好友条目视图（内联对端用户信息 + 请求数 id）。
+// friendView 好友条目视图（内联对端用户信息 + 请求数 id + 发起方备注/分组）。
+// Remark/Group 仅当当前用户是关系发起方（user_id 方向）时非空——
+// friendships 行有方向性，被请求方视角返回空串（v0.1.2 迁移 0003）。
 type friendView struct {
 	ID       int64                `json:"id"`
 	Status   store.FriendshipStatus `json:"status"`
 	Incoming bool                 `json:"incoming"` // true = 对端发起（我是被请求方）
+	Remark   string               `json:"remark"`
+	Group    string               `json:"group"`
 	User     *store.User          `json:"user"`
 }
 
@@ -35,7 +39,12 @@ func (s *Server) handleListFriends(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
-		out = append(out, friendView{ID: f.ID, Status: f.Status, Incoming: incoming, User: u})
+		// 备注/分组是发起方视角的字段：被请求方看到空串。
+		view := friendView{ID: f.ID, Status: f.Status, Incoming: incoming, User: u}
+		if !incoming {
+			view.Remark, view.Group = f.Remark, f.GroupName
+		}
+		out = append(out, view)
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -142,4 +151,56 @@ func (s *Server) handleFriendDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+type patchFriendReq struct {
+	Remark *string `json:"remark"` // 1–64 字符；空串清除备注
+	Group  *string `json:"group"`  // 1–32 字符；空串移出分组
+}
+
+// handlePatchFriend PATCH /api/v1/friends/{id}（设置备注/分组，v0.1.2）。
+// 仅发起方向（friendships.user_id == 当前用户）可改——备注是发起方的本地视图，
+// 被请求方改自己方向的行需要 user_id 是自己，而好友关系行的 user_id 只有一方。
+func (s *Server) handlePatchFriend(w http.ResponseWriter, r *http.Request) {
+	c := currentUser(r)
+	id, ok := pathID(w, r, "id")
+	if !ok {
+		return
+	}
+	f, err := s.store.FriendshipByID(r.Context(), id)
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	// 双方都能定位到关系行，但只有发起方持有备注/分组。
+	if f.UserID != c.UserID {
+		writeErr(w, http.StatusForbidden, "forbidden", "仅发起方可设置备注与分组")
+		return
+	}
+	var req patchFriendReq
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Remark != nil {
+		n := len([]rune(*req.Remark))
+		if n > 64 {
+			writeErr(w, http.StatusBadRequest, "bad_remark", "备注需为 0–64 个字符")
+			return
+		}
+		f.Remark = *req.Remark
+	}
+	if req.Group != nil {
+		n := len([]rune(*req.Group))
+		if n > 32 {
+			writeErr(w, http.StatusBadRequest, "bad_group", "分组名需为 0–32 个字符")
+			return
+		}
+		f.GroupName = *req.Group
+	}
+	if err := s.store.UpdateFriendship(r.Context(), f); err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	other, _ := s.store.UserByID(r.Context(), f.FriendID)
+	writeJSON(w, http.StatusOK, friendView{ID: f.ID, Status: f.Status, Remark: f.Remark, Group: f.GroupName, User: other})
 }

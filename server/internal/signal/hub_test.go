@@ -251,6 +251,50 @@ func TestChatRateLimit(t *testing.T) {
 	}
 }
 
+// TestVoiceRequestState 定向投递：A 请求 B 闭麦 → B 收 voice.state_request（含来源），
+// A 自己收不到；目标不在频道 → A 收 not_in_channel。
+func TestVoiceRequestState(t *testing.T) {
+	f := newChatFixture(t)
+	chID := strconv.FormatInt(f.ch.ID, 10)
+
+	a := f.dial("1", "alice")
+	b := f.dial("2", "bob")
+	a.send(TypeChannelJoin, ChannelJoinData{ChannelID: chID})
+	b.send(TypeChannelJoin, ChannelJoinData{ChannelID: chID})
+	a.recvUntil(TypeChannelJoined)
+	b.recvUntil(TypeChannelJoined)
+
+	mute := true
+	a.send(TypeVoiceRequestState, VoiceRequestStateData{ChannelID: chID, TargetID: "2", Mute: &mute})
+
+	env := b.recvUntil(TypeVoiceStateRequest)
+	var req VoiceStateRequestData
+	if err := env.Decode(&req); err != nil {
+		t.Fatalf("decode voice.state_request: %v", err)
+	}
+	if req.From.ID != "1" || req.From.Nickname != "alice" {
+		t.Fatalf("from = %+v, want alice", req.From)
+	}
+	if req.Mute == nil || !*req.Mute {
+		t.Fatalf("mute = %+v, want true", req.Mute)
+	}
+
+	// 目标不在频道（mallory 未加入）→ 发送者收 not_in_channel。
+	m := f.dial("9", "mallory")
+	m.send(TypeChannelJoin, ChannelJoinData{ChannelID: chID})
+	m.recvUntil(TypeChannelJoined)
+	m.send(TypeChannelLeave, ChannelLeaveData{})
+	m.send(TypeVoiceRequestState, VoiceRequestStateData{ChannelID: chID, TargetID: "2", Mute: &mute})
+	env = m.recvUntil(TypeError)
+	var e ErrorData
+	if err := env.Decode(&e); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if e.Code != ErrCodeNotInChannel {
+		t.Fatalf("code = %q, want %q", e.Code, ErrCodeNotInChannel)
+	}
+}
+
 // TestChatForbidden 既不在房间、也不是频道成员 → forbidden。
 func TestChatForbidden(t *testing.T) {
 	f := newChatFixture(t)

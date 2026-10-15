@@ -206,6 +206,13 @@ func (h *Hub) handleMessage(c *client, data []byte) {
 			return
 		}
 		h.handleVoiceState(c, d)
+	case TypeVoiceRequestState:
+		var d VoiceRequestStateData
+		if env.Decode(&d) != nil {
+			h.sendError(c, ErrCodeBadMessage, "voice.request_state 数据格式错误")
+			return
+		}
+		h.handleVoiceRequestState(c, d)
 	case TypeChatSend:
 		var d ChatSendData
 		if err := env.Decode(&d); err != nil {
@@ -369,6 +376,54 @@ func (h *Hub) handleVoiceState(c *client, d VoiceStateData) {
 	for _, m := range others {
 		h.sendJSON(m, TypeVoiceState, bcast)
 	}
+}
+
+// handleVoiceRequestState 处理 C→S voice.request_state（v0.1.2）：
+// 校验发送者与目标均在同一频道后，把请求**定向转发**给目标——
+// 纯「请求」语义，不广播、不持久化、不强制（server-mute 属权限模型，超范围）。
+// 频控 10 次/分/人：与 chat.send 同套路，防止对目标定向刷屏（review S6）。
+const voiceRequestRateLimit, voiceRequestRateWindow = 10, time.Minute
+
+func (h *Hub) handleVoiceRequestState(c *client, d VoiceRequestStateData) {
+	if d.ChannelID == "" || d.TargetID == "" {
+		h.sendError(c, ErrCodeBadMessage, "voice.request_state 需要 channel_id 与 target_id")
+		return
+	}
+	if d.Mute == nil && d.Deafen == nil {
+		h.sendError(c, ErrCodeBadMessage, "voice.request_state 至少携带 mute 或 deafen")
+		return
+	}
+	if d.TargetID == c.userID {
+		h.sendError(c, ErrCodeBadMessage, "不能对自己发起请求")
+		return
+	}
+	if h.limits != nil {
+		ok, err := h.limits.Allow(context.Background(), "vreq:"+c.userID, voiceRequestRateLimit, voiceRequestRateWindow)
+		if err != nil || !ok {
+			h.sendError(c, ErrCodeRateLimited, "请求过于频繁")
+			return
+		}
+	}
+	h.mu.Lock()
+	room := h.rooms[d.ChannelID]
+	var target *client
+	if room != nil {
+		// 发送者也必须在频道内（room.members[c.userID] 存在即隐含）。
+		if _, in := room.members[c.userID]; in {
+			target = room.members[d.TargetID]
+		}
+	}
+	h.mu.Unlock()
+	if target == nil {
+		h.sendError(c, ErrCodeNotInChannel, "目标不在该频道中")
+		return
+	}
+	h.sendJSON(target, TypeVoiceStateRequest, VoiceStateRequestData{
+		From:   UserBrief{ID: c.userID, Nickname: c.username},
+		Mute:   d.Mute,
+		Deafen: d.Deafen,
+		TS:     time.Now().UnixMilli(),
+	})
 }
 
 // ---- client / roomState 辅助 ----

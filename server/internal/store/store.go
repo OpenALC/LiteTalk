@@ -40,11 +40,14 @@ const (
 )
 
 // Friendship 好友关系（单行表示一对，user_id < friend_id 由 API 层保证顺序）。
+// remark/group_name 为发起方视角的本地备注与分组（v0.1.2 迁移 0003）。
 type Friendship struct {
 	ID        int64            `json:"id" db:"id"`
 	UserID    int64            `json:"user_id" db:"user_id"`
 	FriendID  int64            `json:"friend_id" db:"friend_id"`
 	Status    FriendshipStatus `json:"status" db:"status"`
+	Remark    string           `json:"remark" db:"remark"`
+	GroupName string           `json:"group_name" db:"group_name"`
 	CreatedAt time.Time        `json:"created_at" db:"created_at"`
 }
 
@@ -86,14 +89,24 @@ const (
 	ChannelVoice ChannelType = "voice"
 )
 
-// Channel 频道。
+// Channel 频道。category_id 指向分类表（迁移 0003），NULL = 未分类。
 type Channel struct {
-	ID        int64       `json:"id" db:"id"`
-	ServerID  int64       `json:"server_id" db:"server_id"`
-	Name      string      `json:"name" db:"name"`
-	Type      ChannelType `json:"type" db:"type"`
-	Position  int         `json:"position" db:"position"`
-	CreatedAt time.Time   `json:"created_at" db:"created_at"`
+	ID         int64       `json:"id" db:"id"`
+	ServerID   int64       `json:"server_id" db:"server_id"`
+	Name       string      `json:"name" db:"name"`
+	Type       ChannelType `json:"type" db:"type"`
+	CategoryID *int64      `json:"category_id" db:"category_id"`
+	Position   int         `json:"position" db:"position"`
+	CreatedAt  time.Time   `json:"created_at" db:"created_at"`
+}
+
+// Category 频道分类（v0.1.2 迁移 0003）。空分类可持久化，删除可连带频道。
+type Category struct {
+	ID        int64     `json:"id" db:"id"`
+	ServerID  int64     `json:"server_id" db:"server_id"`
+	Name      string    `json:"name" db:"name"`
+	Position  int       `json:"position" db:"position"`
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
 }
 
 // Message 文字频道消息。
@@ -154,6 +167,13 @@ type Store interface {
 	ChannelsOfServer(ctx context.Context, serverID int64) ([]Channel, error)
 	UpdateChannel(ctx context.Context, c *Channel) error
 	DeleteChannel(ctx context.Context, id int64) error
+
+	// categories（v0.1.2 迁移 0003）
+	CreateCategory(ctx context.Context, c *Category) error
+	CategoryByID(ctx context.Context, id int64) (*Category, error)
+	CategoriesOfServer(ctx context.Context, serverID int64) ([]Category, error)
+	// DeleteCategoryWithChannels 单事务删除分类及其下全部频道（含各频道消息）。
+	DeleteCategoryWithChannels(ctx context.Context, id int64) error
 
 	// messages
 	CreateMessage(ctx context.Context, m *Message) error

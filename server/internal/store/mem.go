@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 )
@@ -16,6 +17,7 @@ type Mem struct {
 	servers      map[int64]*Server
 	members      map[int64]map[int64]*ServerMember // serverID → userID → member
 	channels     map[int64]*Channel
+	categories   map[int64]*Category
 	messages     map[int64]*Message
 	invites      map[string]*Invite
 
@@ -39,6 +41,7 @@ func NewMem() *Mem {
 		servers:     map[int64]*Server{},
 		members:     map[int64]map[int64]*ServerMember{},
 		channels:    map[int64]*Channel{},
+		categories:  map[int64]*Category{},
 		messages:    map[int64]*Message{},
 		invites:     map[string]*Invite{},
 		nextID:      map[string]int64{},
@@ -258,6 +261,11 @@ func (m *Mem) DeleteServer(_ context.Context, id int64) error {
 	}
 	delete(m.servers, id)
 	delete(m.members, id)
+	for catID, cat := range m.categories {
+		if cat.ServerID == id {
+			delete(m.categories, catID)
+		}
+	}
 	for cid, c := range m.channels {
 		if c.ServerID == id {
 			delete(m.channels, cid)
@@ -393,6 +401,75 @@ func (m *Mem) DeleteChannel(_ context.Context, id int64) error {
 			delete(m.messages, mid)
 		}
 	}
+	return nil
+}
+
+// ---- categories（v0.1.2 迁移 0003；内存实现同步语义） ----
+
+func (m *Mem) CreateCategory(_ context.Context, c *Category) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.servers[c.ServerID]; !ok {
+		return ErrNotFound
+	}
+	c.ID = m.next("category")
+	c.CreatedAt = time.Now()
+	cp := *c
+	m.categories[c.ID] = &cp
+	return nil
+}
+
+func (m *Mem) CategoryByID(_ context.Context, id int64) (*Category, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.categories[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	cp := *c
+	return &cp, nil
+}
+
+func (m *Mem) CategoriesOfServer(_ context.Context, serverID int64) ([]Category, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []Category{}
+	for _, c := range m.categories {
+		if c.ServerID == serverID {
+			out = append(out, *c)
+		}
+	}
+	// 与 MySQL 版 ORDER BY position, id 对齐——map 遍历序随机，不排序会导致
+	// GET /servers/{id}/channels 的分类顺序不确定（review S5）。
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Position != out[j].Position {
+			return out[i].Position < out[j].Position
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out, nil
+}
+
+// DeleteCategoryWithChannels 删除分类及其下全部频道（含各频道消息），
+// 与 MySQL 实现语义一致（单操作原子性由 m.mu 保证）。
+func (m *Mem) DeleteCategoryWithChannels(_ context.Context, id int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.categories[id]
+	if !ok {
+		return ErrNotFound
+	}
+	for cid, ch := range m.channels {
+		if ch.CategoryID != nil && *ch.CategoryID == c.ID {
+			delete(m.channels, cid)
+			for mid, msg := range m.messages {
+				if msg.ChannelID == cid {
+					delete(m.messages, mid)
+				}
+			}
+		}
+	}
+	delete(m.categories, id)
 	return nil
 }
 

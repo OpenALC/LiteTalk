@@ -23,6 +23,10 @@ const (
 	TypeRTCAnswer       = "rtc.answer"
 	TypeRTCICE          = "rtc.ice"
 	TypeVoiceState      = "voice.state"
+	// voice.request_state / voice.state_request：请求对方闭麦/静音（v0.1.2）。
+	// 定向转发、无权限强制——接收方自行决定，同 Discord「请求静音」语义。
+	TypeVoiceRequestState = "voice.request_state" // C→S 请求目标闭麦/静音
+	TypeVoiceStateRequest = "voice.state_request" // S→C 定向投递请求
 	TypeChatSend        = "chat.send"    // C→S 文字消息发送
 	TypeChatMessage     = "chat.message" // S→C 文字消息广播
 	TypeError           = "error"
@@ -134,6 +138,23 @@ type VoiceStateData struct {
 	Speaking *bool `json:"speaking,omitempty"`
 	Mute     *bool `json:"mute,omitempty"`
 	Deafen   *bool `json:"deafen,omitempty"`
+}
+
+// VoiceRequestStateData C→S voice.request_state：请求目标成员闭麦/静音。
+// 仅「请求」语义——服务端定向转发给目标，由目标自行决定是否执行（无权限强制）。
+type VoiceRequestStateData struct {
+	ChannelID string `json:"channel_id"`
+	TargetID  string `json:"target_id"`
+	Mute      *bool  `json:"mute,omitempty"`
+	Deafen    *bool  `json:"deafen,omitempty"`
+}
+
+// VoiceStateRequestData S→C voice.state_request：他人对你发出的闭麦/静音请求。
+type VoiceStateRequestData struct {
+	From   UserBrief `json:"from"`
+	Mute   *bool     `json:"mute,omitempty"`
+	Deafen *bool     `json:"deafen,omitempty"`
+	TS     int64     `json:"ts"`
 }
 
 // ChatSendData C→S chat.send：向频道发一条文字消息。
