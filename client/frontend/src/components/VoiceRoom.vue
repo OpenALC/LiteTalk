@@ -2,16 +2,21 @@
 // VoiceRoom 语音房间（v0.1.2）：成员卡片网格 + 底部语音控制条（voice-bar）。
 // voice-bar 仅在语音频道中时显示：真实 RTT 延迟 + 挂断；无频道名/人数
 //（走查 1/2：延迟不常驻、卡片位于语音列表区下方）。
-// 批次①：成员卡片「更多」弹层（音量调节/查看资料）；邀请卡点击生成邀请码并复制。
-import { ref } from 'vue'
+// 批次③：成员卡片右键菜单——他人=添加好友/调节播放音量/请求闭麦/请求静音，
+// 自己=离开频道（走查 6）；请求经 voice.request_state 定向转发，对方接受后生效。
+import { computed, ref } from 'vue'
 import {
   AudioLines, MicOff, HeadphoneOff, MoreHorizontal, UserPlus, Volume2, Info, PhoneOff,
+  UserPlus2,
 } from 'lucide-vue-next'
 import SoundOrb from '../components/SoundOrb.vue'
 import { useVoiceStore } from '../stores/voice'
 import { useServersStore } from '../stores/data'
 import { useNotifyStore } from '../stores/notify'
 import { goApp } from '../api/bridge'
+import type { PeerView } from '../api/types'
+import ContextMenu, { type CtxItem } from './ContextMenu.vue'
+import PromptDialog from './PromptDialog.vue'
 
 const voice = useVoiceStore()
 const servers = useServersStore()
@@ -52,22 +57,7 @@ function showProfile(m: { user_id: string; nickname: string }) {
   notify.show(`${m.nickname}（ID: ${m.user_id}）`)
 }
 
-// ---- 邀请卡：为当前服务器生成邀请码并复制（对齐原型：点击即复制） ----
-async function invite() {
-  const s = servers.currentServer
-  if (s.builtin) {
-    // 内置示例服务器不是服务端实体，无法签发邀请码。
-    notify.show('示例服务器暂不支持邀请，请先通过 + 创建服务器', true)
-    return
-  }
-  try {
-    const code = await goApp().CreateInviteCode(Number(s.id))
-    await navigator.clipboard.writeText(code)
-    notify.show('邀请码已复制，发给朋友吧')
-  } catch (e) {
-    notify.fromErr(e)
-  }
-}
+// ---- 邀请卡（新版 invite 在脚本后部，含剪贴板兜底） ----
 
 // hangup 挂断：离开当前语音频道（voice-bar 按钮）。
 async function hangup() {
@@ -77,13 +67,95 @@ async function hangup() {
     notify.fromErr(e, '离开频道失败')
   }
 }
+
+// ---- 成员右键菜单（批次③，走查 6） ----
+// 他人：添加好友 / 调节播放音量 / 请求闭麦 / 请求静音；
+// 自己：离开频道（对他人=踢人，需权限模型，超范围——设计决策 5.9）。
+const ctx = ref<{ x: number; y: number; member: PeerView } | null>(null)
+const isSelf = (m: PeerView) => m.user_id === voice.selfId()
+const ctxItems = computed<CtxItem[]>(() => {
+  const c = ctx.value
+  if (!c) return []
+  if (isSelf(c.member)) {
+    return [{ key: 'leave', label: '离开频道', icon: PhoneOff, danger: true }]
+  }
+  return [
+    { key: 'add-friend', label: '添加好友', icon: UserPlus2 },
+    { key: 'volume', label: '调节播放音量', icon: Volume2 },
+    { key: 'req-mute', label: '请求闭麦', icon: MicOff },
+    { key: 'req-deafen', label: '请求静音', icon: HeadphoneOff },
+  ]
+})
+
+function openMemberCtx(e: MouseEvent, m: PeerView) {
+  ctx.value = { x: e.clientX, y: e.clientY, member: m }
+}
+
+// addTarget：添加好友弹层预填的昵称。
+const addTarget = ref('')
+
+function onCtxSelect(key: string) {
+  const c = ctx.value
+  if (!c) return
+  const m = c.member
+  switch (key) {
+    case 'add-friend':
+      addTarget.value = m.nickname
+      break
+    case 'volume':
+      toggleMore(m.user_id)
+      break
+    case 'req-mute':
+      // 请求≠强制：定向转发给对方，对方在 toast 里选择接受（设计决策 5.4）。
+      voice.requestVoiceState(m.user_id, true, false).catch((e) => notify.fromErr(e, '请求失败'))
+      break
+    case 'req-deafen':
+      voice.requestVoiceState(m.user_id, false, true).catch((e) => notify.fromErr(e, '请求失败'))
+      break
+    case 'leave':
+      hangup()
+      break
+  }
+}
+
+async function onAddFriendConfirm(target: string) {
+  addTarget.value = ''
+  try {
+    await goApp().SendFriendRequest(target)
+    notify.show('好友请求已发送')
+  } catch (e) {
+    notify.fromErr(e)
+  }
+}
+
+// invite 邀请卡的剪贴板兜底：clipboard 失败（权限/非安全上下文）时把码直接
+// 展示在 toast 里，不让邀请码凭空丢失（批次① review 建议 8）。
+async function invite() {
+  const s = servers.currentServer
+  if (s.builtin) {
+    notify.show('示例服务器暂不支持邀请，请先通过 + 创建服务器', true)
+    return
+  }
+  try {
+    const code = await goApp().CreateInviteCode(Number(s.id))
+    try {
+      await navigator.clipboard.writeText(code)
+      notify.show('邀请码已复制，发给朋友吧')
+    } catch {
+      notify.show(`邀请码：${code}（复制失败，请手动抄录）`, true)
+    }
+  } catch (e) {
+    notify.fromErr(e)
+  }
+}
 </script>
 
 <template>
   <div class="voice-room">
     <!-- data-ctx：成员卡片右键菜单（v0.1.2 批次③在此挂自定义菜单） -->
     <div class="voice-grid" data-ctx>
-      <div v-for="m in voice.members" :key="m.user_id" class="vcard">
+      <div v-for="m in voice.members" :key="m.user_id" class="vcard"
+           @contextmenu.prevent="openMemberCtx($event, m)">
         <!-- 自己的卡片不弹「更多」（音量调节/资料都对他人有意义） -->
         <button v-if="m.user_id !== voice.selfId()" class="more" title="更多"
                 @click="toggleMore(m.user_id)">
@@ -136,6 +208,13 @@ async function hangup() {
         <PhoneOff :size="15" />挂断
       </button>
     </div>
+
+    <!-- 成员右键菜单 + 添加好友弹层（批次③） -->
+    <ContextMenu v-if="ctx" :x="ctx.x" :y="ctx.y" :items="ctxItems"
+                 @select="onCtxSelect" @close="ctx = null" />
+    <PromptDialog v-if="addTarget" title="添加好友" placeholder="昵称#1234"
+                  cta="发送请求" :initial="addTarget"
+                  @confirm="onAddFriendConfirm" @close="addTarget = ''" />
   </div>
 </template>
 

@@ -42,6 +42,7 @@ export const useVoiceStore = defineStore('voice', () => {
     if (!channelId.value) return
     channelId.value = ''
     members.value = []
+    latencyMs.value = 0 // Q4：挂断即归零，避免 voice-bar 重开瞬间残留旧延迟
     await goApp().LeaveChannel()
   }
 

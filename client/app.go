@@ -45,6 +45,11 @@ type App struct {
 	api  *state.APIClient
 	sess *state.Session // 登录并连接信令后创建
 
+	// statsGen 语音统计 ticker 的代际计数（review S9）：connectSession 覆盖会话时
+	// 旧 ticker 的「sess==nil 退出」窗口极小、极易漏退导致协程叠跑/统计双发——
+	// 每次建立/断开会话 +1，ticker 循环发现代际变更即退出。
+	statsGen atomic.Uint64
+
 	mu         sync.Mutex
 	refreshTok string
 	user       state.UserProfile
@@ -541,10 +546,16 @@ func (a *App) connectSession(token, nickname string) error {
 	a.sess = sess
 	a.mu.Unlock()
 	// 周期推送语音统计（延迟/成员数）。
+	// 代际校验：connectSession 覆盖旧会话时旧 ticker 立即退出（S9 防叠跑）。
+	// Add 返回新值——先 Add 再 Load 在并发 connect 下会让两个 ticker 拿到同代（review S5）。
+	gen := a.statsGen.Add(1)
 	go func() {
 		tick := time.NewTicker(2 * time.Second)
 		defer tick.Stop()
 		for range tick.C {
+			if a.statsGen.Load() != gen {
+				return
+			}
 			a.mu.Lock()
 			s := a.sess
 			a.mu.Unlock()
@@ -559,6 +570,7 @@ func (a *App) connectSession(token, nickname string) error {
 
 // disconnectSession 关闭会话。
 func (a *App) disconnectSession() {
+	a.statsGen.Add(1) // 旧 ticker 代际失效（S9）
 	a.mu.Lock()
 	s := a.sess
 	a.sess = nil

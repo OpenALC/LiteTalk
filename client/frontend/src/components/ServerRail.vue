@@ -42,9 +42,10 @@ const ctxItems: CtxItem[] = [
   { key: 'delete', label: '删除服务器', icon: Trash2, danger: true, confirm: true },
 ]
 
-// ---- 介绍页右键（仅删除；且仅当介绍页不是首页时才允许删） ----
+// ---- 介绍页右键（Q1：非首页时可「设为首页」改回，或删除介绍页） ----
 const introCtx = ref<{ x: number; y: number } | null>(null)
 const introCtxItems = computed<CtxItem[]>(() => [
+  { key: 'set-home', label: '设为首页', icon: Home },
   { key: 'hide-intro', label: '删除介绍页', icon: Trash2, danger: true, confirm: true },
 ])
 
@@ -62,6 +63,14 @@ function openIntroCtx(e: MouseEvent) {
 }
 
 async function onIntroSelect(key: string) {
+  if (key === 'set-home') {
+    // 把介绍页改回首页（换过首页后想改回来的入口，Q1）。
+    try {
+      await store.setHome(INTRO_ID)
+      notify.show('介绍页已设为首页')
+    } catch (e) { notify.fromErr(e) }
+    return
+  }
   if (key !== 'hide-intro') return
   try {
     await store.setIntroHidden(true)

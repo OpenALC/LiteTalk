@@ -3,7 +3,7 @@
 // 空白处右键创建频道/分类；分类头右键删除分类（含频道，二次确认）；
 // 分类数据源为 servers.groupsOf（服务端 categories 实体 + 内置示例本地语义）；
 // 底部齿轮跳转 /settings 独立路由页。
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import {
   ChevronDown, Eye, Hash, Lock, Mic, Volume2, Headphones, HeadphoneOff,
   MicOff, Settings, Pencil, Trash2, FolderPlus, Folder,
@@ -13,8 +13,11 @@ import { useServersStore } from '../stores/data'
 import { useVoiceStore } from '../stores/voice'
 import { useAuthStore } from '../stores/auth'
 import { useNotifyStore } from '../stores/notify'
+import { goApp } from '../api/bridge'
+import type { AudioSettings } from '../api/types'
 import ContextMenu, { type CtxItem } from './ContextMenu.vue'
 import PromptDialog from './PromptDialog.vue'
+import VolumeSlider from './VolumeSlider.vue'
 
 const router = useRouter()
 const servers = useServersStore()
@@ -24,11 +27,47 @@ const notify = useNotifyStore()
 
 const collapsed = ref<Record<string, boolean>>({})
 
-// 当前所在语音频道名（个人卡片状态行显示）
+// ---- 个人卡片音量悬停滑块（走查 5；批次③） ----
+// 初值从持久化读；@apply（松手）才 SetAudioSettings 热应用+落盘。
+const micVol = ref(100)
+const playVol = ref(100)
+const micOpen = ref(false)
+const playOpen = ref(false)
+
+onMounted(() => {
+  goApp().GetAudioSettings()
+    .then((s: AudioSettings) => {
+      micVol.value = s.mic_volume
+      playVol.value = s.playback_volume
+    })
+    .catch(() => {})
+})
+
+async function applyVolume(kind: 'mic' | 'playback', v: number) {
+  try {
+    const s = await goApp().GetAudioSettings()
+    if (kind === 'mic') {
+      s.mic_volume = v
+      micVol.value = v
+    } else {
+      s.playback_volume = v
+      playVol.value = v
+    }
+    await goApp().SetAudioSettings(s)
+  } catch (e) {
+    notify.fromErr(e, '音量保存失败')
+  }
+}
+
+// 当前所在语音频道名（个人卡片状态行显示）。
+// Q2：跨服务器查找——人在 A 服频道切到 B 服时不在 currentServer 里找裸 id。
 const currentVoiceChannelName = computed(() => {
   if (!voice.channelId) return ''
-  const ch = servers.currentServer.channels.find((c) => c.id === voice.channelId)
-  return ch?.name ?? voice.channelId
+  for (const s of servers.servers) {
+    const ch = s.channels.find((c) => c.id === voice.channelId)
+    if (ch) return ch.name
+  }
+  return ''
 })
 
 // groups：当前服务器的分类（channels group ∪ 空分类），数据源在 store。
@@ -260,18 +299,27 @@ async function onCatSelect(key: string) {
       </div>
       <div class="me-acts">
         <!-- 文案约定（实测走查 16）：麦克风=闭麦，扬声器=静音 -->
-        <button class="icon-btn" :class="{ danger: voice.muted }"
-                :title="voice.muted ? '取消闭麦' : '闭麦'"
-                @click="voice.setMute(!voice.muted)">
-          <MicOff v-if="voice.muted" :size="17" />
-          <Mic v-else :size="17" />
-        </button>
-        <button class="icon-btn" :class="{ danger: voice.deafened }"
-                :title="voice.deafened ? '取消静音' : '静音'"
-                @click="voice.setDeafen(!voice.deafened)">
-          <HeadphoneOff v-if="voice.deafened" :size="17" />
-          <Headphones v-else :size="17" />
-        </button>
+        <!-- v0.1.2 批次③（走查 5）：hover 按钮上方弹竖向音量滑块（0 底 120 顶） -->
+        <div class="vol-wrap" @mouseenter="micOpen = true" @mouseleave="micOpen = false">
+          <VolumeSlider :open="micOpen" :value="micVol" label="麦克风音量"
+                        @input="micVol = $event" @apply="applyVolume('mic', $event)" />
+          <button class="icon-btn" :class="{ danger: voice.muted }"
+                  :title="voice.muted ? '取消闭麦' : '闭麦'"
+                  @click="voice.setMute(!voice.muted)">
+            <MicOff v-if="voice.muted" :size="17" />
+            <Mic v-else :size="17" />
+          </button>
+        </div>
+        <div class="vol-wrap" @mouseenter="playOpen = true" @mouseleave="playOpen = false">
+          <VolumeSlider :open="playOpen" :value="playVol" label="扬声器音量"
+                        @input="playVol = $event" @apply="applyVolume('playback', $event)" />
+          <button class="icon-btn" :class="{ danger: voice.deafened }"
+                  :title="voice.deafened ? '取消静音' : '静音'"
+                  @click="voice.setDeafen(!voice.deafened)">
+            <HeadphoneOff v-if="voice.deafened" :size="17" />
+            <Headphones v-else :size="17" />
+          </button>
+        </div>
         <!-- v0.1.2：设置独立路由页 -->
         <button class="icon-btn" title="设置" @click="router.push('/settings')">
           <Settings :size="17" />
@@ -417,4 +465,6 @@ async function onCatSelect(key: string) {
 .icon-btn:active { transform: scale(0.92); }
 .icon-btn.danger { background: rgba(232, 91, 91, 0.12); color: var(--red); }
 .icon-btn.danger:hover { background: rgba(232, 91, 91, 0.2); }
+/* v0.1.2 批次③：音量滑块的定位父级（hover 按钮上方弹出） */
+.vol-wrap { position: relative; }
 </style>

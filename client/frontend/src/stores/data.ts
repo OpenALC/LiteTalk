@@ -28,10 +28,16 @@ export interface Server {
 }
 
 export interface Friend {
-  name: string
+  id: number // friendship id（备注/分组/删除 REST 的目标）
+  name: string // 显示名 = remark || nickname（服务端 remark 仅发起方向可写，对方视角恒空回落昵称——预期行为）
+  nickname: string // 原始昵称（添加好友/请求静音等场景用）
+  remark: string // 备注原文（空 = 未设置；编辑弹层初值用）
   status: 'online' | 'idle' | 'busy' | 'offline'
-  sub: string
-  inChannel?: boolean
+  sub: string // 状态行文案（在线/离开/忙碌/离线）
+  inChannel?: boolean // 服务端暂无「好友所在频道」数据，恒 false（按钮隐藏）
+  group: string // 好友分组（显示值，空归「好友」默认组；提交时映射回空串）
+  incoming: boolean // 对方发起=我接受的行。服务端 PATCH 仅发起方向可写——
+  // incoming=true 时备注/分组项必须禁用（review B1：否则 100% 弹 403）。
 }
 
 // isRealID 判断是否为服务端实体 ID（纯数字）；内置示例为字符串 ID。
@@ -179,12 +185,24 @@ export const useServersStore = defineStore('servers', () => {
   }
 
   // removeServer 删除服务器（REST，仅 owner）；删除当前所在服务器时回退到第一个。
+  // S8：删掉的正是首页服务器时 homeId 回落介绍页，避免下次启动选中幽灵 id。
   async function removeServer(id: string) {
     const s = findServer(id)
     if (!s) return
     if (s.builtin) throw new Error('示例服务器不可删除')
     await goApp().DeleteServer(Number(id))
     servers.value = servers.value.filter((x) => x.id !== id)
+    if (homeId.value === id) {
+      // 回落介绍页；若介绍页此前已被隐藏（S6：幽灵首页），改落第一个真实服务器。
+      if (introHidden.value) {
+        const first = servers.value.find((x) => x.id !== INTRO_ID)
+        homeId.value = first?.id ?? INTRO_ID
+        goApp().SetHomeServer(homeId.value === INTRO_ID ? '' : homeId.value).catch(() => {})
+      } else {
+        homeId.value = INTRO_ID
+        goApp().SetHomeServer('').catch(() => {})
+      }
+    }
     if (currentServerId.value === id) {
       selectServer(servers.value[0]?.id ?? '')
     }
@@ -289,27 +307,81 @@ export const useServersStore = defineStore('servers', () => {
 })
 
 export const useFriendsStore = defineStore('friends', () => {
-  const online = ref<Friend[]>([
-    { name: 'Yuki', status: 'online', sub: '休闲大厅', inChannel: true },
-    { name: 'Milo', status: 'online', sub: '休闲大厅', inChannel: true },
-    { name: 'Nael', status: 'idle', sub: '离开' },
-    { name: 'Sora', status: 'online', sub: '在线' },
-    { name: 'Lena', status: 'busy', sub: '忙碌' },
-    { name: 'Riva', status: 'online', sub: '在线' },
-    { name: 'Zeph', status: 'online', sub: '竞技室 #1', inChannel: true },
-    { name: 'Dax', status: 'online', sub: '在线' },
-  ])
-  const offline = ref<Friend[]>([
-    { name: 'Quinn', status: 'offline', sub: '离线' },
-    { name: 'Tara', status: 'offline', sub: '离线' },
-  ])
+  // v0.1.2：mock 已删，全部来自 ListFriends REST。accepted 按 user.status
+  // 分 online/offline 两组；pending+incoming 进「待处理」区（带接受按钮）。
+  const online = ref<Friend[]>([])
+  const offline = ref<Friend[]>([])
+  // pending：待处理的好友请求。incoming=对方发给我（可接受）；
+  // !incoming=我发出待对方回应（仅展示，S3：此前完全不可见）。
+  const pending = ref<{ id: number; name: string; outgoing: boolean }[]>([])
+
+  const STATUS_TEXT = { online: '在线', idle: '离开', busy: '忙碌', offline: '离线' } as const
+
+  // loadFriends 拉取并归组。服务端 friendships.remark/group 仅「发起方向」可写，
+  // 对方视角恒为空——显示名回落 nickname 属预期，不补双侧字段（服务端规格如此）。
+  async function loadFriends() {
+    const list = await goApp().ListFriends()
+    const on: Friend[] = []
+    const off: Friend[] = []
+    const pend: { id: number; name: string; outgoing: boolean }[] = []
+    for (const f of list) {
+      if (f.status === 'pending') {
+        pend.push({ id: f.id, name: f.user.nickname, outgoing: !f.incoming })
+        continue
+      }
+      if (f.status !== 'accepted') continue
+      const key: Friend['status'] =
+        f.user.status === 1 ? 'online' : f.user.status === 2 ? 'idle' : f.user.status === 3 ? 'busy' : 'offline'
+      const entry: Friend = {
+        id: f.id,
+        name: f.remark || f.user.nickname,
+        nickname: f.user.nickname,
+        remark: f.remark,
+        status: key,
+        sub: STATUS_TEXT[key],
+        group: f.group || '好友',
+        incoming: f.incoming,
+      }
+      ;(key === 'offline' ? off : on).push(entry)
+    }
+    // 组内按显示名排序，保证重启/刷新后顺序稳定。
+    const byName = (a: Friend, b: Friend) => a.name.localeCompare(b.name, 'zh')
+    online.value = on.sort(byName)
+    offline.value = off.sort(byName)
+    pending.value = pend
+  }
 
   // sendRequest 发送好友请求（REST；target 形如 昵称#1234，服务端拆分）。
   async function sendRequest(target: string) {
     await goApp().SendFriendRequest(target)
   }
 
-  return { online, offline, sendRequest }
+  // acceptRequest 接受好友请求后刷新列表。
+  async function acceptRequest(id: number) {
+    await goApp().AcceptFriend(id)
+    await loadFriends()
+  }
+
+  // removeFriend 删除好友（UI 已做二次确认）。
+  async function removeFriend(id: number) {
+    await goApp().RemoveFriend(id)
+    await loadFriends()
+  }
+
+  // setMeta 改备注或分组（UpdateFriend 全量写 remark+group，调用方传原值保持另一字段）。
+  // 默认组显示值「好友」提交时映射回空串——服务端空=默认组，持久化字面量会
+  // 把「空」语义写脏且回不去（review S2）。
+  async function setMeta(id: number, remark: string, group: string) {
+    await goApp().UpdateFriend(id, remark, group === '好友' ? '' : group)
+    await loadFriends()
+  }
+
+  // findById 列表内查条目（改备注/分组时取原值用）。
+  function findById(id: number): Friend | undefined {
+    return [...online.value, ...offline.value].find((f) => f.id === id)
+  }
+
+  return { online, offline, pending, loadFriends, sendRequest, acceptRequest, removeFriend, setMeta, findById }
 })
 
 export const useSettingsStore = defineStore('settings', () => {
