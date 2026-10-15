@@ -19,6 +19,7 @@ static int lt_set_inband_fec(OpusEncoder *e, int v)       { return opus_encoder_
 static int lt_set_dtx(OpusEncoder *e, int v)              { return opus_encoder_ctl(e, OPUS_SET_DTX(v)); }
 static int lt_set_plp(OpusEncoder *e, int v)              { return opus_encoder_ctl(e, OPUS_SET_PACKET_LOSS_PERC(v)); }
 static int lt_set_vbr(OpusEncoder *e, int v)              { return opus_encoder_ctl(e, OPUS_SET_VBR(v)); }
+static int lt_set_complexity(OpusEncoder *e, int v)       { return opus_encoder_ctl(e, OPUS_SET_COMPLEXITY(v)); }
 */
 import "C"
 
@@ -112,6 +113,15 @@ func (e *Encoder) SetVBR(on bool) error {
 		return ErrClosed
 	}
 	return ctlError(C.lt_set_vbr(e.st, cBool(on)))
+}
+
+// SetComplexity 设置编码复杂度 0–10（v0.1.2；0 最快，10 质量最高，默认 9）。
+// opus_encoder_ctl 热调安全。
+func (e *Encoder) SetComplexity(v int) error {
+	if e.st == nil {
+		return ErrClosed
+	}
+	return ctlError(C.lt_set_complexity(e.st, C.int(v)))
 }
 
 // Encode 把一帧 PCM（48k 下须为 120/240/480/960/1920/2880 采样）编码到 out。

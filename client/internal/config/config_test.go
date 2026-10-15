@@ -43,25 +43,29 @@ func TestCloseToTray(t *testing.T) {
 	}
 }
 
-// TestAudioSettings 语音设置：默认值回落 + 持久化往返（含低灵敏度档 0）。
+// TestAudioSettings 语音设置：默认值回落 + 持久化往返 + v0.1.2 新字段与旧版兼容映射。
 func TestAudioSettings(t *testing.T) {
 	m := tmpManager(t)
 
-	// 未设置：全部回落默认。
+	// 未设置：全部回落默认（v0.1.2：强度中档 2、AGC 关、VAD 中档 2、复杂度 9、双音量 100）。
 	d := m.GetAudioSettings()
 	if d.BitrateKbps != 32 || !*d.VBR || !*d.DTX || !*d.FEC {
 		t.Fatalf("默认 Opus 参数异常: %+v", d)
 	}
-	if d.PacketLoss != 10 || !*d.Denoise || d.Gain != 10 || *d.VADSens != 1 {
+	if d.PacketLoss != 10 || !*d.Denoise || d.DenoiseStrength != 2 ||
+		*d.AGC || *d.VADSens != 2 || d.Complexity != 9 ||
+		d.MicVolume != 100 || d.PlaybackVolume != 100 {
 		t.Fatalf("默认 DSP 参数异常: %+v", d)
 	}
 
-	// 写入自定义值（灵敏度 0=低 需能往返，不能用零值当"未设置"）。
+	// 写入自定义值（灵敏度 0=最低档 需能往返，不能用零值当"未设置"）。
 	f, tr := false, true
 	low := 0
 	custom := AudioSettings{
 		BitrateKbps: 48, VBR: &f, DTX: &tr, FEC: &f,
-		PacketLoss: 15, Denoise: &f, Gain: 15, VADSens: &low,
+		PacketLoss: 15, Denoise: &f, DenoiseStrength: 3, AGC: &tr,
+		VADSens: &low, Complexity: 5,
+		MicVolume: 60, PlaybackVolume: 120,
 	}
 	if err := m.SetAudioSettings(custom); err != nil {
 		t.Fatalf("SetAudioSettings: %v", err)
@@ -71,20 +75,78 @@ func TestAudioSettings(t *testing.T) {
 	if got.BitrateKbps != 48 || *got.VBR || !*got.DTX || *got.FEC {
 		t.Fatalf("Opus 设置未持久化: %+v", got)
 	}
-	if got.PacketLoss != 15 || *got.Denoise || got.Gain != 15 || *got.VADSens != 0 {
+	if got.PacketLoss != 15 || *got.Denoise || got.DenoiseStrength != 3 ||
+		!*got.AGC || *got.VADSens != 0 || got.Complexity != 5 ||
+		got.MicVolume != 60 || got.PlaybackVolume != 120 {
 		t.Fatalf("DSP 设置未持久化: %+v", got)
 	}
 
-	// 读路径收敛：手改 config.json 的越界值回落默认（写路径白名单只在 SetAudioSettings）。
+	// 读路径收敛：手改 config.json 的越界值回落默认。
 	if err := m.Update(func(c *Config) error {
-		c.Audio = &AudioSettings{BitrateKbps: 999, PacketLoss: 250, Gain: 999}
+		c.Audio = &AudioSettings{BitrateKbps: 999, PacketLoss: 250, Gain: 999, MicVolume: 250, Complexity: 99}
 		return nil
 	}); err != nil {
 		t.Fatalf("注入越界值: %v", err)
 	}
 	got = m.GetAudioSettings()
-	if got.BitrateKbps != 32 || got.PacketLoss != 10 || got.Gain != 10 {
+	if got.BitrateKbps != 32 || got.PacketLoss != 10 || got.Gain != 10 ||
+		got.MicVolume != 120 || got.Complexity != 9 {
 		t.Fatalf("越界值未收敛: %+v", got)
+	}
+}
+
+// TestAudioSettingsLegacy 旧版字段兼容：vad_sens 旧三档在「加载时」一次性迁移 0/2/4
+// （带 VadMigrated 标记幂等，不做每次读取的映射）；旧 Gain×10 换算麦克风音量并 clamp 120。
+// 模拟方式：直接写旧版 config.json 到盘，再构造 Manager（迁移发生在加载期）。
+func TestAudioSettingsLegacy(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	old := `{"audio":{"gain":15,"vad_sens":1}}`
+	if err := os.WriteFile(path, []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := NewWithPath(path)
+	got := m.GetAudioSettings()
+	if *got.VADSens != 2 {
+		t.Fatalf("旧 VADSens 1 应在加载时迁移为 2，实际 %d", *got.VADSens)
+	}
+	if got.MicVolume != 120 {
+		t.Fatalf("旧 Gain 15 应换算并 clamp 到 MicVolume 120，实际 %d", got.MicVolume)
+	}
+	// 幂等：加载迁移已落盘（vad_sens=2 + 标记），重新加载不得二次映射。
+	m2 := NewWithPath(path)
+	if v := *m2.GetAudioSettings().VADSens; v != 2 {
+		t.Fatalf("迁移应幂等，重新加载 vad_sens=%d", v)
+	}
+	// 新刻度保护：迁移后用户设五档刻度 1（较低档），重启不得被旧映射污染。
+	three := 1
+	if err := m2.SetAudioSettings(AudioSettings{VADSens: &three}); err != nil {
+		t.Fatal(err)
+	}
+	m3 := NewWithPath(path)
+	if v := *m3.GetAudioSettings().VADSens; v != 1 {
+		t.Fatalf("新刻度 1 不应被旧映射改写，实际 %d", v)
+	}
+}
+
+// TestUIPrefs v0.1.2 界面偏好：UI 销毁休眠/首页服务器/介绍页隐藏。
+func TestUIPrefs(t *testing.T) {
+	m := tmpManager(t)
+	if m.UIDestroyOnHibernate() || m.IntroHidden() || m.HomeServerID() != "" {
+		t.Fatal("默认值应为 关/未隐藏/介绍页")
+	}
+	if err := m.SetUIDestroyOnHibernate(true); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SetHomeServerID("srv-42"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SetIntroHidden(true); err != nil {
+		t.Fatal(err)
+	}
+	m2 := NewWithPath(m.Path())
+	if !m2.UIDestroyOnHibernate() || m2.HomeServerID() != "srv-42" || !m2.IntroHidden() {
+		t.Fatalf("界面偏好未持久化: %+v", m2.Get())
 	}
 }
 

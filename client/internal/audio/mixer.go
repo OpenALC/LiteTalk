@@ -62,6 +62,9 @@ type Mixer struct {
 	peerList atomic.Pointer[[]*PeerInput] // 无锁遍历快照
 
 	deafen atomic.Bool // 本地耳聋：排空各路并输出静音
+	// masterGain 扬声器总音量（v0.1.2；0–1.2 映射自设置页 0–120），
+	// 混音求和后、截断前施加；deafen 分支不受影响。
+	masterBits atomic.Uint64 // math.Float64bits(masterGain)，初值 1.0
 
 	// ---- Tick 私有的预分配缓冲 ----
 	acc   [FrameSize]int32
@@ -85,6 +88,7 @@ func NewMixer(writeOut func([]int16) int) *Mixer {
 		peers:    make(map[string]*PeerInput),
 		done:     make(chan struct{}),
 	}
+	m.masterBits.Store(math.Float64bits(1.0))
 	empty := []*PeerInput(nil)
 	m.peerList.Store(&empty)
 	return m
@@ -148,6 +152,12 @@ func (m *Mixer) SetDeafen(d bool) { m.deafen.Store(d) }
 // Deafen 当前耳聋状态。
 func (m *Mixer) Deafen() bool { return m.deafen.Load() }
 
+// SetMasterGain 扬声器总音量增益（1.0 不变；设置页 0–120 → 0–1.2），原子热调。
+func (m *Mixer) SetMasterGain(g float64) { m.masterBits.Store(math.Float64bits(g)) }
+
+// MasterGain 当前总音量增益。
+func (m *Mixer) MasterGain() float64 { return math.Float64frombits(m.masterBits.Load()) }
+
 // Tick 混一个 10ms 帧：读各路环（不足补零计 underrun）→ 增益 → int32 求和
 // 截断 → 写输出汇。零堆分配；仅允许单 goroutine 调用（Run 内部或测试）。
 func (m *Mixer) Tick() {
@@ -192,9 +202,13 @@ func (m *Mixer) Tick() {
 		}
 	}
 
+	master := m.MasterGain()
 	var clipped uint64
 	for i := range m.acc {
 		v := m.acc[i]
+		if master != 1.0 {
+			v = int32(float64(v) * master)
+		}
 		if v > math.MaxInt16 {
 			v = math.MaxInt16
 			clipped++

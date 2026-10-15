@@ -23,6 +23,9 @@ const (
 	TypeRTCAnswer       = "rtc.answer"        // 双向 SDP answer
 	TypeRTCIce          = "rtc.ice"           // 双向 trickle ICE
 	TypeVoiceState      = "voice.state"       // C→S→广播 说话/静音/耳聋
+	// v0.1.2 请求静音：C→S voice.request_state，S→C 定向 voice.state_request。
+	TypeVoiceRequestState = "voice.request_state"
+	TypeVoiceStateRequest = "voice.state_request"
 	TypeChatSend        = "chat.send"         // C→S
 	TypeChatMessage     = "chat.message"      // S→C
 	TypePresenceUpdate  = "presence.update"   // S→C
@@ -132,6 +135,22 @@ type VoiceStateData struct {
 	Speaking *bool  `json:"speaking,omitempty"`
 	Mute     *bool  `json:"mute,omitempty"`
 	Deafen   *bool  `json:"deafen,omitempty"`
+}
+
+// VoiceRequestStateData C→S voice.request_state：请求目标闭麦/静音（v0.1.2）。
+type VoiceRequestStateData struct {
+	ChannelID string `json:"channel_id"`
+	TargetID  string `json:"target_id"`
+	Mute      *bool  `json:"mute,omitempty"`
+	Deafen    *bool  `json:"deafen,omitempty"`
+}
+
+// VoiceStateRequestData S→C voice.state_request：他人对你发出的闭麦/静音请求。
+type VoiceStateRequestData struct {
+	From   UserBrief `json:"from"`
+	Mute   *bool     `json:"mute,omitempty"`
+	Deafen *bool     `json:"deafen,omitempty"`
+	TS     int64     `json:"ts"`
 }
 
 // ErrorData 是 error 消息的载荷。

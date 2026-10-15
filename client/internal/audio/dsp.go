@@ -47,21 +47,25 @@ func DefaultDSPConfig() DSPConfig {
 	}
 }
 
-// DSP 封装 RNNoise 降噪 + VAD + 增益 + 说话状态机。
-// Process 零分配；仅允许单 goroutine 调用（增益/开关/门限可跨 goroutine 原子修改）。
+// DSP 封装 RNNoise 降噪 + VAD + AGC + 增益 + 说话状态机。
+// Process 零分配；仅允许单 goroutine 调用（增益/开关/门限/强度/AGC 可跨 goroutine 原子修改）。
 type DSP struct {
-	cfg      DSPConfig
-	denoiser *rnnoise.Denoiser
+	cfg DSPConfig
+	// denoiserPtr 原子槽位：降噪强度切换时整体替换实例（Model 只读可共享，
+	// 替换只在 setter 发生，Process 侧无锁读取指针）。
+	denoiserPtr atomic.Pointer[rnnoise.Denoiser]
 
 	gainBits     atomic.Uint64 // math.Float64bits(Gain)
 	denoiseOn    atomic.Bool
 	speaking     atomic.Bool
 	vadEnterBits atomic.Uint64 // math.Float32bits(VADEnter)，热可调
 	vadExitBits  atomic.Uint64 // math.Float32bits(VADExit)，热可调
+	agcOn        atomic.Bool   // 自动增益开关（v0.1.2；默认关）
 
 	// 处理 goroutine 私有状态
 	enterRun int
 	exitRun  int
+	agcGain  float64 // AGC 当前增益（仅 Process goroutine 触达，初值 1.0）
 }
 
 // NewDSP 加载内嵌模型并创建降噪器。cfg 中的零值字段回落为默认值。
@@ -92,7 +96,8 @@ func NewDSP(cfg DSPConfig) (*DSP, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := &DSP{cfg: cfg, denoiser: dn}
+	d := &DSP{cfg: cfg, agcGain: 1.0}
+	d.denoiserPtr.Store(dn)
 	d.gainBits.Store(math.Float64bits(cfg.Gain))
 	d.denoiseOn.Store(cfg.Denoise)
 	d.vadEnterBits.Store(uint64(math.Float32bits(cfg.VADEnter)))
@@ -119,11 +124,58 @@ func (d *DSP) SetDenoise(on bool) { d.denoiseOn.Store(on) }
 // Denoise 返回降噪开关状态。
 func (d *DSP) Denoise() bool { return d.denoiseOn.Load() }
 
-// VAD 灵敏度档位（设置页「低/中/高」）。
+// AGC（自动增益）参数（v0.1.2）：以 RMS 目标迭代自适应增益，替代手动增益。
+// 步进不对称：下调快（防削波）、上调慢（防泵浦效应/呼吸感）。
 const (
-	VADSensLow  = 0 // 迟钝：enter 0.7 / exit 0.5（嘈杂环境防误触发）
-	VADSensMid  = 1 // 默认：enter 0.6 / exit 0.4（DefaultDSPConfig 校准值）
-	VADSensHigh = 2 // 灵敏：enter 0.5 / exit 0.3（轻声说话也能触发）
+	agcTargetRMS  = 1200.0 // 目标 RMS（int16 域，约 -18dBFS 的语音均值）
+	agcGainMin    = 0.2    // 增益下限（防止把底噪抬得过高）
+	agcGainMax    = 5.0    // 增益上限（防止削波前过载）
+	agcAttack     = 0.3    // 上调步进系数（慢）：弱信号逐帧小幅补增益
+	agcRelease    = 0.8    // 下调步进系数（快）：过强信号迅速压回
+	agcFloorRatio = 0.2    // 无语音门控时的 RMS 地板（低于 target*0.2 视为静音，保持增益不动）
+	agcInitGain   = 1.0
+)
+
+// SetAGC 开关自动增益（原子）。开启后 AGC 增益插在原固定增益之前应用。
+func (d *DSP) SetAGC(on bool) { d.agcOn.Store(on) }
+
+// AGC 当前开关状态。
+func (d *DSP) AGC() bool { return d.agcOn.Load() }
+
+// denoiseStrengthAggressiveness 降噪强度档 → RNNoise Aggressiveness（增益幂指数）。
+// rnnoise-go 构造参数：1.0 为原生行为，>1 抑制更狠；档间同时受默认 GainFloor 影响。
+func denoiseStrengthAggressiveness(level int) float64 {
+	switch level {
+	case 1: // 弱
+		return 1.0
+	case 3: // 强
+		return 2.0
+	default: // 中（含非法档回落）
+		return 1.5
+	}
+}
+
+// SetDenoiseStrength 切换降噪强度（v0.1.2）：按档重建 Denoiser 并原子替换。
+// Model 只读可跨实例共享（model.MustLoad 自带 once 缓存），重建零热路径开销。
+func (d *DSP) SetDenoiseStrength(level int) error {
+	dn, err := rnnoise.New(rnnoise.Options{
+		Model:          model.MustLoad(),
+		Aggressiveness: denoiseStrengthAggressiveness(level),
+	})
+	if err != nil {
+		return err
+	}
+	d.denoiserPtr.Store(dn)
+	return nil
+}
+
+// VAD 灵敏度五档（设置页 v0.1.2 刻度 0–4；旧三档 0/1/2 由 config 层映射为 0/2/4）。
+const (
+	VADSensLowest  = 0 // 最迟钝：enter 0.75 / exit 0.55（强噪环境防误触发）
+	VADSensLow     = 1 // 迟钝：enter 0.70 / exit 0.50
+	VADSensMid     = 2 // 默认：enter 0.60 / exit 0.40（DefaultDSPConfig 校准值）
+	VADSensHigh    = 3 // 灵敏：enter 0.50 / exit 0.30
+	VADSensHighest = 4 // 最灵敏：enter 0.45 / exit 0.25（轻声说话也能触发）
 )
 
 // SetVADSensitivity 按档位调整 VAD 双门限（原子写，回差恒 ≥0.2）。
@@ -131,12 +183,16 @@ const (
 func (d *DSP) SetVADSensitivity(level int) {
 	var enter, exit float32
 	switch level {
+	case VADSensLowest:
+		enter, exit = 0.75, 0.55
 	case VADSensLow:
-		enter, exit = 0.7, 0.5
+		enter, exit = 0.70, 0.50
 	case VADSensHigh:
-		enter, exit = 0.5, 0.3
+		enter, exit = 0.50, 0.30
+	case VADSensHighest:
+		enter, exit = 0.45, 0.25
 	default:
-		enter, exit = 0.6, 0.4
+		enter, exit = 0.60, 0.40
 	}
 	d.vadEnterBits.Store(uint64(math.Float32bits(enter)))
 	d.vadExitBits.Store(uint64(math.Float32bits(exit)))
@@ -165,25 +221,67 @@ func (d *DSP) VADExit() float32 {
 // Speaking 返回当前说话状态。
 func (d *DSP) Speaking() bool { return d.speaking.Load() }
 
-// Process 处理一个 480 采样（10ms）帧：降噪 → 增益 → RMS/VAD 说话判定。
+// Process 处理一个 480 采样（10ms）帧：降噪 → AGC → 固定增益 → RMS/VAD 说话判定。
 // out 与 in 长度都必须 >= FrameSize 且不得重叠；返回 VAD 概率（降噪关闭时为 0）。
 // 全程在预分配缓冲上操作，零堆分配。
 func (d *DSP) Process(out, in []int16) (float32, error) {
 	var vad float32
 	var err error
 	if d.denoiseOn.Load() {
-		vad, err = d.denoiser.ProcessInt16(out[:FrameSize], in[:FrameSize])
+		dn := d.denoiserPtr.Load()
+		vad, err = dn.ProcessInt16(out[:FrameSize], in[:FrameSize])
 		if err != nil {
 			return 0, err
 		}
 	} else {
 		copy(out[:FrameSize], in[:FrameSize])
 	}
+	// AGC（自动增益）：以 RMS 目标迭代自适应，插在固定增益前（v0.1.2，默认关）。
+	// 仅在疑似语音帧上迭代——静音期保持增益不动，否则安静段会在 ~150ms 内
+	// 把增益冲到上限，语音起始瞬间被 5× 放大产生爆音（review S3）。
+	if d.agcOn.Load() {
+		frameRMS := rmsInt16(out[:FrameSize])
+		if d.agcGate(vad, frameRMS) {
+			d.agcGain = d.nextAGCGain(frameRMS)
+		}
+		applyGain(out[:FrameSize], d.agcGain)
+	}
 	if g := d.Gain(); g != 1.0 {
 		applyGain(out[:FrameSize], g)
 	}
 	d.updateSpeaking(vad, rmsInt16(out[:FrameSize]))
 	return vad, nil
+}
+
+// agcGate 判定当前帧是否参与 AGC 迭代：有 VAD 时用 VAD 概率/说话状态，
+// 无 VAD（降噪关）时用 RMS 地板——低于地板视为静音/数字零，增益冻结。
+func (d *DSP) agcGate(vad float32, rms float64) bool {
+	if d.denoiseOn.Load() {
+		return vad > d.VADExit() || d.speaking.Load()
+	}
+	return rms >= agcTargetRMS*agcFloorRatio
+}
+
+// nextAGCGain 依当前帧 RMS 迭代 AGC 增益：低于目标慢升（attack 0.3），
+// 高于目标快降（release 0.8），限幅 [agcGainMin, agcGainMax]。仅 Process goroutine 调用。
+func (d *DSP) nextAGCGain(rms float64) float64 {
+	g := d.agcGain
+	if g <= 0 {
+		g = agcInitGain
+	}
+	switch {
+	case rms < agcTargetRMS*0.8:
+		g *= 1 + agcAttack*(agcTargetRMS*0.8-rms)/agcTargetRMS
+		if g > agcGainMax {
+			g = agcGainMax
+		}
+	case rms > agcTargetRMS*1.2:
+		g *= 1 - agcRelease*(rms-agcTargetRMS*1.2)/agcTargetRMS
+		if g < agcGainMin {
+			g = agcGainMin
+		}
+	}
+	return g
 }
 
 // updateSpeaking 双门限 + 迟滞帧数的状态机。仅处理 goroutine 调用。

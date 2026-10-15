@@ -80,12 +80,16 @@ func ResolveOpusConfig(c OpusConfig) OpusConfig {
 func boolPtr(b bool) *bool { return &b }
 
 // RuntimeSettings 应用层下发的运行时音频设置（Opus 须先经 ResolveOpusConfig）。
-// 由 Session.ApplyAudio 一次性热应用到管线。
+// 由 Session.ApplyAudio 一次性热应用到管线。v0.1.2 扩展复杂度/降噪强度/AGC/总音量。
 type RuntimeSettings struct {
-	Opus    OpusConfig
-	Denoise bool
-	Gain    float64 // 线性增益，1.0 为不变
-	VADSens int     // 0 低 / 1 中 / 2 高
+	Opus           OpusConfig
+	Denoise        bool
+	DenoiseStrength int // 1弱/2中/3强（v0.1.2）
+	AGC            bool // 自动增益（v0.1.2，默认关）
+	Gain           float64 // 麦克风线性增益，1.0 为不变
+	PlaybackGain   float64 // 扬声器总音量（mixer master gain），1.0 为不变
+	VADSens        int     // 0–4 五档
+	Complexity     int     // Opus 复杂度 0–10（≤0 表示不改）
 }
 
 // DefaultPipelineConfig 返回默认管线配置（声卡回环、降噪开、增益 1）。
@@ -419,6 +423,25 @@ func (p *Pipeline) SetDenoise(on bool) { p.dsp.SetDenoise(on) }
 
 // SetVADSensitivity 运行时调整 VAD 灵敏度档位（低/中/高）。
 func (p *Pipeline) SetVADSensitivity(level int) { p.dsp.SetVADSensitivity(level) }
+
+// SetDenoiseStrength 运行时切换降噪强度档（v0.1.2；重建 Denoiser 原子替换）。
+func (p *Pipeline) SetDenoiseStrength(level int) error { return p.dsp.SetDenoiseStrength(level) }
+
+// SetAGC 运行时开关自动增益（v0.1.2）。
+func (p *Pipeline) SetAGC(on bool) { p.dsp.SetAGC(on) }
+
+// SetComplexity 热调 Opus 复杂度 0–10（v0.1.2；编码中调用安全，内部持锁）。
+func (p *Pipeline) SetComplexity(v int) error {
+	if v < 0 || v > 10 {
+		return fmt.Errorf("复杂度非法: %d", v)
+	}
+	p.encMu.Lock()
+	defer p.encMu.Unlock()
+	if p.enc == nil {
+		return codec.ErrClosed
+	}
+	return p.enc.SetComplexity(v)
+}
 
 // applyOpusConfig 把已解析的 Opus 配置刷到编码器（持锁，可在运行中调用）。
 func (p *Pipeline) applyOpusConfig(enc *codec.Encoder, c OpusConfig) error {

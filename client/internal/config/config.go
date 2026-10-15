@@ -46,27 +46,44 @@ type Config struct {
 	Audio               *AudioSettings `json:"audio,omitempty"`          // 语音设置（码率/VBR/DTX/FEC/丢包率/降噪/增益/VAD 灵敏度）
 	AudioCapture        string `json:"audio_capture,omitempty"`        // 采集设备 ID（空=默认）
 	AudioPlayback       string `json:"audio_playback,omitempty"`       // 播放设备 ID（空=默认）
+	// v0.1.2：界面销毁休眠/首页服务器/介绍页隐藏（客户端级偏好，无需服务端）。
+	UIDestroyOnHibernate *bool  `json:"ui_destroy_on_hibernate,omitempty"` // 休眠时 WindowReloadApp 卸载界面（默认 false）
+	HomeServerID         string `json:"home_server_id,omitempty"`          // 首页服务器 id（空 = 介绍页 __intro__）
+	IntroHidden          *bool  `json:"intro_hidden,omitempty"`            // 介绍页已从服务器栏删除（默认 false）
+	// vad_sens_migrated：旧三档（0/1/2）→ 五档（0/2/4）的一次性迁移标记。
+	// v0.1.2 之前只存在 0/1/2 三个合法值，迁移后新刻度 1/2 与旧值歧义，
+	// 故用标记保证幂等（加载时迁移一次并落盘，之后读取不再做映射）。
+	VadMigrated bool `json:"vad_sens_migrated,omitempty"`
 }
 
 // AudioSettings 语音设置。指针/零值字段在读取时回落 DefaultAudioSettings。
+// v0.1.2 扩展：降噪强度/AGC/Opus 复杂度/麦克风与扬声器音量（0–120）。
+// 旧字段 Gain 保留读取兼容（mic_volume 为空时按 gain×10 换算）。
 type AudioSettings struct {
-	BitrateKbps int   `json:"bitrate_kbps,omitempty"` // Opus 目标码率 kbps：16/24/32/48/64（0 → 32）
-	VBR         *bool `json:"vbr,omitempty"`          // 可变码率（nil → true）
-	DTX         *bool `json:"dtx,omitempty"`          // 静音期非连续传输（nil → true）
-	FEC         *bool `json:"fec,omitempty"`          // 带内前向纠错（nil → true）
-	PacketLoss  int   `json:"packet_loss,omitempty"`  // 告知编码器的预期丢包率 %（0 → 10；FEC 关闭时无意义）
-	Denoise     *bool `json:"denoise,omitempty"`      // RNNoise 降噪（nil → true）
-	Gain        int   `json:"gain,omitempty"`         // 输入增益 ×10（0 → 10 = 1.0；范围 0–20）
-	VADSens     *int  `json:"vad_sens,omitempty"`     // VAD 灵敏度：0 低 / 1 中 / 2 高（nil → 1）
+	BitrateKbps    int   `json:"bitrate_kbps,omitempty"`    // Opus 目标码率 kbps：16/24/32/48/64（0 → 32）
+	VBR            *bool `json:"vbr,omitempty"`             // 可变码率（nil → true）
+	DTX            *bool `json:"dtx,omitempty"`             // 静音期非连续传输（nil → true）
+	FEC            *bool `json:"fec,omitempty"`             // 带内前向纠错（nil → true）
+	PacketLoss     int   `json:"packet_loss,omitempty"`     // 告知编码器的预期丢包率 %（0 → 10；FEC 关闭时无意义）
+	Denoise        *bool `json:"denoise,omitempty"`         // RNNoise 降噪总开关（nil → true）
+	DenoiseStrength int  `json:"denoise_strength,omitempty"` // 降噪强度 1弱/2中/3强（0 → 2；0 档配合 Denoise=false 即"关"）
+	AGC            *bool `json:"agc,omitempty"`             // 自动增益（nil → false；新功能默认关）
+	VADSens        *int  `json:"vad_sens,omitempty"`        // VAD 灵敏度 0–4 五档（nil → 2=中）
+	Complexity     int   `json:"opus_complexity,omitempty"` // Opus 复杂度 0–10（0 → 9）
+	Gain           int   `json:"gain,omitempty"`            // 旧版输入增益 ×10（0 → 10 = 1.0；已被 MicVolume 取代，读取时换算）
+	MicVolume      int   `json:"mic_volume,omitempty"`      // 麦克风音量 0–120（默认 100）
+	PlaybackVolume int   `json:"playback_volume,omitempty"` // 扬声器音量 0–120（默认 100）
 }
 
 // DefaultAudioSettings 语音设置出厂值（与管线既有硬编码一致）。
 func DefaultAudioSettings() AudioSettings {
-	t := true
-	one := 1
+	t, f := true, false
+	two := 2
 	return AudioSettings{
 		BitrateKbps: 32, VBR: &t, DTX: &t, FEC: &t,
-		PacketLoss: 10, Denoise: &t, Gain: 10, VADSens: &one,
+		PacketLoss: 10, Denoise: &t, DenoiseStrength: 2,
+		AGC: &f, VADSens: &two, Complexity: 9,
+		Gain: 10, MicVolume: 100, PlaybackVolume: 100,
 	}
 }
 
@@ -99,17 +116,48 @@ func (m *Manager) GetAudioSettings() AudioSettings {
 	if s.Denoise == nil {
 		s.Denoise = d.Denoise
 	}
-	if s.Gain < 0 || s.Gain > 200 { // 0 视为未设置（omitempty 吞掉），与 0.1 最小档区分
-		s.Gain = d.Gain
+	// 降噪强度：0（未设置）→ 默认中档；超出 1–3 收敛。
+	if s.DenoiseStrength < 1 || s.DenoiseStrength > 3 {
+		s.DenoiseStrength = d.DenoiseStrength
+	}
+	if s.AGC == nil {
+		s.AGC = d.AGC
 	}
 	if s.VADSens == nil {
 		s.VADSens = d.VADSens
-	}
-	switch *s.VADSens {
-	case 0, 1, 2:
-	default:
-		one := 1
+	} else if *s.VADSens > 4 {
+		one := 2
 		s.VADSens = &one
+	} else {
+		// 拷贝 int 再使用：s 是浅拷贝，*s.VADSens 直接改写活配置（数据竞争+持久化污染）。
+		v := *s.VADSens
+		s.VADSens = &v
+	}
+	// Opus 复杂度：0 视为未设置 → 默认 9（0 档不可达，UI 滑杆 min 0 但存储层 0=未设置；
+	// 与注释语义统一，避免"注释默认9/读取透传/运行时≤0不动"三处不一致）。
+	if s.Complexity <= 0 || s.Complexity > 10 {
+		s.Complexity = d.Complexity
+	}
+	// 麦克风音量：旧版 Gain（×10）→ MicVolume 换算；0（未设置）→ 100。
+	// Gain 自身也收敛（仅存储兼容字段，UI 已不用）。旧 gain 13–20 换算会越界，clamp 到 120——
+	// 否则读出来存不回去（SetAudioSettings 白名单拒绝 >120，设置页一保存就报错）。
+	if s.Gain < 0 || s.Gain > 200 {
+		s.Gain = d.Gain
+	}
+	if s.MicVolume <= 0 {
+		if s.Gain > 0 && s.Gain <= 20 {
+			s.MicVolume = s.Gain * 10
+		} else {
+			s.MicVolume = d.MicVolume
+		}
+	}
+	if s.MicVolume > 120 {
+		s.MicVolume = 120
+	}
+	if s.PlaybackVolume <= 0 {
+		s.PlaybackVolume = d.PlaybackVolume
+	} else if s.PlaybackVolume > 120 {
+		s.PlaybackVolume = 120
 	}
 	return s
 }
@@ -140,10 +188,31 @@ func New() *Manager {
 }
 
 // NewWithPath 指定路径创建 Manager（测试用）。
+// 加载后执行一次性数据迁移（如 vad_sens 旧三档→五档），迁移结果立即落盘。
 func NewWithPath(path string) *Manager {
 	m := &Manager{path: path}
 	m.cfg = m.read()
+	m.migrateOnce()
 	return m
+}
+
+// migrateOnce 执行有标记位保证幂等的配置迁移：
+//   - vad_sens：v0.1.2 之前仅存在 0/1/2（低/中/高三档），五档刻度上映射为 0/2/4。
+//     迁移靠 VadMigrated 标记只做一次——之后的新刻度 1/2 与旧值存在歧义，
+//     不能每次读都做映射（那会污染新用户配置）。
+func (m *Manager) migrateOnce() {
+	if m.cfg.VadMigrated {
+		return
+	}
+	if a := m.cfg.Audio; a != nil && a.VADSens != nil {
+		if v := *a.VADSens; v == 1 || v == 2 {
+			v *= 2
+			a.VADSens = &v
+		}
+	}
+	m.cfg.VadMigrated = true
+	// 文件不存在时（全新用户）也写盘建立标记，避免后续读出歧义值再迁移。
+	_ = m.Save(m.cfg)
 }
 
 // Path 返回配置文件路径。
@@ -289,6 +358,47 @@ func (m *Manager) CloseToTray() bool {
 func (m *Manager) SetCloseToTray(v bool) error {
 	return m.Update(func(c *Config) error {
 		c.CloseToTray = &v
+		return nil
+	})
+}
+
+// ---------- v0.1.2 界面偏好：UI 销毁休眠 / 首页服务器 / 介绍页隐藏 ----------
+
+// UIDestroyOnHibernate 休眠时是否 WindowReloadApp 卸载界面（默认 false）。
+func (m *Manager) UIDestroyOnHibernate() bool {
+	v := m.Get().UIDestroyOnHibernate
+	return v != nil && *v
+}
+
+// SetUIDestroyOnHibernate 持久化 UI 销毁休眠开关。
+func (m *Manager) SetUIDestroyOnHibernate(v bool) error {
+	return m.Update(func(c *Config) error {
+		c.UIDestroyOnHibernate = &v
+		return nil
+	})
+}
+
+// HomeServerID 首页服务器 id；空串 = 介绍页（__intro__）。
+func (m *Manager) HomeServerID() string { return m.Get().HomeServerID }
+
+// SetHomeServerID 持久化首页服务器（空串恢复介绍页为首页）。
+func (m *Manager) SetHomeServerID(id string) error {
+	return m.Update(func(c *Config) error {
+		c.HomeServerID = id
+		return nil
+	})
+}
+
+// IntroHidden 介绍页是否已被用户从服务器栏删除（默认 false）。
+func (m *Manager) IntroHidden() bool {
+	v := m.Get().IntroHidden
+	return v != nil && *v
+}
+
+// SetIntroHidden 持久化介绍页隐藏状态。
+func (m *Manager) SetIntroHidden(v bool) error {
+	return m.Update(func(c *Config) error {
+		c.IntroHidden = &v
 		return nil
 	})
 }

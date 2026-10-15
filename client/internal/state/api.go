@@ -22,12 +22,14 @@ type AuthTokens struct {
 // UserProfile 用户档案（无头像——硬性约束）。
 // id 与服务端 store.User 一致为数字（曾误声明 string，导致登录/注册/游客
 // 响应解码全部失败——服务端 wire 是 int64）。
+// Status：服务端 users.status（在线状态），好友列表按它归组 online/offline 用。
 type UserProfile struct {
 	ID       int64  `json:"id"`
 	Nickname string `json:"nickname"`
 	Tag      string `json:"tag"`
 	Email    string `json:"email"`
 	IsGuest  bool   `json:"is_guest"`
+	Status   int    `json:"status"` // 0=离线 1=在线 2=离开 3=忙碌（与服务端 users.status 对齐）
 }
 
 // AuthResult 登录/注册成功后的载荷。
@@ -507,6 +509,70 @@ func (c *APIClient) SendFriendRequest(target string) error {
 		return err
 	}
 	if status != http.StatusOK && status != http.StatusCreated {
+		return decodeError(status, data)
+	}
+	return nil
+}
+
+// FriendDTO 好友条目（与服务端 friendView 对齐；Remark/Group 仅发起方视角非空）。
+type FriendDTO struct {
+	ID       int64       `json:"id"`
+	Status   string      `json:"status"` // pending | accepted | blocked
+	Incoming bool        `json:"incoming"`
+	Remark   string      `json:"remark"`
+	Group    string      `json:"group"`
+	User     UserProfile `json:"user"`
+}
+
+// ListFriends 好友关系全量（含 pending；v0.1.2 替换前端 mock）。
+func (c *APIClient) ListFriends() ([]FriendDTO, error) {
+	status, data, err := c.get("/friends")
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, decodeError(status, data)
+	}
+	var list []FriendDTO
+	if err := json.Unmarshal(data, &list); err != nil {
+		return nil, fmt.Errorf("decode friends: %w", err)
+	}
+	return list, nil
+}
+
+// AcceptFriend 接受好友请求（仅被请求方可调）。
+func (c *APIClient) AcceptFriend(id int64) error {
+	status, data, err := c.post(fmt.Sprintf("/friends/requests/%d/accept", id), nil, true)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return decodeError(status, data)
+	}
+	return nil
+}
+
+// RemoveFriend 删除好友关系（双向皆可）。
+func (c *APIClient) RemoveFriend(id int64) error {
+	status, data, err := c.del(fmt.Sprintf("/friends/%d", id))
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return decodeError(status, data)
+	}
+	return nil
+}
+
+// UpdateFriend 设置备注/分组（仅发起方；空串=清除备注/移出分组）。
+// 调用方持有全量状态，两个字段总是整体提交。
+func (c *APIClient) UpdateFriend(id int64, remark, group string) error {
+	body := map[string]string{"remark": remark, "group": group}
+	status, data, err := c.patch(fmt.Sprintf("/friends/%d", id), body)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
 		return decodeError(status, data)
 	}
 	return nil

@@ -111,6 +111,26 @@ func TestMixerGain(t *testing.T) {
 	}
 }
 
+// TestMixerMasterGain 扬声器总音量：master gain 在求和后截断前施加（v0.1.2）。
+func TestMixerMasterGain(t *testing.T) {
+	m, out := newTestMixer()
+	a := m.AddPeer("a")
+	fillPeer(a, 2000, 1)
+	m.SetMasterGain(0.5)
+
+	m.Tick()
+
+	frame := readFrame(t, out)
+	for i, v := range frame {
+		if v != 1000 {
+			t.Fatalf("sample %d = %d, want 1000（2000×0.5）", i, v)
+		}
+	}
+	if m.MasterGain() != 0.5 {
+		t.Fatalf("MasterGain = %v", m.MasterGain())
+	}
+}
+
 func TestMixerMute(t *testing.T) {
 	m, out := newTestMixer()
 	a := m.AddPeer("a")

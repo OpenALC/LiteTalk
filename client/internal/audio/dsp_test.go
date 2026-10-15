@@ -252,7 +252,7 @@ func BenchmarkDSPProcess(b *testing.B) {
 	}
 }
 
-// TestSetVADSensitivity 灵敏度三档映射到 VAD 双门限，非法档回落中档。
+// TestSetVADSensitivity 灵敏度五档（v0.1.2）映射到 VAD 双门限，非法档回落中档。
 func TestSetVADSensitivity(t *testing.T) {
 	d, err := NewDSP(DSPConfig{Denoise: true})
 	if err != nil {
@@ -263,9 +263,11 @@ func TestSetVADSensitivity(t *testing.T) {
 		wantEnter float32
 		wantExit  float32
 	}{
+		{VADSensLowest, 0.75, 0.55},
 		{VADSensLow, 0.7, 0.5},
 		{VADSensMid, 0.6, 0.4},
 		{VADSensHigh, 0.5, 0.3},
+		{VADSensHighest, 0.45, 0.25},
 		{99, 0.6, 0.4}, // 非法档 → 中
 	}
 	for _, c := range cases {
@@ -273,6 +275,106 @@ func TestSetVADSensitivity(t *testing.T) {
 		if e, x := d.VADEnter(), d.VADExit(); e != c.wantEnter || x != c.wantExit {
 			t.Fatalf("level %d: enter=%.2f exit=%.2f, want %.2f/%.2f", c.level, e, x, c.wantEnter, c.wantExit)
 		}
+	}
+}
+
+// TestSetDenoiseStrength 强度切换重建 Denoiser 且稳态输出有差异（v0.1.2）。
+// RNNoise 有 20ms 算法延迟（Delay=2×FrameSize），首帧输出近零，
+// 须先灌入若干帧填满延迟线再比较稳态段。
+func TestSetDenoiseStrength(t *testing.T) {
+	d, err := NewDSP(DSPConfig{Denoise: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 确定性噪声帧序列（同一输入两次 run 完全一致）。
+	mkInputs := func() [][FrameSize]int16 {
+		x := uint32(12345)
+		out := make([][FrameSize]int16, 32)
+		for f := range out {
+			for i := range out[f] {
+				x ^= x << 13
+				x ^= x >> 17
+				x ^= x << 5
+				out[f][i] = int16(x%4000 - 2000)
+			}
+		}
+		return out
+	}
+	run := func(level int, inputs [][FrameSize]int16) [FrameSize]int16 {
+		if err := d.SetDenoiseStrength(level); err != nil {
+			t.Fatalf("SetDenoiseStrength(%d): %v", level, err)
+		}
+		var last [FrameSize]int16
+		var out [FrameSize]int16
+		for i := range inputs {
+			if _, err := d.Process(out[:], inputs[i][:]); err != nil {
+				t.Fatal(err)
+			}
+			last = out
+		}
+		return last
+	}
+	inputs := mkInputs()
+	weak, strong := run(1, inputs), run(3, inputs)
+	same := true
+	for i := range weak {
+		if weak[i] != strong[i] {
+			same = false
+			break
+		}
+	}
+	if same {
+		t.Fatal("弱/强档稳态输出完全一致，强度切换未生效")
+	}
+}
+
+// TestAGCConverge AGC 低幅输入增益上升、高幅输入增益下降并限幅（v0.1.2）。
+func TestAGCConverge(t *testing.T) {
+	d, err := NewDSP(DSPConfig{Denoise: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.SetAGC(true)
+
+	// 低幅 200 RMS 正弦：增益应上升。
+	var frame [FrameSize]int16
+	amp := int16(280) // ≈200 RMS
+	for i := range frame {
+		frame[i] = amp
+	}
+	var out [FrameSize]int16
+	for i := 0; i < 200; i++ {
+		if _, err := d.Process(out[:], frame[:]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lowRMS := rmsInt16(out[:])
+	if lowRMS <= 280 {
+		t.Fatalf("低幅输入 AGC 后 RMS=%.0f，未提升", lowRMS)
+	}
+
+	// 高幅 12000 RMS 方波：增益应下降（低于 1）。
+	big := int16(12000)
+	for i := range frame {
+		frame[i] = big
+	}
+	for i := 0; i < 200; i++ {
+		if _, err := d.Process(out[:], frame[:]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	highPeak := int32(0)
+	for _, s := range out {
+		if v := int32(s); v > highPeak || -v > highPeak {
+			if v < 0 {
+				highPeak = -v
+			} else {
+				highPeak = v
+			}
+		}
+	}
+	if highPeak > math.MaxInt16 {
+		t.Fatalf("高幅输入溢出：峰值 %d", highPeak)
 	}
 }
 

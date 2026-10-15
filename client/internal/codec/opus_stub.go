@@ -56,6 +56,9 @@ func (e *Encoder) SetPacketLossPerc(pct int) error { return ErrUnsupportedPlatfo
 // SetVBR stub。
 func (e *Encoder) SetVBR(on bool) error { return ErrUnsupportedPlatform }
 
+// SetComplexity 非 Windows stub。
+func (e *Encoder) SetComplexity(v int) error { return ErrUnsupportedPlatform }
+
 // Encode stub。
 func (e *Encoder) Encode(pcm []int16, out []byte) (int, error) {
 	return 0, ErrUnsupportedPlatform

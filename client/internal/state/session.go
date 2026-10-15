@@ -31,6 +31,8 @@ type Events struct {
 	OnConnection func(state string)
 	// OnSelf 入房后回传自己的 user_id（UI 标记「我」）。
 	OnSelf func(userID string)
+	// OnStateRequest 收到他人发来的闭麦/静音请求（v0.1.2；接收方自行决定执行）。
+	OnStateRequest func(fromID, fromNickname string, mute, deafen *bool)
 }
 
 // VoiceStats 推给 UI 的语音房统计快照。
@@ -278,6 +280,16 @@ func (s *Session) registerHandlers() {
 			s.ev.OnPeerLeave(d.UserID)
 		}
 	})
+	// voice.state_request：他人请求我闭麦/静音（v0.1.2，定向投递）。
+	s.ws.On(signal.TypeVoiceStateRequest, func(env signal.Envelope) {
+		var d signal.VoiceStateRequestData
+		if env.Decode(&d) != nil {
+			return
+		}
+		if s.ev.OnStateRequest != nil {
+			s.ev.OnStateRequest(d.From.ID, d.From.Nickname, d.Mute, d.Deafen)
+		}
+	})
 }
 
 // setupPeer 建立对 SFU 的单条 PeerConnection（初始 offer 一次，此后只应答）。
@@ -391,6 +403,7 @@ func (s *Session) RestartDevices(captureID, playbackID string) error {
 
 // ApplyAudio 把运行时音频设置热应用到媒体管线（通话中可调，未 Connect 时空操作）。
 // Opus 参数经 ResolveOpusConfig 回落默认；逐项应用，返回首个错误（不中断）。
+// v0.1.2 扩展：复杂度/降噪强度/AGC/扬声器总音量（mixer master gain）。
 func (s *Session) ApplyAudio(rs audio.RuntimeSettings) error {
 	if s.pipe == nil {
 		return nil
@@ -406,6 +419,12 @@ func (s *Session) ApplyAudio(rs audio.RuntimeSettings) error {
 		{"fec", func() error { return s.pipe.SetOpusFEC(*rs.Opus.FEC) }},
 		{"packet_loss", func() error { return s.pipe.SetOpusPacketLoss(rs.Opus.PacketLoss) }},
 	}
+	if rs.Complexity > 0 {
+		steps = append(steps, struct {
+			name string
+			fn   func() error
+		}{"complexity", func() error { return s.pipe.SetComplexity(rs.Complexity) }})
+	}
 	var firstErr error
 	for _, st := range steps {
 		if err := st.fn(); err != nil && firstErr == nil {
@@ -413,7 +432,14 @@ func (s *Session) ApplyAudio(rs audio.RuntimeSettings) error {
 		}
 	}
 	s.pipe.SetDenoise(rs.Denoise)
+	if err := s.pipe.SetDenoiseStrength(rs.DenoiseStrength); err != nil && firstErr == nil {
+		firstErr = fmt.Errorf("audio denoise_strength: %w", err)
+	}
+	s.pipe.SetAGC(rs.AGC)
 	s.pipe.SetGain(rs.Gain)
+	if s.mixer != nil {
+		s.mixer.SetMasterGain(rs.PlaybackGain)
+	}
 	s.pipe.SetVADSensitivity(rs.VADSens)
 	return firstErr
 }
@@ -465,6 +491,39 @@ func (s *Session) SendChat(channelID, content string) error {
 		"channel_id": channelID,
 		"content":    content,
 	})
+}
+
+// RequestVoiceState 请求目标成员闭麦/静音（v0.1.2 voice.request_state；
+// 纯请求语义，目标接受后自行执行，服务端无强制）。
+func (s *Session) RequestVoiceState(channelID, targetID string, mute, deafen bool) error {
+	if s.ws == nil {
+		return fmt.Errorf("session not connected")
+	}
+	return s.ws.Send(signal.TypeVoiceRequestState, signal.VoiceRequestStateData{
+		ChannelID: channelID,
+		TargetID:  targetID,
+		Mute:      &mute,
+		Deafen:    &deafen,
+	})
+}
+
+// VoiceStateView 供 UI 销毁重载后回填的语音态快照（v0.1.2）。
+type VoiceStateView struct {
+	ChannelID string     `json:"channel_id"`
+	Muted     bool       `json:"muted"`
+	Deafened  bool       `json:"deafened"`
+	Members   []PeerView `json:"members"`
+}
+
+// VoiceState 当前语音态快照（channelId 空 = 未在频道）。
+func (s *Session) VoiceState() VoiceStateView {
+	v := VoiceStateView{
+		ChannelID: s.roomID.Load().(string),
+		Muted:     s.muted.Load(),
+		Deafened:  s.deafened.Load(),
+		Members:   s.Members(),
+	}
+	return v
 }
 
 // ChatHandler 注入 chat.message 处理（app 层补挂）。

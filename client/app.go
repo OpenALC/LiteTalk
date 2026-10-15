@@ -146,11 +146,23 @@ func (a *App) startup(ctx context.Context) {
 	})
 }
 
-// emitHibernate 若开启「最小化时休眠」则通知前端进入休眠态。
+// emitHibernate 休眠处理（设置页「最小化时休眠界面」）：
+//   - 常规（默认）：发 sys:hibernate，前端卸载业务组件（省内存，前端状态保留）
+//   - UI 销毁模式（v0.1.2 设置开关）：隐藏窗口后整页 WindowReloadApp，
+//     释放 JS 堆/DOM；唤醒时前端凭 Go 侧状态（登录态/语音会话）自愈重建
 func (a *App) emitHibernate() {
-	if a.hibernateOnMinimize {
-		runtime.EventsEmit(a.ctx, "sys:hibernate")
+	if !a.hibernateOnMinimize {
+		return
 	}
+	if a.cfg.UIDestroyOnHibernate() {
+		go func() {
+			// 稍待隐藏完成再重载，避免重载瞬间窗口闪烁（窗口已隐藏不可见）。
+			time.Sleep(300 * time.Millisecond)
+			runtime.WindowReloadApp(a.ctx)
+		}()
+		return
+	}
+	runtime.EventsEmit(a.ctx, "sys:hibernate")
 }
 
 // onBeforeClose 拦截窗口关闭：默认隐藏到托盘而非退出（问题 4 兜底链）。
@@ -489,6 +501,13 @@ func (a *App) connectSession(token, nickname string) error {
 		OnSelf: func(userID string) {
 			runtime.EventsEmit(a.ctx, "voice:self", userID)
 		},
+		// v0.1.2 请求静音：定向事件给前端（载荷带昵称，前端弹「接受」）。
+		OnStateRequest: func(fromID, fromNickname string, mute, deafen *bool) {
+			runtime.EventsEmit(a.ctx, "voice:state_request", map[string]any{
+				"from_id": fromID, "nickname": fromNickname,
+				"mute": mute != nil && *mute, "deafen": deafen != nil && *deafen,
+			})
+		},
 	}
 	server := a.cfg.Resolve().WSURL
 	sess := state.NewSession(a.api, token, nickname, ev, log.Default())
@@ -644,6 +663,66 @@ func (a *App) SendFriendRequest(target string) error {
 	return a.api.SendFriendRequest(target)
 }
 
+// ---------- 好友管理（v0.1.2：接真实 REST，替换前端 mock） ----------
+
+// ListFriends 好友关系全量（accepted 分在线/离线由前端按 user.status 归组）。
+func (a *App) ListFriends() ([]state.FriendDTO, error) { return a.api.ListFriends() }
+
+// AcceptFriend 接受好友请求（仅被请求方）。
+func (a *App) AcceptFriend(id int64) error { return a.api.AcceptFriend(id) }
+
+// RemoveFriend 删除好友关系。
+func (a *App) RemoveFriend(id int64) error { return a.api.RemoveFriend(id) }
+
+// UpdateFriend 设置好友备注/分组（仅发起方向；空串清除）。
+func (a *App) UpdateFriend(id int64, remark, group string) error {
+	return a.api.UpdateFriend(id, remark, group)
+}
+
+// ---------- 请求静音（v0.1.2） ----------
+
+// RequestVoiceState 请求目标成员闭麦/静音（voice.request_state，定向转发）。
+func (a *App) RequestVoiceState(channelID, targetID string, mute, deafen bool) error {
+	a.mu.Lock()
+	s := a.sess
+	a.mu.Unlock()
+	if s == nil {
+		return fmt.Errorf("not connected")
+	}
+	return s.RequestVoiceState(channelID, targetID, mute, deafen)
+}
+
+// GetVoiceState 当前语音态快照（UI 销毁重载后回填用；channel_id 空=未在频道）。
+func (a *App) GetVoiceState() state.VoiceStateView {
+	a.mu.Lock()
+	s := a.sess
+	a.mu.Unlock()
+	if s == nil {
+		return state.VoiceStateView{}
+	}
+	return s.VoiceState()
+}
+
+// ---------- 界面偏好（v0.1.2：config.json 持久化） ----------
+
+// GetHomeServer 首页服务器 id（空 = 介绍页）。
+func (a *App) GetHomeServer() string { return a.cfg.HomeServerID() }
+
+// SetHomeServer 设置首页服务器（空串恢复介绍页为首页）。
+func (a *App) SetHomeServer(id string) error { return a.cfg.SetHomeServerID(id) }
+
+// GetIntroHidden 介绍页是否已从服务器栏删除。
+func (a *App) GetIntroHidden() bool { return a.cfg.IntroHidden() }
+
+// SetIntroHidden 持久化介绍页隐藏状态。
+func (a *App) SetIntroHidden(v bool) error { return a.cfg.SetIntroHidden(v) }
+
+// GetUIDestroyOnHibernate 休眠时是否卸载整个界面（WindowReloadApp）。
+func (a *App) GetUIDestroyOnHibernate() bool { return a.cfg.UIDestroyOnHibernate() }
+
+// SetUIDestroyOnHibernate 持久化 UI 销毁休眠开关。
+func (a *App) SetUIDestroyOnHibernate(v bool) error { return a.cfg.SetUIDestroyOnHibernate(v) }
+
 // SetPeerVolume 调整某远端成员音量（0.0–2.0）。
 func (a *App) SetPeerVolume(userID string, gain float64) {
 	a.mu.Lock()
@@ -680,17 +759,26 @@ func (a *App) SetAudioDevices(captureID, playbackID string) error {
 // ---------- 语音设置（Opus 编码参数 + DSP；持久化 config.json，通话中热生效） ----------
 
 // runtimeAudio 把持久化语音设置转成管线的运行时设置。
+// v0.1.2：麦克风音量(0–120)→Gain、扬声器音量→PlaybackGain，新增复杂度/强度/AGC。
 func (a *App) runtimeAudio() audio.RuntimeSettings {
 	as := a.cfg.GetAudioSettings()
+	complexity := as.Complexity
+	if complexity <= 0 {
+		complexity = 0 // 0 = 不主动改（管线构造已带默认 9）
+	}
 	return audio.RuntimeSettings{
 		Opus: audio.OpusConfig{
 			BitrateKbps: as.BitrateKbps,
 			VBR:         as.VBR, DTX: as.DTX, FEC: as.FEC,
 			PacketLoss: as.PacketLoss,
 		},
-		Denoise: as.Denoise != nil && *as.Denoise,
-		Gain:    float64(as.Gain) / 10,
-		VADSens: derefInt(as.VADSens, 1),
+		Denoise:         as.Denoise != nil && *as.Denoise,
+		DenoiseStrength: as.DenoiseStrength,
+		AGC:             as.AGC != nil && *as.AGC,
+		Gain:            float64(as.MicVolume) / 100,
+		PlaybackGain:    float64(as.PlaybackVolume) / 100,
+		VADSens:         derefInt(as.VADSens, 2),
+		Complexity:      complexity,
 	}
 }
 
@@ -706,6 +794,7 @@ func (a *App) GetAudioSettings() config.AudioSettings { return a.cfg.GetAudioSet
 
 // SetAudioSettings 持久化语音设置，并对当前会话热应用（未连接时仅持久化，
 // 下次 Connect 后经 connectSession 的 ApplyAudio 生效）。
+// v0.1.2 校验扩展：强度 0–3（0=回落）、复杂度 0–10、麦克风/扬声器 0–120。
 func (a *App) SetAudioSettings(s config.AudioSettings) error {
 	switch s.BitrateKbps {
 	case 0, 16, 24, 32, 48, 64: // 0 = 回落默认
@@ -715,8 +804,17 @@ func (a *App) SetAudioSettings(s config.AudioSettings) error {
 	if s.PacketLoss < 0 || s.PacketLoss > 100 {
 		return fmt.Errorf("丢包率非法: %d", s.PacketLoss)
 	}
-	if s.Gain < 0 || s.Gain > 20 {
-		return fmt.Errorf("增益非法: %d", s.Gain)
+	if s.DenoiseStrength < 0 || s.DenoiseStrength > 3 {
+		return fmt.Errorf("降噪强度非法: %d", s.DenoiseStrength)
+	}
+	if s.Complexity < 0 || s.Complexity > 10 {
+		return fmt.Errorf("复杂度非法: %d", s.Complexity)
+	}
+	if s.MicVolume < 0 || s.MicVolume > 120 {
+		return fmt.Errorf("麦克风音量非法: %d", s.MicVolume)
+	}
+	if s.PlaybackVolume < 0 || s.PlaybackVolume > 120 {
+		return fmt.Errorf("扬声器音量非法: %d", s.PlaybackVolume)
 	}
 	if err := a.cfg.SetAudioSettings(s); err != nil {
 		return err
