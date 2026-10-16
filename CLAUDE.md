@@ -108,7 +108,8 @@ go run github.com/rhysd/actionlint/cmd/actionlint@latest
 - 前端只在 `check-frontend` 构建一次，其他 job 通过 `download-artifact` 获取 `frontend-dist`。**不要在其他 job 里重复构建前端**；新增需要 embed 的 job 时，同样通过 `needs: check-frontend` 下载产物。
 - 只改 `*.md` 或 `LICENSE` 的提交不会触发 CI（paths-ignore）。标签推送不受这个过滤影响。
 - 同一 ref 的新提交会取消旧的检查运行；标签运行不会被取消。
-- 第三方工具要锁版本（例如 `NFPM_VERSION`），禁止使用 `@latest`。
+- 第三方工具要锁版本（例如 `NFPM_VERSION`），禁止使用 `@latest`。runner 也要锁版本（`ubuntu-24.04`），不用 `ubuntu-latest`：它即将迁移到 Ubuntu 26，会改变 glibc 和 WebKitGTK 版本。
+- 待办：各个 actions 仍是 v4/v5，运行在 Node 20 上，有弃用警告。升级到当前大版本（checkout/setup-go/setup-node/upload-artifact v7、download-artifact v8、pnpm/action-setup v6、action-gh-release v3）属于单独任务。打包 job 只在标签时运行，升级后要先用 `workflow_dispatch` 跑一次检查组，再借下一次发版验证打包组。
 - 新增的平台专属代码（`*_windows.go`、`*_linux.go`）必须在对应平台的检查 job 中被编译到。**不准**用 `t.Skip` 掩盖"某平台功能未实现"，平台功能缺失应该让测试失败或断言失败，而不是跳过。
 
 ### 监控 CI

@@ -40,7 +40,7 @@ jobs:
   check-tag:
     name: 标签格式
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: 校验 ${{ github.ref_name }}
         run: |
@@ -51,7 +51,7 @@ jobs:
 
   check-server:
     name: 服务端检查
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: server
@@ -77,7 +77,7 @@ jobs:
   # 前端只在这里构建一次，dist 以 artifact 分发给客户端检查与各打包 job
   check-frontend:
     name: 前端检查
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: client/frontend
@@ -111,7 +111,7 @@ jobs:
   check-client-linux:
     name: 客户端检查（Linux）
     needs: check-frontend
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: client
@@ -176,7 +176,7 @@ jobs:
     name: 服务端打包（linux amd64 / arm64）
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [check-tag, check-server]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -269,7 +269,7 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
@@ -362,7 +362,7 @@ jobs:
       needs.package-server.result == 'success' &&
       needs.package-client-windows.result == 'success' &&
       needs.package-client-linux.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
