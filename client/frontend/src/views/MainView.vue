@@ -4,7 +4,7 @@
 // 延迟/挂断已迁入 VoiceRoom 底部控制条；设置独立为 /settings 路由；
 // 休眠管控上提 App.vue（hibernated 时本视图整体不渲染）。
 import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { AudioLines, MessageCircle, Users } from 'lucide-vue-next'
+import { AudioLines, MessageCircle, Users, WifiOff } from 'lucide-vue-next'
 import { useRouter } from 'vue-router'
 import ServerRail from '../components/ServerRail.vue'
 import ChannelList from '../components/ChannelList.vue'
@@ -17,6 +17,7 @@ import { useChatStore } from '../stores/chat'
 import { useAuthStore } from '../stores/auth'
 import { INTRO_ID, useServersStore } from '../stores/data'
 import { useHotkeys } from '../composables/useHotkeys'
+import { eventsOff, eventsOn } from '../api/bridge'
 
 const router = useRouter()
 const voice = useVoiceStore()
@@ -51,6 +52,10 @@ useHotkeys(
 onMounted(() => {
   voice.bindEvents()
   chat.bindEvents()
+  // auth:session：Go 侧重试连上/中途断线时翻提示条。
+  eventsOn('auth:session', (d) => {
+    auth.setSignalOk((d as { ok?: boolean }).ok !== false)
+  })
   // UI 销毁重载后回填语音态（Go 会话未断）；未连接时为空态无副作用。
   voice.restoreFromGo().catch(() => {})
   // 首页偏好：介绍页默认首页；任意服务器可设为首页（config.json 持久化）。
@@ -67,10 +72,16 @@ onMounted(() => {
 onUnmounted(() => {
   voice.unbindEvents()
   chat.unbindEvents()
+  eventsOff('auth:session')
 })
 </script>
 
 <template>
+  <!-- 信令未连上（登录后连接失败重试中 / 中途断线）：顶部提示条 -->
+  <div v-if="auth.loggedIn && !auth.signalOk" class="signal-bar" role="status">
+    <WifiOff :size="14" />
+    <span>信令连接中，语音暂不可用</span>
+  </div>
   <div class="app">
     <ServerRail />
     <ChannelList v-if="!isIntro" />
@@ -109,6 +120,22 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+/* 信令提示条：置顶悬浮，不扰动三栏布局；动画只用 opacity（规范约束）。 */
+.signal-bar {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  z-index: 60;
+  height: 30px;
+  display: flex; align-items: center; justify-content: center; gap: 7px;
+  background: var(--brand-500);
+  color: var(--surface);
+  font-size: 12.5px; font-weight: 500;
+  animation: signal-pulse 1.6s ease-in-out infinite;
+}
+@keyframes signal-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.72; }
+}
 .app {
   flex: 1; min-height: 0;
   display: flex;

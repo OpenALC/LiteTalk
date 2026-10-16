@@ -11,6 +11,9 @@ export interface AuthResult {
   access_token: string
   refresh_token: string
   user: UserProfile
+  // 信令是否已连上（Go 侧登录后连接信令的首连结果）；false 时后台带退避重试，
+  // UI 显示提示条。可选仅因浏览器 mock 桩不产该字段。
+  session_ok?: boolean
 }
 
 // ServerConfig 服务端能力开关（GET /api/v1/config）。
