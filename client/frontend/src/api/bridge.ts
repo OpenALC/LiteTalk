@@ -212,6 +212,27 @@ export function isNative(): boolean {
   return !!window._wails?.flags
 }
 
+// whenNativeReady 等待 Go 侧注入 window._wails.flags（v3 在 NavigationCompleted
+// 时经 execJS 注入，晚于前端模块求值——路由守卫若抢先跑会把原生误判成 mock）。
+// Go 注入完成会派发 wails:runtime-config-ready 事件；超时按浏览器 mock 处理。
+// 必须在 mount 前 await，保证首个守卫的 isNative() 判定可靠。
+export function whenNativeReady(timeoutMs = 800): Promise<void> {
+  if (isNative() || typeof window === 'undefined') return Promise.resolve()
+  return new Promise((resolve) => {
+    const done = () => {
+      window.removeEventListener('wails:runtime-config-ready', done)
+      resolve()
+    }
+    window.addEventListener('wails:runtime-config-ready', done, { once: true })
+    // 附加监听后复查：事件恰在监听前派发（flags 已就位）时立即返回
+    if (isNative()) {
+      done()
+      return
+    }
+    setTimeout(done, timeoutMs)
+  })
+}
+
 // eventsOn Wails 事件订阅。v3 回调收 WailsEvent 对象，取 .data 对齐 v2 的直载荷语义。
 // 浏览器环境静默（mock 不产事件）。
 export function eventsOn(name: string, cb: (...args: unknown[]) => void) {

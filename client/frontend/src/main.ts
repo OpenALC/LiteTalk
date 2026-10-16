@@ -2,6 +2,7 @@ import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 import App from './App.vue'
 import router from './router'
+import { whenNativeReady } from './api/bridge'
 import './style.css'
 
 // 前端 console/异常转发到后端日志（%AppData%\LiteTalk\app.log），便于排障：
@@ -50,4 +51,10 @@ function installConsoleBridge() {
 }
 installConsoleBridge()
 
-createApp(App).use(createPinia()).use(router).mount('#app')
+// 等待 Go 注入原生标志（wails:runtime-config-ready）再挂载——否则首个路由
+// 守卫会把原生环境误判为浏览器 mock（GetMe 走桩恒成功，登录页被跳过）。
+async function bootstrap() {
+  await whenNativeReady()
+  createApp(App).use(createPinia()).use(router).mount('#app')
+}
+void bootstrap()
