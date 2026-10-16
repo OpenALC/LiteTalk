@@ -39,6 +39,16 @@ func main() {
 			// interceptClose 放行路径（关闭即退出/托盘不可用时托盘不可用）显式调 Quit。
 			DisableQuitOnLastWindowClosed: true,
 		},
+		Linux: application.LinuxOptions{
+			// 与 Windows 同理：destroy 休眠模式销毁唯一窗口后须由托盘唤醒重建。
+			DisableQuitOnLastWindowClosed: true,
+		},
+		Mac: application.MacOptions{
+			// macOS 语义相反：该字段为 true 时最后一窗关闭才终止进程，
+			// v3 默认 false（不终止）。显式写死防上游默认值漂移——
+			// destroy 模式同样依赖关窗后进程存活。
+			ApplicationShouldTerminateAfterLastWindowClosed: false,
+		},
 	})
 
 	// 窗口创建与生命周期钩子注册在 App.buildWindow（托盘唤醒重建时复用）。
