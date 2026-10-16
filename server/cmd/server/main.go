@@ -82,6 +82,7 @@ func main() {
 	refreshStore := auth.NewRefreshStore(kv)
 	codes := auth.NewEmailCodes(kv)
 	limits := auth.NewRateLimit(kv)
+	sessIndex := auth.NewSessionIndex(st, kv)
 
 	// SFU：ICE-Lite + 单 UDP mux（§5.2）
 	sfuInst, err := sfu.New(sfu.Config{
@@ -189,6 +190,8 @@ func main() {
 		// 可信反代（Nginx 等）的 IP/CIDR，命中 RemoteAddr 才采用 X-Real-IP；
 		// 不配置则只信 RemoteAddr。详见 deploy/env/litetalk.env.example。
 		TrustedProxies: splitList(os.Getenv("LITETALK_TRUSTED_PROXIES")),
+		// 多设备会话索引（v1.1.0 迁移 0004）：REST 中间件/WS 握手比对 sid。
+		Session: sessIndex,
 	})
 
 	mux := http.NewServeMux()

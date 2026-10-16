@@ -22,11 +22,13 @@ type registerReq struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
 	Code     string `json:"code"`
+	Device   string `json:"device"` // 设备类型，空=desktop
 }
 
 type loginReq struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
+	Device   string `json:"device"`
 }
 
 type refreshReq struct {
@@ -40,6 +42,22 @@ type logoutReq struct {
 type emailCodeReq struct {
 	Email   string `json:"email"`
 	Purpose string `json:"purpose"` // register | reset
+}
+
+// deviceType 校验并回落设备类型（空→desktop；白名单 [a-z0-9_-]，≤16 字符）。
+func deviceType(s string) (string, bool) {
+	if s == "" {
+		return "desktop", true
+	}
+	if len(s) > 16 {
+		return "", false
+	}
+	for _, c := range s {
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
+			return "", false
+		}
+	}
+	return s, true
 }
 
 type passwordResetReq struct {
@@ -103,6 +121,11 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	dev, okDev := deviceType(req.Device)
+	if !okDev {
+		writeErr(w, http.StatusBadRequest, "bad_device", "设备类型不合法（≤16 字符，仅 a-z0-9_-）")
+		return
+	}
 	req.Email = normalizeEmail(req.Email)
 	if !validNickname(req.Nickname) {
 		writeErr(w, http.StatusBadRequest, "bad_nickname", "昵称需为 2–16 个字符")
@@ -156,7 +179,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, err)
 		return
 	}
-	s.issueTokens(w, r, user, http.StatusCreated)
+	s.issueTokens(w, r, user, dev, http.StatusCreated)
 }
 
 // handleGuest POST /api/v1/auth/guest（simple 模式专属，免注册一键进入）。
@@ -170,6 +193,18 @@ func (s *Server) handleGuest(w http.ResponseWriter, r *http.Request) {
 	ok, err := s.limits.Allow(r.Context(), "guest:"+s.clientIP(r), 5, time.Minute)
 	if err != nil || !ok {
 		writeErr(w, http.StatusTooManyRequests, "rate_limited", "操作过于频繁，请稍后再试")
+		return
+	}
+	var req struct {
+		Device string `json:"device"`
+	}
+	// 请求体可为空（兼容老客户端）；非空时校验。
+	if r.ContentLength > 0 {
+		_ = decodeJSON(w, r, &req)
+	}
+	dev, okDev := deviceType(req.Device)
+	if !okDev {
+		writeErr(w, http.StatusBadRequest, "bad_device", "设备类型不合法")
 		return
 	}
 
@@ -195,7 +230,7 @@ func (s *Server) handleGuest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Printf("[audit] guest created user=%d ip=%s", user.ID, s.clientIP(r))
-	s.issueTokens(w, r, user, http.StatusCreated)
+	s.issueTokens(w, r, user, dev, http.StatusCreated)
 }
 
 // randDigits 返回 n 位随机数字串（crypto/rand；前导零保留）。
@@ -229,6 +264,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Email = normalizeEmail(req.Email)
+	dev, okDev := deviceType(req.Device)
+	if !okDev {
+		writeErr(w, http.StatusBadRequest, "bad_device", "设备类型不合法")
+		return
+	}
 	user, err := s.store.UserByEmail(r.Context(), req.Email)
 	if err != nil || !auth.CheckPassword(user.PasswordHash, req.Password) {
 		writeErr(w, http.StatusUnauthorized, "bad_credentials", "邮箱或密码错误")
@@ -236,7 +276,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Printf("[audit] login ok user=%d ip=%s", user.ID, s.clientIP(r))
-	s.issueTokens(w, r, user, http.StatusOK)
+	s.issueTokens(w, r, user, dev, http.StatusOK)
 }
 
 // handleRefresh POST /api/v1/auth/refresh（旋转刷新令牌）
@@ -249,18 +289,34 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_request", "缺少 refresh_token")
 		return
 	}
-	// 旧令牌哈希反查：逐用户扫不可行，refresh 存储按 userID 键控；
-	// 客户端 refresh 请求附带 access_token 解析 uid 更稳——此处约定请求体可带 user_id，
-	// 或由客户端用过期 access 中的 uid。简化：请求体带 user_id。
-	// 为兼容只传 refresh_token 的客户端，token 中嵌入 uid 前缀。
-	uid, ok := parseRefreshUID(req.RefreshToken)
+	// 先尝试解析新格式 uid.sid.rand；旧格式 uid.rand 走兼容分支。
+	uid, sid, ok := auth.ParseRefreshToken(req.RefreshToken)
 	if !ok {
-		writeErr(w, http.StatusUnauthorized, "unauthorized", "refresh_token 不合法")
-		return
+		// 旧格式：只有 uid.rand（无 sid）。
+		uid, ok = parseRefreshUID(req.RefreshToken)
+		if !ok {
+			writeErr(w, http.StatusUnauthorized, "unauthorized", "refresh_token 不合法")
+			return
+		}
+		sid = "" // 旧格式，无 sid 约束
 	}
-	plain, err := s.refresh.Rotate(r.Context(), uid, req.RefreshToken)
+	// sid 与当前会话不符：另一会话已接管（session_replaced）。
+	if s.sess != nil && sid != "" {
+		curSid, err := s.sess.Get(r.Context(), uid, "desktop")
+		if err == nil && curSid != "" && sid != curSid {
+			w.Header().Set("X-LiteTalk-Auth", "session_replaced")
+			writeErr(w, http.StatusUnauthorized, "session_replaced", "账号已在其他设备登录")
+			return
+		}
+	}
+	plain, err := s.refresh.Rotate(r.Context(), uid, req.RefreshToken, "desktop", sid)
 	if err != nil {
-		writeErr(w, http.StatusUnauthorized, "unauthorized", "refresh_token 无效或已吊销")
+		var code = "unauthorized"
+		if errors.Is(err, auth.ErrSessionReplayed) {
+			code = "session_replayed"
+			w.Header().Set("X-LiteTalk-Auth", "session_replayed")
+		}
+		writeErr(w, http.StatusUnauthorized, code, "refresh_token 无效或已吊销")
 		return
 	}
 	user, err := s.store.UserByID(r.Context(), uid)
@@ -268,7 +324,7 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, err)
 		return
 	}
-	access, err := s.jwt.SignAccess(user.ID, user.Nickname, user.Tag)
+	access, err := s.jwt.SignAccess(user.ID, user.Nickname, user.Tag, sid, "desktop")
 	if err != nil {
 		writeStoreErr(w, err)
 		return
@@ -293,14 +349,18 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "unauthorized", "refresh_token 不合法")
 		return
 	}
-	if !s.refresh.Match(r.Context(), uid, req.RefreshToken) {
+	if !s.refresh.Match(r.Context(), uid, req.RefreshToken, "desktop") {
 		writeErr(w, http.StatusUnauthorized, "unauthorized", "refresh_token 无效或已吊销")
 		return
 	}
-	if err := s.refresh.Revoke(r.Context(), uid); err != nil {
+	if err := s.refresh.Revoke(r.Context(), uid, "desktop"); err != nil {
 		s.log.Printf("[audit] logout 吊销失败 uid=%d err=%v", uid, err)
 		writeErr(w, http.StatusInternalServerError, "internal", "服务器内部错误")
 		return
+	}
+	// 删除该设备会话记录。
+	if s.sess != nil {
+		_ = s.sess.Delete(r.Context(), uid, "desktop")
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -402,19 +462,32 @@ func (s *Server) handlePasswordReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 重置后吊销全部刷新令牌。
-	_ = s.refresh.Revoke(r.Context(), user.ID)
+	_ = s.refresh.RevokeAll(r.Context(), user.ID)
+	// 删除该用户全部设备会话记录。
+	if s.sess != nil {
+		_ = s.sess.DeleteAll(r.Context(), user.ID)
+	}
 	s.log.Printf("[audit] password reset user=%d ip=%s", user.ID, s.clientIP(r))
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// issueTokens 签发 access+refresh 并响应。
-func (s *Server) issueTokens(w http.ResponseWriter, r *http.Request, user *store.User, status int) {
-	access, err := s.jwt.SignAccess(user.ID, user.Nickname, user.Tag)
+// issueTokens 签发 access+refresh 并响应。dev=设备类型（desktop/mobile/…）。
+func (s *Server) issueTokens(w http.ResponseWriter, r *http.Request, user *store.User, dev string, status int) {
+	// 登录/注册/游客成功时覆盖会话（新 sid 即吊销旧会话）。
+	sid := ""
+	if s.sess != nil {
+		sid, err := s.sess.Upsert(r.Context(), user.ID, dev, s.clientIP(r))
+		if err != nil {
+			s.log.Printf("[session] upsert 失败 uid=%d dev=%s err=%v", user.ID, dev, err)
+		}
+		_ = sid
+	}
+	access, err := s.jwt.SignAccess(user.ID, user.Nickname, user.Tag, sid, dev)
 	if err != nil {
 		writeStoreErr(w, err)
 		return
 	}
-	refresh, err := s.refresh.IssueWithUID(r.Context(), user.ID)
+	refresh, err := s.refresh.IssueWithUID(r.Context(), user.ID, dev, sid)
 	if err != nil {
 		writeStoreErr(w, err)
 		return

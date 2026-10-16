@@ -32,7 +32,8 @@ type Server struct {
 	mailer   mailer.Mailer
 	authMode string
 	log      *log.Logger
-	trusted  []*net.IPNet // 可信反代（RemoteAddr 命中才采用 X-Real-IP）
+	trusted  []*net.IPNet       // 可信反代（RemoteAddr 命中才采用 X-Real-IP）
+	sess     *auth.SessionIndex // 多设备会话索引（v1.1.0 迁移 0004）
 }
 
 // Config 构造配置。
@@ -48,6 +49,8 @@ type Config struct {
 	// TrustedProxies 可信反代的 IP/CIDR 列表（逗号分隔 env 在 main 解析后传入）。
 	// 空 = 不信任任何代理：直接取 RemoteAddr，伪造 X-Real-IP 无法绕过限流（P1）。
 	TrustedProxies []string
+	// Session 多设备会话索引（nil 时跳过 sid 校验，仅供测试/迁移期过渡）。
+	Session *auth.SessionIndex
 }
 
 // New 构造 API Server。
@@ -74,6 +77,7 @@ func New(cfg Config) *Server {
 		authMode: mode,
 		log:      lg,
 		trusted:  parseTrustedProxies(lg, cfg.TrustedProxies),
+		sess:     cfg.Session,
 	}
 }
 
@@ -172,6 +176,8 @@ func currentUser(r *http.Request) *auth.Claims {
 }
 
 // auth 鉴权中间件：Authorization: Bearer <access_jwt>。
+// 多设备会话（v1.1.0）：比对 claims.Sid 与当前会话 sid；不符 → 401 session_replaced。
+// 旧版本令牌（无 sid）在 sess 存在时也拒绝（会话约束生效）；sess 为 nil 时跳过（测试/过渡）。
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		h := r.Header.Get("Authorization")
@@ -184,6 +190,14 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 		if err != nil {
 			writeErr(w, http.StatusUnauthorized, "unauthorized", "访问令牌无效或已过期")
 			return
+		}
+		if s.sess != nil {
+			curSid, err := s.sess.Get(r.Context(), claims.UserID, claims.Dev)
+			if err != nil || curSid == "" || claims.Sid == "" || claims.Sid != curSid {
+				w.Header().Set("X-LiteTalk-Auth", "session_replaced")
+				writeErr(w, http.StatusUnauthorized, "session_replaced", "账号已在其他设备登录")
+				return
+			}
 		}
 		next(w, r.WithContext(context.WithValue(r.Context(), userKey, claims)))
 	}
