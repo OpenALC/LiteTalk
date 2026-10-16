@@ -3,6 +3,7 @@ package audio
 import (
 	"math"
 	"testing"
+	"time"
 )
 
 // sineFrame 生成 440Hz 正弦 + 均匀噪声混合的一帧（模拟说话信号，spike 同款）。
@@ -249,6 +250,91 @@ func BenchmarkDSPProcess(b *testing.B) {
 		if _, err := d.Process(out, in); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// BenchmarkDSPSilenceAfterSpeech 防 denormal 回归基准：先 3s 语音帧再 60s 纯零帧，
+// 分别统计两阶段每帧平均耗时并输出比值。修复前静音段会因 IIR 状态落入次正规数
+// 区间而比语音段慢 1.4~2.3 倍；短路后静音段只有峰值扫描，比值应远小于 1。
+// 必须 0 allocs/op。
+func BenchmarkDSPSilenceAfterSpeech(b *testing.B) {
+	d, err := NewDSP(DefaultDSPConfig())
+	if err != nil {
+		b.Fatal(err)
+	}
+	in := make([]int16, FrameSize)
+	out := make([]int16, FrameSize)
+	var phase float64
+	var rng uint32 = 0x5EED
+
+	const speechFrames = 300   // 3s
+	const silenceFrames = 6000 // 60s
+
+	var speechNS, silenceNS int64
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		t0 := time.Now()
+		for f := 0; f < speechFrames; f++ {
+			sineNoiseFrame(in, &phase, 12000, 2000, &rng)
+			if _, err := d.Process(out, in); err != nil {
+				b.Fatal(err)
+			}
+		}
+		speechNS += time.Since(t0).Nanoseconds()
+
+		clear(in)
+		t1 := time.Now()
+		for f := 0; f < silenceFrames; f++ {
+			if _, err := d.Process(out, in); err != nil {
+				b.Fatal(err)
+			}
+		}
+		silenceNS += time.Since(t1).Nanoseconds()
+	}
+	b.StopTimer()
+
+	speechAvg := float64(speechNS) / float64(b.N) / speechFrames
+	silenceAvg := float64(silenceNS) / float64(b.N) / silenceFrames
+	b.Logf("speech %.0f ns/frame, silence %.0f ns/frame, silence/speech = %.3f",
+		speechAvg, silenceAvg, silenceAvg/speechAvg)
+}
+
+// TestDSPSilenceAfterSpeech 防 denormal 回归：同一管线先语音再静音，静音段每帧
+// 耗时不得超过语音段的 1.2 倍。修复前静音段 IIR 状态停在次正规数区间，实测
+// 比值 1.4~2.3；短路后静音段只做峰值扫描，比值应远小于 1。
+func TestDSPSilenceAfterSpeech(t *testing.T) {
+	d := newTestDSP(t, nil)
+
+	in := make([]int16, FrameSize)
+	out := make([]int16, FrameSize)
+	var phase float64
+	var rng uint32 = 0xD1CE
+
+	const speechFrames = 300   // 3s 语音（RNNoise 状态打满非零）
+	const silenceFrames = 3000 // 30s 纯零
+
+	t0 := time.Now()
+	for f := 0; f < speechFrames; f++ {
+		sineNoiseFrame(in, &phase, 12000, 2000, &rng)
+		if _, err := d.Process(out, in); err != nil {
+			t.Fatalf("Process: %v", err)
+		}
+	}
+	speechAvg := float64(time.Since(t0).Nanoseconds()) / speechFrames
+
+	clear(in)
+	t1 := time.Now()
+	for f := 0; f < silenceFrames; f++ {
+		if _, err := d.Process(out, in); err != nil {
+			t.Fatalf("Process: %v", err)
+		}
+	}
+	silenceAvg := float64(time.Since(t1).Nanoseconds()) / silenceFrames
+
+	t.Logf("speech %.0f ns/frame, silence %.0f ns/frame, ratio %.3f", speechAvg, silenceAvg, silenceAvg/speechAvg)
+	if silenceAvg > speechAvg*1.2 {
+		t.Fatalf("静音段每帧 %.0fns > 语音段 %.0fns 的 1.2 倍，denormal 短路疑似失效", silenceAvg, speechAvg)
 	}
 }
 

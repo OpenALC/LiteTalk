@@ -63,9 +63,10 @@ type DSP struct {
 	agcOn        atomic.Bool   // 自动增益开关（v0.1.2；默认关）
 
 	// 处理 goroutine 私有状态
-	enterRun int
-	exitRun  int
-	agcGain  float64 // AGC 当前增益（仅 Process goroutine 触达，初值 1.0）
+	enterRun  int
+	exitRun   int
+	silentRun int     // 连续纯零帧计数（防 denormal 短路用，见 Process）
+	agcGain   float64 // AGC 当前增益（仅 Process goroutine 触达，初值 1.0）
 }
 
 // NewDSP 加载内嵌模型并创建降噪器。cfg 中的零值字段回落为默认值。
@@ -225,6 +226,26 @@ func (d *DSP) Speaking() bool { return d.speaking.Load() }
 // out 与 in 长度都必须 >= FrameSize 且不得重叠；返回 VAD 概率（降噪关闭时为 0）。
 // 全程在预分配缓冲上操作，零堆分配。
 func (d *DSP) Process(out, in []int16) (float32, error) {
+	// 纯零/近零帧短路：跳过 RNNoise。设备静音时输入为精确 0，RNNoise 内部的
+	// 输入高通 IIR 状态会指数衰减进 float32 次正规数区间并长期停留，x86 上走
+	// 微码慢路径，单帧耗时翻数倍（实测 181µs → 250~413µs）。短路后整个静音期
+	// 不再触碰降噪器状态，denormal 只是静止数据，没有 CPU 代价；连续静音
+	// 500ms 再 Reset 一次，把残留状态清干净，避免下次说话首帧被拖慢。
+	// 与完整路径副作用一致：输出全零、vad=0、说话状态机按零 RMS 推进
+	// （vad/rms 传 0 与降噪器对纯零输入的输出在门限语义上等价）、AGC 增益冻结。
+	if peakAbs(in[:FrameSize]) <= 1 {
+		clear(out[:FrameSize])
+		d.silentRun++
+		if d.silentRun == 50 {
+			// Reset 就地清零全部滤波状态（含高通 biquad 的 memHP），零分配；
+			// 若恰逢 SetDenoiseStrength 刚替换实例，Reset 落在旧实例上亦无碍。
+			d.denoiserPtr.Load().Reset()
+		}
+		d.updateSpeaking(0, 0)
+		return 0, nil
+	}
+	d.silentRun = 0
+
 	var vad float32
 	var err error
 	if d.denoiseOn.Load() {
@@ -335,6 +356,22 @@ func applyGain(p []int16, g float64) {
 			p[i] = int16(v)
 		}
 	}
+}
+
+// peakAbs 返回帧内绝对值峰值（零分配）。短路判定用：只有 |sample| <= 1 的
+// 帧才值得走零输出捷径，阈值取 1 是"数字零"与"模拟底噪"的分界。
+func peakAbs(p []int16) int32 {
+	var peak int32
+	for _, s := range p {
+		v := int32(s)
+		if v < 0 {
+			v = -v
+		}
+		if v > peak {
+			peak = v
+		}
+	}
+	return peak
 }
 
 // rmsInt16 计算 RMS（零分配）。
