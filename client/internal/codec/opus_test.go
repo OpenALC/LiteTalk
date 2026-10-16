@@ -40,9 +40,9 @@ func newTestEncoder(t *testing.T) *Encoder {
 	}
 	t.Cleanup(func() { enc.Close() })
 	for name, fn := range map[string]func() error{
-		"SetBitrate(32000)":   func() error { return enc.SetBitrate(32000) },
-		"SetInBandFEC(true)":  func() error { return enc.SetInBandFEC(true) },
-		"SetDTX(true)":        func() error { return enc.SetDTX(true) },
+		"SetBitrate(32000)":     func() error { return enc.SetBitrate(32000) },
+		"SetInBandFEC(true)":    func() error { return enc.SetInBandFEC(true) },
+		"SetDTX(true)":          func() error { return enc.SetDTX(true) },
 		"SetPacketLossPerc(10)": func() error { return enc.SetPacketLossPerc(10) },
 	} {
 		if err := fn(); err != nil {

@@ -40,8 +40,8 @@ type EmailCodes struct {
 // NewEmailCodes 构造管理器。
 func NewEmailCodes(kv kvStore) *EmailCodes { return &EmailCodes{kv: kv} }
 
-func codeKey(purpose, email string) string   { return "code:" + purpose + ":" + email }
-func triesKey(purpose, email string) string  { return "code:tries:" + purpose + ":" + email }
+func codeKey(purpose, email string) string  { return "code:" + purpose + ":" + email }
+func triesKey(purpose, email string) string { return "code:tries:" + purpose + ":" + email }
 func intervalKey(purpose, email string) string {
 	return "rl:code:interval:" + purpose + ":" + email
 }

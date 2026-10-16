@@ -1,5 +1,5 @@
 // loadtest 是 LiteTalk SFU 的无头压测工具：模拟 rooms×users 个真实客户端
-//（WS 信令 + Pion PeerConnection + 50pps 哑 RTP），量化转发性能。
+// （WS 信令 + Pion PeerConnection + 50pps 哑 RTP），量化转发性能。
 //
 // 用法（需先启动服务端，dev-token 模式）：
 //

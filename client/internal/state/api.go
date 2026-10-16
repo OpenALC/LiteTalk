@@ -41,8 +41,8 @@ type AuthResult struct {
 
 // APIClient REST 客户端（§5.4），带 access token 注入与 401 刷新重试一次。
 type APIClient struct {
-	base  string
-	http  *http.Client
+	base   string
+	http   *http.Client
 	access string
 }
 
@@ -161,8 +161,8 @@ func decodeError(status int, data []byte) error {
 
 // ServerConfig 服务端能力开关（GET /api/v1/config，免鉴权）。
 type ServerConfig struct {
-	AuthMode      string `json:"auth_mode"`       // full | simple
-	MailConfigured bool  `json:"mail_configured"` // 发信是否为真实投递
+	AuthMode       string `json:"auth_mode"`       // full | simple
+	MailConfigured bool   `json:"mail_configured"` // 发信是否为真实投递
 }
 
 // GetServerConfig 获取服务端 Auth 模式与发信配置（客户端适配 UI 用）。
@@ -619,4 +619,3 @@ func (c *APIClient) UpdateFriend(id int64, remark, group string) error {
 	}
 	return nil
 }
-

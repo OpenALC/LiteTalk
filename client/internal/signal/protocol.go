@@ -26,12 +26,12 @@ const (
 	// v0.1.2 请求静音：C→S voice.request_state，S→C 定向 voice.state_request。
 	TypeVoiceRequestState = "voice.request_state"
 	TypeVoiceStateRequest = "voice.state_request"
-	TypeChatSend        = "chat.send"         // C→S
-	TypeChatMessage     = "chat.message"      // S→C
-	TypePresenceUpdate  = "presence.update"   // S→C
-	TypeFriendRequest   = "friend.request"    // S→C
-	TypeFriendAccept    = "friend.accept"     // S→C
-	TypeError           = "error"             // S→C
+	TypeChatSend          = "chat.send"       // C→S
+	TypeChatMessage       = "chat.message"    // S→C
+	TypePresenceUpdate    = "presence.update" // S→C
+	TypeFriendRequest     = "friend.request"  // S→C
+	TypeFriendAccept      = "friend.accept"   // S→C
+	TypeError             = "error"           // S→C
 )
 
 // Envelope 信令信封。Data 延迟解析，由订阅者按 Type 自行解码。

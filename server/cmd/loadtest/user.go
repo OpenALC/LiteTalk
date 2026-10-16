@@ -29,24 +29,24 @@ type loadUser struct {
 	pc    *webrtc.PeerConnection
 	track *webrtc.TrackLocalStaticRTP
 
-	nm        sync.Mutex          // 协商互斥（初始 offer 与 SFU 重协商串行化）
-	remoteSet bool                // 远端描述是否就位
+	nm        sync.Mutex // 协商互斥（初始 offer 与 SFU 重协商串行化）
+	remoteSet bool       // 远端描述是否就位
 	pending   []webrtc.ICECandidateInit
 
 	connected chan struct{} // PC connected（关闭一次）
 	readyOnce sync.Once
 
 	// 指标
-	joinStart  time.Time
+	joinStart   time.Time
 	connectedAt time.Time
-	sent       atomic.Int64
-	wsIn       atomic.Int64
-	wsOut      atomic.Int64
-	wsErr      atomic.Int64
-	recvMu     sync.Mutex
-	recv       map[string]*atomic.Int64 // 源用户 ID → 收包数
-	tracksUp   atomic.Int64
-	trackErr   atomic.Int64
+	sent        atomic.Int64
+	wsIn        atomic.Int64
+	wsOut       atomic.Int64
+	wsErr       atomic.Int64
+	recvMu      sync.Mutex
+	recv        map[string]*atomic.Int64 // 源用户 ID → 收包数
+	tracksUp    atomic.Int64
+	trackErr    atomic.Int64
 }
 
 func newUser(cfg *config, room string, roomIdx int, id string) *loadUser {

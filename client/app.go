@@ -673,28 +673,28 @@ func (a *App) connectSession(token, nickname string) error {
 	a.disconnectSession()
 	ev := state.Events{
 		OnPeerJoin: func(userID, nickname string, speaking, mute, deafen bool) {
-			a.emit( "voice:peer-join", map[string]any{
+			a.emit("voice:peer-join", map[string]any{
 				"user_id": userID, "nickname": nickname,
 				"speaking": speaking, "mute": mute, "deafen": deafen,
 			})
 		},
 		OnPeerLeave: func(userID string) {
-			a.emit( "voice:peer-leave", userID)
+			a.emit("voice:peer-leave", userID)
 		},
 		OnPeerSpeaking: func(userID string, speaking, mute, deafen bool) {
-			a.emit( "voice:speaking", map[string]any{
+			a.emit("voice:speaking", map[string]any{
 				"user_id": userID, "speaking": speaking, "mute": mute, "deafen": deafen,
 			})
 		},
 		OnConnection: func(st string) {
-			a.emit( "rtc:connection", st)
+			a.emit("rtc:connection", st)
 		},
 		OnSelf: func(userID string) {
-			a.emit( "voice:self", userID)
+			a.emit("voice:self", userID)
 		},
 		// v0.1.2 请求静音：定向事件给前端（载荷带昵称，前端弹「接受」）。
 		OnStateRequest: func(fromID, fromNickname string, mute, deafen *bool) {
-			a.emit( "voice:state_request", map[string]any{
+			a.emit("voice:state_request", map[string]any{
 				"from_id": fromID, "nickname": fromNickname,
 				"mute": mute != nil && *mute, "deafen": deafen != nil && *deafen,
 			})
@@ -717,14 +717,14 @@ func (a *App) connectSession(token, nickname string) error {
 		}
 	}
 	sess.ChatHandler(func(channelID, msgID, userID, nick, content, ts string) {
-		a.emit( "chat:message", map[string]string{
+		a.emit("chat:message", map[string]string{
 			"id": msgID, "channel_id": channelID, "user_id": userID,
 			"nickname": nick, "content": content, "ts": ts,
 		})
 	})
 	// 服务端 error 帧转发前端（B1：此前未订阅，服务端拒收时消息凭空消失）。
 	sess.ErrorHandler(func(code, message string) {
-		a.emit( "chat:error", map[string]string{
+		a.emit("chat:error", map[string]string{
 			"code": code, "message": message,
 		})
 	})
@@ -748,7 +748,7 @@ func (a *App) connectSession(token, nickname string) error {
 			if s == nil {
 				return
 			}
-			a.emit( "voice:stats", s.Stats())
+			a.emit("voice:stats", s.Stats())
 		}
 	}()
 	return nil

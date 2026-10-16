@@ -28,9 +28,9 @@ func TestNewPriority(t *testing.T) {
 	}
 
 	m, name = New(Config{
-		WebhookURL:   "https://hook.ex.com",
-		SMTPHost:     "smtp.ex.com",
-		SMTPFrom:     "a@ex.com",
+		WebhookURL: "https://hook.ex.com",
+		SMTPHost:   "smtp.ex.com",
+		SMTPFrom:   "a@ex.com",
 	}, lg)
 	if name != "webhook" {
 		t.Fatalf("双配置 name = %s, want webhook（优先级最高）", name)

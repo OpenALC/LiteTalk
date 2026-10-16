@@ -11,12 +11,12 @@ import (
 // Remark/Group 仅当当前用户是关系发起方（user_id 方向）时非空——
 // friendships 行有方向性，被请求方视角返回空串（v0.1.2 迁移 0003）。
 type friendView struct {
-	ID       int64                `json:"id"`
+	ID       int64                  `json:"id"`
 	Status   store.FriendshipStatus `json:"status"`
-	Incoming bool                 `json:"incoming"` // true = 对端发起（我是被请求方）
-	Remark   string               `json:"remark"`
-	Group    string               `json:"group"`
-	User     *store.User          `json:"user"`
+	Incoming bool                   `json:"incoming"` // true = 对端发起（我是被请求方）
+	Remark   string                 `json:"remark"`
+	Group    string                 `json:"group"`
+	User     *store.User            `json:"user"`
 }
 
 // handleListFriends GET /api/v1/friends

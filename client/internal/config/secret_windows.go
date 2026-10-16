@@ -12,11 +12,11 @@ import (
 )
 
 var (
-	crypt32         = syscall.NewLazyDLL("crypt32.dll")
-	procProtect     = crypt32.NewProc("CryptProtectData")
-	procUnprotect   = crypt32.NewProc("CryptUnprotectData")
-	kernel32        = syscall.NewLazyDLL("kernel32.dll")
-	procLocalFree   = kernel32.NewProc("LocalFree")
+	crypt32       = syscall.NewLazyDLL("crypt32.dll")
+	procProtect   = crypt32.NewProc("CryptProtectData")
+	procUnprotect = crypt32.NewProc("CryptUnprotectData")
+	kernel32      = syscall.NewLazyDLL("kernel32.dll")
+	procLocalFree = kernel32.NewProc("LocalFree")
 )
 
 // dataBlob 对应 Win32 DATA_BLOB。

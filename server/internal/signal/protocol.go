@@ -27,9 +27,9 @@ const (
 	// 定向转发、无权限强制——接收方自行决定，同 Discord「请求静音」语义。
 	TypeVoiceRequestState = "voice.request_state" // C→S 请求目标闭麦/静音
 	TypeVoiceStateRequest = "voice.state_request" // S→C 定向投递请求
-	TypeChatSend        = "chat.send"    // C→S 文字消息发送
-	TypeChatMessage     = "chat.message" // S→C 文字消息广播
-	TypeError           = "error"
+	TypeChatSend          = "chat.send"           // C→S 文字消息发送
+	TypeChatMessage       = "chat.message"        // S→C 文字消息广播
+	TypeError             = "error"
 )
 
 // 下行 error 消息的 code 取值

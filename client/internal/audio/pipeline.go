@@ -42,7 +42,7 @@ type PipelineConfig struct {
 }
 
 // OpusConfig Opus 编码参数。零值字段由 ResolveOpusConfig 回落为管线默认值
-//（32kbps / VBR / DTX / FEC 开，丢包率告知 10%）。
+// （32kbps / VBR / DTX / FEC 开，丢包率告知 10%）。
 type OpusConfig struct {
 	BitrateKbps int   // 目标码率 kbps（16/24/32/48/64；0 → 32）
 	VBR         *bool // 可变码率（nil → true）
@@ -82,14 +82,14 @@ func boolPtr(b bool) *bool { return &b }
 // RuntimeSettings 应用层下发的运行时音频设置（Opus 须先经 ResolveOpusConfig）。
 // 由 Session.ApplyAudio 一次性热应用到管线。v0.1.2 扩展复杂度/降噪强度/AGC/总音量。
 type RuntimeSettings struct {
-	Opus           OpusConfig
-	Denoise        bool
-	DenoiseStrength int // 1弱/2中/3强（v0.1.2）
-	AGC            bool // 自动增益（v0.1.2，默认关）
-	Gain           float64 // 麦克风线性增益，1.0 为不变
-	PlaybackGain   float64 // 扬声器总音量（mixer master gain），1.0 为不变
-	VADSens        int     // 0–4 五档
-	Complexity     int     // Opus 复杂度 0–10（≤0 表示不改）
+	Opus            OpusConfig
+	Denoise         bool
+	DenoiseStrength int     // 1弱/2中/3强（v0.1.2）
+	AGC             bool    // 自动增益（v0.1.2，默认关）
+	Gain            float64 // 麦克风线性增益，1.0 为不变
+	PlaybackGain    float64 // 扬声器总音量（mixer master gain），1.0 为不变
+	VADSens         int     // 0–4 五档
+	Complexity      int     // Opus 复杂度 0–10（≤0 表示不改）
 }
 
 // DefaultPipelineConfig 返回默认管线配置（声卡回环、降噪开、增益 1）。

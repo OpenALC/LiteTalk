@@ -41,7 +41,7 @@ func newTestDSP(t *testing.T, mutate func(*DSPConfig)) *DSP {
 
 // TestSpeakingDetection 响亮信号应触发 speaking，随后静音应退出（带迟滞）。
 // 用旁路模式（RMS 门限）验证状态机语义：RNNoise 的 VAD 只对类语音信号置高
-//（spike 实测合成正弦 VAD 均值仅 0.069），VAD 正例需真实语音；
+// （spike 实测合成正弦 VAD 均值仅 0.069），VAD 正例需真实语音；
 // VAD 参与的负例门控由 TestNoiseGate 覆盖。
 func TestSpeakingDetection(t *testing.T) {
 	var transitions []bool

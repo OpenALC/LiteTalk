@@ -475,7 +475,7 @@ func BenchmarkRemoteDecodeFrame(b *testing.B) {
 }
 
 // BenchmarkRemoteDecodePLCFrame 丢包路径：只推偶数 seq，每包弹两拍
-//（空洞 PLC + 正常），验证 PLC 分支同样零分配。
+// （空洞 PLC + 正常），验证 PLC 分支同样零分配。
 func BenchmarkRemoteDecodePLCFrame(b *testing.B) {
 	m := NewMixer(func([]int16) int { return FrameSize })
 	rp := newTestRemotePeer(b, "a", m)

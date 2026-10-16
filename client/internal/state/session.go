@@ -100,8 +100,8 @@ func NewSession(api *APIClient, token, nickname string, ev Events, logger *log.L
 // Connect 建立信令连接并启动媒体管线（未入房，等 JoinChannel）。
 func (s *Session) Connect(serverURL string) error {
 	wsCfg := signal.Config{
-		URL:   serverURL,
-		Token: s.token,
+		URL:    serverURL,
+		Token:  s.token,
 		Logger: s.log,
 	}
 	wsCfg.OnConnect = func(c *signal.Client) {

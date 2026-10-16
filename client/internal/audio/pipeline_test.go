@@ -306,7 +306,8 @@ func TestOpusSetterAfterClose(t *testing.T) {
 }
 
 // TestOpusConfigResolve 零值字段回落默认。
-func TestOpusConfigResolve(t *testing.T) {	r := ResolveOpusConfig(OpusConfig{})
+func TestOpusConfigResolve(t *testing.T) {
+	r := ResolveOpusConfig(OpusConfig{})
 	if r.BitrateKbps != 32 || !*r.VBR || !*r.DTX || !*r.FEC || r.PacketLoss != 10 {
 		t.Fatalf("ResolveOpusConfig 零值回落异常: %+v", r)
 	}

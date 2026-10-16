@@ -12,14 +12,14 @@ import (
 type Mem struct {
 	mu sync.Mutex
 
-	users        map[int64]*User
-	friendships  map[int64]*Friendship
-	servers      map[int64]*Server
-	members      map[int64]map[int64]*ServerMember // serverID → userID → member
-	channels     map[int64]*Channel
-	categories   map[int64]*Category
-	messages     map[int64]*Message
-	invites      map[string]*Invite
+	users       map[int64]*User
+	friendships map[int64]*Friendship
+	servers     map[int64]*Server
+	members     map[int64]map[int64]*ServerMember // serverID → userID → member
+	channels    map[int64]*Channel
+	categories  map[int64]*Category
+	messages    map[int64]*Message
+	invites     map[string]*Invite
 
 	nextID map[string]int64
 

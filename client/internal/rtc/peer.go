@@ -315,7 +315,7 @@ func (p *Peer) ConnectionState() webrtc.PeerConnectionState { return p.pc.Connec
 func (p *Peer) LocalSSRC() uint32 { return p.pkt.SSRC }
 
 // RTT 返回当前选中 ICE candidate pair 的最新往返时延
-//（WebRTC stats 的 currentRoundTripTime，真实网络 RTT）。
+// （WebRTC stats 的 currentRoundTripTime，真实网络 RTT）。
 // 此前 UI 的延迟恒为 0：Session.Stats 取的是管线回环延迟估计，
 // 而回环估计只在 Loopback 模式（M1 试听）有样本，真实通话 Loopback=false。
 // ok=false 表示连接未建立或尚无 RTT 样本（此时调用方应保留上一次值或显示 --）。

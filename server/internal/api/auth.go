@@ -50,9 +50,9 @@ type passwordResetReq struct {
 
 // tokenPair 认证响应。
 type tokenPair struct {
-	AccessToken  string     `json:"access_token"`
-	RefreshToken string     `json:"refresh_token"`
-	ExpiresIn    int64      `json:"expires_in"` // 秒
+	AccessToken  string      `json:"access_token"`
+	RefreshToken string      `json:"refresh_token"`
+	ExpiresIn    int64       `json:"expires_in"` // 秒
 	User         *store.User `json:"user"`
 }
 
@@ -129,9 +129,9 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	var user *store.User
 	for i := 0; i < 5; i++ {
 		user = &store.User{
-			Email:    req.Email,
-			Nickname: req.Nickname,
-			Tag:      fmtTag(int(time.Now().UnixNano()+int64(i*7919)) % 10000),
+			Email:        req.Email,
+			Nickname:     req.Nickname,
+			Tag:          fmtTag(int(time.Now().UnixNano()+int64(i*7919)) % 10000),
 			PasswordHash: hash,
 			// full 模式邮箱已过验证码验证；simple 模式未验证（从简取舍）。
 			EmailVerified: !s.simpleMode(),

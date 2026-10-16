@@ -38,16 +38,16 @@ const (
 
 // Config config.json 的持久化结构。
 type Config struct {
-	ServerBase          string `json:"server_base,omitempty"`            // 服务端基址，如 https://example.com
-	HibernateOnMinimize *bool  `json:"hibernate_on_minimize,omitempty"`  // 最小化时休眠界面（旧版布尔，已由 HibernateMode 取代，保留读取做迁移）
-	HibernateMode       string `json:"hibernate_mode,omitempty"`        // 休眠模式：off 不休眠 / hibernate 卸载业务组件 / destroy 整页重载（默认 off）
-	CloseToTray         *bool  `json:"close_to_tray,omitempty"`          // 关闭窗口时最小化到托盘（默认 true；false=退出程序）
-	SavedEmail          string `json:"saved_email,omitempty"`            // 记住的登录邮箱
-	EncPassword         string `json:"enc_password,omitempty"`           // 记住的密码（DPAPI 密文 base64；非 Windows 恒空）
-	EncGuestRefresh     string `json:"enc_guest_refresh,omitempty"`      // 记住的游客 refresh_token（DPAPI 密文 base64；非 Windows 恒空）
-	Audio               *AudioSettings `json:"audio,omitempty"`          // 语音设置（码率/VBR/DTX/FEC/丢包率/降噪/增益/VAD 灵敏度）
-	AudioCapture        string `json:"audio_capture,omitempty"`        // 采集设备 ID（空=默认）
-	AudioPlayback       string `json:"audio_playback,omitempty"`       // 播放设备 ID（空=默认）
+	ServerBase          string         `json:"server_base,omitempty"`           // 服务端基址，如 https://example.com
+	HibernateOnMinimize *bool          `json:"hibernate_on_minimize,omitempty"` // 最小化时休眠界面（旧版布尔，已由 HibernateMode 取代，保留读取做迁移）
+	HibernateMode       string         `json:"hibernate_mode,omitempty"`        // 休眠模式：off 不休眠 / hibernate 卸载业务组件 / destroy 整页重载（默认 off）
+	CloseToTray         *bool          `json:"close_to_tray,omitempty"`         // 关闭窗口时最小化到托盘（默认 true；false=退出程序）
+	SavedEmail          string         `json:"saved_email,omitempty"`           // 记住的登录邮箱
+	EncPassword         string         `json:"enc_password,omitempty"`          // 记住的密码（DPAPI 密文 base64；非 Windows 恒空）
+	EncGuestRefresh     string         `json:"enc_guest_refresh,omitempty"`     // 记住的游客 refresh_token（DPAPI 密文 base64；非 Windows 恒空）
+	Audio               *AudioSettings `json:"audio,omitempty"`                 // 语音设置（码率/VBR/DTX/FEC/丢包率/降噪/增益/VAD 灵敏度）
+	AudioCapture        string         `json:"audio_capture,omitempty"`         // 采集设备 ID（空=默认）
+	AudioPlayback       string         `json:"audio_playback,omitempty"`        // 播放设备 ID（空=默认）
 	// v0.1.2：界面销毁休眠/首页服务器/介绍页隐藏（客户端级偏好，无需服务端）。
 	UIDestroyOnHibernate *bool  `json:"ui_destroy_on_hibernate,omitempty"` // 休眠时 WindowReloadApp 卸载界面（默认 false）
 	HomeServerID         string `json:"home_server_id,omitempty"`          // 首页服务器 id（空 = 介绍页 __intro__）
@@ -62,19 +62,19 @@ type Config struct {
 // v0.1.2 扩展：降噪强度/AGC/Opus 复杂度/麦克风与扬声器音量（0–120）。
 // 旧字段 Gain 保留读取兼容（mic_volume 为空时按 gain×10 换算）。
 type AudioSettings struct {
-	BitrateKbps    int   `json:"bitrate_kbps,omitempty"`    // Opus 目标码率 kbps：16/24/32/48/64（0 → 32）
-	VBR            *bool `json:"vbr,omitempty"`             // 可变码率（nil → true）
-	DTX            *bool `json:"dtx,omitempty"`             // 静音期非连续传输（nil → true）
-	FEC            *bool `json:"fec,omitempty"`             // 带内前向纠错（nil → true）
-	PacketLoss     int   `json:"packet_loss,omitempty"`     // 告知编码器的预期丢包率 %（0 → 10；FEC 关闭时无意义）
-	Denoise        *bool `json:"denoise,omitempty"`         // RNNoise 降噪总开关（nil → true）
-	DenoiseStrength int  `json:"denoise_strength,omitempty"` // 降噪强度 1弱/2中/3强（0 → 2；0 档配合 Denoise=false 即"关"）
-	AGC            *bool `json:"agc,omitempty"`             // 自动增益（nil → false；新功能默认关）
-	VADSens        *int  `json:"vad_sens,omitempty"`        // VAD 灵敏度 0–4 五档（nil → 2=中）
-	Complexity     int   `json:"opus_complexity,omitempty"` // Opus 复杂度 0–10（0 → 9）
-	Gain           int   `json:"gain,omitempty"`            // 旧版输入增益 ×10（0 → 10 = 1.0；已被 MicVolume 取代，读取时换算）
-	MicVolume      int   `json:"mic_volume,omitempty"`      // 麦克风音量 0–120（默认 100）
-	PlaybackVolume int   `json:"playback_volume,omitempty"` // 扬声器音量 0–120（默认 100）
+	BitrateKbps     int   `json:"bitrate_kbps,omitempty"`     // Opus 目标码率 kbps：16/24/32/48/64（0 → 32）
+	VBR             *bool `json:"vbr,omitempty"`              // 可变码率（nil → true）
+	DTX             *bool `json:"dtx,omitempty"`              // 静音期非连续传输（nil → true）
+	FEC             *bool `json:"fec,omitempty"`              // 带内前向纠错（nil → true）
+	PacketLoss      int   `json:"packet_loss,omitempty"`      // 告知编码器的预期丢包率 %（0 → 10；FEC 关闭时无意义）
+	Denoise         *bool `json:"denoise,omitempty"`          // RNNoise 降噪总开关（nil → true）
+	DenoiseStrength int   `json:"denoise_strength,omitempty"` // 降噪强度 1弱/2中/3强（0 → 2；0 档配合 Denoise=false 即"关"）
+	AGC             *bool `json:"agc,omitempty"`              // 自动增益（nil → false；新功能默认关）
+	VADSens         *int  `json:"vad_sens,omitempty"`         // VAD 灵敏度 0–4 五档（nil → 2=中）
+	Complexity      int   `json:"opus_complexity,omitempty"`  // Opus 复杂度 0–10（0 → 9）
+	Gain            int   `json:"gain,omitempty"`             // 旧版输入增益 ×10（0 → 10 = 1.0；已被 MicVolume 取代，读取时换算）
+	MicVolume       int   `json:"mic_volume,omitempty"`       // 麦克风音量 0–120（默认 100）
+	PlaybackVolume  int   `json:"playback_volume,omitempty"`  // 扬声器音量 0–120（默认 100）
 }
 
 // DefaultAudioSettings 语音设置出厂值（与管线既有硬编码一致）。
@@ -176,7 +176,7 @@ func (m *Manager) SetAudioSettings(s AudioSettings) error {
 type Manager struct {
 	path string
 
-	mu sync.Mutex
+	mu  sync.Mutex
 	cfg Config
 }
 
