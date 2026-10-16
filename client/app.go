@@ -211,7 +211,14 @@ func (a *App) setupTray() {
 	})
 
 	t.SetMenu(menu)
-	a.trayReady.Store(true)
+	// Linux 桌面可能没有托盘宿主（GNOME 未装 AppIndicator 扩展）：图标
+	// 不会出现，此时关窗若仍隐藏就等于把应用藏丢。按实际可用性置位，
+	// 不可用则关窗语义由 interceptClose/closeToTrayOrQuit 回落为退出。
+	if available := tray.Available(); available {
+		a.trayReady.Store(true)
+	} else {
+		log.Printf("托盘不可用（无 StatusNotifierWatcher），关窗将退出程序")
+	}
 }
 
 // buildWindow 创建 webview 窗口并注册生命周期钩子（WindowClosing 拦截 +
@@ -307,17 +314,14 @@ func (a *App) emitHibernate() {
 }
 
 // interceptClose 拦截窗口关闭（v3 WindowClosing Hook，替代 v2 OnBeforeClose）：
-// 返回 true = 已拦截（隐藏到托盘或销毁渲染进程），false = 放行真正关闭。兜底链：
+// 返回 true = 已拦截（隐藏到托盘或销毁渲染进程），false = 放行真正关闭。
+// 实际语义收敛在 closeToTrayOrQuit，与 WindowClose（前端标题栏按钮）共用；
+// 本函数只叠加 OS 关窗钩子特有的放行条件：
 //   - recreating（程序化销毁渲染进程，里程碑②）→ 放行
 //   - forceQuit（托盘「退出」/设置页「退出程序」，调用方已 Quit）→ 放行
-//   - 托盘未就绪 → 放行 + 显式 Quit
-//   - 用户选「关闭窗口时=退出程序」→ 放行 + 显式 Quit
-//   - destroy 模式 → 销毁渲染进程（替代隐藏）
-//   - 其余 → 隐藏到托盘 + hibernate 模式同步卸载界面
 //
-// 注意：main.go 置 DisableQuitOnLastWindowClosed（destroy 模式销毁唯一窗口后
-// 进程须存活），最后一窗关闭不再自动退进程——所有放行路径（除 recreating/
-// forceQuit 外）必须显式 Quit，否则残留无窗进程。
+// 注意：main.go 各平台均禁用/未启用「最后一窗关闭即退进程」（destroy 模式
+// 销毁唯一窗口后进程须存活），所有退出路径必须显式 Quit，否则残留无窗进程。
 func (a *App) interceptClose() bool {
 	if a.recreating.Load() {
 		return false // 程序化销毁（里程碑②），放行
@@ -325,20 +329,25 @@ func (a *App) interceptClose() bool {
 	if a.forceQuit.Load() {
 		return false // 真正退出（Quit 已由调用方发起）
 	}
-	if !a.trayReady.Load() {
-		// 托盘不可用：隐藏=无任何恢复路径，退出（放行 + 显式 Quit，
-		// DisableQuitOnLastWindowClosed 下最后一窗关闭不会自动退进程）。
-		a.quitAfterClose()
-		return false
-	}
-	if !a.cfg.CloseToTray() {
-		a.quitAfterClose() // 用户设置：关闭即退出
-		return false
-	}
+	return a.closeToTrayOrQuit()
+}
+
+// closeToTrayOrQuit 关窗语义的唯一实现（interceptClose 与 WindowClose 共用，
+// 两条入口行为必然一致）：
+//   - destroy 休眠模式 → 销毁渲染进程替代隐藏（内存释放更彻底）
+//   - 托盘不可用或用户设置「关闭窗口时=退出程序」→ 显式 Quit
+//   - 其余 → 隐藏到托盘 + hibernate 模式同步卸载界面
+//
+// 返回 true 表示已处理且窗口仍在（Hook 侧需 Cancel 关闭），false 表示正在退出。
+func (a *App) closeToTrayOrQuit() bool {
 	if a.cfg.HibernateMode() == "destroy" {
-		// 销毁渲染进程替代隐藏：内存释放更彻底，托盘「显示主界面」时重建。
 		a.destroyRenderProcess()
 		return true
+	}
+	if !a.trayReady.Load() || !a.cfg.CloseToTray() {
+		// 托盘不可用：隐藏后无任何恢复路径；或用户明确设置关闭即退出。
+		a.quitAfterClose()
+		return false
 	}
 	if win := a.getWindow(); win != nil {
 		win.Hide()
@@ -426,17 +435,11 @@ func (a *App) WindowMaximize() {
 	}
 }
 
-// WindowClose 关闭。destroy 模式销毁渲染进程；否则转隐藏入托盘
-// （v2 语义即直接隐藏，无 closeToTray 校验——OS 级关窗才走 interceptClose 兜底链）。
+// WindowClose 关闭。前端自定义标题栏按钮调用，与 OS 关窗（interceptClose）
+// 共用 closeToTrayOrQuit：destroy 模式销毁渲染进程；否则按「关闭窗口时」设置
+// 与托盘可用性决定隐藏入托盘或退出程序（v2 语义曾无条件隐藏，设置不生效）。
 func (a *App) WindowClose() {
-	if a.cfg.HibernateMode() == "destroy" {
-		a.destroyRenderProcess()
-		return
-	}
-	if win := a.getWindow(); win != nil {
-		win.Hide()
-	}
-	a.emitHibernate()
+	a.closeToTrayOrQuit()
 }
 
 // ---------- 设置 ----------
