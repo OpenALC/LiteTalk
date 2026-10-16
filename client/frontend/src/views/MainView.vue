@@ -17,7 +17,7 @@ import { useChatStore } from '../stores/chat'
 import { useAuthStore } from '../stores/auth'
 import { INTRO_ID, useServersStore } from '../stores/data'
 import { useHotkeys } from '../composables/useHotkeys'
-import { eventsOff, eventsOn } from '../api/bridge'
+import { eventsOn } from '../api/bridge'
 
 const router = useRouter()
 const voice = useVoiceStore()
@@ -49,11 +49,14 @@ useHotkeys(
   hotkeysActive,
 )
 
+// auth:session：Go 侧重试连上/中途断线时翻提示条。
+// eventsOn 返回按监听器的取消函数，卸载时逐个注销（不按事件名整体 Off）。
+let offAuthSession: () => void = () => {}
+
 onMounted(() => {
   voice.bindEvents()
   chat.bindEvents()
-  // auth:session：Go 侧重试连上/中途断线时翻提示条。
-  eventsOn('auth:session', (d) => {
+  offAuthSession = eventsOn('auth:session', (d) => {
     auth.setSignalOk((d as { ok?: boolean }).ok !== false)
   })
   // UI 销毁重载后回填语音态（Go 会话未断）；未连接时为空态无副作用。
@@ -72,7 +75,7 @@ onMounted(() => {
 onUnmounted(() => {
   voice.unbindEvents()
   chat.unbindEvents()
-  eventsOff('auth:session')
+  offAuthSession()
 })
 </script>
 

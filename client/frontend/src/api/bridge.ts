@@ -235,9 +235,11 @@ export function whenNativeReady(timeoutMs = 800): Promise<void> {
 
 // eventsOn Wails 事件订阅。v3 回调收 WailsEvent 对象，取 .data 对齐 v2 的直载荷语义。
 // 浏览器环境静默（mock 不产事件）。
-export function eventsOn(name: string, cb: (...args: unknown[]) => void) {
-  if (!isNative()) return
-  Events.On(name, (ev) => cb((ev as { data: unknown }).data))
+export function eventsOn(name: string, cb: (...args: unknown[]) => void): () => void {
+  if (!isNative()) return () => {}
+  // v3 的 Events.On 返回按监听器的取消函数：卸载时逐个注销，
+  // 不许用 eventsOff 按事件名清（会把别人注册的同名监听一并清掉）。
+  return Events.On(name, (ev) => cb((ev as { data: unknown }).data))
 }
 
 // eventsOff 取消事件订阅（休眠态清理用；v3 按事件名清掉全部监听）。
