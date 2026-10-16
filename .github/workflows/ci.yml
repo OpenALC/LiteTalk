@@ -146,11 +146,12 @@ jobs:
           $env:PATH = "$nsisDir;$env:PATH"
           makensis /VERSION
       # Wails v3：免 wails CLI——plain go build（CGO/WebView2 同 v2 工具链）+ 自包含 NSIS 脚本
+      # -H=windowsgui：PE 子系统设为 GUI，否则启动时附带控制台窗口（v2 由 wails build 隐式添加）
       - name: 构建客户端（注入版本号）
         working-directory: client
         shell: pwsh
         run: |
-          go build -tags production -trimpath -ldflags "-s -w -X main.version=${{ github.ref_name }}" `
+          go build -tags production -trimpath -ldflags "-s -w -X main.version=${{ github.ref_name }} -H=windowsgui" `
             -o build/bin/LiteTalk.exe .
       - name: 制作 NSIS 安装器
         working-directory: client/build/windows/installer
