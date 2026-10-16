@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -53,21 +54,31 @@ func main() {
 		}
 		st = my
 		log.Println("持久化: MySQL")
-	} else {
+	} else if dev {
 		st = store.NewMem()
 		log.Println("持久化: 内存（设置 LITETALK_MYSQL_DSN 启用 MySQL）")
+	} else {
+		// 生产模式拒绝内存降级：重启后用户/服务器/消息全部丢失，属静默数据事故。
+		log.Fatal("未配置 LITETALK_MYSQL_DSN：生产模式必须以 MySQL 启动（内存存储仅限 dev 模式本地开发）")
 	}
 	if rdb, err := store.OpenRedis(os.Getenv("LITETALK_REDIS_ADDR")); err == nil {
 		defer rdb.Close()
 		kv = rdb
 		log.Println("KV: Redis")
-	} else {
+	} else if dev {
 		kv = store.NewMem()
 		log.Println("KV: 内存（LITETALK_REDIS_ADDR 不可达，降级内存）")
+	} else {
+		// 生产模式拒绝内存 KV：刷新令牌/验证码/限流重启即失，会话全灭。
+		log.Fatalf("Redis 连接失败（%v）：生产模式必须配置可用的 LITETALK_REDIS_ADDR，拒绝降级内存 KV", err)
 	}
 
 	// ---- 账号安全 ----
-	jwtSigner := auth.NewJWT(os.Getenv("LITETALK_JWT_SECRET"))
+	jwtSecret := os.Getenv("LITETALK_JWT_SECRET")
+	if err := validateJWTSecret(jwtSecret, dev); err != nil {
+		log.Fatalf("LITETALK_JWT_SECRET 不合法：%v（请设为至少 32 字节的随机串，如 openssl rand -hex 32）", err)
+	}
+	jwtSigner := auth.NewJWT(jwtSecret)
 	refreshStore := auth.NewRefreshStore(kv)
 	codes := auth.NewEmailCodes(kv)
 	limits := auth.NewRateLimit(kv)
@@ -84,9 +95,14 @@ func main() {
 	}
 	defer sfuInst.Close()
 
-	// WS 信令 hub：默认 JWT 鉴权；LITETALK_DEV_AUTH=1 时 dev- 前缀令牌兜底（JWT 优先）。
+	// WS 信令 hub：默认 JWT 鉴权；dev 模式下 LITETALK_DEV_AUTH=1 可用 dev- 前缀令牌兜底（JWT 优先）。
+	// dev 令牌把 dev-<名字> 映射为真实身份且不做签名校验，生产构建（注入了版本号）必须拒绝启动。
+	devAuth := os.Getenv("LITETALK_DEV_AUTH") == "1"
+	if devAuth && !dev {
+		log.Fatal("LITETALK_DEV_AUTH=1 仅限 dev 模式（未注入版本号的本地构建）：生产构建拒绝启用 dev 令牌")
+	}
 	var authenticator signal.Authenticator
-	if os.Getenv("LITETALK_DEV_AUTH") == "1" {
+	if devAuth {
 		authenticator = func(token string) (string, string, error) {
 			if !strings.HasPrefix(token, "dev-") {
 				if claims, err := jwtSigner.ParseAccess(token); err == nil {
@@ -114,7 +130,7 @@ func main() {
 
 	// TURN 短期凭证签发（coturn use-auth-secret，§5.4）
 	var rtcAuth rtcapi.UserFromToken
-	if os.Getenv("LITETALK_DEV_AUTH") == "1" {
+	if devAuth {
 		rtcAuth = func(token string) (string, error) {
 			if !strings.HasPrefix(token, "dev-") {
 				if claims, err := jwtSigner.ParseAccess(token); err == nil {
@@ -222,6 +238,29 @@ func devUserID(token string) (string, error) {
 }
 
 // ---- 环境变量小工具 ----
+
+// weakSecrets 已公开的示例/默认密钥：与这些值相同即视为未配置（可伪造任意 uid 的令牌）。
+var weakSecrets = map[string]bool{
+	"litetalk-dev-secret-change-me": true, // auth.NewJWT 的 dev 回落值
+	"CHANGE_ME":                     true, // server/deploy/env/litetalk.env.example 占位值
+}
+
+// validateJWTSecret 生产模式密钥准入（P0 S2）：空、不足 32 字节或等于公开示例值均拒绝。
+// dev 模式不做限制——本地开发本来就允许空密钥回落到开发密钥。
+func validateJWTSecret(secret string, dev bool) error {
+	if dev {
+		return nil
+	}
+	switch {
+	case secret == "":
+		return errors.New("未设置 LITETALK_JWT_SECRET")
+	case weakSecrets[secret]:
+		return errors.New("密钥仍是公开示例值（litetalk-dev-secret-change-me / CHANGE_ME），必须更换")
+	case len(secret) < 32:
+		return fmt.Errorf("密钥长度 %d 字节，不足 32 字节", len(secret))
+	}
+	return nil
+}
 
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
