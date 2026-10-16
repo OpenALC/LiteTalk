@@ -477,6 +477,21 @@ func (a *App) GetAudioDeviceSelection() *AudioDeviceSelection {
 	return &AudioDeviceSelection{CaptureID: c.AudioCapture, PlaybackID: c.AudioPlayback}
 }
 
+// TestMicrophone 麦克风自检：用持久化选择的采集设备采样 2 秒，返回 RMS 与峰值
+// （设置页「测试」按钮；独立于会话管线，不动通话状态）。
+func (a *App) TestMicrophone() (map[string]float64, error) {
+	rms, peak, err := audio.TestCapture(a.cfg.Get().AudioCapture, 2*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]float64{"rms": rms, "peak": peak}, nil
+}
+
+// TestSpeaker 扬声器自检：播放 880Hz 正弦测试音 1.5 秒（阻塞至播完）。
+func (a *App) TestSpeaker() error {
+	return audio.TestPlayback(a.cfg.Get().AudioPlayback, 880, 1500*time.Millisecond)
+}
+
 // ---------- 语音会话 ----------
 
 // connectSession 建立信令会话并把事件接到 Wails Events。

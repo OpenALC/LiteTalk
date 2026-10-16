@@ -30,6 +30,8 @@ type GoApp = {
   ListAudioDevices(): Promise<{ capture: AudioDeviceDTO[]; playback: AudioDeviceDTO[] }>
   GetAudioDeviceSelection(): Promise<{ capture_id: string; playback_id: string }>
   SetAudioDevices(captureID: string, playbackID: string): Promise<void>
+  TestMicrophone(): Promise<{ rms: number; peak: number }>
+  TestSpeaker(): Promise<void>
   GetAudioSettings(): Promise<AudioSettings>
   SetAudioSettings(s: AudioSettings): Promise<void>
   JoinChannel(channelID: string): Promise<void>
@@ -138,6 +140,8 @@ const mockApp: GoApp = {
   async LogFromWeb() {},
   async SetAudioDevices() {},
   async GetAudioDeviceSelection() { return { capture_id: '', playback_id: '' } },
+  async TestMicrophone() { return { rms: 800, peak: 3000 } },
+  async TestSpeaker() {},
   async GetAudioSettings() {
     return {
       bitrate_kbps: 32, vbr: true, dtx: true, fec: true, packet_loss: 10,

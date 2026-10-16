@@ -2,8 +2,8 @@
 // SettingsView 设置页（独立路由 /settings，v0.1.2 起不再复用语音/文字舞台区域）。
 // 分区：连接/账号/常规/音频设备/语音/快捷键/关于；改动即热应用 + 落盘 config.json。
 // 语音默认值全部由 Go 侧 GetAudioSettings 回落（零值 → 默认），UI 只消费完整值。
-import { onMounted, ref } from 'vue'
-import { ArrowLeft, LogOut } from 'lucide-vue-next'
+import { onMounted, ref, computed } from 'vue'
+import { ArrowLeft, LogOut, Mic, Volume2 } from 'lucide-vue-next'
 import { useRouter } from 'vue-router'
 import { goApp, type AudioDeviceDTO } from '../api/bridge'
 import { useAuthStore } from '../stores/auth'
@@ -21,12 +21,20 @@ const version = ref('dev')
 // 休眠模式三态（旧版「最小化休眠/卸载界面」双开关已合并：重复且卸载开关
 // 依赖休眠开关才生效——用户反馈不生效。off 不休眠 / hibernate 卸载组件 /
 // destroy 整页重载彻底释放内存（实验性））。
-const HIB_LABELS = ['不休眠', '休眠界面', '彻底卸载（实验）'] as const
+// 选项名标注「暂不生效」：Wails v2 webview 常驻进程，两种模式都看不到内存
+// 下降（用户实测），选择照常持久化、升级 Wails v3 后自动生效。
+const HIB_LABELS = ['不休眠', '休眠界面（暂不生效）', '彻底卸载（暂不生效）'] as const
 const HIB_MODES = ['off', 'hibernate', 'destroy'] as const
 const hibMode = ref<'off' | 'hibernate' | 'destroy'>('off')
 const closeToTray = ref(true)
 const caps = ref<AudioDeviceDTO[]>([])
 const plays = ref<AudioDeviceDTO[]>([])
+// 系统默认设备名（下拉首项「系统默认（当前设备名）」用；找不到时退化纯「系统默认」）。
+const capDefaultName = computed(() => caps.value.find((d) => d.is_default)?.name ?? '')
+const playDefaultName = computed(() => plays.value.find((d) => d.is_default)?.name ?? '')
+// 设备测试中状态（防抖：采样/播放期间禁用按钮）。
+const testingMic = ref(false)
+const testingSpk = ref(false)
 const toast = ref<InstanceType<typeof Toast>>()
 
 // 语音设置：Go 侧返回已回落默认的完整值（码率/VBR/DTX/FEC/丢包/降噪强度/AGC/
@@ -91,6 +99,43 @@ async function applyDevice() {
   await goApp().SetAudioDevices(settings.captureDevice, settings.playbackDevice)
 }
 
+// testMic 麦克风自检：Go 侧用当前选择的设备采样 2 秒，按 RMS 判定。
+// rms ≥ 150 视为有信号（目标：设备能收音，而非判定语音——门限低于
+// dsp 的 RMSEnter=500，避免轻声说话假阴性；安静环境底噪本身即说明设备可用）。
+// 注意必须在采样 2 秒内对着麦克风说话，否则任何设备都会「未检测到」。
+async function testMic() {
+  if (testingMic.value) return
+  testingMic.value = true
+  try {
+    const r = await goApp().TestMicrophone()
+    console.log('[device-test] mic rms=%d peak=%d', r.rms, r.peak)
+    if (r.rms >= 150) {
+      const pct = Math.min(100, Math.round((r.rms / 32767) * 100))
+      toast.value?.show(`麦克风正常（输入电平 ${pct}%）`)
+    } else {
+      toast.value?.show('未检测到声音——测试时请对着麦克风说话；若已说话仍如此，请检查麦克风权限或所选设备', true)
+    }
+  } catch (e) {
+    toast.value?.show(`麦克风测试失败：${e}`, true)
+  } finally {
+    testingMic.value = false
+  }
+}
+
+// testSpeaker 扬声器自检：播放 880Hz 测试音 1.5 秒（Go 阻塞至播完）。
+async function testSpeaker() {
+  if (testingSpk.value) return
+  testingSpk.value = true
+  try {
+    await goApp().TestSpeaker()
+    toast.value?.show('已播放测试音，听到蜂鸣说明扬声器正常')
+  } catch (e) {
+    toast.value?.show(`扬声器测试失败：${e}`, true)
+  } finally {
+    testingSpk.value = false
+  }
+}
+
 // 语音设置改动：热应用到当前会话（未连接仅落盘），失败弹提示。
 async function applyAudio() {
   try {
@@ -135,8 +180,9 @@ async function applyAudio() {
                     @click="setHibernateMode(HIB_MODES[i])">{{ label }}</button>
           </div>
         </div>
-        <!-- 旧版「最小化时休眠界面 / 休眠时卸载界面」双开关已合并为上面三态
-             （重复且卸载开关依赖休眠开关才生效，用户反馈不生效）。 -->
+        <!-- Wails v2 的 webview 随进程常驻，两种休眠模式都看不到内存下降
+             （用户实测）——选择照常持久化，升级 Wails v3 后自动生效。 -->
+        <p class="s-note">Wails v2 无法销毁渲染进程，以上两种模式将在升级 Wails v3 后生效</p>
         <!-- 关闭窗口时：最小化到托盘（默认）/ 退出程序（问题 4b，用户可选） -->
         <div class="s-row">
           <div class="k">关闭窗口时</div>
@@ -157,16 +203,22 @@ async function applyAudio() {
         <div class="s-row">
           <div class="k">麦克风</div>
           <select v-model="settings.captureDevice" @change="applyDevice">
-            <option value="">系统默认</option>
+            <option value="">{{ capDefaultName ? `系统默认（${capDefaultName}）` : '系统默认' }}</option>
             <option v-for="d in caps" :key="d.id" :value="d.id">{{ d.name }}</option>
           </select>
+          <button class="mini-btn" :disabled="testingMic" @click="testMic">
+            <Mic :size="13" />{{ testingMic ? '请说话…' : '测试' }}
+          </button>
         </div>
         <div class="s-row">
           <div class="k">扬声器</div>
           <select v-model="settings.playbackDevice" @change="applyDevice">
-            <option value="">系统默认</option>
+            <option value="">{{ playDefaultName ? `系统默认（${playDefaultName}）` : '系统默认' }}</option>
             <option v-for="d in plays" :key="d.id" :value="d.id">{{ d.name }}</option>
           </select>
+          <button class="mini-btn" :disabled="testingSpk" @click="testSpeaker">
+            <Volume2 :size="13" />{{ testingSpk ? '播放中…' : '测试' }}
+          </button>
         </div>
       </section>
 
@@ -307,7 +359,10 @@ select {
   height: 32px; border-radius: 8px; border: 1.5px solid var(--brand-200);
   padding: 0 8px; font-size: 13px; color: var(--ink-900);
   background: var(--surface); outline: none;
+  /* 设备行：下拉与测试按钮并存时收缩，窄窗允许整行换行不挤爆 */
+  max-width: 260px; min-width: 0;
 }
+.s-row { flex-wrap: wrap; }
 input[type="range"] { flex: 0 0 140px; accent-color: var(--brand-500); }
 .switch { position: relative; width: 36px; height: 20px; flex: none; }
 .switch input { display: none; }
@@ -346,4 +401,22 @@ input[type="range"] { flex: 0 0 140px; accent-color: var(--brand-500); }
 }
 .quit-btn:hover { background: rgba(232, 91, 91, 0.18); }
 .btn-icon { flex: none; }
+
+/* 说明小字（如休眠「暂不生效」注记）：11px 灰，贴近上一行 */
+.s-note {
+  margin: -4px 0 10px;
+  font-size: 11px; color: var(--ink-300);
+}
+
+/* 设备测试小按钮：次级弱化的行内按钮，与下拉并排 */
+.mini-btn {
+  flex: none;
+  display: inline-flex; align-items: center; gap: 4px;
+  height: 30px; padding: 0 10px; border-radius: 8px;
+  font-size: 12px; font-weight: 500;
+  color: var(--ink-600); background: var(--brand-50);
+  transition: background 0.15s, color 0.15s, opacity 0.15s;
+}
+.mini-btn:hover { background: var(--brand-200); color: var(--ink-900); }
+.mini-btn:disabled { opacity: 0.55; cursor: default; }
 </style>
