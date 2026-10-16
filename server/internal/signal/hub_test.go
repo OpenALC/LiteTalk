@@ -20,21 +20,41 @@ import (
 
 // ---- 测试脚手架 ----
 
-// testAuthenticator token "1"→(1,alice)、"2"→(2,bob)、"9"→(9,mallory)、"8"→(8,eve)。
+// testAuthenticator token 形如 "1"（默认 dev=desktop、固定 sid）或 "1:<dev>:<sid>"。
+// uid 映射："1"→alice、"2"→bob、"9"→mallory、"8"→eve。
 // mallory 在 fixture 里是服务器成员，eve 不是（进房权限测试用）。
-func testAuthenticator(token string) (string, string, error) {
-	switch token {
+func testAuthenticator(token string) (Identity, error) {
+	parts := strings.SplitN(token, ":", 3)
+	var name string
+	switch parts[0] {
 	case "1":
-		return "1", "alice", nil
+		name = "alice"
 	case "2":
-		return "2", "bob", nil
+		name = "bob"
 	case "9":
-		return "9", "mallory", nil
+		name = "mallory"
 	case "8":
-		return "8", "eve", nil
+		name = "eve"
+	default:
+		return Identity{}, ErrUnauthorized
 	}
-	return "", "", ErrUnauthorized
+	id := Identity{
+		UserID:   parts[0],
+		Username: name,
+		Dev:      "desktop",
+		Sid:      defaultTestSid(parts[0]),
+	}
+	if len(parts) > 1 && parts[1] != "" {
+		id.Dev = parts[1]
+	}
+	if len(parts) > 2 {
+		id.Sid = parts[2]
+	}
+	return id, nil
 }
+
+// defaultTestSid 每个 uid 的默认 sid（32 字符；未指定会话的旧用例用）。
+func defaultTestSid(uid string) string { return strings.Repeat("s"+uid, 32/len("s"+uid)) }
 
 // chatFixture 一套 hub + 双客户端脚手架：store 里有文本频道 ch、语音频道 vch（成员 alice/bob）。
 type chatFixture struct {
@@ -92,7 +112,7 @@ func newHubServer(t *testing.T, st *store.Mem, dev bool) (*Hub, *httptest.Server
 	}
 	t.Cleanup(func() { _ = inst.Close() })
 
-	hub := NewHub(inst, testAuthenticator, log.New(io.Discard, "", 0), 0, ChatDeps{
+	hub := NewHub(inst, testAuthenticator, nil, log.New(io.Discard, "", 0), 0, ChatDeps{
 		Store:  st,
 		Limits: auth.NewRateLimit(st),
 		Dev:    dev,

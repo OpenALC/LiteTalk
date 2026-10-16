@@ -7,31 +7,59 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/OpenALC/LiteTalk/server/internal/auth"
 	"github.com/OpenALC/LiteTalk/server/internal/sfu"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
 	"github.com/coder/websocket"
 	"github.com/pion/webrtc/v4"
 )
 
+// 心跳与关闭参数（§0.7；测试可直接缩短 Hub 字段）。
+const (
+	defaultHeartbeatEvery = 25 * time.Second // protocol Ping 间隔
+	defaultPongWait       = 10 * time.Second // 无 Pong 判定超时 → CloseNow
+	defaultReadIdle       = 90 * time.Second // 读侧兜底：无数据读且无 pong 的最长寿
+	kickSendWindow        = 400 * time.Millisecond
+	// session.kicked 发送窗口（§0.6：300~500ms）
+	writeTimeout = 10 * time.Second // 单条下行写超时
+)
+
 // Hub WS 信令 hub：连接管理、房间登记与广播（docs/落地方案.md §5.3）。
 // 与 SFU 的桥接：channel.join 在 WS 层登记成员；PeerConnection 建立由 rtc.* 消息驱动。
+// 多设备会话（v1.1.0）：conns 按 uid+dev 单连接索引，同设备顶替/踢线与 SFU 归属核对见 §0。
 type Hub struct {
 	sfu       *sfu.SFU
 	auth      Authenticator
+	sess      *auth.SessionIndex // 多设备会话索引（nil=跳过握手 sid 比对，测试/过渡）
 	log       *log.Logger
 	maxPer    int // 房间人数上限（与 SFU 一致）
 	chatStore ChatStore
 	limits    RateLimiter
 	dev       bool // 开发模式：放行非数字的内置房间（生产必须为 false）
 
-	mu    sync.Mutex
-	rooms map[string]*roomState
+	// 心跳参数（默认值见包常量；测试可缩短）
+	heartbeatEvery time.Duration
+	pongWait       time.Duration
+	readIdle       time.Duration
+
+	mu         sync.Mutex
+	rooms      map[string]*roomState
+	conns      map[connKey]*client // uid+"\x00"+dev → 当前连接（§0.8）
+	nextConnID uint64              // 连接标识自增（SFU peer 归属核对用）
 }
 
+// connKey 连接索引键：uid + "\x00" + dev（§0.8；NUL 分隔避免与 ID 内容歧义）。
+type connKey string
+
+func makeConnKey(uid, dev string) connKey { return connKey(uid + "\x00" + dev) }
+
 // roomState 信令层房间：成员表与语音状态（全内存态，M3 换成频道模型）。
+// members 按 uid 索引且同 uid 仅一个连接（多设备会话切换由 join 抢占完成）。
 type roomState struct {
 	id      string
 	members map[string]*client // userID → client
@@ -43,12 +71,29 @@ type client struct {
 	conn     *websocket.Conn
 	userID   string
 	username string
+	sid      string // 会话 ID（握手比对后的声明值；dev 令牌为空）
+	dev      string // 设备类型（desktop/…）
+	connID   uint64 // Hub 自增连接标识；SFU peer 挂此值做归属核对（§0.9）
 
-	send chan []byte // 下行队列（单写者 goroutine 消费）
+	send       chan []byte // 下行队列（单写者 goroutine 消费）
+	readCancel context.CancelFunc
+	lastAct    atomic.Int64 // 最近活动（UnixNano）：数据读或心跳 pong
+	closing    atomic.Bool  // CloseNow 幂等
 
 	mu     sync.Mutex
 	roomID string // 当前所在频道（空 = 未加入）
 	state  VoiceStateData
+}
+
+// closeNow 立即断连（心跳超时/写失败/队列满）：幂等；取消读循环 ctx 并跳过关闭握手。
+func (c *client) closeNow() {
+	if c.closing.Swap(true) {
+		return
+	}
+	if c.readCancel != nil {
+		c.readCancel()
+	}
+	_ = c.conn.CloseNow()
 }
 
 // ChatDeps 聊天持久化与频控依赖（可零值：仅广播不落库、不限流）。
@@ -61,7 +106,8 @@ type ChatDeps struct {
 }
 
 // NewHub 构造信令 hub。maxMembers <= 0 时取 SFU 的上限。
-func NewHub(s *sfu.SFU, auth Authenticator, logger *log.Logger, maxMembers int, chat ChatDeps) *Hub {
+// sess 为多设备会话索引：非 nil 时 WS 握手比对 claims.Sid（§0.4）；nil 跳过（测试/过渡）。
+func NewHub(s *sfu.SFU, authn Authenticator, sess *auth.SessionIndex, logger *log.Logger, maxMembers int, chat ChatDeps) *Hub {
 	if maxMembers <= 0 {
 		maxMembers = s.MaxMembers()
 	}
@@ -69,22 +115,38 @@ func NewHub(s *sfu.SFU, auth Authenticator, logger *log.Logger, maxMembers int, 
 		logger = log.Default()
 	}
 	return &Hub{
-		sfu:       s,
-		auth:      auth,
-		log:       logger,
-		maxPer:    maxMembers,
-		chatStore: chat.Store,
-		limits:    chat.Limits,
-		dev:       chat.Dev,
-		rooms:     make(map[string]*roomState),
+		sfu:            s,
+		auth:           authn,
+		sess:           sess,
+		log:            logger,
+		maxPer:         maxMembers,
+		chatStore:      chat.Store,
+		limits:         chat.Limits,
+		dev:            chat.Dev,
+		heartbeatEvery: defaultHeartbeatEvery,
+		pongWait:       defaultPongWait,
+		readIdle:       defaultReadIdle,
+		rooms:          make(map[string]*roomState),
+		conns:          make(map[connKey]*client),
 	}
 }
 
-// ServeWS 处理 GET /ws?token=dev-<username>。
+// ServeWS 处理 GET /ws?token=<jwt|dev-xxx>。
 func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
-	userID, username, err := h.auth(r.URL.Query().Get("token"))
+	id, err := h.auth(r.URL.Query().Get("token"))
 	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	// 握手比对会话 sid（§0.4）：不符 → 401 + X-LiteTalk-Auth: session_replaced（body code 同值）。
+	if !h.sessionOK(r.Context(), id) {
+		w.Header().Set("X-LiteTalk-Auth", "session_replaced")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"code":    "session_replaced",
+			"message": "账号已在其他设备登录",
+		})
 		return
 	}
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
@@ -97,24 +159,34 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 	}
 	conn.SetReadLimit(256 * 1024) // SDP 较大，放宽到 256KB
 
-	c := &client{
-		hub:      h,
-		conn:     conn,
-		userID:   userID,
-		username: username,
-		send:     make(chan []byte, 256),
-	}
 	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
+	c := &client{
+		hub:        h,
+		conn:       conn,
+		userID:     id.UserID,
+		username:   id.Username,
+		sid:        id.Sid,
+		dev:        id.Dev,
+		send:       make(chan []byte, 256),
+		readCancel: cancel,
+	}
+	c.lastAct.Store(time.Now().UnixNano())
 
+	// 注册（§0.6 踢人序）：先登记新连接，再处理被顶替的旧连接。
+	old := h.register(c)
 	go c.writeLoop(ctx)
+	go h.heartbeatLoop(ctx, c)
+	if old != nil {
+		h.replace(old, c)
+	}
+
 	h.sendJSON(c, TypeHello, HelloData{
-		User:     UserBrief{ID: userID, Nickname: username},
+		User:     UserBrief{ID: id.UserID, Nickname: id.Username},
 		Servers:  []any{},
 		Friends:  []any{},
 		Presence: map[string]any{},
 	})
-	h.log.Printf("ws: %s 已连接", userID)
+	h.log.Printf("ws: %s 已连接（dev=%s conn=%d）", id.UserID, id.Dev, c.connID)
 
 	defer h.cleanup(c)
 	for {
@@ -122,35 +194,160 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return // 断连：cleanup 统一收尾
 		}
+		c.lastAct.Store(time.Now().UnixNano())
 		h.handleMessage(c, data)
 	}
 }
 
+// sessionOK 握手会话校验（§0.4）：claims.Sid 须与 SessionIndex 当前 sid 一致。
+// 旧版本令牌（sid 空）、会话不存在、sess 为 nil（测试/过渡）、devAuth 的 dev-令牌均按各自规则处理。
+func (h *Hub) sessionOK(ctx context.Context, id Identity) bool {
+	if h.sess == nil || id.SkipSessionCheck {
+		return true
+	}
+	uid, err := strconv.ParseInt(id.UserID, 10, 64)
+	if err != nil {
+		return false // 非数字 uid（dev 令牌）无会话可比对
+	}
+	cur, err := h.sess.Get(ctx, uid, id.Dev)
+	if err != nil || cur == "" || id.Sid == "" || id.Sid != cur {
+		return false
+	}
+	return true
+}
+
+// register 登记连接并分配 connID；返回同 uid+dev 的旧连接（nil=无）。
+func (h *Hub) register(c *client) *client {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.nextConnID++
+	c.connID = h.nextConnID
+	key := makeConnKey(c.userID, c.dev)
+	old := h.conns[key]
+	h.conns[key] = c
+	return old
+}
+
+// unregister 仅当 conns[key] 仍是本连接时摘除（被顶替的旧连接不得误删新连接，§0.8）。
+func (h *Hub) unregister(c *client) {
+	h.mu.Lock()
+	key := makeConnKey(c.userID, c.dev)
+	if h.conns[key] == c {
+		delete(h.conns, key)
+	}
+	h.mu.Unlock()
+}
+
+// replace 处理同 uid+dev 的旧连接（§0.6）：同 sid = 会话半开被替换 → 静默 close 4000；
+// 否则 = 同类设备新登录 → 旧连接先收 session.kicked，发送窗口后 close 4001。异步执行，不阻塞新连接。
+func (h *Hub) replace(old, c *client) {
+	if old.sid != "" && old.sid == c.sid {
+		go func() {
+			_ = old.conn.Close(CloseCodeSessionReplaced, "session replaced")
+		}()
+		return
+	}
+	go func() {
+		h.sendJSON(old, TypeSessionKicked, SessionKickedData{
+			Reason:     KickReasonLoginElsewhere,
+			DeviceType: old.dev,
+		})
+		time.Sleep(kickSendWindow) // 踢人发送窗口（§0.6：300~500ms）
+		_ = old.conn.Close(CloseCodeNewLogin, "login elsewhere")
+	}()
+}
+
+// Kick 踢掉该用户的 WS 连接：dev 为空 = 全部设备（登出/重置密码/语音抢占共用，§0.11）。
+// 每个目标：尽力发 session.kicked（reason 空回落 login_elsewhere）→ 发送窗口 → close 4001。
+func (h *Hub) Kick(uid, dev, reason string) {
+	if reason == "" {
+		reason = KickReasonLoginElsewhere
+	}
+	h.mu.Lock()
+	var targets []*client
+	for k, c := range h.conns {
+		if !strings.HasPrefix(string(k), uid+"\x00") {
+			continue
+		}
+		if dev != "" && string(k) != string(makeConnKey(uid, dev)) {
+			continue
+		}
+		targets = append(targets, c)
+	}
+	h.mu.Unlock()
+	for _, c := range targets {
+		go func(c *client) {
+			h.sendJSON(c, TypeSessionKicked, SessionKickedData{Reason: reason, DeviceType: c.dev})
+			time.Sleep(kickSendWindow)
+			_ = c.conn.Close(CloseCodeNewLogin, "login elsewhere")
+		}(c)
+	}
+}
+
 // writeLoop 唯一写者：保证 coder/websocket 单写者约束。
+// 出错（写超时/对端关闭）→ cancel 读循环 ctx + CloseNow（§0.7）。
 func (c *client) writeLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			_ = c.conn.Close(websocket.StatusNormalClosure, "server shutdown")
+			if !c.closing.Load() {
+				_ = c.conn.Close(websocket.StatusNormalClosure, "server shutdown")
+			}
 			return
 		case msg := <-c.send:
-			wctx, wcancel := context.WithTimeout(ctx, 10*time.Second)
+			wctx, wcancel := context.WithTimeout(ctx, writeTimeout)
 			err := c.conn.Write(wctx, websocket.MessageText, msg)
 			wcancel()
 			if err != nil {
+				c.closeNow()
 				return
 			}
 		}
 	}
 }
 
-// cleanup 断连收尾：离房（触发 SFU 路由清理 + peer_left 广播）。
+// heartbeatLoop 协议层心跳（§0.7）：每 heartbeatEvery 发 Ping，pongWait 内无 Pong → CloseNow；
+// 读侧兜底：readIdle 内无任何活动（数据读或 pong）→ CloseNow（僵尸连接清理）。
+// Ping 依赖读循环并发处理 pong（coder/websocket 在 Read 中自动回 Pong），与 writeLoop 并发安全。
+func (h *Hub) heartbeatLoop(ctx context.Context, c *client) {
+	every := h.heartbeatEvery
+	if every <= 0 {
+		every = defaultHeartbeatEvery
+	}
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if last := c.lastAct.Load(); last > 0 && time.Since(time.Unix(0, last)) > h.readIdle {
+				h.log.Printf("ws: %s 读侧 %v 无活动，关闭僵尸连接", c.userID, h.readIdle)
+				c.closeNow()
+				return
+			}
+			pctx, pcancel := context.WithTimeout(ctx, h.pongWait)
+			err := c.conn.Ping(pctx)
+			pcancel()
+			if err != nil {
+				h.log.Printf("ws: %s 心跳失败（%v 内无 Pong）: %v", c.userID, h.pongWait, err)
+				c.closeNow()
+				return
+			}
+			c.lastAct.Store(time.Now().UnixNano())
+		}
+	}
+}
+
+// cleanup 断连收尾：摘连接索引、离房（触发 SFU 归属清理 + peer_left 广播）。
+// 两处均做身份核对（conns[key]==c、members[uid]==c），被顶替的旧连接不会误删新连接（§0.8）。
 func (h *Hub) cleanup(c *client) {
+	h.unregister(c)
 	h.leaveRoom(c)
 	h.log.Printf("ws: %s 已断开", c.userID)
 }
 
-// sendJSON 编码并投递下行消息；队列满则丢弃并记日志（信令低频率，256 缓冲足够）。
+// sendJSON 编码并投递下行消息；队列满 = 对端消费停滞 → CloseNow（§0.7，不静默丢 rtc.offer/ice）。
 func (h *Hub) sendJSON(c *client, msgType string, data any) {
 	raw, err := MarshalEnvelope(msgType, data)
 	if err != nil {
@@ -160,7 +357,8 @@ func (h *Hub) sendJSON(c *client, msgType string, data any) {
 	select {
 	case c.send <- raw:
 	default:
-		h.log.Printf("ws: %s 下行队列满，丢弃 %s", c.userID, msgType)
+		h.log.Printf("ws: %s 下行队列满，关闭连接（丢弃 %s）", c.userID, msgType)
+		c.closeNow()
 	}
 }
 
@@ -270,7 +468,7 @@ func (h *Hub) authorizeChannelJoin(c *client, channelID string) (code, msg strin
 }
 
 // joinRoom 登记成员并向全房间重发 channel.joined（成员全量，§5.3 无 peer_joined 消息，
-// 成员变化以全量下发，客户端做全量替换）。
+// 成员变化以全量下发，客户端做全量替换）。整个登记在一把 hub.mu 内原子完成。
 func (h *Hub) joinRoom(c *client, channelID string) {
 	// 兜底再校验一次：joinRoom 可能被 channel.join 之外的路径调用，权限不可绕。
 	if code, msg := h.authorizeChannelJoin(c, channelID); code != "" {
@@ -283,10 +481,12 @@ func (h *Hub) joinRoom(c *client, channelID string) {
 		h.sendError(c, ErrCodeAlreadyInChan, "已在该频道中")
 		return
 	}
+	var pending []leaveWork
+	// 先离开旧房（成员摘除在锁内，SFU 清理与广播在锁外执行）。
 	if c.roomIDLocked() != "" {
-		h.mu.Unlock()
-		h.leaveRoom(c) // 先离开旧房间再进新房间
-		h.mu.Lock()
+		if w := h.leaveWorkLocked(c); w != nil {
+			pending = append(pending, *w)
+		}
 	}
 	room := h.rooms[channelID]
 	if room == nil {
@@ -295,6 +495,9 @@ func (h *Hub) joinRoom(c *client, channelID string) {
 	}
 	if len(room.members) >= h.maxPer {
 		h.mu.Unlock()
+		for _, w := range pending {
+			h.finishLeave(w)
+		}
 		h.sendError(c, ErrCodeRoomFull, "语音房间已满")
 		return
 	}
@@ -302,6 +505,10 @@ func (h *Hub) joinRoom(c *client, channelID string) {
 	c.setRoomID(channelID)
 	members := room.snapshotLocked()
 	h.mu.Unlock()
+
+	for _, w := range pending {
+		h.finishLeave(w)
+	}
 
 	h.log.Printf("ws: %s 加入频道 %s（%d 人）", c.userID, channelID, len(members))
 	all := memberInfos(members)
@@ -314,36 +521,61 @@ func (h *Hub) joinRoom(c *client, channelID string) {
 	}
 }
 
-// leaveRoom 离房：移除成员、清理 SFU 路由、向剩余成员广播 channel.peer_left。
-func (h *Hub) leaveRoom(c *client) {
-	h.mu.Lock()
+// leaveWork 一次离房的锁内计算结果：锁外执行 SFU 清理与广播。
+type leaveWork struct {
+	c         *client
+	roomID    string
+	removed   bool // 本连接确实是该房成员（需要广播 peer_left）
+	remaining []*client
+}
+
+// leaveWorkLocked 离房（调用方须持 h.mu）：清本连接 roomID、身份核对后摘成员。
+// members[uid] 不是本连接（已被同账号新连接顶替）时不摘成员、不广播（§0.8 盲删防护）。
+func (h *Hub) leaveWorkLocked(c *client) *leaveWork {
 	roomID := c.roomIDLocked()
 	if roomID == "" {
-		h.mu.Unlock()
-		return
+		return nil
 	}
 	c.setRoomID("")
+	w := &leaveWork{c: c, roomID: roomID}
 	room := h.rooms[roomID]
-	var remaining []*client
-	if room != nil {
-		delete(room.members, c.userID)
-		if len(room.members) == 0 {
-			delete(h.rooms, roomID)
-		} else {
-			remaining = room.snapshotLocked()
-		}
+	if room == nil {
+		return w
 	}
-	h.mu.Unlock()
+	if room.members[c.userID] == c {
+		delete(room.members, c.userID)
+		w.removed = true
+	}
+	if len(room.members) == 0 {
+		delete(h.rooms, roomID)
+	} else {
+		w.remaining = room.snapshotLocked()
+	}
+	return w
+}
 
-	// SFU 路由清理（移除路由、关闭其 PC）
-	h.sfu.Leave(roomID, c.userID)
-	h.log.Printf("ws: %s 离开频道 %s", c.userID, roomID)
-
-	for _, m := range remaining {
+// finishLeave 离房收尾（锁外）：SFU 按 connID 归属清理 + peer_left 广播（仅真实摘除成员时）。
+func (h *Hub) finishLeave(w leaveWork) {
+	h.sfu.LeaveIf(w.roomID, w.c.userID, strconv.FormatUint(w.c.connID, 10))
+	if !w.removed {
+		return
+	}
+	h.log.Printf("ws: %s 离开频道 %s", w.c.userID, w.roomID)
+	for _, m := range w.remaining {
 		h.sendJSON(m, TypeChannelPeerLeft, ChannelPeerLeftData{
-			ChannelID: roomID,
-			UserID:    c.userID,
+			ChannelID: w.roomID,
+			UserID:    w.c.userID,
 		})
+	}
+}
+
+// leaveRoom 离房：移除成员、SFU 归属清理、向剩余成员广播 channel.peer_left。
+func (h *Hub) leaveRoom(c *client) {
+	h.mu.Lock()
+	w := h.leaveWorkLocked(c)
+	h.mu.Unlock()
+	if w != nil {
+		h.finishLeave(*w)
 	}
 }
 
@@ -354,7 +586,7 @@ func (h *Hub) handleRTCOffer(c *client, sdp string) {
 		h.sendError(c, ErrCodeNotInChannel, "请先 channel.join 再发起 rtc.offer")
 		return
 	}
-	answer, err := h.sfu.HandleOffer(roomID, c.userID, sdp, &clientSignal{hub: h, c: c})
+	answer, err := h.sfu.HandleOffer(roomID, c.userID, strconv.FormatUint(c.connID, 10), sdp, &clientSignal{hub: h, c: c})
 	if err != nil {
 		code := ErrCodeRTC
 		if errors.Is(err, sfu.ErrRoomFull) {

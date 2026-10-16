@@ -145,7 +145,7 @@ func TestLoadSmoke(t *testing.T) {
 	for r := 0; r < rooms; r++ {
 		roomID := fmt.Sprintf("load%d", r)
 		for i := 0; i < usersPer; i++ {
-			s.Leave(roomID, roomsArr[r][i].c.userID)
+			s.LeaveIf(roomID, roomsArr[r][i].c.userID, roomsArr[r][i].c.userID)
 		}
 		if s.findRoom(roomID) != nil {
 			t.Errorf("房%s: 全员离开后房间未销毁", roomID)

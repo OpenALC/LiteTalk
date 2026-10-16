@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -29,8 +30,32 @@ const (
 	TypeVoiceStateRequest = "voice.state_request" // S→C 定向投递请求
 	TypeChatSend          = "chat.send"           // C→S 文字消息发送
 	TypeChatMessage       = "chat.message"        // S→C 文字消息广播
+	// 多设备会话（v1.1.0，§0 协议契约）：
+	// session.kicked：同类设备新登录，旧连接被踢——踢前尽力下发，随后 close 4001。
+	TypeSessionKicked = "session.kicked"
+	// session.voice_taken：同账号另一会话抢占语音，本端按本地退房处理（不关连接）。
+	TypeSessionVoiceTaken = "session.voice_taken"
 	TypeError             = "error"
 )
+
+// WS close code（§0.6，4000~4999 为应用自定义区间）。
+const (
+	// CloseCodeSessionReplaced 4000：同会话（同 sid）半开连接被新连接替换——
+	// 静默关闭，不发 session.kicked（客户端按正常退出处理，停止重连）。
+	CloseCodeSessionReplaced = websocket.StatusCode(4000)
+	// CloseCodeNewLogin 4001：同类设备新登录（或登出/重置密码踢线）——
+	// 旧连接先收 session.kicked，300~500ms 发送窗口后以此码关闭。
+	CloseCodeNewLogin = websocket.StatusCode(4001)
+)
+
+// KickReasonLoginElsewhere session.kicked.reason 的标准取值（同类设备新登录）。
+const KickReasonLoginElsewhere = "login_elsewhere"
+
+// SessionKickedData S→C session.kicked：踢前尽力下发；随后 close 4001。
+type SessionKickedData struct {
+	Reason     string `json:"reason"`      // login_elsewhere 等
+	DeviceType string `json:"device_type"` // 被踢连接自身的设备类型
+}
 
 // 下行 error 消息的 code 取值
 const (
@@ -193,20 +218,37 @@ type ErrorData struct {
 // ErrUnauthorized 令牌为空或无法提取用户名。
 var ErrUnauthorized = errors.New("令牌无效")
 
-// Authenticator 校验令牌并返回 (userID, username)。
-// M3 接入 JWT 时替换实现即可，hub 无需改动。
-type Authenticator func(token string) (userID, username string, err error)
+// Identity 鉴权结果：身份 + 会话声明（多设备会话 v1.1.0）。
+type Identity struct {
+	UserID   string
+	Username string
+	// Sid 会话 ID（32 hex）；空 = 旧版本令牌（无会话约束，sess 存在时握手拒绝）。
+	Sid string
+	// Dev 设备类型（desktop/mobile/…）；空 = 旧版本令牌。
+	Dev string
+	// SkipSessionCheck 跳过握手 sid 比对。仅 devAuth 模式的 dev- 令牌置位
+	//（dev 令牌无会话概念；生产构建拒绝启用 devAuth，见 cmd/server）。
+	SkipSessionCheck bool
+}
+
+// Authenticator 校验令牌并返回身份与会话声明。
+type Authenticator func(token string) (Identity, error)
 
 // DevAuthenticator M2 开发令牌：dev-<username>。
-// 仅做非空校验 + 提取用户名，不做任何签名校验。
-func DevAuthenticator(token string) (string, string, error) {
+// 仅做非空校验 + 提取用户名，不做任何签名校验；
+// SkipSessionCheck 置位——仅限 devAuth 模式接线（生产构建禁止该模式）。
+func DevAuthenticator(token string) (Identity, error) {
 	if token == "" {
-		return "", "", ErrUnauthorized
+		return Identity{}, ErrUnauthorized
 	}
 	name := strings.TrimPrefix(token, "dev-")
 	if name == "" {
-		return "", "", ErrUnauthorized
+		return Identity{}, ErrUnauthorized
 	}
-	// TODO(M3): 替换为 JWT access token 校验（解析 sub / nickname）
-	return name, name, nil
+	return Identity{
+		UserID:           name,
+		Username:         name,
+		Dev:              "desktop",
+		SkipSessionCheck: true,
+	}, nil
 }

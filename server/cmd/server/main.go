@@ -104,26 +104,37 @@ func main() {
 	}
 	var authenticator signal.Authenticator
 	if devAuth {
-		authenticator = func(token string) (string, string, error) {
+		authenticator = func(token string) (signal.Identity, error) {
 			if !strings.HasPrefix(token, "dev-") {
 				if claims, err := jwtSigner.ParseAccess(token); err == nil {
-					return strconv.FormatInt(claims.UserID, 10), claims.Nickname, nil
+					return signal.Identity{
+						UserID:   strconv.FormatInt(claims.UserID, 10),
+						Username: claims.Nickname,
+						Sid:      claims.Sid,
+						Dev:      claims.Dev,
+					}, nil
 				}
 			}
+			// dev- 令牌无会话概念：SkipSessionCheck 跳过握手 sid 比对（仅 dev 构建可达）。
 			return signal.DevAuthenticator(token)
 		}
 		log.Println("WS 鉴权: JWT + dev-token 兜底（开发模式）")
 	} else {
-		authenticator = func(token string) (string, string, error) {
+		authenticator = func(token string) (signal.Identity, error) {
 			claims, err := jwtSigner.ParseAccess(token)
 			if err != nil {
-				return "", "", signal.ErrUnauthorized
+				return signal.Identity{}, signal.ErrUnauthorized
 			}
-			return strconv.FormatInt(claims.UserID, 10), claims.Nickname, nil
+			return signal.Identity{
+				UserID:   strconv.FormatInt(claims.UserID, 10),
+				Username: claims.Nickname,
+				Sid:      claims.Sid,
+				Dev:      claims.Dev,
+			}, nil
 		}
 		log.Println("WS 鉴权: JWT")
 	}
-	hub := signal.NewHub(sfuInst, authenticator, log.Default(), 0, signal.ChatDeps{
+	hub := signal.NewHub(sfuInst, authenticator, sessIndex, log.Default(), 0, signal.ChatDeps{
 		Store:  st,
 		Limits: limits,
 		Dev:    dev,
@@ -239,8 +250,8 @@ func healthzHandler(w http.ResponseWriter, r *http.Request) {
 
 // devUserID 把 M2 开发令牌映射为用户 ID（M3 换 JWT 时同步替换）。
 func devUserID(token string) (string, error) {
-	id, _, err := signal.DevAuthenticator(token)
-	return id, err
+	id, err := signal.DevAuthenticator(token)
+	return id.UserID, err
 }
 
 // ---- 环境变量小工具 ----

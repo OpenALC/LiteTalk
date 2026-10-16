@@ -37,44 +37,45 @@ func (r *Room) getPeer(userID string) *Peer {
 	return r.peers[userID]
 }
 
-// addPeer 登记成员并创建其 PeerConnection。同人重入时先清掉旧 peer（重连场景）。
-func (r *Room) addPeer(userID string, sig SignalSender) (*Peer, error) {
+// addPeer 登记成员并创建其 PeerConnection。同 room 同 uid 仅允许一个 peer（§0.9）：
+// 同人重入（同 connID 重协商）或新连接顶替（异 connID）都先清掉旧 peer。
+func (r *Room) addPeer(userID, connID string, sig SignalSender) (*Peer, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if old, ok := r.peers[userID]; ok {
 		delete(r.peers, userID)
-		r.sfu.log.Printf("sfu: 房间 %s 成员 %s 重复协商，替换旧连接", r.id, userID)
+		r.sfu.log.Printf("sfu: 房间 %s 成员 %s 连接替换（connID %s → %s），关闭旧连接", r.id, userID, old.connID, connID)
 		go old.close()
 	}
 	if len(r.peers) >= r.sfu.cfg.MaxMembers {
 		return nil, ErrRoomFull
 	}
-	p, err := newPeer(r, userID, sig)
+	p, err := newPeer(r, userID, connID, sig)
 	if err != nil {
 		return nil, err
 	}
 	r.peers[userID] = p
-	r.sfu.log.Printf("sfu: 成员 %s 加入房间 %s（当前 %d 人）", userID, r.id, len(r.peers))
+	r.sfu.log.Printf("sfu: 成员 %s 加入房间 %s（connID %s，当前 %d 人）", userID, r.id, connID, len(r.peers))
 	return p, nil
 }
 
-// removePeer 移除成员并关闭其 PC。其余成员指向它的 outbound track 惰性保留：
-// forward 循环随 inbound 读失败退出后，自然停止写入。
-func (r *Room) removePeer(userID string) {
+// removePeerIf 仅当 peer 归属 connID 时移除并关闭其 PC（§0.9 身份核对：
+// 同 uid 的新连接已顶替旧 peer 时，旧连接的清理不得误删新连接）。
+// 其余成员指向它的 outbound track 惰性保留：forward 循环随 inbound 读失败退出后，自然停止写入。
+func (r *Room) removePeerIf(userID, connID string) {
 	r.mu.Lock()
 	p, ok := r.peers[userID]
-	if ok {
-		delete(r.peers, userID)
-	}
-	r.mu.Unlock()
-	if !ok {
+	if !ok || p.connID != connID {
+		r.mu.Unlock()
 		return
 	}
+	delete(r.peers, userID)
+	r.mu.Unlock()
 	p.close()
 	r.mu.RLock()
 	n := len(r.peers)
 	r.mu.RUnlock()
-	r.sfu.log.Printf("sfu: 成员 %s 离开房间 %s（剩余 %d 人）", userID, r.id, n)
+	r.sfu.log.Printf("sfu: 成员 %s 离开房间 %s（connID %s，剩余 %d 人）", userID, r.id, connID, n)
 }
 
 // onPeerReady 新成员初始 answer 完成后调用：
