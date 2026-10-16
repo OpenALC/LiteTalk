@@ -38,7 +38,12 @@ onUnmounted(() => {
 <template>
   <div class="app-root">
     <TitleBar />
-    <router-view v-if="!hibernate.hibernated" class="app-main" />
+    <!-- 布局类挂包裹层而非 router-view：router-view 的 class 会透传合并到
+         被路由组件的根元素（Vue 作用域 CSS 会把父组件 scope id 打在子根上），
+         与 MainView .app 的横向 flex 冲突——v0.1.2 曾因此把主界面挤成竖排。 -->
+    <div v-if="!hibernate.hibernated" class="app-main">
+      <router-view />
+    </div>
     <div v-else class="hibernate-tip">已休眠，从托盘打开窗口即可继续</div>
   </div>
   <GlobalToast />
@@ -49,6 +54,9 @@ onUnmounted(() => {
   height: 100vh;
   display: flex; flex-direction: column;
   background: var(--surface);
+  /* 硬性防滚动：窗口内容区由内部各面板自行 overflow，任何子树超高
+     都不应把整页顶出滚动条（桌面应用窗口无滚动语义）。 */
+  overflow: hidden;
 }
 /* 路由视图占满 TitleBar 之下的剩余空间（MainView/SettingsView 均为 flex 列） */
 .app-main { flex: 1; min-height: 0; display: flex; flex-direction: column; }

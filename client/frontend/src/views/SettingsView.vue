@@ -265,7 +265,9 @@ async function applyAudio() {
 </template>
 
 <style scoped>
-/* 独立页：占满 TitleBar 之下的全部区域（不再是 stage 浮层） */
+/* 独立页：占满 TitleBar 之下的全部区域（不再是 stage 浮层）。
+   内容列居中：此前 max-width 560 贴左、右半窗留白，滚动条悬在
+   内容右缘像一根游离蓝条（用户走查反馈），居中后读作列滚动条。 */
 .settings-page {
   flex: 1; min-height: 0;
   display: flex; flex-direction: column;
@@ -285,7 +287,11 @@ async function applyAudio() {
   transition: background 0.15s, color 0.15s;
 }
 .icon-btn:hover { background: var(--brand-50); color: var(--ink-900); }
-.s-body { flex: 1; overflow-y: auto; padding: 22px; max-width: 560px; }
+.s-body {
+  flex: 1; overflow-y: auto; padding: 22px; max-width: 560px; width: 100%;
+  /* 列居中：贴左时右半窗留白、滚动条悬在内容右缘像游离蓝条（用户走查反馈） */
+  margin: 0 auto;
+}
 .s-sec { margin-bottom: 26px; }
 .s-sec h3 {
   font-size: 12px; font-weight: 700; letter-spacing: 1.5px;

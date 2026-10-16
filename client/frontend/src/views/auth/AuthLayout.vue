@@ -74,9 +74,11 @@ onMounted(async () => {
 </template>
 
 <style scoped>
-/* 铺满窗口：桌面窗口自身即容器，不再套外层浮卡 */
+/* 铺满窗口：桌面窗口自身即容器，不再套外层浮卡。
+   v0.1.2 TitleBar 全局化后，本组件在 App.vue 的 flex 列内（上方有 38px 标题栏），
+   必须 100%——旧的 100vh 会超出视口一个标题栏高度，整页被顶出滚动条。 */
 .auth-wrap {
-  height: 100vh; display: grid; grid-template-columns: 1fr 460px;
+  height: 100%; min-height: 0; display: grid; grid-template-columns: 1fr 460px;
   background: var(--surface);
   /* 整页可拖拽窗口（问题 5b）；交互元素在下方统一 no-drag。
      Wails v2 拖拽属性为 --wails-draggable（WebView2 不认 -webkit-app-region） */
@@ -170,7 +172,7 @@ onMounted(async () => {
 .fade-enter-from .conn-modal, .fade-leave-to .conn-modal { transform: translateY(8px) scale(0.97); }
 
 @media (max-width: 880px) {
-  .auth-wrap { grid-template-columns: 1fr; height: 100vh; }
+  .auth-wrap { grid-template-columns: 1fr; height: 100%; }
   .brand { padding: 20px 24px; flex-direction: row; align-items: center; gap: 12px; }
   .brand-mid, .brand-foot { display: none; }
   .panel { padding: 28px 24px; overflow: auto; }
