@@ -25,6 +25,15 @@ func main() {
 		Name:        "轻音 LiteTalk",
 		Description: "开源自建的桌面语音聊天",
 		Icon:        appIcon,
+		// 单实例：重复启动不在 New 里再建应用——wails 通知首实例（回调
+		// OnSecondInstanceLaunch）后以 ExitCode 0 退出进程。UniqueID 全局
+		// 唯一，写反向域名。
+		SingleInstance: &application.SingleInstanceOptions{
+			UniqueID: "io.github.openalc.LiteTalk",
+			OnSecondInstanceLaunch: func(application.SecondInstanceData) {
+				app.ShowMainWindow()
+			},
+		},
 		Services: []application.Service{
 			application.NewService(app),
 		},

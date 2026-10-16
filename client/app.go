@@ -442,6 +442,16 @@ func (a *App) WindowClose() {
 	a.closeToTrayOrQuit()
 }
 
+// ShowMainWindow 唤起主窗（单实例二次启动 OnSecondInstanceLaunch 调用）：
+// 复用托盘唤醒逻辑（destroy 模式按记忆位置重建 / Show / 已最小化则 Restore），
+// 再前置聚焦。回调来自 wails 单实例监听 goroutine，与托盘回调同级，无新约束。
+func (a *App) ShowMainWindow() {
+	a.showFromTray()
+	if win := a.getWindow(); win != nil {
+		win.Focus()
+	}
+}
+
 // ---------- 设置 ----------
 
 // GetHibernateMode 休眠模式：off（不休眠）/ hibernate（卸载业务组件）/ destroy（整页重载）。
