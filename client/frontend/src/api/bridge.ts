@@ -205,19 +205,41 @@ const nativeApp = new Proxy({} as GoApp, {
 })
 
 export function goApp(): GoApp {
-  return isNative() ? nativeApp : mockApp
+  if (isNative()) return nativeApp
+  if (import.meta.env.DEV) return mockApp
+  // 生产环境原生初始化失败：mock 会让「登录一律成功」，是安全事故——
+  // 宁可调用原生绑定报错（响亮失败），也不静默走桩。
+  return nativeApp
 }
 
 export function isNative(): boolean {
   return !!window._wails?.flags
 }
 
+// nativeInitFailed 生产环境等待原生标志超时仍未就绪时置位（模块级单例）。
+// App.vue 据此渲染错误页；一旦置位绝不回落 mock。
+let nativeInitFailed = false
+
+export function isNativeInitFailed(): boolean {
+  return nativeInitFailed
+}
+
+// __resetBridgeForTest 仅 vitest 用：同进程多用例共享模块级状态，需手动复位。
+export function __resetBridgeForTest(): void {
+  nativeInitFailed = false
+}
+
 // whenNativeReady 等待 Go 侧注入 window._wails.flags（v3 在 NavigationCompleted
 // 时经 execJS 注入，晚于前端模块求值——路由守卫若抢先跑会把原生误判成 mock）。
-// Go 注入完成会派发 wails:runtime-config-ready 事件；超时按浏览器 mock 处理。
-// 必须在 mount 前 await，保证首个守卫的 isNative() 判定可靠。
-export function whenNativeReady(timeoutMs = 800): Promise<void> {
+// Go 注入完成会派发 wails:runtime-config-ready 事件；必须在 mount 前 await，
+// 保证首个守卫的 isNative() 判定可靠。
+//
+// 超时语义分环境：浏览器开发（DEV）超时按 mock 处理（开发联调无 Go 后端）；
+// 生产环境 WebView2 冷启动可能数秒，等待延长到 10s，超时判为原生初始化失败并
+// 置 nativeInitFailed——生产静默落 mock 是安全事故，绝不发生。
+export function whenNativeReady(timeoutMs?: number): Promise<void> {
   if (isNative() || typeof window === 'undefined') return Promise.resolve()
+  const timeout = timeoutMs ?? (import.meta.env.DEV ? 800 : 10_000)
   return new Promise((resolve) => {
     const done = () => {
       window.removeEventListener('wails:runtime-config-ready', done)
@@ -229,7 +251,12 @@ export function whenNativeReady(timeoutMs = 800): Promise<void> {
       done()
       return
     }
-    setTimeout(done, timeoutMs)
+    setTimeout(() => {
+      if (!isNative() && !import.meta.env.DEV) {
+        nativeInitFailed = true
+      }
+      done()
+    }, timeout)
   })
 }
 
