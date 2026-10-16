@@ -28,7 +28,7 @@ function onCtxMenu(e: MouseEvent) {
 onMounted(() => {
   window.addEventListener('contextmenu', onCtxMenu, true)
   hibernate.init()
-  goApp().GetHibernateOnMinimize().then((v) => hibernate.setEnabled(v))
+  goApp().GetHibernateMode().then((m) => hibernate.setEnabled(m !== 'off'))
 })
 onUnmounted(() => {
   window.removeEventListener('contextmenu', onCtxMenu, true)

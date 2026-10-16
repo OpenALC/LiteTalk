@@ -18,8 +18,12 @@ const auth = useAuthStore()
 const settings = useSettingsStore()
 const hibernateStore = useHibernateStore()
 const version = ref('dev')
-const hibernate = ref(false)
-const uiDestroy = ref(false)
+// 休眠模式三态（旧版「最小化休眠/卸载界面」双开关已合并：重复且卸载开关
+// 依赖休眠开关才生效——用户反馈不生效。off 不休眠 / hibernate 卸载组件 /
+// destroy 整页重载彻底释放内存（实验性））。
+const HIB_LABELS = ['不休眠', '休眠界面', '彻底卸载（实验）'] as const
+const HIB_MODES = ['off', 'hibernate', 'destroy'] as const
+const hibMode = ref<'off' | 'hibernate' | 'destroy'>('off')
 const closeToTray = ref(true)
 const caps = ref<AudioDeviceDTO[]>([])
 const plays = ref<AudioDeviceDTO[]>([])
@@ -56,14 +60,17 @@ function applyDenoiseIdx(i: number) {
 
 onMounted(async () => {
   version.value = await goApp().GetVersion()
-  hibernate.value = await goApp().GetHibernateOnMinimize()
-  try { uiDestroy.value = await goApp().GetUIDestroyOnHibernate() } catch { /* 方法未就绪保持默认 */ }
+  hibMode.value = (await goApp().GetHibernateMode()) as typeof hibMode.value
   closeToTray.value = await goApp().GetCloseToTray()
   audio.value = await goApp().GetAudioSettings()
   syncDenoiseIdx()
   const devs = await goApp().ListAudioDevices()
   caps.value = devs.capture
   plays.value = devs.playback
+  // 设备下拉初值：空串 = 系统默认（下拉首项显式提供「系统默认」）。
+  const sel = await goApp().GetAudioDeviceSelection().catch(() => null)
+  settings.captureDevice = sel?.capture_id ?? ''
+  settings.playbackDevice = sel?.playback_id ?? ''
 })
 
 // 关闭窗口时：最小化到托盘 / 退出程序（问题 4b，持久化 config.json）。
@@ -72,17 +79,11 @@ async function setCloseToTray(v: boolean) {
   await goApp().SetCloseToTray(v)
 }
 
-async function toggleHibernate(v: boolean) {
-  hibernate.value = v
-  hibernateStore.setEnabled(v)
-  await goApp().SetHibernateOnMinimize(v)
-}
-
-// toggleUIDestroy 休眠时卸载界面：最小化隐藏后整页重载释放 JS 堆，
-// 唤醒时凭 Go 侧状态重建（实验性；依赖 sys:hibernate/sys:wake 链路）。
-async function toggleUIDestroy(v: boolean) {
-  uiDestroy.value = v
-  await goApp().SetUIDestroyOnHibernate(v)
+// setHibernateMode 休眠模式三态切换：即时生效（emitHibernate 按模式分支，互不依赖）。
+async function setHibernateMode(mode: typeof hibMode.value) {
+  hibMode.value = mode
+  hibernateStore.setEnabled(mode !== 'off')
+  await goApp().SetHibernateMode(mode)
 }
 
 // 设备下拉即时应用：切换即热重启设备流（编解码/混音状态保留）。
@@ -127,19 +128,15 @@ async function applyAudio() {
       <section class="s-sec">
         <h3>常规</h3>
         <div class="s-row">
-          <div class="k">最小化时休眠界面（省内存）</div>
-          <label class="switch">
-            <input type="checkbox" :checked="hibernate" @change="toggleHibernate(($event.target as HTMLInputElement).checked)">
-            <i />
-          </label>
+          <div class="k">最小化时</div>
+          <div class="seg-mini">
+            <button v-for="(label, i) in HIB_LABELS" :key="HIB_MODES[i]"
+                    :class="{ on: hibMode === HIB_MODES[i] }"
+                    @click="setHibernateMode(HIB_MODES[i])">{{ label }}</button>
+          </div>
         </div>
-        <div class="s-row">
-          <div class="k">休眠时卸载界面（彻底释放内存，实验性）</div>
-          <label class="switch">
-            <input type="checkbox" :checked="uiDestroy" @change="toggleUIDestroy(($event.target as HTMLInputElement).checked)">
-            <i />
-          </label>
-        </div>
+        <!-- 旧版「最小化时休眠界面 / 休眠时卸载界面」双开关已合并为上面三态
+             （重复且卸载开关依赖休眠开关才生效，用户反馈不生效）。 -->
         <!-- 关闭窗口时：最小化到托盘（默认）/ 退出程序（问题 4b，用户可选） -->
         <div class="s-row">
           <div class="k">关闭窗口时</div>
@@ -160,12 +157,14 @@ async function applyAudio() {
         <div class="s-row">
           <div class="k">麦克风</div>
           <select v-model="settings.captureDevice" @change="applyDevice">
+            <option value="">系统默认</option>
             <option v-for="d in caps" :key="d.id" :value="d.id">{{ d.name }}</option>
           </select>
         </div>
         <div class="s-row">
           <div class="k">扬声器</div>
           <select v-model="settings.playbackDevice" @change="applyDevice">
+            <option value="">系统默认</option>
             <option v-for="d in plays" :key="d.id" :value="d.id">{{ d.name }}</option>
           </select>
         </div>

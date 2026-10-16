@@ -5,10 +5,8 @@ import type { AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ConnConfigView
 type GoApp = {
   GetVersion(): Promise<string>
   GetAuthConfig(): Promise<ServerConfig>
-  GetHibernateOnMinimize(): Promise<boolean>
-  SetHibernateOnMinimize(enabled: boolean): Promise<void>
-  GetUIDestroyOnHibernate(): Promise<boolean>
-  SetUIDestroyOnHibernate(v: boolean): Promise<void>
+  GetHibernateMode(): Promise<string> // off / hibernate / destroy
+  SetHibernateMode(mode: string): Promise<void>
   GetServerConfig(): Promise<ConnConfigView>
   SetServerConfig(baseURL: string): Promise<void>
   TestServerConnection(baseURL: string): Promise<ConnTestResult>
@@ -30,6 +28,7 @@ type GoApp = {
   Logout(): Promise<void>
   GetMe(): Promise<UserProfile>
   ListAudioDevices(): Promise<{ capture: AudioDeviceDTO[]; playback: AudioDeviceDTO[] }>
+  GetAudioDeviceSelection(): Promise<{ capture_id: string; playback_id: string }>
   SetAudioDevices(captureID: string, playbackID: string): Promise<void>
   GetAudioSettings(): Promise<AudioSettings>
   SetAudioSettings(s: AudioSettings): Promise<void>
@@ -96,10 +95,8 @@ declare global {
 const mockApp: GoApp = {
   async GetVersion() { return 'dev' },
   async GetAuthConfig() { return { auth_mode: 'full', mail_configured: false } },
-  async GetHibernateOnMinimize() { return false },
-  async SetHibernateOnMinimize() {},
-  async GetUIDestroyOnHibernate() { return false },
-  async SetUIDestroyOnHibernate() {},
+  async GetHibernateMode() { return 'off' },
+  async SetHibernateMode() {},
   async QuitApp() {},
   async TrayReady() { return true },
   async GetCloseToTray() { return true },
@@ -140,6 +137,7 @@ const mockApp: GoApp = {
   },
   async LogFromWeb() {},
   async SetAudioDevices() {},
+  async GetAudioDeviceSelection() { return { capture_id: '', playback_id: '' } },
   async GetAudioSettings() {
     return {
       bitrate_kbps: 32, vbr: true, dtx: true, fec: true, packet_loss: 10,

@@ -1,34 +1,56 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/OpenALC/LiteTalk/client/internal/config"
 )
 
-// 验证「最小化时休眠界面」设置项的读写与持久化
-func TestHibernateOnMinimize(t *testing.T) {
+// 验证休眠模式三态（off/hibernate/destroy）的读写、持久化与非法值校验。
+func TestHibernateMode(t *testing.T) {
 	m := config.NewWithPath(filepath.Join(t.TempDir(), "config.json"))
 	app := newAppWithConfig(m)
 
-	if app.GetHibernateOnMinimize() {
-		t.Fatal("默认值应为 false（默认关闭）")
+	if app.GetHibernateMode() != "off" {
+		t.Fatal("默认值应为 off")
 	}
-
-	app.SetHibernateOnMinimize(true)
-	if !app.GetHibernateOnMinimize() {
-		t.Fatal("设置 true 后读取应为 true")
+	if err := app.SetHibernateMode("destroy"); err != nil {
+		t.Fatalf("SetHibernateMode: %v", err)
+	}
+	if app.GetHibernateMode() != "destroy" {
+		t.Fatal("设置 destroy 后读取应为 destroy")
 	}
 	// 持久化：新实例读盘恢复。
 	app2 := newAppWithConfig(config.NewWithPath(m.Path()))
-	if h := app2.cfg.Get().HibernateOnMinimize; h == nil || !*h {
-		t.Fatal("休眠开关应已持久化到 config.json")
+	if app2.GetHibernateMode() != "destroy" {
+		t.Fatal("休眠模式应已持久化到 config.json")
 	}
+	if err := app.SetHibernateMode("nope"); err == nil {
+		t.Fatal("非法模式应报错")
+	}
+	if app.GetHibernateMode() != "destroy" {
+		t.Fatal("非法值不得改动已存模式")
+	}
+}
 
-	app.SetHibernateOnMinimize(false)
-	if app.GetHibernateOnMinimize() {
-		t.Fatal("设置 false 后读取应为 false")
+// 验证旧版双布尔开关 → 三态休眠模式的一次性迁移。
+func TestHibernateModeMigration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	legacy := `{"hibernate_on_minimize":true,"ui_destroy_on_hibernate":true}`
+	if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := config.NewWithPath(path)
+	if got := m.HibernateMode(); got != "destroy" {
+		t.Fatalf("旧版双开应迁移为 destroy，得到 %s", got)
+	}
+	// 幂等：再次加载不变。
+	m2 := config.NewWithPath(path)
+	if got := m2.HibernateMode(); got != "destroy" {
+		t.Fatalf("迁移应幂等，得到 %s", got)
 	}
 }
 

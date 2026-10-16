@@ -29,11 +29,8 @@ var version = "dev"
 type App struct {
 	ctx context.Context
 
-	// cfg 本地配置（config.json：服务器地址 / 休眠开关持久化）。
+	// cfg 本地配置（config.json：服务器地址 / 休眠模式持久化）。
 	cfg *config.Manager
-
-	// hibernateOnMinimize 设置项「最小化时休眠界面（省内存）」，默认关闭。
-	hibernateOnMinimize bool
 
 	// forceQuit 托盘「退出」或「退出程序」置位后 OnBeforeClose 放行真正关闭。
 	forceQuit atomic.Bool
@@ -111,11 +108,6 @@ func (a *App) startup(ctx context.Context) {
 	base := r.BaseURL
 	a.api = state.NewAPIClient(base)
 
-	// 恢复持久化的休眠开关。
-	if h := a.cfg.Get().HibernateOnMinimize; h != nil {
-		a.hibernateOnMinimize = *h
-	}
-
 	// 托盘独占 goroutine（systray.Run 需要自己的消息循环）。
 	go tray.Run(tray.Callbacks{
 		OnReady: func() {
@@ -151,23 +143,22 @@ func (a *App) startup(ctx context.Context) {
 	})
 }
 
-// emitHibernate 休眠处理（设置页「最小化时休眠界面」）：
-//   - 常规（默认）：发 sys:hibernate，前端卸载业务组件（省内存，前端状态保留）
-//   - UI 销毁模式（v0.1.2 设置开关）：隐藏窗口后整页 WindowReloadApp，
-//     释放 JS 堆/DOM；唤醒时前端凭 Go 侧状态（登录态/语音会话）自愈重建
+// emitHibernate 休眠处理（设置页「休眠模式」三态：off/hibernate/destroy）：
+//   - hibernate：发 sys:hibernate，前端卸载业务组件（省内存，前端状态保留）
+//   - destroy：隐藏窗口后整页 WindowReloadApp，释放 JS 堆/DOM；
+//     唤醒时前端凭 Go 侧状态（登录态/语音会话）自愈重建
+//   - off / 未启用：什么都不做（独立生效，不再像旧版双开关互相依赖）
 func (a *App) emitHibernate() {
-	if !a.hibernateOnMinimize {
-		return
-	}
-	if a.cfg.UIDestroyOnHibernate() {
+	switch a.cfg.HibernateMode() {
+	case "destroy":
 		go func() {
 			// 稍待隐藏完成再重载，避免重载瞬间窗口闪烁（窗口已隐藏不可见）。
 			time.Sleep(300 * time.Millisecond)
 			runtime.WindowReloadApp(a.ctx)
 		}()
-		return
+	case "hibernate":
+		runtime.EventsEmit(a.ctx, "sys:hibernate")
 	}
-	runtime.EventsEmit(a.ctx, "sys:hibernate")
 }
 
 // onBeforeClose 拦截窗口关闭：默认隐藏到托盘而非退出（问题 4 兜底链）。
@@ -252,18 +243,12 @@ func (a *App) WindowClose() {
 
 // ---------- 设置 ----------
 
-// SetHibernateOnMinimize 设置「最小化时休眠界面」开关（持久化到 config.json）。
+// GetHibernateMode 休眠模式：off（不休眠）/ hibernate（卸载业务组件）/ destroy（整页重载）。
 // 前端监听 sys:hibernate / sys:wake 事件切换休眠态（见 stores/hibernate.ts）。
-func (a *App) SetHibernateOnMinimize(enabled bool) {
-	a.hibernateOnMinimize = enabled
-	_ = a.cfg.Update(func(c *config.Config) error {
-		c.HibernateOnMinimize = &enabled
-		return nil
-	})
-}
+func (a *App) GetHibernateMode() string { return a.cfg.HibernateMode() }
 
-// GetHibernateOnMinimize 读取「最小化时休眠界面」开关
-func (a *App) GetHibernateOnMinimize() bool { return a.hibernateOnMinimize }
+// SetHibernateMode 持久化休眠模式（校验 off/hibernate/destroy）。
+func (a *App) SetHibernateMode(mode string) error { return a.cfg.SetHibernateMode(mode) }
 
 // GetVersion 返回客户端版本号
 func (a *App) GetVersion() string { return version }
@@ -478,6 +463,18 @@ func (a *App) ListAudioDevices() (map[string][]AudioDevice, error) {
 		"capture":  toDTO(caps),
 		"playback": toDTO(plays),
 	}, nil
+}
+
+// AudioDeviceSelection 持久化的输入/输出设备选择（空串 = 系统默认）。
+type AudioDeviceSelection struct {
+	CaptureID  string `json:"capture_id"`
+	PlaybackID string `json:"playback_id"`
+}
+
+// GetAudioDeviceSelection 读取持久化的设备选择（设置页下拉初值；空 = 系统默认）。
+func (a *App) GetAudioDeviceSelection() *AudioDeviceSelection {
+	c := a.cfg.Get()
+	return &AudioDeviceSelection{CaptureID: c.AudioCapture, PlaybackID: c.AudioPlayback}
 }
 
 // ---------- 语音会话 ----------
@@ -738,12 +735,6 @@ func (a *App) GetIntroHidden() bool { return a.cfg.IntroHidden() }
 
 // SetIntroHidden 持久化介绍页隐藏状态。
 func (a *App) SetIntroHidden(v bool) error { return a.cfg.SetIntroHidden(v) }
-
-// GetUIDestroyOnHibernate 休眠时是否卸载整个界面（WindowReloadApp）。
-func (a *App) GetUIDestroyOnHibernate() bool { return a.cfg.UIDestroyOnHibernate() }
-
-// SetUIDestroyOnHibernate 持久化 UI 销毁休眠开关。
-func (a *App) SetUIDestroyOnHibernate(v bool) error { return a.cfg.SetUIDestroyOnHibernate(v) }
 
 // SetPeerVolume 调整某远端成员音量（0.0–2.0）。
 func (a *App) SetPeerVolume(userID string, gain float64) {

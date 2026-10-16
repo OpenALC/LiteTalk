@@ -385,10 +385,12 @@ export const useFriendsStore = defineStore('friends', () => {
 })
 
 export const useSettingsStore = defineStore('settings', () => {
-  const hibernateOnMinimize = ref(false)
+  // 设备下拉当前选择（空串 = 系统默认）；持久化在 Go 侧 config.json，
+  // 设置页 onMounted 用 GetAudioDeviceSelection 回填初值。
   const captureDevice = ref('')
   const playbackDevice = ref('')
 
-  // v0.1.2：设置改为独立路由页 /settings，原 panelOpen 浮层开关已移除。
-  return { hibernateOnMinimize, captureDevice, playbackDevice }
+  // v0.1.2：设置改为独立路由页 /settings，原 panelOpen 浮层开关已移除；
+  // 休眠模式（hibernate_mode 三态）由 hibernate store 直接对接 Go，不经本 store。
+  return { captureDevice, playbackDevice }
 })

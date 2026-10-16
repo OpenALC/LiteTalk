@@ -7,6 +7,7 @@ package config
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -38,7 +39,8 @@ const (
 // Config config.json 的持久化结构。
 type Config struct {
 	ServerBase          string `json:"server_base,omitempty"`            // 服务端基址，如 https://example.com
-	HibernateOnMinimize *bool  `json:"hibernate_on_minimize,omitempty"`  // 最小化时休眠界面
+	HibernateOnMinimize *bool  `json:"hibernate_on_minimize,omitempty"`  // 最小化时休眠界面（旧版布尔，已由 HibernateMode 取代，保留读取做迁移）
+	HibernateMode       string `json:"hibernate_mode,omitempty"`        // 休眠模式：off 不休眠 / hibernate 卸载业务组件 / destroy 整页重载（默认 off）
 	CloseToTray         *bool  `json:"close_to_tray,omitempty"`          // 关闭窗口时最小化到托盘（默认 true；false=退出程序）
 	SavedEmail          string `json:"saved_email,omitempty"`            // 记住的登录邮箱
 	EncPassword         string `json:"enc_password,omitempty"`           // 记住的密码（DPAPI 密文 base64；非 Windows 恒空）
@@ -201,18 +203,35 @@ func NewWithPath(path string) *Manager {
 //     迁移靠 VadMigrated 标记只做一次——之后的新刻度 1/2 与旧值存在歧义，
 //     不能每次读都做映射（那会污染新用户配置）。
 func (m *Manager) migrateOnce() {
-	if m.cfg.VadMigrated {
-		return
-	}
-	if a := m.cfg.Audio; a != nil && a.VADSens != nil {
-		if v := *a.VADSens; v == 1 || v == 2 {
-			v *= 2
-			a.VADSens = &v
+	// 休眠模式迁移：旧版两个布尔开关（最小化休眠 / 卸载界面）语义重叠、
+	// 且卸载开关依赖休眠开关才生效（用户反馈「重复且不生效」）——合并为三态。
+	// 空值 = 未迁移，非空即终态（无需标记位）。与 vad 迁移独立判断、各自幂等。
+	dirty := false
+	if m.cfg.HibernateMode == "" {
+		switch {
+		case m.cfg.UIDestroyOnHibernate != nil && *m.cfg.UIDestroyOnHibernate:
+			m.cfg.HibernateMode = "destroy"
+		case m.cfg.HibernateOnMinimize != nil && *m.cfg.HibernateOnMinimize:
+			m.cfg.HibernateMode = "hibernate"
+		default:
+			m.cfg.HibernateMode = "off"
 		}
+		dirty = true
 	}
-	m.cfg.VadMigrated = true
-	// 文件不存在时（全新用户）也写盘建立标记，避免后续读出歧义值再迁移。
-	_ = m.Save(m.cfg)
+	if !m.cfg.VadMigrated {
+		if a := m.cfg.Audio; a != nil && a.VADSens != nil {
+			if v := *a.VADSens; v == 1 || v == 2 {
+				v *= 2
+				a.VADSens = &v
+			}
+		}
+		m.cfg.VadMigrated = true
+		dirty = true
+	}
+	// 全新用户（文件不存在）也写盘：固化迁移结果，避免后续读出歧义值。
+	if dirty {
+		_ = m.Save(m.cfg)
+	}
 }
 
 // Path 返回配置文件路径。
@@ -364,7 +383,30 @@ func (m *Manager) SetCloseToTray(v bool) error {
 
 // ---------- v0.1.2 界面偏好：UI 销毁休眠 / 首页服务器 / 介绍页隐藏 ----------
 
-// UIDestroyOnHibernate 休眠时是否 WindowReloadApp 卸载界面（默认 false）。
+// HibernateModeValid 合法休眠模式。
+var HibernateModeValid = map[string]bool{"off": true, "hibernate": true, "destroy": true}
+
+// HibernateMode 休眠模式（off/hibernate/destroy；非法或空值回落 off）。
+func (m *Manager) HibernateMode() string {
+	v := m.Get().HibernateMode
+	if !HibernateModeValid[v] {
+		return "off"
+	}
+	return v
+}
+
+// SetHibernateMode 持久化休眠模式（校验 off/hibernate/destroy）。
+func (m *Manager) SetHibernateMode(mode string) error {
+	if !HibernateModeValid[mode] {
+		return fmt.Errorf("休眠模式非法: %s", mode)
+	}
+	return m.Update(func(c *Config) error {
+		c.HibernateMode = mode
+		return nil
+	})
+}
+
+// UIDestroyOnHibernate 休眠时是否 WindowReloadApp 卸载界面（旧版布尔，保留读取供迁移）。
 func (m *Manager) UIDestroyOnHibernate() bool {
 	v := m.Get().UIDestroyOnHibernate
 	return v != nil && *v
