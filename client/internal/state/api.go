@@ -7,12 +7,22 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"sync"
 	"time"
 )
+
+// ErrSessionReplaced 会话已被其他设备顶替/重放（401 + X-LiteTalk-Auth:
+// session_replaced/session_replayed，契约 §0.3/§0.4）。
+// 致命：refresh 令牌同族已失效，刷新也救不回——不触发刷新重试，直接返回；
+// 上层应断会话、清令牌、回登录页。
+var ErrSessionReplaced = errors.New("会话已被其他设备替换")
+
+// authHeaderSession 服务端 401 细分会话类失败的响应头（契约 §0.4）。
+const authHeaderSession = "X-LiteTalk-Auth"
 
 // AuthTokens 登录/刷新返回的令牌对（§5.4 auth 契约）。
 // User 仅服务端响应携带时非空（/auth/refresh 会带回 user，可直接用，
@@ -107,6 +117,8 @@ func (c *APIClient) Token() string {
 
 // do 执行一次请求；401（token_expired/unauthorized）且带鉴权时先合并刷新
 // 再用新令牌原样重放一次（retried 防递归）；仍 401 才返回错误。
+// 401 且会话被顶替/重放（X-LiteTalk-Auth: session_replaced/session_replayed）
+// 则返回 ErrSessionReplaced，不走刷新。
 func (c *APIClient) do(req *http.Request, auth bool) (int, []byte, error) {
 	return c.doOnce(req, auth, false)
 }
@@ -123,27 +135,48 @@ func (c *APIClient) doOnce(req *http.Request, auth, retried bool) (int, []byte, 
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode == http.StatusUnauthorized && auth && !retried && c.refreshSource != nil {
-		var e APIError
-		// 服务端对过期/无效令牌统一返回 unauthorized（router.go），
-		// token_expired 是文档约定码——两者都尝试刷新，刷新失败即原样报错。
-		if json.Unmarshal(data, &e) == nil && (e.Code == "token_expired" || e.Code == "unauthorized") {
-			if _, rerr := c.refreshOnce(req.Context()); rerr == nil {
-				retry := req.Clone(req.Context())
-				// GET/DELETE 无 body 时 GetBody 为 nil（http.NewRequest 只为
-				// bytes.Reader/Buffer 填充），Clone 复用原 Body 即可重放。
-				if req.GetBody != nil {
-					body, berr := req.GetBody()
-					if berr != nil {
-						return resp.StatusCode, data, nil
+	if resp.StatusCode == http.StatusUnauthorized && auth {
+		// 会话被其他设备顶替/重放：致命，直接上抛，不进刷新重试。
+		if isSessionReplaced(resp.Header.Get(authHeaderSession), data) {
+			return resp.StatusCode, data, ErrSessionReplaced
+		}
+		if !retried && c.refreshSource != nil {
+			var e APIError
+			// 服务端对过期/无效令牌统一返回 unauthorized（router.go），
+			// token_expired 是文档约定码——两者都尝试刷新，刷新失败即原样报错。
+			if json.Unmarshal(data, &e) == nil && (e.Code == "token_expired" || e.Code == "unauthorized") {
+				if _, rerr := c.refreshOnce(req.Context()); rerr == nil {
+					retry := req.Clone(req.Context())
+					// GET/DELETE 无 body 时 GetBody 为 nil（http.NewRequest 只为
+					// bytes.Reader/Buffer 填充），Clone 复用原 Body 即可重放。
+					if req.GetBody != nil {
+						body, berr := req.GetBody()
+						if berr != nil {
+							return resp.StatusCode, data, nil
+						}
+						retry.Body = body
 					}
-					retry.Body = body
+					return c.doOnce(retry, auth, true)
+				} else if errors.Is(rerr, ErrSessionReplaced) {
+					// 并发窗口里会话已被顶替（refresh 撞上 session_replaced），
+					// 同样按致命上抛。
+					return resp.StatusCode, data, ErrSessionReplaced
 				}
-				return c.doOnce(retry, auth, true)
 			}
 		}
 	}
 	return resp.StatusCode, data, nil
+}
+
+// isSessionReplaced 判定 401 属会话顶替/重放：头值优先，body code 兜底
+// （契约 §0.4 头与 body code 同值，任一命中即可）。
+func isSessionReplaced(header string, data []byte) bool {
+	if header == "session_replaced" || header == "session_replayed" {
+		return true
+	}
+	var e APIError
+	return json.Unmarshal(data, &e) == nil &&
+		(e.Code == "session_replaced" || e.Code == "session_replayed")
 }
 
 // refreshOnce 并发安全的单次刷新：已有刷新在进行则等待其结果，
@@ -188,6 +221,11 @@ func (c *APIClient) doRefresh(ctx context.Context) (*AuthTokens, error) {
 		return nil, err
 	}
 	if status != http.StatusOK {
+		// refresh 自身 401 不重试（防递归）；会话被顶替/重放按致命上抛，
+		// 让在飞请求也能拿到 ErrSessionReplaced 而非普通 401。
+		if isSessionReplaced("", data) {
+			return nil, ErrSessionReplaced
+		}
 		return nil, decodeError(status, data) // refresh 自身 401 不重试（防递归）
 	}
 	var t AuthTokens

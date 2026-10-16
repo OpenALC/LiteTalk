@@ -32,6 +32,22 @@ const (
 	TypeFriendRequest     = "friend.request"  // S→C
 	TypeFriendAccept      = "friend.accept"   // S→C
 	TypeError             = "error"           // S→C
+	// 批次 2 多设备会话（契约 §0.5，只增不改；与 server/internal/signal/protocol.go 同步）。
+	TypeSessionKicked     = "session.kicked"      // S→C 同类设备新登录踢线，随后 close 4001
+	TypeSessionVoiceTaken = "session.voice_taken" // S→C 同账号另一会话抢占语音，本端本地退房
+)
+
+// 下行 error 消息的 code 取值（与 server/internal/signal/protocol.go 对齐）。
+const (
+	ErrCodeBadMessage    = "bad_message"
+	ErrCodeNotInChannel  = "not_in_channel"
+	ErrCodeAlreadyInChan = "already_in_channel"
+	ErrCodeRoomFull      = "room_full"
+	ErrCodeRTC           = "rtc_error"
+	ErrCodeInternal      = "internal"
+	ErrCodeForbidden     = "forbidden"
+	ErrCodeNotFound      = "not_found"
+	ErrCodeRateLimited   = "rate_limited"
 )
 
 // Envelope 信令信封。Data 延迟解析，由订阅者按 Type 自行解码。
@@ -158,6 +174,14 @@ type VoiceStateRequestData struct {
 type ErrorData struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+
+// SessionKickedData 是 session.kicked 的载荷（契约 §0.5）。
+// 本期 reason 恒为 "login_elsewhere"（同类设备新登录），device_type 为接管端设备。
+// session.voice_taken 载荷为空对象，无需解码。
+type SessionKickedData struct {
+	Reason     string `json:"reason"`
+	DeviceType string `json:"device_type"`
 }
 
 // Bool 返回 b 的指针（构造可选增量字段用）。
