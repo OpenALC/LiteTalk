@@ -41,6 +41,7 @@ const (
 	ErrCodeRTC           = "rtc_error"
 	ErrCodeInternal      = "internal"
 	ErrCodeForbidden     = "forbidden"
+	ErrCodeNotFound      = "not_found"
 	ErrCodeRateLimited   = "rate_limited"
 )
 

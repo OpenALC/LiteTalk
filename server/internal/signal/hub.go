@@ -6,10 +6,12 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/OpenALC/LiteTalk/server/internal/sfu"
+	"github.com/OpenALC/LiteTalk/server/internal/store"
 	"github.com/coder/websocket"
 	"github.com/pion/webrtc/v4"
 )
@@ -23,6 +25,7 @@ type Hub struct {
 	maxPer    int // 房间人数上限（与 SFU 一致）
 	chatStore ChatStore
 	limits    RateLimiter
+	dev       bool // 开发模式：放行非数字的内置房间（生产必须为 false）
 
 	mu    sync.Mutex
 	rooms map[string]*roomState
@@ -52,6 +55,9 @@ type client struct {
 type ChatDeps struct {
 	Store  ChatStore
 	Limits RateLimiter
+	// Dev 开发模式：放行非数字的内置房间 ID（M2 遗留场景，无 store 频道实体）。
+	// 生产构建（注入了版本号）必须为 false，否则任意字符串房间都可进入。
+	Dev bool
 }
 
 // NewHub 构造信令 hub。maxMembers <= 0 时取 SFU 的上限。
@@ -69,6 +75,7 @@ func NewHub(s *sfu.SFU, auth Authenticator, logger *log.Logger, maxMembers int, 
 		maxPer:    maxMembers,
 		chatStore: chat.Store,
 		limits:    chat.Limits,
+		dev:       chat.Dev,
 		rooms:     make(map[string]*roomState),
 	}
 }
@@ -175,6 +182,10 @@ func (h *Hub) handleMessage(c *client, data []byte) {
 			h.sendError(c, ErrCodeBadMessage, "channel.join 需要 channel_id")
 			return
 		}
+		if code, msg := h.authorizeChannelJoin(c, d.ChannelID); code != "" {
+			h.sendError(c, code, msg)
+			return
+		}
 		h.joinRoom(c, d.ChannelID)
 	case TypeChannelLeave:
 		h.leaveRoom(c)
@@ -225,9 +236,47 @@ func (h *Hub) handleMessage(c *client, data []byte) {
 	}
 }
 
+// authorizeChannelJoin 进房权限校验（P0 S1）：返回 (错误码, 消息)，code 为空即放行。
+// 数字频道要求存在、Type 为 voice、请求者是其所属服务器成员；
+// 非数字房间是 M2 内置房间（无 store 频道实体），仅 dev 模式放行。
+// 校验含 store 查询，调用方不得持有 hub.mu。
+func (h *Hub) authorizeChannelJoin(c *client, channelID string) (code, msg string) {
+	ctx := context.Background()
+	chID, err := strconv.ParseInt(channelID, 10, 64)
+	if err != nil {
+		if h.dev {
+			return "", ""
+		}
+		return ErrCodeNotFound, "频道不存在"
+	}
+	if h.chatStore == nil {
+		return ErrCodeNotFound, "频道不存在"
+	}
+	ch, err := h.chatStore.ChannelByID(ctx, chID)
+	if err != nil {
+		return ErrCodeNotFound, "频道不存在"
+	}
+	if ch.Type != store.ChannelVoice {
+		return ErrCodeForbidden, "只能加入语音频道"
+	}
+	uid, err := strconv.ParseInt(c.userID, 10, 64)
+	if err != nil {
+		return ErrCodeForbidden, "无权进入该频道"
+	}
+	if _, err := h.chatStore.Member(ctx, ch.ServerID, uid); err != nil {
+		return ErrCodeForbidden, "无权进入该频道"
+	}
+	return "", ""
+}
+
 // joinRoom 登记成员并向全房间重发 channel.joined（成员全量，§5.3 无 peer_joined 消息，
 // 成员变化以全量下发，客户端做全量替换）。
 func (h *Hub) joinRoom(c *client, channelID string) {
+	// 兜底再校验一次：joinRoom 可能被 channel.join 之外的路径调用，权限不可绕。
+	if code, msg := h.authorizeChannelJoin(c, channelID); code != "" {
+		h.sendError(c, code, msg)
+		return
+	}
 	h.mu.Lock()
 	if c.roomIDLocked() == channelID {
 		h.mu.Unlock()

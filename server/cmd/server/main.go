@@ -33,6 +33,11 @@ const defaultAddr = ":8077"
 func main() {
 	addr := envOr("LITETALK_ADDR", defaultAddr)
 
+	// dev 模式判定：本地 go run / go build 未注入版本号时 version 为 "dev"；
+	// CI 打包始终 -X main.version=<tag> 注入真实版本号，故发布产物一律视为生产模式，
+	// 生产模式下内存降级、默认密钥、dev 令牌开关等开发便利项全部拒绝启动。
+	dev := version == "dev"
+
 	// ---- 持久化（MySQL + Redis，env 注入 DSN；不可用时内存降级） ----
 	var st store.Store
 	var kv store.KV
@@ -104,6 +109,7 @@ func main() {
 	hub := signal.NewHub(sfuInst, authenticator, log.Default(), 0, signal.ChatDeps{
 		Store:  st,
 		Limits: limits,
+		Dev:    dev,
 	})
 
 	// TURN 短期凭证签发（coturn use-auth-secret，§5.4）

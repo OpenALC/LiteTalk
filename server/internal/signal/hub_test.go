@@ -20,7 +20,8 @@ import (
 
 // ---- 测试脚手架 ----
 
-// testAuthenticator token "1"→(1,alice)、"2"→(2,bob)、"9"→(9,mallory)。
+// testAuthenticator token "1"→(1,alice)、"2"→(2,bob)、"9"→(9,mallory)、"8"→(8,eve)。
+// mallory 在 fixture 里是服务器成员，eve 不是（进房权限测试用）。
 func testAuthenticator(token string) (string, string, error) {
 	switch token {
 	case "1":
@@ -29,17 +30,20 @@ func testAuthenticator(token string) (string, string, error) {
 		return "2", "bob", nil
 	case "9":
 		return "9", "mallory", nil
+	case "8":
+		return "8", "eve", nil
 	}
 	return "", "", ErrUnauthorized
 }
 
-// chatFixture 一套 hub + 双客户端脚手架：store 里有文本频道 ch（成员 alice/bob）。
+// chatFixture 一套 hub + 双客户端脚手架：store 里有文本频道 ch、语音频道 vch（成员 alice/bob）。
 type chatFixture struct {
 	t   *testing.T
 	hub *Hub
 	st  *store.Mem
 	srv *httptest.Server
 	ch  *store.Channel
+	vch *store.Channel
 }
 
 func newChatFixture(t *testing.T) *chatFixture {
@@ -60,7 +64,7 @@ func newChatFixture(t *testing.T) *chatFixture {
 	if err := st.CreateServer(ctx, srvRec); err != nil {
 		t.Fatalf("CreateServer: %v", err)
 	}
-	for _, uid := range []int64{u1.ID, u2.ID} {
+	for _, uid := range []int64{u1.ID, u2.ID, 9} { // 9 = mallory：成员（进房权限用例另行用非成员 eve）
 		if err := st.AddMember(ctx, &store.ServerMember{ServerID: srvRec.ID, UserID: uid, Role: store.RoleMember}); err != nil {
 			t.Fatalf("AddMember: %v", err)
 		}
@@ -69,7 +73,19 @@ func newChatFixture(t *testing.T) *chatFixture {
 	if err := st.CreateChannel(ctx, ch); err != nil {
 		t.Fatalf("CreateChannel: %v", err)
 	}
+	vch := &store.Channel{ServerID: srvRec.ID, Name: "lobby", Type: store.ChannelVoice}
+	if err := st.CreateChannel(ctx, vch); err != nil {
+		t.Fatalf("CreateChannel: %v", err)
+	}
 
+	hub, hs := newHubServer(t, st, false)
+
+	return &chatFixture{t: t, hub: hub, st: st, srv: hs, ch: ch, vch: vch}
+}
+
+// newHubServer 用给定 store 搭一套 hub + httptest 服务；dev 控制非数字内置房间放行。
+func newHubServer(t *testing.T, st *store.Mem, dev bool) (*Hub, *httptest.Server) {
+	t.Helper()
 	inst, err := sfu.New(sfu.Config{UDPPort: 0, MaxMembers: 10, Logger: log.New(io.Discard, "", 0)})
 	if err != nil {
 		t.Fatalf("sfu.New: %v", err)
@@ -79,11 +95,11 @@ func newChatFixture(t *testing.T) *chatFixture {
 	hub := NewHub(inst, testAuthenticator, log.New(io.Discard, "", 0), 0, ChatDeps{
 		Store:  st,
 		Limits: auth.NewRateLimit(st),
+		Dev:    dev,
 	})
 	hs := httptest.NewServer(newServeMux(hub))
 	t.Cleanup(hs.Close)
-
-	return &chatFixture{t: t, hub: hub, st: st, srv: hs, ch: ch}
+	return hub, hs
 }
 
 func newServeMux(h *Hub) *http.ServeMux {
@@ -151,7 +167,7 @@ func (c *wsClient) recvUntil(want string) Envelope {
 // 且消息落库可查。
 func TestChatBroadcast(t *testing.T) {
 	f := newChatFixture(t)
-	chID := strconv.FormatInt(f.ch.ID, 10)
+	chID := strconv.FormatInt(f.vch.ID, 10)
 
 	a := f.dial("1", "alice")
 	b := f.dial("2", "bob")
@@ -184,7 +200,7 @@ func TestChatBroadcast(t *testing.T) {
 	}
 
 	// 落库可查。
-	msgs, err := f.st.MessagesBefore(context.Background(), f.ch.ID, 0, 10)
+	msgs, err := f.st.MessagesBefore(context.Background(), f.vch.ID, 0, 10)
 	if err != nil {
 		t.Fatalf("MessagesBefore: %v", err)
 	}
@@ -196,7 +212,7 @@ func TestChatBroadcast(t *testing.T) {
 // TestChatBadContent 超长（2001 字）与空内容拒收（bad_message）。
 func TestChatBadContent(t *testing.T) {
 	f := newChatFixture(t)
-	chID := strconv.FormatInt(f.ch.ID, 10)
+	chID := strconv.FormatInt(f.vch.ID, 10)
 
 	a := f.dial("1", "alice")
 	a.send(TypeChannelJoin, ChannelJoinData{ChannelID: chID})
@@ -216,7 +232,7 @@ func TestChatBadContent(t *testing.T) {
 	}
 
 	// 拒收后不落库。
-	msgs, err := f.st.MessagesBefore(context.Background(), f.ch.ID, 0, 10)
+	msgs, err := f.st.MessagesBefore(context.Background(), f.vch.ID, 0, 10)
 	if err != nil {
 		t.Fatalf("MessagesBefore: %v", err)
 	}
@@ -228,7 +244,7 @@ func TestChatBadContent(t *testing.T) {
 // TestChatRateLimit 20 条/分：第 21 条触发 rate_limited。
 func TestChatRateLimit(t *testing.T) {
 	f := newChatFixture(t)
-	chID := strconv.FormatInt(f.ch.ID, 10)
+	chID := strconv.FormatInt(f.vch.ID, 10)
 
 	a := f.dial("1", "alice")
 	a.send(TypeChannelJoin, ChannelJoinData{ChannelID: chID})
@@ -255,7 +271,7 @@ func TestChatRateLimit(t *testing.T) {
 // A 自己收不到；目标不在频道 → A 收 not_in_channel。
 func TestVoiceRequestState(t *testing.T) {
 	f := newChatFixture(t)
-	chID := strconv.FormatInt(f.ch.ID, 10)
+	chID := strconv.FormatInt(f.vch.ID, 10)
 
 	a := f.dial("1", "alice")
 	b := f.dial("2", "bob")
@@ -298,16 +314,105 @@ func TestVoiceRequestState(t *testing.T) {
 // TestChatForbidden 既不在房间、也不是频道成员 → forbidden。
 func TestChatForbidden(t *testing.T) {
 	f := newChatFixture(t)
-	chID := strconv.FormatInt(f.ch.ID, 10)
+	chID := strconv.FormatInt(f.vch.ID, 10)
 
-	mallory := f.dial("9", "mallory") // 未 join、非成员
-	mallory.send(TypeChatSend, ChatSendData{ChannelID: chID, Content: "hi"})
-	env := mallory.recvUntil(TypeError)
+	eve := f.dial("8", "eve") // 未 join、非成员
+	eve.send(TypeChatSend, ChatSendData{ChannelID: chID, Content: "hi"})
+	env := eve.recvUntil(TypeError)
 	var e ErrorData
 	if err := env.Decode(&e); err != nil {
 		t.Fatalf("decode error: %v", err)
 	}
 	if e.Code != ErrCodeForbidden {
 		t.Fatalf("code = %q, want %q", e.Code, ErrCodeForbidden)
+	}
+}
+
+// TestChannelJoinForbidden 非服务器成员加入语音频道 → forbidden（P0 S1）。
+func TestChannelJoinForbidden(t *testing.T) {
+	f := newChatFixture(t)
+	chID := strconv.FormatInt(f.vch.ID, 10)
+
+	eve := f.dial("8", "eve") // 非该服务器成员
+	eve.send(TypeChannelJoin, ChannelJoinData{ChannelID: chID})
+	env := eve.recvUntil(TypeError)
+	var e ErrorData
+	if err := env.Decode(&e); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if e.Code != ErrCodeForbidden {
+		t.Fatalf("code = %q, want %q", e.Code, ErrCodeForbidden)
+	}
+}
+
+// TestChannelJoinTextForbidden 成员加入文本频道 → forbidden（只能进语音频道）。
+func TestChannelJoinTextForbidden(t *testing.T) {
+	f := newChatFixture(t)
+	chID := strconv.FormatInt(f.ch.ID, 10)
+
+	a := f.dial("1", "alice")
+	a.send(TypeChannelJoin, ChannelJoinData{ChannelID: chID})
+	env := a.recvUntil(TypeError)
+	var e ErrorData
+	if err := env.Decode(&e); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if e.Code != ErrCodeForbidden {
+		t.Fatalf("code = %q, want %q", e.Code, ErrCodeForbidden)
+	}
+}
+
+// TestChannelJoinNotFound 加入不存在的数字频道 → not_found。
+func TestChannelJoinNotFound(t *testing.T) {
+	f := newChatFixture(t)
+
+	a := f.dial("1", "alice")
+	a.send(TypeChannelJoin, ChannelJoinData{ChannelID: "999999"})
+	env := a.recvUntil(TypeError)
+	var e ErrorData
+	if err := env.Decode(&e); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if e.Code != ErrCodeNotFound {
+		t.Fatalf("code = %q, want %q", e.Code, ErrCodeNotFound)
+	}
+}
+
+// TestChannelJoinDevRoom 非数字内置房间：生产 hub 拒绝（not_found），dev hub 放行。
+func TestChannelJoinDevRoom(t *testing.T) {
+	f := newChatFixture(t)
+
+	// 生产（Dev=false）：内置房间不存在于 store → not_found。
+	a := f.dial("1", "alice")
+	a.send(TypeChannelJoin, ChannelJoinData{ChannelID: "builtin-lobby"})
+	env := a.recvUntil(TypeError)
+	var e ErrorData
+	if err := env.Decode(&e); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if e.Code != ErrCodeNotFound {
+		t.Fatalf("code = %q, want %q", e.Code, ErrCodeNotFound)
+	}
+
+	// dev（Dev=true）：放行并正常下发 channel.joined。
+	_, hs := newHubServer(f.t, f.st, true)
+	devClient := &wsClient{t: f.t, user: "alice"}
+	conn, _, err := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(hs.URL, "http")+"/ws?token=1", nil)
+	if err != nil {
+		f.t.Fatalf("dial dev hub: %v", err)
+	}
+	f.t.Cleanup(func() { conn.CloseNow() })
+	devClient.conn = conn
+	devClient.send(TypeChannelJoin, ChannelJoinData{ChannelID: "builtin-lobby"})
+	got := devClient.recvUntil(TypeChannelJoined)
+	if got.Type != TypeChannelJoined {
+		t.Fatalf("dev 房间应能加入，实际收到 %q", got.Type)
+	}
+	var joined ChannelJoinedData
+	if err := got.Decode(&joined); err != nil {
+		t.Fatalf("decode channel.joined: %v", err)
+	}
+	if joined.ChannelID != "builtin-lobby" || len(joined.Members) != 1 {
+		t.Fatalf("joined 数据不符: %+v", joined)
 	}
 }
