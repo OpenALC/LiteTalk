@@ -289,6 +289,105 @@ func TestPeerLoopback(t *testing.T) {
 	<-iceDone
 }
 
+// TestPeerDropDTX 发送端丢弃 DTX 空包：≤2 字节载荷不发出，但 seq/时戳照常
+// 推进（时间线连续，对端按断流做丢包补偿）；恢复说话后 seq/时戳衔接。
+func TestPeerDropDTX(t *testing.T) {
+	sfu := newFakeSFU(t)
+
+	localSDP := make(chan webrtc.SessionDescription, 4)
+	localICE := make(chan webrtc.ICECandidateInit, 64)
+	peer, err := NewPeer(PeerConfig{
+		StreamID: "client-A",
+		Callbacks: PeerCallbacks{
+			OnLocalSDP: func(sdp webrtc.SessionDescription) { localSDP <- sdp },
+			OnLocalICE: func(c webrtc.ICECandidateInit) { localICE <- c },
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewPeer: %v", err)
+	}
+	defer peer.Close()
+
+	sfu.pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+		if c == nil {
+			return
+		}
+		if err := peer.HandleRemoteICE(c.ToJSON()); err != nil {
+			t.Errorf("HandleRemoteICE: %v", err)
+		}
+	})
+	iceDone := make(chan struct{})
+	go func() {
+		defer close(iceDone)
+		for c := range localICE {
+			if err := sfu.pc.AddICECandidate(c); err != nil {
+				t.Errorf("sfu add ice: %v", err)
+			}
+		}
+	}()
+
+	if err := peer.Offer(); err != nil {
+		t.Fatalf("Offer: %v", err)
+	}
+	offer := <-localSDP
+	if err := sfu.pc.SetRemoteDescription(offer); err != nil {
+		t.Fatalf("sfu set remote offer: %v", err)
+	}
+	answer, err := sfu.pc.CreateAnswer(nil)
+	if err != nil {
+		t.Fatalf("sfu create answer: %v", err)
+	}
+	if err := sfu.pc.SetLocalDescription(answer); err != nil {
+		t.Fatalf("sfu set local answer: %v", err)
+	}
+	if err := peer.HandleRemoteSDP(answer); err != nil {
+		t.Fatalf("HandleRemoteSDP(answer): %v", err)
+	}
+	waitConnected(t, peer, sfu)
+
+	speech := bytes.Repeat([]byte{0xAB}, 80)
+	if err := peer.SendOpus(speech); err != nil {
+		t.Fatalf("SendOpus speech1: %v", err)
+	}
+	// 静音期 DTX 空包：应被丢弃但 seq/时戳推进。
+	for i := 0; i < 3; i++ {
+		if err := peer.SendOpus([]byte{0x00}); err != nil {
+			t.Fatalf("SendOpus dtx %d: %v", i, err)
+		}
+	}
+	if err := peer.SendOpus(speech); err != nil {
+		t.Fatalf("SendOpus speech2: %v", err)
+	}
+
+	var first, second *rtp.Packet
+	select {
+	case first = <-sfu.gotRTP:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting first speech pkt")
+	}
+	select {
+	case second = <-sfu.gotRTP:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting second speech pkt")
+	}
+	// 中间 3 个空包被吞：序号跳 4、时戳跳 4×960，时间线保持与发送节拍一致。
+	if second.SequenceNumber != first.SequenceNumber+4 {
+		t.Fatalf("seq gap = %d, want 4 (3 DTX dropped + 1)", int(second.SequenceNumber-first.SequenceNumber))
+	}
+	if second.Timestamp != first.Timestamp+4*rtpTimestampStep {
+		t.Fatalf("ts gap = %d, want %d", second.Timestamp-first.Timestamp, 4*rtpTimestampStep)
+	}
+	if got := peer.Stats.DTXDropped.Load(); got != 3 {
+		t.Fatalf("DTXDropped = %d, want 3", got)
+	}
+	if got := peer.Stats.PacketsSent.Load(); got != 2 {
+		t.Fatalf("PacketsSent = %d, want 2", got)
+	}
+
+	close(localICE)
+	<-iceDone
+}
+
 // TestPeerPendingICE 远端描述就位前到达的候选应排队不报错。
 func TestPeerPendingICE(t *testing.T) {
 	peer, err := NewPeer(PeerConfig{})

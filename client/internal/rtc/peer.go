@@ -61,6 +61,7 @@ type PeerStats struct {
 	PacketsSent   atomic.Uint64 // 上行 RTP 包数
 	BytesSent     atomic.Uint64 // 上行载荷字节数
 	MutedDropped  atomic.Uint64 // 本地静音丢弃的包数（DTX 语义）
+	DTXDropped    atomic.Uint64 // 发送端丢弃的 DTX 空包数（≤2 字节，静音期 Opus 心跳包）
 	RemoteSDPs    atomic.Uint64 // 处理的对端 SDP 数
 	RemoteICEs    atomic.Uint64 // 处理的对端候选数
 	TracksRecv    atomic.Uint64 // OnTrack 次数
@@ -279,6 +280,10 @@ func (p *Peer) markRemoteDescSet() {
 
 // SendOpus 把一个 Opus 包打包为 RTP 发出（seq 自增 1，时戳步进 960）。
 // 本地静音时直接丢弃（停止上行 = DTX 语义，对端 PLC 兜底）。
+// Opus DTX 在静音期产出的 1~2 字节空包同样丢弃：对端解码 ≤1 字节本就走
+// PLC 路径，发了也只是让对端持续做无意义的丢包补偿，N 个静默成员就是
+// N 路空转 PLC。丢弃时 seq/时戳照常推进，时间线保持连续，对端 jitter
+// buffer 把这段当断流处理（预填态回归），恢复说话后无突发。
 // 在管线 OnPacket 回调（20ms）上调用；payload 底层缓冲不会被保留。
 func (p *Peer) SendOpus(payload []byte) error {
 	if p.closed.Load() {
@@ -286,6 +291,16 @@ func (p *Peer) SendOpus(payload []byte) error {
 	}
 	if p.muted.Load() {
 		p.Stats.MutedDropped.Add(1)
+		return nil
+	}
+	if len(payload) <= 2 {
+		p.Stats.DTXDropped.Add(1)
+		// 时戳/序号照常推进：对端看到的时间线连续（等同空包被发出），
+		// 只是中间这一段全部按丢包补偿。
+		p.sendMu.Lock()
+		p.pkt.SequenceNumber++
+		p.pkt.Timestamp += rtpTimestampStep
+		p.sendMu.Unlock()
 		return nil
 	}
 	p.sendMu.Lock()
