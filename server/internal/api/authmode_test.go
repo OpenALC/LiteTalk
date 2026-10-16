@@ -23,7 +23,7 @@ func newTestServerMode(t *testing.T, mode string) (*Server, *store.Mem) {
 	}), mem
 }
 
-// TestSimpleModeRegister 免验证码注册 + email-code 明确提示 + 免验证码找回。
+// TestSimpleModeRegister 免验证码注册 + email-code 明确提示 + simple 模式禁用找回密码（P0 S3）。
 func TestSimpleModeRegister(t *testing.T) {
 	srv, _ := newTestServerMode(t, AuthModeSimple)
 	h := srv.Handler()
@@ -44,12 +44,16 @@ func TestSimpleModeRegister(t *testing.T) {
 		t.Fatalf("code = %v, want verification_not_required", errResp["code"])
 	}
 
-	// 找回密码：免验证码，email+new_password 直接改。
-	postJSON(t, h, "/api/v1/auth/password/reset", "", map[string]string{
+	// 找回密码：simple 模式无邮件通道，凭邮箱+新密码即可改密 = 任意账号接管，必须 403。
+	reset := postJSON(t, h, "/api/v1/auth/password/reset", "", map[string]string{
 		"email": "simple@ex.com", "password": "newpassword456",
-	}, http.StatusOK)
+	}, http.StatusForbidden)
+	if reset["code"] != "reset_unavailable" {
+		t.Fatalf("code = %v, want reset_unavailable", reset["code"])
+	}
+	// 密码未被改动：旧密码仍可登录。
 	postJSON(t, h, "/api/v1/auth/login", "", map[string]string{
-		"email": "simple@ex.com", "password": "newpassword456",
+		"email": "simple@ex.com", "password": "password123",
 	}, http.StatusOK)
 }
 

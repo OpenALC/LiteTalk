@@ -338,6 +338,12 @@ func (s *Server) handleEmailCode(w http.ResponseWriter, r *http.Request) {
 
 // handlePasswordReset POST /api/v1/auth/password/reset
 func (s *Server) handlePasswordReset(w http.ResponseWriter, r *http.Request) {
+	// simple 模式没有邮件验证码可依赖，只凭邮箱+新密码即改密等于把账号送人（P0 S3），
+	// 故该模式整体禁用找回密码；确有需求的部署应改用 full 模式。
+	if s.simpleMode() {
+		writeErr(w, http.StatusForbidden, "reset_unavailable", "当前服务端未开启邮件功能，无法找回密码")
+		return
+	}
 	var req passwordResetReq
 	if !decodeJSON(w, r, &req) {
 		return
@@ -347,13 +353,10 @@ func (s *Server) handlePasswordReset(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_password", "密码至少 8 位")
 		return
 	}
-	// 验证邮箱验证码（simple 模式免验证码：仅凭邮箱+新密码改密，
-	// 适合私域部署的从简取舍，公开部署请用 full 模式）。
-	if !s.simpleMode() {
-		if err := s.codes.Verify(r.Context(), auth.PurposeReset, req.Email, req.Code); err != nil {
-			writeErr(w, http.StatusBadRequest, "bad_code", "验证码无效或已过期")
-			return
-		}
+	// full 模式必须过邮箱验证码。
+	if err := s.codes.Verify(r.Context(), auth.PurposeReset, req.Email, req.Code); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_code", "验证码无效或已过期")
+		return
 	}
 	user, err := s.store.UserByEmail(r.Context(), req.Email)
 	if err != nil {
