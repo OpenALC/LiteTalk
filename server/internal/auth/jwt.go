@@ -156,6 +156,21 @@ func (s *RefreshStore) Revoke(ctx context.Context, userID int64) error {
 	return s.kv.Del(ctx, rtKey(userID))
 }
 
+// Match 校验 "<uid>.<random>" 刷新令牌与存储哈希一致（logout 吊销前用：
+// 不校验的话伪造 "<uid>.x" 即可吊销他人令牌）。
+// 任何取数错误都按不匹配处理（与 Rotate 的 fail-closed 语义一致）。
+func (s *RefreshStore) Match(ctx context.Context, userID int64, plain string) bool {
+	raw := plain
+	if uid, ok := ParseRefreshUID(plain); ok && uid == userID {
+		raw = plain[len(itoa(userID))+1:]
+	}
+	stored, err := s.kv.Get(ctx, rtKey(userID))
+	if err != nil {
+		return false
+	}
+	return stored == HashToken(raw)
+}
+
 // ErrKV 透传存储错误。
 var ErrKV = errors.New("kv error")
 

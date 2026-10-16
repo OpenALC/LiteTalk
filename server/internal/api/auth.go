@@ -277,13 +277,25 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleLogout POST /api/v1/auth/logout
+// 吊销前先校验令牌哈希与存储一致（P1）：否则伪造 "<uid>.x" 即可吊销他人 refresh。
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	var req logoutReq
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if uid, ok := parseRefreshUID(req.RefreshToken); ok {
-		_ = s.refresh.Revoke(r.Context(), uid)
+	uid, ok := parseRefreshUID(req.RefreshToken)
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, "unauthorized", "refresh_token 不合法")
+		return
+	}
+	if !s.refresh.Match(r.Context(), uid, req.RefreshToken) {
+		writeErr(w, http.StatusUnauthorized, "unauthorized", "refresh_token 无效或已吊销")
+		return
+	}
+	if err := s.refresh.Revoke(r.Context(), uid); err != nil {
+		s.log.Printf("[audit] logout 吊销失败 uid=%d err=%v", uid, err)
+		writeErr(w, http.StatusInternalServerError, "internal", "服务器内部错误")
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

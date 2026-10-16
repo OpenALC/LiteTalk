@@ -74,6 +74,40 @@ func TestRefreshRotate(t *testing.T) {
 	}
 }
 
+func TestRefreshMatch(t *testing.T) {
+	ctx := context.Background()
+	mem := store.NewMem()
+	rs := NewRefreshStore(mem)
+
+	plain, err := rs.IssueWithUID(ctx, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 真令牌匹配。
+	if !rs.Match(ctx, 7, plain) {
+		t.Fatal("真令牌应匹配")
+	}
+	// 伪造 "<uid>.x" 不匹配。
+	if rs.Match(ctx, 7, "7.x") {
+		t.Fatal("伪造令牌不应匹配")
+	}
+	// 其他 uid 的令牌不匹配。
+	if rs.Match(ctx, 8, plain) {
+		t.Fatal("他人令牌不应匹配")
+	}
+	// 未签发过令牌的 uid 不匹配（而非报错）。
+	if rs.Match(ctx, 99, "99.x") {
+		t.Fatal("未签发 uid 不应匹配")
+	}
+	// 吊销后不再匹配。
+	if err := rs.Revoke(ctx, 7); err != nil {
+		t.Fatal(err)
+	}
+	if rs.Match(ctx, 7, plain) {
+		t.Fatal("吊销后不应匹配")
+	}
+}
+
 func TestEmailCodeVerify(t *testing.T) {
 	ctx := context.Background()
 	mem := store.NewMem()
