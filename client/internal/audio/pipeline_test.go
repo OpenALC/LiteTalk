@@ -206,8 +206,8 @@ func TestNullBackendRun(t *testing.T) {
 	if err := p.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if err := p.Start(); err == nil {
-		t.Fatal("second Start should fail")
+	if err := p.Start(); err != nil {
+		t.Fatalf("second Start should be a no-op, got: %v", err)
 	}
 	waitFor := func(cond func() bool, msg string) {
 		t.Helper()
@@ -237,6 +237,34 @@ func TestNullBackendRun(t *testing.T) {
 	}
 	t.Logf("null backend 500ms: frames=%d pkts=%d played=%d samples, latency avg %dµs",
 		st.FramesProcessed, st.PacketsEncoded, st.PlaybackSamples, st.LatencyAvgUS)
+}
+
+// TestStartStopIdempotent Start/Stop 重复调用无害：重复 Start 是 no-op、
+// 重复 Stop 不 panic，且 Stop 后可再次 Start 完整重启（退出频道再进的使用方式）。
+func TestStartStopIdempotent(t *testing.T) {
+	p := newLoopbackPipeline(t, func(c *PipelineConfig) { c.Backend = BackendNull })
+
+	if err := p.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := p.Start(); err != nil {
+		t.Fatalf("重复 Start 应为 no-op: %v", err)
+	}
+	p.Stop()
+	p.Stop() // 重复 Stop 不应 panic，也不应死锁
+
+	if err := p.Start(); err != nil {
+		t.Fatalf("Stop 后重启: %v", err)
+	}
+	before := p.Stats().PacketsEncoded
+	deadline := 0
+	for p.Stats().PacketsEncoded <= before {
+		if deadline++; deadline > 2000 {
+			t.Fatalf("重启后管线无进展: before=%d after=%d", before, p.Stats().PacketsEncoded)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	p.Stop()
 }
 
 // TestOpusSettersSmoke Opus 参数热调：合法值生效并可继续编码，非法值报错。

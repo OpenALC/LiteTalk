@@ -272,15 +272,19 @@ func NewPipeline(cfg PipelineConfig) (*Pipeline, error) {
 	return p, nil
 }
 
-// Start 按配置启动采集/播放流与处理 goroutine。幂等性：重复调用报错。
+// Start 按配置启动采集/播放流与处理 goroutine。幂等：已启动时重复调用是
+// 无害 no-op（返回 nil）；Stop 之后可再次 Start 完整重启。已 Close 报错。
+// 生命周期状态机：未启动 →(Start)→ 已启动 →(Stop)→ 未启动 →(Close)→ 已关闭。
 func (p *Pipeline) Start() error {
 	if p.closed.Load() {
 		return errors.New("pipeline closed")
 	}
 	if !p.started.CompareAndSwap(false, true) {
-		return errors.New("pipeline already started")
+		return nil // 已启动：no-op
 	}
 
+	// done 每次启动新建：Stop 关闭后不可复用，重启需要一条新的通知通道。
+	p.done = make(chan struct{})
 	if p.cfg.Backend == BackendNull {
 		p.wg.Add(1)
 		go p.nullLoop()
@@ -371,7 +375,7 @@ func (p *Pipeline) RestartDevices(captureSelector, playbackSelector string) erro
 	return nil
 }
 
-// Stop 停止流与 goroutine（幂等）。codec 资源由 Close 释放。
+// Stop 停止流与 goroutine（幂等，重复调用是无害 no-op）。codec 资源由 Close 释放。
 func (p *Pipeline) Stop() {
 	if p.started.CompareAndSwap(true, false) {
 		close(p.done)
