@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -717,6 +718,50 @@ func (m *MySQL) UseInvite(ctx context.Context, code string) error {
 		return ErrConflict
 	}
 	return nil
+}
+
+// ---- user_sessions（v1.1.0 迁移 0004） ----
+
+func (m *MySQL) UpsertUserSession(ctx context.Context, s *UserSession) error {
+	_, err := m.db.ExecContext(ctx,
+		`INSERT INTO user_sessions (user_id, device_type, sid, ip)
+		 VALUES (?, ?, ?, ?)
+		 ON DUPLICATE KEY UPDATE sid = VALUES(sid), ip = VALUES(ip), updated_at = CURRENT_TIMESTAMP`,
+		s.UserID, s.DeviceType, s.Sid, s.IP)
+	return err
+}
+
+func (m *MySQL) GetUserSession(ctx context.Context, userID int64, deviceType string) (*UserSession, error) {
+	s := &UserSession{}
+	err := m.db.QueryRowContext(ctx,
+		`SELECT user_id, device_type, sid, ip, created_at, updated_at
+		 FROM user_sessions WHERE user_id = ? AND device_type = ?`,
+		userID, deviceType).Scan(&s.UserID, &s.DeviceType, &s.Sid, &s.IP, &s.CreatedAt, &s.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+func (m *MySQL) DeleteUserSession(ctx context.Context, userID int64, deviceType string) error {
+	res, err := m.db.ExecContext(ctx,
+		`DELETE FROM user_sessions WHERE user_id = ? AND device_type = ?`, userID, deviceType)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (m *MySQL) DeleteAllUserSessions(ctx context.Context, userID int64) error {
+	_, err := m.db.ExecContext(ctx, `DELETE FROM user_sessions WHERE user_id = ?`, userID)
+	return err
 }
 
 // ---- 工具 ----

@@ -5,6 +5,73 @@ import (
 	"testing"
 )
 
+// TestUserSession 多设备会话 CRUD（v1.1.0 迁移 0004）。
+func TestUserSession(t *testing.T) {
+	ctx := context.Background()
+	m := NewMem()
+
+	// 未命中时返回 ErrNotFound。
+	if _, err := m.GetUserSession(ctx, 1, "desktop"); err != ErrNotFound {
+		t.Fatalf("未命中应 ErrNotFound，实际 %v", err)
+	}
+
+	// upsert 创建会话。
+	s := &UserSession{UserID: 1, DeviceType: "desktop", Sid: "s1", IP: "10.0.0.1"}
+	if err := m.UpsertUserSession(ctx, s); err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.GetUserSession(ctx, 1, "desktop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Sid != "s1" || got.CreatedAt.IsZero() || got.UpdatedAt.IsZero() {
+		t.Fatalf("读回错误: %+v", got)
+	}
+
+	// upsert 覆盖同设备会话，保留 CreatedAt。
+	s2 := &UserSession{UserID: 1, DeviceType: "desktop", Sid: "s2"}
+	if err := m.UpsertUserSession(ctx, s2); err != nil {
+		t.Fatal(err)
+	}
+	got2, _ := m.GetUserSession(ctx, 1, "desktop")
+	if got2.Sid != "s2" {
+		t.Fatalf("应覆盖为新 sid，实际 %q", got2.Sid)
+	}
+	if !got2.CreatedAt.Equal(got.CreatedAt) {
+		t.Fatalf("覆盖不应重置 CreatedAt")
+	}
+
+	// 异设备共存。
+	if err := m.UpsertUserSession(ctx, &UserSession{UserID: 1, DeviceType: "mobile", Sid: "m1"}); err != nil {
+		t.Fatal(err)
+	}
+	got3, _ := m.GetUserSession(ctx, 1, "mobile")
+	if got3.Sid != "m1" {
+		t.Fatalf("mobile 会话应独立")
+	}
+
+	// 删单个设备会话。
+	if err := m.DeleteUserSession(ctx, 1, "mobile"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.GetUserSession(ctx, 1, "mobile"); err != ErrNotFound {
+		t.Fatalf("删后应 ErrNotFound")
+	}
+
+	// 删全部设备会话。
+	if err := m.DeleteAllUserSessions(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.GetUserSession(ctx, 1, "desktop"); err != ErrNotFound {
+		t.Fatalf("全删后应 ErrNotFound")
+	}
+
+	// 再删应 ErrNotFound（幂等校验，防盲删）。
+	if err := m.DeleteUserSession(ctx, 1, "desktop"); err != ErrNotFound {
+		t.Fatalf("重复删应 ErrNotFound，实际 %v", err)
+	}
+}
+
 // TestMemStore 内存实现基本 CRUD（语义与 MySQL 对齐的回归保障）。
 func TestMemStore(t *testing.T) {
 	ctx := context.Background()

@@ -20,6 +20,7 @@ type Mem struct {
 	categories  map[int64]*Category
 	messages    map[int64]*Message
 	invites     map[string]*Invite
+	sessions    map[int64]map[string]*UserSession // userID → deviceType → session
 
 	nextID map[string]int64
 
@@ -44,6 +45,7 @@ func NewMem() *Mem {
 		categories:  map[int64]*Category{},
 		messages:    map[int64]*Message{},
 		invites:     map[string]*Invite{},
+		sessions:    map[int64]map[string]*UserSession{},
 		nextID:      map[string]int64{},
 		kv:          map[string]kvEntry{},
 		kvTimed:     map[string]*time.Timer{},
@@ -564,6 +566,62 @@ func (m *Mem) UseInvite(_ context.Context, code string) error {
 		return ErrConflict
 	}
 	inv.Uses++
+	return nil
+}
+
+// ---- user_sessions（v1.1.0 迁移 0004） ----
+
+func (m *Mem) UpsertUserSession(_ context.Context, s *UserSession) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	if m.sessions[s.UserID] == nil {
+		m.sessions[s.UserID] = map[string]*UserSession{}
+	}
+	if old, ok := m.sessions[s.UserID][s.DeviceType]; ok {
+		s.CreatedAt = old.CreatedAt
+	} else {
+		s.CreatedAt = now
+	}
+	s.UpdatedAt = now
+	cp := *s
+	m.sessions[s.UserID][s.DeviceType] = &cp
+	return nil
+}
+
+func (m *Mem) GetUserSession(_ context.Context, userID int64, deviceType string) (*UserSession, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	devs, ok := m.sessions[userID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	s, ok := devs[deviceType]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	cp := *s
+	return &cp, nil
+}
+
+func (m *Mem) DeleteUserSession(_ context.Context, userID int64, deviceType string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	devs, ok := m.sessions[userID]
+	if !ok {
+		return ErrNotFound
+	}
+	if _, ok := devs[deviceType]; !ok {
+		return ErrNotFound
+	}
+	delete(devs, deviceType)
+	return nil
+}
+
+func (m *Mem) DeleteAllUserSessions(_ context.Context, userID int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.sessions, userID)
 	return nil
 }
 
