@@ -1,5 +1,7 @@
-// bridge 封装 Wails Go 绑定（window.go.main.App.*）。
+// bridge 封装 Wails v3 Go 绑定（@wailsio/runtime 的 Call.ByName("main.App.*")）。
 // 浏览器独立开发（vite dev 无 Go 后端）时走 mock 桩，行为可联调 UI。
+// 原生环境判定：Go 在 webview 启动时注入 window._wails.flags（浏览器环境恒无）。
+import { Call, Events } from '@wailsio/runtime'
 import type { AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ConnConfigView, ConnTestResult, FriendDTO, PeerView, ServerConfig, ServerDTO, UserProfile, VoiceStateView } from './types'
 
 type GoApp = {
@@ -85,11 +87,7 @@ export interface SavedCredentials {
 
 declare global {
   interface Window {
-    go?: { main?: { App?: GoApp } }
-    runtime?: {
-      EventsOn(name: string, cb: (...args: unknown[]) => void): void
-      EventsOff(name: string): void
-    }
+    _wails?: { flags?: Record<string, unknown> }
   }
 }
 
@@ -198,20 +196,31 @@ const mockApp: GoApp = {
   async SetIntroHidden() {},
 }
 
+// nativeApp v3 原生实现：方法名直映射 main.App.<方法>（与 Go 侧 Service 绑定同名）。
+// Proxy 只拦属性读取，调用语义与 v2 的 window.go.main.App.* 完全一致（JSON 序列化参数）。
+const nativeApp = new Proxy({} as GoApp, {
+  get(_target, method: string) {
+    return (...args: unknown[]) => Call.ByName(`main.App.${method}`, ...args)
+  },
+})
+
 export function goApp(): GoApp {
-  return window.go?.main?.App ?? mockApp
+  return isNative() ? nativeApp : mockApp
 }
 
 export function isNative(): boolean {
-  return !!window.go?.main?.App
+  return !!window._wails?.flags
 }
 
-// eventsOn Wails 事件订阅（浏览器环境静默）。
+// eventsOn Wails 事件订阅。v3 回调收 WailsEvent 对象，取 .data 对齐 v2 的直载荷语义。
+// 浏览器环境静默（mock 不产事件）。
 export function eventsOn(name: string, cb: (...args: unknown[]) => void) {
-  window.runtime?.EventsOn(name, cb)
+  if (!isNative()) return
+  Events.On(name, (ev) => cb((ev as { data: unknown }).data))
 }
 
-// eventsOff 取消事件订阅（休眠态清理用）。
+// eventsOff 取消事件订阅（休眠态清理用；v3 按事件名清掉全部监听）。
 export function eventsOff(name: string) {
-  window.runtime?.EventsOff(name)
+  if (!isNative()) return
+  Events.Off(name)
 }

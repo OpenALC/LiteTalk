@@ -18,16 +18,19 @@ import (
 	"github.com/OpenALC/LiteTalk/client/internal/state"
 	"github.com/OpenALC/LiteTalk/client/internal/tray"
 	"github.com/gen2brain/malgo"
-	"github.com/wailsapp/wails/v2/pkg/runtime"
+	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
 // version 客户端版本号，可用 -ldflags "-X main.version=" 注入，默认 dev
 var version = "dev"
 
-// App 应用结构体：窗口上下文、设置项、业务会话与 API 客户端。
-// 导出方法经 Wails Bind 暴露给前端调用（落地方案 §4.6）。
+// App 应用结构体：Wails v3 应用/窗口引用、设置项、业务会话与 API 客户端。
+// 导出方法经 Service 绑定暴露给前端调用（Call.ByName("main.App.<方法>")）。
 type App struct {
-	ctx context.Context
+	// wails/window 由 main() 在 RegisterService 之后、Run 之前经 Bind 注入。
+	// 测试环境为 nil：事件发送与窗口操作全部空转（见 emit/interceptClose 等）。
+	wails  *application.App
+	window *application.WebviewWindow
 
 	// cfg 本地配置（config.json：服务器地址 / 休眠模式持久化）。
 	cfg *config.Manager
@@ -64,6 +67,20 @@ func newAppWithConfig(m *config.Manager) *App {
 	return &App{cfg: m}
 }
 
+// Bind 注入 v3 应用与主窗口引用（main() 在创建窗口后调用，晚于 RegisterService——
+// 绑定持有的是 App 指针，后续字段变更对绑定透明）。
+func (a *App) Bind(wails *application.App, window *application.WebviewWindow) {
+	a.wails = wails
+	a.window = window
+}
+
+// emit 向前端广播事件的统一出口：测试环境（wails==nil）空转。
+func (a *App) emit(name string, data any) {
+	if a.wails != nil {
+		a.wails.Event.Emit(name, data)
+	}
+}
+
 // initLogging 把全局 log 输出重定向到文件：os.UserConfigDir()/LiteTalk/app.log
 // （与 config.json 同目录）。GUI 子系统无控制台，stdout/stderr 不可见，排障
 // 全依赖此文件；超过 5MB 启动时截断。文件排 MultiWriter 首位——无控制台时
@@ -98,75 +115,94 @@ func (a *App) LogFromWeb(level, msg string) {
 	log.Printf("[web:%s] %s", level, msg)
 }
 
-// startup 启动回调：保存上下文、创建 API 客户端、启动系统托盘。
+// ServiceStartup v3 服务启动回调：初始化日志、创建 API 客户端、配置系统托盘。
 // 服务器地址优先级：环境变量 LITETALK_API > config.json > 默认本机（运维/调试最高）。
-func (a *App) startup(ctx context.Context) {
+// 托盘使用 v3 内建 SystemTray（替代 v2 getlantern/systray）；创建后由 Run 统一拉起。
+func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) error {
 	initLogging()
 	log.Printf("=== LiteTalk %s 启动 (pid=%d) ===", version, os.Getpid())
-	a.ctx = ctx
 	r := a.cfg.Resolve()
-	base := r.BaseURL
-	a.api = state.NewAPIClient(base)
+	a.api = state.NewAPIClient(r.BaseURL)
+	a.setupTray()
+	return nil
+}
 
-	// 托盘独占 goroutine（systray.Run 需要自己的消息循环）。
-	go tray.Run(tray.Callbacks{
-		OnReady: func() {
-			// 图标与菜单建好才视为托盘可用（问题 4a/4c）。
-			a.trayReady.Store(true)
-		},
-		OnShow: func() {
-			runtime.WindowShow(a.ctx)
-			runtime.WindowUnminimise(a.ctx)
-			runtime.EventsEmit(a.ctx, "sys:wake")
-		},
-		OnToggleMute: func() bool {
-			a.mu.Lock()
-			s := a.sess
-			a.mu.Unlock()
-			if s == nil {
-				return false
-			}
-			muted := !s.Muted()
-			s.SetMute(muted)
-			return muted
-		},
-		OnQuit: func() {
-			a.forceQuit.Store(true)
-			runtime.Quit(a.ctx)
-		},
-		IsMuted: func() bool {
-			a.mu.Lock()
-			s := a.sess
-			a.mu.Unlock()
-			return s != nil && s.Muted()
-		},
+// setupTray 配置系统托盘：图标 + 右键菜单（显示主界面 / 静音 / 退出）。
+// 菜单就绪即置 trayReady（v3 托盘由 Run 统一启动，失败会走 fatal 弹窗而非静默）。
+func (a *App) setupTray() {
+	t := a.wails.SystemTray.New()
+	t.SetIcon(tray.Icon).SetTooltip("轻音 LiteTalk")
+
+	menu := a.wails.Menu.New()
+	showItem := menu.Add("显示主界面")
+	muteItem := menu.AddCheckbox("静音", false)
+	menu.AddSeparator()
+	quitItem := menu.Add("退出")
+
+	showItem.OnClick(func(*application.Context) {
+		a.showFromTray()
 	})
+	muteItem.OnClick(func(*application.Context) {
+		a.mu.Lock()
+		s := a.sess
+		a.mu.Unlock()
+		if s == nil {
+			muteItem.SetChecked(false)
+			return
+		}
+		muted := !s.Muted()
+		s.SetMute(muted)
+		muteItem.SetChecked(muted)
+	})
+	quitItem.OnClick(func(*application.Context) {
+		a.forceQuit.Store(true)
+		a.wails.Quit()
+	})
+
+	t.SetMenu(menu)
+	a.trayReady.Store(true)
+}
+
+// showFromTray 托盘「显示主界面」：解除最小化并前置窗口，发 sys:wake 让前端清休眠态。
+func (a *App) showFromTray() {
+	if a.window == nil {
+		return
+	}
+	a.window.Show()
+	if a.window.IsMinimised() {
+		a.window.Restore()
+	}
+	a.emit("sys:wake", nil)
 }
 
 // emitHibernate 休眠处理（设置页「休眠模式」三态：off/hibernate/destroy）：
 //   - hibernate：发 sys:hibernate，前端卸载业务组件（省内存，前端状态保留）
-//   - destroy：隐藏窗口后整页 WindowReloadApp，释放 JS 堆/DOM；
+//   - destroy：隐藏窗口后整页 Reload，释放 JS 堆/DOM；
 //     唤醒时前端凭 Go 侧状态（登录态/语音会话）自愈重建
 //   - off / 未启用：什么都不做（独立生效，不再像旧版双开关互相依赖）
 func (a *App) emitHibernate() {
 	switch a.cfg.HibernateMode() {
 	case "destroy":
+		if a.window == nil {
+			return
+		}
 		go func() {
 			// 稍待隐藏完成再重载，避免重载瞬间窗口闪烁（窗口已隐藏不可见）。
 			time.Sleep(300 * time.Millisecond)
-			runtime.WindowReloadApp(a.ctx)
+			a.window.Reload()
 		}()
 	case "hibernate":
-		runtime.EventsEmit(a.ctx, "sys:hibernate")
+		a.emit("sys:hibernate", nil)
 	}
 }
 
-// onBeforeClose 拦截窗口关闭：默认隐藏到托盘而非退出（问题 4 兜底链）。
-//   - forceQuit（托盘「退出」/设置页「退出程序」）→ 放行真正关闭
-//   - 托盘未就绪（图标不可用）→ 放行真正关闭，绝不隐藏窗口把用户锁死
-//   - 用户选「关闭窗口时=退出程序」→ 放行真正关闭
+// interceptClose 拦截窗口关闭（v3 WindowClosing Hook，替代 v2 OnBeforeClose）：
+// 返回 true = 已拦截（隐藏到托盘并休眠），false = 放行真正关闭。兜底链：
+//   - forceQuit（托盘「退出」/设置页「退出程序」）→ 放行
+//   - 托盘未就绪 → 放行，绝不隐藏窗口把用户锁死
+//   - 用户选「关闭窗口时=退出程序」→ 放行
 //   - 其余 → 隐藏到托盘
-func (a *App) onBeforeClose(ctx context.Context) bool {
+func (a *App) interceptClose() bool {
 	if a.forceQuit.Load() {
 		return false // 真正退出
 	}
@@ -177,7 +213,9 @@ func (a *App) onBeforeClose(ctx context.Context) bool {
 	if !a.cfg.CloseToTray() {
 		return false // 用户设置：关闭即退出
 	}
-	runtime.WindowHide(ctx)
+	if a.window != nil {
+		a.window.Hide()
+	}
 	a.emitHibernate()
 	return true
 }
@@ -185,7 +223,9 @@ func (a *App) onBeforeClose(ctx context.Context) bool {
 // QuitApp 显式退出程序（设置页「退出程序」按钮，不依赖托盘）。
 func (a *App) QuitApp() {
 	a.forceQuit.Store(true)
-	runtime.Quit(a.ctx)
+	if a.wails != nil {
+		a.wails.Quit()
+	}
 }
 
 // TrayReady 返回托盘是否就绪（前端可在关闭前预判行为）。
@@ -228,16 +268,24 @@ func (a *App) ClearSavedCredentials() {
 
 // WindowMinimize 最小化窗口（设置开启时同步休眠界面）。
 func (a *App) WindowMinimize() {
-	runtime.WindowMinimise(a.ctx)
+	if a.window != nil {
+		a.window.Minimise()
+	}
 	a.emitHibernate()
 }
 
 // WindowMaximize 最大化/还原。
-func (a *App) WindowMaximize() { runtime.WindowToggleMaximise(a.ctx) }
+func (a *App) WindowMaximize() {
+	if a.window != nil {
+		a.window.ToggleMaximise()
+	}
+}
 
 // WindowClose 关闭（转隐藏到托盘；设置开启时同步休眠界面）。
 func (a *App) WindowClose() {
-	runtime.WindowHide(a.ctx)
+	if a.window != nil {
+		a.window.Hide()
+	}
 	a.emitHibernate()
 }
 
@@ -499,28 +547,28 @@ func (a *App) connectSession(token, nickname string) error {
 	a.disconnectSession()
 	ev := state.Events{
 		OnPeerJoin: func(userID, nickname string, speaking, mute, deafen bool) {
-			runtime.EventsEmit(a.ctx, "voice:peer-join", map[string]any{
+			a.emit( "voice:peer-join", map[string]any{
 				"user_id": userID, "nickname": nickname,
 				"speaking": speaking, "mute": mute, "deafen": deafen,
 			})
 		},
 		OnPeerLeave: func(userID string) {
-			runtime.EventsEmit(a.ctx, "voice:peer-leave", userID)
+			a.emit( "voice:peer-leave", userID)
 		},
 		OnPeerSpeaking: func(userID string, speaking, mute, deafen bool) {
-			runtime.EventsEmit(a.ctx, "voice:speaking", map[string]any{
+			a.emit( "voice:speaking", map[string]any{
 				"user_id": userID, "speaking": speaking, "mute": mute, "deafen": deafen,
 			})
 		},
 		OnConnection: func(st string) {
-			runtime.EventsEmit(a.ctx, "rtc:connection", st)
+			a.emit( "rtc:connection", st)
 		},
 		OnSelf: func(userID string) {
-			runtime.EventsEmit(a.ctx, "voice:self", userID)
+			a.emit( "voice:self", userID)
 		},
 		// v0.1.2 请求静音：定向事件给前端（载荷带昵称，前端弹「接受」）。
 		OnStateRequest: func(fromID, fromNickname string, mute, deafen *bool) {
-			runtime.EventsEmit(a.ctx, "voice:state_request", map[string]any{
+			a.emit( "voice:state_request", map[string]any{
 				"from_id": fromID, "nickname": fromNickname,
 				"mute": mute != nil && *mute, "deafen": deafen != nil && *deafen,
 			})
@@ -543,14 +591,14 @@ func (a *App) connectSession(token, nickname string) error {
 		}
 	}
 	sess.ChatHandler(func(channelID, msgID, userID, nick, content, ts string) {
-		runtime.EventsEmit(a.ctx, "chat:message", map[string]string{
+		a.emit( "chat:message", map[string]string{
 			"id": msgID, "channel_id": channelID, "user_id": userID,
 			"nickname": nick, "content": content, "ts": ts,
 		})
 	})
 	// 服务端 error 帧转发前端（B1：此前未订阅，服务端拒收时消息凭空消失）。
 	sess.ErrorHandler(func(code, message string) {
-		runtime.EventsEmit(a.ctx, "chat:error", map[string]string{
+		a.emit( "chat:error", map[string]string{
 			"code": code, "message": message,
 		})
 	})
@@ -574,7 +622,7 @@ func (a *App) connectSession(token, nickname string) error {
 			if s == nil {
 				return
 			}
-			runtime.EventsEmit(a.ctx, "voice:stats", s.Stats())
+			a.emit( "voice:stats", s.Stats())
 		}
 	}()
 	return nil
@@ -880,8 +928,8 @@ func (a *App) GetVoiceMembers() []state.PeerView {
 
 // ---------- 生命周期 ----------
 
-// shutdown 退出清理。
-func (a *App) shutdown(ctx context.Context) {
+// ServiceShutdown v3 服务关闭回调：退出清理。
+func (a *App) ServiceShutdown() error {
 	a.disconnectSession()
 	a.mu.Lock()
 	if a.audioCtx != nil {
@@ -889,4 +937,5 @@ func (a *App) shutdown(ctx context.Context) {
 		a.audioCtx = nil
 	}
 	a.mu.Unlock()
+	return nil
 }

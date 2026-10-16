@@ -55,16 +55,16 @@
 
 前置：Go 1.27+、Node 22+、pnpm。仓库结构：
 
-- `client/` Wails v2 桌面客户端（`frontend/` 为 Vue 3 + TS 前端）
+- `client/` Wails v3 桌面客户端（`frontend/` 为 Vue 3 + TS 前端）
 - `server/` Go 服务端（REST + WS 信令 + 自研 Pion SFU）
 
 ```bash
 # 服务端
 cd server && go run ./cmd/server
 
-# 客户端（需 wails CLI：go install github.com/wailsapp/wails/v2/cmd/wails@latest）
-cd client/frontend && pnpm install
-cd .. && wails dev
+# 客户端：前端 watch 构建 + Go 侧 FRONTEND_DEVSERVER_URL 指向 vite
+cd client/frontend && pnpm install && pnpm run dev
+cd client && set FRONTEND_DEVSERVER_URL=http://localhost:5173 && go run .
 ```
 
 国内开发建议先配镜像：`go env -w GOPROXY=https://goproxy.cn,direct`（前端镜像已内置）。

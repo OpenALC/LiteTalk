@@ -166,6 +166,9 @@ importers:
 
   .:
     dependencies:
+      '@wailsio/runtime':
+        specifier: 3.0.0-beta.30
+        version: 3.0.0-beta.30
       lucide-vue-next:
         specifier: ^0.577.0
         version: 0.577.0(vue@3.5.43(typescript@5.9.3))
@@ -440,6 +443,9 @@ packages:
 
   '@vue/shared@3.5.43':
     resolution: {integrity: sha512-uksS7YGMR5NZyr4JNq0Rp+QyLns0ueaz20KwzIPW9R0LH1Vnt4E+XUM29PNseEbf1www2gOuhuDi5AKOIXag9Q==}
+
+  '@wailsio/runtime@3.0.0-beta.30':
+    resolution: {integrity: sha512-vmcoHbnTO3x11LvuEAdq/3JofELyoRwofEuietfXd9ghW92CspEMBVnltFhOfyHMmU28wkw1kfGKKG8/Nh3fgw==}
 
   acorn@8.19.0:
     resolution: {integrity: sha512-oJlA3XiRm7Cyk6qFD2Jn8ak9B7jSy0qy00ADO3+8dpT0LSjFihQYv4C02LFCSYJV3Q37xYwwRy5m+IpIiUzqWw==}
@@ -1104,6 +1110,8 @@ snapshots:
       '@vue/shared': 3.5.43
 
   '@vue/shared@3.5.43': {}
+
+  '@wailsio/runtime@3.0.0-beta.30': {}
 
   acorn@8.19.0: {}
 

@@ -43,12 +43,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Wails v2 在 Linux 编译依赖 GTK/WebKitGTK 头文件；
-      # ubuntu-latest（24.04）只有 webkit2gtk-4.1，对应 wails 构建标签 webkit2_41
-      - name: 安装 GTK/WebKitGTK 开发库
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev
       # pnpm 版本由 client/frontend/package.json 的 packageManager 字段决定
       - uses: pnpm/action-setup@v4
         with:
@@ -70,15 +64,17 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: client/go.sum
+      # Wails v3：检查用 server 构建标签（无 GUI 依赖、免 GTK/WebKitGTK），
+      # 编译全集代码；真实 GUI 构建由下方打包 job 在各自原生 runner 完成
       - name: go vet
         working-directory: client
-        run: go vet -tags webkit2_41 ./...
+        run: go vet -tags server ./...
       - name: go test
         working-directory: client
-        run: go test -tags webkit2_41 ./...
+        run: go test -tags server ./...
       - name: go build
         working-directory: client
-        run: go build -tags webkit2_41 ./...
+        run: go build -tags server ./...
 
   # ---------------- 打包发版（仅 v* 标签） ----------------
 
@@ -131,8 +127,6 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
           cache-dependency-path: client/frontend/pnpm-lock.yaml
-      - name: 安装 wails CLI
-        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
       - name: 安装前端依赖
         working-directory: client/frontend
         run: pnpm install --frozen-lockfile
@@ -147,9 +141,21 @@ jobs:
           Add-Content -Path $env:GITHUB_PATH -Value $nsisDir
           $env:PATH = "$nsisDir;$env:PATH"
           makensis /VERSION
-      - name: wails build（含 NSIS 安装器）
+      # Wails v3：免 wails CLI——plain go build（CGO/WebView2 同 v2 工具链）+ 自包含 NSIS 脚本
+      - name: 构建客户端（注入版本号）
         working-directory: client
-        run: wails build -platform windows/amd64 -nsis
+        shell: pwsh
+        run: |
+          go build -tags production -trimpath -ldflags "-s -w -X main.version=${{ github.ref_name }}" `
+            -o build/bin/LiteTalk.exe .
+      - name: 制作 NSIS 安装器
+        working-directory: client/build/windows/installer
+        shell: pwsh
+        run: |
+          makensis -DARG_WAILS_AMD64_BINARY="..\..\bin\LiteTalk.exe" project.nsi
+          if (-not (Test-Path "..\..\bin\LiteTalk-amd64-installer.exe")) {
+            throw "makensis 未产出 LiteTalk-amd64-installer.exe"
+          }
       - name: 整理产物（安装器 + 绿色版 zip）
         working-directory: client
         shell: pwsh
@@ -164,8 +170,7 @@ jobs:
           }
           Write-Host "安装器: $($installer.Name)"
           Copy-Item $installer.FullName dist/LiteTalk-windows-amd64-setup.exe
-          Compress-Archive -Path build/bin/LiteTalk.exe -DestinationPath dist/LiteTalk-windows-amd64-portable.zip
-      - uses: actions/upload-artifact@v4
+          Compress-Archive -Path build/bin/LiteTalk.exe -DestinationPath dist/LiteTalk-windows-amd64-portable.zip      - uses: actions/upload-artifact@v4
         with:
           name: dist-client-windows
           path: client/dist/*
@@ -195,16 +200,18 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
           cache-dependency-path: client/frontend/pnpm-lock.yaml
-      - name: 安装 wails CLI 与 nfpm
-        run: |
-          go install github.com/wailsapp/wails/v2/cmd/wails@latest
-          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+      - name: 安装 nfpm
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
       - name: 安装前端依赖
         working-directory: client/frontend
         run: pnpm install --frozen-lockfile
-      - name: wails build
+      # Wails v3：gtk3 构建标签对应 WebKitGTK 4.1（同 v2 webkit2_41 的 apt 依赖）
+      - name: 构建客户端（注入版本号）
         working-directory: client
-        run: wails build -platform linux/amd64 -tags webkit2_41
+        run: |
+          go build -tags gtk3,production -trimpath \
+            -ldflags "-s -w -X main.version=${{ github.ref_name }}" \
+            -o build/bin/LiteTalk .
       - name: 绿色版 tar.gz
         working-directory: client
         run: |
@@ -252,16 +259,18 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
           cache-dependency-path: client/frontend/pnpm-lock.yaml
-      - name: 安装 wails CLI 与 nfpm
-        run: |
-          go install github.com/wailsapp/wails/v2/cmd/wails@latest
-          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+      - name: 安装 nfpm
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
       - name: 安装前端依赖
         working-directory: client/frontend
         run: pnpm install --frozen-lockfile
-      - name: wails build
+      # Wails v3：gtk3 构建标签对应 WebKitGTK 4.1（ARM runner 同样 apt 依赖）
+      - name: 构建客户端（注入版本号）
         working-directory: client
-        run: wails build -platform linux/arm64 -tags webkit2_41
+        run: |
+          go build -tags gtk3,production -trimpath \
+            -ldflags "-s -w -X main.version=${{ github.ref_name }}" \
+            -o build/bin/LiteTalk .
       - name: 绿色版 tar.gz
         working-directory: client
         run: |
@@ -301,19 +310,22 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
           cache-dependency-path: client/frontend/pnpm-lock.yaml
-      - name: 安装 wails CLI
-        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
       - name: 安装前端依赖
         working-directory: client/frontend
         run: pnpm install --frozen-lockfile
-      - name: wails build
+      # Wails v3：免 wails CLI——plain go build。
+      # 注意：v3 无 .app bundle 打包（原 wails CLI 产物），此处产出裸二进制 zip（该 job 本为非阻塞）。
+      - name: 构建客户端（注入版本号）
         working-directory: client
-        run: wails build -platform darwin/arm64
-      - name: 打包 .app
+        run: |
+          go build -tags production -trimpath \
+            -ldflags "-s -w -X main.version=${{ github.ref_name }}" \
+            -o build/bin/LiteTalk .
+      - name: 打包 zip
         working-directory: client
         run: |
           mkdir -p dist
-          cd build/bin && zip -r -X ../../dist/LiteTalk-macos-arm64.zip LiteTalk.app
+          cd build/bin && zip -r -X ../../dist/LiteTalk-macos-arm64.zip LiteTalk
       - uses: actions/upload-artifact@v4
         with:
           name: dist-client-macos
