@@ -81,7 +81,7 @@ onMounted(async () => {
   height: 100%; min-height: 0; display: grid; grid-template-columns: 1fr 460px;
   background: var(--surface);
   /* 整页可拖拽窗口（问题 5b）；交互元素在下方统一 no-drag。
-     Wails v2 拖拽属性为 --wails-draggable（WebView2 不认 -webkit-app-region） */
+     Wails 无边框拖拽属性为 --wails-draggable（WebView2 不认 -webkit-app-region） */
   --wails-draggable: drag;
 }
 /* 悬浮窗控样式已随 v0.1.2 全局 TitleBar 移除（win-controls 块删除） */

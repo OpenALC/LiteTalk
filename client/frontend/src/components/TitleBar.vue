@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // TitleBar 自定义标题栏（无边框窗口拖拽区 + 最小化/最大化/关闭）。
-// Wails v2 无边框窗口：拖拽用 --wails-draggable（WebView2 不认 Electron 的
+// Wails 无边框窗口（v2/v3 相同）：拖拽用 --wails-draggable（WebView2 不认 Electron 的
 // -webkit-app-region）。
 // 关闭走 useWindowClose：首次关窗提示「已最小化到托盘」（问题 4d）。
 import { ref } from 'vue'
