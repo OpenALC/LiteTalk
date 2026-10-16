@@ -161,7 +161,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          # 安装器文件名随 wails 版本/平台可能不同，用通配符查找而非硬编码
+          # 安装器产物名固定为 LiteTalk-amd64-installer.exe（自包含 project.nsi 的 OutFile）
           $installer = Get-ChildItem build/bin/*-installer.exe | Select-Object -First 1
           if (-not $installer) {
             Write-Host "build/bin 内容："
@@ -170,7 +170,8 @@ jobs:
           }
           Write-Host "安装器: $($installer.Name)"
           Copy-Item $installer.FullName dist/LiteTalk-windows-amd64-setup.exe
-          Compress-Archive -Path build/bin/LiteTalk.exe -DestinationPath dist/LiteTalk-windows-amd64-portable.zip      - uses: actions/upload-artifact@v4
+          Compress-Archive -Path build/bin/LiteTalk.exe -DestinationPath dist/LiteTalk-windows-amd64-portable.zip
+      - uses: actions/upload-artifact@v4
         with:
           name: dist-client-windows
           path: client/dist/*
