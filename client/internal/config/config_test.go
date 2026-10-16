@@ -47,14 +47,15 @@ func TestCloseToTray(t *testing.T) {
 func TestAudioSettings(t *testing.T) {
 	m := tmpManager(t)
 
-	// 未设置：全部回落默认（v0.1.2：强度中档 2、AGC 关、VAD 中档 2、复杂度 9、双音量 100）。
+	// 未设置：全部回落默认（v0.1.2：强度中档 2、VAD 中档 2、复杂度 9、双音量 100；
+	// v1.1：AGC 默认开、输入声道 auto）。
 	d := m.GetAudioSettings()
 	if d.BitrateKbps != 32 || !*d.VBR || !*d.DTX || !*d.FEC {
 		t.Fatalf("默认 Opus 参数异常: %+v", d)
 	}
 	if d.PacketLoss != 10 || !*d.Denoise || d.DenoiseStrength != 2 ||
-		*d.AGC || *d.VADSens != 2 || d.Complexity != 9 ||
-		d.MicVolume != 100 || d.PlaybackVolume != 100 {
+		!*d.AGC || *d.VADSens != 2 || d.Complexity != 9 ||
+		d.MicVolume != 100 || d.PlaybackVolume != 100 || d.InputMode != "auto" {
 		t.Fatalf("默认 DSP 参数异常: %+v", d)
 	}
 
@@ -65,7 +66,7 @@ func TestAudioSettings(t *testing.T) {
 		BitrateKbps: 48, VBR: &f, DTX: &tr, FEC: &f,
 		PacketLoss: 15, Denoise: &f, DenoiseStrength: 3, AGC: &tr,
 		VADSens: &low, Complexity: 5,
-		MicVolume: 60, PlaybackVolume: 120,
+		MicVolume: 60, PlaybackVolume: 120, InputMode: "right",
 	}
 	if err := m.SetAudioSettings(custom); err != nil {
 		t.Fatalf("SetAudioSettings: %v", err)
@@ -77,20 +78,20 @@ func TestAudioSettings(t *testing.T) {
 	}
 	if got.PacketLoss != 15 || *got.Denoise || got.DenoiseStrength != 3 ||
 		!*got.AGC || *got.VADSens != 0 || got.Complexity != 5 ||
-		got.MicVolume != 60 || got.PlaybackVolume != 120 {
+		got.MicVolume != 60 || got.PlaybackVolume != 120 || got.InputMode != "right" {
 		t.Fatalf("DSP 设置未持久化: %+v", got)
 	}
 
 	// 读路径收敛：手改 config.json 的越界值回落默认。
 	if err := m.Update(func(c *Config) error {
-		c.Audio = &AudioSettings{BitrateKbps: 999, PacketLoss: 250, Gain: 999, MicVolume: 250, Complexity: 99}
+		c.Audio = &AudioSettings{BitrateKbps: 999, PacketLoss: 250, Gain: 999, MicVolume: 250, Complexity: 99, InputMode: "bogus"}
 		return nil
 	}); err != nil {
 		t.Fatalf("注入越界值: %v", err)
 	}
 	got = m.GetAudioSettings()
 	if got.BitrateKbps != 32 || got.PacketLoss != 10 || got.Gain != 10 ||
-		got.MicVolume != 120 || got.Complexity != 9 {
+		got.MicVolume != 120 || got.Complexity != 9 || got.InputMode != "auto" {
 		t.Fatalf("越界值未收敛: %+v", got)
 	}
 }

@@ -728,9 +728,10 @@ func (a *App) GetAudioDeviceSelection() *AudioDeviceSelection {
 }
 
 // TestMicrophone 麦克风自检：用持久化选择的采集设备采样 2 秒，返回 RMS 与峰值
-// （设置页「测试」按钮；独立于会话管线，不动通话状态）。
+// （设置页「测试」按钮；独立于会话管线，不动通话状态；下混模式与通话链路一致）。
 func (a *App) TestMicrophone() (map[string]float64, error) {
-	rms, peak, err := audio.TestCapture(a.cfg.Get().AudioCapture, 2*time.Second)
+	as := a.cfg.GetAudioSettings()
+	rms, peak, err := audio.TestCapture(a.cfg.Get().AudioCapture, audio.ParseInputMode(as.InputMode), 2*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -1147,6 +1148,7 @@ func (a *App) runtimeAudio() audio.RuntimeSettings {
 		PlaybackGain:    float64(as.PlaybackVolume) / 100,
 		VADSens:         derefInt(as.VADSens, 2),
 		Complexity:      complexity,
+		InputMode:       audio.ParseInputMode(as.InputMode),
 	}
 }
 
@@ -1183,6 +1185,9 @@ func (a *App) SetAudioSettings(s config.AudioSettings) error {
 	}
 	if s.PlaybackVolume < 0 || s.PlaybackVolume > 120 {
 		return fmt.Errorf("扬声器音量非法: %d", s.PlaybackVolume)
+	}
+	if s.InputMode != "" && !config.InputModes[s.InputMode] {
+		return fmt.Errorf("输入声道模式非法: %s", s.InputMode)
 	}
 	if err := a.cfg.SetAudioSettings(s); err != nil {
 		return err

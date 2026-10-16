@@ -22,9 +22,9 @@ import (
 var testBusy atomic.Bool
 
 // TestCapture 用指定采集设备（selector 空 = 系统默认）采集 dur 时长，
-// 返回 RMS 与峰值（int16 域）。回调内累计 sum(x²)/max|x|，零分配。
-// 进程内同时只允许一个测试运行（TryLock 失败返回忙错误）。
-func TestCapture(selector string, dur time.Duration) (rms, peak float64, err error) {
+// 返回 RMS 与峰值（int16 域，按 mode 下混后的单声道——与通话链路口径一致）。
+// 回调内累计 sum(x²)/max|x|，零分配。进程内同时只允许一个测试运行。
+func TestCapture(selector string, mode InputMode, dur time.Duration) (rms, peak float64, err error) {
 	if !testBusy.CompareAndSwap(false, true) {
 		return 0, 0, fmt.Errorf("已有测试在进行中，请稍后再试")
 	}
@@ -41,9 +41,10 @@ func TestCapture(selector string, dur time.Duration) (rms, peak float64, err err
 		return 0, 0, err
 	}
 
+	ch := ctx.nativeCaptureChannels(devID)
 	cfg := malgo.DefaultDeviceConfig(malgo.Capture)
 	cfg.Capture.Format = malgo.FormatS16
-	cfg.Capture.Channels = 1
+	cfg.Capture.Channels = uint32(ch)
 	cfg.SampleRate = SampleRate
 	cfg.PeriodSizeInMilliseconds = 10
 	if devID != nil {
@@ -54,6 +55,9 @@ func TestCapture(selector string, dur time.Duration) (rms, peak float64, err err
 	var sum float64
 	var peakV int32
 	var frames int
+	// 下混缓冲与状态：回调外预分配（4096 帧 ≈85ms，超限分块处理）。
+	mono := make([]int16, maxDownmixFrames)
+	var dm downmixState
 
 	callbacks := malgo.DeviceCallbacks{
 		Data: func(_, inputSamples []byte, _ uint32) {
@@ -62,25 +66,41 @@ func TestCapture(selector string, dur time.Duration) (rms, peak float64, err err
 				return
 			}
 			samples := unsafe.Slice((*int16)(unsafe.Pointer(unsafe.SliceData(inputSamples))), n)
-			var s float64
-			var p int32
-			for _, x := range samples {
-				ax := int32(x)
-				if ax < 0 {
-					ax = -ax
+			acc := func(p []int16) {
+				var s float64
+				var p2 int32
+				for _, x := range p {
+					ax := int32(x)
+					if ax < 0 {
+						ax = -ax
+					}
+					s += float64(x) * float64(x)
+					if ax > p2 {
+						p2 = ax
+					}
 				}
-				s += float64(x) * float64(x)
-				if ax > p {
-					p = ax
+				mu.Lock()
+				sum += s
+				frames += len(p)
+				if p2 > peakV {
+					peakV = p2
 				}
+				mu.Unlock()
 			}
-			mu.Lock()
-			sum += s
-			frames += n
-			if p > peakV {
-				peakV = p
+			if ch <= 1 {
+				acc(samples)
+				return
 			}
-			mu.Unlock()
+			total := n / ch
+			for off := 0; off < total; {
+				take := total - off
+				if take > len(mono) {
+					take = len(mono)
+				}
+				got := downmixFrame(mono[:take], samples[off*ch:(off+take)*ch], ch, mode, &dm)
+				acc(mono[:got])
+				off += take
+			}
 		},
 	}
 

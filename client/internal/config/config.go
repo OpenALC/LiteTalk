@@ -60,32 +60,38 @@ type Config struct {
 
 // AudioSettings 语音设置。指针/零值字段在读取时回落 DefaultAudioSettings。
 // v0.1.2 扩展：降噪强度/AGC/Opus 复杂度/麦克风与扬声器音量（0–120）。
+// v1.1 扩展：输入声道下混 InputMode；AGC 默认开。
 // 旧字段 Gain 保留读取兼容（mic_volume 为空时按 gain×10 换算）。
 type AudioSettings struct {
-	BitrateKbps     int   `json:"bitrate_kbps,omitempty"`     // Opus 目标码率 kbps：16/24/32/48/64（0 → 32）
-	VBR             *bool `json:"vbr,omitempty"`              // 可变码率（nil → true）
-	DTX             *bool `json:"dtx,omitempty"`              // 静音期非连续传输（nil → true）
-	FEC             *bool `json:"fec,omitempty"`              // 带内前向纠错（nil → true）
-	PacketLoss      int   `json:"packet_loss,omitempty"`      // 告知编码器的预期丢包率 %（0 → 10；FEC 关闭时无意义）
-	Denoise         *bool `json:"denoise,omitempty"`          // RNNoise 降噪总开关（nil → true）
-	DenoiseStrength int   `json:"denoise_strength,omitempty"` // 降噪强度 1弱/2中/3强（0 → 2；0 档配合 Denoise=false 即"关"）
-	AGC             *bool `json:"agc,omitempty"`              // 自动增益（nil → false；新功能默认关）
-	VADSens         *int  `json:"vad_sens,omitempty"`         // VAD 灵敏度 0–4 五档（nil → 2=中）
-	Complexity      int   `json:"opus_complexity,omitempty"`  // Opus 复杂度 0–10（0 → 9）
-	Gain            int   `json:"gain,omitempty"`             // 旧版输入增益 ×10（0 → 10 = 1.0；已被 MicVolume 取代，读取时换算）
-	MicVolume       int   `json:"mic_volume,omitempty"`       // 麦克风音量 0–120（默认 100）
-	PlaybackVolume  int   `json:"playback_volume,omitempty"`  // 扬声器音量 0–120（默认 100）
+	BitrateKbps     int    `json:"bitrate_kbps,omitempty"`     // Opus 目标码率 kbps：16/24/32/48/64（0 → 32）
+	VBR             *bool  `json:"vbr,omitempty"`              // 可变码率（nil → true）
+	DTX             *bool  `json:"dtx,omitempty"`              // 静音期非连续传输（nil → true）
+	FEC             *bool  `json:"fec,omitempty"`              // 带内前向纠错（nil → true）
+	PacketLoss      int    `json:"packet_loss,omitempty"`      // 告知编码器的预期丢包率 %（0 → 10；FEC 关闭时无意义）
+	Denoise         *bool  `json:"denoise,omitempty"`          // RNNoise 降噪总开关（nil → true）
+	DenoiseStrength int    `json:"denoise_strength,omitempty"` // 降噪强度 1弱/2中/3强（0 → 2；0 档配合 Denoise=false 即"关"）
+	AGC             *bool  `json:"agc,omitempty"`              // 自动增益（nil → true；v1.1 起默认开）
+	VADSens         *int   `json:"vad_sens,omitempty"`         // VAD 灵敏度 0–4 五档（nil → 2=中）
+	Complexity      int    `json:"opus_complexity,omitempty"`  // Opus 复杂度 0–10（0 → 9）
+	Gain            int    `json:"gain,omitempty"`             // 旧版输入增益 ×10（0 → 10 = 1.0；已被 MicVolume 取代，读取时换算）
+	MicVolume       int    `json:"mic_volume,omitempty"`       // 麦克风音量 0–120（默认 100）
+	PlaybackVolume  int    `json:"playback_volume,omitempty"`  // 扬声器音量 0–120（默认 100）
+	InputMode       string `json:"input_mode,omitempty"`       // 输入声道下混：auto/left/right/mix（"" → auto）
 }
+
+// InputModes 合法输入声道模式（SetAudioSettings 白名单 / GetAudioSettings 收敛）。
+var InputModes = map[string]bool{"auto": true, "left": true, "right": true, "mix": true}
 
 // DefaultAudioSettings 语音设置出厂值（与管线既有硬编码一致）。
 func DefaultAudioSettings() AudioSettings {
-	t, f := true, false
+	t := true
 	two := 2
 	return AudioSettings{
 		BitrateKbps: 32, VBR: &t, DTX: &t, FEC: &t,
 		PacketLoss: 10, Denoise: &t, DenoiseStrength: 2,
-		AGC: &f, VADSens: &two, Complexity: 9,
+		AGC: &t, VADSens: &two, Complexity: 9,
 		Gain: 10, MicVolume: 100, PlaybackVolume: 100,
+		InputMode: "auto",
 	}
 }
 
@@ -160,6 +166,10 @@ func (m *Manager) GetAudioSettings() AudioSettings {
 		s.PlaybackVolume = d.PlaybackVolume
 	} else if s.PlaybackVolume > 120 {
 		s.PlaybackVolume = 120
+	}
+	// 输入声道模式：空串/非法值回落 auto。
+	if !InputModes[s.InputMode] {
+		s.InputMode = d.InputMode
 	}
 	return s
 }

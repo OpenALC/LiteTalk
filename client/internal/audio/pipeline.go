@@ -26,8 +26,9 @@ type PipelineConfig struct {
 	Backend  Backend
 	Loopback bool // 编码后本地直接解码送播放环（M1 回环试听；M2 改为 OnPacket 发出）
 
-	CaptureSelector  string // 采集设备 ID 十六进制串或名称子串，空 = 默认
-	PlaybackSelector string // 播放设备同上
+	CaptureSelector  string    // 采集设备 ID 十六进制串或名称子串，空 = 默认
+	PlaybackSelector string    // 播放设备同上
+	InputMode        InputMode // 采集下混模式（零值 = auto；RuntimeSettings 可热改）
 
 	DSP DSPConfig // 降噪/增益/说话判定
 
@@ -84,12 +85,13 @@ func boolPtr(b bool) *bool { return &b }
 type RuntimeSettings struct {
 	Opus            OpusConfig
 	Denoise         bool
-	DenoiseStrength int     // 1弱/2中/3强（v0.1.2）
-	AGC             bool    // 自动增益（v0.1.2，默认关）
-	Gain            float64 // 麦克风线性增益，1.0 为不变
-	PlaybackGain    float64 // 扬声器总音量（mixer master gain），1.0 为不变
-	VADSens         int     // 0–4 五档
-	Complexity      int     // Opus 复杂度 0–10（≤0 表示不改）
+	DenoiseStrength int       // 1弱/2中/3强（v0.1.2）
+	AGC             bool      // 自动增益（v1.1 默认开）
+	Gain            float64   // 麦克风线性增益，1.0 为不变
+	PlaybackGain    float64   // 扬声器总音量（mixer master gain），1.0 为不变
+	VADSens         int       // 0–4 五档
+	Complexity      int       // Opus 复杂度 0–10（≤0 表示不改）
+	InputMode       InputMode // 采集下混模式（变更即热重启采集流）
 }
 
 // DefaultPipelineConfig 返回默认管线配置（声卡回环、降噪开、增益 1）。
@@ -203,6 +205,13 @@ type Pipeline struct {
 
 	devMu sync.Mutex // 保护 capture/playback 字段（RestartDevices 与 captureLoop.wake 并发）
 
+	// restartMu 串行化设备流重启（RestartDevices 与 SetInputMode 的热重启可能
+	// 并发：交错会把对方刚打开的设备流覆盖泄漏）。
+	restartMu sync.Mutex
+
+	// inputMode 当前下混模式（原子热调；StartCapture/热重启读取）。
+	inputMode atomic.Uint32
+
 	done    chan struct{}
 	wg      sync.WaitGroup
 	started atomic.Bool
@@ -237,6 +246,11 @@ func NewPipeline(cfg PipelineConfig) (*Pipeline, error) {
 		done:     make(chan struct{}),
 		nullRNG:  0x1EAF1234,
 	}
+	if cfg.InputMode > InputModeMix {
+		cfg.InputMode = InputModeAuto
+		p.cfg.InputMode = InputModeAuto
+	}
+	p.inputMode.Store(uint32(cfg.InputMode))
 
 	cfg.DSP.OnSpeakingChange = func(b bool) {
 		p.stats.SpeakingChanges.Add(1)
@@ -298,7 +312,7 @@ func (p *Pipeline) Start() error {
 	}
 	p.ctx = ctx
 
-	cap_, err := StartCapture(ctx, p.cfg.CaptureSelector, p.capRing, &p.stats)
+	cap_, err := StartCapture(ctx, p.cfg.CaptureSelector, p.capRing, &p.stats, InputMode(p.inputMode.Load()))
 	if err != nil {
 		p.ctx.Close()
 		p.started.Store(false)
@@ -328,6 +342,8 @@ func (p *Pipeline) RestartDevices(captureSelector, playbackSelector string) erro
 	if p.closed.Load() {
 		return errors.New("pipeline closed")
 	}
+	p.restartMu.Lock()
+	defer p.restartMu.Unlock()
 	p.cfg.CaptureSelector = captureSelector
 	p.cfg.PlaybackSelector = playbackSelector
 	if !p.started.Load() {
@@ -349,11 +365,11 @@ func (p *Pipeline) RestartDevices(captureSelector, playbackSelector string) erro
 		oldPlay.Stop()
 	}
 
-	cap_, err := StartCapture(p.ctx, captureSelector, p.capRing, &p.stats)
+	cap_, err := StartCapture(p.ctx, captureSelector, p.capRing, &p.stats, InputMode(p.inputMode.Load()))
 	if err != nil && captureSelector != "" {
 		// 设备消失/失效：回退默认设备。
 		p.cfg.CaptureSelector = ""
-		cap_, err = StartCapture(p.ctx, "", p.capRing, &p.stats)
+		cap_, err = StartCapture(p.ctx, "", p.capRing, &p.stats, InputMode(p.inputMode.Load()))
 	}
 	if err != nil {
 		return fmt.Errorf("restart capture: %w", err)
@@ -371,6 +387,47 @@ func (p *Pipeline) RestartDevices(captureSelector, playbackSelector string) erro
 
 	p.devMu.Lock()
 	p.capture, p.playback = cap_, play
+	p.devMu.Unlock()
+	return nil
+}
+
+// SetInputMode 运行时切换下混模式：原子写 + 热重启采集流（播放/编解码不动），
+// 让设置页改动即时生效。未启动/空卡后端仅记录，下次 Start 生效。
+func (p *Pipeline) SetInputMode(m InputMode) error {
+	if m > InputModeMix {
+		return fmt.Errorf("输入声道模式非法: %v", uint32(m))
+	}
+	if uint32(m) == p.inputMode.Swap(uint32(m)) {
+		return nil // 未变化：no-op
+	}
+	if !p.started.Load() || p.cfg.Backend != BackendDevice || p.ctx == nil {
+		return nil
+	}
+	p.restartMu.Lock()
+	defer p.restartMu.Unlock()
+	return p.restartCaptureLocked()
+}
+
+// restartCaptureLocked 仅重启采集流（已持 restartMu）。
+// 失败语义与 RestartDevices 一致：capture 置 nil，由调用方向上透传错误。
+func (p *Pipeline) restartCaptureLocked() error {
+	p.devMu.Lock()
+	oldCap := p.capture
+	p.capture = nil
+	p.devMu.Unlock()
+	if oldCap != nil {
+		oldCap.Stop()
+	}
+	cap_, err := StartCapture(p.ctx, p.cfg.CaptureSelector, p.capRing, &p.stats, InputMode(p.inputMode.Load()))
+	if err != nil && p.cfg.CaptureSelector != "" {
+		p.cfg.CaptureSelector = ""
+		cap_, err = StartCapture(p.ctx, "", p.capRing, &p.stats, InputMode(p.inputMode.Load()))
+	}
+	if err != nil {
+		return fmt.Errorf("restart capture: %w", err)
+	}
+	p.devMu.Lock()
+	p.capture = cap_
 	p.devMu.Unlock()
 	return nil
 }

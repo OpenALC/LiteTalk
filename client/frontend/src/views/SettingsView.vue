@@ -6,6 +6,7 @@ import { onMounted, ref, computed } from 'vue'
 import { ArrowLeft, LogOut, Mic, Volume2 } from 'lucide-vue-next'
 import { useRouter } from 'vue-router'
 import { goApp, type AudioDeviceDTO } from '../api/bridge'
+import type { AudioSettings } from '../api/types'
 import { useAuthStore } from '../stores/auth'
 import { useSettingsStore } from '../stores/data'
 import { useHibernateStore } from '../stores/hibernate'
@@ -38,11 +39,12 @@ const testingSpk = ref(false)
 const toast = ref<InstanceType<typeof Toast>>()
 
 // 语音设置：Go 侧返回已回落默认的完整值（码率/VBR/DTX/FEC/丢包/降噪强度/AGC/
-// 麦克风/扬声器音量/VAD 五档/Opus 复杂度）。
-const audio = ref({
+// 麦克风/扬声器音量/VAD 五档/Opus 复杂度/输入声道/前置增益）。
+const audio = ref<AudioSettings>({
   bitrate_kbps: 32, vbr: true, dtx: true, fec: true,
-  packet_loss: 10, denoise: true, denoise_strength: 2, agc: false,
+  packet_loss: 10, denoise: true, denoise_strength: 2, agc: true,
   mic_volume: 100, playback_volume: 100, vad_sens: 2, opus_complexity: 9,
+  input_mode: 'auto', pre_gain_db: 0,
 })
 const BITRATES = [16, 24, 32, 48, 64]
 // VAD 五档（v0.1.2 扩展；旧三档由 Go 侧映射 0/2/4）。
@@ -50,6 +52,15 @@ const VAD_LABELS = ['很低', '低', '中', '高', '很高']
 // 降噪强度四档：关（denoise=false）/弱/中/强（denoise_strength=1/2/3，
 // Go 侧映射 rnnoise Aggressiveness 1.0/1.5/2.0）。
 const DENOISE_LABELS = ['关', '弱', '中', '强']
+// 输入声道下混：auto=自动选最强声道（反相锁定单声道），left/right 固定，mix 平均。
+const INPUT_LABELS: Record<NonNullable<AudioSettings['input_mode']>, string> = {
+  auto: '自动', left: '左声道', right: '右声道', mix: '混合',
+}
+function setInputMode(e: Event) {
+  const v = (e.target as HTMLSelectElement).value
+  audio.value.input_mode = (v in INPUT_LABELS ? v : 'auto') as AudioSettings['input_mode']
+  void applyAudio()
+}
 
 // denoiseIdx 降噪强度当前档位（computed 双向：关↔denoise=false，其余↔strength）。
 const denoiseIdx = ref(2)
@@ -71,6 +82,9 @@ onMounted(async () => {
   hibMode.value = (await goApp().GetHibernateMode()) as typeof hibMode.value
   closeToTray.value = await goApp().GetCloseToTray()
   audio.value = await goApp().GetAudioSettings()
+  // omitempty 字段（0/空值不序列化）在 UI 侧补默认，避免滑杆/下拉空值。
+  audio.value.input_mode ??= 'auto'
+  audio.value.pre_gain_db ??= 0
   syncDenoiseIdx()
   const devs = await goApp().ListAudioDevices()
   caps.value = devs.capture
@@ -209,6 +223,13 @@ async function applyAudio() {
           <button class="mini-btn" :disabled="testingMic" @click="testMic">
             <Mic :size="13" />{{ testingMic ? '请说话…' : '测试' }}
           </button>
+        </div>
+        <!-- 输入声道下混：单声道有信号的耳麦在 auto 下不再被各声道平均压掉 -->
+        <div class="s-row">
+          <div class="k">输入声道</div>
+          <select :value="audio.input_mode ?? 'auto'" @change="setInputMode">
+            <option v-for="(label, mode) in INPUT_LABELS" :key="mode" :value="mode">{{ label }}</option>
+          </select>
         </div>
         <div class="s-row">
           <div class="k">扬声器</div>

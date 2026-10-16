@@ -81,6 +81,59 @@ func pickDevice(devices []DeviceInfo, selector string) int {
 	return -2
 }
 
+// nativeCaptureChannels 查询采集设备的原生声道数（上限 4）。
+// 查询失败/信息缺失回落 1（等价 miniaudio 矩形下混，不劣于修复前）。
+// devID 为 nil 表示系统默认设备；非 nil 时优先按 ID 精确查询。
+func (c *Context) nativeCaptureChannels(devID *malgo.DeviceID) int {
+	const maxChannels = 4
+	chFrom := func(info malgo.DeviceInfo) int {
+		for _, f := range info.Formats {
+			if f.Channels > 0 {
+				n := int(f.Channels)
+				if n > maxChannels {
+					n = maxChannels
+				}
+				return n
+			}
+		}
+		return 1
+	}
+	if devID != nil {
+		info, err := c.ctx.DeviceInfo(malgo.Capture, *devID, malgo.Shared)
+		if err == nil {
+			return chFrom(info)
+		}
+	}
+	// 默认设备或精确查询失败：回落枚举列表（IsDefault / ID 匹配）。
+	infos, err := c.ctx.Devices(malgo.Capture)
+	if err != nil || len(infos) == 0 {
+		return 1
+	}
+	idx := -1
+	if devID == nil {
+		for i := range infos {
+			if infos[i].IsDefault != 0 {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			idx = 0
+		}
+	} else {
+		for i := range infos {
+			if infos[i].ID == *devID {
+				idx = i
+				break
+			}
+		}
+	}
+	if idx < 0 {
+		return 1
+	}
+	return chFrom(infos[idx])
+}
+
 // resolveDeviceID 把用户的选择器解析为 malgo 设备 ID 指针。
 // selector 为空 → nil（默认设备）；否则先精确匹配 ID 十六进制串，
 // 再大小写不敏感子串匹配设备名；都不中则报错并列出候选。
