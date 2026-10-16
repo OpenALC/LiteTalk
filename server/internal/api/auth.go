@@ -162,7 +162,7 @@ func (s *Server) handleGuest(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "guest_disabled", "游客登录仅在 simple 模式开放")
 		return
 	}
-	ok, err := s.limits.Allow(r.Context(), "guest:"+clientIP(r), 5, time.Minute)
+	ok, err := s.limits.Allow(r.Context(), "guest:"+s.clientIP(r), 5, time.Minute)
 	if err != nil || !ok {
 		writeErr(w, http.StatusTooManyRequests, "rate_limited", "操作过于频繁，请稍后再试")
 		return
@@ -189,7 +189,7 @@ func (s *Server) handleGuest(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, err)
 		return
 	}
-	s.log.Printf("[audit] guest created user=%d ip=%s", user.ID, clientIP(r))
+	s.log.Printf("[audit] guest created user=%d ip=%s", user.ID, s.clientIP(r))
 	s.issueTokens(w, r, user, http.StatusCreated)
 }
 
@@ -214,7 +214,7 @@ func randHex(n int) string {
 
 // handleLogin POST /api/v1/auth/login（限流 5 次/min/IP）
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
-	ok, err := s.limits.Allow(r.Context(), "login:"+clientIP(r), 5, time.Minute)
+	ok, err := s.limits.Allow(r.Context(), "login:"+s.clientIP(r), 5, time.Minute)
 	if err != nil || !ok {
 		writeErr(w, http.StatusTooManyRequests, "rate_limited", "登录过于频繁，请稍后再试")
 		return
@@ -227,10 +227,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	user, err := s.store.UserByEmail(r.Context(), req.Email)
 	if err != nil || !auth.CheckPassword(user.PasswordHash, req.Password) {
 		writeErr(w, http.StatusUnauthorized, "bad_credentials", "邮箱或密码错误")
-		s.log.Printf("[audit] login failed email=%s ip=%s", req.Email, clientIP(r))
+		s.log.Printf("[audit] login failed email=%s ip=%s", req.Email, s.clientIP(r))
 		return
 	}
-	s.log.Printf("[audit] login ok user=%d ip=%s", user.ID, clientIP(r))
+	s.log.Printf("[audit] login ok user=%d ip=%s", user.ID, s.clientIP(r))
 	s.issueTokens(w, r, user, http.StatusOK)
 }
 
@@ -344,7 +344,7 @@ func (s *Server) handleEmailCode(w http.ResponseWriter, r *http.Request) {
 	if err := s.mailer.SendCode(req.Email, req.Purpose, code); err != nil {
 		s.log.Printf("[mailer] 发送失败 to=%s err=%v", req.Email, err)
 	}
-	s.log.Printf("[audit] email-code sent email=%s purpose=%s ip=%s", req.Email, req.Purpose, clientIP(r))
+	s.log.Printf("[audit] email-code sent email=%s purpose=%s ip=%s", req.Email, req.Purpose, s.clientIP(r))
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -387,7 +387,7 @@ func (s *Server) handlePasswordReset(w http.ResponseWriter, r *http.Request) {
 	}
 	// 重置后吊销全部刷新令牌。
 	_ = s.refresh.Revoke(r.Context(), user.ID)
-	s.log.Printf("[audit] password reset user=%d ip=%s", user.ID, clientIP(r))
+	s.log.Printf("[audit] password reset user=%d ip=%s", user.ID, s.clientIP(r))
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 

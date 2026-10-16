@@ -186,6 +186,9 @@ func main() {
 		Mailer:   mail,
 		AuthMode: authMode,
 		Log:      log.Default(),
+		// 可信反代（Nginx 等）的 IP/CIDR，命中 RemoteAddr 才采用 X-Real-IP；
+		// 不配置则只信 RemoteAddr。详见 deploy/env/litetalk.env.example。
+		TrustedProxies: splitList(os.Getenv("LITETALK_TRUSTED_PROXIES")),
 	})
 
 	mux := http.NewServeMux()

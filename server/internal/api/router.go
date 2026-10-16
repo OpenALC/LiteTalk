@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -31,6 +32,7 @@ type Server struct {
 	mailer   mailer.Mailer
 	authMode string
 	log      *log.Logger
+	trusted  []*net.IPNet // 可信反代（RemoteAddr 命中才采用 X-Real-IP）
 }
 
 // Config 构造配置。
@@ -43,6 +45,9 @@ type Config struct {
 	Mailer   mailer.Mailer
 	AuthMode string // 空视为 full
 	Log      *log.Logger
+	// TrustedProxies 可信反代的 IP/CIDR 列表（逗号分隔 env 在 main 解析后传入）。
+	// 空 = 不信任任何代理：直接取 RemoteAddr，伪造 X-Real-IP 无法绕过限流（P1）。
+	TrustedProxies []string
 }
 
 // New 构造 API Server。
@@ -68,7 +73,37 @@ func New(cfg Config) *Server {
 		mailer:   m,
 		authMode: mode,
 		log:      lg,
+		trusted:  parseTrustedProxies(lg, cfg.TrustedProxies),
 	}
+}
+
+// parseTrustedProxies 把 IP/CIDR 字符串列表解析成匹配网络；非法项跳过并记日志。
+func parseTrustedProxies(lg *log.Logger, entries []string) []*net.IPNet {
+	var out []*net.IPNet
+	for _, e := range entries {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			continue
+		}
+		if strings.Contains(e, "/") {
+			if _, n, err := net.ParseCIDR(e); err == nil {
+				out = append(out, n)
+			} else {
+				lg.Printf("[config] 忽略非法可信代理 CIDR %q: %v", e, err)
+			}
+			continue
+		}
+		if ip := net.ParseIP(e); ip != nil {
+			bits := 128 // IPv6 按 /128 精确匹配
+			if ip4 := ip.To4(); ip4 != nil {
+				ip, bits = ip4, 32
+			}
+			out = append(out, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+		} else {
+			lg.Printf("[config] 忽略非法可信代理 IP %q", e)
+		}
+	}
+	return out
 }
 
 // simpleMode 当前是否为简捷模式（免验证码）。
@@ -211,10 +246,33 @@ func pathID(w http.ResponseWriter, r *http.Request, name string) (int64, bool) {
 	return id, true
 }
 
-// clientIP 取客户端 IP（Nginx 后取 X-Real-IP）。
-func clientIP(r *http.Request) string {
-	if v := r.Header.Get("X-Real-IP"); v != "" {
-		return v
+// clientIP 取客户端 IP：仅当 RemoteAddr 命中可信代理列表时才采用 X-Real-IP。
+// 默认（空列表）不信任任何代理——服务直接监听公网时，无条件信任 X-Real-IP
+// 会让伪造该头绕过登录/注册等 IP 限流（P1）。
+// IPv4/IPv6 统一用 net.SplitHostPort 解析：按 ":" 切会把 IPv6 截成 "["，
+// 导致全部 IPv6 用户共用一个限流桶。
+func (s *Server) clientIP(r *http.Request) string {
+	host := remoteHost(r.RemoteAddr)
+	if remoteIP := net.ParseIP(host); remoteIP != nil {
+		for _, n := range s.trusted {
+			if n.Contains(remoteIP) {
+				if x := strings.TrimSpace(r.Header.Get("X-Real-IP")); x != "" {
+					if ip := net.ParseIP(x); ip != nil {
+						return ip.String()
+					}
+				}
+				break
+			}
+		}
 	}
-	return strings.Split(r.RemoteAddr, ":")[0]
+	return host
+}
+
+// remoteHost 从 RemoteAddr（host:port / [v6]:port）提取 host；解析失败原样返回。
+func remoteHost(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	return host
 }
