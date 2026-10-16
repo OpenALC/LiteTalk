@@ -2,17 +2,29 @@ package audio
 
 import (
 	"errors"
+	"runtime"
 	"testing"
 	"time"
 
 	"github.com/OpenALC/LiteTalk/client/internal/codec"
 )
 
+// requireOpus 编解码测试前置：darwin 尚未接入 libopus（stub），是唯一允许
+// 跳过的平台；Linux/Windows 必须已接入，Supported() 为假直接判失败——
+// 不准再用动态 Skip 掩盖平台接入回归。
+func requireOpus(tb testing.TB) {
+	tb.Helper()
+	if runtime.GOOS == "darwin" {
+		tb.Skip("darwin 尚未接入 libopus（stub）")
+	}
+	if !codec.Supported() {
+		tb.Fatalf("codec.Supported() = false on %s：Linux/Windows 必须接入 libopus", runtime.GOOS)
+	}
+}
+
 func newLoopbackPipeline(t *testing.T, mutate func(*PipelineConfig)) *Pipeline {
 	t.Helper()
-	if !codec.Supported() {
-		t.Skip("opus codec unsupported on this platform")
-	}
+	requireOpus(t)
 	cfg := DefaultPipelineConfig()
 	cfg.Backend = BackendNull // 不 Start，仅同步注入，用不到后端
 	if mutate != nil {

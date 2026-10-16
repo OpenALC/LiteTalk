@@ -44,9 +44,7 @@ func encodeSinePackets(t testing.TB, n int) [][]byte {
 // newTestRemotePeer 直接构造单路远端（不带 track），解码拍由测试同步驱动。
 func newTestRemotePeer(t testing.TB, id string, m *Mixer) *remotePeer {
 	t.Helper()
-	if !codec.Supported() {
-		t.Skip("opus codec unsupported on this platform")
-	}
+	requireOpus(t)
 	dec, err := codec.NewDecoder(SampleRate, 1)
 	if err != nil {
 		t.Fatalf("new decoder: %v", err)
@@ -282,9 +280,7 @@ func newTestSFUPC(t *testing.T) *webrtc.PeerConnection {
 // RTP → rtc.Peer OnTrack → RemoteManager.HandleTrack → jitter → 解码 → 混音输入；
 // peer 离开必须拆除链路与混音输入。
 func TestRemoteHandleTrackLoopback(t *testing.T) {
-	if !codec.Supported() {
-		t.Skip("opus codec unsupported on this platform")
-	}
+	requireOpus(t)
 	m, _ := newTestMixer()
 	rm := NewRemoteManager(m, nil)
 	t.Cleanup(rm.RemoveAll)
