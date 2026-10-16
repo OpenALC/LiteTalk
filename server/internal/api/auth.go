@@ -92,8 +92,13 @@ func parseRefreshUID(token string) (int64, bool) {
 
 // ---- handlers ----
 
-// handleRegister POST /api/v1/auth/register
+// handleRegister POST /api/v1/auth/register（限流 10 次/h/IP：防批量注册与 bcrypt CPU 放大）
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	ok, err := s.limits.Allow(r.Context(), "register:"+s.clientIP(r), 10, time.Hour)
+	if err != nil || !ok {
+		writeErr(w, http.StatusTooManyRequests, "rate_limited", "操作过于频繁，请稍后再试")
+		return
+	}
 	var req registerReq
 	if !decodeJSON(w, r, &req) {
 		return
@@ -300,10 +305,15 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// handleEmailCode POST /api/v1/auth/email-code
+// handleEmailCode POST /api/v1/auth/email-code（限流 10 次/h/IP：防对批量邮箱轰炸发信）
 func (s *Server) handleEmailCode(w http.ResponseWriter, r *http.Request) {
 	if s.simpleMode() {
 		writeErr(w, http.StatusBadRequest, "verification_not_required", "当前服务未启用邮箱验证，无需验证码")
+		return
+	}
+	ok, err := s.limits.Allow(r.Context(), "emailcode:"+s.clientIP(r), 10, time.Hour)
+	if err != nil || !ok {
+		writeErr(w, http.StatusTooManyRequests, "rate_limited", "操作过于频繁，请稍后再试")
 		return
 	}
 	var req emailCodeReq
@@ -354,6 +364,12 @@ func (s *Server) handlePasswordReset(w http.ResponseWriter, r *http.Request) {
 	// 故该模式整体禁用找回密码；确有需求的部署应改用 full 模式。
 	if s.simpleMode() {
 		writeErr(w, http.StatusForbidden, "reset_unavailable", "当前服务端未开启邮件功能，无法找回密码")
+		return
+	}
+	// 限流 10 次/h/IP：防对批量邮箱尝试爆破验证码。
+	ok, err := s.limits.Allow(r.Context(), "reset:"+s.clientIP(r), 10, time.Hour)
+	if err != nil || !ok {
+		writeErr(w, http.StatusTooManyRequests, "rate_limited", "操作过于频繁，请稍后再试")
 		return
 	}
 	var req passwordResetReq
