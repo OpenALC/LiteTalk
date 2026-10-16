@@ -1,7 +1,7 @@
-//go:build !windows
+//go:build !windows && !linux
 
-// Package config 的非 Windows 加密 stub（问题 6a）：
-// 无 DPAPI 等价物，密码不保存（只记邮箱），杜绝明文/假加密落盘。
+// Package config 的其余平台加密 stub（darwin 等）：
+// 无 DPAPI/降级存储，密码不保存（只记邮箱），杜绝明文/假加密落盘。
 package config
 
 import "errors"

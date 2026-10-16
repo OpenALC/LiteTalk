@@ -44,7 +44,7 @@ type Config struct {
 	CloseToTray         *bool          `json:"close_to_tray,omitempty"`         // 关闭窗口时最小化到托盘（默认 true；false=退出程序）
 	SavedEmail          string         `json:"saved_email,omitempty"`           // 记住的登录邮箱
 	EncPassword         string         `json:"enc_password,omitempty"`          // 记住的密码（DPAPI 密文 base64；非 Windows 恒空）
-	EncGuestRefresh     string         `json:"enc_guest_refresh,omitempty"`     // 记住的游客 refresh_token（DPAPI 密文 base64；非 Windows 恒空）
+	EncGuestRefresh     string         `json:"enc_guest_refresh,omitempty"`     // 记住的游客 refresh_token（Windows DPAPI 密文 / Linux base64+0600 降级；其余平台恒空）
 	Audio               *AudioSettings `json:"audio,omitempty"`                 // 语音设置（码率/VBR/DTX/FEC/丢包率/降噪/增益/VAD 灵敏度）
 	AudioCapture        string         `json:"audio_capture,omitempty"`         // 采集设备 ID（空=默认）
 	AudioPlayback       string         `json:"audio_playback,omitempty"`        // 播放设备 ID（空=默认）
@@ -262,7 +262,9 @@ func (m *Manager) Save(c Config) error {
 		return err
 	}
 	tmp := m.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	// 0600：config.json 含加密后的游客 refresh_token（Linux 降级为 base64+0600，
+	// 见 secret_linux.go），同用户外不可读——对齐 SSH 私钥的文件权限模型。
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, m.path); err != nil {
@@ -497,8 +499,8 @@ func (m *Manager) ClearSavedCredentials() error {
 
 // ---------- 记住游客身份（refresh_token 轮换维持同一游客） ----------
 
-// GetGuestRefresh 读取记住的游客 refresh_token（DPAPI 解密）。
-// 解密失败/非 Windows 平台返回空（视为无记住的游客）。
+// GetGuestRefresh 读取记住的游客 refresh_token（平台保护后解密/解码）。
+// 解密失败/不支持的平台返回空（视为无记住的游客）。
 func (m *Manager) GetGuestRefresh() string {
 	enc := m.Get().EncGuestRefresh
 	if enc == "" {
@@ -510,8 +512,8 @@ func (m *Manager) GetGuestRefresh() string {
 	return ""
 }
 
-// SetGuestRefresh 保存游客 refresh_token（DPAPI 加密）。
-// 传空串清除。加密失败（非 Windows）不保存——游客没有密码兜底，
+// SetGuestRefresh 保存游客 refresh_token（平台保护后落盘）。
+// 传空串清除。保护失败（不支持的 platform）不保存——游客没有密码兜底，
 // 存不了就下次新建，绝不明文落盘。
 func (m *Manager) SetGuestRefresh(token string) error {
 	enc := ""
