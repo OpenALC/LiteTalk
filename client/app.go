@@ -19,6 +19,7 @@ import (
 	"github.com/OpenALC/LiteTalk/client/internal/tray"
 	"github.com/gen2brain/malgo"
 	"github.com/wailsapp/wails/v3/pkg/application"
+	"github.com/wailsapp/wails/v3/pkg/events"
 )
 
 // version 客户端版本号，可用 -ldflags "-X main.version=" 注入，默认 dev
@@ -29,8 +30,20 @@ var version = "dev"
 type App struct {
 	// wails/window 由 main() 在 RegisterService 之后、Run 之前经 Bind 注入。
 	// 测试环境为 nil：事件发送与窗口操作全部空转（见 emit/interceptClose 等）。
-	wails  *application.App
+	wails *application.App
+
+	// winMu 保护 window 引用（托盘回调/服务绑定/窗口事件监听分属不同 goroutine）。
+	winMu  sync.Mutex
 	window *application.WebviewWindow
+
+	// recreating 程序化销毁渲染进程（里程碑② destroy 模式）的标志：
+	// WindowClosing Hook 见它放行关闭。重建窗口后复位（见 showFromTray）——
+	// 新窗口的 Hook 同样检查此标志，不复位会把用户正常关窗误判为销毁。
+	recreating atomic.Bool
+
+	// 销毁前保存的窗口位置/大小/最大化态，托盘唤醒重建时恢复。
+	savedBounds    *application.Rect
+	savedMaximised bool
 
 	// cfg 本地配置（config.json：服务器地址 / 休眠模式持久化）。
 	cfg *config.Manager
@@ -71,7 +84,21 @@ func newAppWithConfig(m *config.Manager) *App {
 // 绑定持有的是 App 指针，后续字段变更对绑定透明）。
 func (a *App) Bind(wails *application.App, window *application.WebviewWindow) {
 	a.wails = wails
-	a.window = window
+	a.setWindow(window)
+}
+
+// getWindow/setWindow window 引用的并发安全访问器。
+// destroyRenderProcess 销毁后置 nil，唤醒时由 showFromTray 重建。
+func (a *App) getWindow() *application.WebviewWindow {
+	a.winMu.Lock()
+	defer a.winMu.Unlock()
+	return a.window
+}
+
+func (a *App) setWindow(w *application.WebviewWindow) {
+	a.winMu.Lock()
+	defer a.winMu.Unlock()
+	a.window = w
 }
 
 // emit 向前端广播事件的统一出口：测试环境（wails==nil）空转。
@@ -163,61 +190,150 @@ func (a *App) setupTray() {
 	a.trayReady.Store(true)
 }
 
-// showFromTray 托盘「显示主界面」：解除最小化并前置窗口，发 sys:wake 让前端清休眠态。
-func (a *App) showFromTray() {
-	if a.window == nil {
+// buildWindow 创建 webview 窗口并注册生命周期钩子（WindowClosing 拦截 +
+// WindowMinimise 监听）。main() 启动与 showFromTray() 重建共用——钩子是
+// 窗口实例级的，重建必须重新注册。
+func (a *App) buildWindow(opts application.WebviewWindowOptions) *application.WebviewWindow {
+	win := a.wails.Window.NewWithOptions(opts)
+
+	// 关窗拦截：默认隐藏到托盘而非退出（见 interceptClose）。
+	// Hook 先于 v3 内建关闭处理器执行，Cancel 即中止关闭。
+	win.RegisterHook(events.Common.WindowClosing, func(e *application.WindowEvent) {
+		if a.interceptClose() {
+			e.Cancel()
+		}
+	})
+
+	// 最小化监听：destroy 模式最小化即销毁渲染进程（监听器在独立 goroutine 执行）。
+	win.OnWindowEvent(events.Common.WindowMinimise, func(*application.WindowEvent) {
+		if a.cfg.HibernateMode() == "destroy" {
+			a.destroyRenderProcess()
+		}
+	})
+
+	return win
+}
+
+// destroyRenderProcess 销毁渲染进程（里程碑②，destroy 休眠模式的真实实现）：
+// 释放 webview 内存（JS 堆/DOM/合成器），Go 侧语音会话与信令保持运行——
+// 这是与「隐藏窗口」的本质区别。关闭是异步的：Close 返回时销毁未必完成，
+// 旧窗口收尾与新窗口可短暂并存，v3 WindowManager 负责移除旧实例。
+// 重复触发安全（window 已 nil 直接返回）。
+func (a *App) destroyRenderProcess() {
+	win := a.getWindow()
+	if win == nil {
 		return
 	}
-	a.window.Show()
-	if a.window.IsMinimised() {
-		a.window.Restore()
+	if b := win.Bounds(); b.Width > 0 {
+		bb := b
+		a.savedBounds = &bb
+		a.savedMaximised = win.IsMaximised()
+	}
+	a.recreating.Store(true)
+	win.Close()
+	a.setWindow(nil)
+}
+
+// showFromTray 托盘「显示主界面」：窗口被销毁（destroy 休眠模式）则按记忆的
+// 位置/大小/最大化态重建；否则解除最小化并前置。发 sys:wake 让前端清休眠态。
+func (a *App) showFromTray() {
+	win := a.getWindow()
+	if win == nil {
+		if a.wails == nil {
+			return // 测试环境
+		}
+		opts := application.WebviewWindowOptions{
+			Title:            "轻音 LiteTalk",
+			Width:            1080,
+			Height:           680,
+			MinWidth:         1080,
+			MinHeight:        680,
+			Frameless:        true,
+			BackgroundColour: application.NewRGB(255, 255, 255),
+			Hidden:           true, // 先隐藏创建，恢复最大化态后再 Show，避免闪烁
+		}
+		if a.savedBounds != nil && a.savedBounds.Width > 0 {
+			opts.X, opts.Y = a.savedBounds.X, a.savedBounds.Y
+			opts.Width, opts.Height = a.savedBounds.Width, a.savedBounds.Height
+		}
+		win = a.buildWindow(opts)
+		a.setWindow(win)
+		if a.savedMaximised {
+			win.Maximise()
+		}
+		// 新窗口生命周期开始：复位程序化销毁标志（新窗口的 Hook 同样检查
+		// recreating，不复位会把用户正常关窗误判为销毁而直接退出）。
+		a.recreating.Store(false)
+	}
+	win.Show()
+	if win.IsMinimised() {
+		win.Restore()
 	}
 	a.emit("sys:wake", nil)
 }
 
-// emitHibernate 休眠处理（设置页「休眠模式」三态：off/hibernate/destroy）：
-//   - hibernate：发 sys:hibernate，前端卸载业务组件（省内存，前端状态保留）
-//   - destroy：隐藏窗口后整页 Reload，释放 JS 堆/DOM；
-//     唤醒时前端凭 Go 侧状态（登录态/语音会话）自愈重建
-//   - off / 未启用：什么都不做（独立生效，不再像旧版双开关互相依赖）
+// emitHibernate 休眠处理（设置页「休眠模式」三态之一 hibernate）：
+// 发 sys:hibernate，前端卸载业务组件（省内存，前端状态保留）。
+// destroy 模式不走这里——由 destroyRenderProcess 直接销毁渲染进程（里程碑②）。
+// off / 未启用：什么都不做（独立生效，不再像旧版双开关互相依赖）。
 func (a *App) emitHibernate() {
-	switch a.cfg.HibernateMode() {
-	case "destroy":
-		if a.window == nil {
-			return
-		}
-		go func() {
-			// 稍待隐藏完成再重载，避免重载瞬间窗口闪烁（窗口已隐藏不可见）。
-			time.Sleep(300 * time.Millisecond)
-			a.window.Reload()
-		}()
-	case "hibernate":
+	if a.cfg.HibernateMode() == "hibernate" {
 		a.emit("sys:hibernate", nil)
 	}
 }
 
 // interceptClose 拦截窗口关闭（v3 WindowClosing Hook，替代 v2 OnBeforeClose）：
-// 返回 true = 已拦截（隐藏到托盘并休眠），false = 放行真正关闭。兜底链：
-//   - forceQuit（托盘「退出」/设置页「退出程序」）→ 放行
-//   - 托盘未就绪 → 放行，绝不隐藏窗口把用户锁死
-//   - 用户选「关闭窗口时=退出程序」→ 放行
-//   - 其余 → 隐藏到托盘
+// 返回 true = 已拦截（隐藏到托盘或销毁渲染进程），false = 放行真正关闭。兜底链：
+//   - recreating（程序化销毁渲染进程，里程碑②）→ 放行
+//   - forceQuit（托盘「退出」/设置页「退出程序」，调用方已 Quit）→ 放行
+//   - 托盘未就绪 → 放行 + 显式 Quit
+//   - 用户选「关闭窗口时=退出程序」→ 放行 + 显式 Quit
+//   - destroy 模式 → 销毁渲染进程（替代隐藏）
+//   - 其余 → 隐藏到托盘 + hibernate 模式同步卸载界面
+//
+// 注意：main.go 置 DisableQuitOnLastWindowClosed（destroy 模式销毁唯一窗口后
+// 进程须存活），最后一窗关闭不再自动退进程——所有放行路径（除 recreating/
+// forceQuit 外）必须显式 Quit，否则残留无窗进程。
 func (a *App) interceptClose() bool {
+	if a.recreating.Load() {
+		return false // 程序化销毁（里程碑②），放行
+	}
 	if a.forceQuit.Load() {
-		return false // 真正退出
+		return false // 真正退出（Quit 已由调用方发起）
 	}
 	if !a.trayReady.Load() {
-		// 托盘不可用：隐藏=无任何恢复路径，直接退出。
+		// 托盘不可用：隐藏=无任何恢复路径，退出（放行 + 显式 Quit，
+		// DisableQuitOnLastWindowClosed 下最后一窗关闭不会自动退进程）。
+		a.quitAfterClose()
 		return false
 	}
 	if !a.cfg.CloseToTray() {
-		return false // 用户设置：关闭即退出
+		a.quitAfterClose() // 用户设置：关闭即退出
+		return false
 	}
-	if a.window != nil {
-		a.window.Hide()
+	if a.cfg.HibernateMode() == "destroy" {
+		// 销毁渲染进程替代隐藏：内存释放更彻底，托盘「显示主界面」时重建。
+		a.destroyRenderProcess()
+		return true
+	}
+	if win := a.getWindow(); win != nil {
+		win.Hide()
 	}
 	a.emitHibernate()
 	return true
+}
+
+// quitAfterClose 在窗口关闭完成后退出进程。窗口关闭是异步的（Hook 经 channel
+// 派发），同步调 Quit 会与 WM_CLOSE 收尾重入；起 goroutine 延后 50ms 再 Quit，
+// 此时窗口已销毁。Quit 幂等（多路径重复调用安全）。
+func (a *App) quitAfterClose() {
+	if a.wails == nil {
+		return
+	}
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		a.wails.Quit()
+	}()
 }
 
 // QuitApp 显式退出程序（设置页「退出程序」按钮，不依赖托盘）。
@@ -266,25 +382,35 @@ func (a *App) ClearSavedCredentials() {
 
 // ---------- 窗口控制（自定义标题栏调用） ----------
 
-// WindowMinimize 最小化窗口（设置开启时同步休眠界面）。
+// WindowMinimize 最小化窗口。destroy 模式直接销毁渲染进程（跳过最小化动画，
+// 避免先进任务栏再消失的闪烁）；hibernate 模式同步发 sys:hibernate 卸载界面。
 func (a *App) WindowMinimize() {
-	if a.window != nil {
-		a.window.Minimise()
+	if a.cfg.HibernateMode() == "destroy" {
+		a.destroyRenderProcess()
+		return
+	}
+	if win := a.getWindow(); win != nil {
+		win.Minimise()
 	}
 	a.emitHibernate()
 }
 
 // WindowMaximize 最大化/还原。
 func (a *App) WindowMaximize() {
-	if a.window != nil {
-		a.window.ToggleMaximise()
+	if win := a.getWindow(); win != nil {
+		win.ToggleMaximise()
 	}
 }
 
-// WindowClose 关闭（转隐藏到托盘；设置开启时同步休眠界面）。
+// WindowClose 关闭。destroy 模式销毁渲染进程；否则转隐藏入托盘
+// （v2 语义即直接隐藏，无 closeToTray 校验——OS 级关窗才走 interceptClose 兜底链）。
 func (a *App) WindowClose() {
-	if a.window != nil {
-		a.window.Hide()
+	if a.cfg.HibernateMode() == "destroy" {
+		a.destroyRenderProcess()
+		return
+	}
+	if win := a.getWindow(); win != nil {
+		win.Hide()
 	}
 	a.emitHibernate()
 }

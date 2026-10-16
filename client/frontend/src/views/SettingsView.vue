@@ -18,12 +18,12 @@ const auth = useAuthStore()
 const settings = useSettingsStore()
 const hibernateStore = useHibernateStore()
 const version = ref('dev')
-// 休眠模式三态（旧版「最小化休眠/卸载界面」双开关已合并：重复且卸载开关
-// 依赖休眠开关才生效——用户反馈不生效。off 不休眠 / hibernate 卸载组件 /
-// destroy 整页重载彻底释放内存（实验性））。
-// 选项名标注「暂不生效」：已迁移 Wails v3，但最小化时销毁渲染进程（里程碑②）
-// 尚未实现，最小化路径两种模式都看不到内存下降；选择照常持久化，实现后自动生效。
-const HIB_LABELS = ['不休眠', '休眠界面（暂不生效）', '彻底卸载（暂不生效）'] as const
+// 休眠模式三态（v0.1.2 合并旧版双开关）：
+//   off      不休眠
+//   hibernate 最小化/关窗时卸载界面组件——webview 进程仍在，内存下降有限
+//   destroy  最小化/关窗时销毁渲染进程（里程碑②，Wails v3）——真正释放内存，
+//            唤醒经托盘「显示主界面」自动重建界面，语音等后台不受影响
+const HIB_LABELS = ['不休眠', '休眠界面', '彻底卸载（推荐省内存）'] as const
 const HIB_MODES = ['off', 'hibernate', 'destroy'] as const
 const hibMode = ref<'off' | 'hibernate' | 'destroy'>('off')
 const closeToTray = ref(true)
@@ -180,9 +180,9 @@ async function applyAudio() {
                     @click="setHibernateMode(HIB_MODES[i])">{{ label }}</button>
           </div>
         </div>
-        <!-- 已迁移 Wails v3；最小化销毁渲染进程（里程碑②）实现前，最小化路径
-             两种休眠模式都看不到内存下降——选择照常持久化，实现后自动生效。 -->
-        <p class="s-note">最小化时销毁渲染进程尚未实现，以上两种模式将在后续版本生效</p>
+        <!-- 休眠界面=卸载界面组件（webview 进程保留）；彻底卸载=销毁渲染进程。
+             两种模式都由托盘「显示主界面」唤醒，语音通话等后台不受影响。 -->
+        <p class="s-note">休眠界面保留 webview 进程（内存下降有限）；彻底卸载销毁渲染进程，唤醒时自动重建</p>
         <!-- 关闭窗口时：最小化到托盘（默认）/ 退出程序（问题 4b，用户可选） -->
         <div class="s-row">
           <div class="k">关闭窗口时</div>
