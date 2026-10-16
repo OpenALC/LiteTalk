@@ -58,9 +58,9 @@ func main() {
 	var peerRef atomic.Pointer[rtc.Peer]
 
 	wsCfg := signal.Config{
-		URL:    *server,
-		Token:  "dev-" + *name,
-		Logger: logger,
+		URL:       *server,
+		TokenFunc: func(context.Context) (string, error) { return "dev-" + *name, nil },
+		Logger:    logger,
 	}
 	// （重）连成功 → 重发入房订阅。
 	wsCfg.OnConnect = func(c *signal.Client) {

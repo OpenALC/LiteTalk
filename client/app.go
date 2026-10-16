@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -57,6 +58,13 @@ type App struct {
 
 	api  *state.APIClient
 	sess *state.Session // 登录并连接信令后创建
+
+	// connMu 串行化 connectSession/disconnectSession：双击登录或登录与游客并发
+	// 时，同一时刻只允许一个活跃会话（旧会话在切换时关闭，不再泄漏双管线）。
+	connMu sync.Mutex
+
+	// loginGen 登录代际：登出/新登录 +1，进行中的信令重试循环发现代际变更即退出。
+	loginGen atomic.Uint64
 
 	// statsGen 语音统计 ticker 的代际计数（review S9）：connectSession 覆盖会话时
 	// 旧 ticker 的「sess==nil 退出」窗口极小、极易漏退导致协程叠跑/统计双发——
@@ -150,6 +158,22 @@ func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) 
 	log.Printf("=== LiteTalk %s 启动 (pid=%d) ===", version, os.Getpid())
 	r := a.cfg.Resolve()
 	a.api = state.NewAPIClient(r.BaseURL)
+	// 401 自动刷新重试的令牌来源与回写：refresh_token 存 app 层（区分持久化
+	// 策略——游客落盘 config.json），旋转后的新令牌对经回调回传。
+	a.api.SetRefreshSource(func(ctx context.Context) (string, error) {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return a.refreshTok, nil
+	})
+	a.api.SetOnRefreshed(func(t state.AuthTokens) {
+		a.mu.Lock()
+		a.refreshTok = t.RefreshToken
+		isGuest := a.user.IsGuest
+		a.mu.Unlock()
+		if isGuest && t.RefreshToken != "" { // 游客无密码兜底，旋转后立刻落盘
+			_ = a.cfg.SetGuestRefresh(t.RefreshToken)
+		}
+	})
 	a.setupTray()
 	return nil
 }
@@ -501,7 +525,8 @@ func (a *App) SendEmailCode(email, purpose string) error {
 	return a.api.SendEmailCode(email, purpose)
 }
 
-// Login 邮箱密码登录。成功后连接信令。
+// Login 邮箱密码登录。成功后连接信令（SessionOK 报告信令是否连上，
+// false 时后台带退避重试，期间前端显示「信令连接中」提示条）。
 func (a *App) Login(email, password string) (*state.AuthResult, error) {
 	r, err := a.api.Login(email, password)
 	if err != nil {
@@ -511,9 +536,7 @@ func (a *App) Login(email, password string) (*state.AuthResult, error) {
 	a.refreshTok = r.RefreshToken
 	a.user = r.User
 	a.mu.Unlock()
-	if err := a.connectSession(r.AccessToken, r.User.Nickname); err != nil {
-		log.Printf("connect session: %v", err) // 登录成功但信令暂不可达：UI 可重试
-	}
+	r.SessionOK = a.startSession(r.AccessToken, r.User.Nickname)
 	return r, nil
 }
 
@@ -527,30 +550,48 @@ func (a *App) Register(nickname, email, password, code string) (*state.AuthResul
 	a.refreshTok = r.RefreshToken
 	a.user = r.User
 	a.mu.Unlock()
-	_ = a.connectSession(r.AccessToken, r.User.Nickname)
+	r.SessionOK = a.startSession(r.AccessToken, r.User.Nickname)
 	return r, nil
 }
 
 // LoginAsGuest 游客一键进入（simple 模式）。优先复用记住的游客身份：
-// 已存 refresh_token 先走 /auth/refresh 续期（rotation 写回持久化），
-// 失败/过期再新建游客。游客身份跨启动保持同一账号，避免账号堆积。
+// 已存 refresh_token 先走 /auth/refresh 续期（rotation 立即落盘）。
+// 旧实现 refresh 成功但 Me() 失败会清令牌新建游客——旧身份/好友全丢（S6）；
+// 现在：refresh 响应自带 user 直接用（不带才 Me），令牌先落盘，
+// 只有明确 401 才清令牌，网络错误保留已存令牌下次启动续试。
 func (a *App) LoginAsGuest() (*state.AuthResult, error) {
 	if saved := a.cfg.GetGuestRefresh(); saved != "" {
-		if t, err := a.api.Refresh(saved); err == nil {
-			if u, merr := a.api.Me(); merr == nil {
-				_ = a.cfg.SetGuestRefresh(t.RefreshToken) // 轮换写回（guest 无密码兜底，丢了就变新号）
-				a.mu.Lock()
-				a.refreshTok = t.RefreshToken
-				a.user = *u
-				a.mu.Unlock()
-				_ = a.connectSession(t.AccessToken, u.Nickname)
-				return &state.AuthResult{
-					AccessToken: t.AccessToken, RefreshToken: t.RefreshToken, User: *u,
-				}, nil
+		t, err := a.api.Refresh(saved)
+		if err == nil {
+			_ = a.cfg.SetGuestRefresh(t.RefreshToken) // 轮换立即落盘
+			a.mu.Lock()
+			a.refreshTok = t.RefreshToken
+			a.mu.Unlock()
+			u := t.User
+			if u == nil {
+				if mu, merr := a.api.Me(); merr == nil {
+					u = mu
+				}
 			}
+			if u == nil {
+				// 拿不到 user 但令牌已保：本次登录失败，下次启动续用同一游客。
+				return nil, fmt.Errorf("获取用户信息失败，请重试")
+			}
+			a.mu.Lock()
+			a.user = *u
+			a.mu.Unlock()
+			ok := a.startSession(t.AccessToken, u.Nickname)
+			return &state.AuthResult{
+				AccessToken: t.AccessToken, RefreshToken: t.RefreshToken,
+				User: *u, SessionOK: ok,
+			}, nil
 		}
-		// 已存令牌失效（过期/被吊销/服务端迁移）：清掉走新建。
-		_ = a.cfg.SetGuestRefresh("")
+		var ae *state.APIError
+		if errors.As(err, &ae) && ae.Status == http.StatusUnauthorized {
+			_ = a.cfg.SetGuestRefresh("") // 明确失效（过期/被吊销/服务端迁移）才清
+		} else {
+			return nil, err // 网络错误：保留已存令牌，不覆盖不新建
+		}
 	}
 
 	r, err := a.api.Guest()
@@ -562,7 +603,7 @@ func (a *App) LoginAsGuest() (*state.AuthResult, error) {
 	a.refreshTok = r.RefreshToken
 	a.user = r.User
 	a.mu.Unlock()
-	_ = a.connectSession(r.AccessToken, r.User.Nickname)
+	r.SessionOK = a.startSession(r.AccessToken, r.User.Nickname)
 	return r, nil
 }
 
@@ -573,6 +614,7 @@ func (a *App) ResetPassword(email, code, newPassword string) error {
 
 // Logout 注销：断信令、吊销 refresh。
 func (a *App) Logout() error {
+	a.loginGen.Add(1) // 使进行中的信令重试循环退出
 	a.mu.Lock()
 	rt := a.refreshTok
 	a.refreshTok = ""
@@ -668,9 +710,61 @@ func (a *App) TestSpeaker() error {
 
 // ---------- 语音会话 ----------
 
+// signalFirstWait 首连等待上限：WS 拨号跑在后台 goroutine，connectSession
+// 轮询 SignalConnected 定 session_ok；超时视为信令暂不可达（转后台重试）。
+const signalFirstWait = 5 * time.Second
+
+// startSession 建立信令会话并报告是否连上（session_ok）。未连上时起一个
+// 带退避的后台重试（1s/2s/4s/8s/16s…封顶 5 分钟），直到成功或登出/切换会话
+// （loginGen 代际校验）；每次状态变化发 auth:session{ok} 事件给前端提示条。
+func (a *App) startSession(token, nickname string) bool {
+	a.loginGen.Add(1)
+	gen := a.loginGen.Load()
+	attempt := func() bool {
+		if err := a.connectSession(token, nickname); err != nil {
+			log.Printf("connect session: %v", err)
+			return false
+		}
+		a.emit("auth:session", map[string]any{"ok": true})
+		return true
+	}
+	if attempt() {
+		return true
+	}
+	a.emit("auth:session", map[string]any{"ok": false})
+	go func() {
+		backoff := time.Second
+		for {
+			select {
+			case <-time.After(backoff):
+			}
+			if a.loginGen.Load() != gen {
+				return // 已登出或切换会话
+			}
+			if attempt() {
+				return
+			}
+			backoff *= 2
+			if backoff > 5*time.Minute {
+				backoff = 5 * time.Minute
+			}
+		}
+	}()
+	return false
+}
+
 // connectSession 建立信令会话并把事件接到 Wails Events。
+// connMu 全程串行化：进入时先关闭旧会话（disconnectSessionLocked），
+// 保证同一时刻只有一个活跃会话——并发登录不再泄漏旧会话的双管线。
 func (a *App) connectSession(token, nickname string) error {
-	a.disconnectSession()
+	a.connMu.Lock()
+	defer a.connMu.Unlock()
+	return a.connectSessionLocked(token, nickname)
+}
+
+// connectSessionLocked 前提：已持 connMu。
+func (a *App) connectSessionLocked(token, nickname string) error {
+	a.disconnectSessionLocked()
 	ev := state.Events{
 		OnPeerJoin: func(userID, nickname string, speaking, mute, deafen bool) {
 			a.emit("voice:peer-join", map[string]any{
@@ -688,6 +782,13 @@ func (a *App) connectSession(token, nickname string) error {
 		},
 		OnConnection: func(st string) {
 			a.emit("rtc:connection", st)
+			// 信令连断映射 auth:session：中途断线同样要翻前端提示条。
+			switch st {
+			case "connected":
+				a.emit("auth:session", map[string]any{"ok": true})
+			case "disconnected":
+				a.emit("auth:session", map[string]any{"ok": false})
+			}
 		},
 		OnSelf: func(userID string) {
 			a.emit("voice:self", userID)
@@ -699,12 +800,15 @@ func (a *App) connectSession(token, nickname string) error {
 				"mute": mute != nil && *mute, "deafen": deafen != nil && *deafen,
 			})
 		},
+		// 媒体管线初始化失败（如 Linux 缺 Opus）：音频不可用但信令已连，
+		// 前端 toast 明确提示，JoinChannel 会返回同因错误。
+		OnVoiceUnavailable: func(errMsg string) {
+			a.emit("voice:unavailable", map[string]string{"error": errMsg})
+		},
 	}
 	server := a.cfg.Resolve().WSURL
 	sess := state.NewSession(a.api, token, nickname, ev, log.Default())
-	if err := sess.Connect(server); err != nil {
-		return err
-	}
+	sess.Connect(server) // 音频降级不阻塞：Connect 不再整体失败
 	// 连接即应用持久化的语音设置（码率/VBR/DTX/FEC/丢包率/降噪/增益/VAD 灵敏度）。
 	if err := sess.ApplyAudio(a.runtimeAudio()); err != nil {
 		log.Printf("apply audio settings: %v", err)
@@ -731,9 +835,17 @@ func (a *App) connectSession(token, nickname string) error {
 	a.mu.Lock()
 	a.sess = sess
 	a.mu.Unlock()
-	// 周期推送语音统计（延迟/成员数）。
+	// 首连结果决定本次 session_ok；超时则返回错误交给 startSession 退避重试。
+	deadline := time.Now().Add(signalFirstWait)
+	for !sess.SignalConnected() {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("signal connect timeout (%s)", server)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// 周期推送语音统计（延迟/成员数），仅入房期间发送——未入房无通话数据，
+	// 恒定 0 无意义还白唤醒前端（采集/播放也是入房才启动，见 startMedia）。
 	// 代际校验：connectSession 覆盖旧会话时旧 ticker 立即退出（S9 防叠跑）。
-	// Add 返回新值——先 Add 再 Load 在并发 connect 下会让两个 ticker 拿到同代（review S5）。
 	gen := a.statsGen.Add(1)
 	go func() {
 		tick := time.NewTicker(2 * time.Second)
@@ -748,6 +860,9 @@ func (a *App) connectSession(token, nickname string) error {
 			if s == nil {
 				return
 			}
+			if !s.InRoom() {
+				continue
+			}
 			a.emit("voice:stats", s.Stats())
 		}
 	}()
@@ -756,6 +871,13 @@ func (a *App) connectSession(token, nickname string) error {
 
 // disconnectSession 关闭会话。
 func (a *App) disconnectSession() {
+	a.connMu.Lock()
+	defer a.connMu.Unlock()
+	a.disconnectSessionLocked()
+}
+
+// disconnectSessionLocked 前提：已持 connMu。
+func (a *App) disconnectSessionLocked() {
 	a.statsGen.Add(1) // 旧 ticker 代际失效（S9）
 	a.mu.Lock()
 	s := a.sess
