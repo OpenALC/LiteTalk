@@ -10,13 +10,14 @@ import (
 // friendView 好友条目视图（内联对端用户信息 + 请求数 id + 发起方备注/分组）。
 // Remark/Group 仅当当前用户是关系发起方（user_id 方向）时非空——
 // friendships 行有方向性，被请求方视角返回空串（v0.1.2 迁移 0003）。
+// User 用 PublicUser 视图：不含 email，昵称#tag 可枚举，不能外泄他人邮箱（P1）。
 type friendView struct {
 	ID       int64                  `json:"id"`
 	Status   store.FriendshipStatus `json:"status"`
 	Incoming bool                   `json:"incoming"` // true = 对端发起（我是被请求方）
 	Remark   string                 `json:"remark"`
 	Group    string                 `json:"group"`
-	User     *store.User            `json:"user"`
+	User     *PublicUser            `json:"user"`
 }
 
 // handleListFriends GET /api/v1/friends
@@ -40,7 +41,7 @@ func (s *Server) handleListFriends(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		// 备注/分组是发起方视角的字段：被请求方看到空串。
-		view := friendView{ID: f.ID, Status: f.Status, Incoming: incoming, User: u}
+		view := friendView{ID: f.ID, Status: f.Status, Incoming: incoming, User: publicUser(u)}
 		if !incoming {
 			view.Remark, view.Group = f.Remark, f.GroupName
 		}
@@ -97,7 +98,7 @@ func (s *Server) handleFriendRequest(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, friendView{ID: f.ID, Status: f.Status, Incoming: false, User: target})
+	writeJSON(w, http.StatusCreated, friendView{ID: f.ID, Status: f.Status, Incoming: false, User: publicUser(target)})
 }
 
 // handleFriendAccept POST /api/v1/friends/requests/{id}/accept
@@ -127,7 +128,7 @@ func (s *Server) handleFriendAccept(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	other, _ := s.store.UserByID(r.Context(), f.UserID)
-	writeJSON(w, http.StatusOK, friendView{ID: f.ID, Status: f.Status, Incoming: true, User: other})
+	writeJSON(w, http.StatusOK, friendView{ID: f.ID, Status: f.Status, Incoming: true, User: publicUser(other)})
 }
 
 // handleFriendDelete DELETE /api/v1/friends/{id}
@@ -202,5 +203,5 @@ func (s *Server) handlePatchFriend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	other, _ := s.store.UserByID(r.Context(), f.FriendID)
-	writeJSON(w, http.StatusOK, friendView{ID: f.ID, Status: f.Status, Remark: f.Remark, Group: f.GroupName, User: other})
+	writeJSON(w, http.StatusOK, friendView{ID: f.ID, Status: f.Status, Remark: f.Remark, Group: f.GroupName, User: publicUser(other)})
 }

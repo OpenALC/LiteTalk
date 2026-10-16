@@ -5,6 +5,72 @@ import (
 	"testing"
 )
 
+// assertNoEmail 断言 friendView 的 user 子对象不含 email 键。
+func assertNoEmail(t *testing.T, item map[string]any) {
+	t.Helper()
+	u, ok := item["user"].(map[string]any)
+	if !ok {
+		t.Fatalf("user 字段缺失或类型错误: %+v", item)
+	}
+	if _, leak := u["email"]; leak {
+		t.Fatalf("好友响应泄露 email: %+v", u)
+	}
+	if u["nickname"] == "" || u["tag"] == "" {
+		t.Fatalf("公开视图缺 nickname/tag: %+v", u)
+	}
+}
+
+// TestFriendsResponseNoEmail 好友相关响应一律 PublicUser 视图：对端 email 不外泄（P1）。
+// 昵称#tag 只有 1 万种组合可枚举，带 email 等于公开任意用户邮箱。
+func TestFriendsResponseNoEmail(t *testing.T) {
+	srv, mem := newTestServer(t)
+	h := srv.Handler()
+
+	aTok, _ := registerUser(t, h, mem, "pa@ex.com", "隐私A", "password123")
+	bTok, _ := registerUser(t, h, mem, "pb@ex.com", "隐私B", "password123")
+
+	// A 加 B（请求响应里的 user 是对端）。
+	bu, err := mem.UserByEmail(t.Context(), "pb@ex.com")
+	if err != nil {
+		t.Fatalf("UserByEmail: %v", err)
+	}
+	fr := postJSON(t, h, "/api/v1/friends/requests", aTok,
+		map[string]string{"nickname": fmt.Sprintf("隐私B#%s", bu.Tag)}, 201)
+	assertNoEmail(t, fr)
+
+	fid := int(fr["id"].(float64))
+
+	// B 接受（响应对 A 视角）。
+	acc := postJSON(t, h, fmt.Sprintf("/api/v1/friends/requests/%d/accept", fid), bTok, nil, 200)
+	assertNoEmail(t, acc)
+
+	// 双方列表（对端 user）。
+	for _, tok := range []string{aTok, bTok} {
+		list := getJSON(t, h, "/api/v1/friends", tok, 200).([]any)
+		if len(list) != 1 {
+			t.Fatalf("好友列表应有 1 条，实际 %d", len(list))
+		}
+		assertNoEmail(t, list[0].(map[string]any))
+	}
+
+	// PATCH 备注响应对端也无 email。
+	patched := patchJSON(t, h, fmt.Sprintf("/api/v1/friends/%d", fid), aTok,
+		map[string]string{"remark": "同事"}, 200)
+	assertNoEmail(t, patched)
+}
+
+// TestSelfResponseKeepsEmail 本人 /me 与注册自响应仍带 email（视图只约束「他人」）。
+func TestSelfResponseKeepsEmail(t *testing.T) {
+	srv, mem := newTestServer(t)
+	h := srv.Handler()
+
+	access, _ := registerUser(t, h, mem, "self@ex.com", "本人视图", "password123")
+	me := getJSON(t, h, "/api/v1/users/me", access, 200).(map[string]any)
+	if me["email"] != "self@ex.com" {
+		t.Fatalf("/me 应保留本人 email，实际 %v", me["email"])
+	}
+}
+
 // TestPatchFriendRemark 备注/分组：发起方可改并随列表返回，被请求方 403。
 func TestPatchFriendRemark(t *testing.T) {
 	srv, mem := newTestServer(t)
