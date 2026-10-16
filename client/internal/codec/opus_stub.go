@@ -1,10 +1,10 @@
-//go:build !windows
+//go:build !windows && (!linux || !cgo)
 
-// Package codec 的非 Windows stub。
+// Package codec 的 fallback stub：darwin 等未接入平台，以及关闭 CGO 的
+// Linux 交叉编译（cgo 文件整体被排除，须回落 stub 才能编译通过）。
 //
-// 本阶段 client/third_party 只有 Windows x86_64 预编译 libopus，
-// 其他平台返回 ErrUnsupportedPlatform，保证 Linux/macOS 上
-// go vet / go test / go build 不炸（M4 打包前再补各平台预编译库）。
+// Windows 用仓库内预编译静态库，Linux + CGO 链系统 libopus，
+// 其余组合返回 ErrUnsupportedPlatform，保证 go vet / go test / go build 不炸。
 package codec
 
 import "errors"
