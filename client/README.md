@@ -1,6 +1,6 @@
 # LiteTalk 客户端
 
-Go + Wails v2 桌面端：音频采集/降噪/Opus 编解码、WebRTC 通话、Vue 3 界面。
+Go + Wails v3 桌面端：音频采集/降噪/Opus 编解码、WebRTC 通话、Vue 3 界面。
 
 ## 快捷键
 

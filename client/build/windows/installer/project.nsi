@@ -1,13 +1,16 @@
 ; 轻音 LiteTalk Windows 安装器（自包含 NSIS 脚本，替代 v2 wails CLI 生成的 project.nsi）
 ; 用法（CI）：
-;   makensis -DARG_WAILS_AMD64_BINARY=..\..\bin\LiteTalk.exe project.nsi
+;   makensis -DARG_WAILS_AMD64_BINARY=..\..\bin\LiteTalk.exe -DINFO_PRODUCTVERSION=1.2.3 project.nsi
 ; 产物：..\..\bin\LiteTalk-amd64-installer.exe
 Unicode true
 
 !define INFO_PROJECTNAME    "LiteTalk"
 !define INFO_COMPANYNAME    "OpenALC"
 !define INFO_PRODUCTNAME    "轻音 LiteTalk"
-!define INFO_PRODUCTVERSION "0.1.2"
+; CI 从标签注入（三段纯数字）；本地手动打包未传时回落 0.0.0
+!ifndef INFO_PRODUCTVERSION
+  !define INFO_PRODUCTVERSION "0.0.0"
+!endif
 !define INFO_COPYRIGHT      "(c) OpenALC"
 !define PRODUCT_EXECUTABLE  "LiteTalk.exe"
 

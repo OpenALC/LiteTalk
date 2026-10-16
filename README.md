@@ -69,7 +69,8 @@ cd client && set FRONTEND_DEVSERVER_URL=http://localhost:5173 && go run .
 
 国内开发建议先配镜像：`go env -w GOPROXY=https://goproxy.cn,direct`（前端镜像已内置）。
 
-CI：push 触发 vet/test/build 检查；推送 `v*` 标签自动全平台打包并发布 GitHub Release。
+CI：push / PR 触发检查（gofmt、vet、`test -race`、前端类型检查与单测，Linux + Windows 双平台）；推送 `v*` 标签自动全平台打包并发布 GitHub Release（附 SHA256SUMS，macOS 为实验性非阻塞）。
+开发流程、提交规范与门禁细节见 [CLAUDE.md](CLAUDE.md)。
 
 ## License
 

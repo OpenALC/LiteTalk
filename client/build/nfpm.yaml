@@ -11,7 +11,7 @@ homepage: https://github.com/OpenALC/LiteTalk
 vendor: OpenALC
 description: |
   轻音 LiteTalk 桌面语音联机客户端。
-  基于 Wails v2 构建，运行时依赖 WebKitGTK 与 PortAudio / libopus。
+  基于 Wails v3 构建，运行时依赖 WebKitGTK 4.1 与 libopus。
 contents:
   - src: ./build/bin/LiteTalk
     dst: /usr/bin/litetalk
