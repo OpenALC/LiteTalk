@@ -62,7 +62,8 @@ jobs:
       - name: 安装前端依赖
         working-directory: client/frontend
         run: pnpm install --frozen-lockfile
-      # main.go 中 //go:embed all:frontend/dist 依赖产物，前端构建必须在 go vet 之前
+      # main.go 的 //go:embed all:frontend/dist 依赖产物——免 wails CLI 后
+      # 打包 job 必须显式先构建前端（v2 由 wails build 隐式执行）
       - name: 构建前端
         working-directory: client/frontend
         run: pnpm run build
@@ -134,6 +135,11 @@ jobs:
       - name: 安装前端依赖
         working-directory: client/frontend
         run: pnpm install --frozen-lockfile
+      # main.go 的 //go:embed all:frontend/dist 依赖产物——免 wails CLI 后
+      # 打包 job 必须显式先构建前端（v2 由 wails build 隐式执行）
+      - name: 构建前端
+        working-directory: client/frontend
+        run: pnpm run build
       # windows-latest 不保证 makensis 在 PATH：choco 安装后显式加入 NSIS 目录并验证
       - name: 安装 NSIS
         shell: pwsh
@@ -211,6 +217,11 @@ jobs:
       - name: 安装前端依赖
         working-directory: client/frontend
         run: pnpm install --frozen-lockfile
+      # main.go 的 //go:embed all:frontend/dist 依赖产物——免 wails CLI 后
+      # 打包 job 必须显式先构建前端（v2 由 wails build 隐式执行）
+      - name: 构建前端
+        working-directory: client/frontend
+        run: pnpm run build
       # Wails v3：gtk3 构建标签对应 WebKitGTK 4.1（同 v2 webkit2_41 的 apt 依赖）
       - name: 构建客户端（注入版本号）
         working-directory: client
@@ -270,6 +281,11 @@ jobs:
       - name: 安装前端依赖
         working-directory: client/frontend
         run: pnpm install --frozen-lockfile
+      # main.go 的 //go:embed all:frontend/dist 依赖产物——免 wails CLI 后
+      # 打包 job 必须显式先构建前端（v2 由 wails build 隐式执行）
+      - name: 构建前端
+        working-directory: client/frontend
+        run: pnpm run build
       # Wails v3：gtk3 构建标签对应 WebKitGTK 4.1（ARM runner 同样 apt 依赖）
       - name: 构建客户端（注入版本号）
         working-directory: client
@@ -319,6 +335,11 @@ jobs:
       - name: 安装前端依赖
         working-directory: client/frontend
         run: pnpm install --frozen-lockfile
+      # main.go 的 //go:embed all:frontend/dist 依赖产物——免 wails CLI 后
+      # 打包 job 必须显式先构建前端（v2 由 wails build 隐式执行）
+      - name: 构建前端
+        working-directory: client/frontend
+        run: pnpm run build
       # Wails v3：免 wails CLI——plain go build。
       # 注意：v3 无 .app bundle 打包（原 wails CLI 产物），此处产出裸二进制 zip（该 job 本为非阻塞）。
       - name: 构建客户端（注入版本号）
