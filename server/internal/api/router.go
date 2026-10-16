@@ -22,6 +22,12 @@ const (
 	AuthModeSimple = "simple"
 )
 
+// Hub abstracts signal.Hub for logout/reset-password session kicking.
+// Defined here to avoid an import cycle (signal imports store, api imports signal would cycle via main wiring).
+type Hub interface {
+	Kick(uid, dev, reason string)
+}
+
 // Server API 依赖集合。
 type Server struct {
 	store    store.Store
@@ -34,6 +40,7 @@ type Server struct {
 	log      *log.Logger
 	trusted  []*net.IPNet       // 可信反代（RemoteAddr 命中才采用 X-Real-IP）
 	sess     *auth.SessionIndex // 多设备会话索引（v1.1.0 迁移 0004）
+	hub      Hub                // WS 信令 hub（登出/重置密码踢线；nil=不踢）
 }
 
 // Config 构造配置。
@@ -51,6 +58,8 @@ type Config struct {
 	TrustedProxies []string
 	// Session 多设备会话索引（nil 时跳过 sid 校验，仅供测试/迁移期过渡）。
 	Session *auth.SessionIndex
+	// Hub 信令 hub（登出/重置密码踢线；nil 时仅清会话不踢 WS，测试常用）。
+	Hub Hub
 }
 
 // New 构造 API Server。
@@ -78,6 +87,7 @@ func New(cfg Config) *Server {
 		log:      lg,
 		trusted:  parseTrustedProxies(lg, cfg.TrustedProxies),
 		sess:     cfg.Session,
+		hub:      cfg.Hub,
 	}
 }
 

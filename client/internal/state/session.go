@@ -616,12 +616,14 @@ func (s *Session) Stats() string {
 }
 
 // SendChat 发送文字消息（chat.send，chat.message 由 WS 回落）。
+// type 字段是服务端 chat.send 的必填校验（v1.1.0 §0.12：本期仅 text）。
 func (s *Session) SendChat(channelID, content string) error {
 	if s.ws == nil {
 		return fmt.Errorf("session not connected")
 	}
 	return s.ws.Send(signal.TypeChatSend, map[string]string{
 		"channel_id": channelID,
+		"type":       "text",
 		"content":    content,
 	})
 }

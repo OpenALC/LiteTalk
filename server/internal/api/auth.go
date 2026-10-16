@@ -362,6 +362,10 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if s.sess != nil {
 		_ = s.sess.Delete(r.Context(), uid, "desktop")
 	}
+	// 登出即踢自己的 WS（同 uid+dev 的活动连接）；reason 空→login_elsewhere（契约 §0.11）。
+	if s.hub != nil {
+		s.hub.Kick(strconv.FormatInt(uid, 10), "desktop", "")
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -466,6 +470,10 @@ func (s *Server) handlePasswordReset(w http.ResponseWriter, r *http.Request) {
 	// 删除该用户全部设备会话记录。
 	if s.sess != nil {
 		_ = s.sess.DeleteAll(r.Context(), user.ID)
+	}
+	// 重置密码踢该用户全部设备 WS（契约 §0.11：dev 空=全部）。
+	if s.hub != nil {
+		s.hub.Kick(strconv.FormatInt(user.ID, 10), "", "password_reset")
 	}
 	s.log.Printf("[audit] password reset user=%d ip=%s", user.ID, s.clientIP(r))
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})

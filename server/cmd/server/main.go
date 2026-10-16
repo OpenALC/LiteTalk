@@ -203,6 +203,8 @@ func main() {
 		TrustedProxies: splitList(os.Getenv("LITETALK_TRUSTED_PROXIES")),
 		// 多设备会话索引（v1.1.0 迁移 0004）：REST 中间件/WS 握手比对 sid。
 		Session: sessIndex,
+		// 信令 hub：登出/重置密码踢 WS（api.Hub 接口避免 signal→api 循环）。
+		Hub: hub,
 	})
 
 	mux := http.NewServeMux()
