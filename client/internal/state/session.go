@@ -534,6 +534,7 @@ func (s *Session) RestartDevices(captureID, playbackID string) error {
 // ApplyAudio 把运行时音频设置热应用到媒体管线（通话中可调，未 Connect 时空操作）。
 // Opus 参数经 ResolveOpusConfig 回落默认；逐项应用，返回首个错误（不中断）。
 // v0.1.2 扩展：复杂度/降噪强度/AGC/扬声器总音量（mixer master gain）。
+// v1.1 扩展：前置增益（原子热生效）/输入声道模式（热重启采集流）。
 func (s *Session) ApplyAudio(rs audio.RuntimeSettings) error {
 	if s.pipe == nil {
 		return nil
@@ -548,6 +549,8 @@ func (s *Session) ApplyAudio(rs audio.RuntimeSettings) error {
 		{"dtx", func() error { return s.pipe.SetOpusDTX(*rs.Opus.DTX) }},
 		{"fec", func() error { return s.pipe.SetOpusFEC(*rs.Opus.FEC) }},
 		{"packet_loss", func() error { return s.pipe.SetOpusPacketLoss(rs.Opus.PacketLoss) }},
+		{"pre_gain", func() error { return s.pipe.SetPreGainDB(rs.PreGainDB) }},
+		{"input_mode", func() error { return s.pipe.SetInputMode(rs.InputMode) }},
 	}
 	if rs.Complexity > 0 {
 		steps = append(steps, struct {
