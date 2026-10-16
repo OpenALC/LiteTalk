@@ -469,6 +469,8 @@ func (h *Hub) authorizeChannelJoin(c *client, channelID string) (code, msg strin
 
 // joinRoom 登记成员并向全房间重发 channel.joined（成员全量，§5.3 无 peer_joined 消息，
 // 成员变化以全量下发，客户端做全量替换）。整个登记在一把 hub.mu 内原子完成。
+// 语音单处（§0.10）：同 uid 其他会话在任一语音房 → 先发 session.voice_taken、
+// 清其房间成员与 SFU peer，然后本连接进房。
 func (h *Hub) joinRoom(c *client, channelID string) {
 	// 兜底再校验一次：joinRoom 可能被 channel.join 之外的路径调用，权限不可绕。
 	if code, msg := h.authorizeChannelJoin(c, channelID); code != "" {
@@ -501,11 +503,37 @@ func (h *Hub) joinRoom(c *client, channelID string) {
 		h.sendError(c, ErrCodeRoomFull, "语音房间已满")
 		return
 	}
+	// 语音单处：摘同 uid 其他会话（锁内），通知与 SFU 清理走 pending（锁外）。
+	var voiceTakens []*client
+	for k, o := range h.conns {
+		if o == c || !strings.HasPrefix(string(k), c.userID+"\x00") {
+			continue
+		}
+		if o.roomIDLocked() == "" {
+			continue
+		}
+		voiceTakens = append(voiceTakens, o)
+		if w := h.leaveWorkLocked(o); w != nil {
+			pending = append(pending, *w)
+		}
+	}
+	// 抢占通知先于 channel.joined 下发；SFU 清理在锁外、joined 广播之前完成（§0.10）。
+	for _, o := range voiceTakens {
+		h.sendJSON(o, TypeSessionVoiceTaken, nil)
+	}
+	// 同房抢占会摘掉旧成员——若目标房因此被销毁则重建。
+	room = h.rooms[channelID]
+	if room == nil {
+		room = &roomState{id: channelID, members: make(map[string]*client)}
+		h.rooms[channelID] = room
+	}
 	room.members[c.userID] = c
 	c.setRoomID(channelID)
 	members := room.snapshotLocked()
 	h.mu.Unlock()
 
+	// 锁外：被抢占/自旧房的 SFU 归属清理 + peer_left 广播（peer_left 先于 joined，
+	// 同房抢占时接收方按序应用后成员列表仍含本 uid）。
 	for _, w := range pending {
 		h.finishLeave(w)
 	}

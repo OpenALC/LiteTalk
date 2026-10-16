@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -265,7 +266,7 @@ func TestHubKickDevices(t *testing.T) {
 	}
 }
 
-// ---- T4：握手 sid 比对 ----
+// ---- T4/T5：握手 sid 比对 + 语音单处 ----
 
 // TestWSSessionHandshakeSid WS 握手比对会话 sid（§0.4）：
 // 当前 sid → 放行；异 sid / 旧令牌（空 sid）/ 无会话 → 401 + X-LiteTalk-Auth: session_replaced。
@@ -312,5 +313,42 @@ func TestWSSessionHandshakeSid(t *testing.T) {
 		t.Fatal("无会话记录握手应失败")
 	} else if resp == nil || resp.StatusCode != 401 {
 		t.Fatalf("握手状态码 = %v, want 401", resp)
+	}
+}
+
+// TestVoiceTakenSameAccount 语音单处（§0.10）：desktop 在房，同账号 mobile 进同一语音房
+// → desktop 收 session.voice_taken（连接不断），成员登记转移给 mobile。
+func TestVoiceTakenSameAccount(t *testing.T) {
+	f := newChatFixture(t)
+	chID := strconv.FormatInt(f.vch.ID, 10)
+
+	desk := f.dial("1:desktop:"+strings.Repeat("d", 32), "alice-desk")
+	mob := f.dial("1:mobile:"+strings.Repeat("m", 32), "alice-mob")
+
+	desk.send(TypeChannelJoin, ChannelJoinData{ChannelID: chID})
+	desk.recvUntil(TypeChannelJoined)
+
+	mob.send(TypeChannelJoin, ChannelJoinData{ChannelID: chID})
+	// desktop 先收 voice_taken，且不收 peer_left/joined（已被摘出成员表）。
+	env := desk.recvUntil(TypeSessionVoiceTaken)
+	if env.Type != TypeSessionVoiceTaken {
+		t.Fatalf("期望 session.voice_taken，收到 %q", env.Type)
+	}
+	mob.recvUntil(TypeChannelJoined)
+
+	f.hub.mu.Lock()
+	room := f.hub.rooms[chID]
+	mobC := f.hub.conns[makeConnKey("1", "mobile")]
+	deskC := f.hub.conns[makeConnKey("1", "desktop")]
+	f.hub.mu.Unlock()
+	if room == nil || room.members["1"] != mobC {
+		t.Fatalf("成员登记未转移给 mobile 连接")
+	}
+	if deskC == nil || deskC.roomIDLocked() != "" {
+		t.Fatal("desktop 连接应已退出语音房")
+	}
+	// desktop 连接本身不被踢（voice_taken 不关 WS）。
+	if deskC.conn == nil {
+		t.Fatal("desktop 连接不应被销毁")
 	}
 }
