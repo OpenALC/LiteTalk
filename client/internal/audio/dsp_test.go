@@ -483,3 +483,129 @@ func TestSetVADThresholds(t *testing.T) {
 		t.Fatalf("enter=%.4f exit=%.4f, want ≈0.80/0.50", e, x)
 	}
 }
+
+// TestPreGainApplied 前置增益按 dB 换算生效，且不改动调用方的 in 缓冲。
+func TestPreGainApplied(t *testing.T) {
+	d := newTestDSP(t, func(c *DSPConfig) { c.Denoise = false })
+	if err := d.SetPreGainDB(18); err != nil {
+		t.Fatalf("SetPreGainDB: %v", err)
+	}
+	if got := d.PreGainDB(); got < 17.9 || got > 18.1 {
+		t.Fatalf("PreGainDB() = %.2f, want ≈18", got)
+	}
+
+	in := make([]int16, FrameSize)
+	out := make([]int16, FrameSize)
+	var phase float64
+	var rng uint32 = 3
+	sineNoiseFrame(in, &phase, 1000, 0, &rng)
+	before := make([]int16, FrameSize)
+	copy(before, in)
+	if _, err := d.Process(out, in); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	for i := range in {
+		if in[i] != before[i] {
+			t.Fatalf("Process 改动了调用方的 in 缓冲 @%d", i)
+		}
+	}
+	inRMS, outRMS := rmsInt16(in), rmsInt16(out)
+	want := inRMS * dbToLinear(18)
+	if outRMS < want*0.99 || outRMS > want*1.01 {
+		t.Fatalf("+18dB 前置增益: out RMS %.0f, want ≈%.0f（in %.0f）", outRMS, want, inRMS)
+	}
+}
+
+// TestPreGainRange 构造时越界收敛、运行时 setter 越界报错。
+func TestPreGainRange(t *testing.T) {
+	d := newTestDSP(t, func(c *DSPConfig) { c.PreGainDB = 100 })
+	if got := d.PreGainDB(); got < 23.9 || got > 24.1 {
+		t.Fatalf("构造越界应收敛到 +24dB，得到 %.2f", got)
+	}
+	if err := d.SetPreGainDB(30); err == nil {
+		t.Fatal("SetPreGainDB(30) 应报错")
+	}
+	if err := d.SetPreGainDB(-13); err == nil {
+		t.Fatal("SetPreGainDB(-13) 应报错")
+	}
+	if err := d.SetPreGainDB(-12); err != nil {
+		t.Fatalf("SetPreGainDB(-12) 合法: %v", err)
+	}
+	if got := d.PreGainDB(); got < -12.1 || got > -11.9 {
+		t.Fatalf("PreGainDB() = %.2f, want ≈-12", got)
+	}
+}
+
+// TestPreGainBeforeDenoise 前置增益先于 RNNoise：弱正弦（≈-50dBFS）在默认强度
+// 降噪下稳态被压制到近零；+18dB 前置增益把它抬进降噪器的有效区后输出显著存活。
+// 若增益在 RNNoise 之后，输出只会是「近零 × 7.943」仍然近零——不可能复活信号。
+func TestPreGainBeforeDenoise(t *testing.T) {
+	run := func(preDB float64) float64 {
+		d := newTestDSP(t, nil) // denoise on
+		if err := d.SetPreGainDB(preDB); err != nil {
+			t.Fatal(err)
+		}
+		in := make([]int16, FrameSize)
+		out := make([]int16, FrameSize)
+		var phase float64
+		var rng uint32 = 0x5150
+		var acc float64
+		const frames, warm = 60, 20 // 跳过 RNNoise 2 帧延迟线预热
+		for f := 0; f < frames; f++ {
+			sineNoiseFrame(in, &phase, 300, 0, &rng)
+			if _, err := d.Process(out, in); err != nil {
+				t.Fatal(err)
+			}
+			if f >= warm {
+				acc += rmsInt16(out)
+			}
+		}
+		return acc / (frames - warm)
+	}
+	before, after := run(0), run(18)
+	t.Logf("denoise 前置 +18dB: 弱正弦 out RMS %.1f -> %.1f", before, after)
+	if before >= 5 {
+		t.Fatalf("测试信号未被压制：pre=0 时 out RMS %.1f，区分度不足", before)
+	}
+	if after < 100 {
+		t.Fatalf("+18dB 前置后弱正弦未复活：out RMS %.1f < 100（增益疑似在 RNNoise 之后）", after)
+	}
+}
+
+// TestWeakSignalPreGainPassesGate -40dBFS 弱信号：无前置增益过不了说话门限，
+// +18dB 后（仍在 RNNoise 之前）抬过门限。旁路模式（denoise off）排除 VAD 干扰。
+func TestWeakSignalPreGainPassesGate(t *testing.T) {
+	d := newTestDSP(t, func(c *DSPConfig) { c.Denoise = false })
+
+	in := make([]int16, FrameSize)
+	out := make([]int16, FrameSize)
+	for i := range in {
+		in[i] = 328 // ≈ -40dBFS
+	}
+	const frames = 10
+	for f := 0; f < frames; f++ {
+		if _, err := d.Process(out, in); err != nil {
+			t.Fatal(err)
+		}
+		if d.Speaking() {
+			t.Fatalf("-40dBFS 弱信号不应触发 speaking（帧 %d）", f)
+		}
+	}
+	if err := d.SetPreGainDB(18); err != nil {
+		t.Fatal(err)
+	}
+	activated := -1
+	for f := 0; f < frames; f++ {
+		if _, err := d.Process(out, in); err != nil {
+			t.Fatal(err)
+		}
+		if d.Speaking() {
+			activated = f
+			break
+		}
+	}
+	if activated < 0 {
+		t.Fatalf("+18dB 后 -40dBFS 弱信号仍未触发 speaking（out RMS %.0f）", rmsInt16(out))
+	}
+	t.Logf("+18dB 后于第 %d 帧触发 speaking", activated)
+}

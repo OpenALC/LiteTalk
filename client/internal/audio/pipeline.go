@@ -92,6 +92,7 @@ type RuntimeSettings struct {
 	VADSens         int       // 0–4 五档
 	Complexity      int       // Opus 复杂度 0–10（≤0 表示不改）
 	InputMode       InputMode // 采集下混模式（变更即热重启采集流）
+	PreGainDB       float64   // 前置增益 dB（-12~+24，RNNoise 之前；0=不变）
 }
 
 // DefaultPipelineConfig 返回默认管线配置（声卡回环、降噪开、增益 1）。
@@ -488,8 +489,11 @@ func (p *Pipeline) SetVADSensitivity(level int) { p.dsp.SetVADSensitivity(level)
 // SetDenoiseStrength 运行时切换降噪强度档（v0.1.2；重建 Denoiser 原子替换）。
 func (p *Pipeline) SetDenoiseStrength(level int) error { return p.dsp.SetDenoiseStrength(level) }
 
-// SetAGC 运行时开关自动增益（v0.1.2）。
+// SetAGC 运行时开关自动增益（v1.1 默认开）。
 func (p *Pipeline) SetAGC(on bool) { p.dsp.SetAGC(on) }
+
+// SetPreGainDB 运行时调整前置增益（-12~+24dB，越界报错；原子热生效）。
+func (p *Pipeline) SetPreGainDB(db float64) error { return p.dsp.SetPreGainDB(db) }
 
 // SetComplexity 热调 Opus 复杂度 0–10（v0.1.2；编码中调用安全，内部持锁）。
 func (p *Pipeline) SetComplexity(v int) error {

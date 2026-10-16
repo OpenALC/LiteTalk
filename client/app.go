@@ -1149,6 +1149,7 @@ func (a *App) runtimeAudio() audio.RuntimeSettings {
 		VADSens:         derefInt(as.VADSens, 2),
 		Complexity:      complexity,
 		InputMode:       audio.ParseInputMode(as.InputMode),
+		PreGainDB:       as.PreGainDB,
 	}
 }
 
@@ -1188,6 +1189,9 @@ func (a *App) SetAudioSettings(s config.AudioSettings) error {
 	}
 	if s.InputMode != "" && !config.InputModes[s.InputMode] {
 		return fmt.Errorf("输入声道模式非法: %s", s.InputMode)
+	}
+	if s.PreGainDB < config.PreGainMinDB || s.PreGainDB > config.PreGainMaxDB {
+		return fmt.Errorf("前置增益越界: %.1fdB", s.PreGainDB)
 	}
 	if err := a.cfg.SetAudioSettings(s); err != nil {
 		return err

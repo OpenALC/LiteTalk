@@ -253,6 +253,12 @@ async function applyAudio() {
                     @click="applyDenoiseIdx(i)">{{ label }}</button>
           </div>
         </div>
+        <!-- 前置增益：施加在降噪之前，补偿 -40dBFS 级弱麦；输出音量在下面的「麦克风音量」 -->
+        <div class="s-row">
+          <div class="k">前置增益（弱麦补偿）</div>
+          <input v-model.number="audio.pre_gain_db" type="range" min="-12" max="24" step="1" @change="applyAudio">
+          <span class="v">{{ audio.pre_gain_db }} dB</span>
+        </div>
         <div class="s-row">
           <div class="k">麦克风音量</div>
           <input v-model.number="audio.mic_volume" type="range" min="0" max="120" step="5" @change="applyAudio">

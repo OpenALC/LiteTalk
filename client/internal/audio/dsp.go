@@ -1,6 +1,7 @@
 package audio
 
 import (
+	"fmt"
 	"math"
 	"sync/atomic"
 
@@ -15,10 +16,22 @@ const (
 	OpusFrameSize = 960 // Opus 帧：20ms = 2 个 RNNoise 帧
 )
 
+// 前置增益 dB 值域（0.25×~16×）。越界在 setter 报错、构造时收敛。
+const (
+	preGainMinDB = -12.0
+	preGainMaxDB = 24.0
+)
+
+// dbToLinear dB → 线性倍数（满刻度基准 32767）。
+func dbToLinear(db float64) float64 { return math.Pow(10, db/20) }
+
 // DSPConfig 降噪/增益/说话判定配置。
 type DSPConfig struct {
 	Denoise bool    // 是否启用 RNNoise（关闭时 VAD 不可用，说话判定退化为纯 RMS 门限）
-	Gain    float64 // 线性增益，1.0 为不变
+	Gain    float64 // 线性增益，1.0 为不变（输出音量）
+	// PreGainDB 前置增益 dB（-12~+24 ≈ 0.25×~16×）：施加在 RNNoise 之前，
+	// 弱麦先抬进降噪器/VAD 的有效区；零值 0 = 不变。
+	PreGainDB float64
 
 	// 说话判定：VAD 概率与 RMS 双门限 + 帧数迟滞。
 	// spike 实测纯白噪声 VAD 均值约 0.569 偏高，单靠概率会误触发，必须叠加 RMS 门限。
@@ -56,11 +69,15 @@ type DSP struct {
 	denoiserPtr atomic.Pointer[rnnoise.Denoiser]
 
 	gainBits     atomic.Uint64 // math.Float64bits(Gain)
+	preGainBits  atomic.Uint64 // math.Float64bits(前置线性增益)，热可调
 	denoiseOn    atomic.Bool
 	speaking     atomic.Bool
 	vadEnterBits atomic.Uint64 // math.Float32bits(VADEnter)，热可调
 	vadExitBits  atomic.Uint64 // math.Float32bits(VADExit)，热可调
-	agcOn        atomic.Bool   // 自动增益开关（v0.1.2；默认关）
+	agcOn        atomic.Bool   // 自动增益开关（v1.1 默认开，见 config 层）
+
+	// preBuf 前置增益的预分配 scratch（Process 里 in→preBuf→RNNoise，不改调用方 in）。
+	preBuf [FrameSize]int16
 
 	// 处理 goroutine 私有状态
 	enterRun  int
@@ -100,6 +117,15 @@ func NewDSP(cfg DSPConfig) (*DSP, error) {
 	d := &DSP{cfg: cfg, agcGain: 1.0}
 	d.denoiserPtr.Store(dn)
 	d.gainBits.Store(math.Float64bits(cfg.Gain))
+	// 构造路径越界收敛（运行时 setter 报错）：零值 0dB = 1.0× 无需特殊处理。
+	pre := cfg.PreGainDB
+	if pre < preGainMinDB {
+		pre = preGainMinDB
+	}
+	if pre > preGainMaxDB {
+		pre = preGainMaxDB
+	}
+	d.preGainBits.Store(math.Float64bits(dbToLinear(pre)))
 	d.denoiseOn.Store(cfg.Denoise)
 	d.vadEnterBits.Store(uint64(math.Float32bits(cfg.VADEnter)))
 	d.vadExitBits.Store(uint64(math.Float32bits(cfg.VADExit)))
@@ -117,6 +143,24 @@ func (d *DSP) SetGain(g float64) {
 // Gain 返回当前增益。
 func (d *DSP) Gain() float64 {
 	return math.Float64frombits(d.gainBits.Load())
+}
+
+// SetPreGainDB 运行时调整前置增益（原子，热路径无锁）。范围 -12~+24dB，越界报错。
+func (d *DSP) SetPreGainDB(db float64) error {
+	if db < preGainMinDB || db > preGainMaxDB {
+		return fmt.Errorf("前置增益越界: %.1fdB（允许 %.0f~%+.0f）", db, preGainMinDB, preGainMaxDB)
+	}
+	d.preGainBits.Store(math.Float64bits(dbToLinear(db)))
+	return nil
+}
+
+// PreGainDB 返回当前前置增益 dB（0 = 不变）。
+func (d *DSP) PreGainDB() float64 {
+	g := math.Float64frombits(d.preGainBits.Load())
+	if g <= 0 {
+		return 0
+	}
+	return 20 * math.Log10(g)
 }
 
 // SetDenoise 运行时开关降噪（原子，热路径无锁）。
@@ -222,7 +266,7 @@ func (d *DSP) VADExit() float32 {
 // Speaking 返回当前说话状态。
 func (d *DSP) Speaking() bool { return d.speaking.Load() }
 
-// Process 处理一个 480 采样（10ms）帧：降噪 → AGC → 固定增益 → RMS/VAD 说话判定。
+// Process 处理一个 480 采样（10ms）帧：前置增益 → 降噪 → AGC → 固定增益 → RMS/VAD 说话判定。
 // out 与 in 长度都必须 >= FrameSize 且不得重叠；返回 VAD 概率（降噪关闭时为 0）。
 // 全程在预分配缓冲上操作，零堆分配。
 func (d *DSP) Process(out, in []int16) (float32, error) {
@@ -246,16 +290,24 @@ func (d *DSP) Process(out, in []int16) (float32, error) {
 	}
 	d.silentRun = 0
 
+	// 前置增益（RNNoise 之前）：弱麦先抬进降噪器/VAD 的有效区。写入预分配
+	// scratch（不改调用方的 in）；g==1 时跳过，保持原零拷贝路径。
+	src := in[:FrameSize]
+	if g := math.Float64frombits(d.preGainBits.Load()); g != 1 {
+		applyGainInto(d.preBuf[:FrameSize], in[:FrameSize], g)
+		src = d.preBuf[:FrameSize]
+	}
+
 	var vad float32
 	var err error
 	if d.denoiseOn.Load() {
 		dn := d.denoiserPtr.Load()
-		vad, err = dn.ProcessInt16(out[:FrameSize], in[:FrameSize])
+		vad, err = dn.ProcessInt16(out[:FrameSize], src)
 		if err != nil {
 			return 0, err
 		}
 	} else {
-		copy(out[:FrameSize], in[:FrameSize])
+		copy(out[:FrameSize], src)
 	}
 	// AGC（自动增益）：以 RMS 目标迭代自适应，插在固定增益前（v0.1.2，默认关）。
 	// 仅在疑似语音帧上迭代——静音期保持增益不动，否则安静段会在 ~150ms 内
@@ -344,17 +396,12 @@ func (d *DSP) updateSpeaking(vad float32, rms float64) {
 }
 
 // applyGain 就地施加线性增益并截断到 int16。
-func applyGain(p []int16, g float64) {
-	for i, s := range p {
-		v := float64(s) * g
-		switch {
-		case v > math.MaxInt16:
-			p[i] = math.MaxInt16
-		case v < math.MinInt16:
-			p[i] = math.MinInt16
-		default:
-			p[i] = int16(v)
-		}
+func applyGain(p []int16, g float64) { applyGainInto(p, p, g) }
+
+// applyGainInto src×g → dst（就地安全：允许 dst==src），截断到 int16。
+func applyGainInto(dst, src []int16, g float64) {
+	for i, s := range src {
+		dst[i] = clampInt16(float64(s) * g)
 	}
 }
 

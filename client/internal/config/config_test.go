@@ -66,7 +66,7 @@ func TestAudioSettings(t *testing.T) {
 		BitrateKbps: 48, VBR: &f, DTX: &tr, FEC: &f,
 		PacketLoss: 15, Denoise: &f, DenoiseStrength: 3, AGC: &tr,
 		VADSens: &low, Complexity: 5,
-		MicVolume: 60, PlaybackVolume: 120, InputMode: "right",
+		MicVolume: 60, PlaybackVolume: 120, InputMode: "right", PreGainDB: 6,
 	}
 	if err := m.SetAudioSettings(custom); err != nil {
 		t.Fatalf("SetAudioSettings: %v", err)
@@ -78,20 +78,22 @@ func TestAudioSettings(t *testing.T) {
 	}
 	if got.PacketLoss != 15 || *got.Denoise || got.DenoiseStrength != 3 ||
 		!*got.AGC || *got.VADSens != 0 || got.Complexity != 5 ||
-		got.MicVolume != 60 || got.PlaybackVolume != 120 || got.InputMode != "right" {
+		got.MicVolume != 60 || got.PlaybackVolume != 120 || got.InputMode != "right" ||
+		got.PreGainDB != 6 {
 		t.Fatalf("DSP 设置未持久化: %+v", got)
 	}
 
 	// 读路径收敛：手改 config.json 的越界值回落默认。
 	if err := m.Update(func(c *Config) error {
-		c.Audio = &AudioSettings{BitrateKbps: 999, PacketLoss: 250, Gain: 999, MicVolume: 250, Complexity: 99, InputMode: "bogus"}
+		c.Audio = &AudioSettings{BitrateKbps: 999, PacketLoss: 250, Gain: 999, MicVolume: 250, Complexity: 99, InputMode: "bogus", PreGainDB: 999}
 		return nil
 	}); err != nil {
 		t.Fatalf("注入越界值: %v", err)
 	}
 	got = m.GetAudioSettings()
 	if got.BitrateKbps != 32 || got.PacketLoss != 10 || got.Gain != 10 ||
-		got.MicVolume != 120 || got.Complexity != 9 || got.InputMode != "auto" {
+		got.MicVolume != 120 || got.Complexity != 9 || got.InputMode != "auto" ||
+		got.PreGainDB != PreGainMaxDB {
 		t.Fatalf("越界值未收敛: %+v", got)
 	}
 }
