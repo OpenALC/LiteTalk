@@ -27,8 +27,10 @@ type Handler func(Envelope)
 
 // Config WS 客户端配置。零值字段回落为默认值。
 type Config struct {
-	URL   string // ws(s)://host/ws（不含 query）
-	Token string // 追加为 ?token=...（dev 模式为 dev-<name>）
+	URL string // ws(s)://host/ws（不含 query）
+	// TokenFunc 每次拨号前调用取鉴权令牌（追加为 ?token=...；dev 模式为 dev-<name>）。
+	// 用函数而非静态串：REST 侧刷新令牌后，重连自动带上新令牌。nil = 不带 token。
+	TokenFunc func(ctx context.Context) (string, error)
 
 	PingInterval time.Duration // 心跳周期，默认 30s（服务端 presence TTL 90s）
 	WriteTimeout time.Duration // 单条写超时，默认 10s
@@ -161,7 +163,18 @@ func (c *Client) Run(ctx context.Context) error {
 			return nil
 		}
 		dialCtx, cancel := context.WithTimeout(ctx, c.cfg.DialTimeout)
-		conn, resp, err := websocket.Dial(dialCtx, c.wsURL(), &websocket.DialOptions{})
+		wsURL, terr := c.wsURL(dialCtx)
+		cancel()
+		if terr != nil {
+			c.logf("token fetch failed: %v (retry in %v)", terr, backoff)
+			if werr := c.wait(ctx, backoff); werr != nil {
+				return nil
+			}
+			backoff = nextBackoff(backoff, c.cfg.ReconnectMax)
+			continue
+		}
+		dialCtx, cancel = context.WithTimeout(ctx, c.cfg.DialTimeout)
+		conn, resp, err := websocket.Dial(dialCtx, wsURL, &websocket.DialOptions{})
 		cancel()
 		if err != nil {
 			if isAuthFailure(resp) {
@@ -287,15 +300,23 @@ func (c *Client) wait(ctx context.Context, d time.Duration) error {
 	}
 }
 
-func (c *Client) wsURL() string {
+func (c *Client) wsURL(ctx context.Context) (string, error) {
 	u, err := url.Parse(c.cfg.URL)
 	if err != nil {
-		return c.cfg.URL // Dial 会再报一次错
+		return c.cfg.URL, nil // Dial 会再报一次错
 	}
-	q := u.Query()
-	q.Set("token", c.cfg.Token)
-	u.RawQuery = q.Encode()
-	return u.String()
+	if c.cfg.TokenFunc != nil {
+		tok, err := c.cfg.TokenFunc(ctx)
+		if err != nil {
+			return "", err
+		}
+		if tok != "" {
+			q := u.Query()
+			q.Set("token", tok)
+			u.RawQuery = q.Encode()
+		}
+	}
+	return u.String(), nil
 }
 
 func (c *Client) logf(format string, args ...any) {

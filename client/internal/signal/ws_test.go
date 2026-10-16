@@ -21,6 +21,7 @@ type stubServer struct {
 	mu       sync.Mutex
 	conns    int
 	pings    int
+	tokens   []string    // 每次拨号携带的 token（校验 TokenFunc 每次拨号调用）
 	dropOnce atomic.Bool // 首条连接收到首条业务消息后异常断开（测重连）
 
 	received chan Envelope
@@ -48,6 +49,7 @@ func newStubServer(t *testing.T) *stubServer {
 		}
 		s.mu.Lock()
 		s.conns++
+		s.tokens = append(s.tokens, tok)
 		connIdx := s.conns
 		s.mu.Unlock()
 		defer conn.CloseNow()
@@ -105,10 +107,20 @@ func (s *stubServer) pingCount() int {
 	return s.pings
 }
 
+// lastToken 最近一次拨号携带的 token。
+func (s *stubServer) lastToken() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.tokens) == 0 {
+		return ""
+	}
+	return s.tokens[len(s.tokens)-1]
+}
+
 func testConfig(url, token string) Config {
 	return Config{
 		URL:          url,
-		Token:        token,
+		TokenFunc:    func(context.Context) (string, error) { return token, nil },
 		PingInterval: 50 * time.Millisecond,
 		ReconnectMin: 20 * time.Millisecond,
 		ReconnectMax: 100 * time.Millisecond,
@@ -249,6 +261,48 @@ func TestWSHeartbeat(t *testing.T) {
 	})
 	if !c.Connected() {
 		t.Fatal("should stay connected during heartbeat")
+	}
+}
+
+// TestWSTokenFuncPerDial 校验 TokenFunc 每次拨号都被调用、且取的是当时的最新值
+// （令牌刷新后重连必须带新令牌，否则服务端按旧令牌鉴权永远 401）。
+func TestWSTokenFuncPerDial(t *testing.T) {
+	stub := newStubServer(t)
+	stub.dropOnce.Store(true)
+
+	var tok atomic.Value // string
+	tok.Store("dev-first")
+	var calls atomic.Int32
+	c := NewClient(Config{
+		URL: stub.wsURL(),
+		TokenFunc: func(context.Context) (string, error) {
+			calls.Add(1)
+			return tok.Load().(string), nil
+		},
+		PingInterval: 50 * time.Millisecond,
+		ReconnectMin: 20 * time.Millisecond,
+		ReconnectMax: 100 * time.Millisecond,
+	})
+	defer c.Close()
+
+	var connects atomic.Int32
+	c.cfg.OnConnect = func(*Client) { connects.Add(1) }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+
+	waitFor(t, "first connect", 3*time.Second, func() bool { return connects.Load() >= 1 })
+
+	// 首连后换令牌；发一条业务消息触发桩掐线（dropOnce），强制重连。
+	tok.Store("dev-second")
+	if err := c.Send(TypeChannelJoin, ChannelJoinData{ChannelID: "x"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	waitFor(t, "reconnect with new token", 5*time.Second, func() bool {
+		return stub.connCount() >= 2 && stub.lastToken() == "dev-second"
+	})
+	if n := calls.Load(); n < 2 {
+		t.Fatalf("TokenFunc calls = %d, want >= 2 (one per dial)", n)
 	}
 }
 
