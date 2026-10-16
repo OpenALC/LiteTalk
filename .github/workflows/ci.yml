@@ -43,6 +43,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Wails v3 Linux 构建（含 server 标签下的 cgo 内部包）走 pkg-config：
+      # gtk3 标签对应 gtk+-3.0/webkit2gtk-4.1，与 v2 webkit2_41 同一套 apt 依赖
+      - name: 安装 GTK/WebKitGTK 开发库
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev
       # pnpm 版本由 client/frontend/package.json 的 packageManager 字段决定
       - uses: pnpm/action-setup@v4
         with:
@@ -64,17 +70,15 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: client/go.sum
-      # Wails v3：检查用 server 构建标签（无 GUI 依赖、免 GTK/WebKitGTK），
-      # 编译全集代码；真实 GUI 构建由下方打包 job 在各自原生 runner 完成
       - name: go vet
         working-directory: client
-        run: go vet -tags server ./...
+        run: go vet -tags gtk3 ./...
       - name: go test
         working-directory: client
-        run: go test -tags server ./...
+        run: go test -tags gtk3 ./...
       - name: go build
         working-directory: client
-        run: go build -tags server ./...
+        run: go build -tags gtk3 ./...
 
   # ---------------- 打包发版（仅 v* 标签） ----------------
 
