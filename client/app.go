@@ -76,6 +76,10 @@ type App struct {
 	user       state.UserProfile
 
 	audioCtx *audio.Context // 设备枚举用，惰性创建
+
+	// levelMon 设置页实时电平推送（audio:level，100ms 节流）；仅麦克风测试
+	// 期间活跃。a.mu 保护指针本身，Stop 在锁外等待监视 goroutine 退出。
+	levelMon *audio.LevelMonitor
 }
 
 // NewApp 创建应用实例
@@ -741,6 +745,41 @@ func (a *App) TestMicrophone() (map[string]float64, error) {
 // TestSpeaker 扬声器自检：播放 880Hz 正弦测试音 1.5 秒（阻塞至播完）。
 func (a *App) TestSpeaker() error {
 	return audio.TestPlayback(a.cfg.Get().AudioPlayback, 880, 1500*time.Millisecond)
+}
+
+// StartLevelMonitor 启动设置页实时电平推送（audio:level 事件，100ms 节流）。
+// 仅麦克风测试期间调用（TestMicrophone 启动、结束时 StopLevelMonitor）；
+// 重复调用为无害 no-op。设备/下混模式取持久化配置，与通话链路一致。
+func (a *App) StartLevelMonitor() error {
+	as := a.cfg.GetAudioSettings()
+	selector := a.cfg.Get().AudioCapture
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.levelMon != nil {
+		return nil
+	}
+	mon, err := audio.StartLevelMonitor(selector, audio.ParseInputMode(as.InputMode), func(s audio.LevelSample) {
+		// 监视 goroutine 上回调：只投递事件，不做任何阻塞操作。
+		a.emit("audio:level", map[string]any{
+			"peak": s.PeakDB, "rms": s.RmsDB, "threshold": s.ThresholdDB,
+		})
+	})
+	if err != nil {
+		return err
+	}
+	a.levelMon = mon
+	return nil
+}
+
+// StopLevelMonitor 停止电平推送并释放设备（幂等；锁外等待监视退出，避免死锁）。
+func (a *App) StopLevelMonitor() {
+	a.mu.Lock()
+	mon := a.levelMon
+	a.levelMon = nil
+	a.mu.Unlock()
+	if mon != nil {
+		mon.Stop()
+	}
 }
 
 // ---------- 语音会话 ----------
