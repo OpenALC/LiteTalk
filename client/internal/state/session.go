@@ -33,6 +33,8 @@ type Events struct {
 	OnSelf func(userID string)
 	// OnStateRequest 收到他人发来的闭麦/静音请求（v0.1.2；接收方自行决定执行）。
 	OnStateRequest func(fromID, fromNickname string, mute, deafen *bool)
+	// OnVoiceUnavailable 媒体管线初始化失败（音频不可用但信令照常连接）。
+	OnVoiceUnavailable func(errMsg string)
 }
 
 // VoiceStats 推给 UI 的语音房统计快照。
@@ -67,14 +69,23 @@ type Session struct {
 	remoteMgr *audio.RemoteManager
 	states    *audio.StateTable
 
-	peerRef atomic.Pointer[rtc.Peer]
-	roomID  atomic.Value // string
+	// voiceUnavailable/voiceErr：媒体管线初始化失败（如 Linux 缺 Opus）。
+	// 降级而非整体失败——信令照常连接，JoinChannel 明确报错供前端 toast。
+	voiceUnavailable bool
+	voiceErr         error
 
-	mu       sync.Mutex
-	members  map[string]PeerView
-	selfID   string
-	muted    atomic.Bool
-	deafened atomic.Bool
+	// voiceSend 说话状态发送队列：容量 1 只保留最新值（说话状态高频翻转，
+	// 积压旧状态无意义），由专用 goroutine 消费发送（音频回调禁止直发网络）。
+	voiceSend    chan signal.VoiceStateData
+	mediaStarted atomic.Bool // 采集/播放是否已启动（入房才启动，按需点亮麦克风）
+	peerRef      atomic.Pointer[rtc.Peer]
+	roomID       atomic.Value // string
+	muted        atomic.Bool
+	deafened     atomic.Bool
+
+	mu      sync.Mutex
+	members map[string]PeerView
+	selfID  string
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -86,23 +97,27 @@ func NewSession(api *APIClient, token, nickname string, ev Events, logger *log.L
 		logger = log.Default()
 	}
 	s := &Session{
-		api:     api,
-		log:     logger,
-		ev:      ev,
-		token:   token,
-		name:    nickname,
-		members: make(map[string]PeerView),
+		api:       api,
+		log:       logger,
+		ev:        ev,
+		token:     token,
+		name:      nickname,
+		members:   make(map[string]PeerView),
+		voiceSend: make(chan signal.VoiceStateData, 1),
 	}
 	s.roomID.Store("")
 	return s
 }
 
-// Connect 建立信令连接并启动媒体管线（未入房，等 JoinChannel）。
-func (s *Session) Connect(serverURL string) error {
+// Connect 建立信令连接并装配媒体管线（采集/播放入房才启动，见 startMedia）。
+// 媒体管线初始化失败不再让登录整体失败：置 voiceUnavailable、发
+// OnVoiceUnavailable 事件，信令照常连接（纯文字/好友功能仍可用）。
+func (s *Session) Connect(serverURL string) {
 	wsCfg := signal.Config{
 		URL:    serverURL,
-		Token:  s.token,
 		Logger: s.log,
+		// 闭包取令牌：REST 侧刷新 access token 后，WS 重连自动携带新令牌。
+		TokenFunc: func(context.Context) (string, error) { return s.token, nil },
 	}
 	wsCfg.OnConnect = func(c *signal.Client) {
 		if s.ev.OnConnection != nil {
@@ -120,20 +135,31 @@ func (s *Session) Connect(serverURL string) error {
 		if p := s.peerRef.Swap(nil); p != nil {
 			_ = p.Close()
 		}
-		s.remoteMgr.RemoveAll()
+		if s.remoteMgr != nil {
+			s.remoteMgr.RemoveAll()
+		}
+		s.stopMedia()
 	}
 	s.ws = signal.NewClient(wsCfg)
 	s.registerHandlers()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancel = cancel
+
 	// 媒体管线：采集→降噪→Opus→(OnPacket→RTP)；下行混音→播放环。
+	// 构造失败（如无 Opus 的平台）降级：跳过音频初始化，信令不受影响。
 	pcfg := audio.DefaultPipelineConfig()
 	pcfg.Loopback = false
 	pcfg.DSP.OnSpeakingChange = func(speaking bool) {
-		// DSP 回调在音频 goroutine 上，必须非阻塞。
+		// DSP 回调跑在音频 goroutine 上，必须非阻塞：投递到容量 1 的
+		// voiceSend，由下方专用 goroutine 发送；积压时丢弃旧值只留最新。
 		if s.muted.Load() {
 			speaking = false
 		}
-		_ = s.ws.Send(signal.TypeVoiceState, signal.VoiceStateData{Speaking: signal.Bool(speaking)})
+		select {
+		case s.voiceSend <- signal.VoiceStateData{Speaking: signal.Bool(speaking)}:
+		default:
+		}
 	}
 	pcfg.OnPacket = func(pkt []byte) {
 		if p := s.peerRef.Load(); p != nil {
@@ -142,30 +168,39 @@ func (s *Session) Connect(serverURL string) error {
 	}
 	pipe, err := audio.NewPipeline(pcfg)
 	if err != nil {
-		return fmt.Errorf("pipeline: %w", err)
-	}
-	s.pipe = pipe
-
-	s.mixer = audio.NewMixer(pipe.WritePlayback)
-	s.remoteMgr = audio.NewRemoteManager(s.mixer, s.log)
-	s.states = audio.NewStateTable()
-	s.states.OnChange = func(id string, st audio.PeerVoiceState) {
-		if s.ev.OnPeerSpeaking != nil {
-			s.ev.OnPeerSpeaking(id, st.Speaking, st.Mute, st.Deafen)
+		s.voiceUnavailable = true
+		s.voiceErr = err
+		s.log.Printf("pipeline unavailable: %v (signaling continues)", err)
+		if s.ev.OnVoiceUnavailable != nil {
+			s.ev.OnVoiceUnavailable(err.Error())
+		}
+	} else {
+		s.pipe = pipe
+		s.mixer = audio.NewMixer(pipe.WritePlayback)
+		s.remoteMgr = audio.NewRemoteManager(s.mixer, s.log)
+		s.states = audio.NewStateTable()
+		s.states.OnChange = func(id string, st audio.PeerVoiceState) {
+			if s.ev.OnPeerSpeaking != nil {
+				s.ev.OnPeerSpeaking(id, st.Speaking, st.Mute, st.Deafen)
+			}
 		}
 	}
-	if err := s.mixer.Start(); err != nil {
-		_ = pipe.Close()
-		return fmt.Errorf("mixer: %w", err)
-	}
-	if err := pipe.Start(); err != nil {
-		s.mixer.Stop()
-		_ = pipe.Close()
-		return fmt.Errorf("pipeline start: %w", err)
-	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	s.cancel = cancel
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case st := <-s.voiceSend:
+				if s.ws != nil {
+					_ = s.ws.Send(signal.TypeVoiceState, st)
+				}
+			}
+		}
+	}()
+
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -173,7 +208,42 @@ func (s *Session) Connect(serverURL string) error {
 			s.log.Printf("signal run: %v", err)
 		}
 	}()
-	return nil
+}
+
+// startMedia 启动采集/播放（幂等）。未入房不启动——空闲时也跑
+// 采集+RNNoise+Opus 是白耗 CPU 且 Windows 麦克风指示灯常亮。
+// 启动失败仅记录（重入房可重试），不影响信令与对端下行。
+func (s *Session) startMedia() {
+	if s.voiceUnavailable || s.pipe == nil {
+		return
+	}
+	if !s.mediaStarted.CompareAndSwap(false, true) {
+		return
+	}
+	if err := s.mixer.Start(); err != nil {
+		s.mediaStarted.Store(false)
+		s.log.Printf("mixer start: %v", err)
+		return
+	}
+	if err := s.pipe.Start(); err != nil {
+		s.mixer.Stop()
+		s.mediaStarted.Store(false)
+		s.log.Printf("pipeline start: %v", err)
+	}
+}
+
+// stopMedia 停止采集/播放（幂等）。与 LeaveChannel/断线/Close 的清理路径
+// 合并调用；Start/Stop 成对后可再 Start（重入房）。
+func (s *Session) stopMedia() {
+	if !s.mediaStarted.CompareAndSwap(true, false) {
+		return
+	}
+	if s.mixer != nil {
+		s.mixer.Stop()
+	}
+	if s.pipe != nil {
+		s.pipe.Stop()
+	}
 }
 
 // registerHandlers 挂信令消息处理（对照 calltest 的接线范式）。
@@ -189,6 +259,7 @@ func (s *Session) registerHandlers() {
 		if err := env.Decode(&d); err != nil {
 			return
 		}
+		s.startMedia() // 入房才启动采集/播放
 		s.mu.Lock()
 		s.members = make(map[string]PeerView, len(d.Members))
 		for _, m := range d.Members {
@@ -196,7 +267,7 @@ func (s *Session) registerHandlers() {
 				UserID: m.UserID, Nickname: m.Nickname,
 				Speaking: m.Speaking, Mute: m.Mute, Deafen: m.Deafen,
 			}
-			if m.UserID != d.Self.UserID {
+			if m.UserID != d.Self.UserID && s.states != nil {
 				s.states.Set(m.UserID, audio.PeerVoiceState{Speaking: m.Speaking, Mute: m.Mute, Deafen: m.Deafen})
 			}
 		}
@@ -217,6 +288,14 @@ func (s *Session) registerHandlers() {
 			return
 		}
 		s.setupPeer()
+		// 补发完整语音状态（muted+deafened 现值）：重连/重入房后服务端内存里的
+		// 旧状态可能已丢，peer 又是新建（默认不静音）——不发则「UI 显示已闭麦但声音照传」。
+		if s.ws != nil {
+			_ = s.ws.Send(signal.TypeVoiceState, signal.VoiceStateData{
+				Mute:   signal.Bool(s.muted.Load()),
+				Deafen: signal.Bool(s.deafened.Load()),
+			})
+		}
 	})
 	s.ws.On(signal.TypeRTCOffer, func(env signal.Envelope) {
 		var d signal.SDPData
@@ -271,8 +350,12 @@ func (s *Session) registerHandlers() {
 		if env.Decode(&d) != nil {
 			return
 		}
-		s.remoteMgr.RemovePeer(d.UserID)
-		s.states.Remove(d.UserID)
+		if s.remoteMgr != nil {
+			s.remoteMgr.RemovePeer(d.UserID)
+		}
+		if s.states != nil {
+			s.states.Remove(d.UserID)
+		}
 		s.mu.Lock()
 		delete(s.members, d.UserID)
 		s.mu.Unlock()
@@ -296,6 +379,9 @@ func (s *Session) registerHandlers() {
 func (s *Session) setupPeer() {
 	if old := s.peerRef.Swap(nil); old != nil {
 		_ = old.Close()
+	}
+	if s.remoteMgr == nil { // 音频降级路径不可能走到（JoinChannel 已拦截），防御
+		return
 	}
 	s.remoteMgr.RemoveAll()
 	streamID := s.name
@@ -329,6 +415,9 @@ func (s *Session) setupPeer() {
 		s.log.Printf("new peer: %v", err)
 		return
 	}
+	// 新 peer 默认不静音：必须同步本地静音态，否则重连后出现
+	//「UI 显示已闭麦但声音照传」。deafen 是混音器总线层的口，无 peer 级对应。
+	peer.SetMuted(s.muted.Load())
 	s.peerRef.Store(peer)
 	if err := peer.Offer(); err != nil {
 		s.log.Printf("offer: %v", err)
@@ -340,8 +429,17 @@ func (s *Session) JoinChannel(channelID string) error {
 	if s.ws == nil {
 		return fmt.Errorf("session not connected")
 	}
+	if s.voiceUnavailable {
+		return fmt.Errorf("语音不可用: %w", s.voiceErr)
+	}
 	s.roomID.Store(channelID)
-	return s.ws.Send(signal.TypeChannelJoin, signal.ChannelJoinData{ChannelID: channelID})
+	if err := s.ws.Send(signal.TypeChannelJoin, signal.ChannelJoinData{ChannelID: channelID}); err != nil {
+		// roomID 先存是为断线重连恢复；发送失败必须回滚——否则重连后
+		// OnConnect 重发 join 造成「幽灵入房」。
+		s.roomID.Store("")
+		return fmt.Errorf("join channel: %w", err)
+	}
+	return nil
 }
 
 // LeaveChannel 离开当前语音频道。
@@ -357,8 +455,13 @@ func (s *Session) LeaveChannel() error {
 	if p := s.peerRef.Swap(nil); p != nil {
 		_ = p.Close()
 	}
-	s.remoteMgr.RemoveAll()
-	s.mixer.SetDeafen(false)
+	if s.remoteMgr != nil {
+		s.remoteMgr.RemoveAll()
+	}
+	s.stopMedia()
+	if s.mixer != nil {
+		s.mixer.SetDeafen(false)
+	}
 	return nil
 }
 
@@ -461,7 +564,10 @@ func (s *Session) Members() []PeerView {
 
 // Stats 统计快照（JSON 给 UI）。
 func (s *Session) Stats() string {
-	vs := VoiceStats{PeerIDs: s.remoteMgr.PeerIDs()}
+	vs := VoiceStats{}
+	if s.remoteMgr != nil {
+		vs.PeerIDs = s.remoteMgr.PeerIDs()
+	}
 	if p := s.peerRef.Load(); p != nil {
 		vs.RtpSent = p.Stats.PacketsSent.Load()
 		// 延迟优先取 WebRTC 选中 ICE pair 的真实 RTT（问题：此前恒 0ms——
@@ -585,12 +691,22 @@ func (s *Session) Close() {
 	if s.remoteMgr != nil {
 		s.remoteMgr.RemoveAll()
 	}
+	s.stopMedia()
 	if s.mixer != nil {
 		s.mixer.Stop()
 	}
 	if s.pipe != nil {
 		_ = s.pipe.Close()
 	}
+}
+
+// SignalConnected 报告信令 WS 当前是否有活跃连接（app 层据首次连接结果定 session_ok）。
+func (s *Session) SignalConnected() bool { return s.ws != nil && s.ws.Connected() }
+
+// InRoom 报告当前是否在语音频道（app 层 voice:stats ticker 据它门控发送）。
+func (s *Session) InRoom() bool {
+	room, _ := s.roomID.Load().(string)
+	return room != ""
 }
 
 // iceFromPion / iceToPion 信令线格式 ↔ pion（与 calltest 同款）。
