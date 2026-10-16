@@ -445,6 +445,9 @@ func (s *Session) JoinChannel(channelID string) error {
 // LeaveChannel 离开当前语音频道。
 func (s *Session) LeaveChannel() error {
 	room, _ := s.roomID.Load().(string)
+	// 无论后续发送成败、是否已在房里：采集/播放随离开停止（幂等），
+	// 否则发送失败路径会把媒体留在运行态。
+	s.stopMedia()
 	if room == "" || s.ws == nil {
 		return nil
 	}
@@ -458,7 +461,6 @@ func (s *Session) LeaveChannel() error {
 	if s.remoteMgr != nil {
 		s.remoteMgr.RemoveAll()
 	}
-	s.stopMedia()
 	if s.mixer != nil {
 		s.mixer.SetDeafen(false)
 	}

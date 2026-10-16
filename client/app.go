@@ -721,7 +721,7 @@ func (a *App) startSession(token, nickname string) bool {
 	a.loginGen.Add(1)
 	gen := a.loginGen.Load()
 	attempt := func() bool {
-		if err := a.connectSession(token, nickname); err != nil {
+		if err := a.connectSession(token, nickname, gen); err != nil {
 			log.Printf("connect session: %v", err)
 			return false
 		}
@@ -756,9 +756,14 @@ func (a *App) startSession(token, nickname string) bool {
 // connectSession 建立信令会话并把事件接到 Wails Events。
 // connMu 全程串行化：进入时先关闭旧会话（disconnectSessionLocked），
 // 保证同一时刻只有一个活跃会话——并发登录不再泄漏旧会话的双管线。
-func (a *App) connectSession(token, nickname string) error {
+// gen 为发起方的登录代际：持锁后复查，新登录/登出已发生时放弃本次建立
+// （否则旧令牌的重试可能覆盖新会话）。
+func (a *App) connectSession(token, nickname string, gen uint64) error {
 	a.connMu.Lock()
 	defer a.connMu.Unlock()
+	if a.loginGen.Load() != gen {
+		return fmt.Errorf("session superseded")
+	}
 	return a.connectSessionLocked(token, nickname)
 }
 

@@ -1,11 +1,14 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/OpenALC/LiteTalk/client/internal/config"
+	"github.com/OpenALC/LiteTalk/client/internal/state"
 )
 
 // 验证休眠模式三态（off/hibernate/destroy）的读写、持久化与非法值校验。
@@ -100,5 +103,59 @@ func TestServerConnectionBadURL(t *testing.T) {
 	r := app.TestServerConnection("not-a-url")
 	if r.OK || r.ErrorMsg == "" {
 		t.Fatalf("非法地址应返回失败结果: %+v", r)
+	}
+}
+
+// TestLoginAsGuestNetworkErrorKeepsToken 网络错误（5xx）时不得清除已存游客
+// refresh_token：令牌可能仍有效，下次启动续用同一身份（S6 回归）。
+func TestLoginAsGuestNetworkErrorKeepsToken(t *testing.T) {
+	m := config.NewWithPath(filepath.Join(t.TempDir(), "config.json"))
+	app := newAppWithConfig(m)
+	if err := m.SetGuestRefresh("saved-refresh-token"); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"code":"internal","message":"boom"}`))
+	}))
+	defer srv.Close()
+	app.api = state.NewAPIClient(srv.URL)
+
+	if _, err := app.LoginAsGuest(); err == nil {
+		t.Fatal("服务端 500 时登录应失败")
+	}
+	if got := m.GetGuestRefresh(); got != "saved-refresh-token" {
+		t.Fatalf("网络错误不得清除已存游客令牌，得到 %q", got)
+	}
+}
+
+// TestLoginAsGuest401ClearsToken 明确 401（过期/被吊销）才清令牌并走新建。
+func TestLoginAsGuest401ClearsToken(t *testing.T) {
+	m := config.NewWithPath(filepath.Join(t.TempDir(), "config.json"))
+	app := newAppWithConfig(m)
+	if err := m.SetGuestRefresh("dead-refresh-token"); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/auth/refresh":
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"code":"unauthorized","message":"refresh_token 无效或已吊销"}`))
+		default:
+			// 新建游客也失败：让 LoginAsGuest 在连接信令前返回，避免慢路径。
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"code":"internal","message":"boom"}`))
+		}
+	}))
+	defer srv.Close()
+	app.api = state.NewAPIClient(srv.URL)
+
+	if _, err := app.LoginAsGuest(); err == nil {
+		t.Fatal("refresh 401 + guest 500 时登录应失败")
+	}
+	if got := m.GetGuestRefresh(); got != "" {
+		t.Fatalf("明确 401 应清除已存游客令牌，得到 %q", got)
 	}
 }
