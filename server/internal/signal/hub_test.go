@@ -197,7 +197,7 @@ func TestChatBroadcast(t *testing.T) {
 	a.recvUntil(TypeChannelJoined)
 	b.recvUntil(TypeChannelJoined)
 
-	a.send(TypeChatSend, ChatSendData{ChannelID: chID, Content: "你好 bob"})
+	a.send(TypeChatSend, ChatSendData{ChannelID: chID, Type: "text", Content: "你好 bob"})
 
 	for _, c := range []*wsClient{a, b} {
 		env := c.recvUntil(TypeChatMessage)
@@ -240,7 +240,7 @@ func TestChatBadContent(t *testing.T) {
 
 	over := strings.Repeat("字", 2001)
 	for _, content := range []string{"", over} {
-		a.send(TypeChatSend, ChatSendData{ChannelID: chID, Content: content})
+		a.send(TypeChatSend, ChatSendData{ChannelID: chID, Type: "text", Content: content})
 		env := a.recvUntil(TypeError)
 		var e ErrorData
 		if err := env.Decode(&e); err != nil {
@@ -271,12 +271,12 @@ func TestChatRateLimit(t *testing.T) {
 	a.recvUntil(TypeChannelJoined)
 
 	for i := 0; i < 20; i++ {
-		a.send(TypeChatSend, ChatSendData{ChannelID: chID, Content: "msg"})
+		a.send(TypeChatSend, ChatSendData{ChannelID: chID, Type: "text", Content: "msg"})
 		if env := a.recvUntil(TypeChatMessage); env.Type != TypeChatMessage {
 			t.Fatalf("第 %d 条未广播", i+1)
 		}
 	}
-	a.send(TypeChatSend, ChatSendData{ChannelID: chID, Content: "overflow"})
+	a.send(TypeChatSend, ChatSendData{ChannelID: chID, Type: "text", Content: "overflow"})
 	env := a.recvUntil(TypeError)
 	var e ErrorData
 	if err := env.Decode(&e); err != nil {
@@ -337,7 +337,7 @@ func TestChatForbidden(t *testing.T) {
 	chID := strconv.FormatInt(f.vch.ID, 10)
 
 	eve := f.dial("8", "eve") // 未 join、非成员
-	eve.send(TypeChatSend, ChatSendData{ChannelID: chID, Content: "hi"})
+	eve.send(TypeChatSend, ChatSendData{ChannelID: chID, Type: "text", Content: "hi"})
 	env := eve.recvUntil(TypeError)
 	var e ErrorData
 	if err := env.Decode(&e); err != nil {

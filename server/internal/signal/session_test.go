@@ -352,3 +352,70 @@ func TestVoiceTakenSameAccount(t *testing.T) {
 		t.Fatal("desktop 连接不应被销毁")
 	}
 }
+
+// ---- T6：chat 类型校验与推送范围 ----
+
+// TestChatTypeValidation chat.send 仅接受 type=text（§0.12）。
+func TestChatTypeValidation(t *testing.T) {
+	f := newChatFixture(t)
+	chID := strconv.FormatInt(f.ch.ID, 10)
+
+	a := f.dial("1", "alice")
+	a.recvUntil(TypeHello)
+
+	for _, d := range []ChatSendData{
+		{ChannelID: chID, Content: "缺 type"},          // 缺 type
+		{ChannelID: chID, Type: "file", Content: "x"}, // 非 text
+	} {
+		a.send(TypeChatSend, d)
+		env := a.recvUntil(TypeError)
+		var e ErrorData
+		if err := env.Decode(&e); err != nil {
+			t.Fatalf("decode error: %v", err)
+		}
+		if e.Code != ErrCodeBadMessage {
+			t.Fatalf("code = %q, want %q", e.Code, ErrCodeBadMessage)
+		}
+	}
+
+	a.send(TypeChatSend, ChatSendData{ChannelID: chID, Type: "text", Content: "ok"})
+	if env := a.recvUntil(TypeChatMessage); env.Type != TypeChatMessage {
+		t.Fatalf("type=text 应广播，实际 %q", env.Type)
+	}
+}
+
+// TestChatBroadcastServerWide 广播范围（§0.12）：文字频道消息推送到该服务器
+// 全部在线成员（即便不在语音房）；非服务器成员收不到。
+func TestChatBroadcastServerWide(t *testing.T) {
+	f := newChatFixture(t)
+	chID := strconv.FormatInt(f.ch.ID, 10) // 文本频道；全员不进任何语音房
+
+	a := f.dial("1", "alice")
+	b := f.dial("2", "bob")
+	m := f.dial("9", "mallory")
+	eve := f.dial("8", "eve") // 非该服务器成员
+	for _, c := range []*wsClient{a, b, m, eve} {
+		c.recvUntil(TypeHello)
+	}
+
+	a.send(TypeChatSend, ChatSendData{ChannelID: chID, Type: "text", Content: "全体成员可见"})
+
+	for _, c := range []*wsClient{a, b, m} {
+		env := c.recvUntil(TypeChatMessage)
+		var msg ChatMessageData
+		if err := env.Decode(&msg); err != nil {
+			t.Fatalf("decode chat.message: %v", err)
+		}
+		if msg.Content != "全体成员可见" || msg.ChannelID != chID {
+			t.Fatalf("消息不符: %+v", msg)
+		}
+	}
+
+	// eve（非成员）不应收到任何 chat.message。
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	_, data, err := eve.conn.Read(ctx)
+	if err == nil {
+		t.Fatalf("非成员不应收到广播，实际 %s", data)
+	}
+}

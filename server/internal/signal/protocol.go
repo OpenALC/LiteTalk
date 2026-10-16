@@ -184,8 +184,10 @@ type VoiceStateRequestData struct {
 }
 
 // ChatSendData C→S chat.send：向频道发一条文字消息。
+// Type 为消息种类（§0.12）：本期仅支持 "text"，其他值拒收。
 type ChatSendData struct {
 	ChannelID string `json:"channel_id"`
+	Type      string `json:"type"`
 	Content   string `json:"content"`
 }
 
