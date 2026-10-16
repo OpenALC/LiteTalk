@@ -629,6 +629,27 @@ func (a *App) Logout() error {
 	return nil
 }
 
+// onKicked 被服务端踢下线（同类设备在其他设备登录，契约 §0.5/§0.6）：
+// 停信令退避重试（loginGen+1）→ 断会话 → 清内存 refresh（游客连同落盘
+// 令牌一并作废，否则下次启动会拿它续出一个无人在线的会话）→ 通知前端。
+// 只在被踢路径调用：主动 Logout 不发 auth:kicked，登出不弹「已在其他设备登录」。
+func (a *App) onKicked(reason string) {
+	a.loginGen.Add(1) // 停 startSession 的后台重试循环
+	a.disconnectSession()
+	a.mu.Lock()
+	a.refreshTok = ""
+	isGuest := a.user.IsGuest
+	a.mu.Unlock()
+	if isGuest {
+		_ = a.cfg.SetGuestRefresh("")
+	}
+	if reason == "" {
+		reason = "login_elsewhere"
+	}
+	log.Printf("session kicked: %s", reason)
+	a.emit("auth:kicked", map[string]any{"reason": reason})
+}
+
 // GetMe 当前用户档案。
 func (a *App) GetMe() (*state.UserProfile, error) {
 	a.mu.Lock()
@@ -812,6 +833,11 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 		// 前端 toast 明确提示，JoinChannel 会返回同因错误。
 		OnVoiceUnavailable: func(errMsg string) {
 			a.emit("voice:unavailable", map[string]string{"error": errMsg})
+		},
+		// 被踢（session.kicked / WS 4001）：回调跑在 ws 读循环 goroutine（会话
+		// wg 内），而断开会话要 wg.Wait 这条读循环——同步执行必死锁，故异步。
+		OnKicked: func(reason string) {
+			go a.onKicked(reason)
 		},
 	}
 	server := a.cfg.Resolve().WSURL

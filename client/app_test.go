@@ -159,3 +159,65 @@ func TestLoginAsGuest401ClearsToken(t *testing.T) {
 		t.Fatalf("明确 401 应清除已存游客令牌，得到 %q", got)
 	}
 }
+
+// TestOnKickedClearsSessionAndTokens 游客被踢：停重试代际、断会话、清内存
+// refresh 并作废落盘的游客令牌（契约 §0.5 全链路的 Go 侧清理）。
+func TestOnKickedClearsSessionAndTokens(t *testing.T) {
+	m := config.NewWithPath(filepath.Join(t.TempDir(), "config.json"))
+	app := newAppWithConfig(m)
+	if err := m.SetGuestRefresh("guest-rt"); err != nil {
+		t.Fatal(err)
+	}
+	app.api = state.NewAPIClient("http://127.0.0.1:1")
+	app.mu.Lock()
+	app.refreshTok = "rt"
+	app.user = state.UserProfile{ID: 1, Nickname: "游客-0001", IsGuest: true}
+	app.sess = state.NewSession(app.api, "tok", "n", state.Events{}, nil)
+	app.mu.Unlock()
+
+	genBefore := app.loginGen.Load()
+	app.onKicked("login_elsewhere")
+
+	if got := app.loginGen.Load(); got != genBefore+1 {
+		t.Fatalf("被踢应使 loginGen+1 停掉信令重试循环，得到 %d（前置 %d）", got, genBefore)
+	}
+	app.mu.Lock()
+	rt, sess := app.refreshTok, app.sess
+	app.mu.Unlock()
+	if rt != "" {
+		t.Fatalf("被踢应清空内存 refreshTok，得到 %q", rt)
+	}
+	if sess != nil {
+		t.Fatal("被踢应断开会话（sess 置 nil）")
+	}
+	if got := m.GetGuestRefresh(); got != "" {
+		t.Fatalf("游客被踢应作废落盘令牌，得到 %q", got)
+	}
+}
+
+// TestOnKickedKeepsGuestTokenForAccountUser 账号用户被踢不得动落盘的游客
+// 令牌——那是另一个身份的凭据，与本次会话无关。
+func TestOnKickedKeepsGuestTokenForAccountUser(t *testing.T) {
+	m := config.NewWithPath(filepath.Join(t.TempDir(), "config.json"))
+	app := newAppWithConfig(m)
+	if err := m.SetGuestRefresh("other-guest-rt"); err != nil {
+		t.Fatal(err)
+	}
+	app.api = state.NewAPIClient("http://127.0.0.1:1")
+	app.mu.Lock()
+	app.refreshTok = "rt"
+	app.user = state.UserProfile{ID: 7, Nickname: "alice"}
+	app.mu.Unlock()
+
+	app.onKicked("login_elsewhere")
+
+	if got := m.GetGuestRefresh(); got != "other-guest-rt" {
+		t.Fatalf("账号用户被踢不得清游客令牌，得到 %q", got)
+	}
+	app.mu.Lock()
+	rt := app.refreshTok
+	app.mu.Unlock()
+	if rt != "" {
+		t.Fatalf("被踢应清空内存 refreshTok，得到 %q", rt)
+	}
+}

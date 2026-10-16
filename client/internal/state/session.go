@@ -35,6 +35,10 @@ type Events struct {
 	OnStateRequest func(fromID, fromNickname string, mute, deafen *bool)
 	// OnVoiceUnavailable 媒体管线初始化失败（音频不可用但信令照常连接）。
 	OnVoiceUnavailable func(errMsg string)
+	// OnKicked 被服务端踢下线（session.kicked 消息 / WS 4001：同类设备新登录，
+	// 契约 §0.5）。reason 约定值 login_elsewhere。回调可能跑在 ws 读循环
+	// goroutine（会话 wg 内）：实现侧不得同步 Close 会话，须异步执行。
+	OnKicked func(reason string)
 }
 
 // VoiceStats 推给 UI 的语音房统计快照。
@@ -373,6 +377,27 @@ func (s *Session) registerHandlers() {
 			s.ev.OnStateRequest(d.From.ID, d.From.Nickname, d.Mute, d.Deafen)
 		}
 	})
+	// session.kicked：同类设备在其他设备登录，服务端踢本连接（契约 §0.5）。
+	// 断开与清令牌在 app 层 OnKicked 完成，此处只上报原因。
+	// 字面量对齐契约消息类型；signal/protocol.go 补 TypeSessionKicked 后可换常量。
+	s.ws.On("session.kicked", func(env signal.Envelope) {
+		var d struct {
+			Reason string `json:"reason"`
+		}
+		reason := "login_elsewhere"
+		if env.Decode(&d) == nil && d.Reason != "" {
+			reason = d.Reason
+		}
+		s.handleKicked(reason)
+	})
+}
+
+// handleKicked 上报被踢原因（session.kicked 消息的统一出口，后续 WS 4001
+// 错误映射也走这里）。
+func (s *Session) handleKicked(reason string) {
+	if s.ev.OnKicked != nil {
+		s.ev.OnKicked(reason)
+	}
 }
 
 // setupPeer 建立对 SFU 的单条 PeerConnection（初始 offer 一次，此后只应答）。

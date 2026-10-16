@@ -44,3 +44,19 @@ func TestJoinChannelVoiceUnavailable(t *testing.T) {
 		t.Fatalf("voiceUnavailable 时不应写入 roomID, 得到 %q", got)
 	}
 }
+
+// TestHandleKickedForwardsReason session.kicked 的上报出口：原因原样透传，
+// 未注册回调时静默（Events 零值可安全构造）。
+func TestHandleKickedForwardsReason(t *testing.T) {
+	got := ""
+	s := NewSession(NewAPIClient("http://127.0.0.1:1"), "tok", "n",
+		Events{OnKicked: func(reason string) { got = reason }}, nil)
+	s.handleKicked("login_elsewhere")
+	if got != "login_elsewhere" {
+		t.Fatalf("应原样透传被踢原因, 得到 %q", got)
+	}
+
+	// 零值 Events：无回调不得 panic。
+	quiet := NewSession(NewAPIClient("http://127.0.0.1:1"), "tok", "n", Events{}, nil)
+	quiet.handleKicked("login_elsewhere")
+}
