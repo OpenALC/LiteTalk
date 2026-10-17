@@ -117,10 +117,13 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@v4
-      - name: 安装 GTK/WebKitGTK/libopus 开发库
+      # libx11-dev / libxi-dev 供 client/internal/hotkey/hotkey_linux.go 的 cgo 用
+      # （X11 + XInput2 raw 事件）。只是构建期开发库：libX11.so.6 / libXi.so.6 运行
+      # 时已由 libgtk-3-0 传递依赖，nfpm 的 depends 不用动。
+      - name: 安装 GTK/WebKitGTK/libopus/X11 开发库
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev libopus-dev
+          sudo apt-get install -y pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev libopus-dev libx11-dev libxi-dev
       - uses: actions/download-artifact@v4
         with:
           name: frontend-dist
@@ -277,10 +280,11 @@ jobs:
       ARCH: ${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v4
-      - name: 安装 GTK/WebKitGTK/libopus 开发库
+      # 与 check-client-linux 同一批开发库：打包 job 也编译 hotkey_linux.go 的 cgo
+      - name: 安装 GTK/WebKitGTK/libopus/X11 开发库
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev libopus-dev
+          sudo apt-get install -y pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev libopus-dev libx11-dev libxi-dev
       - uses: actions/download-artifact@v4
         with:
           name: frontend-dist
