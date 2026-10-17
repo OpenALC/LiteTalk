@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 
 	"github.com/OpenALC/LiteTalk/client/internal/audio"
+	"github.com/OpenALC/LiteTalk/client/internal/hotkey"
 	"github.com/OpenALC/LiteTalk/client/internal/rtc"
 	"github.com/OpenALC/LiteTalk/client/internal/signal"
 	"github.com/pion/webrtc/v4"
@@ -90,6 +91,11 @@ type Session struct {
 	roomID       atomic.Value // string
 	muted        atomic.Bool
 	deafened     atomic.Bool
+
+	// sendGate 按键说话发送门（PTT/语音激活/常开）。App 层长期持有的值对象，
+	// 会话重建不换门——用户按住的 PTT 状态不能因为重连丢掉。建管线时转交
+	// Pipeline，之后由 Pipeline 每帧自行 Load。
+	sendGate atomic.Pointer[hotkey.Gate]
 
 	mu      sync.Mutex
 	members map[string]PeerView
@@ -188,6 +194,11 @@ func (s *Session) Connect(serverURL string) {
 		}
 	} else {
 		s.pipe = pipe
+		// 发包门：App 层在 NewSession 之后、Connect 之前注入；此处补到管线上
+		// （SetSendGate 在管线已存在时也会即时生效，两条路径等价）。
+		if g := s.sendGate.Load(); g != nil {
+			pipe.SetSendGate(g)
+		}
 		s.mixer = audio.NewMixer(pipe.WritePlayback)
 		s.remoteMgr = audio.NewRemoteManager(s.mixer, s.log)
 		s.states = audio.NewStateTable()
@@ -527,6 +538,19 @@ func (s *Session) LeaveChannel() error {
 	}
 	return nil
 }
+
+// SetSendGate 注入按键说话发送门（传 nil 清除）。管线已建立时立即生效，
+// 未建立（未 Connect 或音频降级）时先存住，Connect 建管线后自动补上。
+// 跨 goroutine 安全：内部 atomic。
+func (s *Session) SetSendGate(g *hotkey.Gate) {
+	s.sendGate.Store(g)
+	if s.pipe != nil {
+		s.pipe.SetSendGate(g)
+	}
+}
+
+// SendGate 返回当前发送门（未注入为 nil）。
+func (s *Session) SendGate() *hotkey.Gate { return s.sendGate.Load() }
 
 // SetMute 本地静音（停止上行发包 + 隐藏波形）。
 func (s *Session) SetMute(muted bool) {

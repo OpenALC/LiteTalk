@@ -17,6 +17,7 @@ import (
 
 	"github.com/OpenALC/LiteTalk/client/internal/audio"
 	"github.com/OpenALC/LiteTalk/client/internal/config"
+	"github.com/OpenALC/LiteTalk/client/internal/hotkey"
 	"github.com/OpenALC/LiteTalk/client/internal/state"
 	"github.com/OpenALC/LiteTalk/client/internal/tray"
 	"github.com/gen2brain/malgo"
@@ -81,6 +82,20 @@ type App struct {
 	// levelMon 设置页实时电平推送（audio:level，100ms 节流）；仅麦克风测试
 	// 期间活跃。a.mu 保护指针本身，Stop 在锁外等待监视 goroutine 退出。
 	levelMon *audio.LevelMonitor
+
+	// 全局热键（v1.2.0）：hkMgr 持系统钩子，hkGate 是长期存活的值对象——
+	// 都不随会话重建，重连时经 Session.SetSendGate 把同一个 Gate 挂到新管线上，
+	// 用户按住的 PTT 状态与尾包窗不因重连丢失。hkQuit 关闭即退出事件消费
+	// goroutine（hk.Events() 的通道永不关闭，不能 for range）。
+	hkMgr     *hotkey.Manager
+	hkGate    *hotkey.Gate
+	hkQuit    chan struct{}
+	hkQuitOne sync.Once
+
+	// trayMute 托盘「静音」勾选项：前端/热键改静音时同步勾选态（此前只有
+	// 托盘自己的点击会更新，另两条路径改了静音托盘不跟着变）。
+	// setupTray 在 ServiceStartup 里赋值，早于热键 goroutine 启动。
+	trayMute *application.MenuItem
 }
 
 // NewApp 创建应用实例
@@ -180,6 +195,7 @@ func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) 
 		}
 	})
 	a.setupTray()
+	a.startHotkeys()
 	return nil
 }
 
@@ -194,6 +210,7 @@ func (a *App) setupTray() {
 	menu := a.wails.Menu.New()
 	showItem := menu.Add("显示主界面")
 	muteItem := menu.AddCheckbox("静音", false)
+	a.trayMute = muteItem // 热键/前端改静音时同步勾选态（见 syncTrayMute）
 	menu.AddSeparator()
 	quitItem := menu.Add("退出")
 
@@ -906,6 +923,8 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 	}
 	server := a.cfg.Resolve().WSURL
 	sess := state.NewSession(a.api, token, nickname, ev, log.Default())
+	// 按键说话发送门：App 级长期存活的同一个 Gate，重连不换（PTT 按住状态不丢）。
+	sess.SetSendGate(a.hkGate)
 	sess.Connect(server) // 音频降级不阻塞：Connect 不再整体失败
 	// 连接即应用持久化的语音设置（码率/VBR/DTX/FEC/丢包率/降噪/增益/VAD 灵敏度）。
 	if err := sess.ApplyAudio(a.runtimeAudio()); err != nil {
@@ -1016,6 +1035,7 @@ func (a *App) SetMute(muted bool) {
 	if s != nil {
 		s.SetMute(muted)
 	}
+	a.syncTrayMute(muted)
 }
 
 // SetDeafen 耳聋开关。
@@ -1258,6 +1278,154 @@ func (a *App) SetAudioSettings(s config.AudioSettings) error {
 	return nil
 }
 
+// ---------- 全局热键（v1.2.0：PTT / 闭麦 / 静音 / 全关全开） ----------
+
+// startHotkeys 创建全局热键 Manager 与按键说话发送门，按持久化配置启动监听，
+// 并起 goroutine 把输入事件转成动作。ServiceStartup 调用一次。
+//
+// Manager 与 Gate 都是应用级、不随会话重建：重连时 connectSession 经
+// Session.SetSendGate 把同一个 Gate 挂到新管线上。
+func (a *App) startHotkeys() {
+	st := a.cfg.GetHotkeySettings()
+	a.hkGate = &hotkey.Gate{}
+	a.hkGate.SetMode(st.Mode)
+	a.hkMgr = hotkey.New(st)
+	// Enabled=false 时 Start 不装钩子（返回 nil）——默认关闭，用户主动开；
+	// 平台不支持时返回 ErrUnsupportedPlatform。两者都不影响可用性语义，
+	// 见 GetHotkeyAvailability（只看 Available，不看 Start 的返回值）。
+	if err := a.hkMgr.Start(); err != nil {
+		log.Printf("hotkey start: %v", err)
+	}
+	a.emitHotkeyAvailable()
+	a.hkQuit = make(chan struct{})
+	go a.hotkeyLoop()
+}
+
+// stopHotkeys 退出事件消费 goroutine 并卸载钩子。ServiceShutdown 调用，幂等。
+func (a *App) stopHotkeys() {
+	// hkQuit 只关一次：关闭后不能置 nil，否则 hotkeyLoop 的 select 会拿到
+	// nil 通道（永久阻塞）而不是退出信号。
+	a.hkQuitOne.Do(func() {
+		if a.hkQuit != nil {
+			close(a.hkQuit)
+		}
+	})
+	if a.hkMgr != nil {
+		a.hkMgr.Stop()
+	}
+}
+
+// emitHotkeyAvailable 推送一次平台可用性（设置页据此展示降级说明，而非灰掉了事）。
+// reason 仅在不可用时给出原因。
+func (a *App) emitHotkeyAvailable() {
+	if a.hkMgr == nil {
+		return
+	}
+	available := a.hkMgr.Available()
+	reason := ""
+	if !available {
+		reason = hotkey.ErrUnsupportedPlatform.Error()
+	}
+	a.emit("hotkey:available", map[string]any{"available": available, "reason": reason})
+}
+
+// hotkeyLoop 消费热键事件。
+// 不能 for range a.hkMgr.Events()：该通道永不关闭（Stop 之后只是不再有新事件），
+// for range 会把这个 goroutine 永久挂住——必须用自己的退出信号结束循环。
+func (a *App) hotkeyLoop() {
+	for {
+		select {
+		case <-a.hkQuit:
+			return
+		case ev := <-a.hkMgr.Events():
+			a.handleHotkeyEvent(ev)
+		}
+	}
+}
+
+// handleHotkeyEvent 热键动作分发，跑在专用 goroutine 上。跨线程约定与 OnKicked
+// 一致：不碰会话内部状态，只走 Session 的公开方法（内部已原子/加锁），
+// emit 非阻塞可直调。
+func (a *App) handleHotkeyEvent(ev hotkey.Event) {
+	switch ev.Action {
+	case hotkey.ActionPTT:
+		if ev.Pressed {
+			a.hkGate.Press()
+		} else {
+			// 尾包窗：松手后补一小段话音，避免末字被硬切。
+			tail := time.Duration(a.cfg.GetHotkeySettings().TailMS) * time.Millisecond
+			a.hkGate.Release(tail)
+		}
+		// 仅 UI 反馈用（按住高亮），不影响发送门本身。
+		a.emit("hotkey:ptt", map[string]any{"pressed": ev.Pressed})
+	case hotkey.ActionMute:
+		mute, _ := a.voiceMuteState()
+		a.SetMute(!mute)
+	case hotkey.ActionDeafen:
+		_, deafen := a.voiceMuteState()
+		a.SetDeafen(!deafen)
+	case hotkey.ActionDual:
+		// 全关 / 全开：已全关则全开，否则全关（与前端 dual 语义一致）。
+		mute, deafen := a.voiceMuteState()
+		allOff := !(mute && deafen)
+		a.SetMute(allOff)
+		a.SetDeafen(allOff)
+	}
+}
+
+// voiceMuteState 当前闭麦/静音态（无会话时两者皆 false）。
+func (a *App) voiceMuteState() (mute, deafen bool) {
+	a.mu.Lock()
+	s := a.sess
+	a.mu.Unlock()
+	if s == nil {
+		return false, false
+	}
+	return s.Muted(), s.Deafened()
+}
+
+// syncTrayMute 同步托盘「静音」勾选态。托盘点击、前端设置、全局热键三条路径
+// 改静音都必须收口到这里，否则托盘勾选与真实状态会各说各话。
+func (a *App) syncTrayMute(muted bool) {
+	if a.trayMute != nil {
+		a.trayMute.SetChecked(muted)
+	}
+}
+
+// GetHotkeySettings 读取持久化热键设置（设置页初始化用；未配置回落默认值）。
+func (a *App) GetHotkeySettings() hotkey.Settings { return a.cfg.GetHotkeySettings() }
+
+// SetHotkeySettings 持久化并热应用（钩子绑定 + 发送门模式即时生效，不重连会话）。
+// 校验：Sanitize 之后与入参不同即报错，不静默改写用户的输入——否则设置里看到
+// 的绑定其实没生效（读路径对非法绑定是直接清空的）。
+func (a *App) SetHotkeySettings(s hotkey.Settings) error {
+	clean := s.Sanitize()
+	if clean != s {
+		return fmt.Errorf("热键设置含非法值：绑定需为修饰键加主键（如 ctrl+shift+m、mouse4），尾包延迟 0–1000ms")
+	}
+	if err := a.cfg.SetHotkeySettings(clean); err != nil {
+		return err
+	}
+	// 热应用：绑定换了立刻重装钩子，模式换了立刻改发送门（未启动时 SetSettings
+	// 只存值，等 Start 生效）。
+	if a.hkMgr != nil {
+		if err := a.hkMgr.SetSettings(clean); err != nil {
+			return err
+		}
+	}
+	if a.hkGate != nil {
+		a.hkGate.SetMode(clean.Mode)
+	}
+	return nil
+}
+
+// GetHotkeyAvailability 当前平台是否支持全局热键（设置页据此展示降级说明）。
+// 直接问 Manager 的平台能力：Enabled=false 时 Start() 也返回 nil，只有
+// Available() 反映平台支持，不能用 Start 的返回值判断。
+func (a *App) GetHotkeyAvailability() bool {
+	return a.hkMgr != nil && a.hkMgr.Available()
+}
+
 // SendChat 发送文字消息。
 func (a *App) SendChat(channelID, content string) error {
 	a.mu.Lock()
@@ -1285,6 +1453,7 @@ func (a *App) GetVoiceMembers() []state.PeerView {
 // ServiceShutdown v3 服务关闭回调：退出清理。
 func (a *App) ServiceShutdown() error {
 	a.disconnectSession()
+	a.stopHotkeys()
 	a.mu.Lock()
 	if a.audioCtx != nil {
 		_ = a.audioCtx.Close()
