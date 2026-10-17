@@ -1,28 +1,36 @@
 //go:build ignore
 
-// 一次性生成器：产出 client/internal/tray/icon.ico（32x32 品牌蓝声波条，单帧 32bpp BMP+AND）。
+// 一次性生成器：产出 client/internal/tray/icon.ico（32x32 品牌蓝声波条，单帧 32bpp BMP+AND）
+// 与 icon.png（256x256 同图案，Linux/macOS 托盘用——StatusNotifierItem 只认 PNG）。
 // go run gen_icon.go
 package main
 
 import (
 	"image"
+	"image/png"
 	"log"
 	"os"
 )
 
-func main() {
-	const size = 32
-	img := image.NewNRGBA(image.Rect(0, 0, size, size))
+// 品牌蓝 #4FA4F3 声波条：5 根竖条，中间高两边低（坐标以 32x32 为基准按比例缩放）。
+var barColor = [4]uint8{0x4F, 0xA4, 0xF3, 0xFF}
 
-	// 品牌蓝 #4FA4F3 声波条：5 根竖条，中间高两边低。
-	barColor := [4]uint8{0x4F, 0xA4, 0xF3, 0xFF}
-	bars := []struct{ x, h int }{
-		{7, 10}, {12, 18}, {17, 24}, {22, 18}, {27, 10},
+var bars32 = []struct{ x, h int }{
+	{7, 10}, {12, 18}, {17, 24}, {22, 18}, {27, 10},
+}
+
+func drawIcon(size int) *image.NRGBA {
+	img := image.NewNRGBA(image.Rect(0, 0, size, size))
+	bw := size / 24 // 条半宽：32 时 1px（原图案 3px 宽），256 时 10px，等比缩放
+	if bw < 1 {
+		bw = 1
 	}
-	for _, b := range bars {
-		top := (size - b.h) / 2
-		for y := top; y < top+b.h; y++ {
-			for x := b.x - 1; x <= b.x+1; x++ {
+	for _, b := range bars32 {
+		cx := b.x * size / 32
+		h := b.h * size / 32
+		top := (size - h) / 2
+		for y := top; y < top+h; y++ {
+			for x := cx - bw; x <= cx+bw; x++ {
 				i := img.PixOffset(x, y)
 				img.Pix[i+0] = barColor[0]
 				img.Pix[i+1] = barColor[1]
@@ -31,12 +39,25 @@ func main() {
 			}
 		}
 	}
+	return img
+}
 
-	ico := encodeICO(img)
+func main() {
+	ico := encodeICO(drawIcon(32))
 	if err := os.WriteFile("icon.ico", ico, 0o644); err != nil {
 		log.Fatal(err)
 	}
 	log.Printf("icon.ico written: %d bytes", len(ico))
+
+	pngFile, err := os.Create("icon.png")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer pngFile.Close()
+	if err := png.Encode(pngFile, drawIcon(256)); err != nil {
+		log.Fatal(err)
+	}
+	log.Println("icon.png written (256x256)")
 }
 
 // encodeICO 编码单帧 32x32 32bpp BMP+AND ICO（与 tray 包同款逻辑）。

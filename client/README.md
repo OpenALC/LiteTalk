@@ -14,13 +14,13 @@ Go + Wails v3 桌面端：音频采集/降噪/Opus 编解码、WebRTC 通话、V
 
 输入框内不触发快捷键；设置页「快捷键」列表与上表同步。
 
-## 系统托盘（Windows）
+## 系统托盘
 
 - **显示主界面**：唤起窗口（最小化时同时还原）
 - **静音**：勾选态实时同步当前静音状态
 - **退出**：真正退出应用（关闭按钮只隐藏到托盘，不退出）
 
-非 Windows 平台托盘为空实现，其余功能不受影响。
+托盘为 Wails v3 内建 SystemTray：Windows 用 ICO 图标，Linux（StatusNotifierItem）/macOS 用 PNG 图标（见 internal/tray）。
 
 ## 最小化休眠（省内存）
 

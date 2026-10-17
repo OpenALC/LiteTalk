@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -184,9 +185,11 @@ func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) 
 
 // setupTray 配置系统托盘：图标 + 右键菜单（显示主界面 / 静音 / 退出）。
 // 菜单就绪即置 trayReady（v3 托盘由 Run 统一启动，失败会走 fatal 弹窗而非静默）。
+// 图标按平台选格式：Windows 用 ICO，Linux（StatusNotifierItem）/macOS 用 PNG——
+// v3 Linux 托盘 SetIcon 内部 png.Decode 只认 PNG，喂 ICO 会静默失败（托盘无图标）。
 func (a *App) setupTray() {
 	t := a.wails.SystemTray.New()
-	t.SetIcon(tray.Icon).SetTooltip("轻音 LiteTalk")
+	t.SetIcon(tray.IconForRuntime()).SetTooltip("轻音 LiteTalk")
 
 	menu := a.wails.Menu.New()
 	showItem := menu.Add("显示主界面")
@@ -299,6 +302,11 @@ func (a *App) showFromTray() {
 		// 新窗口生命周期开始：复位程序化销毁标志（新窗口的 Hook 同样检查
 		// recreating，不复位会把用户正常关窗误判为销毁而直接退出）。
 		a.recreating.Store(false)
+	}
+	// GTK（Linux）窗口 hide→show 重映射后会丢失 undecorated 状态（重新与合成器
+	// 协商装饰时原生标题栏复活，自定义标题栏变成双标题栏）——托盘唤醒统一重设无边框。
+	if runtime.GOOS == "linux" {
+		win.SetFrameless(true)
 	}
 	win.Show()
 	if win.IsMinimised() {
