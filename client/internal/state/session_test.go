@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -192,6 +193,70 @@ func TestVoiceTakenLeavesRoomLocally(t *testing.T) {
 
 // TestIsLoopbackURL 钉住环回判定：本机联调要收集环回候选，公网必须关闭——
 // 判反了要么连不上本机 SFU，要么把 127.0.0.1 暴露给远端。
+// TestPrefetchICEDecouplesReadLoop 预取缓存与读循环解耦（#13）：cachedICE 纯读
+// 缓存，凭证接口关掉后照样返回；JoinChannel 负责预取（可阻塞的绑定线程）。
+func TestPrefetchICEDecouplesReadLoop(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"iceServers":[{"urls":["stun:s:3478"]}],"expiresAt":1}`))
+	}))
+	s := NewSession(NewAPIClient(srv.URL), "tok", "n", Events{}, nil)
+
+	// JoinChannel 预取：未连接的 ws 让 Send 报错回滚 roomID，但预取已经完成。
+	s.ws = signal.NewClient(signal.Config{URL: "ws://127.0.0.1:1/ws"})
+	defer s.ws.Close()
+	_ = s.JoinChannel("room1")
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("JoinChannel 应预取一次凭证，实际 %d 次", got)
+	}
+
+	// cachedICE 只读缓存：凭证接口下线后仍返回，且不再产生请求。
+	srv.Close()
+	got := s.cachedICE()
+	if len(got) != 1 || got[0].URLs[0] != "stun:s:3478" {
+		t.Fatalf("cachedICE 应返回预取结果，实际 %v", got)
+	}
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("cachedICE 不得触发网络请求，凭证请求累计 %d 次", n)
+	}
+
+	// 从未预取 → 空列表（降级），不 panic。
+	s2 := NewSession(NewAPIClient("http://127.0.0.1:1"), "tok", "n", Events{}, nil)
+	if got2 := s2.cachedICE(); got2 != nil {
+		t.Fatalf("未预取时 cachedICE 应为 nil，实际 %v", got2)
+	}
+}
+
+// TestRTCCredentialsShortTimeout 凭证接口黑洞时按短超时快速失败（#13）：
+// 默认 15s 会把 WS 读循环停摆到撞心跳预算，这里必须数秒内返回错误。
+func TestRTCCredentialsShortTimeout(t *testing.T) {
+	block := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-block // 黑洞：不放行就一直挂着
+	}))
+	defer srv.Close()
+	defer close(block) // 先放行 handler 再关 server，避免 Close 等待悬挂请求
+
+	old := rtCredentialsTimeout
+	rtCredentialsTimeout = 100 * time.Millisecond
+	defer func() { rtCredentialsTimeout = old }()
+
+	s := NewSession(NewAPIClient(srv.URL), "tok", "n", Events{}, nil)
+	start := time.Now()
+	if _, err := s.api.RTCCredentials(); err == nil {
+		t.Fatal("黑洞端点应返回超时错误")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("短超时未生效，耗时 %v", elapsed)
+	}
+	// 超时同样走降级：fetchICEServers 返回空列表。
+	if got := s.fetchICEServers(); got != nil {
+		t.Fatalf("超时应降级空 ICE 列表，实际 %v", got)
+	}
+}
+
 func TestIsLoopbackURL(t *testing.T) {
 	cases := []struct {
 		base string

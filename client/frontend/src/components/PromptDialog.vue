@@ -10,9 +10,12 @@ const props = withDefaults(defineProps<{
   placeholder?: string
   cta?: string
   initial?: string
+  // 输入长度上限按服务端规则传入（分类名/服务器名/分组名 32，频道名 64 等）：
+  // 上限放宽会让人打到 400 才知道超长（#16）。
+  maxlen?: number
   options?: { value: string; label: string }[]
   optionDefault?: string
-}>(), { placeholder: '', cta: '确定', initial: '' })
+}>(), { placeholder: '', cta: '确定', initial: '', maxlen: 64 })
 
 const emit = defineEmits<{
   (e: 'confirm', value: string, option: string): void
@@ -38,7 +41,7 @@ function submit() {
         <button class="pd-close" title="关闭" @click="emit('close')"><X :size="16" /></button>
       </div>
       <input ref="inputEl" v-model="value" class="pd-input" :placeholder="placeholder"
-             maxlength="64" autofocus @keydown.enter.prevent="submit">
+             :maxlength="maxlen" autofocus @keydown.enter.prevent="submit">
       <div v-if="options?.length" class="pd-opts">
         <button v-for="o in options" :key="o.value" type="button"
                 :class="{ on: option === o.value }" @click="option = o.value">

@@ -10,7 +10,7 @@ import {
   MicOff, Settings, Pencil, Trash2, FolderPlus, Folder,
 } from 'lucide-vue-next'
 import { useRouter } from 'vue-router'
-import { useServersStore } from '../stores/data'
+import { useServersStore, catDropIndex } from '../stores/data'
 import { useVoiceStore } from '../stores/voice'
 import { useAuthStore } from '../stores/auth'
 import { useNotifyStore } from '../stores/notify'
@@ -251,13 +251,13 @@ async function onCatRenameConfirm(value: string) {
 const dragCat = ref<string | null>(null)
 const dropIdx = ref<number | null>(null)
 
-// dropPos 把 groups 序号映射到 extraGroups 目标序：落到非分类条目（未分类/
-// 内置自带组）取分类区末尾。
-function dropPos(gi: number): number {
+// dropPos 把 groups 序号映射到 reorderCategory 的插入序：落到非分类条目（未分类/
+// 内置自带组）取分类区末尾；落到分类上 = 插到它之前（.drop-target 顶边线）。
+function dropPos(gi: number, dragId: string): number {
   const list = servers.extraGroups[servers.currentServerId] ?? []
   const g = groups.value[gi]
   const to = g ? list.findIndex((x) => x.id === g.id) : -1
-  return to >= 0 ? to : list.length
+  return catDropIndex(list, dragId, to)
 }
 
 function onCatDragStart(e: DragEvent, id: string) {
@@ -291,7 +291,7 @@ async function onCatDrop(e: DragEvent, gi: number) {
   dropIdx.value = null
   if (!id) return
   try {
-    await servers.reorderCategory(servers.currentServerId, id, dropPos(gi))
+    await servers.reorderCategory(servers.currentServerId, id, dropPos(gi, id))
   } catch (err) {
     notify.fromErr(err, '排序保存失败')
   }
@@ -415,13 +415,15 @@ async function onCatDrop(e: DragEvent, gi: number) {
 
     <PromptDialog v-if="renaming" title="重命名频道" :initial="renaming.initial" cta="保存"
                   @confirm="onRenameConfirm" @close="renaming = null" />
+    <!-- 分类名上限 32（服务端 validCategoryName）：上限放到 64 会打到 400 才报错（#16） -->
     <PromptDialog v-if="catRenaming" title="重命名分类" :initial="catRenaming.initial" cta="保存"
-                  @confirm="onCatRenameConfirm" @close="catRenaming = null" />
+                  :maxlen="32" @confirm="onCatRenameConfirm" @close="catRenaming = null" />
     <PromptDialog v-if="blankPrompt?.mode === 'channel'" title="创建频道"
                   placeholder="频道名称" cta="创建"
                   @confirm="onBlankConfirm" @close="blankPrompt = null" />
     <PromptDialog v-else-if="blankPrompt?.mode === 'category'" title="创建分类"
                   placeholder="分类名称" cta="创建"
+                  :maxlen="32"
                   @confirm="onBlankConfirm" @close="blankPrompt = null" />
   </aside>
 </template>
