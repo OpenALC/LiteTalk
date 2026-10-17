@@ -19,7 +19,7 @@ import (
 // Events 会话 → UI 的事件回调（由 app 层接到 runtime.EventsEmit）。
 type Events struct {
 	// OnPeerJoin 有成员进入房间（含自己首次入房的成员全量推送前的逐个通知）。
-	OnPeerJoin func(userID, nickname string, speaking, mute, deafen bool)
+	OnPeerJoin func(userID, nickname, tag string, speaking, mute, deafen bool)
 	// OnPeerLeave 有成员离开。
 	OnPeerLeave func(userID string)
 	// OnPeerSpeaking 远端说话状态变化。
@@ -59,6 +59,7 @@ type VoiceStats struct {
 type PeerView struct {
 	UserID   string `json:"user_id"`
 	Nickname string `json:"nickname"`
+	Tag      string `json:"tag"` // 昵称#tag 的 tag，好友请求用
 	Speaking bool   `json:"speaking"`
 	Mute     bool   `json:"mute"`
 	Deafen   bool   `json:"deafen"`
@@ -287,7 +288,7 @@ func (s *Session) registerHandlers() {
 		s.members = make(map[string]PeerView, len(d.Members))
 		for _, m := range d.Members {
 			s.members[m.UserID] = PeerView{
-				UserID: m.UserID, Nickname: m.Nickname,
+				UserID: m.UserID, Nickname: m.Nickname, Tag: m.Tag,
 				Speaking: m.Speaking, Mute: m.Mute, Deafen: m.Deafen,
 			}
 			if m.UserID != d.Self.UserID && s.states != nil {
@@ -301,7 +302,7 @@ func (s *Session) registerHandlers() {
 		}
 		if s.ev.OnPeerJoin != nil {
 			for _, m := range d.Members {
-				s.ev.OnPeerJoin(m.UserID, m.Nickname, m.Speaking, m.Mute, m.Deafen)
+				s.ev.OnPeerJoin(m.UserID, m.Nickname, m.Tag, m.Speaking, m.Mute, m.Deafen)
 			}
 		}
 		// 仅在无存活 peer 时建连（他人入房广播不动媒体链路）。
