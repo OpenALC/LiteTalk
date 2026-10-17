@@ -1114,6 +1114,26 @@ func (a *App) DeleteCategory(id int64, withChannels bool) error {
 	return a.api.DeleteCategory(id, withChannels)
 }
 
+// RenameCategory 重命名分类（owner/admin；1–32 字）。
+func (a *App) RenameCategory(id int64, name string) error {
+	return a.api.RenameCategory(id, name)
+}
+
+// UpdateCategory 改分类名/位置（owner/admin）。Wails 绑定不用指针参数：
+// name 为空串表示不改名，position < 0 表示不改位置；position 为目标序（0-based），
+// 服务端移到此位置并重排同服务器其它分类为 0..n-1。
+func (a *App) UpdateCategory(id int64, name string, position int) (*state.CategoryDTO, error) {
+	var n *string
+	if name != "" {
+		n = &name
+	}
+	var p *int
+	if position >= 0 {
+		p = &position
+	}
+	return a.api.UpdateCategory(id, n, p)
+}
+
 // SendFriendRequest 发送好友请求（target 形如 "昵称#1234"）。
 func (a *App) SendFriendRequest(target string) error {
 	return a.api.SendFriendRequest(target)

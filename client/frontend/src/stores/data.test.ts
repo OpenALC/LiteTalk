@@ -6,6 +6,10 @@ import { createPinia, setActivePinia } from 'pinia'
 const mockGoApp = vi.hoisted(() => ({
   ListServers: vi.fn(),
   ListChannels: vi.fn(),
+  RenameCategory: vi.fn(async () => {}),
+  UpdateCategory: vi.fn(async (id: number, name: string, position: number) => ({
+    id, server_id: 0, name: name || `分类${id}`, position: position < 0 ? 0 : position,
+  })),
   GetHomeServer: vi.fn(async () => ''),
   GetIntroHidden: vi.fn(async () => false),
 }))
@@ -13,11 +17,20 @@ vi.mock('../api/bridge', () => ({ goApp: () => mockGoApp }))
 
 import { useServersStore, UNCATEGORIZED } from './data'
 
+// resetMock 每例前清桩：mockReset 连实现一起清，需补回默认实现。
+function resetMock() {
+  mockGoApp.ListServers.mockReset()
+  mockGoApp.ListChannels.mockReset()
+  mockGoApp.RenameCategory.mockReset().mockResolvedValue(undefined)
+  mockGoApp.UpdateCategory.mockReset().mockImplementation(async (id, name, position) => ({
+    id, server_id: 0, name: name || `分类${id}`, position: position < 0 ? 0 : position,
+  }))
+}
+
 describe('频道列表恢复', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
-    mockGoApp.ListServers.mockReset()
-    mockGoApp.ListChannels.mockReset()
+    resetMock()
   })
 
   it('loadRemoteServers 逐服恢复频道与空分类', async () => {
@@ -71,5 +84,83 @@ describe('频道列表恢复', () => {
     const s = useServersStore()
     await expect(s.loadRemoteServers()).resolves.toBeUndefined()
     expect(s.findServer('9')?.channels).toEqual([])
+  })
+})
+
+describe('分类改名与排序', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    resetMock()
+  })
+
+  it('内置示例改名只改本地（含归组频道的 group），不调 REST', async () => {
+    const s = useServersStore()
+    await s.createCategory('design', '本地组')
+    s.findServer('design')!.channels.push({ id: 'c1', name: '房', type: 'voice', group: '本地组' })
+    const cat = s.extraGroups['design'].find((g) => g.name === '本地组')!
+
+    await s.renameCategory('design', cat.id, '改过名')
+
+    expect(s.extraGroups['design'][0].name).toBe('改过名')
+    expect(s.findServer('design')!.channels[0].group).toBe('改过名')
+    expect(mockGoApp.RenameCategory).not.toHaveBeenCalled()
+  })
+
+  it('真实分类改名走 PATCH 并同步频道 group', async () => {
+    mockGoApp.ListServers.mockResolvedValue([
+      { id: 21, name: '服21', owner_id: 1, icon_name: 'music', icon_color: '#4FA4F3' },
+    ])
+    mockGoApp.ListChannels.mockResolvedValue({
+      categories: [{ id: 211, server_id: 21, name: '旧名', position: 0 }],
+      channels: [{ id: 2101, server_id: 21, name: '房', type: 'voice', category_id: 211, position: 0 }],
+    })
+    const s = useServersStore()
+    await s.loadRemoteServers()
+
+    await s.renameCategory('21', '211', '新名')
+
+    expect(mockGoApp.RenameCategory).toHaveBeenCalledWith(211, '新名')
+    expect(s.extraGroups['21'][0].name).toBe('新名')
+    expect(s.findServer('21')!.channels[0].group).toBe('新名')
+  })
+
+  it('本地排序：移到目标序并重排 position，不调 REST', async () => {
+    const s = useServersStore()
+    await s.createCategory('design', '甲')
+    await s.createCategory('design', '乙')
+    await s.createCategory('design', '丙')
+    const ids = s.extraGroups['design'].map((g) => g.id)
+
+    await s.reorderCategory('design', ids[2], 0)
+
+    expect(s.extraGroups['design'].map((g) => g.name)).toEqual(['丙', '甲', '乙'])
+    expect(s.extraGroups['design'].map((g) => g.position)).toEqual([0, 1, 2])
+    expect(mockGoApp.UpdateCategory).not.toHaveBeenCalled()
+  })
+
+  it('真实分类排序乐观更新，失败回滚顺序', async () => {
+    mockGoApp.ListServers.mockResolvedValue([
+      { id: 22, name: '服22', owner_id: 1, icon_name: 'music', icon_color: '#4FA4F3' },
+    ])
+    mockGoApp.ListChannels.mockResolvedValue({
+      categories: [
+        { id: 1, server_id: 22, name: '甲', position: 0 },
+        { id: 2, server_id: 22, name: '乙', position: 1 },
+        { id: 3, server_id: 22, name: '丙', position: 2 },
+      ],
+      channels: [],
+    })
+    const s = useServersStore()
+    await s.loadRemoteServers()
+
+    mockGoApp.UpdateCategory.mockRejectedValue(new Error('500'))
+    await expect(s.reorderCategory('22', '3', 0)).rejects.toThrow('500')
+    expect(s.extraGroups['22'].map((g) => g.name)).toEqual(['甲', '乙', '丙'])
+
+    mockGoApp.UpdateCategory.mockResolvedValue({ id: 3, server_id: 22, name: '丙', position: 0 })
+    await s.reorderCategory('22', '3', 0)
+    expect(mockGoApp.UpdateCategory).toHaveBeenCalledWith(3, '', 0)
+    expect(s.extraGroups['22'].map((g) => g.name)).toEqual(['丙', '甲', '乙'])
+    expect(s.groupsOf('22', []).map((g) => g.name)).toEqual(['丙', '甲', '乙'])
   })
 })
