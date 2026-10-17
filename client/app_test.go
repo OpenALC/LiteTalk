@@ -453,3 +453,24 @@ func TestSetServerConfigEnvOverride(t *testing.T) {
 		t.Fatalf("env 覆盖下 API 基址不应变化：%s（期望 %s）", got, envSrv.URL)
 	}
 }
+
+// TestIsWaylandEnv 钉住 Wayland 会话判定：重建窗口时坐标定位必须禁用的条件。
+// 判定错了会在 Wayland 上把窗口定位丢掉或在 X11 上失去位置记忆。
+func TestIsWaylandEnv(t *testing.T) {
+	cases := []struct {
+		goos, wayland, x11 string
+		want               bool
+	}{
+		{"linux", "wayland-0", ":0", true},  // XWayland：仍是 Wayland 会话
+		{"linux", "wayland-0", "", true},    // 纯 Wayland
+		{"linux", "", "", true},             // 无 DISPLAY 也无 WAYLAND_DISPLAY：按 Wayland 处理（协议无定位）
+		{"linux", "", ":0", false},          // 纯 X11
+		{"windows", "wayland-0", "", false}, // 非 Linux 恒 false
+		{"darwin", "", "", false},
+	}
+	for _, c := range cases {
+		if got := isWaylandEnv(c.goos, c.wayland, c.x11); got != c.want {
+			t.Errorf("isWaylandEnv(%q,%q,%q) = %v，期望 %v", c.goos, c.wayland, c.x11, got, c.want)
+		}
+	}
+}

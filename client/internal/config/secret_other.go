@@ -15,3 +15,13 @@ func protectString(string) (string, error) {
 func unprotectString(string) (string, error) {
 	return "", errors.New("unsupported platform")
 }
+
+// guestTokenGet 其余平台无机密存储：恒视为未记住（每次新建游客）。
+func guestTokenGet(string) string { return "" }
+
+// guestTokenPut 其余平台不保存游客令牌（protectString 恒失败 = 绝不明文落盘），
+// 返回 "" 走清空语义。
+func guestTokenPut(string) string { return "" }
+
+// secretMode 其余平台无加密后端，按文件弱保护口径上报（不存 = 提示无意义但契约取值固定）。
+func secretMode() string { return SecretModeFile }

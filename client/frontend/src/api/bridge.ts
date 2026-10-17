@@ -22,6 +22,8 @@ type GoApp = {
   GetSavedCredentials(): Promise<SavedCredentials>
   SetSavedCredentials(email: string, password: string): Promise<void>
   ClearSavedCredentials(): Promise<void>
+  // 机密存储模式：keyring / file / dpapi。Linux 回落 file 时 UI 需明示提示。
+  SecretStorageMode(): Promise<string>
   SendEmailCode(email: string, purpose: string): Promise<void>
   Login(email: string, password: string): Promise<AuthResult>
   LoginAsGuest(): Promise<AuthResult>
@@ -112,6 +114,7 @@ const mockApp: GoApp = {
   async GetSavedCredentials() { return { email: '', password: '', saved: false } },
   async SetSavedCredentials() {},
   async ClearSavedCredentials() {},
+  async SecretStorageMode() { return 'keyring' },
   async GetServerConfig() {
     return { base_url: 'http://127.0.0.1:8077', ws_url: 'ws://127.0.0.1:8077/ws', source: 'default' as const }
   },

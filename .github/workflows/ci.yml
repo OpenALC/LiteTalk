@@ -280,10 +280,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # 与 check-client-linux 同一批开发库：打包 job 也编译 hotkey_linux.go 的 cgo
+      # desktop-file-utils 供 litetalk.desktop 静态校验（issue #6）
       - name: 安装 GTK/WebKitGTK/libopus/X11 开发库
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev libopus-dev libx11-dev libxi-dev
+          sudo apt-get install -y pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev libopus-dev libx11-dev libxi-dev desktop-file-utils
+      - name: desktop-file-validate（.desktop 静态校验）
+        working-directory: client
+        run: desktop-file-validate build/linux/litetalk.desktop
       - uses: actions/download-artifact@v4
         with:
           name: frontend-dist
@@ -300,6 +304,23 @@ jobs:
           go build -tags gtk3,production -trimpath \
             -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
             -o build/bin/LiteTalk .
+      # glibc 符号版本检查（issue #9）：构建基线 ubuntu-24.04 = glibc 2.39。
+      # 产物引用的最高符号版本不得更高，否则静默抬高最低发行版要求。
+      - name: glibc 符号版本检查（不得超过 GLIBC_2.39）
+        working-directory: client
+        run: |
+          set -o pipefail
+          objdump -T build/bin/LiteTalk | grep -o 'GLIBC_[0-9.]*' | sort -uV | tee glibc-syms.txt
+          max=$(tail -1 glibc-syms.txt)
+          if [ -z "$max" ]; then
+            echo "::error::objdump 未发现任何 glibc 符号——二进制或工具链异常"
+            exit 1
+          fi
+          if [ "$(printf '%s\n%s\n' "$max" 'GLIBC_2.39' | sort -V | tail -1)" != "GLIBC_2.39" ]; then
+            echo "::error::产物引用了 $max，超过构建基线 GLIBC_2.39"
+            exit 1
+          fi
+          echo "glibc 检查通过（最高 $max）"
       - name: 绿色版 tar.gz
         working-directory: client
         run: |

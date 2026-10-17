@@ -115,6 +115,12 @@ onMounted(async () => {
   version.value = await goApp().GetVersion()
   hibMode.value = (await goApp().GetHibernateMode()) as typeof hibMode.value
   closeToTray.value = await goApp().GetCloseToTray()
+  // 机密存储模式：先订阅（ServiceStartup 已推过也能兜到后续变化），再补拉当前值。
+  cancelSecret = eventsOn('sys:secret', (d) => {
+    const p = d as { mode?: string } | null
+    if (typeof p?.mode === 'string') secretMode.value = p.mode
+  })
+  secretMode.value = await goApp().SecretStorageMode().catch(() => '')
   audio.value = await goApp().GetAudioSettings()
   // omitempty 字段（0/空值不序列化）在 UI 侧补默认，避免滑杆/下拉空值。
   audio.value.input_mode ??= 'auto'
@@ -206,6 +212,8 @@ onUnmounted(() => {
   stopRecord()
   cancelHkAvail?.()
   cancelHkAvail = null
+  cancelSecret?.()
+  cancelSecret = null
   void levelBridge().StopLevelMonitor?.().catch(() => {})
 })
 
@@ -248,6 +256,12 @@ const hkConflicts = computed(() => findHotkeyConflicts(hk.value))
 // 抵消。运行时无法可靠去重，只能提示用户改绑。
 const hkInAppClashes = computed(() => findInAppClashes(hk.value))
 let cancelHkAvail: (() => void) | null = null
+
+// 机密存储模式（keyring / file / dpapi）：Linux 无密钥环时令牌落明文文件，
+// 必须明示提示（issue #8，不静默降级）。sys:secret 在 ServiceStartup 推一次，
+// 本页挂载多半晚于它 → 主动调 SecretStorageMode 补拉，事件仅兜底。
+const secretMode = ref('')
+let cancelSecret: (() => void) | null = null
 
 function setHkMode(i: number) {
   hk.value.mode = (i >= 0 && i <= 2 ? i : 0) as HotkeySettings['mode']
@@ -371,6 +385,10 @@ function bindRecording(spec: string) {
             <LogOut :size="14" class="btn-icon" />退出登录
           </button>
         </div>
+        <!-- Linux 无密钥环时游客令牌回落明文文件（issue #8）：明示降级，不静默 -->
+        <p v-if="secretMode === 'file'" class="s-note s-warn">
+          <CircleAlert :size="13" />令牌以明文文件存储，建议在有密钥环的桌面使用
+        </p>
       </section>
 
       <section class="s-sec">

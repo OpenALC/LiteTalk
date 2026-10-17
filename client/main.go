@@ -68,8 +68,8 @@ func main() {
 		Title:            "轻音 LiteTalk",
 		Width:            1080,
 		Height:           680,
-		MinWidth:         1080,
-		MinHeight:        680,
+		MinWidth:         960,
+		MinHeight:        600,
 		Frameless:        true, // 无边框窗口 + 前端自定义标题栏（--wails-draggable 拖拽）
 		BackgroundColour: application.NewRGB(255, 255, 255),
 	})

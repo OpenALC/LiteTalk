@@ -38,6 +38,12 @@
 
 登录界面支持注册 / 找回密码；私域部署可开 simple 模式免验证码（见下）。
 
+### 最低支持发行版
+
+Linux 产物以 **Ubuntu 24.04**（glibc 2.39）为构建基线，CI 校验产物不引用更高版本的 glibc 符号；
+运行环境需提供 WebKitGTK 4.1 与 libopus（deb/rpm 已声明依赖）。中文界面依赖系统 CJK 字体，
+最小化安装建议补装 `fonts-noto-cjk`，否则界面文字可能显示为方框。
+
 ### 服务端
 
 见 **[server/deploy/README.md](server/deploy/README.md)**：端口、MySQL/Redis/coturn/Nginx/systemd
