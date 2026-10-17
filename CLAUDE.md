@@ -58,6 +58,8 @@ GH="/c/Users/Yang/AppData/Local/Microsoft/WinGet/Packages/GitHub.cli_Microsoft.W
 - 构建标签：
   - Windows / macOS：`production`（选正式版 runtime.js）；
   - **Linux 一律用 `gtk3`**（对应 WebKitGTK 4.1），打包用 `gtk3,production`。不要用 `server` 标签做 Linux 检查。
+- 热重载开发：在 `client/` 下执行 `wails3 dev`（**不是** `wails dev`，那是 v2 CLI，会报找不到 `wails.json`）。Windows 的 Taskfile 通过 `CC` 指定 mingw gcc，默认路径是 `C:/tools/mingw64/bin`，可用 `LITETALK_MINGW` 覆盖。go-task 在 Windows 上设置 `env.PATH` 不会影响命令查找，所以不要改成通过 PATH 注入。
+- 改动 `client/Taskfile.yml`、`client/build/**/Taskfile.yml` 或 `build/config.yml` 后，必须在**没有手动设置 PATH 和 CGO_ENABLED 的干净 shell** 里实际跑一次 `wails3 dev`，并跑一次 `wails3 task --dry package VERSION=v0.0.0`，确认版本号确实注入了。CI 不覆盖这部分。
 - mingw ld 的 `claims to have 0xffff relocs` 警告无害。
 - 在 PowerShell 里跑基准测试时，模式参数必须加引号：`-bench="."`。
 

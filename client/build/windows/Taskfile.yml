@@ -1,27 +1,36 @@
 version: '3'
 
-# Windows 平台构建。cgo（libopus/malgo/WASAPI）依赖 mingw64 gcc：
-# 在 Git Bash 里先 export PATH="/c/tools/mingw64/bin:$PATH" 再跑 wails3 dev/task。
+# Windows 平台构建。cgo（libopus/malgo/WASAPI）需要 mingw64 gcc：
+# 默认用 C:/tools/mingw64/bin/gcc.exe（docs/M1-环境前置.md 的安装位置），
+# 环境变量 LITETALK_MINGW 可改为其他 bin 目录。经 CC 指定而非改 PATH——
+# go-task 的 env.PATH 在 Windows 上不会被 sh 解释器用于查找命令。
 
 includes:
   common: ../Taskfile.yml
+
+vars:
+  MINGW_BIN: '{{.LITETALK_MINGW | default "C:/tools/mingw64/bin"}}'
 
 tasks:
   build:
     summary: 构建 Windows 客户端
     deps:
       - task: common:go:mod:tidy
+    preconditions:
+      - sh: '"{{.MINGW_BIN}}/gcc.exe" --version'
+        msg: "未找到 {{.MINGW_BIN}}/gcc.exe（cgo 必需）。安装 winlibs mingw64 到 C:/tools/mingw64，或设 LITETALK_MINGW 指向其 bin 目录"
     cmds:
       - go build {{.BUILD_FLAGS}} -o {{.BIN_DIR}}/{{.APP_NAME}}.exe .
     vars:
+      PRODUCTION: '{{.PRODUCTION | default "false"}}'
+      VERSION: '{{.VERSION | default "dev"}}'
       # dev：无 production 标签（开发版 runtime.js，走 FRONTEND_DEVSERVER_URL）；
       # production：与 CI 一致（-H windowsgui 去控制台窗，-s -w 瘦身）。
       BUILD_FLAGS: '{{if eq .PRODUCTION "true"}}-tags production -trimpath -buildvcs=false -ldflags="-s -w -X main.version={{.VERSION}} -H windowsgui"{{else}}-buildvcs=false{{end}}'
     env:
       CGO_ENABLED: '1'
+      CC: '{{.MINGW_BIN}}/gcc.exe'
       GOOS: windows
-      PRODUCTION: '{{.PRODUCTION | default "false"}}'
-      VERSION: '{{.VERSION | default "dev"}}'
 
   run:
     summary: 运行 Windows 客户端

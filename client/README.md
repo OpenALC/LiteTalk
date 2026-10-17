@@ -57,17 +57,16 @@ pnpm run type-check
 脚手架在 `Taskfile.yml` + `build/config.yml`（CI 打包不依赖 wails CLI，仍走裸 `go build`，见 `.github/workflows/ci.yml`）。
 
 ```bash
-# Git Bash；cgo（libopus/malgo/WASAPI）依赖 mingw64 gcc
-export PATH="/c/tools/mingw64/bin:$PATH"
-export CGO_ENABLED=1
 cd client
-wails3 dev               # 需 wails v3 CLI（go install github.com/wailsapp/wails/v3/cmd/wails3）
+wails3 dev               # 需 wails v3 CLI：go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.30
 ```
 
-行为：vite dev server（端口 9245，`WAILS_VITE_PORT` 可改）+ 监视 `*.go` 变更自动重建重启；前端 HMR。dev 二进制输出到 `build/bin/`（已 gitignore）。
+前置：Windows 需要 mingw64 gcc（cgo：libopus/malgo/WASAPI），默认取 `C:/tools/mingw64/bin/gcc.exe`；装在别处时设 `LITETALK_MINGW=<bin 目录>`。不需要手动改 PATH 或 `CGO_ENABLED`，Taskfile 已注入 `CC` 与 `CGO_ENABLED=1`。
+
+行为：vite dev server（端口 9245，`WAILS_VITE_PORT` 可改）+ 监视 `*.go` 变更自动重建重启；前端 HMR。dev 二进制输出到 `build/bin/`（已 gitignore）。生产构建：`wails3 task package VERSION=v1.2.3`。
 
 注意：
-- 系统里的 `wails`（v2 CLI）不兼容 v3 项目，必须用 `wails3`；
+- 系统里的 `wails`（v2 CLI）不兼容 v3 项目（报 `wails.json` 找不到即为此），必须用 `wails3`；
 - vite 显式绑 `127.0.0.1`：wails v3 Windows 的 asset 代理地址是 `wails.localhost`（解析 IPv4），vite 默认只绑 IPv6 `[::1]` 会被拒连；
 - Linux 构建走 `-tags gtk3`（对应 WebKitGTK 4.1，勿用默认 GTK4）。
 

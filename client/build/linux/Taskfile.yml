@@ -14,12 +14,12 @@ tasks:
     cmds:
       - go build {{.BUILD_FLAGS}} -o {{.BIN_DIR}}/{{.APP_NAME}} .
     vars:
+      PRODUCTION: '{{.PRODUCTION | default "false"}}'
+      VERSION: '{{.VERSION | default "dev"}}'
       BUILD_FLAGS: '{{if eq .PRODUCTION "true"}}-tags gtk3,production -trimpath -buildvcs=false -ldflags="-s -w -X main.version={{.VERSION}}"{{else}}-tags gtk3 -buildvcs=false{{end}}'
     env:
       CGO_ENABLED: '1'
       GOOS: linux
-      PRODUCTION: '{{.PRODUCTION | default "false"}}'
-      VERSION: '{{.VERSION | default "dev"}}'
 
   run:
     summary: 运行 Linux 客户端
