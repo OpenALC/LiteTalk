@@ -196,6 +196,9 @@ func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) 
 	})
 	a.setupTray()
 	a.startHotkeys()
+	// 机密存储模式推一次给前端（契约 §0.6 sys:secret）：回落明文文件存储必须
+	// 让 UI 可感知，不能静默降级。前端也可能主动调 SecretStorageMode 补拉。
+	a.emit("sys:secret", SecretModeEvent{Mode: config.SecretMode()})
 	return nil
 }
 
@@ -471,6 +474,17 @@ func (a *App) SetSavedCredentials(email, password string) {
 // ClearSavedCredentials 清除记住的凭据。
 func (a *App) ClearSavedCredentials() {
 	_ = a.cfg.ClearSavedCredentials()
+}
+
+// SecretModeEvent sys:secret 事件载荷（契约 §0.6）。
+type SecretModeEvent struct {
+	Mode string `json:"mode"` // keyring / file / dpapi
+}
+
+// SecretStorageMode 当前机密存储模式（keyring / file / dpapi）。
+// Linux 回落明文文件存储时前端需明示提示，不静默降级（issue #8）。
+func (a *App) SecretStorageMode() string {
+	return config.SecretMode()
 }
 
 // ---------- 窗口控制（自定义标题栏调用） ----------

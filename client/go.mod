@@ -11,10 +11,12 @@ require (
 	github.com/pion/rtp v1.10.5
 	github.com/pion/webrtc/v4 v4.2.23
 	github.com/wailsapp/wails/v3 v3.0.0-beta.30
+	github.com/zalando/go-keyring v0.2.8
 )
 
 require (
 	github.com/adrg/xdg v0.5.3 // indirect
+	github.com/danieljoos/wincred v1.2.3 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
