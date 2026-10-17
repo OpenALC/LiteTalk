@@ -189,3 +189,78 @@ func TestVoiceTakenLeavesRoomLocally(t *testing.T) {
 		t.Fatal("must not send channel.leave on session.voice_taken")
 	}
 }
+
+// TestIsLoopbackURL 钉住环回判定：本机联调要收集环回候选，公网必须关闭——
+// 判反了要么连不上本机 SFU，要么把 127.0.0.1 暴露给远端。
+func TestIsLoopbackURL(t *testing.T) {
+	cases := []struct {
+		base string
+		want bool
+	}{
+		{"http://127.0.0.1:8077", true},
+		{"http://127.0.0.1", true},
+		{"http://127.1.2.3:8077", true},
+		{"http://[::1]:8077", true},
+		{"http://localhost:8077", true},
+		{"https://localhost", true},
+		{"http://LocalHost:8077", true},
+		{"https://talk.example.com", false},
+		{"http://192.168.1.10:8077", false},
+		{"http://10.0.0.1:8077", false},
+		{"http://8.8.8.8", false},
+		{"https://[2001:db8::1]:8077", false},
+		{"not-a-url", false},
+		{"", false},
+		{"http://", false},
+	}
+	for _, c := range cases {
+		if got := IsLoopbackURL(c.base); got != c.want {
+			t.Errorf("IsLoopbackURL(%q) = %v, want %v", c.base, got, c.want)
+		}
+	}
+}
+
+// TestFetchICEServers 验证凭证拉取的两条路径：正常拿到 ICE servers 与失败降级为空。
+func TestFetchICEServers(t *testing.T) {
+	// 正常路径：服务端返回 stun+turn 两条。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"iceServers":[
+			{"urls":["stun:stun.example.com:3478"]},
+			{"urls":["turn:turn.example.com:3478?transport=tcp"],"username":"u","credential":"c"}
+		],"expiresAt":1}`))
+	}))
+	defer srv.Close()
+	s := NewSession(NewAPIClient(srv.URL), "tok", "n", Events{}, nil)
+	got := s.fetchICEServers()
+	if len(got) != 2 {
+		t.Fatalf("期望 2 条 ICE server，实际 %d", len(got))
+	}
+	if got[0].URLs[0] != "stun:stun.example.com:3478" {
+		t.Errorf("stun URL 错误: %v", got[0].URLs)
+	}
+	if got[1].Username != "u" || got[1].Credential != "c" {
+		t.Errorf("turn 凭证错误: %+v", got[1])
+	}
+
+	// 降级路径：服务端未配置 TURN（503）→ 空 ICE 列表，不 panic 不阻断。
+	fail := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "turn not configured", http.StatusServiceUnavailable)
+	}))
+	defer fail.Close()
+	s2 := NewSession(NewAPIClient(fail.URL), "tok", "n", Events{}, nil)
+	if got2 := s2.fetchICEServers(); got2 != nil {
+		t.Fatalf("失败时应降级为空 ICE 列表，实际 %v", got2)
+	}
+
+	// 空数组也是合法的（dev 无 TURN）：不报错，返回 nil。
+	empty := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"iceServers":[],"expiresAt":0}`))
+	}))
+	defer empty.Close()
+	s3 := NewSession(NewAPIClient(empty.URL), "tok", "n", Events{}, nil)
+	if got3 := s3.fetchICEServers(); got3 != nil {
+		t.Fatalf("空 iceServers 应返回 nil，实际 %v", got3)
+	}
+}
