@@ -693,7 +693,7 @@ input[type="range"] { flex: 0 0 140px; accent-color: var(--brand-500); }
   color: var(--brand-700); background: var(--brand-50);
   transition: background 0.2s var(--ease);
 }
-.logout-btn:hover { background: var(--brand-100); }
+.logout-btn:hover { background: var(--brand-200); }
 
 /* 登出确认弹层 */
 .logout-overlay {
@@ -706,16 +706,16 @@ input[type="range"] { flex: 0 0 140px; accent-color: var(--brand-500); }
   min-width: 220px; text-align: center;
   box-shadow: var(--shadow-2, 0 8px 32px rgba(23,50,75,0.18));
 }
-.logout-card p { margin: 0 0 16px; font-size: 15px; font-weight: 600; color: var(--ink); }
+.logout-card p { margin: 0 0 16px; font-size: 15px; font-weight: 600; color: var(--ink-900); }
 .logout-acts { display: flex; gap: 10px; justify-content: center; }
 .logout-cancel, .logout-ok {
   height: 32px; padding: 0 18px; border-radius: 8px;
   font-size: 13px; font-weight: 600;
   transition: background 0.2s var(--ease);
 }
-.logout-cancel { color: var(--ink-2); background: var(--bg); }
-.logout-cancel:hover { background: var(--bg-2); }
-.logout-ok { color: #fff; background: var(--brand); }
+.logout-cancel { color: var(--ink-600); background: var(--brand-50); }
+.logout-cancel:hover { background: var(--brand-200); }
+.logout-ok { color: #fff; background: var(--brand-500); }
 .logout-ok:hover { background: var(--brand-700); }
 
 /* 说明小字（如休眠「暂不生效」注记）：11px 灰，贴近上一行 */

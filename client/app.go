@@ -565,6 +565,9 @@ func (a *App) retarget(baseURL string) {
 			isGuest := a.user.IsGuest
 			a.user = state.UserProfile{}
 			a.mu.Unlock()
+			// 清 access token：换服后旧令牌不被接受，残留会让 GetMe 把用户
+			// 「登回」到一个无信令连接的僵尸会话。
+			a.api.SetToken("")
 			if isGuest {
 				_ = a.cfg.SetGuestRefresh("")
 			}
@@ -721,10 +724,15 @@ func (a *App) Logout() error {
 	a.user = state.UserProfile{} // 清档案，否则 GetMe 仍返回旧用户
 	a.mu.Unlock()
 	a.disconnectSession()
+	var err error
 	if rt != "" {
-		return a.api.Logout(rt)
+		// 吊销请求要带 Bearer，故不能先清 access token。
+		err = a.api.Logout(rt)
 	}
-	return nil
+	// 无条件清 access token：GetMe 在 user 为空时回落 a.api.Me()，残留有效
+	// 令牌会把已登出的用户「登回来」（被踢后 rt 已空、api.Logout 根本不走）。
+	a.api.SetToken("")
+	return err
 }
 
 // onKicked 被服务端踢下线（同类设备在其他设备登录，契约 §0.5/§0.6）：
