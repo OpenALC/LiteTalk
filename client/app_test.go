@@ -205,6 +205,40 @@ func TestOnKickedClearsSessionAndTokens(t *testing.T) {
 	}
 }
 
+// TestLogoutClearsAccessToken 登出必须无条件清 APIClient 的 access token：
+// GetMe 在 user 为空时回落 api.Me()，残留有效令牌会把已登出的用户「登回来」
+// （被踢后 rt 已空、api.Logout 根本不走，尤其明显）。
+func TestLogoutClearsAccessToken(t *testing.T) {
+	m := config.NewWithPath(filepath.Join(t.TempDir(), "config.json"))
+	app := newAppWithConfig(m)
+	app.api = state.NewAPIClient("http://127.0.0.1:1")
+
+	// rt == "" 路径（被踢后前端 logout）：即使不发吊销请求也要清 token。
+	app.api.SetToken("stale-access")
+	app.mu.Lock()
+	app.user = state.UserProfile{ID: 1, Nickname: "a"}
+	app.mu.Unlock()
+	if err := app.Logout(); err != nil {
+		t.Fatalf("Logout: %v", err)
+	}
+	if got := app.api.Token(); got != "" {
+		t.Fatalf("登出后 access token 应清空，得到 %q", got)
+	}
+
+	// rt != "" 路径：吊销失败也必须清 token（否则僵尸会话只在离线时复活）。
+	app.api.SetToken("stale-access-2")
+	app.mu.Lock()
+	app.refreshTok = "rt"
+	app.user = state.UserProfile{ID: 1, Nickname: "a"}
+	app.mu.Unlock()
+	if err := app.Logout(); err == nil {
+		t.Fatal("吊销端点不可达时 Logout 应返回错误")
+	}
+	if got := app.api.Token(); got != "" {
+		t.Fatalf("吊销失败后 access token 仍应清空，得到 %q", got)
+	}
+}
+
 // TestOnKickedKeepsGuestTokenForAccountUser 账号用户被踢不得动落盘的游客
 // 令牌——那是另一个身份的凭据，与本次会话无关。
 func TestOnKickedKeepsGuestTokenForAccountUser(t *testing.T) {
