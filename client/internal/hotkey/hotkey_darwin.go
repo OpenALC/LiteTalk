@@ -8,14 +8,17 @@
 // crosscall2，约束与开销都不划算。因此 C 侧只做「归一化 + 入队 + 唤醒」，
 // Go 侧用独立线程阻塞取事件再做匹配。队列满则丢，与 emit 的语义一致。
 //
+// 本文件只管「OS 事件摄取」和「token → macOS 键码」两件事；绑定表构建、
+// 按下/抬起配对、鼠标统一编号都在 bindings.go，与 windows/linux 共用。
+//
 // 平台限制（如实降级，不假装支持）：
 //   - 需要「辅助功能」权限（AXIsProcessTrusted）。未授权时 Available() 返回
 //     false、Start() 返回 ErrUnsupportedPlatform，由前端提示用户去授权；
 //   - macOS 没有 Insert 键，也没有 F21–F24 的虚拟键码，这 5 个 token 在 macOS
 //     上绑定后不生效（建表时直接跳过，不填假键码）；
-//   - 只捕获鼠标侧键（kCGEventOtherMouseDown/Up，按钮 3/4 = XBUTTON1/2 →
-//     mouse4/mouse5），不捕获左/中/右键，所以 mouse1/mouse2/mouse3 绑定后
-//     不生效——把全局左键当 PTT 键本身就是坏主意；
+//   - 只捕获鼠标侧键（kCGEventOtherMouseDown/Up，原生按钮 3/4 → 统一编号
+//     4/5 → mouse4/mouse5），不捕获左/中/右键，所以 mouse1/mouse2/mouse3
+//     绑定后不生效——把全局左键当 PTT 键本身就是坏主意；
 //   - 修饰键 win 对应 macOS 的 Command。
 //
 // 本文件未经编译验证：CI 的 macOS job 只在打 tag 时运行且 continue-on-error，
@@ -243,10 +246,6 @@ import (
 // 但 tap 装不上，调用方该报「这机器有毛病」而不是「去授权」。
 var errTapCreate = errors.New("hotkey: CGEventTapCreate 失败")
 
-// stopTimeout 是 stop() 等 run loop 与消费线程退出的上限。正常路径下
-// liteTalkStop 一置位，20ms 的 RunInMode 切片立刻返回，这个超时只是兜底。
-const stopTimeout = 2 * time.Second
-
 // darwinCodeOfToken 是主键 token → macOS 虚拟键码。鼠标键不在表内（走 OtherMouse 事件）。
 // 键码取自 Carbon Events.h 的 kVK_* 常量，与 Windows 的 VK 完全不是一套。
 // 最大的坑：字母键码按 ANSI 物理布局走（A/S/D/F 一排、Q/W/E 一排、Z/X/C 一排），
@@ -300,70 +299,41 @@ func buildDarwinKeycodeTable() map[string]int {
 	return m
 }
 
-// darwinMouseButtonOfToken 把鼠标 token 映射成 macOS 的按钮号。macOS 的按钮号
-// 从 0 起（0 左 / 1 右 / 2 中 / 3 XBUTTON1 / 4 XBUTTON2），与 Windows 的 1 起编号
-// 差一。只认侧键：另三个按钮根本不在事件 mask 里，见文件头说明。
-func darwinMouseButtonOfToken(tok string) (int, bool) {
-	switch tok {
-	case "mouse4":
-		return 3, true
-	case "mouse5":
-		return 4, true
+// darwinCodeLookup 把主键 token 翻成 macOS 虚拟键码，供 bindings.go 的
+// newHookState 回调。键码表本身是 map[string]int（键码是 0–0x7E 的小整数），
+// 这里转成统一的 uint32。
+func darwinCodeLookup(token string) (uint32, bool) {
+	code, ok := darwinCodeOfToken[token]
+	return uint32(code), ok
+}
+
+// darwinUnifiedButton 把 macOS 原生的鼠标按钮号翻成 bindings.go 定义的统一编号
+// （1 左 / 2 右 / 3 中 / 4 XBUTTON1 / 5 XBUTTON2）。
+//
+// 坑在于两边编号基准不同：kCGMouseEventButtonNumber 从 0 起报（0 左 / 1 右 /
+// 2 中 / 3 XBUTTON1 / 4 XBUTTON2），统一编号前三个已被左/右/中占用，所以
+// XBUTTON1/2 是 4/5——原生号要 +1。这与 Windows 侧 xButton() 的 +3 是同一个坑
+// （那边 mouseData 高位字报的是 1/2，同样要往前挪三位），T1 在 Windows 上正栽在
+// 这里，所以统一编号只在这一处换算，绑定表不认原生号。
+func darwinUnifiedButton(native int) uint32 {
+	switch native {
+	case 0:
+		return 1
+	case 1:
+		return 2
+	case 2:
+		return 3
+	case 3:
+		return 4
+	case 4:
+		return 5
 	}
-	return 0, false
-}
-
-// darwinHookState / darwinKeyBind / darwinMouseBind 与 hotkey_windows.go 里的
-// 同名结构等价，但那份在 windows 标签下、darwin 构建看不到，只能在这里再写一份。
-type darwinHookState struct {
-	keys []darwinKeyBind
-	mice []darwinMouseBind
-}
-
-type darwinKeyBind struct {
-	code   int
-	mods   uint8
-	action Action
-}
-
-type darwinMouseBind struct {
-	btn    int
-	mods   uint8
-	action Action
-}
-
-// newDarwinHookState 从设置构建绑定表。Enabled=false 返回空表——此时 Manager
-// 根本不会装 tap，空表只是双保险。平台上不存在的键在这里被跳过。
-func newDarwinHookState(st Settings) *darwinHookState {
-	hs := &darwinHookState{}
-	if !st.Enabled {
-		return hs
-	}
-	for _, a := range allActions {
-		spec := st.specFor(a)
-		if spec == "" {
-			continue
-		}
-		b, err := ParseBinding(spec)
-		if err != nil {
-			continue
-		}
-		if btn, ok := darwinMouseButtonOfToken(b.key); ok {
-			hs.mice = append(hs.mice, darwinMouseBind{btn: btn, mods: b.mods, action: a})
-			continue
-		}
-		code, ok := darwinCodeOfToken[b.key]
-		if !ok {
-			continue
-		}
-		hs.keys = append(hs.keys, darwinKeyBind{code: code, mods: b.mods, action: a})
-	}
-	return hs
+	return 0
 }
 
 // darwinSource 是 macOS 平台的事件源实现。
 type darwinSource struct {
-	st atomic.Pointer[darwinHookState]
+	st atomic.Pointer[hookState]
 
 	mu       sync.Mutex
 	done     chan struct{} // run loop 线程退出后关闭
@@ -388,7 +358,7 @@ func (s *darwinSource) start(st Settings, ch chan<- Event) error {
 		s.mu.Unlock()
 		return ErrUnsupportedPlatform
 	}
-	s.st.Store(newDarwinHookState(st))
+	s.st.Store(newHookState(st, darwinCodeLookup))
 	installed := make(chan error, 1)
 	done := make(chan struct{})
 	consumed := make(chan struct{})
@@ -445,7 +415,7 @@ func (s *darwinSource) stop() {
 }
 
 // update 热替换绑定表。
-func (s *darwinSource) update(st Settings) { s.st.Store(newDarwinHookState(st)) }
+func (s *darwinSource) update(st Settings) { s.st.Store(newHookState(st, darwinCodeLookup)) }
 
 // pump 是 run loop 线程主体：装 tap → 信号安装结果 → 跑 run loop。
 // 必须在 LockOSThread 之后的那个线程上跑：CFRunLoopAddSource 加的是
@@ -487,10 +457,11 @@ func (s *darwinSource) consume(ch chan<- Event) {
 }
 
 // darwinRuntime 持有事件分发的可变状态，只在 consume 所在的单线程上读写。
+// 按下/抬起配对用 bindings.go 的 activeSet，与 windows 共用同一份实现。
 type darwinRuntime struct {
 	src    *darwinSource
 	ch     chan<- Event
-	active darwinActiveSet
+	active activeSet
 }
 
 // onKey 处理一次键盘按下。修饰键位直接取自事件的 CGEventGetFlags——macOS 每个
@@ -498,7 +469,7 @@ type darwinRuntime struct {
 // 导致漏判」这个问题在这里不存在。
 func (rt *darwinRuntime) onKey(code, mods C.int) {
 	if a, ok := rt.matchKey(code, mods); ok {
-		rt.active.add(darwinKeyID(int(code)), a)
+		rt.active.add(uint32(code), a)
 		emit(rt.ch, Event{Action: a, Pressed: true})
 	}
 }
@@ -506,15 +477,17 @@ func (rt *darwinRuntime) onKey(code, mods C.int) {
 // onKeyUp 处理一次键盘抬起。修饰键不参与：用户先松修饰键再松主键（PTT 最常见
 // 收尾）时，主键抬起事件里的修饰键快照已经少了那位，若拿来匹配就会配平不了。
 func (rt *darwinRuntime) onKeyUp(code, _ C.int) {
-	if i := rt.active.find(darwinKeyID(int(code))); i >= 0 {
+	if i := rt.active.find(uint32(code)); i >= 0 {
 		emit(rt.ch, Event{Action: rt.active.items[i].action, Pressed: false})
 		rt.active.removeAt(i)
 	}
 }
 
-// onMouse 处理鼠标侧键的按下/抬起。
+// onMouse 处理鼠标侧键的按下/抬起。button 是 macOS 原生按钮号，先换算成统一
+// 编号，匹配与配平才和绑定表（以及 windows/linux）对得上。
 func (rt *darwinRuntime) onMouse(button, mods C.int, up bool) {
-	id := darwinMouseID(int(button))
+	btn := darwinUnifiedButton(int(button))
+	id := mouseID(btn)
 	if up {
 		if i := rt.active.find(id); i >= 0 {
 			emit(rt.ch, Event{Action: rt.active.items[i].action, Pressed: false})
@@ -525,7 +498,7 @@ func (rt *darwinRuntime) onMouse(button, mods C.int, up bool) {
 	if rt.active.find(id) >= 0 {
 		return // 重复按下（连点尚未抬起）
 	}
-	if a, ok := rt.matchMouse(button, mods); ok {
+	if a, ok := rt.matchMouse(btn, mods); ok {
 		rt.active.add(id, a)
 		emit(rt.ch, Event{Action: a, Pressed: true})
 	}
@@ -539,64 +512,23 @@ func (rt *darwinRuntime) matchKey(code, mods C.int) (Action, bool) {
 		return "", false
 	}
 	for i := range st.keys {
-		if st.keys[i].code == int(code) && st.keys[i].mods == uint8(mods) {
+		if st.keys[i].code == uint32(code) && st.keys[i].mods == uint8(mods) {
 			return st.keys[i].action, true
 		}
 	}
 	return "", false
 }
 
-func (rt *darwinRuntime) matchMouse(button, mods C.int) (Action, bool) {
+// matchMouse 按统一按钮编号查找绑定。
+func (rt *darwinRuntime) matchMouse(btn uint32, mods C.int) (Action, bool) {
 	st := rt.src.st.Load()
 	if st == nil {
 		return "", false
 	}
 	for i := range st.mice {
-		if st.mice[i].btn == int(button) && st.mice[i].mods == uint8(mods) {
+		if st.mice[i].btn == btn && st.mice[i].mods == uint8(mods) {
 			return st.mice[i].action, true
 		}
 	}
 	return "", false
-}
-
-// darwinMouseIDBase 给鼠标按钮一个不会与任何虚拟键码（0–0x7E）冲突的 id 空间。
-const darwinMouseIDBase = 0x10000
-
-func darwinKeyID(code int) uint32  { return uint32(code) }
-func darwinMouseID(btn int) uint32 { return darwinMouseIDBase + uint32(btn) }
-
-// darwinActiveEntry / darwinActiveSet 与 hotkey_windows.go 里的同名实现等价，
-// 但那份在 windows 标签下，darwin 构建看不到，只能在这里再写一份。
-// 按下时就地记下是哪个动作，抬起时按同一个 id 配平——这样用户先松修饰键再松
-// 主键（PTT 最常见收尾）也能正确收到抬起，不会卡在「已按下」导致说话停不下来。
-type darwinActiveEntry struct {
-	id     uint32
-	action Action
-}
-
-type darwinActiveSet struct {
-	items [8]darwinActiveEntry
-	n     int
-}
-
-func (a *darwinActiveSet) find(id uint32) int {
-	for i := 0; i < a.n; i++ {
-		if a.items[i].id == id {
-			return i
-		}
-	}
-	return -1
-}
-
-func (a *darwinActiveSet) add(id uint32, action Action) {
-	if a.find(id) >= 0 || a.n == len(a.items) {
-		return
-	}
-	a.items[a.n] = darwinActiveEntry{id: id, action: action}
-	a.n++
-}
-
-func (a *darwinActiveSet) removeAt(i int) {
-	a.n--
-	a.items[i] = a.items[a.n]
 }
