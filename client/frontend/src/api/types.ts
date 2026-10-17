@@ -76,6 +76,21 @@ export interface AudioSettings {
   pre_gain_db?: number
 }
 
+// HotkeySettings 全局热键与按键说话配置（与 Go 侧 hotkey.Settings / config 的
+// HotkeySettings json tag 逐字对齐，字段名不得单方面改动）。
+// mode：0 按住说话 / 1 语音激活 / 2 常开；绑定为规范化串（"ctrl+shift+m"、"mouse4"），
+// 空串或缺失都表示未绑定；tail_ms 尾包延迟 0–1000，omitempty 后可能缺省。
+export interface HotkeySettings {
+  enabled: boolean
+  mode: 0 | 1 | 2
+  ptt?: string
+  mute?: string
+  deafen?: string
+  dual?: string
+  tail_ms?: number
+  cue_sound?: boolean
+}
+
 // AudioLevel audio:level 事件载荷（设置页麦克风测试期间 100ms 推送一次）。
 // peak/rms/threshold 均为 dBFS 负值；threshold 为当前说话进入门限（电平条标线）。
 export interface AudioLevel {

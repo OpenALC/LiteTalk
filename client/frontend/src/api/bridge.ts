@@ -2,7 +2,7 @@
 // 浏览器独立开发（vite dev 无 Go 后端）时走 mock 桩，行为可联调 UI。
 // 原生环境判定：Go 在 webview 启动时注入 window._wails.flags（浏览器环境恒无）。
 import { Call, Events } from '@wailsio/runtime'
-import type { AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ConnConfigView, ConnTestResult, FriendDTO, PeerView, ServerConfig, ServerDTO, UserProfile, VoiceStateView } from './types'
+import type { AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ConnConfigView, ConnTestResult, FriendDTO, HotkeySettings, PeerView, ServerConfig, ServerDTO, UserProfile, VoiceStateView } from './types'
 
 type GoApp = {
   GetVersion(): Promise<string>
@@ -36,6 +36,10 @@ type GoApp = {
   TestSpeaker(): Promise<void>
   GetAudioSettings(): Promise<AudioSettings>
   SetAudioSettings(s: AudioSettings): Promise<void>
+  // 全局热键与按键说话（GetHotkeyAvailability 为 false 时平台不支持，UI 需明示降级）。
+  GetHotkeySettings(): Promise<HotkeySettings>
+  SetHotkeySettings(s: HotkeySettings): Promise<void>
+  GetHotkeyAvailability(): Promise<boolean>
   JoinChannel(channelID: string): Promise<void>
   LeaveChannel(): Promise<void>
   SetMute(muted: boolean): Promise<void>
@@ -148,6 +152,13 @@ const mockApp: GoApp = {
     }
   },
   async SetAudioSettings() {},
+  // 全局热键桩：默认值走 Go 侧 hotkey.DefaultSettings 的 TS 等价（全关、绑定全空）。
+  // 浏览器环境没有原生钩子，可用性恒 false——设置页据此展示降级说明。
+  async GetHotkeySettings() {
+    return { enabled: false, mode: 0, tail_ms: 250, cue_sound: false }
+  },
+  async SetHotkeySettings() {},
+  async GetHotkeyAvailability() { return false },
   async ListAudioDevices() {
     return {
       capture: [{ id: 'default', name: '默认麦克风', is_default: true }],
