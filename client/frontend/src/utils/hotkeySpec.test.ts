@@ -3,10 +3,12 @@
 import { describe, expect, it } from 'vitest'
 import {
   HOTKEY_ACTIONS,
+  IN_APP_COMBOS,
   bindingFromKeyEvent,
   bindingFromMouseEvent,
   bindingLabel,
   findHotkeyConflicts,
+  findInAppClashes,
   modifierPrefix,
   normalizeBinding,
 } from './hotkeySpec'
@@ -234,5 +236,44 @@ describe('findHotkeyConflicts 冲突检测', () => {
 describe('HOTKEY_ACTIONS 动作表', () => {
   it('与 Go 侧 hotkey.Action 的四个动作一一对应', () => {
     expect(HOTKEY_ACTIONS.map((a) => a.id)).toEqual(['ptt', 'mute', 'deafen', 'dual'])
+  })
+})
+
+describe('IN_APP_COMBOS 应用内快捷键组合', () => {
+  it('由 useHotkeys 的 HOTKEYS 归一化而来，覆盖闭麦/静音/全关/搜索/设置', () => {
+    // 规范化后应含 ctrl+m、ctrl+d、ctrl+shift+m、ctrl+k、ctrl+,
+    expect(IN_APP_COMBOS).toContain('ctrl+m')
+    expect(IN_APP_COMBOS).toContain('ctrl+d')
+    expect(IN_APP_COMBOS).toContain('ctrl+shift+m')
+    expect(IN_APP_COMBOS).toContain('ctrl+k')
+    expect(IN_APP_COMBOS).toContain('ctrl+,')
+  })
+
+  it('不含非法组合（HOTKEYS 若写出非法串应被滤掉而不是抛错）', () => {
+    for (const c of IN_APP_COMBOS) {
+      expect(normalizeBinding(c)).toBe(c)
+    }
+  })
+})
+
+describe('findInAppClashes 与应用内快捷键撞车', () => {
+  it('全局绑定撞上应用内组合时报告，未绑定不报告', () => {
+    expect(findInAppClashes({ ptt: 'ctrl+m' })).toEqual(['ctrl+m'])
+    expect(findInAppClashes({ mute: 'ctrl+shift+m' })).toEqual(['ctrl+shift+m'])
+    expect(findInAppClashes({ ptt: 'ctrl+alt+mouse5' })).toEqual([])
+    expect(findInAppClashes({})).toEqual([])
+  })
+
+  it('规范化后比较：大小写与修饰键顺序不同也算撞车', () => {
+    expect(findInAppClashes({ ptt: 'Ctrl+M' })).toEqual(['ctrl+m'])
+    expect(findInAppClashes({ ptt: 'Shift+Ctrl+M' })).toEqual(['ctrl+shift+m'])
+  })
+
+  it('非法绑定串不参与判定', () => {
+    expect(findInAppClashes({ ptt: 'foo' })).toEqual([])
+  })
+
+  it('多个动作撞车时按动作序全部报告', () => {
+    expect(findInAppClashes({ ptt: 'ctrl+m', mute: 'ctrl+d' })).toEqual(['ctrl+m', 'ctrl+d'])
   })
 })

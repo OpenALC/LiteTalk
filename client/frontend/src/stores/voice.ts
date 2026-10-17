@@ -108,6 +108,14 @@ export const useVoiceStore = defineStore('voice', () => {
     offs.push(eventsOn('voice:self', (id) => {
       _selfId = id as string
     }))
+    // 全局热键 / 托盘在 webview 之外改闭麦静音，前端只靠自己那一路的乐观更新
+    // 会停在旧值。Go 侧三条路径统一推这个事件，这里只覆写状态、不回写 Go。
+    offs.push(eventsOn('voice:state', (d) => {
+      const p = d as { muted?: boolean; deafened?: boolean } | null
+      if (typeof p?.muted === 'boolean') muted.value = p.muted
+      if (typeof p?.deafened === 'boolean') deafened.value = p.deafened
+      applySelf()
+    }))
     offs.push(eventsOn('voice:peer-join', (p) => {
       const peer = p as PeerView
       if (!members.value.some((m) => m.user_id === peer.user_id)) {

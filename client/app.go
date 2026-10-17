@@ -225,9 +225,9 @@ func (a *App) setupTray() {
 			muteItem.SetChecked(false)
 			return
 		}
-		muted := !s.Muted()
-		s.SetMute(muted)
-		muteItem.SetChecked(muted)
+		// 收口到 App.SetMute：勾选态同步与 voice:state 推送都在那一条路上，
+		// 托盘不再自己调 Session.SetMute（那条路前端收不到状态变化）。
+		a.SetMute(!s.Muted())
 	})
 	quitItem.OnClick(func(*application.Context) {
 		a.forceQuit.Store(true)
@@ -1027,7 +1027,8 @@ func (a *App) LeaveChannel() error {
 	return s.LeaveChannel()
 }
 
-// SetMute 本地静音开关。
+// SetMute 本地静音开关。前端、托盘、全局热键三条路径都收口到这里，
+// 各自只负责算出目标状态，不同时维护自己的副本。
 func (a *App) SetMute(muted bool) {
 	a.mu.Lock()
 	s := a.sess
@@ -1036,9 +1037,10 @@ func (a *App) SetMute(muted bool) {
 		s.SetMute(muted)
 	}
 	a.syncTrayMute(muted)
+	a.emitVoiceState()
 }
 
-// SetDeafen 耳聋开关。
+// SetDeafen 耳聋开关。与 SetMute 同理，是耳聋状态的唯一入口。
 func (a *App) SetDeafen(deafened bool) {
 	a.mu.Lock()
 	s := a.sess
@@ -1046,6 +1048,7 @@ func (a *App) SetDeafen(deafened bool) {
 	if s != nil {
 		s.SetDeafen(deafened)
 	}
+	a.emitVoiceState()
 }
 
 // ---------- 服务器 / 频道 / 好友（REST CRUD） ----------
@@ -1390,6 +1393,14 @@ func (a *App) syncTrayMute(muted bool) {
 	if a.trayMute != nil {
 		a.trayMute.SetChecked(muted)
 	}
+}
+
+// emitVoiceState 把本地闭麦/静音态推给前端。全局热键和托盘都在 webview 之外
+// 改状态，前端只靠自己那一路的乐观更新会停在旧值——用户按了全局热键却看到
+// 界面没反应。三条路径都走 App.SetMute/SetDeafen，在这里统一出口。
+func (a *App) emitVoiceState() {
+	mute, deafen := a.voiceMuteState()
+	a.emit("voice:state", map[string]any{"muted": mute, "deafened": deafen})
 }
 
 // GetHotkeySettings 读取持久化热键设置（设置页初始化用；未配置回落默认值）。

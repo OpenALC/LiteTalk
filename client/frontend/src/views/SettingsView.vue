@@ -13,7 +13,7 @@ import { useHibernateStore } from '../stores/hibernate'
 import { HOTKEYS, isTypingTarget } from '../composables/useHotkeys'
 import {
   HOTKEY_ACTIONS, bindingFromKeyEvent, bindingFromMouseEvent, bindingLabel,
-  findHotkeyConflicts, normalizeBinding, type HotkeyActionID,
+  findHotkeyConflicts, findInAppClashes, normalizeBinding, type HotkeyActionID,
 } from '../utils/hotkeySpec'
 import ServerConnPanel from '../components/ServerConnPanel.vue'
 import Toast from '../components/Toast.vue'
@@ -230,6 +230,10 @@ const HK_MODE_LABELS = ['按住说话', '语音激活', '常开'] as const
 const recording = ref('')
 // 冲突组合：同一规范化组合被多个动作占用（UI 标红 + 禁止静默覆盖）。
 const hkConflicts = computed(() => findHotkeyConflicts(hk.value))
+// 与应用内快捷键（Ctrl+M 等）撞车的全局绑定：窗口聚焦下两条路径都会触发，
+// 净效果取决于 OS 钩子与 webview keydown 的到达顺序，可能一次翻转也可能互相
+// 抵消。运行时无法可靠去重，只能提示用户改绑。
+const hkInAppClashes = computed(() => findInAppClashes(hk.value))
 let cancelHkAvail: (() => void) | null = null
 
 function setHkMode(i: number) {
@@ -551,6 +555,9 @@ function bindRecording(spec: string) {
         </div>
         <p v-if="hkConflicts.length" class="s-note s-warn">
           <CircleAlert :size="13" />{{ hkConflicts.map(bindingLabel).join('、') }} 被多个动作占用，请改绑其中一个
+        </p>
+        <p v-if="hkInAppClashes.length" class="s-note s-warn">
+          <CircleAlert :size="13" />{{ hkInAppClashes.map(bindingLabel).join('、') }} 与应用内快捷键相同，窗口聚焦时会重复触发，请改绑
         </p>
       </section>
 

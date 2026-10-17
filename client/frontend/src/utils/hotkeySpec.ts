@@ -8,6 +8,7 @@
 //   · 拒绝：空串、未知 token、出现两个以上主键、修饰键重复、只有修饰键没有主键
 // 录制态（SettingsView）只负责把 DOM 事件翻成 token 串，合法性判定全在本文件，
 // 保证 UI 预览与 Go 侧落库结果一致。
+import { HOTKEYS } from '../composables/useHotkeys'
 
 // HOTKEY_ACTIONS 可绑定的四个动作（与 Go 侧 hotkey.Action 对齐；悄悄话属 issue #45，本批不绑）。
 export const HOTKEY_ACTIONS = [
@@ -155,4 +156,22 @@ export function findHotkeyConflicts(s: Partial<Record<HotkeyActionID, string | u
     count.set(b, (count.get(b) ?? 0) + 1)
   }
   return [...count.entries()].filter(([, n]) => n > 1).map(([b]) => b)
+}
+
+// IN_APP_COMBOS 应用内快捷键（useHotkeys 的 HOTKEYS）的规范化组合。
+// 全局热键与它们撞车时，窗口聚焦下两条路径都会触发同一个动作：OS 钩子先到、
+// webview keydown 后到，两者各自读一份状态再取反，净效果取决于到达顺序，
+// 可能一次翻转也可能互相抵消。只能提示用户改绑，无法在运行时可靠去重。
+export const IN_APP_COMBOS: readonly string[] = HOTKEYS.map((h) => normalizeBinding(h.combo)).filter(
+  (b): b is string => b !== null,
+)
+
+// findInAppClashes 返回与应用内快捷键撞车的全局绑定（规范化串，保持动作序）。
+export function findInAppClashes(s: Partial<Record<HotkeyActionID, string | undefined>>): string[] {
+  const out: string[] = []
+  for (const a of HOTKEY_ACTIONS) {
+    const b = normalizeBinding(s[a.id] ?? '')
+    if (b && IN_APP_COMBOS.includes(b)) out.push(b)
+  }
+  return out
 }
