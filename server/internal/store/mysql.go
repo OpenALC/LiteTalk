@@ -633,6 +633,78 @@ func (m *MySQL) DeleteCategoryWithChannels(ctx context.Context, id int64) error 
 	return tx.Commit()
 }
 
+func (m *MySQL) UpdateCategory(ctx context.Context, c *Category) error {
+	res, err := m.db.ExecContext(ctx,
+		`UPDATE categories SET name = ?, position = ? WHERE id = ?`,
+		c.Name, c.Position, c.ID)
+	if err != nil {
+		return err
+	}
+	return checkAffected(res)
+}
+
+// ReorderCategories 把 id 移到 position（0-based，越界夹到首/尾），同服务器
+// 其它分类相对顺序保持并重排为 0..n-1（单事务）。
+func (m *MySQL) ReorderCategories(ctx context.Context, serverID, id int64, position int) error {
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	// Tx 同时只允许一个活跃查询：先把 id 集读完并关闭 rows，再逐条 UPDATE。
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id FROM categories WHERE server_id = ? ORDER BY position, id`, serverID)
+	if err != nil {
+		return err
+	}
+	ids := []int64{}
+	found := false
+	for rows.Next() {
+		var cid int64
+		if err := rows.Scan(&cid); err != nil {
+			rows.Close()
+			return err
+		}
+		if cid == id {
+			found = true
+		}
+		ids = append(ids, cid)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if !found {
+		return ErrNotFound
+	}
+	rest := make([]int64, 0, len(ids))
+	for _, cid := range ids {
+		if cid != id {
+			rest = append(rest, cid)
+		}
+	}
+	if position < 0 {
+		position = 0
+	}
+	if position > len(rest) {
+		position = len(rest)
+	}
+	out := make([]int64, 0, len(ids))
+	out = append(out, rest[:position]...)
+	out = append(out, id)
+	out = append(out, rest[position:]...)
+	for i, cid := range out {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE categories SET position = ? WHERE id = ?`, i, cid); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // ---- messages ----
 
 func (m *MySQL) CreateMessage(ctx context.Context, msg *Message) error {

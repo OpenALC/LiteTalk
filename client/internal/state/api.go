@@ -547,6 +547,31 @@ type ChannelDTO struct {
 	ServerID int64  `json:"server_id"`
 	Name     string `json:"name"`
 	Type     string `json:"type"` // text | voice
+	// CategoryID 分类归属（0 = 无分类/未分类，映射自服务端 NULL）；Position 同服务器序。
+	CategoryID *int64 `json:"category_id"`
+	Position   int    `json:"position"`
+}
+
+// ServerChannels GET /servers/{id}/channels 响应（categories + channels 两数组）。
+type ServerChannels struct {
+	Categories []CategoryDTO `json:"categories"`
+	Channels   []ChannelDTO  `json:"channels"`
+}
+
+// ListChannels 列出服务器的分类与频道（成员可读）。重启后频道列表恢复用。
+func (c *APIClient) ListChannels(serverID int64) (*ServerChannels, error) {
+	status, data, err := c.get(fmt.Sprintf("/servers/%d/channels", serverID))
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, decodeError(status, data)
+	}
+	var out ServerChannels
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("decode server channels: %w", err)
+	}
+	return &out, nil
 }
 
 // ListServers 列出当前用户加入的服务器。
@@ -721,6 +746,36 @@ func (c *APIClient) DeleteCategory(id int64, withChannels bool) error {
 		return decodeError(status, data)
 	}
 	return nil
+}
+
+// RenameCategory 重命名分类（owner/admin；1–32 字）。
+func (c *APIClient) RenameCategory(id int64, name string) error {
+	_, err := c.UpdateCategory(id, &name, nil)
+	return err
+}
+
+// UpdateCategory 改分类名/位置（owner/admin；至少给一个字段）。position 为目标序
+// （0-based），服务端把该分类移到此位置并重排同服务器其它分类为 0..n-1。
+func (c *APIClient) UpdateCategory(id int64, name *string, position *int) (*CategoryDTO, error) {
+	body := map[string]any{}
+	if name != nil {
+		body["name"] = *name
+	}
+	if position != nil {
+		body["position"] = *position
+	}
+	status, data, err := c.patch(fmt.Sprintf("/categories/%d", id), body)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, decodeError(status, data)
+	}
+	var cat CategoryDTO
+	if err := json.Unmarshal(data, &cat); err != nil {
+		return nil, fmt.Errorf("decode category: %w", err)
+	}
+	return &cat, nil
 }
 
 // SendFriendRequest 发送好友请求（target 形如 "昵称#1234"，服务端负责拆分）。

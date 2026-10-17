@@ -183,3 +183,83 @@ func TestCategoryForbidden(t *testing.T) {
 	postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/categories", sid), bTok,
 		map[string]string{"name": "越权"}, 403)
 }
+
+// TestPatchCategory 分类重命名与排序（0.1.2）：owner/admin 才可改，成员只读；
+// name/position 至少给一个；position 重排同服务器分类为 0..n-1。
+func TestPatchCategory(t *testing.T) {
+	srv, mem := newTestServer(t)
+	h := srv.Handler()
+
+	aTok, _ := registerUser(t, h, mem, "pa@ex.com", "改名A", "password123")
+	bTok, _ := registerUser(t, h, mem, "pb@ex.com", "改名B", "password123")
+	cTok, _ := registerUser(t, h, mem, "pc@ex.com", "路人C", "password123")
+
+	sv := postJSON(t, h, "/api/v1/servers", aTok, map[string]string{"name": "改名服"}, 201)
+	sid := int(sv["id"].(float64))
+	inv := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/invites", sid), aTok, map[string]any{}, 201)
+	postJSON(t, h, "/api/v1/servers/join", bTok, map[string]string{"code": inv["code"].(string)}, 200)
+
+	// 三个分类：甲 乙 丙（position 0 1 2）。
+	catIDs := []int{}
+	for _, name := range []string{"甲", "乙", "丙"} {
+		cat := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/categories", sid), aTok,
+			map[string]string{"name": name}, 201)
+		catIDs = append(catIDs, int(cat["id"].(float64)))
+	}
+
+	// 未登录 → 401。
+	patchJSON(t, h, fmt.Sprintf("/api/v1/categories/%d", catIDs[0]), "",
+		map[string]any{"name": "x"}, 401)
+	// 都不给 → 400 bad_request。
+	out := patchJSON(t, h, fmt.Sprintf("/api/v1/categories/%d", catIDs[0]), aTok,
+		map[string]any{}, 400)
+	if out["code"] != "bad_request" {
+		t.Fatalf("code = %v", out["code"])
+	}
+	// 非法名 → 400 bad_name。
+	out = patchJSON(t, h, fmt.Sprintf("/api/v1/categories/%d", catIDs[0]), aTok,
+		map[string]any{"name": ""}, 400)
+	if out["code"] != "bad_name" {
+		t.Fatalf("code = %v", out["code"])
+	}
+	// 成员只读 → 403；非成员 → 403。
+	patchJSON(t, h, fmt.Sprintf("/api/v1/categories/%d", catIDs[0]), bTok,
+		map[string]any{"name": "越权改"}, 403)
+	patchJSON(t, h, fmt.Sprintf("/api/v1/categories/%d", catIDs[0]), cTok,
+		map[string]any{"name": "路人改"}, 403)
+
+	// owner 改名 → 200，响应回带最终字段。
+	out = patchJSON(t, h, fmt.Sprintf("/api/v1/categories/%d", catIDs[0]), aTok,
+		map[string]any{"name": "甲改"}, 200)
+	if out["name"] != "甲改" || int(out["id"].(float64)) != catIDs[0] {
+		t.Fatalf("改名响应 = %+v", out)
+	}
+
+	// 丙移到最前 → 顺序 丙 甲改 乙，position 重排 0 1 2。
+	patchJSON(t, h, fmt.Sprintf("/api/v1/categories/%d", catIDs[2]), aTok,
+		map[string]any{"position": 0}, 200)
+	chans := getJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/channels", sid), aTok, 200).(map[string]any)
+	cats := chans["categories"].([]any)
+	want := []string{"丙", "甲改", "乙"}
+	for i, raw := range cats {
+		m := raw.(map[string]any)
+		if m["name"] != want[i] || int(m["position"].(float64)) != i {
+			t.Fatalf("重排后[%d] = %+v，期望 %s/%d", i, m, want[i], i)
+		}
+	}
+
+	// 同一请求既改名又重排。
+	patchJSON(t, h, fmt.Sprintf("/api/v1/categories/%d", catIDs[1]), aTok,
+		map[string]any{"name": "乙改", "position": 2}, 200)
+	chans = getJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/channels", sid), aTok, 200).(map[string]any)
+	cats = chans["categories"].([]any)
+	want = []string{"丙", "甲改", "乙改"}
+	for i, raw := range cats {
+		if raw.(map[string]any)["name"] != want[i] {
+			t.Fatalf("改名+重排后[%d] = %+v，期望 %s", i, raw, want[i])
+		}
+	}
+
+	// 不存在的分类 → 404。
+	patchJSON(t, h, "/api/v1/categories/9999", aTok, map[string]any{"name": "x"}, 404)
+}

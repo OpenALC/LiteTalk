@@ -2,7 +2,7 @@
 // 浏览器独立开发（vite dev 无 Go 后端）时走 mock 桩，行为可联调 UI。
 // 原生环境判定：Go 在 webview 启动时注入 window._wails.flags（浏览器环境恒无）。
 import { Call, Events } from '@wailsio/runtime'
-import type { AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ConnConfigView, ConnTestResult, FriendDTO, HotkeySettings, PeerView, ServerConfig, ServerDTO, UserProfile, VoiceStateView } from './types'
+import type { AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ConnConfigView, ConnTestResult, FriendDTO, HotkeySettings, PeerView, ServerChannels, ServerConfig, ServerDTO, UserProfile, VoiceStateView } from './types'
 
 type GoApp = {
   GetVersion(): Promise<string>
@@ -54,6 +54,7 @@ type GoApp = {
   LogFromWeb(level: string, msg: string): Promise<void>
   // 服务器/频道/好友 REST CRUD（服务端已有端点；批次①接线）
   ListServers(): Promise<ServerDTO[]>
+  ListChannels(serverID: number): Promise<ServerChannels>
   CreateServer(name: string): Promise<ServerDTO>
   JoinServerByCode(code: string): Promise<ServerDTO>
   RenameServer(id: number, name: string): Promise<void>
@@ -64,6 +65,9 @@ type GoApp = {
   DeleteChannel(id: number): Promise<void>
   CreateCategory(serverID: number, name: string): Promise<CategoryDTO>
   DeleteCategory(id: number, withChannels: boolean): Promise<void>
+  // 分类改名/排序（PATCH /categories/{id}）：name 空串 = 不改名，position < 0 = 不改位置。
+  RenameCategory(id: number, name: string): Promise<void>
+  UpdateCategory(id: number, name: string, position: number): Promise<CategoryDTO>
   SendFriendRequest(target: string): Promise<void>
   // 好友真实 REST（v0.1.2 批次③消费）
   ListFriends(): Promise<FriendDTO[]>
@@ -176,6 +180,12 @@ const mockApp: GoApp = {
   async RequestVoiceState() {},
   // 以下为批次①新增的服务器/频道/好友桩：返回可联调 UI 的假数据。
   async ListServers() { return [] },
+  async ListChannels(serverID: number) {
+    return {
+      categories: [{ id: 1, server_id: serverID, name: '默认分类', position: 0 }],
+      channels: [{ id: 11, server_id: serverID, name: '大厅', type: 'voice' as const, category_id: 1, position: 0 }],
+    }
+  },
   async CreateServer(name: string) {
     return { id: Date.now(), name, owner_id: 1, icon_name: 'messages-square', icon_color: '#4FA4F3' }
   },
@@ -194,6 +204,10 @@ const mockApp: GoApp = {
     return { id: Date.now(), server_id: serverID, name, position: 0 }
   },
   async DeleteCategory() {},
+  async RenameCategory() {},
+  async UpdateCategory(id: number, name: string, position: number) {
+    return { id, server_id: 0, name: name || `分类${id}`, position: position < 0 ? 0 : position }
+  },
   async SendFriendRequest() {},
   // 好友真实 REST 桩：空列表（浏览器开发环境无可联调数据）。
   async ListFriends() { return [] },
