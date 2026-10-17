@@ -214,7 +214,24 @@ type KV interface {
 	Del(ctx context.Context, keys ...string) error
 	// Incr 自增并返回新值；key 不存在时从 0 开始并设置 ttl。
 	Incr(ctx context.Context, key string, ttl time.Duration) (int64, error)
+	// Eval 执行 Lua 脚本（Redis）或锁内等价模拟（Mem）。
+	// 当前唯一脚本是 CASScript；实现方不认识脚本应报错而非猜语义（fail-closed）。
+	Eval(ctx context.Context, script string, keys []string, args ...string) (any, error)
 }
+
+// CASScript 比较交换（compare-and-swap）脚本：
+// KEYS[1] 当前值与 ARGV[1] 相等时替换为 ARGV[2]、TTL 重置为 ARGV[3] 秒并返回 1，否则返回 0。
+// Redis 单线程执行 EVAL，GET 比对与 SET 之间插不进其他写——auth 的刷新令牌旋转靠它
+// 杜绝并发重放（同一令牌被多个 goroutine 同时旋转时只有一个成功）。
+// Mem.Eval 在全局锁内模拟同一语义（GET+SET 排队执行，等价原子）。
+const CASScript = `
+local cur = redis.call('GET', KEYS[1])
+if cur == ARGV[1] then
+  redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+  return 1
+end
+return 0
+`
 
 // ErrKVNotFound Get 未命中（区别于其他错误）。
 var ErrKVNotFound = errors.New("kv: key not found")

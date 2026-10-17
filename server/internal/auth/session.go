@@ -97,13 +97,10 @@ func (x *SessionIndex) Upsert(ctx context.Context, uid int64, dev, ip string) (s
 		_ = x.kv.Set(ctx, sessionKVKey(uid, dev), sid, 7*24*time.Hour)
 	}
 	x.mu.Lock()
-	x.cache[sessionCacheKey(uid, dev)] = sessionCacheEntry{sid: sid, exp: time.Now().Add(sessionCacheCacheTTLForWrite)}
+	x.cache[sessionCacheKey(uid, dev)] = sessionCacheEntry{sid: sid, exp: time.Now().Add(sessionCacheTTL)}
 	x.mu.Unlock()
 	return sid, nil
 }
-
-// sessionCacheCacheTTLForWrite 写入时缓存 TTL（同 Get）。
-const sessionCacheCacheTTLForWrite = sessionCacheTTL
 
 // Delete 删除指定设备会话（登出）：三层同删。
 func (x *SessionIndex) Delete(ctx context.Context, uid int64, dev string) error {
@@ -125,12 +122,12 @@ func (x *SessionIndex) DeleteAll(ctx context.Context, uid int64) error {
 		_ = x.store.DeleteAllUserSessions(ctx, uid)
 	}
 	if x.kv != nil {
-		for _, d := range knownDevices {
+		for d := range DeviceTypes {
 			_ = x.kv.Del(ctx, sessionKVKey(uid, d))
 		}
 	}
 	x.mu.Lock()
-	for _, d := range knownDevices {
+	for d := range DeviceTypes {
 		delete(x.cache, sessionCacheKey(uid, d))
 	}
 	x.mu.Unlock()

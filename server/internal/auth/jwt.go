@@ -3,8 +3,10 @@ package auth
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
+	"github.com/OpenALC/LiteTalk/server/internal/store"
 	"github.com/golang-jwt/jwt/v5"
 )
 
@@ -72,7 +74,7 @@ func (j *JWT) ParseAccess(token string) (*Claims, error) {
 
 // ---- 刷新令牌（Redis 存储、每次旋转）----
 
-// RefreshStore 刷新令牌存取（KV 抽象，rt:{uid} 存哈希）。
+// RefreshStore 刷新令牌存取（KV 抽象，rt:{uid}:{dev} 存哈希）。
 type RefreshStore struct {
 	kv kvStore
 }
@@ -82,10 +84,27 @@ type kvStore interface {
 	Set(ctx context.Context, key, value string, ttl time.Duration) error
 	Del(ctx context.Context, keys ...string) error
 	Incr(ctx context.Context, key string, ttl time.Duration) (int64, error)
+	Eval(ctx context.Context, script string, keys []string, args ...string) (any, error)
 }
 
 // NewRefreshStore 构造刷新令牌存储。
 func NewRefreshStore(kv kvStore) *RefreshStore { return &RefreshStore{kv: kv} }
+
+// DeviceDesktop 桌面端设备类型（旧格式 refresh 令牌无 dev 段，一律按此解析，R1）。
+const DeviceDesktop = "desktop"
+
+// DeviceTypes 设备类型白名单（P2-2）：登录入参校验（api.deviceType）、refresh 令牌解析、
+// RevokeAll/DeleteAll 枚举共用这一份；新增设备类型只需改这里并补迁移文档。
+var DeviceTypes = map[string]struct{}{
+	"desktop": {},
+	"mobile":  {},
+}
+
+// IsKnownDevice 是否为白名单内的设备类型。
+func IsKnownDevice(dev string) bool {
+	_, ok := DeviceTypes[dev]
+	return ok
+}
 
 // rtKey 现代键：按 uid+dev 隔离（每设备一个槽位）。
 func rtKey(userID int64, dev string) string { return "rt:" + itoa(userID) + ":" + dev }
@@ -106,51 +125,72 @@ func (s *RefreshStore) Issue(ctx context.Context, userID int64, dev, sid string)
 	return plain, nil
 }
 
-// IssueWithUID 签发带 uid.sid 前缀的刷新令牌（"<uid>.<sid>.<random>"），
-// 客户端 refresh 时无需额外携带 user_id/sid，服务端可直接反查并比对当前会话。
-// sid 为空时签发旧格式 "<uid>.<random>"（兼容测试/迁移场景）。
+// IssueWithUID 签发带前缀的刷新令牌并存储哈希（R1：令牌自描述设备与会话）：
+//   - dev 非空：新格式 "<uid>.<dev>.<sid>.<rand>"（sid 为空时退化为 "<uid>.<dev>.<rand>"）；
+//   - dev 为空：旧格式 "<uid>.<sid>.<rand>"（sid 为空时再退化为 "<uid>.<rand>"）。
+//
+// 客户端 refresh/logout 时无需额外携带设备与会话信息，服务端从令牌本身解析。
 func (s *RefreshStore) IssueWithUID(ctx context.Context, userID int64, dev, sid string) (string, error) {
 	plain, err := s.Issue(ctx, userID, dev, sid)
 	if err != nil {
 		return "", err
 	}
-	if sid == "" {
-		return itoa(userID) + "." + plain, nil // 旧格式
-	}
-	return itoa(userID) + "." + sid + "." + plain, nil // 新格式
+	return formatRefreshToken(userID, dev, sid, plain), nil
 }
 
-// ParseRefreshToken 从 "<uid>.<sid>.<random>" 格式解析用户 ID 与 sid。
-func ParseRefreshToken(token string) (userID int64, sid string, ok bool) {
-	dot1 := -1
-	for i := 0; i < len(token); i++ {
-		if token[i] == '.' {
-			dot1 = i
-			break
-		}
+// formatRefreshToken 拼装 refresh 明文（不落库；普通签发与 CAS 旋转共用）。
+func formatRefreshToken(userID int64, dev, sid, plain string) string {
+	var b strings.Builder
+	b.WriteString(itoa(userID))
+	if dev != "" {
+		b.WriteByte('.')
+		b.WriteString(dev)
 	}
+	if sid != "" {
+		b.WriteByte('.')
+		b.WriteString(sid)
+	}
+	b.WriteByte('.')
+	b.WriteString(plain)
+	return b.String()
+}
+
+// ParseRefreshToken 解析 refresh 令牌，返回 uid、设备类型与会话 ID（R1：自描述，无需反查）。
+// 支持四种格式：
+//   - "<uid>.<dev>.<sid>.<rand>"：新格式，dev 段须命中 DeviceTypes 白名单；
+//   - "<uid>.<dev>.<rand>"：sid 为空的退化新格式（按 dev 段与旧格式区分，sid 恒为 32hex 不会撞设备名）；
+//   - "<uid>.<sid>.<rand>" / "<uid>.<rand>"：v1.1.0 前的旧格式，dev 一律按 desktop 解析。
+func ParseRefreshToken(token string) (uid int64, dev, sid string, ok bool) {
+	dot1 := strings.IndexByte(token, '.')
 	if dot1 <= 0 {
-		return 0, "", false
+		return 0, "", "", false
 	}
-	dot2 := -1
-	for i := dot1 + 1; i < len(token); i++ {
-		if token[i] == '.' {
-			dot2 = i
-			break
-		}
-	}
-	if dot2 <= dot1+1 {
-		return 0, "", false
-	}
-	uid := parseInto(token[:dot1])
+	uid = parseInto(token[:dot1])
 	if uid <= 0 {
-		return 0, "", false
+		return 0, "", "", false
 	}
-	sid = token[dot1+1 : dot2]
-	if len(sid) != 32 {
-		return 0, "", false
+	rest := token[dot1+1:]
+	dot2 := strings.IndexByte(rest, '.')
+	if dot2 < 0 {
+		return uid, DeviceDesktop, "", true // 旧格式 uid.rand
 	}
-	return uid, sid, true
+	seg, tail := rest[:dot2], rest[dot2+1:]
+	if IsKnownDevice(seg) {
+		// 新格式：tail 为 "<sid>.<rand>"，sid 为空时退化为 "<rand>"。
+		d := strings.IndexByte(tail, '.')
+		if d < 0 {
+			return uid, seg, "", true
+		}
+		if strings.IndexByte(tail[d+1:], '.') >= 0 {
+			return 0, "", "", false // rand 为 hex 不含点，再含点即畸形
+		}
+		return uid, seg, tail[:d], true
+	}
+	// 旧格式 uid.sid.rand：rand 是 hex 不含点，tail 再含点即畸形令牌。
+	if strings.IndexByte(tail, '.') >= 0 {
+		return 0, "", "", false
+	}
+	return uid, DeviceDesktop, seg, true
 }
 
 func parseInto(s string) int64 {
@@ -164,47 +204,32 @@ func parseInto(s string) int64 {
 	return n
 }
 
-// ErrSessionReplaced sid 与当前会话不符（另一会话已接管）。
+// ErrSessionReplaced 令牌 sid 与当前会话不符（另一会话已接管该设备槽位）。
+// 当前会话只存在于 SessionIndex，RefreshStore 无权访问，故由 API 层握手前比对后返回。
 var ErrSessionReplaced = errors.New("session replaced")
 
-// ErrSessionReplayed sid 与当前会话相符但哈希不符（旧令牌重放，整个令牌族作废）。
+// ErrSessionReplayed 旧令牌重放（CAS 比对失败：并发旋转被抢先，或旋转后的旧值再次使用）。
 var ErrSessionReplayed = errors.New("session replayed")
 
-// Rotate CAS 旋转：校验旧令牌匹配后换发新令牌并吊销旧值。
-// token 为完整格式（含 uid.sid 前缀）或裸随机串（兼容 Issue 直发）。
+// Rotate 旋转：校验旧令牌匹配后换发新令牌并吊销旧值。
+// dev/sid 全部从令牌解析（R1），调用方无从传错设备类型——P0-2（mobile 刷新必败）即因
+// 调用方写死 desktop 所致。token 为 IssueWithUID 签发的完整格式。
 //
-// 旧格式 "<uid>.<rand>"（无 sid 段）：legacy 分支读 rt:{uid} 单槽位，命中即迁移到新键。
-// 新格式 "<uid>.<sid>.<rand>"：走 Lua CAS（旧哈希匹配→原子替换）；
-// CAS 失败区分 sid 不符（session_replaced）与哈希不匹配（session_replayed，令牌族作废）。
-func (s *RefreshStore) Rotate(ctx context.Context, userID int64, oldPlain, dev, sid string) (string, error) {
-	// 剥离 uid/sid 前缀取真正的随机段做哈希比对。
-	raw := oldPlainStrip(userID, oldPlain)
-
-	// 新键 CAS 路径。
-	key := rtKey(userID, dev)
-	stored, err := s.kv.Get(ctx, key)
-	if err == nil && stored != "" {
-		// sid 与当前会话不符：另一会话已接管。
-		if u, tokSid, ok := ParseRefreshToken(oldPlain); ok && u == userID && tokSid != sid {
-			return "", ErrSessionReplaced
-		}
-		// 哈希不匹配：旧令牌重放。
-		if stored != HashToken(raw) {
-			return "", ErrSessionReplayed
-		}
-		// 发新令牌并原子替换。
-		plain, err := s.IssueWithUID(ctx, userID, dev, sid)
-		if err != nil {
-			return "", err
-		}
-		return plain, nil
+// 新键 rt:{uid}:{dev} 走 Lua CAS（store.CASScript）：Redis 单线程保证 GET 比对与 SET
+// 原子，并发重放同一令牌只有一个 goroutine 成功，其余 ErrSessionReplayed。
+// 新键无值时兼容旧版单槽位 rt:{uid}（v1.1.0 前的旧格式令牌）：命中即迁移到新键再旋转。
+func (s *RefreshStore) Rotate(ctx context.Context, userID int64, oldPlain string) (string, error) {
+	uid, dev, sid, ok := ParseRefreshToken(oldPlain)
+	if !ok || uid != userID {
+		return "", ErrInvalidToken
 	}
+	raw := oldPlainStrip(oldPlain)
+	key := rtKey(userID, dev)
 
-	// 新键无值：兼容读旧键 rt:{uid}（旧格式单槽位）。
-	if u, ok := ParseRefreshUID(oldPlain); ok && u == userID && stored == "" {
-		oldVal, err := s.kv.Get(ctx, rtKeyLegacy(userID))
-		if err == nil && oldVal == HashToken(raw) {
-			// 迁移到新键（当前会话 sid），再旋转。
+	// 新键无值：旧格式令牌读 legacy 单槽位，哈希命中则迁移（带上令牌自带 sid）到新键。
+	if _, err := s.kv.Get(ctx, key); err != nil {
+		oldVal, err2 := s.kv.Get(ctx, rtKeyLegacy(userID))
+		if err2 == nil && oldVal == HashToken(raw) {
 			plain, err := s.IssueWithUID(ctx, userID, dev, sid)
 			if err != nil {
 				return "", err
@@ -212,90 +237,71 @@ func (s *RefreshStore) Rotate(ctx context.Context, userID int64, oldPlain, dev, 
 			_ = s.kv.Del(ctx, rtKeyLegacy(userID)) // 迁移成功后删除旧键
 			return plain, nil
 		}
+		return "", ErrInvalidToken
 	}
-	return "", ErrInvalidToken
+
+	// 真 CAS：期望值=旧令牌哈希。不匹配（被抢先旋转/旧值重放）→ 0 → ErrSessionReplayed。
+	newPlain, err := RandomToken(32)
+	if err != nil {
+		return "", err
+	}
+	res, err := s.kv.Eval(ctx, store.CASScript, []string{key},
+		HashToken(raw), HashToken(newPlain), itoa(int64(RefreshTokenTTL/time.Second)))
+	if err != nil {
+		return "", err
+	}
+	if n, _ := res.(int64); n != 1 {
+		return "", ErrSessionReplayed
+	}
+	return formatRefreshToken(userID, dev, sid, newPlain), nil
 }
 
-// ParseRefreshUID 兼容旧签名（单值解析 uid）；新代码用 ParseRefreshToken。
-func ParseRefreshUID(token string) (int64, bool) {
-	if uid, _, ok := ParseRefreshToken(token); ok {
-		return uid, true
+// Revoke 吊销刷新令牌（logout）：dev 从令牌解析（R1），连 legacy 单槽位键一并删除——
+// 迁移窗口内只删新键会让旧格式令牌在 logout 后依然有效。
+func (s *RefreshStore) Revoke(ctx context.Context, userID int64, plain string) error {
+	uid, dev, _, ok := ParseRefreshToken(plain)
+	if !ok || uid != userID {
+		return ErrInvalidToken
 	}
-	// 旧格式：只有 uid 一段或 uid+rand。
-	if dot := indexOfDot(token); dot > 0 {
-		uid := parseInto(token[:dot])
-		if uid > 0 {
-			return uid, true
-		}
-	}
-	return 0, false
-}
-
-// Revoke 吊销指定设备的刷新令牌（logout）。
-func (s *RefreshStore) Revoke(ctx context.Context, userID int64, dev string) error {
-	return s.kv.Del(ctx, rtKey(userID, dev))
+	return s.kv.Del(ctx, rtKey(userID, dev), rtKeyLegacy(userID))
 }
 
 // RevokeAll 吊销该用户全部设备的刷新令牌（重置密码用）。
 func (s *RefreshStore) RevokeAll(ctx context.Context, userID int64) error {
-	// 逐设备删除（KV 抽象无 SCAN；设备类型有限：desktop/mobile/…）。
-	var keys []string
-	for _, d := range knownDevices {
+	// 逐设备删除（KV 抽象无 SCAN；设备类型枚举自 DeviceTypes 白名单）。
+	keys := make([]string, 0, len(DeviceTypes)+1)
+	for d := range DeviceTypes {
 		keys = append(keys, rtKey(userID, d))
 	}
 	keys = append(keys, rtKeyLegacy(userID)) // 兼容旧键
 	return s.kv.Del(ctx, keys...)
 }
 
-// knownDevices 本期支持的全部设备类型（RevokeAll 按此枚举）。
-var knownDevices = []string{"desktop", "mobile"}
-
-// Match 校验 "<uid>.<sid>.<rand>" 刷新令牌与存储哈希一致（logout 吊销前用）。
-func (s *RefreshStore) Match(ctx context.Context, userID int64, plain, dev string) bool {
-	raw := oldPlainStrip(userID, plain)
+// Match 校验刷新令牌与存储哈希一致（logout 吊销前用：不校验则伪造 "<uid>.x" 可吊销他人令牌）。
+// dev 从令牌解析（R1）；任何取数错误都按不匹配处理（fail-closed）。
+func (s *RefreshStore) Match(ctx context.Context, userID int64, plain string) bool {
+	uid, dev, _, ok := ParseRefreshToken(plain)
+	if !ok || uid != userID {
+		return false
+	}
 	stored, err := s.kv.Get(ctx, rtKey(userID, dev))
 	if err == nil {
-		return stored == HashToken(raw)
+		return stored == HashToken(oldPlainStrip(plain))
 	}
-	// 新键无值：兼容旧键。
-	oldVal, err2 := s.kv.Get(ctx, rtKeyLegacy(userID))
-	if err2 == nil {
-		return oldVal == HashToken(raw)
+	// 新键无值：兼容旧版单槽位 rt:{uid}（旧格式令牌）。
+	if oldVal, err := s.kv.Get(ctx, rtKeyLegacy(userID)); err == nil {
+		return oldVal == HashToken(oldPlainStrip(plain))
 	}
 	return false
 }
 
-// oldPlainStrip 从完整 refresh 令牌中剥离 uid/sid 前缀，取真正的随机段。
-// 新格式 "uid.sid.rand" → 返回 "rand"；旧格式 "uid.rand" → 返回 "rand"。
-// Issue 存的是 HashToken(rand)，所以比对时也必须只对 rand 做哈希。
-func oldPlainStrip(userID int64, plain string) string {
-	// 新格式：uid.sid.rand —— 第二个点之后是 rand。
-	if u, sid, ok := ParseRefreshToken(plain); ok && u == userID {
-		_ = sid // sid 已验证
-		dot1 := indexOfDot(plain)
-		dot2 := indexOfDot(plain[dot1+1:]) + dot1 + 1
-		return plain[dot2+1:] // skip "uid.sid."
-	}
-	// 旧格式：uid.rand —— 第一个点之后是 rand。
-	// 用 ParseRefreshUID（兼容 "uid." 和 "uid..rand" 等旧格式）。
-	if u, ok := ParseRefreshUID(plain); ok && u == userID {
-		// 找到第一个点，跳过它。
-		dot1 := indexOfDot(plain)
-		if dot1 > 0 {
-			return plain[dot1+1:] // skip "uid."
-		}
+// oldPlainStrip 从完整 refresh 令牌中取真正的随机段（末段）：Issue 存的是 HashToken(rand)，
+// 比对时也必须只对 rand 做哈希。rand 为 hex 不含点，故末段切分对全部格式成立。
+func oldPlainStrip(plain string) string {
+	if i := strings.LastIndexByte(plain, '.'); i >= 0 {
+		return plain[i+1:]
 	}
 	return plain
-}
-
-// indexOfDot 找第一个 '.' 的下标；不存在返回 -1。
-func indexOfDot(s string) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == '.' {
-			return i
-		}
-	}
-	return -1
 }
 
 // ErrKV 透传存储错误。

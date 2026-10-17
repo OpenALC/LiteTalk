@@ -44,18 +44,14 @@ type emailCodeReq struct {
 	Purpose string `json:"purpose"` // register | reset
 }
 
-// deviceType 校验并回落设备类型（空→desktop；白名单 [a-z0-9_-]，≤16 字符）。
+// deviceType 校验并回落设备类型（空→desktop）。白名单与 auth.DeviceTypes 共用（P2-2）：
+// 新增设备类型只需改 auth 包一处；非法值（如 tablet）一律 400。
 func deviceType(s string) (string, bool) {
 	if s == "" {
-		return "desktop", true
+		return auth.DeviceDesktop, true
 	}
-	if len(s) > 16 {
+	if !auth.IsKnownDevice(s) {
 		return "", false
-	}
-	for _, c := range s {
-		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
-			return "", false
-		}
 	}
 	return s, true
 }
@@ -103,11 +99,6 @@ func fmtTag(n int) string {
 	return s
 }
 
-// parseRefreshUID 解析 "<uid>.<random>" 格式刷新令牌中的用户 ID。
-func parseRefreshUID(token string) (int64, bool) {
-	return auth.ParseRefreshUID(token)
-}
-
 // ---- handlers ----
 
 // handleRegister POST /api/v1/auth/register（限流 10 次/h/IP：防批量注册与 bcrypt CPU 放大）
@@ -123,7 +114,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	dev, okDev := deviceType(req.Device)
 	if !okDev {
-		writeErr(w, http.StatusBadRequest, "bad_device", "设备类型不合法（≤16 字符，仅 a-z0-9_-）")
+		writeErr(w, http.StatusBadRequest, "bad_device", "设备类型不合法（仅 desktop/mobile）")
 		return
 	}
 	req.Email = normalizeEmail(req.Email)
@@ -204,7 +195,7 @@ func (s *Server) handleGuest(w http.ResponseWriter, r *http.Request) {
 	}
 	dev, okDev := deviceType(req.Device)
 	if !okDev {
-		writeErr(w, http.StatusBadRequest, "bad_device", "设备类型不合法")
+		writeErr(w, http.StatusBadRequest, "bad_device", "设备类型不合法（仅 desktop/mobile）")
 		return
 	}
 
@@ -266,7 +257,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	req.Email = normalizeEmail(req.Email)
 	dev, okDev := deviceType(req.Device)
 	if !okDev {
-		writeErr(w, http.StatusBadRequest, "bad_device", "设备类型不合法")
+		writeErr(w, http.StatusBadRequest, "bad_device", "设备类型不合法（仅 desktop/mobile）")
 		return
 	}
 	user, err := s.store.UserByEmail(r.Context(), req.Email)
@@ -289,29 +280,25 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_request", "缺少 refresh_token")
 		return
 	}
-	// 先尝试解析新格式 uid.sid.rand；旧格式 uid.rand 走兼容分支。
-	uid, sid, ok := auth.ParseRefreshToken(req.RefreshToken)
+	// 令牌自描述 uid/dev/sid（R1：<uid>.<dev>.<sid>.<rand>，旧格式回落 dev=desktop）。
+	// 设备类型从令牌解析而非写死——P0-2：mobile 用户刷新时按 desktop 取键必败。
+	uid, dev, sid, ok := auth.ParseRefreshToken(req.RefreshToken)
 	if !ok {
-		// 旧格式：只有 uid.rand（无 sid）。
-		uid, ok = parseRefreshUID(req.RefreshToken)
-		if !ok {
-			writeErr(w, http.StatusUnauthorized, "unauthorized", "refresh_token 不合法")
-			return
-		}
-		sid = "" // 旧格式，无 sid 约束
+		writeErr(w, http.StatusUnauthorized, "unauthorized", "refresh_token 不合法")
+		return
 	}
-	// sid 与当前会话不符：另一会话已接管（session_replaced）。
+	// sid 与当前会话不符：另一会话已接管该设备槽位（session_replaced）。
 	if s.sess != nil && sid != "" {
-		curSid, err := s.sess.Get(r.Context(), uid, "desktop")
+		curSid, err := s.sess.Get(r.Context(), uid, dev)
 		if err == nil && curSid != "" && sid != curSid {
 			w.Header().Set("X-LiteTalk-Auth", "session_replaced")
 			writeErr(w, http.StatusUnauthorized, "session_replaced", "账号已在其他设备登录")
 			return
 		}
 	}
-	plain, err := s.refresh.Rotate(r.Context(), uid, req.RefreshToken, "desktop", sid)
+	plain, err := s.refresh.Rotate(r.Context(), uid, req.RefreshToken)
 	if err != nil {
-		var code = "unauthorized"
+		code := "unauthorized"
 		if errors.Is(err, auth.ErrSessionReplayed) {
 			code = "session_replayed"
 			w.Header().Set("X-LiteTalk-Auth", "session_replayed")
@@ -324,7 +311,7 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, err)
 		return
 	}
-	access, err := s.jwt.SignAccess(user.ID, user.Nickname, user.Tag, sid, "desktop")
+	access, err := s.jwt.SignAccess(user.ID, user.Nickname, user.Tag, sid, dev)
 	if err != nil {
 		writeStoreErr(w, err)
 		return
@@ -344,27 +331,28 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	uid, ok := parseRefreshUID(req.RefreshToken)
+	// 设备类型同样从令牌解析（R1），不再写死 desktop。
+	uid, dev, _, ok := auth.ParseRefreshToken(req.RefreshToken)
 	if !ok {
 		writeErr(w, http.StatusUnauthorized, "unauthorized", "refresh_token 不合法")
 		return
 	}
-	if !s.refresh.Match(r.Context(), uid, req.RefreshToken, "desktop") {
+	if !s.refresh.Match(r.Context(), uid, req.RefreshToken) {
 		writeErr(w, http.StatusUnauthorized, "unauthorized", "refresh_token 无效或已吊销")
 		return
 	}
-	if err := s.refresh.Revoke(r.Context(), uid, "desktop"); err != nil {
+	if err := s.refresh.Revoke(r.Context(), uid, req.RefreshToken); err != nil {
 		s.log.Printf("[audit] logout 吊销失败 uid=%d err=%v", uid, err)
 		writeErr(w, http.StatusInternalServerError, "internal", "服务器内部错误")
 		return
 	}
 	// 删除该设备会话记录。
 	if s.sess != nil {
-		_ = s.sess.Delete(r.Context(), uid, "desktop")
+		_ = s.sess.Delete(r.Context(), uid, dev)
 	}
 	// 登出即踢自己的 WS（同 uid+dev 的活动连接）；reason 空→login_elsewhere（契约 §0.11）。
 	if s.hub != nil {
-		s.hub.Kick(strconv.FormatInt(uid, 10), "desktop", "")
+		s.hub.Kick(strconv.FormatInt(uid, 10), dev, "")
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
