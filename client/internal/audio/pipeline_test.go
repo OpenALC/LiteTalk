@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/OpenALC/LiteTalk/client/internal/codec"
+	"github.com/OpenALC/LiteTalk/client/internal/hotkey"
 )
 
 // requireOpus 编解码测试前置：darwin 尚未接入 libopus（stub），是唯一允许
@@ -198,6 +199,236 @@ func TestPacketHook(t *testing.T) {
 	}
 	if st := p.Stats(); st.PacketsDecoded != 0 {
 		t.Fatalf("non-loopback PacketsDecoded = %d, want 0", st.PacketsDecoded)
+	}
+}
+
+// ---------- 按键说话发送门（v1.2.0） ----------
+
+// gatePipeline 构造带发包门的非回环管线（不起后端，ProcessPCM 同步注入），
+// 与 TestPacketHook 同款；返回管线与已设模式的 Gate。
+func gatePipeline(t *testing.T, mode hotkey.Mode, onPacket func(), onSpeak func(bool)) (*Pipeline, *hotkey.Gate) {
+	t.Helper()
+	p := newLoopbackPipeline(t, func(c *PipelineConfig) {
+		c.Loopback = false
+		c.DSP.Denoise = false // 省掉 RNNoise；说话判定走 RMS 支路（vadAvailable=false）
+		if onPacket != nil {
+			c.OnPacket = func([]byte) { onPacket() }
+		}
+		if onSpeak != nil {
+			c.DSP.OnSpeakingChange = onSpeak
+		}
+	})
+	g := &hotkey.Gate{}
+	g.SetMode(mode)
+	p.SetSendGate(g)
+	return p, g
+}
+
+// feedLoud / feedSilent 注入 n 个 10ms 帧。loud 的 RMS 远高于自适应门限
+// （初始底噪 -50dB → 进入门限 -38dB），EnterFrames=3 帧内必翻说话态。
+func feedLoud(t *testing.T, p *Pipeline, in []int16, phase *float64, rng *uint32, frames int) {
+	t.Helper()
+	for i := 0; i < frames; i++ {
+		sineNoiseFrame(in, phase, 12000, 2000, rng)
+		if err := p.ProcessPCM(in); err != nil {
+			t.Fatalf("ProcessPCM: %v", err)
+		}
+	}
+}
+
+func feedSilent(t *testing.T, p *Pipeline, in []int16, frames int) {
+	t.Helper()
+	clear(in)
+	for i := 0; i < frames; i++ {
+		if err := p.ProcessPCM(in); err != nil {
+			t.Fatalf("ProcessPCM: %v", err)
+		}
+	}
+}
+
+// TestSendGatePTT 按住说话：未按住全拦（PTTDropped 计数）、按住放行、
+// 尾包 0 松手即拦、尾包窗内继续放行且窗过恢复全拦。
+func TestSendGatePTT(t *testing.T) {
+	var packets int
+	p, gate := gatePipeline(t, hotkey.ModePTT, func() { packets++ }, nil)
+	in := make([]int16, FrameSize)
+	var phase float64
+	var rng uint32 = 0x5A5A
+
+	feedLoud(t, p, in, &phase, &rng, 20) // 100ms = 10 个包
+	if packets != 0 {
+		t.Fatalf("未按住却发出 %d 个包", packets)
+	}
+	if d := p.Stats().PTTDropped; d != 10 {
+		t.Fatalf("PTTDropped = %d, want 10", d)
+	}
+
+	gate.Press()
+	feedLoud(t, p, in, &phase, &rng, 20)
+	if packets != 10 {
+		t.Fatalf("按住后只发出 %d 个包, want 10", packets)
+	}
+	if d := p.Stats().PTTDropped; d != 10 {
+		t.Fatalf("按住期间 PTTDropped 不应增长, got %d", d)
+	}
+
+	// 尾包 0：松手立即全拦（不补尾音）。
+	gate.Release(0)
+	feedLoud(t, p, in, &phase, &rng, 20)
+	if packets != 10 {
+		t.Fatalf("松手（无尾包）后又发出 %d 个包", packets-10)
+	}
+	if d := p.Stats().PTTDropped; d != 20 {
+		t.Fatalf("PTTDropped = %d, want 20", d)
+	}
+
+	// 尾包窗：松手后 250ms 内继续放行，窗过恢复全拦。
+	gate.Press()
+	feedLoud(t, p, in, &phase, &rng, 4) // 2 个包（此时说话态早已立起）
+	before := packets
+	gate.Release(250 * time.Millisecond)
+	feedLoud(t, p, in, &phase, &rng, 4) // 窗内：再 2 个包
+	if packets-before != 2 {
+		t.Fatalf("尾包窗内包数 = %d, want 2", packets-before)
+	}
+	if d := p.Stats().PTTDropped; d != 20 {
+		t.Fatalf("尾包窗内 PTTDropped 不应增长, got %d", d)
+	}
+	time.Sleep(300 * time.Millisecond) // 窗（250ms）必已过期
+	feedLoud(t, p, in, &phase, &rng, 20)
+	if packets != before+2 {
+		t.Fatalf("尾包窗过后又发出 %d 个包", packets-before-2)
+	}
+	if d := p.Stats().PTTDropped; d != 30 {
+		t.Fatalf("PTTDropped = %d, want 30", d)
+	}
+}
+
+// TestSendGateVoice 语音激活：门控来源是 DSP VAD——静音帧全拦、语音帧放行。
+// 这是 ModeVoice 与 ModeOpen 的唯一区别（常开不看 speaking，见下一例）。
+func TestSendGateVoice(t *testing.T) {
+	var packets int
+	p, _ := gatePipeline(t, hotkey.ModeVoice, func() { packets++ }, nil)
+	in := make([]int16, FrameSize)
+
+	feedSilent(t, p, in, 20) // VAD 不起：全拦
+	if packets != 0 {
+		t.Fatalf("静音期却发出 %d 个包", packets)
+	}
+	if d := p.Stats().PTTDropped; d != 10 {
+		t.Fatalf("PTTDropped = %d, want 10", d)
+	}
+
+	var phase float64
+	var rng uint32 = 0x77
+	feedLoud(t, p, in, &phase, &rng, 20) // EnterFrames=3 迟滞后放行
+	if packets == 0 {
+		t.Fatal("语音期一个包都没发出")
+	}
+	if packets >= 10 {
+		t.Fatalf("语音期发出 %d/10 个包，EnterFrames 迟滞似乎失效", packets)
+	}
+	// 丢弃数 = 静音期 10 个 + 语音期进门限迟滞丢掉的那几个。
+	if d := p.Stats().PTTDropped; d != uint64(10+(10-packets)) {
+		t.Fatalf("PTTDropped = %d, want %d", d, 10+(10-packets))
+	}
+}
+
+// TestSendGateOpen 常开：恒放行，静音帧也照发（与 ModeVoice 正相反）。
+func TestSendGateOpen(t *testing.T) {
+	var packets int
+	p, _ := gatePipeline(t, hotkey.ModeOpen, func() { packets++ }, nil)
+	in := make([]int16, FrameSize)
+	feedSilent(t, p, in, 20)
+	if packets != 10 {
+		t.Fatalf("常开模式静音期包数 = %d, want 10", packets)
+	}
+	if d := p.Stats().PTTDropped; d != 0 {
+		t.Fatalf("常开模式 PTTDropped = %d, want 0", d)
+	}
+}
+
+// TestSendGateNil 未设门 = 恒放行：门是可选装配，nil 不改变既有行为。
+func TestSendGateNil(t *testing.T) {
+	var packets int
+	p := newLoopbackPipeline(t, func(c *PipelineConfig) {
+		c.Loopback = false
+		c.OnPacket = func([]byte) { packets++ }
+	})
+	in := make([]int16, FrameSize)
+	feedSilent(t, p, in, 20)
+	if packets != 10 {
+		t.Fatalf("无门时包数 = %d, want 10", packets)
+	}
+	if d := p.Stats().PTTDropped; d != 0 {
+		t.Fatalf("无门时 PTTDropped = %d, want 0", d)
+	}
+}
+
+// TestSendGateSuppressesSpeaking 门关时压掉说话态：包已被发包门拦下，
+// UI 声波球与远端说话状态不能再亮（否则"包没发却在说话"）。
+// DSP 自身状态不受影响（Speaking() 仍为真），门开后重新上报。
+func TestSendGateSuppressesSpeaking(t *testing.T) {
+	var states []bool
+	p, gate := gatePipeline(t, hotkey.ModePTT, nil, func(b bool) { states = append(states, b) })
+	in := make([]int16, FrameSize)
+	var phase float64
+	var rng uint32 = 0x33
+
+	feedLoud(t, p, in, &phase, &rng, 100) // 1s 大声：DSP 必判说话
+	if !p.Speaking() {
+		t.Fatal("DSP 应已判说话（门只压上报，不改 DSP 状态）")
+	}
+	for _, s := range states {
+		if s {
+			t.Fatalf("门关时不应上报说话: %v", states)
+		}
+	}
+
+	feedSilent(t, p, in, 300) // 3s 静音：DSP 退出说话态
+	if p.Speaking() {
+		t.Fatal("3s 静音后 DSP 应退出说话态")
+	}
+
+	gate.Press()
+	feedLoud(t, p, in, &phase, &rng, 100) // 按住 + 大声：正常上报 true
+	sawTrue := false
+	for _, s := range states {
+		sawTrue = sawTrue || s
+	}
+	if !sawTrue {
+		t.Fatalf("按住后应上报说话: %v", states)
+	}
+}
+
+// BenchmarkProcessPCMWithSendGate 带发包门的同步注入基准：门加在编码出口，
+// 每帧只多一次原子指针 Load + Gate 内 atomic 读，必须零分配（热路径红线）。
+func BenchmarkProcessPCMWithSendGate(b *testing.B) {
+	requireOpus(b)
+	cfg := DefaultPipelineConfig()
+	cfg.Backend = BackendNull
+	cfg.Loopback = false
+	cfg.DSP.Denoise = false
+	p, err := NewPipeline(cfg)
+	if err != nil {
+		b.Fatalf("NewPipeline: %v", err)
+	}
+	defer p.Close()
+	gate := &hotkey.Gate{}
+	gate.SetMode(hotkey.ModePTT)
+	gate.Press() // 按住：放行，走完整发包路径
+	p.SetSendGate(gate)
+
+	in := make([]int16, FrameSize)
+	var phase float64
+	var rng uint32 = 0xABCD
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sineNoiseFrame(in, &phase, 12000, 2000, &rng)
+		if err := p.ProcessPCM(in); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/OpenALC/LiteTalk/client/internal/codec"
+	"github.com/OpenALC/LiteTalk/client/internal/hotkey"
 )
 
 // Backend 选择管线的音频来源/去向。
@@ -120,6 +121,7 @@ type Stats struct {
 	PlaybackUnderruns atomic.Uint64 // 播放欠载次数（补静音）
 	PlaybackDropped   atomic.Uint64 // 播放环满丢弃的采样数
 	SpeakingChanges   atomic.Uint64 // 说话状态翻转次数
+	PTTDropped        atomic.Uint64 // 按键说话发送门拦下的包数（20ms）
 	LatencyCount      atomic.Uint64 // 延迟测量样本数
 	LatencySumUS      atomic.Uint64 // 延迟累计（微秒）
 	LatencyMaxUS      atomic.Uint64 // 延迟峰值（微秒）
@@ -141,6 +143,7 @@ type StatsSnapshot struct {
 	PlaybackUnderruns uint64
 	PlaybackDropped   uint64
 	SpeakingChanges   uint64
+	PTTDropped        uint64
 	AvgPacketBytes    float64
 	LatencyCount      uint64
 	LatencyAvgUS      uint64
@@ -176,6 +179,7 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		PlaybackUnderruns: s.PlaybackUnderruns.Load(),
 		PlaybackDropped:   s.PlaybackDropped.Load(),
 		SpeakingChanges:   s.SpeakingChanges.Load(),
+		PTTDropped:        s.PTTDropped.Load(),
 		AvgPacketBytes:    avg,
 		LatencyCount:      latCnt,
 		LatencyAvgUS:      latAvg,
@@ -212,6 +216,11 @@ type Pipeline struct {
 
 	// inputMode 当前下混模式（原子热调；StartCapture/热重启读取）。
 	inputMode atomic.Uint32
+
+	// sendGate 按键说话发送门（PTT 按住 / 语音激活 / 常开）。nil = 不设门，
+	// 恒放行。原子指针：处理 goroutine 每帧 Load，SetSendGate 可在任意
+	// goroutine 调用（值对象长期存活，跨会话复用不会泄漏）。
+	sendGate atomic.Pointer[hotkey.Gate]
 
 	done    chan struct{}
 	wg      sync.WaitGroup
@@ -254,6 +263,12 @@ func NewPipeline(cfg PipelineConfig) (*Pipeline, error) {
 	p.inputMode.Store(uint32(cfg.InputMode))
 
 	cfg.DSP.OnSpeakingChange = func(b bool) {
+		// PTT 门关闭时同步压掉说话态：这一帧的发包已被发送门拦下，UI 的
+		// 声波球与远端说话状态不能再亮，否则出现「包没发却在说话」。
+		// 语义与 session 的静音压制一致（muted 时同样上报 false）。
+		if g := p.sendGate.Load(); g != nil && !g.Allow(b) {
+			b = false
+		}
 		p.stats.SpeakingChanges.Add(1)
 		if userSpeakCB != nil {
 			userSpeakCB(b)
@@ -603,6 +618,10 @@ func (p *Pipeline) SetOpusPacketLoss(pct int) error {
 // Speaking 当前说话状态。
 func (p *Pipeline) Speaking() bool { return p.dsp.Speaking() }
 
+// SetSendGate 设置按键说话发送门（传 nil 清除）。Gate 是零分配的值对象，
+// 可在会话建立时注入一次、长期复用；热路径只做一次原子指针 Load。
+func (p *Pipeline) SetSendGate(g *hotkey.Gate) { p.sendGate.Store(g) }
+
 // ReadPlayback 从播放环读出解码后的采样（测试/null 汇用），返回采样数。
 func (p *Pipeline) ReadPlayback(out []int16) int { return p.playRing.Read(out) }
 
@@ -698,8 +717,8 @@ func (p *Pipeline) synthFrame(dst []int16) {
 	}
 }
 
-// processFrame 单个 10ms 帧的核心链路：DSP → 拼 20ms → 编码 → 回环解码 → 播放环。
-// 全部使用预分配缓冲，零堆分配。仅处理 goroutine 调用。
+// processFrame 单个 10ms 帧的核心链路：DSP → 拼 20ms → 编码 → 发包门 →
+// 回环解码 → 播放环。全部使用预分配缓冲，零堆分配。仅处理 goroutine 调用。
 func (p *Pipeline) processFrame(frame []int16) {
 	if p.opusHalf == 0 {
 		p.frameStart = time.Now()
@@ -728,6 +747,16 @@ func (p *Pipeline) processFrame(frame []int16) {
 	}
 	p.stats.PacketsEncoded.Add(1)
 	p.stats.BytesEncoded.Add(uint64(n))
+
+	// 发包门：发送 = !muted && (gate == nil || gate.Allow(speaking))。
+	// muted 门在 rtc/peer.go（SendOpus）那一侧，此处只做按键说话门控。
+	// speaking 取 DSP 本帧判定（驱动 OnSpeakingChange 的同一个量，见
+	// dsp.updateSpeaking），不重算；门关时计数丢弃并整帧短路，回环试听
+	// 一并停掉——没发出去的声音也不该回放。
+	if g := p.sendGate.Load(); g != nil && !g.Allow(p.dsp.Speaking()) {
+		p.stats.PTTDropped.Add(1)
+		return
+	}
 
 	if p.cfg.OnPacket != nil {
 		p.cfg.OnPacket(p.pktBuf[:n])
