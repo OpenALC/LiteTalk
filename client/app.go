@@ -871,9 +871,9 @@ func (a *App) connectSession(token, nickname string, gen uint64) error {
 func (a *App) connectSessionLocked(token, nickname string) error {
 	a.disconnectSessionLocked()
 	ev := state.Events{
-		OnPeerJoin: func(userID, nickname string, speaking, mute, deafen bool) {
+		OnPeerJoin: func(userID, nickname, tag string, speaking, mute, deafen bool) {
 			a.emit("voice:peer-join", map[string]any{
-				"user_id": userID, "nickname": nickname,
+				"user_id": userID, "nickname": nickname, "tag": tag,
 				"speaking": speaking, "mute": mute, "deafen": deafen,
 			})
 		},

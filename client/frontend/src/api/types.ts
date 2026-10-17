@@ -25,6 +25,7 @@ export interface ServerConfig {
 export interface PeerView {
   user_id: string
   nickname: string
+  tag: string
   speaking: boolean
   mute: boolean
   deafen: boolean

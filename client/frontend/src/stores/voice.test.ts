@@ -11,7 +11,7 @@ describe('voice store 房间态清理', () => {
   })
 
   const peer: PeerView = {
-    user_id: 'u1', nickname: '甲', speaking: false, mute: false, deafen: false,
+    user_id: 'u1', nickname: '甲', tag: '0001', speaking: false, mute: false, deafen: false,
   }
 
   it('resetRoom 清空频道、成员与延迟', () => {

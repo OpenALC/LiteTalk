@@ -71,6 +71,7 @@ type client struct {
 	conn     *websocket.Conn
 	userID   string
 	username string
+	tag      string // 昵称#tag 的 tag（join 时从 store 缓存，成员快照填充）
 	sid      string // 会话 ID（握手比对后的声明值；dev 令牌为空）
 	dev      string // 设备类型（desktop/…）
 	connID   uint64 // Hub 自增连接标识；SFU peer 挂此值做归属核对（§0.9）
@@ -471,9 +472,14 @@ func (h *Hub) authorizeChannelJoin(c *client, channelID string) (code, msg strin
 	if err != nil {
 		return ErrCodeForbidden, "无权进入该频道"
 	}
-	if _, err := h.chatStore.Member(ctx, ch.ServerID, uid); err != nil {
+	mem, err := h.chatStore.Member(ctx, ch.ServerID, uid)
+	if err != nil {
 		return ErrCodeForbidden, "无权进入该频道"
 	}
+	// 缓存 tag 到连接上（成员快照填充用；join 是低频路径，一次查询即可）
+	c.mu.Lock()
+	c.tag = mem.Tag
+	c.mu.Unlock()
 	return "", ""
 }
 
@@ -826,6 +832,7 @@ func memberInfoOf(m *client) MemberInfo {
 	return MemberInfo{
 		UserID:   m.userID,
 		Nickname: m.username,
+		Tag:      m.tag,
 		Mute:     m.state.Mute != nil && *m.state.Mute,
 		Deafen:   m.state.Deafen != nil && *m.state.Deafen,
 		Speaking: m.state.Speaking != nil && *m.state.Speaking,
@@ -839,6 +846,7 @@ func memberInfos(members []*client) []MemberInfo {
 		infos = append(infos, MemberInfo{
 			UserID:   m.userID,
 			Nickname: m.username,
+			Tag:      m.tag,
 			Mute:     m.state.Mute != nil && *m.state.Mute,
 			Deafen:   m.state.Deafen != nil && *m.state.Deafen,
 			Speaking: m.state.Speaking != nil && *m.state.Speaking,
