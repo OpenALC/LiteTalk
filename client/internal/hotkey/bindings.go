@@ -1,10 +1,16 @@
 package hotkey
 
+import "time"
+
 // 平台中立部分：绑定表构建、按下/抬起配对、按键位图。
 // 三个平台（windows/linux/darwin）共用这一份，各自只提供「主键 token → 平台
 // 原生键码」的映射和 OS 事件摄取。曾把这些放在 windows 标签文件里，导致 darwin
 // 和 linux 各自抄一份——而按下/抬起配对正是出过 bug 的地方（Windows 的 X 按钮
 // 编号差 3），抄多份等于给同类缺陷留多个入口。
+
+// stopTimeout 是 Stop() 等平台事件循环退出的上限。正常路径下退出信号一投过去
+// 循环立刻返回，这个超时只是兜底，不该被踩到。三个平台共用同一个值。
+const stopTimeout = 2 * time.Second
 
 // keyBind 一条键盘绑定。code 是平台原生键码（Windows VK / Linux KeySym /
 // macOS keycode），由各平台的 keycodeOf 解析后填入；token 保留原始主键，

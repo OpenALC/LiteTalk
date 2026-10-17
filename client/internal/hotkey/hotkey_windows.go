@@ -73,10 +73,6 @@ const (
 	vkRWin     = 0x5C
 )
 
-// stopTimeout 是 Stop() 等消息循环退出的上限。正常路径下 PostThreadMessageW
-// 一投过去 GetMessageW 立刻返回，这个超时只是兜底，不该被踩到。
-const stopTimeout = 2 * time.Second
-
 // kbdllhookstruct 对应 Win32 KBDLLHOOKSTRUCT。
 type kbdllhookstruct struct {
 	vkCode      uint32
