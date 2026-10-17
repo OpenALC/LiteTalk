@@ -1059,6 +1059,11 @@ func (a *App) ListServers() ([]state.ServerDTO, error) {
 	return a.api.ListServers()
 }
 
+// ListChannels 列出服务器的分类与频道（成员可读）；重启后频道列表恢复用。
+func (a *App) ListChannels(serverID int64) (*state.ServerChannels, error) {
+	return a.api.ListChannels(serverID)
+}
+
 // CreateServer 创建服务器（名称为唯一必填项）。
 func (a *App) CreateServer(name string) (*state.ServerDTO, error) {
 	return a.api.CreateServer(name)

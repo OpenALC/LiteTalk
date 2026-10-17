@@ -1,11 +1,15 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { goApp } from '../api/bridge'
+import type { ServerChannels } from '../api/types'
 
 // 频道/服务器/好友数据域。
-// 服务器/频道的管理操作已接真实 REST（批次①）；频道「列出」服务端暂无
-// GET 端点，因此 REST 服务器的频道列表只在会话内可见（新建时拿到真实 ID），
-// 重启后需服务端补 GET /servers/{id}/channels 才能恢复——见 store 内注释。
+// 服务器/频道的管理操作已接真实 REST（批次①）；频道列表经
+// GET /servers/{id}/channels 在登录后逐服恢复（#12）——重启不再丢列表。
+// 服务端已建频道挂到分类下，但客户端新建频道暂不带 category_id（issue 未覆盖），
+// 会话内新建的频道落在类型默认组，重启后随服务端数据归位（见 loadChannels）。
+
+export const UNCATEGORIZED = '未分类'
 
 export interface Channel {
   id: string
@@ -146,8 +150,8 @@ export const useServersStore = defineStore('servers', () => {
 
   // ---- 真实 REST（批次①接线） ----
 
-  // loadRemoteServers 登录后拉取真实服务器列表并入（数字 ID 与内置示例不冲突）。
-  // 注意：服务端暂无「列出服务器频道」端点，REST 服务器的频道列表需会话内新建。
+  // loadRemoteServers 登录后拉取真实服务器并恢复各自频道列表（数字 ID 与内置示例不冲突）。
+  // 逐服调 ListChannels、单服失败只跳过（403/网络错误都不重试），不阻断其它服。
   async function loadRemoteServers() {
     const list = await goApp().ListServers()
     for (const s of list) {
@@ -155,6 +159,37 @@ export const useServersStore = defineStore('servers', () => {
       if (!servers.value.some((x) => x.id === id)) {
         servers.value.push({ id, name: s.name, icon: iconFromServer(s.icon_name), channels: [] })
       }
+      await loadChannels(id)
+    }
+  }
+
+  // loadChannels 拉服务器的分类与频道：channel.group 取分类名（无分类归「未分类」），
+  // 空分类也进 extraGroups（空分类重启后不丢）。失败静默跳过，由调用方决定是否提示。
+  async function loadChannels(serverId: string) {
+    const s = findServer(serverId)
+    if (!s || s.builtin) return
+    let out: ServerChannels
+    try {
+      out = await goApp().ListChannels(Number(serverId))
+    } catch {
+      return
+    }
+    const nameOf = new Map<number, string>()
+    for (const c of out.categories ?? []) nameOf.set(c.id, c.name)
+    s.channels = (out.channels ?? []).map((c) => ({
+      id: String(c.id),
+      name: c.name,
+      type: c.type,
+      group: (c.category_id ? nameOf.get(c.category_id) : undefined) || UNCATEGORIZED,
+    }))
+    extraGroups.value = {
+      ...extraGroups.value,
+      [serverId]: (out.categories ?? [])
+        .map((c) => ({ id: String(c.id), name: c.name, position: c.position ?? 0 }))
+        .sort((a, b) => a.position - b.position),
+    }
+    if (currentChannelId.value && !s.channels.some((c) => c.id === currentChannelId.value)) {
+      currentChannelId.value = s.channels[0]?.id ?? ''
     }
   }
 
@@ -246,20 +281,36 @@ export const useServersStore = defineStore('servers', () => {
 
   // ---- 频道分类（v0.1.2：服务端 categories 实体 + 内置示例本地语义） ----
   // extraGroups：服务器 ID → 分类列表（含空分类；内置服务器 id 为 'local-<name>'）。
-  const extraGroups = ref<Record<string, { id: string; name: string }[]>>({})
+  // position 为显示序（真实分类 = 服务端 position，重排后 0..n-1）。
+  const extraGroups = ref<Record<string, { id: string; name: string; position: number }[]>>({})
 
-  // groupsOf 某服务器的全部分类（频道 group 并集 + 空分类），保持首次出现序。
+  // groupsOf 某服务器的全部分类。Channel.group 是分类名——按名归组（同名分类会
+  // 合并显示，过渡方案）。排序：显式分类按 position；无分类条目的分组里「未分类」
+  // 沉底，其余（内置示例自带组）按频道首次出现序排在显式分类之前。sort 稳定。
   function groupsOf(serverId: string, channels: Channel[]): { id: string; name: string }[] {
-    const out: { id: string; name: string }[] = []
+    const cats = extraGroups.value[serverId] ?? []
+    const byName = new Map(cats.map((g) => [g.name, g]))
+    const out: { id: string; name: string; key: number }[] = []
     const seen = new Set<string>()
-    const put = (id: string, name: string) => {
+    const put = (id: string, name: string, key: number) => {
       if (seen.has(name)) return
       seen.add(name)
-      out.push({ id, name })
+      out.push({ id, name, key })
     }
-    for (const c of channels) put(`chan:${c.group}`, c.group)
-    for (const g of extraGroups.value[serverId] ?? []) put(g.id, g.name)
-    return out
+    let rank = 0
+    for (const c of channels) {
+      const g = byName.get(c.group)
+      if (g) {
+        put(g.id, g.name, g.position)
+      } else if (c.group === UNCATEGORIZED) {
+        put(`chan:${c.group}`, c.group, Number.MAX_SAFE_INTEGER)
+      } else {
+        put(`chan:${c.group}`, c.group, -1000 + rank++)
+      }
+    }
+    for (const g of cats) put(g.id, g.name, g.position)
+    out.sort((a, b) => a.key - b.key)
+    return out.map(({ id, name }) => ({ id, name }))
   }
 
   // createCategory 新建分类：真实服务器走 REST；内置示例仅本地（重启还原，注释已注明）。
@@ -268,12 +319,18 @@ export const useServersStore = defineStore('servers', () => {
     if (!s) return
     if (s.builtin) {
       const list = extraGroups.value[serverId] ?? []
-      extraGroups.value = { ...extraGroups.value, [serverId]: [...list, { id: `local-${name}`, name }] }
+      extraGroups.value = {
+        ...extraGroups.value,
+        [serverId]: [...list, { id: `local-${name}`, name, position: list.length }],
+      }
       return
     }
     const c = await goApp().CreateCategory(Number(serverId), name)
     const list = extraGroups.value[serverId] ?? []
-    extraGroups.value = { ...extraGroups.value, [serverId]: [...list, { id: String(c.id), name: c.name }] }
+    extraGroups.value = {
+      ...extraGroups.value,
+      [serverId]: [...list, { id: String(c.id), name: c.name, position: c.position ?? list.length }],
+    }
   }
 
   // deleteCategory 删除分类及其下频道（二次确认由 UI 负责）：

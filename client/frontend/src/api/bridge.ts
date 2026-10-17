@@ -2,7 +2,7 @@
 // 浏览器独立开发（vite dev 无 Go 后端）时走 mock 桩，行为可联调 UI。
 // 原生环境判定：Go 在 webview 启动时注入 window._wails.flags（浏览器环境恒无）。
 import { Call, Events } from '@wailsio/runtime'
-import type { AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ConnConfigView, ConnTestResult, FriendDTO, HotkeySettings, PeerView, ServerConfig, ServerDTO, UserProfile, VoiceStateView } from './types'
+import type { AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ConnConfigView, ConnTestResult, FriendDTO, HotkeySettings, PeerView, ServerChannels, ServerConfig, ServerDTO, UserProfile, VoiceStateView } from './types'
 
 type GoApp = {
   GetVersion(): Promise<string>
@@ -54,6 +54,7 @@ type GoApp = {
   LogFromWeb(level: string, msg: string): Promise<void>
   // 服务器/频道/好友 REST CRUD（服务端已有端点；批次①接线）
   ListServers(): Promise<ServerDTO[]>
+  ListChannels(serverID: number): Promise<ServerChannels>
   CreateServer(name: string): Promise<ServerDTO>
   JoinServerByCode(code: string): Promise<ServerDTO>
   RenameServer(id: number, name: string): Promise<void>
@@ -176,6 +177,12 @@ const mockApp: GoApp = {
   async RequestVoiceState() {},
   // 以下为批次①新增的服务器/频道/好友桩：返回可联调 UI 的假数据。
   async ListServers() { return [] },
+  async ListChannels(serverID: number) {
+    return {
+      categories: [{ id: 1, server_id: serverID, name: '默认分类', position: 0 }],
+      channels: [{ id: 11, server_id: serverID, name: '大厅', type: 'voice' as const, category_id: 1, position: 0 }],
+    }
+  },
   async CreateServer(name: string) {
     return { id: Date.now(), name, owner_id: 1, icon_name: 'messages-square', icon_color: '#4FA4F3' }
   },
