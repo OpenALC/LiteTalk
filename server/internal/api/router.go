@@ -167,6 +167,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/channels/{id}", s.auth(s.handleDeleteChannel))
 	// categories（v0.1.2 迁移 0003）
 	mux.HandleFunc("POST /api/v1/servers/{id}/categories", s.auth(s.handleCreateCategory))
+	mux.HandleFunc("PATCH /api/v1/categories/{id}", s.auth(s.handlePatchCategory))
 	mux.HandleFunc("DELETE /api/v1/categories/{id}", s.auth(s.handleDeleteCategory))
 	// messages
 	mux.HandleFunc("GET /api/v1/channels/{id}/messages", s.auth(s.handleListMessages))
