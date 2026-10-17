@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -32,6 +33,7 @@ type config struct {
 	duration    time.Duration
 	loopback    bool
 	multiDevice bool
+	relay       bool
 }
 
 // register 注册（邮箱撞库则登录），返回注册邮箱、access token、用户 ID 与 iceServers。
@@ -92,6 +94,7 @@ func main() {
 	flag.DurationVar(&cfg.duration, "duration", 8*time.Second, "发包时长")
 	flag.BoolVar(&cfg.loopback, "loopback", false, "允许环回候选（测本机服务端时必开）")
 	flag.BoolVar(&cfg.multiDevice, "multi-device", false, "多设备会话场景：同设备踢线/异设备共存/语音抢占")
+	flag.BoolVar(&cfg.relay, "relay", false, "验证 TURN 凭证含 turn/turns 中继地址（需 LITETALK_TURN_SECRET 已配）")
 	flag.Parse()
 	if cfg.users < 2 {
 		fmt.Fprintln(os.Stderr, "users ≥ 2")
@@ -134,6 +137,28 @@ func main() {
 		}
 		fmt.Printf("  probe-%d 注册+取凭证 OK（uid=%d，iceServers=%d 条）\n", i, uid, len(ice))
 		accts = append(accts, acct{token: token, id: fmt.Sprintf("%d", uid), ice: ice})
+	}
+
+	// -relay：验证凭证含 TURN 中继地址（UDP 被封网络的兜底路径）。
+	// 本验证确认「配置 → 凭证签发 → 客户端收到」链路通；实际中继转发
+	// 需真机 coturn 联调（网络层无法在 CI 模拟）。
+	if cfg.relay {
+		hasTurn := false
+		for _, a := range accts {
+			for _, srv := range a.ice {
+				for _, u := range srv.urls() {
+					if strings.HasPrefix(u, "turn:") || strings.HasPrefix(u, "turns:") {
+						hasTurn = true
+						fmt.Printf("  TURN 中继地址: %s\n", u)
+					}
+				}
+			}
+		}
+		if !hasTurn {
+			fmt.Fprintln(os.Stderr, "-relay 失败：凭证中无 turn/turns 地址（检查 LITETALK_TURN_URLS 与 LITETALK_TURN_SECRET）")
+			os.Exit(1)
+		}
+		fmt.Println("  -relay OK：凭证含 TURN 中继地址")
 	}
 
 	sem := make(chan struct{}, 8)

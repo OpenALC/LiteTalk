@@ -23,6 +23,25 @@ type ICEServer struct {
 	CredentialType string `json:"credentialType,omitempty"`
 }
 
+// urls 提取 URL 列表（JSON 反序列化后可能是 string、[]any 或 []string）。
+func (s ICEServer) urls() []string {
+	switch v := s.URLs.(type) {
+	case string:
+		return []string{v}
+	case []string:
+		return v
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if str, ok := item.(string); ok {
+				out = append(out, str)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
 // probeUser 一个真实链路探测端：WS 信令 + Pion PC + 哑 RTP 双向计数。
 // 与 loadtest 的差别：token 用真实 JWT，ICE servers 取服务端凭证接口。
 type probeUser struct {
