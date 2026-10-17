@@ -34,7 +34,10 @@ body,
 }
 
 body {
-  font-family: "MiSans", "HarmonyOS Sans SC", "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  /* Linux 发行版的 CJK 字体名是 Noto Sans CJK SC / Source Han Sans SC（fonts-noto-cjk），
+     少了这两项中文会掉进无 CJK 覆盖的 sans-serif 变成方框（issue #9）。 */
+  font-family: "MiSans", "HarmonyOS Sans SC", "PingFang SC", "Microsoft YaHei",
+    "Noto Sans CJK SC", "Source Han Sans SC", "Noto Sans SC", sans-serif;
   color: var(--ink-900);
   font-size: 14px;
   background: var(--brand-50);

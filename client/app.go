@@ -309,8 +309,8 @@ func (a *App) showFromTray() {
 			Title:            "轻音 LiteTalk",
 			Width:            1080,
 			Height:           680,
-			MinWidth:         1080,
-			MinHeight:        680,
+			MinWidth:         960,
+			MinHeight:        600,
 			Frameless:        true,
 			BackgroundColour: application.NewRGB(255, 255, 255),
 			Hidden:           true, // 先隐藏创建，恢复最大化态后再 Show，避免闪烁
