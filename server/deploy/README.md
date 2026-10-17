@@ -44,6 +44,8 @@ sudo mkdir -p /opt/litetalk/server
 sudo tar -xzf litetalk-server-linux-amd64.tar.gz -C /opt/litetalk/server
 ```
 
+迁移 SQL 已内嵌进二进制（embed.FS），升级时**不再需要解压 `migrations/` 目录**；多实例同时启动时自动用 MySQL `GET_LOCK` 互斥，只迁移一次。
+
 环境变量（**逐项改掉 CHANGE_ME**）：
 
 ```bash

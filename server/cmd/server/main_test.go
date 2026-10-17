@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 )
 
@@ -64,5 +66,39 @@ func TestValidateJWTSecret(t *testing.T) {
 	}
 	if err := validateJWTSecret("a-much-longer-random-production-secret-value", false); err != nil {
 		t.Fatalf("长随机密钥应放行，实际 %v", err)
+	}
+}
+
+// TestResolveMigrations 验证迁移 FS 选择：默认 embed，LITETALK_MIGRATIONS_DIR 覆盖磁盘。
+func TestResolveMigrations(t *testing.T) {
+	// 默认走 embed。
+	t.Setenv("LITETALK_MIGRATIONS_DIR", "")
+	got := resolveMigrations()
+	if _, ok := got.(fs.FS); !ok {
+		t.Fatal("应返回 fs.FS")
+	}
+	entries, err := fs.ReadDir(got, ".")
+	if err != nil {
+		t.Fatalf("embed FS 不可读: %v", err)
+	}
+	var hasUp bool
+	for _, e := range entries {
+		if e.Name() == "0001_init.up.sql" {
+			hasUp = true
+		}
+	}
+	if !hasUp {
+		t.Fatal("embed FS 应包含 0001_init.up.sql")
+	}
+
+	// 磁盘覆盖模式。
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/0001_init.up.sql", []byte("SELECT 1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LITETALK_MIGRATIONS_DIR", dir)
+	got = resolveMigrations()
+	if _, err := fs.ReadFile(got, "0001_init.up.sql"); err != nil {
+		t.Fatalf("磁盘 FS 应可读: %v", err)
 	}
 }

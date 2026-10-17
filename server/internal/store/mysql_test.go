@@ -2,8 +2,11 @@ package store
 
 import (
 	"context"
+	"io/fs"
 	"os"
 	"testing"
+
+	"github.com/OpenALC/LiteTalk/server/migrations"
 )
 
 // openTestMySQL 连接真库；DSN 不可用时返回 nil（测试 t.Skip）。
@@ -38,17 +41,17 @@ func TestMySQLMigrateAndCRUD(t *testing.T) {
 		_, _ = m.DB().ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl)
 	}
 
-	migDir := findMigrations(t)
-	if err := m.Migrate(ctx, migDir); err != nil {
+	migFS := findMigrations(t)
+	if err := m.Migrate(ctx, migFS); err != nil {
 		t.Fatalf("迁移失败: %v", err)
 	}
 	// 幂等：重复执行应跳过。
-	if err := m.Migrate(ctx, migDir); err != nil {
+	if err := m.Migrate(ctx, migFS); err != nil {
 		t.Fatalf("重复迁移应幂等: %v", err)
 	}
 
 	// 回滚验证 down 迁移。
-	if err := m.RollbackLast(ctx, migDir); err != nil {
+	if err := m.RollbackLast(ctx, migFS); err != nil {
 		t.Fatalf("回滚失败: %v", err)
 	}
 	var cnt int
@@ -56,7 +59,7 @@ func TestMySQLMigrateAndCRUD(t *testing.T) {
 		t.Fatalf("回滚后 users 表应消失 cnt=%d err=%v", cnt, err)
 	}
 	// 再迁移回来。
-	if err := m.Migrate(ctx, migDir); err != nil {
+	if err := m.Migrate(ctx, migFS); err != nil {
 		t.Fatalf("二次迁移失败: %v", err)
 	}
 
@@ -74,14 +77,12 @@ func TestMySQLMigrateAndCRUD(t *testing.T) {
 	}
 }
 
-// findMigrations 定位 migrations 目录（相对本包 ../../migrations）。
-func findMigrations(t *testing.T) string {
+// findMigrations 定位迁移文件：优先 embed（migrations.FS），回退磁盘目录。
+func findMigrations(t *testing.T) fs.FS {
 	t.Helper()
-	for _, p := range []string{"../../migrations", "../migrations", "migrations"} {
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
+	// 磁盘目录覆盖测试（LITETALK_MIGRATIONS_DIR 指定时验证 os.DirFS 路径）。
+	if dir := os.Getenv("LITETALK_MIGRATIONS_DIR"); dir != "" {
+		return os.DirFS(dir)
 	}
-	t.Fatal("找不到 migrations 目录")
-	return ""
+	return migrations.FS
 }
