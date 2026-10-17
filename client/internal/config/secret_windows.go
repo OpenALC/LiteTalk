@@ -79,3 +79,31 @@ func unprotectString(enc string) (string, error) {
 	copy(plain, unsafe.Slice(out.pbData, out.cbData))
 	return string(plain), nil
 }
+
+// guestTokenGet 读取游客 refresh_token（DPAPI 解密；Windows 不走 keyring）。
+func guestTokenGet(fileEnc string) string {
+	if fileEnc == "" {
+		return ""
+	}
+	plain, err := unprotectString(fileEnc)
+	if err != nil {
+		return ""
+	}
+	return plain
+}
+
+// guestTokenPut 保存（plain 非空）或清除（空）游客 refresh_token（DPAPI 加密）。
+// 保护失败返回 ""——绝不明文落盘。
+func guestTokenPut(plain string) string {
+	if plain == "" {
+		return ""
+	}
+	enc, err := protectString(plain)
+	if err != nil {
+		return ""
+	}
+	return enc
+}
+
+// secretMode Windows 机密存储恒为 DPAPI（user scope，见 protectString）。
+func secretMode() string { return SecretModeDPAPI }

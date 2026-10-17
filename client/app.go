@@ -145,25 +145,23 @@ func (a *App) emit(name string, data any) {
 
 // initLogging 把全局 log 输出重定向到文件：os.UserConfigDir()/LiteTalk/app.log
 // （与 config.json 同目录）。GUI 子系统无控制台，stdout/stderr 不可见，排障
-// 全依赖此文件；超过 5MB 启动时截断。文件排 MultiWriter 首位——无控制台时
-// stderr 写入会失败并短路 MultiWriter，放前面会吞掉文件写入。
+// 全依赖此文件；5MB × 3 档滚动（issue #10：不再启动截断，超限先滚动）。
+// 文件 0600、目录 0700——日志含令牌/连接细节，同用户外不可读。
+// 文件排 MultiWriter 首位——无控制台时 stderr 写入会失败并短路 MultiWriter，
+// 放前面会吞掉文件写入。
 func initLogging() {
 	dir, err := os.UserConfigDir()
 	if err != nil {
 		return
 	}
 	logDir := filepath.Join(dir, "LiteTalk")
-	_ = os.MkdirAll(logDir, 0o755)
-	f, err := os.OpenFile(filepath.Join(logDir, "app.log"),
-		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	_ = os.MkdirAll(logDir, 0o700)
+	_ = os.Chmod(logDir, 0o700) // 旧版本 0755 建的目录在此收紧
+	w, err := config.NewRotateWriter(filepath.Join(logDir, "app.log"), 5<<20, 3, 0o600)
 	if err != nil {
 		return
 	}
-	if fi, err := f.Stat(); err == nil && fi.Size() > 5<<20 {
-		_ = f.Truncate(0)
-		_, _ = f.Seek(0, 0)
-	}
-	log.SetOutput(io.MultiWriter(f, os.Stderr))
+	log.SetOutput(io.MultiWriter(w, os.Stderr))
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 }
 
@@ -203,6 +201,9 @@ func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) 
 	})
 	a.setupTray()
 	a.startHotkeys()
+	// 机密存储模式推一次给前端（契约 §0.6 sys:secret）：回落明文文件存储必须
+	// 让 UI 可感知，不能静默降级。前端也可能主动调 SecretStorageMode 补拉。
+	a.emit("sys:secret", SecretModeEvent{Mode: config.SecretMode()})
 	return nil
 }
 
@@ -213,6 +214,11 @@ func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) 
 func (a *App) setupTray() {
 	t := a.wails.SystemTray.New()
 	t.SetIcon(tray.IconForRuntime()).SetTooltip("轻音 LiteTalk")
+	// 左键单击托盘 = 显示主界面（与 Windows 行为一致；v3 SystemTray 的点击回调
+	// 两平台共用同一路径，Linux StatusNotifierItem 同样可达）。
+	t.OnClick(func() {
+		a.showFromTray()
+	})
 
 	menu := a.wails.Menu.New()
 	showItem := menu.Add("显示主界面")
@@ -308,14 +314,18 @@ func (a *App) showFromTray() {
 			Title:            "轻音 LiteTalk",
 			Width:            1080,
 			Height:           680,
-			MinWidth:         1080,
-			MinHeight:        680,
+			MinWidth:         960,
+			MinHeight:        600,
 			Frameless:        true,
 			BackgroundColour: application.NewRGB(255, 255, 255),
 			Hidden:           true, // 先隐藏创建，恢复最大化态后再 Show，避免闪烁
 		}
 		if a.savedBounds != nil && a.savedBounds.Width > 0 {
-			opts.X, opts.Y = a.savedBounds.X, a.savedBounds.Y
+			// Wayland 协议不允许应用定位窗口（坐标写入被忽略或告警）：只记忆尺寸，
+			// 不写 X/Y，改由 Focus 前置（见下方 show 分支）。X11/Windows 保留完整位置记忆。
+			if !isWaylandSession() {
+				opts.X, opts.Y = a.savedBounds.X, a.savedBounds.Y
+			}
 			opts.Width, opts.Height = a.savedBounds.Width, a.savedBounds.Height
 		}
 		win = a.buildWindow(opts)
@@ -336,7 +346,29 @@ func (a *App) showFromTray() {
 	if win.IsMinimised() {
 		win.Restore()
 	}
+	// Wayland 无坐标可用，靠 Focus 抢输入焦点完成前置（X11/Windows 由坐标记忆保证位置）。
+	if isWaylandSession() {
+		win.Focus()
+	}
 	a.emit("sys:wake", nil)
+}
+
+// isWaylandEnv 按给定环境判定 Wayland 会话（纯函数，便于测试注入）：
+// Linux 下有 WAYLAND_DISPLAY 即 Wayland；无 DISPLAY（纯 Wayland、无 XWayland）也算。
+// 非 Linux 恒 false。
+func isWaylandEnv(goos, waylandDisplay, x11Display string) bool {
+	if goos != "linux" {
+		return false
+	}
+	if waylandDisplay != "" {
+		return true
+	}
+	return x11Display == ""
+}
+
+// isWaylandSession 进程环境的 Wayland 会话判定（Wayland 下禁止坐标定位窗口）。
+func isWaylandSession() bool {
+	return isWaylandEnv(runtime.GOOS, os.Getenv("WAYLAND_DISPLAY"), os.Getenv("DISPLAY"))
 }
 
 // emitHibernate 休眠处理（设置页「休眠模式」三态之一 hibernate）：
@@ -447,6 +479,17 @@ func (a *App) SetSavedCredentials(email, password string) {
 // ClearSavedCredentials 清除记住的凭据。
 func (a *App) ClearSavedCredentials() {
 	_ = a.cfg.ClearSavedCredentials()
+}
+
+// SecretModeEvent sys:secret 事件载荷（契约 §0.6）。
+type SecretModeEvent struct {
+	Mode string `json:"mode"` // keyring / file / dpapi
+}
+
+// SecretStorageMode 当前机密存储模式（keyring / file / dpapi）。
+// Linux 回落明文文件存储时前端需明示提示，不静默降级（issue #8）。
+func (a *App) SecretStorageMode() string {
+	return config.SecretMode()
 }
 
 // ---------- 窗口控制（自定义标题栏调用） ----------
