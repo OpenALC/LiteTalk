@@ -15,9 +15,10 @@
 //     返回 false。Wayland 的 portal GlobalShortcuts 只有按下没有松开，物理上
 //     做不了 PTT；
 //   - 服务器不支持 XInput2（低于 2.0）时不可用，raw 事件是整套实现的前提；
-//   - 修饰键位取事件自带的快照，不自行累积——XI2 每次 raw 事件都带完整修饰键
-//     状态（Windows 的 LL 钩子没有所以要累积），启动前就按住的修饰键因此也能
-//     正确匹配。Mod1 视为 Alt、Mod4 视为 Win，这是 X 上几乎唯一的约定；
+//   - 修饰键位用 XQueryKeymap 现取，不依赖 XIRawEvent.mods：那个成员在部分
+//     libxi 版本上不存在（Ubuntu 24.04 实测编译不过），XQueryKeymap 是任何
+//     版本都有的老 API。代价是每个输入事件多一次往返，频率远低于音频帧，
+//     且只在 pump 线程上跑。Mod1 视为 Alt、Mod4 视为 Win，这是 X 上几乎唯一的约定；
 //   - 键位按 keysym 匹配（keycode 第 0 列），用户切到非拉丁布局后原有绑定不再
 //     触发——与 Windows/macOS 的行为一致，不特殊处理。
 //
@@ -72,16 +73,42 @@ static int liteTalkXIReady(Display *dpy) {
     return major >= 2;
 }
 
-// liteTalkMods 把 XIModifierState 折算成 X 修饰键掩码，并掩掉 Lock（CapsLock）、
-// Mod2（NumLock）、Mod3：绑定不该受大小写锁定和数字键盘锁影响。
-// 取 effective（base|latched|locked 加键盘组的效果），个别驱动不填它，退回另
-// 三个字段自己或一遍——同时缺位的概率远低于只缺一个。
-static unsigned int liteTalkMods(XIModifierState m) {
-    unsigned int v = (unsigned int)m.effective;
-    if (v == 0) {
-        v = (unsigned int)(m.base | m.latched | m.locked);
+// liteTalkModsOfKeymap 用 XQueryKeymap 取当前修饰键位，折算成 X 修饰键掩码，
+// 并掩掉 Lock（CapsLock）、Mod2（NumLock）、Mod3：绑定不该受大小写锁定和数字
+// 键盘锁影响。
+//
+// 为什么不直接用 XIRawEvent.mods：那个成员在部分 libxi 版本上不存在
+// （Ubuntu 24.04 的 libxi-dev 实测编译报 'XIRawEvent' has no member named 'mods'），
+// 而 XQueryKeymap / XKeysymToKeycode 是 Xlib 最老的一批 API，任何版本都在，
+// 且不需要额外头文件。代价是每个输入事件多一次到 X server 的往返——输入事件
+// 频率比音频帧低两三个数量级，且只跑在专用 pump 线程上，不碰音频热路径。
+static unsigned int liteTalkModsOfKeymap(Display *dpy) {
+    char keys[32];
+    XQueryKeymap(dpy, keys);
+    KeyCode kc;
+    unsigned int v = 0;
+    if ((liteTalkKeyDown(keys, XKeysymToKeycode(dpy, XK_Control_L)) != 0) ||
+        (liteTalkKeyDown(keys, XKeysymToKeycode(dpy, XK_Control_R)) != 0)) {
+        v |= ControlMask;
     }
-    return v & (unsigned int)(ShiftMask | ControlMask | Mod1Mask | Mod4Mask);
+    if ((liteTalkKeyDown(keys, XKeysymToKeycode(dpy, XK_Alt_L)) != 0) ||
+        (liteTalkKeyDown(keys, XKeysymToKeycode(dpy, XK_Alt_R)) != 0)) {
+        v |= Mod1Mask;
+    }
+    if ((liteTalkKeyDown(keys, XKeysymToKeycode(dpy, XK_Shift_L)) != 0) ||
+        (liteTalkKeyDown(keys, XKeysymToKeycode(dpy, XK_Shift_R)) != 0)) {
+        v |= ShiftMask;
+    }
+    if ((liteTalkKeyDown(keys, XKeysymToKeycode(dpy, XK_Super_L)) != 0) ||
+        (liteTalkKeyDown(keys, XKeysymToKeycode(dpy, XK_Super_R)) != 0)) {
+        v |= Mod4Mask;
+    }
+    return v;
+}
+
+// liteTalkKeyDown 测试 XQueryKeymap 位图里某个 keycode 是否按下。
+static int liteTalkKeyDown(const char *keys, KeyCode kc) {
+    return (keys[kc / 8] & (1 << (kc % 8))) != 0;
 }
 
 static int lkXIOpcode = 0;
@@ -147,7 +174,7 @@ static int liteTalkNext(Display *dpy, liteTalkInput *out) {
     out->kind = kind;
     out->code = 0;
     out->sym = 0;
-    out->mods = liteTalkMods(raw->mods);
+    out->mods = liteTalkModsOfKeymap(dpy);
     if (kind == LK_KIND_KEY_DOWN || kind == LK_KIND_KEY_UP) {
         // 第 0 列是未按 Shift 的 keysym：绑定 token 全小写，按物理键匹配，
         // 于是 ctrl+shift+m 与 ctrl+m 拿到的是同一个 XK_m，靠 mods 区分。
