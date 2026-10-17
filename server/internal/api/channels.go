@@ -58,7 +58,7 @@ func (s *Server) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 		ch.Position = *req.Position
 	}
 	if err := s.store.CreateChannel(r.Context(), ch); err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, ch)
@@ -80,7 +80,7 @@ func (s *Server) handlePatchChannel(w http.ResponseWriter, r *http.Request) {
 	}
 	ch, err := s.store.ChannelByID(r.Context(), id)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	if !s.requireRole(w, r, ch.ServerID, c.UserID, store.RoleAdmin) {
@@ -121,7 +121,7 @@ func (s *Server) handlePatchChannel(w http.ResponseWriter, r *http.Request) {
 		ch.Position = *req.Position
 	}
 	if err := s.store.UpdateChannel(r.Context(), ch); err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, ch)
@@ -136,14 +136,14 @@ func (s *Server) handleDeleteChannel(w http.ResponseWriter, r *http.Request) {
 	}
 	ch, err := s.store.ChannelByID(r.Context(), id)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	if !s.requireRole(w, r, ch.ServerID, c.UserID, store.RoleAdmin) {
 		return
 	}
 	if err := s.store.DeleteChannel(r.Context(), id); err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -164,12 +164,12 @@ func (s *Server) handleListChannels(w http.ResponseWriter, r *http.Request) {
 	}
 	channels, err := s.store.ChannelsOfServer(r.Context(), serverID)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	categories, err := s.store.CategoriesOfServer(r.Context(), serverID)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	if channels == nil {

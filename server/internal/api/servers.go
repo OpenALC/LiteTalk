@@ -72,13 +72,13 @@ func (s *Server) handleCreateServer(w http.ResponseWriter, r *http.Request) {
 		IconColor: req.IconColor,
 	}
 	if err := s.store.CreateServer(r.Context(), srv); err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	// 创建者自动成为 owner 成员。
 	mem := &store.ServerMember{ServerID: srv.ID, UserID: c.UserID, Role: store.RoleOwner}
 	if err := s.store.AddMember(r.Context(), mem); err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, srv)
@@ -89,7 +89,7 @@ func (s *Server) handleListServers(w http.ResponseWriter, r *http.Request) {
 	c := currentUser(r)
 	servers, err := s.store.ServersOfUser(r.Context(), c.UserID)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, servers)
@@ -113,7 +113,7 @@ func (s *Server) handlePatchServer(w http.ResponseWriter, r *http.Request) {
 	}
 	srv, err := s.store.ServerByID(r.Context(), id)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	var req patchServerReq
@@ -138,7 +138,7 @@ func (s *Server) handlePatchServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.UpdateServer(r.Context(), srv); err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, srv)
@@ -155,7 +155,7 @@ func (s *Server) handleDeleteServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.DeleteServer(r.Context(), id); err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -197,12 +197,12 @@ func (s *Server) handleJoinServer(w http.ResponseWriter, r *http.Request) {
 	}
 	mem := &store.ServerMember{ServerID: inv.ServerID, UserID: c.UserID, Role: store.RoleMember}
 	if err := s.store.AddMember(r.Context(), mem); err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	srv, err := s.store.ServerByID(r.Context(), inv.ServerID)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, srv)
@@ -222,7 +222,7 @@ func (s *Server) handleServerMembers(w http.ResponseWriter, r *http.Request) {
 	}
 	members, err := s.store.MembersOfServer(r.Context(), id)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, members)
@@ -249,7 +249,7 @@ func (s *Server) handleCreateInvite(w http.ResponseWriter, r *http.Request) {
 	}
 	code, err := randomCode(12)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	inv := &store.Invite{
@@ -263,7 +263,7 @@ func (s *Server) handleCreateInvite(w http.ResponseWriter, r *http.Request) {
 		inv.ExpiresAt = &t
 	}
 	if err := s.store.CreateInvite(r.Context(), inv); err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, inv)
