@@ -93,6 +93,16 @@ func TestMySQLMigrateAndCRUD(t *testing.T) {
 	if err := m.UpdateCategory(ctx, upd); err != nil {
 		t.Fatalf("UpdateCategory: %v", err)
 	}
+	// 原样保存（值全同）必须成功：MySQL 无 clientFoundRows 时报 0 行受影响，
+	// 不能误判不存在（与 Mem 对齐）；不存在的 id 仍须 ErrNotFound。
+	if err := m.UpdateCategory(ctx, upd); err != nil {
+		t.Fatalf("原样保存应成功: %v", err)
+	}
+	miss := *upd
+	miss.ID = 999999
+	if err := m.UpdateCategory(ctx, &miss); err != ErrNotFound {
+		t.Fatalf("不存在 id 应 ErrNotFound: %v", err)
+	}
 	// 末位移到最前，重排为 0..n-1。
 	if err := m.ReorderCategories(ctx, sv.ID, catIDs[2], 0); err != nil {
 		t.Fatalf("ReorderCategories: %v", err)

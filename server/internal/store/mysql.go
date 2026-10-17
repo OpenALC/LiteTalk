@@ -640,7 +640,19 @@ func (m *MySQL) UpdateCategory(ctx context.Context, c *Category) error {
 	if err != nil {
 		return err
 	}
-	return checkAffected(res)
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	// MySQL 未开 clientFoundRows：值全同现值时同样报 0 行。行存在即成功（与
+	// Mem 对齐，否则「原样保存」会被误报 404），行不存在才 ErrNotFound。
+	if _, err := m.CategoryByID(ctx, c.ID); err != nil {
+		return err
+	}
+	return nil
 }
 
 // ReorderCategories 把 id 移到 position（0-based，越界夹到首/尾），同服务器
