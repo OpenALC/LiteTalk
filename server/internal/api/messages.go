@@ -17,7 +17,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	ch, err := s.store.ChannelByID(r.Context(), id)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	// 成员才能读频道消息。
@@ -37,7 +37,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	msgs, err := s.store.MessagesBefore(r.Context(), id, beforeID, limit)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, msgs)
@@ -59,7 +59,7 @@ func (s *Server) handleCreateMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	ch, err := s.store.ChannelByID(r.Context(), id)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	if ch.Type != store.ChannelText {
@@ -90,7 +90,7 @@ func (s *Server) handleCreateMessage(w http.ResponseWriter, r *http.Request) {
 		Content:   req.Content,
 	}
 	if err := s.store.CreateMessage(r.Context(), msg); err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	msg.SenderNickname, msg.SenderTag = c.Nickname, c.Tag

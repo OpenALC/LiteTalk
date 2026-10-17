@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	ossignal "os/signal"
@@ -23,6 +25,7 @@ import (
 	"github.com/OpenALC/LiteTalk/server/internal/sfu"
 	"github.com/OpenALC/LiteTalk/server/internal/signal"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/migrations"
 )
 
 // version 由构建时 -X main.version= 注入，默认 dev
@@ -48,8 +51,8 @@ func main() {
 			log.Fatalf("MySQL 连接失败: %v", err)
 		}
 		defer my.Close()
-		migDir := envOr("LITETALK_MIGRATIONS_DIR", "migrations")
-		if err := my.Migrate(context.Background(), migDir); err != nil {
+		migFS := resolveMigrations()
+		if err := my.Migrate(context.Background(), migFS); err != nil {
 			log.Fatalf("数据库迁移失败: %v", err)
 		}
 		st = my
@@ -78,6 +81,11 @@ func main() {
 	if err := validateJWTSecret(jwtSecret, dev); err != nil {
 		log.Fatalf("LITETALK_JWT_SECRET 不合法：%v（请设为至少 32 字节的随机串，如 openssl rand -hex 32）", err)
 	}
+	// SFU IP 校验：生产拒环回（#22）。
+	sfuIP := envOr("LITETALK_SFU_IP", "127.0.0.1")
+	if err := validateSFUIP(sfuIP, dev); err != nil {
+		log.Fatalf("LITETALK_SFU_IP 不合法：%v", err)
+	}
 	jwtSigner := auth.NewJWT(jwtSecret)
 	refreshStore := auth.NewRefreshStore(kv)
 	codes := auth.NewEmailCodes(kv)
@@ -87,7 +95,7 @@ func main() {
 	// SFU：ICE-Lite + 单 UDP mux（§5.2）
 	sfuInst, err := sfu.New(sfu.Config{
 		UDPPort:    envInt("LITETALK_SFU_UDP", 7845),
-		NAT1To1IP:  envOr("LITETALK_SFU_IP", "127.0.0.1"),
+		NAT1To1IP:  sfuIP,
 		MaxMembers: envInt("LITETALK_SFU_MAX", 10),
 		Logger:     log.Default(),
 	})
@@ -207,6 +215,9 @@ func main() {
 		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// 捕获 SIGINT / SIGTERM，触发优雅关闭
@@ -216,17 +227,22 @@ func main() {
 	go func() {
 		log.Printf("litetalk server %s 监听 %s（SFU UDP %d）", version, addr, sfuInst.Port())
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("HTTP 服务异常退出: %v", err)
+			log.Printf("HTTP 服务异常退出: %v", err)
+			stop() // 触发主 goroutine 走优雅关闭路径
 		}
 	}()
 
 	<-ctx.Done()
 	log.Println("收到退出信号，开始优雅关闭")
 
+	// 关闭序：hub 广播 server.shutdown → HTTP 优雅关闭 → SFU 关闭。
+	// defer 的 LIFO 会先关 SFU 再关 MySQL，与正常退出顺序一致。
+	hub.Shutdown("shutdown")
+
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Fatalf("优雅关闭失败: %v", err)
+		log.Printf("优雅关闭失败: %v", err)
 	}
 	log.Println("服务已停止")
 }
@@ -286,6 +302,22 @@ func validateJWTSecret(secret string, dev bool) error {
 	return nil
 }
 
+// validateSFUIP 生产模式拒环回地址（#22）：SFU 对外通告 IP 为环回时客户端 ICE 候选不可达。
+// dev 模式允许（本机联调）。
+func validateSFUIP(ip string, dev bool) error {
+	if dev {
+		return nil
+	}
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return fmt.Errorf("不是合法 IP: %q", ip)
+	}
+	if parsed.IsLoopback() {
+		return fmt.Errorf("生产模式禁止环回地址（127.0.0.0/8、::1），实际 %q", ip)
+	}
+	return nil
+}
+
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -314,4 +346,13 @@ func splitList(s string) []string {
 		}
 	}
 	return out
+}
+
+// resolveMigrations 返回迁移 SQL 的文件系统：
+// LITETALK_MIGRATIONS_DIR 非空时用磁盘目录覆盖（本地调试）；否则用 embed 的 migrations.FS。
+func resolveMigrations() fs.FS {
+	if dir := os.Getenv("LITETALK_MIGRATIONS_DIR"); dir != "" {
+		return os.DirFS(dir)
+	}
+	return migrations.FS
 }

@@ -25,7 +25,7 @@ func (s *Server) handleListFriends(w http.ResponseWriter, r *http.Request) {
 	c := currentUser(r)
 	fs, err := s.store.FriendshipsOfUser(r.Context(), c.UserID)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	out := []friendView{}
@@ -95,7 +95,7 @@ func (s *Server) handleFriendRequest(w http.ResponseWriter, r *http.Request) {
 		Status:   store.FriendPending,
 	}
 	if err := s.store.CreateFriendship(r.Context(), f); err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, friendView{ID: f.ID, Status: f.Status, Incoming: false, User: publicUser(target)})
@@ -110,7 +110,7 @@ func (s *Server) handleFriendAccept(w http.ResponseWriter, r *http.Request) {
 	}
 	f, err := s.store.FriendshipByID(r.Context(), id)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	// 只有被请求方可以接受。
@@ -124,7 +124,7 @@ func (s *Server) handleFriendAccept(w http.ResponseWriter, r *http.Request) {
 	}
 	f.Status = store.FriendAccepted
 	if err := s.store.UpdateFriendship(r.Context(), f); err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	other, _ := s.store.UserByID(r.Context(), f.UserID)
@@ -140,7 +140,7 @@ func (s *Server) handleFriendDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	f, err := s.store.FriendshipByID(r.Context(), id)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	if f.UserID != c.UserID && f.FriendID != c.UserID {
@@ -148,7 +148,7 @@ func (s *Server) handleFriendDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.DeleteFriendship(r.Context(), id); err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -170,7 +170,7 @@ func (s *Server) handlePatchFriend(w http.ResponseWriter, r *http.Request) {
 	}
 	f, err := s.store.FriendshipByID(r.Context(), id)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	// 双方都能定位到关系行，但只有发起方持有备注/分组。
@@ -199,7 +199,7 @@ func (s *Server) handlePatchFriend(w http.ResponseWriter, r *http.Request) {
 		f.GroupName = *req.Group
 	}
 	if err := s.store.UpdateFriendship(r.Context(), f); err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	other, _ := s.store.UserByID(r.Context(), f.FriendID)

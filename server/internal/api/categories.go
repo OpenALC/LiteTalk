@@ -37,12 +37,12 @@ func (s *Server) handleCreateCategory(w http.ResponseWriter, r *http.Request) {
 	}
 	existing, err := s.store.CategoriesOfServer(r.Context(), serverID)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	cat := &store.Category{ServerID: serverID, Name: req.Name, Position: len(existing)}
 	if err := s.store.CreateCategory(r.Context(), cat); err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, cat)
@@ -59,7 +59,7 @@ func (s *Server) handleDeleteCategory(w http.ResponseWriter, r *http.Request) {
 	}
 	cat, err := s.store.CategoryByID(r.Context(), id)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	if !s.requireRole(w, r, cat.ServerID, c.UserID, store.RoleAdmin) {
@@ -69,7 +69,7 @@ func (s *Server) handleDeleteCategory(w http.ResponseWriter, r *http.Request) {
 	if withChannels != 1 {
 		channels, err := s.store.ChannelsOfServer(r.Context(), cat.ServerID)
 		if err != nil {
-			writeStoreErr(w, err)
+			s.writeStoreErr(w, r, err)
 			return
 		}
 		for _, ch := range channels {
@@ -80,7 +80,7 @@ func (s *Server) handleDeleteCategory(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err := s.store.DeleteCategoryWithChannels(r.Context(), id); err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})

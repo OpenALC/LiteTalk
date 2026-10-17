@@ -563,6 +563,10 @@ func (m *Mem) UseInvite(_ context.Context, code string) error {
 	if !ok {
 		return ErrNotFound
 	}
+	// 原子路径含过期校验（#22）。
+	if inv.ExpiresAt != nil && time.Now().After(*inv.ExpiresAt) {
+		return ErrExpired
+	}
 	if inv.MaxUses > 0 && inv.Uses >= inv.MaxUses {
 		return ErrConflict
 	}
@@ -695,6 +699,34 @@ func (m *Mem) Incr(_ context.Context, key string, ttl time.Duration) (int64, err
 	}
 	n++
 	// 首次创建才设置 TTL（与 Redis INCR+EX 语义对齐）。
+	if _, ok := m.kvTimed[key]; !ok {
+		m.setLocked(key, itoa(n), ttl)
+	} else {
+		e := m.kv[key]
+		e.value = itoa(n)
+		m.kv[key] = e
+	}
+	return n, nil
+}
+
+// IncrCap 原子自增并限幅（#22）：全局锁内模拟 Redis Lua 语义。
+func (m *Mem) IncrCap(_ context.Context, key string, ttl time.Duration, cap int64) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var n int64
+	if e, ok := m.kv[key]; ok && (e.exp.IsZero() || time.Now().Before(e.exp)) {
+		for _, c := range e.value {
+			if c < '0' || c > '9' {
+				n = 0
+				break
+			}
+			n = n*10 + int64(c-'0')
+		}
+	}
+	n++
+	if n > cap {
+		return cap + 1, nil
+	}
 	if _, ok := m.kvTimed[key]; !ok {
 		m.setLocked(key, itoa(n), ttl)
 	} else {

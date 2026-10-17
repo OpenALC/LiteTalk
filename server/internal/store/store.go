@@ -14,6 +14,7 @@ var (
 	ErrNotFound  = errors.New("not found")
 	ErrConflict  = errors.New("conflict")
 	ErrForbidden = errors.New("forbidden")
+	ErrExpired   = errors.New("expired")
 )
 
 // User 用户（§6.1 users 表）。无头像字段。
@@ -214,6 +215,9 @@ type KV interface {
 	Del(ctx context.Context, keys ...string) error
 	// Incr 自增并返回新值；key 不存在时从 0 开始并设置 ttl。
 	Incr(ctx context.Context, key string, ttl time.Duration) (int64, error)
+	// IncrCap 原子自增并限幅（#22）：新值 > cap 时不增长、返回 cap+1（调用方据此判超限）；
+	// key 不存在时从 1 开始并设置 ttl。用于替换「Incr 后再比较」的竞态。
+	IncrCap(ctx context.Context, key string, ttl time.Duration, cap int64) (int64, error)
 	// Eval 执行 Lua 脚本（Redis）或锁内等价模拟（Mem）。
 	// 当前唯一脚本是 CASScript；实现方不认识脚本应报错而非猜语义（fail-closed）。
 	Eval(ctx context.Context, script string, keys []string, args ...string) (any, error)

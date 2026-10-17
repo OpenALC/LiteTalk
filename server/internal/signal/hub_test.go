@@ -436,3 +436,29 @@ func TestChannelJoinDevRoom(t *testing.T) {
 		t.Fatalf("joined 数据不符: %+v", joined)
 	}
 }
+
+// TestHubShutdown 广播 server.shutdown 后连接关闭（#21）。
+func TestHubShutdown(t *testing.T) {
+	f := newChatFixture(t)
+	c := f.dial("1", "alice")
+	c.recvUntil(TypeHello)
+
+	go f.hub.Shutdown("shutdown")
+
+	env := c.recvUntil(TypeServerShutdown)
+	var d ServerShutdownData
+	if err := json.Unmarshal(env.Data, &d); err != nil {
+		t.Fatalf("decode ServerShutdownData: %v", err)
+	}
+	if d.Reason != "shutdown" {
+		t.Fatalf("reason = %q, want shutdown", d.Reason)
+	}
+
+	// 连接应在发送窗口后被 CloseNow。
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, _, err := c.conn.Read(ctx)
+	if err == nil {
+		t.Fatal("连接应已关闭")
+	}
+}
