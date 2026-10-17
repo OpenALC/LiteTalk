@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/OpenALC/LiteTalk/server/internal/store"
@@ -11,7 +12,7 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	c := currentUser(r)
 	user, err := s.store.UserByID(r.Context(), c.UserID)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, user)
@@ -30,7 +31,7 @@ func (s *Server) handlePatchMe(w http.ResponseWriter, r *http.Request) {
 	}
 	user, err := s.store.UserByID(r.Context(), c.UserID)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	if req.Nickname != nil {
@@ -47,10 +48,15 @@ func (s *Server) handlePatchMe(w http.ResponseWriter, r *http.Request) {
 				if err == nil {
 					break
 				}
-				if err != store.ErrConflict {
-					writeStoreErr(w, err)
+				if !errors.Is(err, store.ErrConflict) {
+					s.writeStoreErr(w, r, err)
 					return
 				}
+			}
+			// 5 次重试仍冲突 → 409（#22）。
+			if err != nil {
+				s.writeStoreErr(w, r, err)
+				return
 			}
 		}
 	}

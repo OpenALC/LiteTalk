@@ -14,14 +14,21 @@ import (
 // bcryptCost 按安全要点 §8 固定 12。
 const bcryptCost = 12
 
+// dummyHash 固定 bcrypt 哈希：游客/空哈希路径也走一次完整比较，消除空哈希早退的时序差（#22）。
+var dummyHash = []byte("$2a$12$UlbcvL1zfCj4bH0TrfoIaeFN9ykOog8EHv4Wx8rjYAnXGdDakbU.6")
+
 // HashPassword bcrypt(12) 哈希。
 func HashPassword(plain string) (string, error) {
 	b, err := bcrypt.GenerateFromPassword([]byte(plain), bcryptCost)
 	return string(b), err
 }
 
-// CheckPassword 校验密码。
+// CheckPassword 校验密码。空哈希（游客）也走一次 bcrypt 比较再返回失败（等时）。
 func CheckPassword(hash, plain string) bool {
+	if hash == "" {
+		_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(plain))
+		return false
+	}
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(plain)) == nil
 }
 

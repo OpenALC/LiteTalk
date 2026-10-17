@@ -295,6 +295,59 @@ func (h *Hub) Kick(uid, dev, reason string) {
 	}
 }
 
+// Shutdown 优雅关闭广播（#21）：对全部连接投递 server.shutdown，150ms 发送窗口后 CloseNow。
+func (h *Hub) Shutdown(reason string) {
+	if reason == "" {
+		reason = "shutdown"
+	}
+	h.mu.Lock()
+	targets := make([]*client, 0, len(h.conns))
+	for _, c := range h.conns {
+		targets = append(targets, c)
+	}
+	h.mu.Unlock()
+	for _, c := range targets {
+		h.sendJSON(c, TypeServerShutdown, ServerShutdownData{Reason: reason, TS: time.Now().UnixMilli()})
+	}
+	if len(targets) > 0 {
+		time.Sleep(150 * time.Millisecond) // 发送窗口：让下行队列把 shutdown 消息写出去
+	}
+	for _, c := range targets {
+		c.closeNow()
+	}
+}
+
+// KickChannel 把该频道房间内的全部连接强制离房（#22，频道/服务器删除后收尾）。
+// 只清房间归属与 SFU peer，不动 WS 连接本身——被摘连接收 session.voice_taken
+// 做本地退房（复用既有「服务端单方面摘出房间」路径）。
+// 单实例语义：跨实例部署踢不到其他实例上的连接。
+func (h *Hub) KickChannel(channelID, reason string) {
+	h.mu.Lock()
+	room := h.rooms[channelID]
+	if room == nil {
+		h.mu.Unlock()
+		return
+	}
+	var pending []leaveWork
+	var removed []*client
+	for _, c := range room.members {
+		if w := h.leaveWorkLocked(c); w != nil {
+			pending = append(pending, *w)
+			removed = append(removed, c)
+		}
+	}
+	h.mu.Unlock()
+	for _, w := range pending {
+		h.finishLeave(w)
+	}
+	if reason != "" {
+		h.log.Printf("ws: 频道 %s 被移除（%s），%d 人已离房", channelID, reason, len(removed))
+	}
+	for _, c := range removed {
+		h.sendJSON(c, TypeSessionVoiceTaken, nil)
+	}
+}
+
 // writeLoop 唯一写者：保证 coder/websocket 单写者约束。
 // 出错（写超时/对端关闭）→ cancel 读循环 ctx + CloseNow（§0.7）。
 func (c *client) writeLoop(ctx context.Context) {

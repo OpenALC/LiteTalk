@@ -87,8 +87,8 @@ func validNickname(s string) bool {
 	return n >= 2 && n <= 16
 }
 
-// validPassword 密码 ≥8 位。
-func validPassword(s string) bool { return len(s) >= 8 }
+// validPassword 密码 8–72 字节（bcrypt 上限 72B，超出在入口就拒）。
+func validPassword(s string) bool { return len(s) >= 8 && len(s) <= 72 }
 
 // fmtTag 定宽 4 位。
 func fmtTag(n int) string {
@@ -127,7 +127,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !validPassword(req.Password) {
-		writeErr(w, http.StatusBadRequest, "bad_password", "密码至少 8 位")
+		writeErr(w, http.StatusBadRequest, "bad_password", "密码需 8–72 个字符")
 		return
 	}
 	// 验证邮箱验证码（simple 模式免验证码）。
@@ -140,7 +140,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	hash, err := auth.HashPassword(req.Password)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 
@@ -167,7 +167,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		break
 	}
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	s.issueTokens(w, r, user, dev, http.StatusCreated)
@@ -217,7 +217,7 @@ func (s *Server) handleGuest(w http.ResponseWriter, r *http.Request) {
 		break
 	}
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	s.log.Printf("[audit] guest created user=%d ip=%s", user.ID, s.clientIP(r))
@@ -261,7 +261,12 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user, err := s.store.UserByEmail(r.Context(), req.Email)
-	if err != nil || !auth.CheckPassword(user.PasswordHash, req.Password) {
+	// 等时比较（#22）：用户不存在也走一次 bcrypt，消除「存在/不存在」时序差。
+	hash := ""
+	if err == nil {
+		hash = user.PasswordHash
+	}
+	if err != nil || !auth.CheckPassword(hash, req.Password) {
 		writeErr(w, http.StatusUnauthorized, "bad_credentials", "邮箱或密码错误")
 		s.log.Printf("[audit] login failed email=%s ip=%s", req.Email, s.clientIP(r))
 		return
@@ -308,12 +313,12 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	}
 	user, err := s.store.UserByID(r.Context(), uid)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	access, err := s.jwt.SignAccess(user.ID, user.Nickname, user.Tag, sid, dev)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, tokenPair{
@@ -394,13 +399,13 @@ func (s *Server) handleEmailCode(w http.ResponseWriter, r *http.Request) {
 	code, err := s.codes.Send(r.Context(), req.Purpose, req.Email)
 	switch {
 	case errors.Is(err, auth.ErrCodeTooFrequent):
-		writeErr(w, http.StatusTooManyRequests, "too_frequent", "发送过于频繁，请 60 秒后再试")
+		writeErr(w, http.StatusTooManyRequests, "rate_limited", "发送过于频繁，请 60 秒后再试")
 		return
 	case errors.Is(err, auth.ErrCodeDailyLimit):
-		writeErr(w, http.StatusTooManyRequests, "daily_limit", "今日发送次数已达上限")
+		writeErr(w, http.StatusTooManyRequests, "rate_limited", "今日发送次数已达上限")
 		return
 	case err != nil:
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	if err := s.mailer.SendCode(req.Email, req.Purpose, code); err != nil {
@@ -430,7 +435,7 @@ func (s *Server) handlePasswordReset(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Email = normalizeEmail(req.Email)
 	if !validPassword(req.Password) {
-		writeErr(w, http.StatusBadRequest, "bad_password", "密码至少 8 位")
+		writeErr(w, http.StatusBadRequest, "bad_password", "密码需 8–72 个字符")
 		return
 	}
 	// full 模式必须过邮箱验证码。
@@ -445,12 +450,12 @@ func (s *Server) handlePasswordReset(w http.ResponseWriter, r *http.Request) {
 	}
 	hash, err := auth.HashPassword(req.Password)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	user.PasswordHash = hash
 	if err := s.store.UpdateUser(r.Context(), user); err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	// 重置后吊销全部刷新令牌。
@@ -484,12 +489,12 @@ func (s *Server) issueTokens(w http.ResponseWriter, r *http.Request, user *store
 	}
 	access, err := s.jwt.SignAccess(user.ID, user.Nickname, user.Tag, sid, dev)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	refresh, err := s.refresh.IssueWithUID(r.Context(), user.ID, dev, sid)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	writeJSON(w, status, tokenPair{
