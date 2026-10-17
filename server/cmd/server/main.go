@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -23,6 +24,7 @@ import (
 	"github.com/OpenALC/LiteTalk/server/internal/sfu"
 	"github.com/OpenALC/LiteTalk/server/internal/signal"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/migrations"
 )
 
 // version 由构建时 -X main.version= 注入，默认 dev
@@ -48,8 +50,8 @@ func main() {
 			log.Fatalf("MySQL 连接失败: %v", err)
 		}
 		defer my.Close()
-		migDir := envOr("LITETALK_MIGRATIONS_DIR", "migrations")
-		if err := my.Migrate(context.Background(), migDir); err != nil {
+		migFS := resolveMigrations()
+		if err := my.Migrate(context.Background(), migFS); err != nil {
 			log.Fatalf("数据库迁移失败: %v", err)
 		}
 		st = my
@@ -314,4 +316,13 @@ func splitList(s string) []string {
 		}
 	}
 	return out
+}
+
+// resolveMigrations 返回迁移 SQL 的文件系统：
+// LITETALK_MIGRATIONS_DIR 非空时用磁盘目录覆盖（本地调试）；否则用 embed 的 migrations.FS。
+func resolveMigrations() fs.FS {
+	if dir := os.Getenv("LITETALK_MIGRATIONS_DIR"); dir != "" {
+		return os.DirFS(dir)
+	}
+	return migrations.FS
 }

@@ -195,12 +195,11 @@ jobs:
               go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
               -o ../dist/linux-$arch/litetalk-server ./cmd/server
           done
-      # 迁移目前运行时从磁盘读取：随包附带 migrations/，避免升级漏传（改 embed 前的过渡）
-      - name: 打包 tar.gz（二进制 + migrations）
+      # 迁移已 embed 进二进制（migrations.FS），不再随包附带 migrations/ 目录
+      - name: 打包 tar.gz（仅二进制）
         run: |
           for arch in amd64 arm64; do
-            cp -r server/migrations dist/linux-$arch/
-            tar -C dist/linux-$arch -czf dist/litetalk-server-linux-$arch.tar.gz litetalk-server migrations
+            tar -C dist/linux-$arch -czf dist/litetalk-server-linux-$arch.tar.gz litetalk-server
           done
       - uses: actions/upload-artifact@v4
         with:

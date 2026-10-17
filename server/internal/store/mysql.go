@@ -5,8 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -47,17 +47,33 @@ func (m *MySQL) Close() error { return m.db.Close() }
 // DB 暴露底层句柄（迁移工具用）。
 func (m *MySQL) DB() *sql.DB { return m.db }
 
-// Migrate 按文件名顺序执行 migrationsDir 下的 *.up.sql（golang-migrate 命名约定），
+// Migrate 按文件名顺序执行 fsys 下的 *.up.sql（golang-migrate 命名约定），
 // 已执行过的跳过（记录在 schema_migrations）。
-func (m *MySQL) Migrate(ctx context.Context, migrationsDir string) error {
-	if _, err := m.db.ExecContext(ctx,
+// 启动互斥：GET_LOCK('litetalk_migrate', 60) 防多实例并发迁移；拿不到锁返回错误。
+func (m *MySQL) Migrate(ctx context.Context, fsys fs.FS) error {
+	conn, err := m.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	// 同一连接拿锁/解锁——连接池里两条不同连接会锁不住。
+	var got int
+	if err := conn.QueryRowContext(ctx, `SELECT GET_LOCK('litetalk_migrate', 60)`).Scan(&got); err != nil {
+		return fmt.Errorf("migrate lock: %w", err)
+	}
+	if got != 1 {
+		return errors.New("migrate lock: 60s 内另一实例正在迁移")
+	}
+	defer conn.ExecContext(ctx, `SELECT RELEASE_LOCK('litetalk_migrate')`)
+
+	if _, err := conn.ExecContext(ctx,
 		`CREATE TABLE IF NOT EXISTS schema_migrations (
 			version VARCHAR(255) PRIMARY KEY,
 			applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`); err != nil {
 		return fmt.Errorf("create schema_migrations: %w", err)
 	}
-	entries, err := os.ReadDir(migrationsDir)
+	entries, err := fs.ReadDir(fsys, ".")
 	if err != nil {
 		return err
 	}
@@ -71,24 +87,24 @@ func (m *MySQL) Migrate(ctx context.Context, migrationsDir string) error {
 	for _, name := range ups {
 		version := strings.TrimSuffix(name, ".up.sql")
 		var n int
-		if err := m.db.QueryRowContext(ctx,
+		if err := conn.QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM schema_migrations WHERE version = ?`, version).Scan(&n); err != nil {
 			return err
 		}
 		if n > 0 {
 			continue
 		}
-		body, err := os.ReadFile(filepath.Join(migrationsDir, name))
+		body, err := fs.ReadFile(fsys, name)
 		if err != nil {
 			return err
 		}
 		// MySQL 驱动不支持多语句 Exec，逐条执行。
 		for _, stmt := range splitSQL(string(body)) {
-			if _, err := m.db.ExecContext(ctx, stmt); err != nil {
+			if _, err := conn.ExecContext(ctx, stmt); err != nil {
 				return fmt.Errorf("apply %s: %w", name, err)
 			}
 		}
-		if _, err := m.db.ExecContext(ctx,
+		if _, err := conn.ExecContext(ctx,
 			`INSERT INTO schema_migrations (version) VALUES (?)`, version); err != nil {
 			return err
 		}
@@ -97,7 +113,7 @@ func (m *MySQL) Migrate(ctx context.Context, migrationsDir string) error {
 }
 
 // RollbackLast 执行最近一个已应用版本的 *.down.sql（验证 down 迁移用）。
-func (m *MySQL) RollbackLast(ctx context.Context, migrationsDir string) error {
+func (m *MySQL) RollbackLast(ctx context.Context, fsys fs.FS) error {
 	var version string
 	err := m.db.QueryRowContext(ctx,
 		`SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1`).Scan(&version)
@@ -107,7 +123,7 @@ func (m *MySQL) RollbackLast(ctx context.Context, migrationsDir string) error {
 	if err != nil {
 		return err
 	}
-	body, err := os.ReadFile(filepath.Join(migrationsDir, version+".down.sql"))
+	body, err := fs.ReadFile(fsys, version+".down.sql")
 	if err != nil {
 		return err
 	}
