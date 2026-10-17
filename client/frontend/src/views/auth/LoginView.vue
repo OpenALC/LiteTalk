@@ -22,9 +22,9 @@ const showPwd = ref(false)
 const loading = ref(false)
 const guestLoading = ref(false)
 
-// kicked 被踢横幅数据源（非空即显示，文案固定）。进入登录页时取走 store 里的
-// 原因并清（横幅生命周期只在本次访问，不留到下次）；挂载期间的 auth:kicked
-// 实时刷新（事件可能在本页挂载后才到，store 层回登录页导航完成前的窗口）。
+// kicked 被踢横幅数据源（非空即显示，文案按 reason 分支）。进入登录页时取走
+// store 里的原因并清（横幅生命周期只在本次访问，不留到下次）；挂载期间的
+// auth:kicked 实时刷新（事件可能在本页挂载后才到，store 层回登录页导航完成前的窗口）。
 const kicked = ref('')
 let offKicked: () => void = () => {}
 
@@ -104,10 +104,11 @@ async function guestEnter() {
 
 <template>
   <AuthLayout>
-    <!-- 被踢提示：账号已在其他设备登录，本端会话与令牌已被 Go 侧清除 -->
+    <!-- 被踢提示：本端会话与令牌已被 Go 侧清除。server_changed 是服务器地址
+         热切换后令牌不被新服务端接受，不是异地登录，文案必须分开。 -->
     <div v-if="kicked" class="kicked-bar" role="status">
       <Info :size="15" />
-      <span>账号已在其他设备登录</span>
+      <span>{{ kicked === 'server_changed' ? '当前令牌不被新服务器接受，请重新登录' : '账号已在其他设备登录' }}</span>
     </div>
 
     <div class="seg">
