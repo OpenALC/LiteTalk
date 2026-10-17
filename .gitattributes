@@ -1,10 +1,23 @@
 # 统一行尾为 LF。本机 core.autocrlf=true，检出时会把文本转成 CRLF，
-# 导致 gofmt -l 长期列出 71 个文件（本地永远无法满足「gofmt -l 无输出」门禁），
+# 导致 gofmt -l 长期列出全部 .go 文件（本地永远无法满足「gofmt -l 无输出」门禁），
 # 且 Go 工具改写文件后在 git status 里制造假改动。
 # eol=lf 优先于 core.autocrlf，对所有克隆（含 agent worktree）生效。
+
+# Go 与 shell
 *.go    text eol=lf
 *.mod   text eol=lf
 *.sum   text eol=lf
 *.sh    text eol=lf
+
+# 配置与数据库迁移
 *.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
 *.sql   text eol=lf
+
+# 前端（Vue/TS 源码与工程配置）
+*.ts    text eol=lf
+*.tsx   text eol=lf
+*.vue   text eol=lf
+*.css   text eol=lf
+*.html  text eol=lf
