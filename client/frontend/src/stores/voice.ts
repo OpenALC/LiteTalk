@@ -53,6 +53,16 @@ export const useVoiceStore = defineStore('voice', () => {
     connected.value = false
   }
 
+  // resetAll 登出时全量清理（含 resetRoom 不覆盖的 muted/deafened/peerVolumes）。
+  // setup 风格 store 无 $reset（Pinia 只给 option store 注入），必须显式清理。
+  function resetAll() {
+    resetRoom()
+    muted.value = false
+    deafened.value = false
+    peerVolumes.value = {}
+    _selfId = ''
+  }
+
   async function setMute(v: boolean) {
     muted.value = v
     await goApp().SetMute(v)
@@ -166,7 +176,7 @@ export const useVoiceStore = defineStore('voice', () => {
 
   return {
     channelId, members, muted, deafened, dualOff, latencyMs, connected, peerVolumes,
-    selfId, setSelf, join, leave, resetRoom, setMute, setDeafen, setPeerVolume,
+    selfId, setSelf, join, leave, resetRoom, resetAll, setMute, setDeafen, setPeerVolume,
     requestVoiceState, restoreFromGo, bindEvents, unbindEvents,
   }
 })

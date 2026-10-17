@@ -654,12 +654,13 @@ func (a *App) ResetPassword(email, code, newPassword string) error {
 	return a.api.ResetPassword(email, code, newPassword)
 }
 
-// Logout 注销：断信令、吊销 refresh。
+// Logout 注销：断信令、吊销 refresh，清空本地用户档案。
 func (a *App) Logout() error {
 	a.loginGen.Add(1) // 使进行中的信令重试循环退出
 	a.mu.Lock()
 	rt := a.refreshTok
 	a.refreshTok = ""
+	a.user = state.UserProfile{} // 清档案，否则 GetMe 仍返回旧用户
 	a.mu.Unlock()
 	a.disconnectSession()
 	if rt != "" {
@@ -870,9 +871,9 @@ func (a *App) connectSession(token, nickname string, gen uint64) error {
 func (a *App) connectSessionLocked(token, nickname string) error {
 	a.disconnectSessionLocked()
 	ev := state.Events{
-		OnPeerJoin: func(userID, nickname string, speaking, mute, deafen bool) {
+		OnPeerJoin: func(userID, nickname, tag string, speaking, mute, deafen bool) {
 			a.emit("voice:peer-join", map[string]any{
-				"user_id": userID, "nickname": nickname,
+				"user_id": userID, "nickname": nickname, "tag": tag,
 				"speaking": speaking, "mute": mute, "deafen": deafen,
 			})
 		},

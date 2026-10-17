@@ -126,6 +126,7 @@ type ChannelJoinData struct {
 type MemberInfo struct {
 	UserID   string `json:"user_id"`
 	Nickname string `json:"nickname"`
+	Tag      string `json:"tag,omitempty"` // 昵称#tag 的 tag，好友请求用
 	Mute     bool   `json:"mute"`
 	Deafen   bool   `json:"deafen"`
 	Speaking bool   `json:"speaking"`
