@@ -103,7 +103,7 @@ func (s *Server) handlePatchCategory(w http.ResponseWriter, r *http.Request) {
 	}
 	cat, err := s.store.CategoryByID(r.Context(), id)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	// 权限按「分类所属服务器」的 owner/admin 判定：成员只读，不够改。
@@ -125,13 +125,13 @@ func (s *Server) handlePatchCategory(w http.ResponseWriter, r *http.Request) {
 		}
 		cat.Name = *req.Name
 		if err := s.store.UpdateCategory(r.Context(), cat); err != nil {
-			writeStoreErr(w, err)
+			s.writeStoreErr(w, r, err)
 			return
 		}
 	}
 	if req.Position != nil {
 		if err := s.store.ReorderCategories(r.Context(), cat.ServerID, id, *req.Position); err != nil {
-			writeStoreErr(w, err)
+			s.writeStoreErr(w, r, err)
 			return
 		}
 		// 重排后重新读回，响应里的 position 是最终序号。
