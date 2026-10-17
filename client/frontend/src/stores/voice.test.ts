@@ -11,7 +11,7 @@ describe('voice store 房间态清理', () => {
   })
 
   const peer: PeerView = {
-    user_id: 'u1', nickname: '甲', speaking: false, mute: false, deafen: false,
+    user_id: 'u1', nickname: '甲', tag: '0001', speaking: false, mute: false, deafen: false,
   }
 
   it('resetRoom 清空频道、成员与延迟', () => {
@@ -48,5 +48,28 @@ describe('voice store 房间态清理', () => {
     voice.resetRoom()
     expect(voice.channelId).toBe('')
     expect(voice.members).toEqual([])
+  })
+
+  it('resetAll 清空全部状态（含 muted/deafened/peerVolumes）', () => {
+    const voice = useVoiceStore()
+    voice.channelId = 'room1'
+    voice.members = [peer]
+    voice.latencyMs = 42
+    voice.connected = true
+    voice.muted = true
+    voice.deafened = true
+    voice.peerVolumes = { u1: 1.5 }
+    voice.setSelf('u1')
+
+    voice.resetAll()
+
+    expect(voice.channelId).toBe('')
+    expect(voice.members).toEqual([])
+    expect(voice.latencyMs).toBe(0)
+    expect(voice.connected).toBe(false)
+    expect(voice.muted).toBe(false)
+    expect(voice.deafened).toBe(false)
+    expect(voice.peerVolumes).toEqual({})
+    expect(voice.selfId()).toBe('')
   })
 })

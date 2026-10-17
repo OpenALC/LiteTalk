@@ -81,10 +81,11 @@ export const useAuthStore = defineStore('auth', () => {
     clearKickedReason()
     // 清理各业务 store 的本地缓存（B2：chat.clear 此前是死代码，
     // 登出后换账号登录会继承上一账号的聊天记录）。
+    // setup 风格 store 无 $reset，用显式 resetAll。
     const { useChatStore } = await import('./chat')
     const { useVoiceStore } = await import('./voice')
     useChatStore().clear()
-    useVoiceStore().$reset()
+    useVoiceStore().resetAll()
   }
 
   // handleKicked 被踢全链路（auth:kicked）：复用 logout 清本地会话缓存与登出态，
