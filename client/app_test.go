@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/OpenALC/LiteTalk/client/internal/config"
+	"github.com/OpenALC/LiteTalk/client/internal/hotkey"
 	"github.com/OpenALC/LiteTalk/client/internal/state"
 )
 
@@ -220,4 +221,45 @@ func TestOnKickedKeepsGuestTokenForAccountUser(t *testing.T) {
 	if rt != "" {
 		t.Fatalf("被踢应清空内存 refreshTok，得到 %q", rt)
 	}
+}
+
+// TestHotkeyEffectTriggerEdges 钉住「哪个沿触发什么」——这个不变量没有测试时，
+// 闭麦/静音/全关的分支漏判 ev.Pressed，实际行为变成「按住闭麦、松开恢复说话」，
+// 与用户对快捷键的预期完全相反，且只有真机连按才能发现。
+func TestHotkeyEffectTriggerEdges(t *testing.T) {
+	// PTT：两个沿都要响应。少任何一个都会变成开关或卡在说话。
+	if e := effectOf(hotkey.Event{Action: hotkey.ActionPTT, Pressed: true}); !e.pttPress || e.pttRelease {
+		t.Errorf("PTT 按下应只产生 pttPress，实际 %+v", e)
+	}
+	if e := effectOf(hotkey.Event{Action: hotkey.ActionPTT, Pressed: false}); !e.pttRelease || e.pttPress {
+		t.Errorf("PTT 抬起应只产生 pttRelease，实际 %+v", e)
+	}
+
+	// 锁存开关：只有按下沿触发，抬起沿必须是空操作。
+	// 完整一次「按下+抬起」只能产生一次切换。
+	for _, a := range []hotkey.Action{hotkey.ActionMute, hotkey.ActionDeafen, hotkey.ActionDual} {
+		press := effectOf(hotkey.Event{Action: a, Pressed: true})
+		release := effectOf(hotkey.Event{Action: a, Pressed: false})
+		n := boolToInt(press.mute) + boolToInt(press.deafen) + boolToInt(press.dual)
+		if n != 1 {
+			t.Errorf("%s 按下应恰好触发一个动作，实际 %+v", a, press)
+		}
+		if release != (hotkeyEffect{}) {
+			t.Errorf("%s 抬起不应触发任何动作，实际 %+v", a, release)
+		}
+	}
+
+	// 未知动作两个沿都必须是空操作，不能误触。
+	for _, pressed := range []bool{true, false} {
+		if e := effectOf(hotkey.Event{Action: hotkey.Action("nope"), Pressed: pressed}); e != (hotkeyEffect{}) {
+			t.Errorf("未知动作(pressed=%v) 不应有效果，实际 %+v", pressed, e)
+		}
+	}
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }

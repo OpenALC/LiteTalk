@@ -1346,33 +1346,75 @@ func (a *App) hotkeyLoop() {
 	}
 }
 
+// hotkeyEffect 是一次热键事件要产生的效果。
+type hotkeyEffect struct {
+	pttPress   bool // 按住说话：打开发送门
+	pttRelease bool // 松开说话：关门并开尾包窗
+	mute       bool // 切换闭麦
+	deafen     bool // 切换静音（耳聋）
+	dual       bool // 全关 / 全开
+}
+
+// effectOf 把一次热键事件翻译成要做的动作。
+//
+// 两类动作的触发沿完全不同，混用会出线上事故：
+//   - PTT 是「按住说话」，按下和抬起都要响应，少一个就变成开关或卡在说话；
+//   - 闭麦 / 静音 / 全关全是锁存开关，用户心理模型是「按一下切一次」，
+//     **只能由按下沿触发**。若抬起也响应，实际行为变成「按住闭麦、松开
+//     恢复说话」——与任何用户对快捷键的预期都相反。
+func effectOf(ev hotkey.Event) hotkeyEffect {
+	var e hotkeyEffect
+	switch ev.Action {
+	case hotkey.ActionPTT:
+		if ev.Pressed {
+			e.pttPress = true
+		} else {
+			e.pttRelease = true
+		}
+	case hotkey.ActionMute, hotkey.ActionDeafen, hotkey.ActionDual:
+		if !ev.Pressed {
+			return e // 锁存开关忽略抬起沿
+		}
+		switch ev.Action {
+		case hotkey.ActionMute:
+			e.mute = true
+		case hotkey.ActionDeafen:
+			e.deafen = true
+		case hotkey.ActionDual:
+			e.dual = true
+		}
+	}
+	return e
+}
+
 // handleHotkeyEvent 热键动作分发，跑在专用 goroutine 上。跨线程约定与 OnKicked
 // 一致：不碰会话内部状态，只走 Session 的公开方法（内部已原子/加锁），
 // emit 非阻塞可直调。
 func (a *App) handleHotkeyEvent(ev hotkey.Event) {
-	switch ev.Action {
-	case hotkey.ActionPTT:
-		if ev.Pressed {
-			a.hkGate.Press()
-		} else {
-			// 尾包窗：松手后补一小段话音，避免末字被硬切。
-			tail := time.Duration(a.cfg.GetHotkeySettings().TailMS) * time.Millisecond
-			a.hkGate.Release(tail)
-		}
-		// 仅 UI 反馈用（按住高亮），不影响发送门本身。
-		a.emit("hotkey:ptt", map[string]any{"pressed": ev.Pressed})
-	case hotkey.ActionMute:
+	e := effectOf(ev)
+	switch {
+	case e.pttPress:
+		a.hkGate.Press()
+	case e.pttRelease:
+		// 尾包窗：松手后补一小段话音，避免末字被硬切。
+		tail := time.Duration(a.cfg.GetHotkeySettings().TailMS) * time.Millisecond
+		a.hkGate.Release(tail)
+	case e.mute:
 		mute, _ := a.voiceMuteState()
 		a.SetMute(!mute)
-	case hotkey.ActionDeafen:
+	case e.deafen:
 		_, deafen := a.voiceMuteState()
 		a.SetDeafen(!deafen)
-	case hotkey.ActionDual:
+	case e.dual:
 		// 全关 / 全开：已全关则全开，否则全关（与前端 dual 语义一致）。
 		mute, deafen := a.voiceMuteState()
 		allOff := !(mute && deafen)
 		a.SetMute(allOff)
 		a.SetDeafen(allOff)
+	}
+	// 仅 UI 反馈用（按住高亮），不影响发送门本身。
+	if ev.Action == hotkey.ActionPTT {
+		a.emit("hotkey:ptt", map[string]any{"pressed": ev.Pressed})
 	}
 }
 
