@@ -224,10 +224,12 @@ var ErrUnauthorized = errors.New("令牌无效")
 type Identity struct {
 	UserID   string
 	Username string
-	// Sid 会话 ID（32 hex）；空 = 旧版本令牌（无会话约束，sess 存在时握手拒绝）。
+	// Sid 会话 ID（32 hex）；空 = 旧版本令牌（无会话约束，sess 存在时按过渡期规则处理）。
 	Sid string
 	// Dev 设备类型（desktop/mobile/…）；空 = 旧版本令牌。
 	Dev string
+	// IssuedAt 令牌签发时间（Unix 秒）；旧版本令牌过渡期判定用（v1.1.0 兼容窗口）。
+	IssuedAt int64
 	// SkipSessionCheck 跳过握手 sid 比对。仅 devAuth 模式的 dev- 令牌置位
 	//（dev 令牌无会话概念；生产构建拒绝启用 devAuth，见 cmd/server）。
 	SkipSessionCheck bool

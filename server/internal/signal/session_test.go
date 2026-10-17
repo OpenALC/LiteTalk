@@ -355,7 +355,8 @@ func TestVoiceTakenSameAccount(t *testing.T) {
 
 // ---- T6：chat 类型校验与推送范围 ----
 
-// TestChatTypeValidation chat.send 仅接受 type=text（§0.12）。
+// TestChatTypeValidation chat.send 仅接受 type=text（§0.12）；
+// 缺 type 字段按 text 放行（v1.0.x 客户端兼容，P1-3），显式非 text 才拒。
 func TestChatTypeValidation(t *testing.T) {
 	f := newChatFixture(t)
 	chID := strconv.FormatInt(f.ch.ID, 10)
@@ -363,19 +364,19 @@ func TestChatTypeValidation(t *testing.T) {
 	a := f.dial("1", "alice")
 	a.recvUntil(TypeHello)
 
-	for _, d := range []ChatSendData{
-		{ChannelID: chID, Content: "缺 type"},          // 缺 type
-		{ChannelID: chID, Type: "file", Content: "x"}, // 非 text
-	} {
-		a.send(TypeChatSend, d)
-		env := a.recvUntil(TypeError)
-		var e ErrorData
-		if err := env.Decode(&e); err != nil {
-			t.Fatalf("decode error: %v", err)
-		}
-		if e.Code != ErrCodeBadMessage {
-			t.Fatalf("code = %q, want %q", e.Code, ErrCodeBadMessage)
-		}
+	// 缺 type：默认按 text 放行，不收到 error。
+	a.send(TypeChatSend, ChatSendData{ChannelID: chID, Content: "缺 type"})
+	a.recvUntil(TypeChatMessage)
+
+	// 显式非 text：拒绝。
+	a.send(TypeChatSend, ChatSendData{ChannelID: chID, Type: "file", Content: "x"})
+	env := a.recvUntil(TypeError)
+	var e ErrorData
+	if err := env.Decode(&e); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if e.Code != ErrCodeBadMessage {
+		t.Fatalf("code = %q, want %q", e.Code, ErrCodeBadMessage)
 	}
 
 	a.send(TypeChatSend, ChatSendData{ChannelID: chID, Type: "text", Content: "ok"})

@@ -107,12 +107,7 @@ func main() {
 		authenticator = func(token string) (signal.Identity, error) {
 			if !strings.HasPrefix(token, "dev-") {
 				if claims, err := jwtSigner.ParseAccess(token); err == nil {
-					return signal.Identity{
-						UserID:   strconv.FormatInt(claims.UserID, 10),
-						Username: claims.Nickname,
-						Sid:      claims.Sid,
-						Dev:      claims.Dev,
-					}, nil
+					return identityFromClaims(claims), nil
 				}
 			}
 			// dev- 令牌无会话概念：SkipSessionCheck 跳过握手 sid 比对（仅 dev 构建可达）。
@@ -125,12 +120,7 @@ func main() {
 			if err != nil {
 				return signal.Identity{}, signal.ErrUnauthorized
 			}
-			return signal.Identity{
-				UserID:   strconv.FormatInt(claims.UserID, 10),
-				Username: claims.Nickname,
-				Sid:      claims.Sid,
-				Dev:      claims.Dev,
-			}, nil
+			return identityFromClaims(claims), nil
 		}
 		log.Println("WS 鉴权: JWT")
 	}
@@ -248,6 +238,21 @@ func healthzHandler(w http.ResponseWriter, r *http.Request) {
 		"status":  "ok",
 		"version": version,
 	})
+}
+
+// identityFromClaims 从 JWT Claims 构造信令身份。IssuedAt 透传供握手侧
+// 旧版本令牌（无 sid）过渡期判定（v1.1.0 兼容窗口）。
+func identityFromClaims(claims *auth.Claims) signal.Identity {
+	id := signal.Identity{
+		UserID:   strconv.FormatInt(claims.UserID, 10),
+		Username: claims.Nickname,
+		Sid:      claims.Sid,
+		Dev:      claims.Dev,
+	}
+	if claims.IssuedAt != nil {
+		id.IssuedAt = claims.IssuedAt.Unix()
+	}
+	return id
 }
 
 // devUserID 把 M2 开发令牌映射为用户 ID（M3 换 JWT 时同步替换）。

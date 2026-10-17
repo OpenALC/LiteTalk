@@ -38,6 +38,10 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 		return
 	}
 	// 消息类型校验（§0.12）：本期仅 text。
+	// 缺省字段按 text 处理——v1.0.x 客户端不带 type，服务端升级后不能直接拒收（P1-3 兼容）。
+	if d.Type == "" {
+		d.Type = "text"
+	}
 	if d.Type != "text" {
 		h.sendError(c, ErrCodeBadMessage, "chat.send 仅支持 type=text")
 		return

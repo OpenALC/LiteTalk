@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/OpenALC/LiteTalk/server/internal/auth"
 	"github.com/OpenALC/LiteTalk/server/internal/mailer"
@@ -185,9 +186,14 @@ func currentUser(r *http.Request) *auth.Claims {
 	return c
 }
 
+// legacyTokenGrace 旧版本令牌（无 sid）过渡期：与 signal 侧同值同时长，
+// 服务端升级后已签发令牌在有效期内仍可用，给用户留重新登录窗口（P1-3）。
+const legacyTokenGrace = 2*time.Hour + 5*time.Minute
+
 // auth 鉴权中间件：Authorization: Bearer <access_jwt>。
 // 多设备会话（v1.1.0）：比对 claims.Sid 与当前会话 sid；不符 → 401 session_replaced。
-// 旧版本令牌（无 sid）在 sess 存在时也拒绝（会话约束生效）；sess 为 nil 时跳过（测试/过渡）。
+// 旧版本令牌（sid 空）在 legacyTokenGrace 过渡期内放行（兼容 v1.0.x 客户端）；
+// sess 为 nil 时整段跳过（测试/降级路径，生产不可达）。
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		h := r.Header.Get("Authorization")
@@ -202,11 +208,20 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		if s.sess != nil {
-			curSid, err := s.sess.Get(r.Context(), claims.UserID, claims.Dev)
-			if err != nil || curSid == "" || claims.Sid == "" || claims.Sid != curSid {
-				w.Header().Set("X-LiteTalk-Auth", "session_replaced")
-				writeErr(w, http.StatusUnauthorized, "session_replaced", "账号已在其他设备登录")
-				return
+			if claims.Sid == "" {
+				// 旧版本令牌：过渡期内放行，超期拒绝。
+				if claims.IssuedAt == nil || time.Since(claims.IssuedAt.Time) >= legacyTokenGrace {
+					w.Header().Set("X-LiteTalk-Auth", "session_replaced")
+					writeErr(w, http.StatusUnauthorized, "session_replaced", "登录状态已过期，请重新登录")
+					return
+				}
+			} else {
+				curSid, err := s.sess.Get(r.Context(), claims.UserID, claims.Dev)
+				if err != nil || curSid == "" || claims.Sid != curSid {
+					w.Header().Set("X-LiteTalk-Auth", "session_replaced")
+					writeErr(w, http.StatusUnauthorized, "session_replaced", "账号已在其他设备登录")
+					return
+				}
 			}
 		}
 		next(w, r.WithContext(context.WithValue(r.Context(), userKey, claims)))

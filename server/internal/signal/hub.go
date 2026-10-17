@@ -199,8 +199,14 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// legacyTokenGrace 旧版本令牌（无 sid）的过渡期：服务端升级后已签发的 access
+// 在有效期内仍可握手/REST，给用户留出重新登录窗口（P1-3）。令牌本身 2h TTL，
+// 故取 2h+5min 缓冲；超期一律按 session_replaced 拒。
+const legacyTokenGrace = 2*time.Hour + 5*time.Minute
+
 // sessionOK 握手会话校验（§0.4）：claims.Sid 须与 SessionIndex 当前 sid 一致。
-// 旧版本令牌（sid 空）、会话不存在、sess 为 nil（测试/过渡）、devAuth 的 dev-令牌均按各自规则处理。
+// 旧版本令牌（sid 空）在 legacyTokenGrace 过渡期内放行；sess 为 nil（测试/过渡）、
+// devAuth 的 dev-令牌按各自规则处理。
 func (h *Hub) sessionOK(ctx context.Context, id Identity) bool {
 	if h.sess == nil || id.SkipSessionCheck {
 		return true
@@ -209,8 +215,12 @@ func (h *Hub) sessionOK(ctx context.Context, id Identity) bool {
 	if err != nil {
 		return false // 非数字 uid（dev 令牌）无会话可比对
 	}
+	if id.Sid == "" {
+		// 旧版本令牌：过渡期内放行（兼容 v1.0.x 客户端），超期拒绝。
+		return id.IssuedAt > 0 && time.Since(time.Unix(id.IssuedAt, 0)) < legacyTokenGrace
+	}
 	cur, err := h.sess.Get(ctx, uid, id.Dev)
-	if err != nil || cur == "" || id.Sid == "" || id.Sid != cur {
+	if err != nil || cur == "" || id.Sid != cur {
 		return false
 	}
 	return true
