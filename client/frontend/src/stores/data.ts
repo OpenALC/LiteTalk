@@ -49,6 +49,17 @@ export function isRealID(id: string): boolean {
   return /^\d+$/.test(id)
 }
 
+// catDropIndex 把拖拽落点换算成 reorderCategory 的插入序（#16）。落点语义是
+// 「插到目标分类之前」（.drop-target 顶边线），而 reorderCategory 的 position
+// 是删掉拖拽项之后的插入序——向下拖（源在目标前）时删前下标比删后大 1，直接用
+// 目标下标会落到目标之后，与高亮提示相反。targetIndex 负数/越界表示落点在
+// 非分类条目上（未分类/内置自带组），取分类区末尾。
+export function catDropIndex(list: { id: string }[], dragId: string, targetIndex: number): number {
+  if (targetIndex < 0 || targetIndex >= list.length) return list.length
+  const from = list.findIndex((x) => x.id === dragId)
+  return from >= 0 && from < targetIndex ? targetIndex - 1 : targetIndex
+}
+
 // INTRO_ID 介绍页伪服务器 ID：不是服务端实体，无频道栏（v0.1.2 首页体系）。
 export const INTRO_ID = '__intro__'
 
