@@ -192,14 +192,14 @@ func TestNewHookState(t *testing.T) {
 		Deafen:  "ctrl+alt+d",
 		Dual:    "bogus", // 解析失败，应被跳过而不是让整个表空掉
 	}
-	hs := newHookState(st)
+	hs := newHookState(st, vkLookup)
 	if len(hs.keys) != 2 || len(hs.mice) != 1 {
 		t.Fatalf("keys=%d mice=%d，期望 2/1", len(hs.keys), len(hs.mice))
 	}
-	if hs.keys[0] != (keyBind{vk: 0x4D, mods: modCtrl | modShift, action: ActionPTT}) {
+	if hs.keys[0] != (keyBind{token: "m", code: 0x4D, mods: modCtrl | modShift, action: ActionPTT}) {
 		t.Errorf("PTT 绑定项 = %+v", hs.keys[0])
 	}
-	if hs.keys[1] != (keyBind{vk: 0x44, mods: modCtrl | modAlt, action: ActionDeafen}) {
+	if hs.keys[1] != (keyBind{token: "d", code: 0x44, mods: modCtrl | modAlt, action: ActionDeafen}) {
 		t.Errorf("Deafen 绑定项 = %+v", hs.keys[1])
 	}
 	if hs.mice[0] != (mouseBind{btn: 4, mods: 0, action: ActionMute}) {
@@ -207,19 +207,19 @@ func TestNewHookState(t *testing.T) {
 	}
 
 	// Enabled=false 返回空表：此时 Manager 根本不会装钩子，空表只是双保险
-	if hs := newHookState(Settings{Enabled: false, PTT: "ctrl+m"}); len(hs.keys) != 0 || len(hs.mice) != 0 {
+	if hs := newHookState(Settings{Enabled: false, PTT: "ctrl+m"}, vkLookup); len(hs.keys) != 0 || len(hs.mice) != 0 {
 		t.Errorf("关闭时绑定表应为空，实际 keys=%d mice=%d", len(hs.keys), len(hs.mice))
 	}
 	// 全空设置
-	if hs := newHookState(Settings{Enabled: true}); len(hs.keys) != 0 || len(hs.mice) != 0 {
+	if hs := newHookState(Settings{Enabled: true}, vkLookup); len(hs.keys) != 0 || len(hs.mice) != 0 {
 		t.Errorf("无绑定时表应为空，实际 keys=%d mice=%d", len(hs.keys), len(hs.mice))
 	}
 }
 
 func TestOnKeyDispatch(t *testing.T) {
 	st := &hookState{keys: []keyBind{
-		{vk: 0x4D, mods: modCtrl | modShift, action: ActionPTT},
-		{vk: 0x44, mods: modCtrl | modAlt, action: ActionDeafen},
+		{token: "m", code: 0x4D, mods: modCtrl | modShift, action: ActionPTT},
+		{token: "d", code: 0x44, mods: modCtrl | modAlt, action: ActionDeafen},
 	}}
 	ch := make(chan Event, 16)
 	rt := newTestRuntime(st, ch)
@@ -351,7 +351,7 @@ func TestOnMouseDispatch(t *testing.T) {
 
 func TestMatchKeyAndMouse(t *testing.T) {
 	st := &hookState{
-		keys: []keyBind{{vk: 0x4D, mods: modCtrl, action: ActionPTT}},
+		keys: []keyBind{{token: "m", code: 0x4D, mods: modCtrl, action: ActionPTT}},
 		mice: []mouseBind{{btn: 4, mods: modShift, action: ActionMute}},
 	}
 	rt := newTestRuntime(st, nil)

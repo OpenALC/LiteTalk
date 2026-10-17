@@ -137,72 +137,11 @@ func buildVKTable() map[string]uint32 {
 	return m
 }
 
-// mouseButtonOfToken 把鼠标 token 映射成按钮号（1 左 / 2 右 / 3 中 /
-// 4 XBUTTON1 / 5 XBUTTON2），与 Win32 的 VK_LBUTTON..VK_XBUTTON2 一致。
-// 注意 X 按钮的「Win32 索引」是 1/2，与这里的「鼠标键序号」4/5 不是一回事，
-// 换算见 xButton。
-func mouseButtonOfToken(tok string) (uint32, bool) {
-	switch tok {
-	case "mouse1":
-		return 1, true
-	case "mouse2":
-		return 2, true
-	case "mouse3":
-		return 3, true
-	case "mouse4":
-		return 4, true
-	case "mouse5":
-		return 5, true
-	}
-	return 0, false
-}
-
-// hookState 是绑定表的不可变快照。热更新时整体替换指针，钩子回调只读快照，
-// 跨线程不共享可变状态。
-type hookState struct {
-	keys []keyBind
-	mice []mouseBind
-}
-
-type keyBind struct {
-	vk     uint32
-	mods   uint8
-	action Action
-}
-
-type mouseBind struct {
-	btn    uint32
-	mods   uint8
-	action Action
-}
-
-// newHookState 从设置构建绑定表。Enabled=false 返回空表——此时 Manager 根本
-// 不会装钩子，空表只是双保险。
-func newHookState(st Settings) *hookState {
-	hs := &hookState{}
-	if !st.Enabled {
-		return hs
-	}
-	for _, a := range allActions {
-		spec := st.specFor(a)
-		if spec == "" {
-			continue
-		}
-		b, err := ParseBinding(spec)
-		if err != nil {
-			continue
-		}
-		if btn, ok := mouseButtonOfToken(b.key); ok {
-			hs.mice = append(hs.mice, mouseBind{btn: btn, mods: b.mods, action: a})
-			continue
-		}
-		vk, ok := vkOfToken[b.key]
-		if !ok {
-			continue
-		}
-		hs.keys = append(hs.keys, keyBind{vk: vk, mods: b.mods, action: a})
-	}
-	return hs
+// vkLookup 把主键 token 翻成 Windows 虚拟键码，供共享的 newHookState 使用。
+// X 按钮的「Win32 索引」是 1/2，与统一按钮编号 4/5 不是一回事，换算见 xButton。
+func vkLookup(token string) (uint32, bool) {
+	v, ok := vkOfToken[token]
+	return v, ok
 }
 
 // winSource 是 Windows 平台的事件源实现。
@@ -237,7 +176,7 @@ func (s *winSource) start(st Settings, ch chan<- Event) error {
 		s.mu.Unlock()
 		return ErrUnsupportedPlatform
 	}
-	s.st.Store(newHookState(st))
+	s.st.Store(newHookState(st, vkLookup))
 	installed := make(chan error, 1)
 	done := make(chan struct{})
 	s.done = done
@@ -291,7 +230,7 @@ func (s *winSource) stop() {
 }
 
 // update 热替换绑定表。
-func (s *winSource) update(st Settings) { s.st.Store(newHookState(st)) }
+func (s *winSource) update(st Settings) { s.st.Store(newHookState(st, vkLookup)) }
 
 // pump 是钩子线程主体：装钩子 → GetMessage 消息循环 → 收到 WM_QUIT 退出。
 // 必须在 LockOSThread 之后的那个线程上跑：SetWindowsHookEx 的 lpfn 由
@@ -364,8 +303,8 @@ type hookRuntime struct {
 	src *winSource
 	ch  chan<- Event
 
-	mods    uint8     // 当前修饰键位（跟随真实键盘累积）
-	pressed [4]uint64 // 已按下的 vk 位图（0–255），用于滤掉自动重复
+	mods    uint8      // 当前修饰键位（跟随真实键盘累积）
+	pressed pressedSet // 已按下的键码位图，用于滤掉自动重复
 	active  activeSet
 }
 
@@ -511,7 +450,7 @@ func (rt *hookRuntime) matchKey(vk uint32) (Action, bool) {
 		return "", false
 	}
 	for i := range st.keys {
-		if st.keys[i].vk == vk && st.keys[i].mods == rt.mods {
+		if st.keys[i].code == vk && st.keys[i].mods == rt.mods {
 			return st.keys[i].action, true
 		}
 	}
@@ -538,11 +477,6 @@ func (rt *hookRuntime) onMouse(btn uint32, up bool) {
 	}
 }
 
-// mouseIDBase 给鼠标按钮一个不会与任何虚拟键码（0–255）冲突的 id 空间。
-const mouseIDBase = 0x10000
-
-func mouseID(btn uint32) uint32 { return mouseIDBase + btn }
-
 func (rt *hookRuntime) matchMouse(btn uint32) (Action, bool) {
 	st := rt.src.st.Load()
 	if st == nil {
@@ -556,45 +490,9 @@ func (rt *hookRuntime) matchMouse(btn uint32) (Action, bool) {
 	return "", false
 }
 
-func (rt *hookRuntime) setPressed(vk uint32)   { rt.pressed[vk>>6] |= 1 << (vk & 63) }
-func (rt *hookRuntime) clearPressed(vk uint32) { rt.pressed[vk>>6] &^= 1 << (vk & 63) }
+func (rt *hookRuntime) setPressed(vk uint32)   { rt.pressed.set(vk) }
+func (rt *hookRuntime) clearPressed(vk uint32) { rt.pressed.clear(vk) }
 
 func (rt *hookRuntime) isPressed(vk uint32) bool {
-	return rt.pressed[vk>>6]&(1<<(vk&63)) != 0
-}
-
-// activeEntry 记录一个已按下尚未抬起的绑定。
-type activeEntry struct {
-	id     uint32
-	action Action
-}
-
-// activeSet 是「按下中」的绑定表。按下时就地记下是哪个动作，抬起时按同一个
-// id 配平——这样用户先松修饰键再松主键（PTT 最常见收尾）也能正确收到抬起，
-// 不会卡在「已按下」导致说话停不下来。
-type activeSet struct {
-	items [8]activeEntry
-	n     int
-}
-
-func (a *activeSet) find(id uint32) int {
-	for i := 0; i < a.n; i++ {
-		if a.items[i].id == id {
-			return i
-		}
-	}
-	return -1
-}
-
-func (a *activeSet) add(id uint32, action Action) {
-	if a.find(id) >= 0 || a.n == len(a.items) {
-		return
-	}
-	a.items[a.n] = activeEntry{id: id, action: action}
-	a.n++
-}
-
-func (a *activeSet) removeAt(i int) {
-	a.n--
-	a.items[i] = a.items[a.n]
+	return rt.pressed.is(vk)
 }
