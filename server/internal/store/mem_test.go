@@ -183,6 +183,11 @@ func TestCategoryUpdateAndReorder(t *testing.T) {
 	if err := m.UpdateCategory(ctx, &missing); err != ErrNotFound {
 		t.Fatalf("不存在 id 应 ErrNotFound，实际 %v", err)
 	}
+	// 原样保存（值全同）必须成功：用户在对话框里不改内容直接保存是常规操作，
+	// 不是 404（MySQL 无 clientFoundRows 时同样报 0 行，两边语义须一致）。
+	if err := m.UpdateCategory(ctx, got); err != nil {
+		t.Fatalf("原样保存应成功，实际 %v", err)
+	}
 
 	// 末尾移到最前：丙 甲 乙 → 位置 0 1 2。
 	if err := m.ReorderCategories(ctx, s.ID, ids[2], 0); err != nil {
