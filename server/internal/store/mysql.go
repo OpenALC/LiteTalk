@@ -373,28 +373,36 @@ func (m *MySQL) UpdateServer(ctx context.Context, s *Server) error {
 }
 
 func (m *MySQL) DeleteServer(ctx context.Context, id int64) error {
-	// 子表清理：channels/messages/invites/members 一并删除（无 FK 约束，显式清理）。
-	if _, err := m.db.ExecContext(ctx,
-		`DELETE FROM messages WHERE channel_id IN (SELECT id FROM channels WHERE server_id = ?)`, id); err != nil {
-		return err
-	}
-	if _, err := m.db.ExecContext(ctx, `DELETE FROM channels WHERE server_id = ?`, id); err != nil {
-		return err
-	}
-	if _, err := m.db.ExecContext(ctx, `DELETE FROM categories WHERE server_id = ?`, id); err != nil {
-		return err
-	}
-	if _, err := m.db.ExecContext(ctx, `DELETE FROM invites WHERE server_id = ?`, id); err != nil {
-		return err
-	}
-	if _, err := m.db.ExecContext(ctx, `DELETE FROM server_members WHERE server_id = ?`, id); err != nil {
-		return err
-	}
-	res, err := m.db.ExecContext(ctx, `DELETE FROM servers WHERE id = ?`, id)
+	// 单事务删除主体 + 级联子资源（#22）：中途失败时整体回滚。
+	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	return checkAffected(res)
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM messages WHERE channel_id IN (SELECT id FROM channels WHERE server_id = ?)`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM channels WHERE server_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM categories WHERE server_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM invites WHERE server_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM server_members WHERE server_id = ?`, id); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM servers WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	if err := checkAffected(res); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (m *MySQL) AddMember(ctx context.Context, mem *ServerMember) error {
@@ -526,14 +534,23 @@ func (m *MySQL) UpdateChannel(ctx context.Context, c *Channel) error {
 }
 
 func (m *MySQL) DeleteChannel(ctx context.Context, id int64) error {
-	if _, err := m.db.ExecContext(ctx, `DELETE FROM messages WHERE channel_id = ?`, id); err != nil {
-		return err
-	}
-	res, err := m.db.ExecContext(ctx, `DELETE FROM channels WHERE id = ?`, id)
+	// 单事务：消息 + 频道一起删（#22）。
+	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	return checkAffected(res)
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE channel_id = ?`, id); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM channels WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	if err := checkAffected(res); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ---- categories（v0.1.2 迁移 0003） ----
@@ -712,9 +729,11 @@ func (m *MySQL) InviteByCode(ctx context.Context, code string) (*Invite, error) 
 }
 
 func (m *MySQL) UseInvite(ctx context.Context, code string) error {
+	// 原子路径含 max_uses 与过期校验（#22）：防止「校验通过后被并发放大」。
 	res, err := m.db.ExecContext(ctx,
 		`UPDATE invites SET uses = uses + 1
-		 WHERE code = ? AND (max_uses = 0 OR uses < max_uses)`, code)
+		 WHERE code = ? AND (max_uses = 0 OR uses < max_uses)
+		   AND (expires_at IS NULL OR expires_at > NOW())`, code)
 	if err != nil {
 		return err
 	}
@@ -723,13 +742,18 @@ func (m *MySQL) UseInvite(ctx context.Context, code string) error {
 		return err
 	}
 	if n == 0 {
-		// 区分不存在与已用尽。
-		var cnt int
-		if err := m.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE code = ?`, code).Scan(&cnt); err != nil {
+		// 区分不存在、已用尽与已过期。
+		var cnt, expired int
+		if err := m.db.QueryRowContext(ctx,
+			`SELECT COUNT(*), COALESCE(SUM(expires_at IS NOT NULL AND expires_at <= NOW()), 0)
+			 FROM invites WHERE code = ?`, code).Scan(&cnt, &expired); err != nil {
 			return err
 		}
 		if cnt == 0 {
 			return ErrNotFound
+		}
+		if expired > 0 {
+			return ErrExpired
 		}
 		return ErrConflict
 	}

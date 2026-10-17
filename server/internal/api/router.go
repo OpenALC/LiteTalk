@@ -27,6 +27,7 @@ const (
 // Defined here to avoid an import cycle (signal imports store, api imports signal would cycle via main wiring).
 type Hub interface {
 	Kick(uid, dev, reason string)
+	KickChannel(channelID, reason string)
 }
 
 // Server API 依赖集合。
@@ -255,6 +256,8 @@ func (s *Server) writeStoreErr(w http.ResponseWriter, r *http.Request, err error
 		writeErr(w, http.StatusConflict, "conflict", "资源冲突")
 	case errors.Is(err, store.ErrForbidden):
 		writeErr(w, http.StatusForbidden, "forbidden", "无权操作")
+	case errors.Is(err, store.ErrExpired):
+		writeErr(w, http.StatusGone, "code_expired", "邀请码已过期")
 	default:
 		path := ""
 		if r != nil && r.URL != nil {

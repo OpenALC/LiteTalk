@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
@@ -68,5 +69,71 @@ func TestDecodeJSONTooLargeChunked(t *testing.T) {
 
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("chunked 期望 413，实际 %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestValidPassword 密码 8–72 字节（#22）。
+func TestValidPassword(t *testing.T) {
+	valid := []string{"12345678", "a-very-long-but-acceptable-password-string-0123456789", strings.Repeat("x", 72)}
+	for _, s := range valid {
+		if !validPassword(s) {
+			t.Fatalf("密码 %q 应合法", s[:20])
+		}
+	}
+	invalid := []string{"", "1234567", strings.Repeat("x", 73)}
+	for _, s := range invalid {
+		if validPassword(s) {
+			t.Fatalf("密码（%d 字节）应非法", len(s))
+		}
+	}
+}
+
+// TestPatchMeOK 合法昵称变更正常通过（409 路径由 writeStoreErr 单测覆盖）。
+func TestPatchMeOK(t *testing.T) {
+	srv, _ := newTestServerMode(t, AuthModeSimple)
+	h := srv.Handler()
+	// simple 模式直接注册。
+	out := postJSON(t, h, "/api/v1/auth/register", "", map[string]string{
+		"nickname": "conflict-user", "email": "conflict@test.com", "password": "password123",
+	}, 201)
+	tok, _ := out["access_token"].(string)
+	if tok == "" {
+		t.Fatalf("注册响应缺 access_token: %v", out)
+	}
+
+	body := map[string]any{"nickname": "new-name-ok"}
+	buf := new(bytes.Buffer)
+	_ = json.NewEncoder(buf).Encode(body)
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/users/me", buf)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("合法昵称变更应 200，实际 %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestRateLimitCodesUnified 频控超限一律 429 rate_limited（#22 / §0.1.3）。
+func TestRateLimitCodesUnified(t *testing.T) {
+	srv, _ := newTestServerMode(t, AuthModeFull)
+	h := srv.Handler()
+	// 登录频控 5 次/min：第 6 次应 429 且 code=rate_limited。
+	for i := 0; i < 6; i++ {
+		body := map[string]any{"email": "rl@test.com", "password": "wrong-password-123"}
+		buf := new(bytes.Buffer)
+		_ = json.NewEncoder(buf).Encode(body)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", buf)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if i == 5 {
+			if rec.Code != http.StatusTooManyRequests {
+				t.Fatalf("第 6 次应 429，实际 %d", rec.Code)
+			}
+			if !strings.Contains(rec.Body.String(), "rate_limited") {
+				t.Fatalf("code 应为 rate_limited，实际 %s", rec.Body.String())
+			}
+		}
 	}
 }

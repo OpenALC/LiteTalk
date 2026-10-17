@@ -3,7 +3,9 @@ package api
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/OpenALC/LiteTalk/server/internal/store"
@@ -154,9 +156,16 @@ func (s *Server) handleDeleteServer(w http.ResponseWriter, r *http.Request) {
 	if !s.requireRole(w, r, id, c.UserID, store.RoleOwner) {
 		return
 	}
+	// 删前记下频道 ID，删后逐个踢出房间成员（#22）。
+	channels, _ := s.store.ChannelsOfServer(r.Context(), id)
 	if err := s.store.DeleteServer(r.Context(), id); err != nil {
 		s.writeStoreErr(w, r, err)
 		return
+	}
+	if s.hub != nil {
+		for _, ch := range channels {
+			s.hub.KickChannel(strconv.FormatInt(ch.ID, 10), "server_deleted")
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -192,7 +201,15 @@ func (s *Server) handleJoinServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.UseInvite(r.Context(), inv.Code); err != nil {
-		writeErr(w, http.StatusConflict, "code_exhausted", "邀请码使用次数已达上限")
+		if errors.Is(err, store.ErrConflict) {
+			writeErr(w, http.StatusConflict, "code_exhausted", "邀请码使用次数已达上限")
+			return
+		}
+		if errors.Is(err, store.ErrExpired) {
+			writeErr(w, http.StatusGone, "code_expired", "邀请码已过期")
+			return
+		}
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	mem := &store.ServerMember{ServerID: inv.ServerID, UserID: c.UserID, Role: store.RoleMember}
@@ -245,6 +262,11 @@ func (s *Server) handleCreateInvite(w http.ResponseWriter, r *http.Request) {
 	}
 	var req createInviteReq
 	if !decodeJSON(w, r, &req) {
+		return
+	}
+	// 邀请参数校验（#22）：max_uses 不可为负。
+	if req.MaxUses < 0 {
+		writeErr(w, http.StatusBadRequest, "bad_request", "max_uses 不可为负")
 		return
 	}
 	code, err := randomCode(12)

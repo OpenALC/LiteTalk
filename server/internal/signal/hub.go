@@ -316,6 +316,37 @@ func (h *Hub) Shutdown(reason string) {
 	}
 }
 
+// KickChannel 把该频道房间内的全部连接强制离房（#22，频道/服务器删除后收尾）。
+// 只清房间归属与 SFU peer，不动 WS 连接本身——被摘连接收 session.voice_taken
+// 做本地退房（复用既有「服务端单方面摘出房间」路径）。
+// 单实例语义：跨实例部署踢不到其他实例上的连接。
+func (h *Hub) KickChannel(channelID, reason string) {
+	h.mu.Lock()
+	room := h.rooms[channelID]
+	if room == nil {
+		h.mu.Unlock()
+		return
+	}
+	var pending []leaveWork
+	var removed []*client
+	for _, c := range room.members {
+		if w := h.leaveWorkLocked(c); w != nil {
+			pending = append(pending, *w)
+			removed = append(removed, c)
+		}
+	}
+	h.mu.Unlock()
+	for _, w := range pending {
+		h.finishLeave(w)
+	}
+	if reason != "" {
+		h.log.Printf("ws: 频道 %s 被移除（%s），%d 人已离房", channelID, reason, len(removed))
+	}
+	for _, c := range removed {
+		h.sendJSON(c, TypeSessionVoiceTaken, nil)
+	}
+}
+
 // writeLoop 唯一写者：保证 coder/websocket 单写者约束。
 // 出错（写超时/对端关闭）→ cancel 读循环 ctx + CloseNow（§0.7）。
 func (c *client) writeLoop(ctx context.Context) {

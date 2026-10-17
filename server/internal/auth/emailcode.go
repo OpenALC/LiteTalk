@@ -108,9 +108,9 @@ type RateLimit struct {
 // NewRateLimit 构造限流器。
 func NewRateLimit(kv kvStore) *RateLimit { return &RateLimit{kv: kv} }
 
-// Allow 窗口内第 n 次请求；超过 limit 返回 false。
+// Allow 窗口内第 n 次请求；超过 limit 返回 false。计数走 IncrCap 原子限幅（#22）。
 func (r *RateLimit) Allow(ctx context.Context, key string, limit int, window time.Duration) (bool, error) {
-	n, err := r.kv.Incr(ctx, "rl:"+key, window)
+	n, err := r.kv.IncrCap(ctx, "rl:"+key, window, int64(limit))
 	if err != nil {
 		return false, err
 	}

@@ -69,7 +69,31 @@ func TestValidateJWTSecret(t *testing.T) {
 	}
 }
 
-// TestResolveMigrations 验证迁移 FS 选择：默认 embed，LITETALK_MIGRATIONS_DIR 覆盖磁盘。
+// TestValidateSFUIP 生产模式拒环回地址（#22）。
+func TestValidateSFUIP(t *testing.T) {
+	// dev 模式全放行。
+	for _, ip := range []string{"127.0.0.1", "::1", "10.0.0.1", "bad-ip"} {
+		if err := validateSFUIP(ip, true); err != nil {
+			t.Fatalf("dev 模式 %q 应放行，实际 %v", ip, err)
+		}
+	}
+	// 生产：环回拒绝。
+	for _, ip := range []string{"127.0.0.1", "127.0.0.53", "::1"} {
+		if err := validateSFUIP(ip, false); err == nil {
+			t.Fatalf("生产模式环回 %q 应拒绝", ip)
+		}
+	}
+	// 生产：非法 IP 拒绝。
+	if err := validateSFUIP("not-an-ip", false); err == nil {
+		t.Fatal("非法 IP 应拒绝")
+	}
+	// 生产：公网/内网 IP 放行。
+	for _, ip := range []string{"10.0.0.1", "192.168.1.1", "8.8.8.8", "2001:db8::1"} {
+		if err := validateSFUIP(ip, false); err != nil {
+			t.Fatalf("非环回 %q 应放行，实际 %v", ip, err)
+		}
+	}
+}
 func TestResolveMigrations(t *testing.T) {
 	// 默认走 embed。
 	t.Setenv("LITETALK_MIGRATIONS_DIR", "")

@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/OpenALC/LiteTalk/server/internal/store"
 )
@@ -145,6 +146,10 @@ func (s *Server) handleDeleteChannel(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.DeleteChannel(r.Context(), id); err != nil {
 		s.writeStoreErr(w, r, err)
 		return
+	}
+	// 频道删除后踢出该房间内成员（#22，单实例语义）。
+	if s.hub != nil {
+		s.hub.KickChannel(strconv.FormatInt(id, 10), "channel_deleted")
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
