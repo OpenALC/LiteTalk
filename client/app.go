@@ -508,16 +508,74 @@ func (a *App) GetServerConfig() *ServerConfigView {
 	return &ServerConfigView{BaseURL: r.BaseURL, WSURL: r.WSURL, Source: string(r.Source)}
 }
 
-// SetServerConfig 保存服务器地址（WS 自动推导：https→wss、http→ws，末尾补 /ws）。
-// 重启后生效——运行中热切换信令/REST 连接成本高，不做即时切换。
+// SetServerConfig 保存服务器地址并热切换（WS 自动推导：https→wss、http→ws，末尾补 /ws）。
+// 流程：校验 → healthz 探活 → 落盘 → 重定向 REST/信令到新地址 →
+// 用当前令牌重建信令会话。探活失败保持原地址不动，返回错误给前端提示。
 func (a *App) SetServerConfig(baseURL string) error {
 	if err := config.ValidateBase(baseURL); err != nil {
 		return err
 	}
-	return a.cfg.Update(func(c *config.Config) error {
+	// 先探活再落盘：不通的新地址不写盘，运行中状态不受影响。
+	r := a.TestServerConnection(baseURL)
+	if !r.OK {
+		return fmt.Errorf("切换失败，已恢复原地址: %s", r.ErrorMsg)
+	}
+	old := a.cfg.Resolve()
+	if err := a.cfg.Update(func(c *config.Config) error {
 		c.ServerBase = baseURL
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	cur := a.cfg.Resolve()
+	// env 覆盖时 Resolve 结果不变（LITETALK_API 优先于 config.json）：无变化不折腾会话。
+	if cur.BaseURL == old.BaseURL && cur.WSURL == old.WSURL {
+		return nil
+	}
+	a.retarget(cur.BaseURL)
+	return nil
+}
+
+// retarget 把 REST 基址切到新地址并重建信令会话（热切换核心）。
+// 已登录则携带当前令牌重连；令牌不被新服务端接受时清会话回登录态。
+func (a *App) retarget(baseURL string) {
+	if a.api == nil {
+		return // 测试环境未初始化 API 客户端，跳过
+	}
+	a.api.SetBase(baseURL)
+	a.mu.Lock()
+	token := a.api.Token()
+	nickname := a.user.Nickname
+	loggedIn := a.user.ID != 0
+	a.mu.Unlock()
+	// 停旧会话与退避重试（loginGen+1），避免旧地址的重试循环赖着不走。
+	a.loginGen.Add(1)
+	a.disconnectSession()
+	if !loggedIn || token == "" {
+		a.emit("auth:session", map[string]any{"ok": false})
+		return
+	}
+	// 令牌兼容性预检：Me() 能通就重连信令；401（含刷新失败）才清会话回登录态。
+	if _, err := a.api.Me(); err != nil {
+		var ae *state.APIError
+		if errors.As(err, &ae) && ae.Status == http.StatusUnauthorized {
+			log.Printf("server switch: token rejected by new server: %v", err)
+			a.mu.Lock()
+			a.refreshTok = ""
+			isGuest := a.user.IsGuest
+			a.user = state.UserProfile{}
+			a.mu.Unlock()
+			if isGuest {
+				_ = a.cfg.SetGuestRefresh("")
+			}
+			// 复用 auth:kicked 让前端走 logout → 登录页（现有唯一回登录页机制）。
+			a.emit("auth:kicked", map[string]any{"reason": "server_changed"})
+			return
+		}
+		// 非 401（网络抖动等）：继续尝试连接信令，交给 startSession 的重试兜底。
+		log.Printf("server switch: me check: %v（继续尝试信令连接）", err)
+	}
+	a.startSession(token, nickname)
 }
 
 // ConnTestResult 连通性测试结果。
