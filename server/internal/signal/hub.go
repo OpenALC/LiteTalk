@@ -745,6 +745,57 @@ func (h *Hub) handleVoiceRequestState(c *client, d VoiceRequestStateData) {
 	})
 }
 
+// ---- Hub 带锁快照 ----
+
+// 以下访问器测试与生产共用：hub.rooms / hub.conns / room.members 只允许在持有 h.mu 时
+// 触碰，包外代码与测试一律改走这些方法。P0-3 的竞争正是测试在解锁后读 room.members，
+// 与 cleanup → leaveWorkLocked 的持锁删除并发——读侧不收锁，写侧加锁也挡不住。
+// 返回的 *client 由连接自身生命周期持有，超出锁后引用是安全的；其可变字段
+// （roomID、state）仍须经 roomIDLocked / memberInfoOf 等访问器读。
+
+// roomMember 房间内某 uid 的成员连接（房不存在或该 uid 不在房 → nil）。持 h.mu。
+func (h *Hub) roomMember(channelID, uid string) *client {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	room := h.rooms[channelID]
+	if room == nil {
+		return nil
+	}
+	return room.members[uid]
+}
+
+// roomMemberCount 房间成员数（房不存在 → 0）。持 h.mu。
+func (h *Hub) roomMemberCount(channelID string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	room := h.rooms[channelID]
+	if room == nil {
+		return 0
+	}
+	return len(room.members)
+}
+
+// connByDevice 某 uid+dev 的当前连接（不在线 → nil）。持 h.mu。
+func (h *Hub) connByDevice(uid, dev string) *client {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.conns[makeConnKey(uid, dev)]
+}
+
+// connCount 某 uid 的全部设备连接数（O(连接数)，仅断言/排障用）。持 h.mu。
+func (h *Hub) connCount(uid string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	prefix := uid + "\x00"
+	n := 0
+	for k := range h.conns {
+		if strings.HasPrefix(string(k), prefix) {
+			n++
+		}
+	}
+	return n
+}
+
 // ---- client / roomState 辅助 ----
 
 func (c *client) roomIDLocked() string {

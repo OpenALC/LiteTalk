@@ -127,9 +127,7 @@ func TestSessionKickedSameDevice(t *testing.T) {
 	// 索引槽位被新连接顶替；旧连接的 cleanup 不得盲删（身份核对见 TestCleanupIdentity）。
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		f.hub.mu.Lock()
-		got := f.hub.conns[makeConnKey("1", "desktop")]
-		f.hub.mu.Unlock()
+		got := f.hub.connByDevice("1", "desktop")
 		if got != nil && got.sid == sidB {
 			break
 		}
@@ -252,15 +250,16 @@ func TestHubKickDevices(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		f.hub.mu.Lock()
-		_, mobOK := f.hub.conns[makeConnKey("2", "mobile")]
-		desk := f.hub.conns[makeConnKey("2", "desktop")]
-		f.hub.mu.Unlock()
-		if !mobOK && desk != nil {
+		mobOK := f.hub.connByDevice("2", "mobile") != nil
+		deskOK := f.hub.connByDevice("2", "desktop") != nil
+		if !mobOK && deskOK {
+			if got := f.hub.connCount("2"); got != 1 {
+				t.Fatalf("设备级 Kick 后 uid=2 连接数 = %d, want 1", got)
+			}
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("设备级 Kick 后索引不符：mobile仍在=%v desktop在=%v", mobOK, desk != nil)
+			t.Fatalf("设备级 Kick 后索引不符：mobile仍在=%v desktop在=%v", mobOK, deskOK)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -318,6 +317,7 @@ func TestWSSessionHandshakeSid(t *testing.T) {
 
 // TestVoiceTakenSameAccount 语音单处（§0.10）：desktop 在房，同账号 mobile 进同一语音房
 // → desktop 收 session.voice_taken（连接不断），成员登记转移给 mobile。
+// hub 状态一律走带锁快照访问器（P0-3：读侧不收锁会与 cleanup 的持锁删除并发）。
 func TestVoiceTakenSameAccount(t *testing.T) {
 	f := newChatFixture(t)
 	chID := strconv.FormatInt(f.vch.ID, 10)
@@ -336,20 +336,78 @@ func TestVoiceTakenSameAccount(t *testing.T) {
 	}
 	mob.recvUntil(TypeChannelJoined)
 
-	f.hub.mu.Lock()
-	room := f.hub.rooms[chID]
-	mobC := f.hub.conns[makeConnKey("1", "mobile")]
-	deskC := f.hub.conns[makeConnKey("1", "desktop")]
-	f.hub.mu.Unlock()
-	if room == nil || room.members["1"] != mobC {
-		t.Fatalf("成员登记未转移给 mobile 连接")
+	mobC := f.hub.connByDevice("1", "mobile")
+	deskC := f.hub.connByDevice("1", "desktop")
+	if mobC == nil || deskC == nil {
+		t.Fatalf("连接索引缺失：mobile=%v desktop=%v", mobC, deskC)
 	}
-	if deskC == nil || deskC.roomIDLocked() != "" {
+	if f.hub.roomMember(chID, "1") != mobC {
+		t.Fatal("成员登记未转移给 mobile 连接")
+	}
+	if got := f.hub.roomMemberCount(chID); got != 1 {
+		t.Fatalf("房间成员数 = %d, want 1", got)
+	}
+	if deskC.roomIDLocked() != "" {
 		t.Fatal("desktop 连接应已退出语音房")
 	}
 	// desktop 连接本身不被踢（voice_taken 不关 WS）。
 	if deskC.conn == nil {
 		t.Fatal("desktop 连接不应被销毁")
+	}
+	if got := f.hub.connCount("1"); got != 2 {
+		t.Fatalf("uid=1 连接数 = %d, want 2（voice_taken 不踢线）", got)
+	}
+
+	// 被抢占的 mobile 连接仍然健康：Kick 时先收 session.kicked、再 close 4001。
+	// readCloseCode 允许 kicked 帧先于关闭帧到达（Kick 有发送窗口）。
+	f.hub.Kick("1", "mobile", "logout")
+	if code := mob.readCloseCode(); code != CloseCodeNewLogin {
+		t.Fatalf("mobile close code = %d, want %d", code, CloseCodeNewLogin)
+	}
+}
+
+// TestHubSnapshotAccessors hub 带锁快照访问器（P0-3）：房间/连接状态只经这些方法读，
+// 房不存在、uid 不在房、设备不在线一律返回零值。
+func TestHubSnapshotAccessors(t *testing.T) {
+	hub, _ := newHubServer(t, store.NewMem(), false)
+
+	desk := &client{hub: hub, userID: "1", username: "alice", dev: "desktop", send: make(chan []byte, 4)}
+	mob := &client{hub: hub, userID: "1", username: "alice", dev: "mobile", send: make(chan []byte, 4)}
+	bob := &client{hub: hub, userID: "2", username: "bob", dev: "desktop", send: make(chan []byte, 4)}
+
+	hub.mu.Lock()
+	hub.conns[makeConnKey("1", "desktop")] = desk
+	hub.conns[makeConnKey("1", "mobile")] = mob
+	hub.conns[makeConnKey("2", "desktop")] = bob
+	hub.rooms["9"] = &roomState{id: "9", members: map[string]*client{"1": desk}}
+	hub.mu.Unlock()
+
+	if got := hub.roomMember("9", "1"); got != desk {
+		t.Fatalf("roomMember = %v, want desktop 连接", got)
+	}
+	if got := hub.roomMember("9", "2"); got != nil {
+		t.Fatalf("roomMember(uid 不在房) = %v, want nil", got)
+	}
+	if got := hub.roomMember("404", "1"); got != nil {
+		t.Fatalf("roomMember(房不存在) = %v, want nil", got)
+	}
+	if got := hub.roomMemberCount("9"); got != 1 {
+		t.Fatalf("roomMemberCount = %d, want 1", got)
+	}
+	if got := hub.roomMemberCount("404"); got != 0 {
+		t.Fatalf("roomMemberCount(房不存在) = %d, want 0", got)
+	}
+	if got := hub.connByDevice("1", "mobile"); got != mob {
+		t.Fatalf("connByDevice = %v, want mobile 连接", got)
+	}
+	if got := hub.connByDevice("1", "web"); got != nil {
+		t.Fatalf("connByDevice(设备不在线) = %v, want nil", got)
+	}
+	if got := hub.connCount("1"); got != 2 {
+		t.Fatalf("connCount(uid=1) = %d, want 2", got)
+	}
+	if got := hub.connCount("404"); got != 0 {
+		t.Fatalf("connCount(uid 不在线) = %d, want 0", got)
 	}
 }
 
