@@ -138,25 +138,23 @@ func (a *App) emit(name string, data any) {
 
 // initLogging 把全局 log 输出重定向到文件：os.UserConfigDir()/LiteTalk/app.log
 // （与 config.json 同目录）。GUI 子系统无控制台，stdout/stderr 不可见，排障
-// 全依赖此文件；超过 5MB 启动时截断。文件排 MultiWriter 首位——无控制台时
-// stderr 写入会失败并短路 MultiWriter，放前面会吞掉文件写入。
+// 全依赖此文件；5MB × 3 档滚动（issue #10：不再启动截断，超限先滚动）。
+// 文件 0600、目录 0700——日志含令牌/连接细节，同用户外不可读。
+// 文件排 MultiWriter 首位——无控制台时 stderr 写入会失败并短路 MultiWriter，
+// 放前面会吞掉文件写入。
 func initLogging() {
 	dir, err := os.UserConfigDir()
 	if err != nil {
 		return
 	}
 	logDir := filepath.Join(dir, "LiteTalk")
-	_ = os.MkdirAll(logDir, 0o755)
-	f, err := os.OpenFile(filepath.Join(logDir, "app.log"),
-		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	_ = os.MkdirAll(logDir, 0o700)
+	_ = os.Chmod(logDir, 0o700) // 旧版本 0755 建的目录在此收紧
+	w, err := config.NewRotateWriter(filepath.Join(logDir, "app.log"), 5<<20, 3, 0o600)
 	if err != nil {
 		return
 	}
-	if fi, err := f.Stat(); err == nil && fi.Size() > 5<<20 {
-		_ = f.Truncate(0)
-		_, _ = f.Seek(0, 0)
-	}
-	log.SetOutput(io.MultiWriter(f, os.Stderr))
+	log.SetOutput(io.MultiWriter(w, os.Stderr))
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 }
 

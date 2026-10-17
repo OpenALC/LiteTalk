@@ -310,9 +310,13 @@ func (m *Manager) read() Config {
 func (m *Manager) Save(c Config) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := os.MkdirAll(filepath.Dir(m.path), 0o755); err != nil {
+	dir := filepath.Dir(m.path)
+	// 0700：配置目录含令牌文件（Linux 回落明文存储），同用户外不可进。
+	// 旧版本用 0755 建的目录在此收紧（issue #10）。
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
+	_ = os.Chmod(dir, 0o700)
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return err
