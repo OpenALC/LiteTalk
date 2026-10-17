@@ -62,8 +62,10 @@ type RefreshSource func(ctx context.Context) (string, error)
 
 // APIClient REST 客户端（§5.4），带 access token 注入与 401 刷新重试一次。
 type APIClient struct {
-	base string
-	http *http.Client
+	// baseMu 保护 base：SetServerConfig 热切换时替换，在飞请求自然结束。
+	baseMu sync.RWMutex
+	base   string
+	http   *http.Client
 
 	// tokenMu 保护 access：SetToken/Token 与每个请求的读并发（CI -race）。
 	tokenMu sync.RWMutex
@@ -116,7 +118,19 @@ func (c *APIClient) Token() string {
 }
 
 // Base 返回 REST 基址（会话侧据此判环回候选，见 IsLoopbackURL）。
-func (c *APIClient) Base() string { return c.base }
+func (c *APIClient) Base() string {
+	c.baseMu.RLock()
+	defer c.baseMu.RUnlock()
+	return c.base
+}
+
+// SetBase 热切换 REST 基址。在飞请求可能仍走旧地址（自然结束），
+// 后续请求走新地址。配合 SetServerConfig 的地址热切换使用。
+func (c *APIClient) SetBase(base string) {
+	c.baseMu.Lock()
+	defer c.baseMu.Unlock()
+	c.base = base
+}
 
 // do 执行一次请求；401（token_expired/unauthorized）且带鉴权时先合并刷新
 // 再用新令牌原样重放一次（retried 防递归）；仍 401 才返回错误。
@@ -248,7 +262,7 @@ func (c *APIClient) post(path string, body any, auth bool) (int, []byte, error) 
 	if err != nil {
 		return 0, nil, fmt.Errorf("marshal %s: %w", path, err)
 	}
-	req, err := http.NewRequest(http.MethodPost, c.base+"/api/v1"+path, bytes.NewReader(raw))
+	req, err := http.NewRequest(http.MethodPost, c.Base()+"/api/v1"+path, bytes.NewReader(raw))
 	if err != nil {
 		return 0, nil, err
 	}
@@ -262,7 +276,7 @@ func (c *APIClient) post(path string, body any, auth bool) (int, []byte, error) 
 
 // get JSON GET（带 Bearer）。
 func (c *APIClient) get(path string) (int, []byte, error) {
-	req, err := http.NewRequest(http.MethodGet, c.base+"/api/v1"+path, nil)
+	req, err := http.NewRequest(http.MethodGet, c.Base()+"/api/v1"+path, nil)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -279,7 +293,7 @@ func (c *APIClient) patch(path string, body any) (int, []byte, error) {
 	if err != nil {
 		return 0, nil, fmt.Errorf("marshal %s: %w", path, err)
 	}
-	req, err := http.NewRequest(http.MethodPatch, c.base+"/api/v1"+path, bytes.NewReader(raw))
+	req, err := http.NewRequest(http.MethodPatch, c.Base()+"/api/v1"+path, bytes.NewReader(raw))
 	if err != nil {
 		return 0, nil, err
 	}
@@ -293,7 +307,7 @@ func (c *APIClient) patch(path string, body any) (int, []byte, error) {
 
 // del JSON DELETE（带 Bearer，管理端点：删除服务器/频道等）。
 func (c *APIClient) del(path string) (int, []byte, error) {
-	req, err := http.NewRequest(http.MethodDelete, c.base+"/api/v1"+path, nil)
+	req, err := http.NewRequest(http.MethodDelete, c.Base()+"/api/v1"+path, nil)
 	if err != nil {
 		return 0, nil, err
 	}

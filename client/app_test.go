@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/OpenALC/LiteTalk/client/internal/config"
@@ -66,7 +67,7 @@ func TestGetVersion(t *testing.T) {
 	}
 }
 
-// 验证服务器地址配置：保存 / WS 推导 / 来源
+// 验证服务器地址配置：保存 / WS 推导 / 来源（热切换需探活通过才落盘）
 func TestServerConfig(t *testing.T) {
 	m := config.NewWithPath(filepath.Join(t.TempDir(), "config.json"))
 	app := newAppWithConfig(m)
@@ -77,19 +78,27 @@ func TestServerConfig(t *testing.T) {
 		t.Fatalf("默认解析错误: %+v", v)
 	}
 
-	// 保存后生效（file 来源），WS 自动推导 wss。
-	if err := app.SetServerConfig("https://talk.example.com"); err != nil {
+	// 保存后生效（file 来源），WS 自动推导 wss。热切换先探活，mock healthz。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","version":"test"}`))
+	}))
+	defer srv.Close()
+	if err := app.SetServerConfig(srv.URL); err != nil {
 		t.Fatalf("SetServerConfig: %v", err)
 	}
 	v = app.GetServerConfig()
-	if v.BaseURL != "https://talk.example.com" || v.WSURL != "wss://talk.example.com/ws" {
+	if v.BaseURL != srv.URL {
 		t.Fatalf("保存后解析错误: %+v", v)
+	}
+	if !strings.HasPrefix(v.WSURL, "ws://") || !strings.HasSuffix(v.WSURL, "/ws") {
+		t.Fatalf("WS 推导错误: %s", v.WSURL)
 	}
 	if v.Source != "file" {
 		t.Fatalf("来源应为 file，得到 %s", v.Source)
 	}
 
-	// 非法地址拒绝保存。
+	// 非法地址拒绝保存（不探活，先校验）。
 	if err := app.SetServerConfig("ftp://x"); err == nil {
 		t.Fatal("非法 scheme 应报错")
 	}
@@ -262,4 +271,79 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// TestSetServerConfigHotSwitch 验证热切换：探活通过 → 落盘 + 重定向 API 基址；
+// 探活失败 → 不动原地址，返回错误。
+func TestSetServerConfigHotSwitch(t *testing.T) {
+	// 模拟新服务器：healthz 返回 200。
+	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/healthz" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","version":"test"}`))
+	}))
+	defer ok.Close()
+
+	m := config.NewWithPath(filepath.Join(t.TempDir(), "config.json"))
+	app := newAppWithConfig(m)
+	app.api = state.NewAPIClient("http://127.0.0.1:1") // 初始地址
+
+	// 成功切换。
+	if err := app.SetServerConfig(ok.URL); err != nil {
+		t.Fatalf("SetServerConfig: %v", err)
+	}
+	v := app.GetServerConfig()
+	if v.BaseURL != ok.URL {
+		t.Fatalf("切换后地址错误: %s（期望 %s）", v.BaseURL, ok.URL)
+	}
+	if got := app.api.Base(); got != ok.URL {
+		t.Fatalf("API 基址未重定向: %s（期望 %s）", got, ok.URL)
+	}
+
+	// 失败切换：不可达地址 → 报错，原地址不动。
+	if err := app.SetServerConfig("http://127.0.0.1:1"); err == nil {
+		t.Fatal("不可达地址应报错")
+	}
+	v2 := app.GetServerConfig()
+	if v2.BaseURL != ok.URL {
+		t.Fatalf("切换失败后应保持原地址 %s，实际 %s", ok.URL, v2.BaseURL)
+	}
+	if got := app.api.Base(); got != ok.URL {
+		t.Fatalf("切换失败后 API 基址应保持 %s，实际 %s", ok.URL, got)
+	}
+}
+
+// TestSetServerConfigEnvOverride 环境变量 LITETALK_API 优先于 config.json：
+// SetServerConfig 写盘但不改变生效地址（Resolve 仍取 env），也不触发热切换。
+func TestSetServerConfigEnvOverride(t *testing.T) {
+	envSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","version":"env"}`))
+	}))
+	defer envSrv.Close()
+	fileSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","version":"file"}`))
+	}))
+	defer fileSrv.Close()
+
+	t.Setenv("LITETALK_API", envSrv.URL)
+	m := config.NewWithPath(filepath.Join(t.TempDir(), "config.json"))
+	app := newAppWithConfig(m)
+	app.api = state.NewAPIClient(envSrv.URL)
+
+	// SetServerConfig 写 fileSrv 地址到盘；Resolve 仍返回 envSrv。
+	if err := app.SetServerConfig(fileSrv.URL); err != nil {
+		t.Fatalf("SetServerConfig: %v", err)
+	}
+	v := app.GetServerConfig()
+	if v.BaseURL != envSrv.URL {
+		t.Fatalf("env 覆盖下生效地址应为 %s，实际 %s", envSrv.URL, v.BaseURL)
+	}
+	if got := app.api.Base(); got != envSrv.URL {
+		t.Fatalf("env 覆盖下 API 基址不应变化：%s（期望 %s）", got, envSrv.URL)
+	}
 }
