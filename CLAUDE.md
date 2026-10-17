@@ -88,6 +88,13 @@ go run github.com/rhysd/actionlint/cmd/actionlint@latest
 
 `gofmt -l` 的输出必须为空，否则 CI 失败。
 
+行尾由根目录 `.gitattributes` 统一固定为 LF（`*.go`/`*.mod`/`*.sum`/`*.sh`/`*.yml`/`*.sql`），`eol=lf` 优先于本机的 `core.autocrlf=true`。在这个文件之前就存在的克隆，工作区仍是 CRLF，`gofmt -l` 会列出全部文件——需要把这些文件删掉再检出一次才会转成 LF（`git checkout-index -f -a` 对未过期文件无效，`git add --renormalize .` 只改索引不改工作区）：
+
+```bash
+git ls-files --eol | awk '$2=="w/crlf"{print $NF}' | tr '\n' '\0' | xargs -0 rm -f
+git checkout -- .
+```
+
 ---
 
 ## 4. CI 门禁（`.github/workflows/ci.yml`）
