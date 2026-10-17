@@ -262,4 +262,19 @@ func TestPatchCategory(t *testing.T) {
 
 	// 不存在的分类 → 404。
 	patchJSON(t, h, "/api/v1/categories/9999", aTok, map[string]any{"name": "x"}, 404)
+
+	// 原样保存（name 未变）→ 200：对话框不改内容直接保存是常规操作，不是 404。
+	out = patchJSON(t, h, fmt.Sprintf("/api/v1/categories/%d", catIDs[1]), aTok,
+		map[string]any{"name": "乙改"}, 200)
+	if out["name"] != "乙改" {
+		t.Fatalf("原样保存响应 = %+v", out)
+	}
+	// name 未变 + 同请求带 position：重排不得被 no-op 更新挡下。
+	patchJSON(t, h, fmt.Sprintf("/api/v1/categories/%d", catIDs[1]), aTok,
+		map[string]any{"name": "乙改", "position": 0}, 200)
+	chans = getJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/channels", sid), aTok, 200).(map[string]any)
+	cats = chans["categories"].([]any)
+	if first := cats[0].(map[string]any)["name"]; first != "乙改" {
+		t.Fatalf("no-op 改名后重排未生效，首位 = %v", first)
+	}
 }

@@ -65,6 +65,13 @@ type App struct {
 	// 时，同一时刻只允许一个活跃会话（旧会话在切换时关闭，不再泄漏双管线）。
 	connMu sync.Mutex
 
+	// retargetMu 串行化服务器切换（SetServerConfig 的落盘+retarget 整段）：
+	// Wails 绑定并发调用，两次保存交错执行两个 retarget 会留下「REST 基址指向 B、
+	// 信令会话连着 A」的撕裂态。独立于 a.mu——retarget 内部要调 startSession 等
+	// 取 a.mu 的路径。锁内含 retarget 的 Me() 预检等网络 I/O：切换原子性优先，
+	// 且保存本就是低频用户操作，串行等待可接受；healthz 探活在锁外（不改共享状态）。
+	retargetMu sync.Mutex
+
 	// loginGen 登录代际：登出/新登录 +1，进行中的信令重试循环发现代际变更即退出。
 	loginGen atomic.Uint64
 
@@ -515,11 +522,16 @@ func (a *App) SetServerConfig(baseURL string) error {
 	if err := config.ValidateBase(baseURL); err != nil {
 		return err
 	}
-	// 先探活再落盘：不通的新地址不写盘，运行中状态不受影响。
+	// 先探活再落盘：不通的新地址不写盘，运行中状态不受影响。探活在锁外：
+	// 只读探测、不改共享状态，并发保存各自探活即可。
 	r := a.TestServerConnection(baseURL)
 	if !r.OK {
 		return fmt.Errorf("切换失败，已恢复原地址: %s", r.ErrorMsg)
 	}
+	// 落盘 + retarget 整段原子：交错的 retarget 会留下 REST 基址与信令会话
+	// 分属两台服务器的撕裂态（双击保存即可触发）。
+	a.retargetMu.Lock()
+	defer a.retargetMu.Unlock()
 	old := a.cfg.Resolve()
 	if err := a.cfg.Update(func(c *config.Config) error {
 		c.ServerBase = baseURL
@@ -538,6 +550,7 @@ func (a *App) SetServerConfig(baseURL string) error {
 
 // retarget 把 REST 基址切到新地址并重建信令会话（热切换核心）。
 // 已登录则携带当前令牌重连；令牌不被新服务端接受时清会话回登录态。
+// 调用方须持 retargetMu——与落盘合成一个原子切换，防并发保存交错。
 func (a *App) retarget(baseURL string) {
 	if a.api == nil {
 		return // 测试环境未初始化 API 客户端，跳过
@@ -565,6 +578,9 @@ func (a *App) retarget(baseURL string) {
 			isGuest := a.user.IsGuest
 			a.user = state.UserProfile{}
 			a.mu.Unlock()
+			// 清 access token：换服后旧令牌不被接受，残留会让 GetMe 把用户
+			// 「登回」到一个无信令连接的僵尸会话。
+			a.api.SetToken("")
 			if isGuest {
 				_ = a.cfg.SetGuestRefresh("")
 			}
@@ -721,10 +737,15 @@ func (a *App) Logout() error {
 	a.user = state.UserProfile{} // 清档案，否则 GetMe 仍返回旧用户
 	a.mu.Unlock()
 	a.disconnectSession()
+	var err error
 	if rt != "" {
-		return a.api.Logout(rt)
+		// 吊销请求要带 Bearer，故不能先清 access token。
+		err = a.api.Logout(rt)
 	}
-	return nil
+	// 无条件清 access token：GetMe 在 user 为空时回落 a.api.Me()，残留有效
+	// 令牌会把已登出的用户「登回来」（被踢后 rt 已空、api.Logout 根本不走）。
+	a.api.SetToken("")
+	return err
 }
 
 // onKicked 被服务端踢下线（同类设备在其他设备登录，契约 §0.5/§0.6）：
