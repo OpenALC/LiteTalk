@@ -209,6 +209,9 @@ func main() {
 		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// 捕获 SIGINT / SIGTERM，触发优雅关闭
@@ -218,17 +221,22 @@ func main() {
 	go func() {
 		log.Printf("litetalk server %s 监听 %s（SFU UDP %d）", version, addr, sfuInst.Port())
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("HTTP 服务异常退出: %v", err)
+			log.Printf("HTTP 服务异常退出: %v", err)
+			stop() // 触发主 goroutine 走优雅关闭路径
 		}
 	}()
 
 	<-ctx.Done()
 	log.Println("收到退出信号，开始优雅关闭")
 
+	// 关闭序：hub 广播 server.shutdown → HTTP 优雅关闭 → SFU 关闭。
+	// defer 的 LIFO 会先关 SFU 再关 MySQL，与正常退出顺序一致。
+	hub.Shutdown("shutdown")
+
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Fatalf("优雅关闭失败: %v", err)
+		log.Printf("优雅关闭失败: %v", err)
 	}
 	log.Println("服务已停止")
 }
