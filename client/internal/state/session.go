@@ -101,6 +101,12 @@ type Session struct {
 	// Pipeline，之后由 Pipeline 每帧自行 Load。
 	sendGate atomic.Pointer[hotkey.Gate]
 
+	// iceMu/iceServers 预取的 STUN/TURN 凭证缓存（#13）：setupPeer 跑在 WS 读
+	// 循环的 channel.joined 处理器里，禁止网络 I/O——凭证由 JoinChannel 在可
+	// 阻塞的 Wails 绑定线程预取，读循环只读缓存；缓存空则降级空 ICE 列表。
+	iceMu      sync.RWMutex
+	iceServers []webrtc.ICEServer
+
 	mu      sync.Mutex
 	members map[string]PeerView
 	selfID  string
@@ -465,8 +471,10 @@ func (s *Session) setupPeer() {
 		streamID = s.selfID
 	}
 	peer, err := rtc.NewPeer(rtc.PeerConfig{
-		StreamID:        streamID,
-		ICEServers:      s.fetchICEServers(),
+		StreamID: streamID,
+		// 只读预取缓存，不做网络 I/O：本函数跑在 WS 读循环的 channel.joined
+		// 处理器里，同步拉凭证会把信令收发停摆到撞心跳预算（#13）。
+		ICEServers:      s.cachedICE(),
 		IncludeLoopback: IsLoopbackURL(s.api.Base()), // 环回候选仅本机/内网 SFU 需要
 		Callbacks: rtc.PeerCallbacks{
 			OnLocalSDP: func(sdp webrtc.SessionDescription) {
@@ -509,6 +517,9 @@ func (s *Session) JoinChannel(channelID string) error {
 	if s.voiceUnavailable {
 		return fmt.Errorf("语音不可用: %w", s.voiceErr)
 	}
+	// 预取 ICE 凭证再进房：setupPeer 跑在 WS 读循环上，不能做网络 I/O（#13）。
+	// 这里是 Wails 绑定 goroutine，阻塞可接受；失败留空缓存，降级空 ICE 列表。
+	s.prefetchICE()
 	s.roomID.Store(channelID)
 	if err := s.ws.Send(signal.TypeChannelJoin, signal.ChannelJoinData{ChannelID: channelID}); err != nil {
 		// roomID 先存是为断线重连恢复；发送失败必须回滚——否则重连后
@@ -821,6 +832,23 @@ func IsLoopbackURL(base string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// prefetchICE 预取 STUN/TURN 凭证并写入缓存。只在可阻塞的 goroutine 调用
+// （JoinChannel 的 Wails 绑定线程）；WS 读循环上的 setupPeer 只读缓存（#13）。
+// 失败留空缓存，由 cachedICE 降级空 ICE 列表——本机/内网直连仍可通。
+func (s *Session) prefetchICE() {
+	servers := s.fetchICEServers()
+	s.iceMu.Lock()
+	s.iceServers = servers
+	s.iceMu.Unlock()
+}
+
+// cachedICE 读预取结果。零 I/O，专供 WS 读循环使用；空即降级空 ICE 列表。
+func (s *Session) cachedICE() []webrtc.ICEServer {
+	s.iceMu.RLock()
+	defer s.iceMu.RUnlock()
+	return s.iceServers
 }
 
 // fetchICEServers 拉取 STUN/TURN 凭证并转成 pion 格式。失败或服务端未配置

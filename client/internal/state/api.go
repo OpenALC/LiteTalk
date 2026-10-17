@@ -258,11 +258,16 @@ func (c *APIClient) doRefresh(ctx context.Context) (*AuthTokens, error) {
 
 // post JSON POST，auth=true 时带 Bearer。返回状态码与响应体。
 func (c *APIClient) post(path string, body any, auth bool) (int, []byte, error) {
+	return c.postCtx(context.Background(), path, body, auth)
+}
+
+// postCtx 同 post，但带请求上下文（可设短超时，见 RTCCredentials）。
+func (c *APIClient) postCtx(ctx context.Context, path string, body any, auth bool) (int, []byte, error) {
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return 0, nil, fmt.Errorf("marshal %s: %w", path, err)
 	}
-	req, err := http.NewRequest(http.MethodPost, c.Base()+"/api/v1"+path, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.Base()+"/api/v1"+path, bytes.NewReader(raw))
 	if err != nil {
 		return 0, nil, err
 	}
@@ -514,9 +519,15 @@ type ICEServersResponse struct {
 	ExpiresAt  int64       `json:"expiresAt"`
 }
 
+// rtCredentialsTimeout /rtc/credentials 短超时：该请求可能落在进房链路上，
+// 用全局 15s 会把 WS 读循环停摆到撞心跳预算（#13）。失败由调用方降级空 ICE。
+var rtCredentialsTimeout = 3 * time.Second
+
 // RTCCredentials 获取 STUN/TURN 凭证。
 func (c *APIClient) RTCCredentials() (*ICEServersResponse, error) {
-	status, data, err := c.post("/rtc/credentials", map[string]string{}, true)
+	ctx, cancel := context.WithTimeout(context.Background(), rtCredentialsTimeout)
+	defer cancel()
+	status, data, err := c.postCtx(ctx, "/rtc/credentials", map[string]string{}, true)
 	if err != nil {
 		return nil, err
 	}
