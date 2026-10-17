@@ -1,0 +1,40 @@
+version: '3'
+
+# 跨平台公共任务。平台相关构建在 build/{windows,linux,darwin}/Taskfile.yml。
+
+tasks:
+  go:mod:tidy:
+    summary: go mod tidy
+    internal: true
+    cmds:
+      - go mod tidy
+
+  install:frontend:deps:
+    summary: 安装前端依赖（pnpm，项目硬性约束）
+    dir: frontend
+    sources:
+      - package.json
+      - pnpm-lock.yaml
+    generates:
+      - node_modules/**
+    preconditions:
+      - sh: pnpm --version
+        msg: "未找到 pnpm。项目只用 pnpm（见 CLAUDE.md），请先安装：npm i -g pnpm"
+    cmds:
+      - pnpm install --prefer-offline
+
+  dev:frontend:
+    summary: 启动 vite dev server（端口由 WAILS_VITE_PORT 注入）
+    dir: frontend
+    deps:
+      - task: install:frontend:deps
+    cmds:
+      - pnpm run dev
+
+  build:frontend:
+    summary: 生产前端构建（go:embed 依赖 frontend/dist）
+    dir: frontend
+    deps:
+      - task: install:frontend:deps
+    cmds:
+      - pnpm run build

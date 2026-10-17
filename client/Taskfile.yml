@@ -1,0 +1,36 @@
+version: '3'
+
+includes:
+  common: ./build/Taskfile.yml
+  windows: ./build/windows/Taskfile.yml
+  darwin: ./build/darwin/Taskfile.yml
+  linux: ./build/linux/Taskfile.yml
+
+vars:
+  APP_NAME: "LiteTalk"
+  BIN_DIR: "build/bin"
+  # wails3 dev 注入 WAILS_VITE_PORT（dev.go 默认 9245）。
+  VITE_PORT: '{{.WAILS_VITE_PORT | default 9245}}'
+
+tasks:
+  build:
+    summary: 构建应用（按当前平台分发）
+    cmds:
+      - task: "{{OS}}:build"
+
+  package:
+    summary: 生产构建（产物在 build/bin/；安装器打包由 CI 负责）
+    cmds:
+      - task: "{{OS}}:build"
+        vars:
+          PRODUCTION: "true"
+
+  run:
+    summary: 运行应用
+    cmds:
+      - task: "{{OS}}:run"
+
+  dev:
+    summary: 开发模式（vite HMR + go 变更重建设置）
+    cmds:
+      - wails3 dev -config ./build/config.yml -port {{.VITE_PORT}}

@@ -52,4 +52,23 @@ pnpm run build           # 构建到 dist/（go:embed 依赖）
 pnpm run type-check
 ```
 
+### wails3 dev（热重载开发模式）
+
+脚手架在 `Taskfile.yml` + `build/config.yml`（CI 打包不依赖 wails CLI，仍走裸 `go build`，见 `.github/workflows/ci.yml`）。
+
+```bash
+# Git Bash；cgo（libopus/malgo/WASAPI）依赖 mingw64 gcc
+export PATH="/c/tools/mingw64/bin:$PATH"
+export CGO_ENABLED=1
+cd client
+wails3 dev               # 需 wails v3 CLI（go install github.com/wailsapp/wails/v3/cmd/wails3）
+```
+
+行为：vite dev server（端口 9245，`WAILS_VITE_PORT` 可改）+ 监视 `*.go` 变更自动重建重启；前端 HMR。dev 二进制输出到 `build/bin/`（已 gitignore）。
+
+注意：
+- 系统里的 `wails`（v2 CLI）不兼容 v3 项目，必须用 `wails3`；
+- vite 显式绑 `127.0.0.1`：wails v3 Windows 的 asset 代理地址是 `wails.localhost`（解析 IPv4），vite 默认只绑 IPv6 `[::1]` 会被拒连；
+- Linux 构建走 `-tags gtk3`（对应 WebKitGTK 4.1，勿用默认 GTK4）。
+
 联调 harness：`go run ./cmd/calltest --help`（入房通话）、`go run ./cmd/audioloop --help`（音频回环）。

@@ -1,0 +1,35 @@
+version: '3'
+
+# Linux 平台构建。gtk3 标签（对应 WebKitGTK 4.1；CLAUDE.md 硬性约束，勿用默认 GTK4）。
+# cgo（libopus 走 pkg-config 系统库）需 libopus-dev + pkg-config（CI 的 apt 步骤同款）。
+
+includes:
+  common: ../Taskfile.yml
+
+tasks:
+  build:
+    summary: 构建 Linux 客户端
+    deps:
+      - task: common:go:mod:tidy
+    cmds:
+      - go build {{.BUILD_FLAGS}} -o {{.BIN_DIR}}/{{.APP_NAME}} .
+    vars:
+      BUILD_FLAGS: '{{if eq .PRODUCTION "true"}}-tags gtk3,production -trimpath -buildvcs=false -ldflags="-s -w -X main.version={{.VERSION}}"{{else}}-tags gtk3 -buildvcs=false{{end}}'
+    env:
+      CGO_ENABLED: '1'
+      GOOS: linux
+      PRODUCTION: '{{.PRODUCTION | default "false"}}'
+      VERSION: '{{.VERSION | default "dev"}}'
+
+  run:
+    summary: 运行 Linux 客户端
+    cmds:
+      - cmd: './{{.BIN_DIR}}/{{.APP_NAME}}'
+        platforms: [linux]
+
+  package:
+    summary: 生产构建（deb/rpm 由 CI 的 nfpm 流程负责）
+    cmds:
+      - task: build
+        vars:
+          PRODUCTION: "true"

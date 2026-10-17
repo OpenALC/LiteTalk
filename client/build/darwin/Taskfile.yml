@@ -1,0 +1,34 @@
+version: '3'
+
+# macOS 平台构建（实验性；CI 的 macOS job 不阻塞发版）。
+
+includes:
+  common: ../Taskfile.yml
+
+tasks:
+  build:
+    summary: 构建 macOS 客户端
+    deps:
+      - task: common:go:mod:tidy
+    cmds:
+      - go build {{.BUILD_FLAGS}} -o {{.BIN_DIR}}/{{.APP_NAME}}.app/Contents/MacOS/{{.APP_NAME}} .
+    vars:
+      BUILD_FLAGS: '{{if eq .PRODUCTION "true"}}-tags production -trimpath -buildvcs=false -ldflags="-s -w -X main.version={{.VERSION}}"{{else}}-buildvcs=false{{end}}'
+    env:
+      CGO_ENABLED: '1'
+      GOOS: darwin
+      PRODUCTION: '{{.PRODUCTION | default "false"}}'
+      VERSION: '{{.VERSION | default "dev"}}'
+
+  run:
+    summary: 运行 macOS 客户端
+    cmds:
+      - cmd: './{{.BIN_DIR}}/{{.APP_NAME}}.app/Contents/MacOS/{{.APP_NAME}}'
+        platforms: [darwin]
+
+  package:
+    summary: 生产构建（zip 由 CI 负责）
+    cmds:
+      - task: build
+        vars:
+          PRODUCTION: "true"

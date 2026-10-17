@@ -1,0 +1,38 @@
+version: '3'
+
+# Windows 平台构建。cgo（libopus/malgo/WASAPI）依赖 mingw64 gcc：
+# 在 Git Bash 里先 export PATH="/c/tools/mingw64/bin:$PATH" 再跑 wails3 dev/task。
+
+includes:
+  common: ../Taskfile.yml
+
+tasks:
+  build:
+    summary: 构建 Windows 客户端
+    deps:
+      - task: common:go:mod:tidy
+    cmds:
+      - go build {{.BUILD_FLAGS}} -o {{.BIN_DIR}}/{{.APP_NAME}}.exe .
+    vars:
+      # dev：无 production 标签（开发版 runtime.js，走 FRONTEND_DEVSERVER_URL）；
+      # production：与 CI 一致（-H windowsgui 去控制台窗，-s -w 瘦身）。
+      BUILD_FLAGS: '{{if eq .PRODUCTION "true"}}-tags production -trimpath -buildvcs=false -ldflags="-s -w -X main.version={{.VERSION}} -H windowsgui"{{else}}-buildvcs=false{{end}}'
+    env:
+      CGO_ENABLED: '1'
+      GOOS: windows
+      PRODUCTION: '{{.PRODUCTION | default "false"}}'
+      VERSION: '{{.VERSION | default "dev"}}'
+
+  run:
+    summary: 运行 Windows 客户端
+    cmds:
+      # 正斜杠：go-task 经 sh 执行，反斜杠会被当转义符（exit 127 not found）。
+      - cmd: '{{.BIN_DIR}}/{{.APP_NAME}}.exe'
+        platforms: [windows]
+
+  package:
+    summary: 生产构建（安装器由 CI 的 NSIS 流程负责）
+    cmds:
+      - task: build
+        vars:
+          PRODUCTION: "true"
