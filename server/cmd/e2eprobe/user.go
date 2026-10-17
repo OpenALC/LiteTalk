@@ -55,6 +55,16 @@ type probeUser struct {
 	recv        map[string]*atomic.Int64
 	tracksUp    atomic.Int64
 	trackErr    atomic.Int64
+
+	// 多端场景观测（-multi-device）：踢线/抢占消息、进房与服务端关闭码。
+	gotHello      atomic.Bool
+	gotKicked     atomic.Bool
+	gotVoiceTaken atomic.Bool
+	joinedRoom    atomic.Bool
+	closeCode     atomic.Int32  // 0 = 尚未收到服务端 close 帧；-1 = 异常断开（非 close 帧）
+	lastSrvErr    atomic.Value  // string "code: message"，最近一条下行 error（诊断用）
+	readDone      chan struct{} // readLoop 退出信号
+	readOnce      sync.Once
 }
 
 func newUser(cfg *config, room, id, token string, ice []ICEServer, others []string) *probeUser {
@@ -64,7 +74,8 @@ func newUser(cfg *config, room, id, token string, ice []ICEServer, others []stri
 		recv[src] = &atomic.Int64{}
 	}
 	return &probeUser{cfg: cfg, id: id, room: room, token: token, ice: ice,
-		connected: make(chan struct{}), atGate: make(chan struct{}), recv: recv}
+		connected: make(chan struct{}), atGate: make(chan struct{}), recv: recv,
+		readDone: make(chan struct{})}
 }
 
 func (u *probeUser) run(ctx context.Context, sendStart, sendStop <-chan struct{}) error {
@@ -136,9 +147,16 @@ func (u *probeUser) wsSend(msgType string, data any) error {
 }
 
 func (u *probeUser) readLoop(ctx context.Context) {
+	defer u.readOnce.Do(func() { close(u.readDone) })
 	for {
 		_, msg, err := u.ws.Read(ctx)
 		if err != nil {
+			// 服务端主动断开会带 close 帧（4001 踢线等）；网络错误记 -1。
+			if s := websocket.CloseStatus(err); s != -1 {
+				u.closeCode.Store(int32(s))
+			} else if ctx.Err() == nil {
+				u.closeCode.Store(-1)
+			}
 			return
 		}
 		var env signal.Envelope
@@ -146,6 +164,19 @@ func (u *probeUser) readLoop(ctx context.Context) {
 			continue
 		}
 		switch env.Type {
+		case signal.TypeHello:
+			u.gotHello.Store(true)
+		case signal.TypeChannelJoined:
+			u.joinedRoom.Store(true)
+		case signal.TypeError:
+			var d signal.ErrorData
+			if env.Decode(&d) == nil {
+				u.lastSrvErr.Store(d.Code + ": " + d.Message)
+			}
+		case typeSessionKicked:
+			u.gotKicked.Store(true)
+		case typeSessionVoiceTaken:
+			u.gotVoiceTaken.Store(true)
 		case signal.TypeRTCAnswer:
 			var d signal.SDPData
 			if env.Decode(&d) == nil {
@@ -163,6 +194,12 @@ func (u *probeUser) readLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// srvErr 最近一条下行 error（无则空串）。
+func (u *probeUser) srvErr() string {
+	s, _ := u.lastSrvErr.Load().(string)
+	return s
 }
 
 // ---- WebRTC ----

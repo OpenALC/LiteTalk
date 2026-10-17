@@ -9,7 +9,7 @@ import (
 	"github.com/OpenALC/LiteTalk/server/internal/store"
 )
 
-// newTestServerMode 指定 AuthMode 的测试服务器。
+// newTestServerMode 指定 AuthMode 的测试服务器（注入 SessionIndex，理由同 newTestServer）。
 func newTestServerMode(t *testing.T, mode string) (*Server, *store.Mem) {
 	t.Helper()
 	mem := store.NewMem()
@@ -20,6 +20,7 @@ func newTestServerMode(t *testing.T, mode string) (*Server, *store.Mem) {
 		Codes:    auth.NewEmailCodes(mem),
 		Limits:   auth.NewRateLimit(mem),
 		AuthMode: mode,
+		Session:  auth.NewSessionIndex(mem, mem),
 	}), mem
 }
 

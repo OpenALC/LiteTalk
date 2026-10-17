@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -207,4 +208,133 @@ func TestAPITokenConcurrent(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+// TestAPI401SessionReplacedFatal 会话顶替三分支之「致命」：401 + session_replaced/
+// session_replayed（头或 body）→ ErrSessionReplaced 直接返回，绝不触发刷新重试。
+func TestAPI401SessionReplacedFatal(t *testing.T) {
+	cases := []struct {
+		name   string
+		header string // 空串 = 不带头，只靠 body code 兜底
+		code   string
+	}{
+		{"头 session_replaced", "session_replaced", "session_replaced"},
+		{"头 session_replayed", "session_replayed", "session_replayed"},
+		{"仅 body code", "", "session_replaced"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var refreshCalls atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/api/v1/auth/refresh":
+					refreshCalls.Add(1)
+					_, _ = w.Write([]byte(`{"access_token":"tok2","refresh_token":"rt2","expires_in":7200}`))
+				case "/api/v1/users/me":
+					if tc.header != "" {
+						w.Header().Set("X-LiteTalk-Auth", tc.header)
+					}
+					w.WriteHeader(http.StatusUnauthorized)
+					_, _ = w.Write([]byte(fmt.Sprintf(
+						`{"code":%q,"message":"账号已在其他设备登录"}`, tc.code)))
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+
+			c := NewAPIClient(srv.URL)
+			c.SetToken("tok1")
+			c.SetRefreshSource(func(context.Context) (string, error) { return "rt1", nil })
+
+			_, err := c.Me()
+			if !errors.Is(err, ErrSessionReplaced) {
+				t.Fatalf("want ErrSessionReplaced, got %v", err)
+			}
+			if got := refreshCalls.Load(); got != 0 {
+				t.Fatalf("会话顶替不得触发刷新, 实际 %d 次", got)
+			}
+			if c.Token() != "tok1" {
+				t.Fatalf("会话顶替不得改动令牌: %q", c.Token())
+			}
+		})
+	}
+}
+
+// TestAPI401SessionReplacedDuringRefresh 刷新窗口撞上会话顶替：
+// 原请求 401(unauthorized) 走刷新，refresh 自身返回 session_replaced →
+// 在飞请求同样以 ErrSessionReplaced 收场，不再重放。
+func TestAPI401SessionReplacedDuringRefresh(t *testing.T) {
+	var refreshCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/auth/refresh":
+			refreshCalls.Add(1)
+			w.Header().Set("X-LiteTalk-Auth", "session_replaced")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"code":"session_replaced","message":"账号已在其他设备登录"}`))
+		case "/api/v1/users/me":
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"code":"unauthorized","message":"访问令牌无效或已过期"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := NewAPIClient(srv.URL)
+	c.SetToken("tok1")
+	c.SetRefreshSource(func(context.Context) (string, error) { return "rt1", nil })
+
+	_, err := c.Me()
+	if !errors.Is(err, ErrSessionReplaced) {
+		t.Fatalf("want ErrSessionReplaced, got %v", err)
+	}
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("refresh 调用次数 = %d, want 1", got)
+	}
+}
+
+// TestAPI401TokenExpiredRefreshRetry 会话三分支之「token_expired」：
+// 401 + body code token_expired → 刷新一次 → 新令牌重放原请求 → 200。
+func TestAPI401TokenExpiredRefreshRetry(t *testing.T) {
+	var refreshCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/auth/refresh":
+			refreshCalls.Add(1)
+			_, _ = w.Write([]byte(`{"access_token":"tok2","refresh_token":"rt2","expires_in":7200}`))
+		case "/api/v1/users/me":
+			if r.Header.Get("Authorization") == "Bearer tok2" {
+				_, _ = w.Write([]byte(mePayload))
+				return
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"code":"token_expired","message":"访问令牌已过期"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := NewAPIClient(srv.URL)
+	c.SetToken("tok1")
+	c.SetRefreshSource(func(context.Context) (string, error) { return "rt1", nil })
+
+	u, err := c.Me()
+	if err != nil {
+		t.Fatalf("token_expired 应经刷新重试后成功: %v", err)
+	}
+	if u.Nickname != "甲" {
+		t.Fatalf("Me 解码异常: %+v", u)
+	}
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("refresh 调用次数 = %d, want 1", got)
+	}
+	if c.Token() != "tok2" {
+		t.Fatalf("access token 未更新为 tok2: %q", c.Token())
+	}
 }

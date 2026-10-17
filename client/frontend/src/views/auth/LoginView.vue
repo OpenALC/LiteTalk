@@ -3,12 +3,12 @@
 // 记住密码（问题 6）：启动自动填充（不自动登录）；成功登录且勾选→保存；
 // 取消勾选→清除已存凭据。密码经 DPAPI 加密落盘（Go 侧）。
 // 游客进入（simple 模式）：一键游客登录，Go 侧复用已记住的游客身份。
-import { onMounted, reactive, ref } from 'vue'
+import { onMounted, onUnmounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { Eye, EyeOff, LockKeyhole, Mail, Check, UserRound } from 'lucide-vue-next'
+import { Eye, EyeOff, LockKeyhole, Mail, Check, UserRound, Info } from 'lucide-vue-next'
 import AuthLayout from './AuthLayout.vue'
 import Toast from '../../components/Toast.vue'
-import { goApp } from '../../api/bridge'
+import { eventsOn, goApp } from '../../api/bridge'
 import { useAuthStore } from '../../stores/auth'
 import './auth-forms.css'
 
@@ -22,9 +22,22 @@ const showPwd = ref(false)
 const loading = ref(false)
 const guestLoading = ref(false)
 
+// kicked 被踢横幅数据源（非空即显示，文案固定）。进入登录页时取走 store 里的
+// 原因并清（横幅生命周期只在本次访问，不留到下次）；挂载期间的 auth:kicked
+// 实时刷新（事件可能在本页挂载后才到，store 层回登录页导航完成前的窗口）。
+const kicked = ref('')
+let offKicked: () => void = () => {}
+
 const emailRe = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
 onMounted(async () => {
+  kicked.value = auth.kickedReason
+  auth.clearKickedReason()
+  // eventsOn 返回按监听器的取消函数，卸载时逐个注销（不按事件名整体 Off）。
+  offKicked = eventsOn('auth:kicked', (d) => {
+    const r = (d as { reason?: unknown } | null)?.reason
+    kicked.value = typeof r === 'string' && r !== '' ? r : 'login_elsewhere'
+  })
   auth.loadConfig() // 拉服务端能力开关（simple 模式显示「游客进入」）
   // 自动填充记住的凭据（不自动登录，用户手动点登录）。
   try {
@@ -35,6 +48,10 @@ onMounted(async () => {
       form.remember = true
     }
   } catch { /* 无已存凭据 */ }
+})
+
+onUnmounted(() => {
+  offKicked()
 })
 
 // 取消勾选即清除已存凭据（问题 6c）。
@@ -87,6 +104,12 @@ async function guestEnter() {
 
 <template>
   <AuthLayout>
+    <!-- 被踢提示：账号已在其他设备登录，本端会话与令牌已被 Go 侧清除 -->
+    <div v-if="kicked" class="kicked-bar" role="status">
+      <Info :size="15" />
+      <span>账号已在其他设备登录</span>
+    </div>
+
     <div class="seg">
       <div class="seg-thumb" />
       <button class="on">登录</button>
@@ -144,3 +167,17 @@ async function guestEnter() {
     <Toast ref="toast" />
   </AuthLayout>
 </template>
+
+<style scoped>
+/* 被踢横幅：主题色系内低对比提示（brand-50 底 + brand-200 描边 + ink-900 字），
+   无动画（出现即静态展示）。 */
+.kicked-bar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 12px; margin-bottom: 18px;
+  background: var(--brand-50);
+  border: 1px solid var(--brand-200);
+  border-radius: 10px;
+  font-size: 13px; color: var(--ink-900);
+}
+.kicked-bar svg { color: var(--brand-500); flex: none; }
+</style>

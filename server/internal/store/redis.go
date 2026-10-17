@@ -60,3 +60,12 @@ func (r *RedisKV) Incr(ctx context.Context, key string, ttl time.Duration) (int6
 	}
 	return n, nil
 }
+
+// Eval 执行 Lua 脚本（go-redis EVAL）。CAS 的原子性由 Redis 单线程执行模型保证。
+func (r *RedisKV) Eval(ctx context.Context, script string, keys []string, args ...string) (any, error) {
+	argv := make([]any, len(args))
+	for i, a := range args {
+		argv[i] = a
+	}
+	return r.rdb.Eval(ctx, script, keys, argv...).Result()
+}

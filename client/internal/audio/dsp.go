@@ -1,6 +1,7 @@
 package audio
 
 import (
+	"fmt"
 	"math"
 	"sync/atomic"
 
@@ -15,17 +16,98 @@ const (
 	OpusFrameSize = 960 // Opus 帧：20ms = 2 个 RNNoise 帧
 )
 
+// 前置增益 dB 值域（0.25×~16×）。越界在 setter 报错、构造时收敛。
+const (
+	preGainMinDB = -12.0
+	preGainMaxDB = 24.0
+)
+
+// dbToLinear dB → 线性倍数（满刻度基准 32767）。
+func dbToLinear(db float64) float64 { return math.Pow(10, db/20) }
+
+// dbFS 线性幅度 → dBFS（满刻度 32767 基准），下限 -100 防 log(0)=-Inf。
+func dbFS(v float64) float64 {
+	if v <= 0 {
+		return -100
+	}
+	if db := 20 * math.Log10(v/32767); db < -100 {
+		return -100
+	} else {
+		return db
+	}
+}
+
+// dbToAmp dBFS → 线性幅度。
+func dbToAmp(db float64) float64 { return 32767 * dbToLinear(db) }
+
+// 底噪统计与自适应说话门限（dBFS 域；v1.1）。
+const (
+	noiseWinFrames    = 200   // minimum-statistics 窗口：2s @10ms
+	noiseInitDB       = -50.0 // 窗空时的初始底噪
+	noisePushMarginDB = 20.0  // 仅接收 ≤底噪+20dB 的帧入窗（语音不入窗）
+	noiseCeilingDB    = -20.0 // 或 ≤-20dBFS（稳态偏高的环境噪声也入窗）
+	enterOffsetDB     = 12.0  // 说话进入门限 = 底噪+12dB
+	exitOffsetDB      = 6.0   // 说话退出门限 = 底噪+6dB；AGC 门控同用 +6dB
+	thresholdFloorDB  = -50.0 // 门限绝对下限（弱底噪环境不再无限下探）
+)
+
+// enterThresholdDB / exitThresholdDB 自适应说话门限（dBFS）。
+func enterThresholdDB(floorDB float64) float64 { return max(floorDB+enterOffsetDB, thresholdFloorDB) }
+func exitThresholdDB(floorDB float64) float64  { return max(floorDB+exitOffsetDB, thresholdFloorDB) }
+
+// noiseTracker minimum-statistics 底噪：2s 滑动窗取最小（预分配环形，零分配）。
+// 收帧带准入门槛（≤底噪+20dB 或 ≤-20dBFS），防止连续语音把窗灌满后门限
+// 跟着语音抬升；数字静音帧由调用方跳过（静音没有可估底噪，且会把窗压到
+// -100 后长时间排斥真实底噪入窗）。
+type noiseTracker struct {
+	win   [noiseWinFrames]float64
+	head  int
+	count int
+}
+
+// observe 收录一帧 RMS（int16 域）。
+func (n *noiseTracker) observe(rms float64) {
+	db := dbFS(rms)
+	if cur := n.floorDB(); db > cur+noisePushMarginDB && db > noiseCeilingDB {
+		return
+	}
+	if n.count < len(n.win) {
+		n.win[n.count] = db
+		n.count++
+		return
+	}
+	n.win[n.head] = db
+	n.head = (n.head + 1) % len(n.win)
+}
+
+// floorDB 窗内最小值 = 当前底噪估计；窗空回落初始值。
+func (n *noiseTracker) floorDB() float64 {
+	if n.count == 0 {
+		return noiseInitDB
+	}
+	m := n.win[0]
+	for i := 1; i < n.count; i++ {
+		if n.win[i] < m {
+			m = n.win[i]
+		}
+	}
+	return m
+}
+
 // DSPConfig 降噪/增益/说话判定配置。
 type DSPConfig struct {
 	Denoise bool    // 是否启用 RNNoise（关闭时 VAD 不可用，说话判定退化为纯 RMS 门限）
-	Gain    float64 // 线性增益，1.0 为不变
+	Gain    float64 // 线性增益，1.0 为不变（输出音量）
+	// PreGainDB 前置增益 dB（-12~+24 ≈ 0.25×~16×）：施加在 RNNoise 之前，
+	// 弱麦先抬进降噪器/VAD 的有效区；零值 0 = 不变。
+	PreGainDB float64
 
-	// 说话判定：VAD 概率与 RMS 双门限 + 帧数迟滞。
+	// 说话判定：VAD 概率与自适应 RMS 门限并联 + 帧数迟滞。
 	// spike 实测纯白噪声 VAD 均值约 0.569 偏高，单靠概率会误触发，必须叠加 RMS 门限。
+	// RMS 门限自适应底噪（v1.1）：enter=底噪+12dB、exit=底噪+6dB，绝对下限 -50dBFS；
+	// 旧固定 RMSEnter/RMSExit 已删除（固定 500 让弱麦克风永远到不了门限）。
 	VADEnter    float32 // 进入判定的 VAD 门限（>）
 	VADExit     float32 // 退出判定的 VAD 门限（<）
-	RMSEnter    float64 // 进入判定的 RMS 门限（>=）
-	RMSExit     float64 // 退出判定的 RMS 门限（<），低于 RMSEnter 形成回差
 	EnterFrames int     // 连续满足进入条件 N 帧才置 speaking（防抖）
 	ExitFrames  int     // 连续满足退出条件 N 帧才清除 speaking（挂起，避免字间停顿闪断）
 
@@ -40,8 +122,6 @@ func DefaultDSPConfig() DSPConfig {
 		Gain:        1.0,
 		VADEnter:    0.6,
 		VADExit:     0.4,
-		RMSEnter:    500,
-		RMSExit:     300,
 		EnterFrames: 3,  // 30ms 起判
 		ExitFrames:  15, // 150ms 挂起
 	}
@@ -56,11 +136,18 @@ type DSP struct {
 	denoiserPtr atomic.Pointer[rnnoise.Denoiser]
 
 	gainBits     atomic.Uint64 // math.Float64bits(Gain)
+	preGainBits  atomic.Uint64 // math.Float64bits(前置线性增益)，热可调
 	denoiseOn    atomic.Bool
 	speaking     atomic.Bool
 	vadEnterBits atomic.Uint64 // math.Float32bits(VADEnter)，热可调
 	vadExitBits  atomic.Uint64 // math.Float32bits(VADExit)，热可调
-	agcOn        atomic.Bool   // 自动增益开关（v0.1.2；默认关）
+	agcOn        atomic.Bool   // 自动增益开关（v1.1 默认开，nil→true 见 config 层）
+
+	// preBuf 前置增益的预分配 scratch（Process 里 in→preBuf→RNNoise，不改调用方 in）。
+	preBuf [FrameSize]int16
+
+	// noise minimum-statistics 底噪（说话门限与 AGC 门控共用；Process goroutine 私有）。
+	noise noiseTracker
 
 	// 处理 goroutine 私有状态
 	enterRun  int
@@ -81,12 +168,6 @@ func NewDSP(cfg DSPConfig) (*DSP, error) {
 	if cfg.VADExit == 0 {
 		cfg.VADExit = def.VADExit
 	}
-	if cfg.RMSEnter == 0 {
-		cfg.RMSEnter = def.RMSEnter
-	}
-	if cfg.RMSExit == 0 {
-		cfg.RMSExit = def.RMSExit
-	}
 	if cfg.EnterFrames == 0 {
 		cfg.EnterFrames = def.EnterFrames
 	}
@@ -100,6 +181,15 @@ func NewDSP(cfg DSPConfig) (*DSP, error) {
 	d := &DSP{cfg: cfg, agcGain: 1.0}
 	d.denoiserPtr.Store(dn)
 	d.gainBits.Store(math.Float64bits(cfg.Gain))
+	// 构造路径越界收敛（运行时 setter 报错）：零值 0dB = 1.0× 无需特殊处理。
+	pre := cfg.PreGainDB
+	if pre < preGainMinDB {
+		pre = preGainMinDB
+	}
+	if pre > preGainMaxDB {
+		pre = preGainMaxDB
+	}
+	d.preGainBits.Store(math.Float64bits(dbToLinear(pre)))
 	d.denoiseOn.Store(cfg.Denoise)
 	d.vadEnterBits.Store(uint64(math.Float32bits(cfg.VADEnter)))
 	d.vadExitBits.Store(uint64(math.Float32bits(cfg.VADExit)))
@@ -119,21 +209,39 @@ func (d *DSP) Gain() float64 {
 	return math.Float64frombits(d.gainBits.Load())
 }
 
+// SetPreGainDB 运行时调整前置增益（原子，热路径无锁）。范围 -12~+24dB，越界报错。
+func (d *DSP) SetPreGainDB(db float64) error {
+	if db < preGainMinDB || db > preGainMaxDB {
+		return fmt.Errorf("前置增益越界: %.1fdB（允许 %.0f~%+.0f）", db, preGainMinDB, preGainMaxDB)
+	}
+	d.preGainBits.Store(math.Float64bits(dbToLinear(db)))
+	return nil
+}
+
+// PreGainDB 返回当前前置增益 dB（0 = 不变）。
+func (d *DSP) PreGainDB() float64 {
+	g := math.Float64frombits(d.preGainBits.Load())
+	if g <= 0 {
+		return 0
+	}
+	return 20 * math.Log10(g)
+}
+
 // SetDenoise 运行时开关降噪（原子，热路径无锁）。
 func (d *DSP) SetDenoise(on bool) { d.denoiseOn.Store(on) }
 
 // Denoise 返回降噪开关状态。
 func (d *DSP) Denoise() bool { return d.denoiseOn.Load() }
 
-// AGC（自动增益）参数（v0.1.2）：以 RMS 目标迭代自适应增益，替代手动增益。
+// AGC（自动增益）参数（v1.1 重做）：以 RMS 目标迭代自适应增益，替代手动增益。
 // 步进不对称：下调快（防削波）、上调慢（防泵浦效应/呼吸感）。
 const (
 	agcTargetRMS  = 1200.0 // 目标 RMS（int16 域，约 -18dBFS 的语音均值）
 	agcGainMin    = 0.2    // 增益下限（防止把底噪抬得过高）
-	agcGainMax    = 5.0    // 增益上限（防止削波前过载）
+	agcGainMax    = 10.0   // 增益上限（v1.1：5→10，弱麦补偿余量）
 	agcAttack     = 0.3    // 上调步进系数（慢）：弱信号逐帧小幅补增益
 	agcRelease    = 0.8    // 下调步进系数（快）：过强信号迅速压回
-	agcFloorRatio = 0.2    // 无语音门控时的 RMS 地板（低于 target*0.2 视为静音，保持增益不动）
+	agcFloorRatio = 0.2    // 无 VAD（降噪关）时的绝对 RMS 地板（target×0.2）
 	agcInitGain   = 1.0
 )
 
@@ -222,7 +330,7 @@ func (d *DSP) VADExit() float32 {
 // Speaking 返回当前说话状态。
 func (d *DSP) Speaking() bool { return d.speaking.Load() }
 
-// Process 处理一个 480 采样（10ms）帧：降噪 → AGC → 固定增益 → RMS/VAD 说话判定。
+// Process 处理一个 480 采样（10ms）帧：前置增益 → 降噪 → AGC → 固定增益 → RMS/VAD 说话判定。
 // out 与 in 长度都必须 >= FrameSize 且不得重叠；返回 VAD 概率（降噪关闭时为 0）。
 // 全程在预分配缓冲上操作，零堆分配。
 func (d *DSP) Process(out, in []int16) (float32, error) {
@@ -246,20 +354,33 @@ func (d *DSP) Process(out, in []int16) (float32, error) {
 	}
 	d.silentRun = 0
 
+	// 底噪观察：取原始输入（pre-gain 之前）的 RMS——门限以设备电平为基准，
+	// 前置/输出增益让信号相对固定门限更容易过线。数字静音帧已在上方短路，
+	// 走到这里必有真实信号。
+	d.noise.observe(rmsInt16(in[:FrameSize]))
+
+	// 前置增益（RNNoise 之前）：弱麦先抬进降噪器/VAD 的有效区。写入预分配
+	// scratch（不改调用方的 in）；g==1 时跳过，保持原零拷贝路径。
+	src := in[:FrameSize]
+	if g := math.Float64frombits(d.preGainBits.Load()); g != 1 {
+		applyGainInto(d.preBuf[:FrameSize], in[:FrameSize], g)
+		src = d.preBuf[:FrameSize]
+	}
+
 	var vad float32
 	var err error
 	if d.denoiseOn.Load() {
 		dn := d.denoiserPtr.Load()
-		vad, err = dn.ProcessInt16(out[:FrameSize], in[:FrameSize])
+		vad, err = dn.ProcessInt16(out[:FrameSize], src)
 		if err != nil {
 			return 0, err
 		}
 	} else {
-		copy(out[:FrameSize], in[:FrameSize])
+		copy(out[:FrameSize], src)
 	}
-	// AGC（自动增益）：以 RMS 目标迭代自适应，插在固定增益前（v0.1.2，默认关）。
-	// 仅在疑似语音帧上迭代——静音期保持增益不动，否则安静段会在 ~150ms 内
-	// 把增益冲到上限，语音起始瞬间被 5× 放大产生爆音（review S3）。
+	// AGC（自动增益）：以 RMS 目标迭代自适应，插在固定增益前（v1.1 默认开）。
+	// 仅在门控开启的帧迭代——静音/底噪期增益冻结，否则安静段会在 ~150ms 内
+	// 把增益冲到上限，语音起始瞬间被 10× 放大产生爆音（review S3）。
 	if d.agcOn.Load() {
 		frameRMS := rmsInt16(out[:FrameSize])
 		if d.agcGate(vad, frameRMS) {
@@ -274,9 +395,13 @@ func (d *DSP) Process(out, in []int16) (float32, error) {
 	return vad, nil
 }
 
-// agcGate 判定当前帧是否参与 AGC 迭代：有 VAD 时用 VAD 概率/说话状态，
-// 无 VAD（降噪关）时用 RMS 地板——低于地板视为静音/数字零，增益冻结。
+// agcGate 判定当前帧是否参与 AGC 迭代（v1.1 重做）：「VAD 或 RMS 明显高于
+// 底噪（+6dB）」——不再纯靠 VAD（弱信号 VAD 低 → AGC 永不迭代的死循环）。
+// 降噪关闭（无 VAD）时保留 v0.1.2 的绝对地板（target×0.2）兜底。
 func (d *DSP) agcGate(vad float32, rms float64) bool {
+	if rms > dbToAmp(d.noise.floorDB()+exitOffsetDB) {
+		return true
+	}
 	if d.denoiseOn.Load() {
 		return vad > d.VADExit() || d.speaking.Load()
 	}
@@ -305,13 +430,16 @@ func (d *DSP) nextAGCGain(rms float64) float64 {
 	return g
 }
 
-// updateSpeaking 双门限 + 迟滞帧数的状态机。仅处理 goroutine 调用。
+// updateSpeaking 双门限 + 迟滞帧数的状态机（v1.1：RMS 门限自适应底噪）。
+// 仅处理 goroutine 调用。
 func (d *DSP) updateSpeaking(vad float32, rms float64) {
 	vadAvailable := d.denoiseOn.Load()
 	speaking := d.speaking.Load()
+	enterLin := dbToAmp(enterThresholdDB(d.noise.floorDB()))
+	exitLin := dbToAmp(exitThresholdDB(d.noise.floorDB()))
 
 	if !speaking {
-		enterOK := rms >= d.cfg.RMSEnter && (!vadAvailable || vad > d.VADEnter())
+		enterOK := rms >= enterLin && (!vadAvailable || vad > d.VADEnter())
 		if enterOK {
 			d.enterRun++
 			if d.enterRun >= d.cfg.EnterFrames {
@@ -328,7 +456,7 @@ func (d *DSP) updateSpeaking(vad float32, rms float64) {
 		return
 	}
 
-	exitNow := rms < d.cfg.RMSExit || (vadAvailable && vad < d.VADExit())
+	exitNow := rms < exitLin || (vadAvailable && vad < d.VADExit())
 	if exitNow {
 		d.exitRun++
 		if d.exitRun >= d.cfg.ExitFrames {
@@ -344,17 +472,12 @@ func (d *DSP) updateSpeaking(vad float32, rms float64) {
 }
 
 // applyGain 就地施加线性增益并截断到 int16。
-func applyGain(p []int16, g float64) {
-	for i, s := range p {
-		v := float64(s) * g
-		switch {
-		case v > math.MaxInt16:
-			p[i] = math.MaxInt16
-		case v < math.MinInt16:
-			p[i] = math.MinInt16
-		default:
-			p[i] = int16(v)
-		}
+func applyGain(p []int16, g float64) { applyGainInto(p, p, g) }
+
+// applyGainInto src×g → dst（就地安全：允许 dst==src），截断到 int16。
+func applyGainInto(dst, src []int16, g float64) {
+	for i, s := range src {
+		dst[i] = clampInt16(float64(s) * g)
 	}
 }
 

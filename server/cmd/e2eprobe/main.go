@@ -7,6 +7,7 @@
 //
 //	go run ./cmd/e2eprobe -addr 203.0.113.10:8077
 //	go run ./cmd/e2eprobe -addr 127.0.0.1:8077 -loopback   # 本机服务端
+//	go run ./cmd/e2eprobe -addr 127.0.0.1:8077 -multi-device  # 多设备会话场景（踢线/共存/语音抢占）
 package main
 
 import (
@@ -26,15 +27,17 @@ import (
 )
 
 type config struct {
-	addr     string
-	users    int
-	duration time.Duration
-	loopback bool
+	addr        string
+	users       int
+	duration    time.Duration
+	loopback    bool
+	multiDevice bool
 }
 
-// register 注册（邮箱撞库则登录），返回 access token、用户 ID 与 iceServers。
-func register(addr, nickname string) (string, int64, []ICEServer, error) {
-	email := fmt.Sprintf("probe%d@example.com", time.Now().UnixNano())
+// register 注册（邮箱撞库则登录），返回注册邮箱、access token、用户 ID 与 iceServers。
+// 邮箱单独返回供 -multi-device 场景后续按设备反复登录。
+func register(addr, nickname string) (email, token string, id int64, ice []ICEServer, err error) {
+	email = fmt.Sprintf("probe%d@example.com", time.Now().UnixNano())
 	password := "probe1234"
 
 	post := func(path string, body any) (int, []byte, error) {
@@ -52,7 +55,7 @@ func register(addr, nickname string) (string, int64, []ICEServer, error) {
 		"nickname": nickname, "email": email, "password": password,
 	})
 	if err != nil {
-		return "", 0, nil, fmt.Errorf("register 请求: %w", err)
+		return "", "", 0, nil, fmt.Errorf("register 请求: %w", err)
 	}
 	var pair struct {
 		AccessToken string `json:"access_token"`
@@ -61,16 +64,16 @@ func register(addr, nickname string) (string, int64, []ICEServer, error) {
 		} `json:"user"`
 	}
 	if code != http.StatusCreated {
-		return "", 0, nil, fmt.Errorf("register HTTP %d: %s", code, b)
+		return "", "", 0, nil, fmt.Errorf("register HTTP %d: %s", code, b)
 	}
 	if err := json.Unmarshal(b, &pair); err != nil || pair.AccessToken == "" {
-		return "", 0, nil, fmt.Errorf("token 解析失败: %s", b)
+		return "", "", 0, nil, fmt.Errorf("token 解析失败: %s", b)
 	}
 
 	req, _ := http.NewRequest("POST", "http://"+addr+"/api/v1/rtc/credentials?token="+pair.AccessToken, nil)
 	cresp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", 0, nil, fmt.Errorf("rtc/credentials: %w", err)
+		return "", "", 0, nil, fmt.Errorf("rtc/credentials: %w", err)
 	}
 	defer cresp.Body.Close()
 	var creds struct {
@@ -79,7 +82,7 @@ func register(addr, nickname string) (string, int64, []ICEServer, error) {
 	if cresp.StatusCode == http.StatusOK {
 		_ = json.NewDecoder(cresp.Body).Decode(&creds)
 	}
-	return pair.AccessToken, pair.User.ID, creds.ICEServers, nil
+	return email, pair.AccessToken, pair.User.ID, creds.ICEServers, nil
 }
 
 func main() {
@@ -88,6 +91,7 @@ func main() {
 	flag.IntVar(&cfg.users, "users", 2, "每房间人数（含自己）")
 	flag.DurationVar(&cfg.duration, "duration", 8*time.Second, "发包时长")
 	flag.BoolVar(&cfg.loopback, "loopback", false, "允许环回候选（测本机服务端时必开）")
+	flag.BoolVar(&cfg.multiDevice, "multi-device", false, "多设备会话场景：同设备踢线/异设备共存/语音抢占")
 	flag.Parse()
 	if cfg.users < 2 {
 		fmt.Fprintln(os.Stderr, "users ≥ 2")
@@ -96,6 +100,12 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	if cfg.multiDevice {
+		code := runMultiDevice(ctx, cfg)
+		stop()
+		os.Exit(code)
+	}
 
 	fmt.Printf("E2E 探测 %s：%d 人同房，%s 媒体，loopback=%v\n", cfg.addr, cfg.users, cfg.duration, cfg.loopback)
 
@@ -117,7 +127,7 @@ func main() {
 	}
 	accts := make([]acct, 0, cfg.users)
 	for i := 0; i < cfg.users; i++ {
-		token, uid, ice, err := register(cfg.addr, fmt.Sprintf("探测%d", i+1))
+		_, token, uid, ice, err := register(cfg.addr, fmt.Sprintf("探测%d", i+1))
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "注册失败:", err)
 			os.Exit(1)

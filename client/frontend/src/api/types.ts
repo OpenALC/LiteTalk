@@ -64,12 +64,24 @@ export interface AudioSettings {
   packet_loss: number // 5–20
   denoise: boolean
   denoise_strength: number // 1 弱 / 2 中 / 3 强（rnnoise Aggressiveness 档位）
-  agc: boolean // 自动增益（实验性，默认关）
+  agc: boolean // 自动增益（默认开）
   gain?: number // 旧输入增益 ×10（已由 mic_volume 取代，Go 侧兼容换算）
   mic_volume: number // 0–120（100 = 1.0 原声）
   playback_volume: number // 0–120（混音总线增益）
   vad_sens: number // 0–4 五档（旧 0/1/2 由 Go 侧加载时一次性迁移 0/2/4）
   opus_complexity: number // Opus 复杂度 0–10（默认 9；字段名与 Go json tag 对齐）
+  // 输入声道下混（Go 侧总会返回；可选仅为兼容浏览器 mock 桩）。
+  input_mode?: 'auto' | 'left' | 'right' | 'mix'
+  // 前置增益 dB（-12~+24，RNNoise 之前；0 = 不变，omitempty 后可能缺省）。
+  pre_gain_db?: number
+}
+
+// AudioLevel audio:level 事件载荷（设置页麦克风测试期间 100ms 推送一次）。
+// peak/rms/threshold 均为 dBFS 负值；threshold 为当前说话进入门限（电平条标线）。
+export interface AudioLevel {
+  peak: number
+  rms: number
+  threshold: number
 }
 
 // VoiceStateView 语音状态恢复视图（GetVoiceState；UI 销毁重载后回填用）。

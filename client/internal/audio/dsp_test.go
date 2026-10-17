@@ -114,7 +114,7 @@ func TestNoiseGate(t *testing.T) {
 	var vadSum float64
 	const frames = 500
 	for f := 0; f < frames; f++ {
-		noiseFrame(in, 800, &rng) // RMS ≈ 460 < RMSEnter(500)
+		noiseFrame(in, 800, &rng) // RMS ≈ 460：自适应门限下 ≈底噪+0dB，远低于底噪+12dB
 		vad, err := d.Process(out, in)
 		if err != nil {
 			t.Fatalf("Process: %v", err)
@@ -481,5 +481,271 @@ func TestSetVADThresholds(t *testing.T) {
 	d.SetVADThresholds(0.8, 0.5) // 合法回差 → 原样
 	if e, x := d.VADEnter(), d.VADExit(); !approx(e, 0.8) || !approx(x, 0.5) {
 		t.Fatalf("enter=%.4f exit=%.4f, want ≈0.80/0.50", e, x)
+	}
+}
+
+// TestPreGainApplied 前置增益按 dB 换算生效，且不改动调用方的 in 缓冲。
+func TestPreGainApplied(t *testing.T) {
+	d := newTestDSP(t, func(c *DSPConfig) { c.Denoise = false })
+	if err := d.SetPreGainDB(18); err != nil {
+		t.Fatalf("SetPreGainDB: %v", err)
+	}
+	if got := d.PreGainDB(); got < 17.9 || got > 18.1 {
+		t.Fatalf("PreGainDB() = %.2f, want ≈18", got)
+	}
+
+	in := make([]int16, FrameSize)
+	out := make([]int16, FrameSize)
+	var phase float64
+	var rng uint32 = 3
+	sineNoiseFrame(in, &phase, 1000, 0, &rng)
+	before := make([]int16, FrameSize)
+	copy(before, in)
+	if _, err := d.Process(out, in); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	for i := range in {
+		if in[i] != before[i] {
+			t.Fatalf("Process 改动了调用方的 in 缓冲 @%d", i)
+		}
+	}
+	inRMS, outRMS := rmsInt16(in), rmsInt16(out)
+	want := inRMS * dbToLinear(18)
+	if outRMS < want*0.99 || outRMS > want*1.01 {
+		t.Fatalf("+18dB 前置增益: out RMS %.0f, want ≈%.0f（in %.0f）", outRMS, want, inRMS)
+	}
+}
+
+// TestPreGainRange 构造时越界收敛、运行时 setter 越界报错。
+func TestPreGainRange(t *testing.T) {
+	d := newTestDSP(t, func(c *DSPConfig) { c.PreGainDB = 100 })
+	if got := d.PreGainDB(); got < 23.9 || got > 24.1 {
+		t.Fatalf("构造越界应收敛到 +24dB，得到 %.2f", got)
+	}
+	if err := d.SetPreGainDB(30); err == nil {
+		t.Fatal("SetPreGainDB(30) 应报错")
+	}
+	if err := d.SetPreGainDB(-13); err == nil {
+		t.Fatal("SetPreGainDB(-13) 应报错")
+	}
+	if err := d.SetPreGainDB(-12); err != nil {
+		t.Fatalf("SetPreGainDB(-12) 合法: %v", err)
+	}
+	if got := d.PreGainDB(); got < -12.1 || got > -11.9 {
+		t.Fatalf("PreGainDB() = %.2f, want ≈-12", got)
+	}
+}
+
+// TestPreGainBeforeDenoise 前置增益先于 RNNoise：弱正弦（≈-50dBFS）在默认强度
+// 降噪下稳态被压制到近零；+18dB 前置增益把它抬进降噪器的有效区后输出显著存活。
+// 若增益在 RNNoise 之后，输出只会是「近零 × 7.943」仍然近零——不可能复活信号。
+func TestPreGainBeforeDenoise(t *testing.T) {
+	run := func(preDB float64) float64 {
+		d := newTestDSP(t, nil) // denoise on
+		if err := d.SetPreGainDB(preDB); err != nil {
+			t.Fatal(err)
+		}
+		in := make([]int16, FrameSize)
+		out := make([]int16, FrameSize)
+		var phase float64
+		var rng uint32 = 0x5150
+		var acc float64
+		const frames, warm = 60, 20 // 跳过 RNNoise 2 帧延迟线预热
+		for f := 0; f < frames; f++ {
+			sineNoiseFrame(in, &phase, 300, 0, &rng)
+			if _, err := d.Process(out, in); err != nil {
+				t.Fatal(err)
+			}
+			if f >= warm {
+				acc += rmsInt16(out)
+			}
+		}
+		return acc / (frames - warm)
+	}
+	before, after := run(0), run(18)
+	t.Logf("denoise 前置 +18dB: 弱正弦 out RMS %.1f -> %.1f", before, after)
+	if before >= 5 {
+		t.Fatalf("测试信号未被压制：pre=0 时 out RMS %.1f，区分度不足", before)
+	}
+	if after < 100 {
+		t.Fatalf("+18dB 前置后弱正弦未复活：out RMS %.1f < 100（增益疑似在 RNNoise 之后）", after)
+	}
+}
+
+// TestWeakSignalPreGainPassesGate -40dBFS 弱信号：无前置增益过不了说话门限，
+// +18dB 后（仍在 RNNoise 之前）抬过门限。旁路模式（denoise off）排除 VAD 干扰。
+func TestWeakSignalPreGainPassesGate(t *testing.T) {
+	d := newTestDSP(t, func(c *DSPConfig) { c.Denoise = false })
+
+	in := make([]int16, FrameSize)
+	out := make([]int16, FrameSize)
+	for i := range in {
+		in[i] = 328 // ≈ -40dBFS
+	}
+	const frames = 10
+	for f := 0; f < frames; f++ {
+		if _, err := d.Process(out, in); err != nil {
+			t.Fatal(err)
+		}
+		if d.Speaking() {
+			t.Fatalf("-40dBFS 弱信号不应触发 speaking（帧 %d）", f)
+		}
+	}
+	if err := d.SetPreGainDB(18); err != nil {
+		t.Fatal(err)
+	}
+	activated := -1
+	for f := 0; f < frames; f++ {
+		if _, err := d.Process(out, in); err != nil {
+			t.Fatal(err)
+		}
+		if d.Speaking() {
+			activated = f
+			break
+		}
+	}
+	if activated < 0 {
+		t.Fatalf("+18dB 后 -40dBFS 弱信号仍未触发 speaking（out RMS %.0f）", rmsInt16(out))
+	}
+	t.Logf("+18dB 后于第 %d 帧触发 speaking", activated)
+}
+
+// TestNoiseTracker minimum-statistics 底噪窗：准入门槛（≤底噪+20dB 或 ≤-20dBFS）、
+// 滑动最小、窗空回落初始值。
+func TestNoiseTracker(t *testing.T) {
+	var n noiseTracker
+	if got := n.floorDB(); got != noiseInitDB {
+		t.Fatalf("窗空底噪 = %.1f, want %.1f", got, noiseInitDB)
+	}
+	n.observe(dbToAmp(-50))
+	if got := n.floorDB(); math.Abs(got+50) > 0.1 {
+		t.Fatalf("首帧入窗后底噪 = %.2f, want ≈-50", got)
+	}
+	n.observe(dbToAmp(-17)) // 高于 -50+20 且高于 -20 → 拒收（语音不入窗）
+	if got := n.floorDB(); math.Abs(got+50) > 0.1 {
+		t.Fatalf("语音帧污染了底噪窗: %.2f", got)
+	}
+	n.observe(dbToAmp(-70)) // 更安静 → 底噪跟随下探
+	if got := n.floorDB(); math.Abs(got+70) > 0.1 {
+		t.Fatalf("更低底噪未入窗: %.2f", got)
+	}
+	// 滑动：持续 -40dB 稳态环境把旧值挤出后，底噪收敛到 -40。
+	for i := 0; i < 2*noiseWinFrames; i++ {
+		n.observe(dbToAmp(-40)) // -40 ≤ -20dBFS ceiling，入窗
+	}
+	if got := n.floorDB(); math.Abs(got+40) > 0.5 {
+		t.Fatalf("滑动窗未收敛: %.2f, want ≈-40", got)
+	}
+}
+
+// TestSpeakingThresholdAdaptive 自适应门限与回差：恒定底噪上进入需底噪+12dB、
+// 退出在底噪+6dB；两门限之间保持 speaking（回差防闪断）。
+func TestSpeakingThresholdAdaptive(t *testing.T) {
+	var transitions []bool
+	d := newTestDSP(t, func(c *DSPConfig) {
+		c.Denoise = false
+		c.OnSpeakingChange = func(b bool) { transitions = append(transitions, b) }
+	})
+	in := make([]int16, FrameSize)
+	out := make([]int16, FrameSize)
+	feed := func(v int16, frames int) {
+		for i := range in {
+			in[i] = v
+		}
+		for f := 0; f < frames; f++ {
+			if _, err := d.Process(out, in); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	feed(100, 120) // 恒定底噪 ≈-50.3dBFS：建立底噪窗，不应触发
+	if d.Speaking() {
+		t.Fatal("恒定底噪触发了 speaking")
+	}
+	feed(600, 5) // ≈-36.4dBFS（底噪+14dB）→ 进入
+	if !d.Speaking() {
+		t.Fatal("底噪+14dB 语音未触发 speaking")
+	}
+	feed(250, 100) // 介于 exit 与 enter 之间 → 回差保持
+	if !d.Speaking() {
+		t.Fatal("回差区间内 speaking 被误清除")
+	}
+	feed(150, 20) // 低于 exit → 挂起 15 帧后清除
+	if d.Speaking() {
+		t.Fatal("低于退出门限未清除 speaking")
+	}
+	if len(transitions) != 2 || !transitions[0] || transitions[1] {
+		t.Fatalf("翻转序列应为 [true false]，得到 %v", transitions)
+	}
+}
+
+// TestWeakVoiceTriggers 弱语音（真实底噪上方 17dB）触发、恒定底噪不触发——
+// 钉住「固定绝对门限让弱麦永远不亮」的回归。
+func TestWeakVoiceTriggers(t *testing.T) {
+	d := newTestDSP(t, func(c *DSPConfig) { c.Denoise = false })
+	in := make([]int16, FrameSize)
+	out := make([]int16, FrameSize)
+	feed := func(v int16, frames int) {
+		for i := range in {
+			in[i] = v
+		}
+		for f := 0; f < frames; f++ {
+			if _, err := d.Process(out, in); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	feed(61, 120) // 底噪 ≈-55.4dBFS
+	if d.Speaking() {
+		t.Fatal("恒定底噪触发了 speaking")
+	}
+	feed(400, 5) // ≈-38.2dBFS，高于底噪 17dB
+	if !d.Speaking() {
+		t.Fatalf("弱语音未触发 speaking（out RMS %.0f）", rmsInt16(out))
+	}
+}
+
+// TestPureSilenceNeverTriggers 纯静音：不触发说话，AGC 增益冻结不动。
+func TestPureSilenceNeverTriggers(t *testing.T) {
+	d := newTestDSP(t, func(c *DSPConfig) { c.Denoise = true })
+	d.SetAGC(true)
+	in := make([]int16, FrameSize)
+	out := make([]int16, FrameSize)
+	for f := 0; f < 300; f++ {
+		if _, err := d.Process(out, in); err != nil {
+			t.Fatal(err)
+		}
+		if d.Speaking() {
+			t.Fatalf("纯静音第 %d 帧触发 speaking", f)
+		}
+	}
+	if d.agcGain != agcInitGain {
+		t.Fatalf("纯静音下 AGC 增益被改动: %v", d.agcGain)
+	}
+}
+
+// TestAGCCapped 弱恒定信号 AGC 收敛到上限且全程不超过（v1.1 上限 10×）。
+func TestAGCCapped(t *testing.T) {
+	d, err := NewDSP(DSPConfig{Denoise: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.SetAGC(true)
+	var frame [FrameSize]int16
+	for i := range frame {
+		frame[i] = 300 // ≈-40.5dBFS 恒定弱信号（≥240 绝对地板，AGC 门开）
+	}
+	var out [FrameSize]int16
+	for f := 0; f < 300; f++ {
+		if _, err := d.Process(out[:], frame[:]); err != nil {
+			t.Fatal(err)
+		}
+		if d.agcGain > agcGainMax {
+			t.Fatalf("第 %d 帧 AGC 增益 %v 超过上限 %v", f, d.agcGain, agcGainMax)
+		}
+	}
+	if d.agcGain < agcGainMax {
+		t.Fatalf("AGC 未收敛到上限: %v", d.agcGain)
 	}
 }

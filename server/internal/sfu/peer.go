@@ -19,6 +19,7 @@ import (
 //     answer 应用完毕后补做一次，避免 offer 在途时叠加 offer。
 type Peer struct {
 	userID string
+	connID string // 归属 WS 连接标识（§0.9）：LeaveIf 只关归属连接，不误清新连接
 	room   *Room
 	pc     *webrtc.PeerConnection
 	signal SignalSender
@@ -35,13 +36,14 @@ type Peer struct {
 	closed            bool
 }
 
-func newPeer(room *Room, userID string, sig SignalSender) (*Peer, error) {
+func newPeer(room *Room, userID, connID string, sig SignalSender) (*Peer, error) {
 	pc, err := room.sfu.api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		return nil, fmt.Errorf("创建 PeerConnection 失败: %w", err)
 	}
 	p := &Peer{
 		userID:   userID,
+		connID:   connID,
 		room:     room,
 		pc:       pc,
 		signal:   sig,

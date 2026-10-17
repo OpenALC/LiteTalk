@@ -2,10 +2,11 @@
 // SettingsView 设置页（独立路由 /settings，v0.1.2 起不再复用语音/文字舞台区域）。
 // 分区：连接/账号/常规/音频设备/语音/快捷键/关于；改动即热应用 + 落盘 config.json。
 // 语音默认值全部由 Go 侧 GetAudioSettings 回落（零值 → 默认），UI 只消费完整值。
-import { onMounted, ref, computed } from 'vue'
+import { onMounted, onUnmounted, ref, computed } from 'vue'
 import { ArrowLeft, LogOut, Mic, Volume2 } from 'lucide-vue-next'
 import { useRouter } from 'vue-router'
-import { goApp, type AudioDeviceDTO } from '../api/bridge'
+import { goApp, eventsOn, type AudioDeviceDTO } from '../api/bridge'
+import type { AudioLevel, AudioSettings } from '../api/types'
 import { useAuthStore } from '../stores/auth'
 import { useSettingsStore } from '../stores/data'
 import { useHibernateStore } from '../stores/hibernate'
@@ -37,12 +38,30 @@ const testingMic = ref(false)
 const testingSpk = ref(false)
 const toast = ref<InstanceType<typeof Toast>>()
 
+// 实时电平条（-60~0dBFS 刻度 + 说话门限标线）：仅麦克风测试期间由
+// audio:level 事件驱动（Go 侧 100ms 节流）；空闲显示占位。
+const lvl = ref<AudioLevel>({ peak: -60, rms: -60, threshold: -100 })
+const lvlScale = computed(() => Math.min(1, Math.max(0, (lvl.value.rms + 60) / 60)))
+const lvlMark = computed(() =>
+  `${Math.min(100, Math.max(0, (lvl.value.threshold + 60) / 60) * 100)}%`)
+const lvlText = computed(() =>
+  lvl.value.rms <= -59.5 ? '—' : `${lvl.value.rms.toFixed(0)} dB`)
+let cancelLevel: (() => void) | null = null
+
+// LevelBridge Go 侧 Start/StopLevelMonitor（bridge.ts 类型未含，本地扩展；
+// 浏览器 mock 桩无此方法 → 可选调用静默跳过）。
+type LevelBridge = { StartLevelMonitor?(): Promise<void>; StopLevelMonitor?(): Promise<void> }
+function levelBridge() {
+  return goApp() as ReturnType<typeof goApp> & LevelBridge
+}
+
 // 语音设置：Go 侧返回已回落默认的完整值（码率/VBR/DTX/FEC/丢包/降噪强度/AGC/
-// 麦克风/扬声器音量/VAD 五档/Opus 复杂度）。
-const audio = ref({
+// 麦克风/扬声器音量/VAD 五档/Opus 复杂度/输入声道/前置增益）。
+const audio = ref<AudioSettings>({
   bitrate_kbps: 32, vbr: true, dtx: true, fec: true,
-  packet_loss: 10, denoise: true, denoise_strength: 2, agc: false,
+  packet_loss: 10, denoise: true, denoise_strength: 2, agc: true,
   mic_volume: 100, playback_volume: 100, vad_sens: 2, opus_complexity: 9,
+  input_mode: 'auto', pre_gain_db: 0,
 })
 const BITRATES = [16, 24, 32, 48, 64]
 // VAD 五档（v0.1.2 扩展；旧三档由 Go 侧映射 0/2/4）。
@@ -50,6 +69,15 @@ const VAD_LABELS = ['很低', '低', '中', '高', '很高']
 // 降噪强度四档：关（denoise=false）/弱/中/强（denoise_strength=1/2/3，
 // Go 侧映射 rnnoise Aggressiveness 1.0/1.5/2.0）。
 const DENOISE_LABELS = ['关', '弱', '中', '强']
+// 输入声道下混：auto=自动选最强声道（反相锁定单声道），left/right 固定，mix 平均。
+const INPUT_LABELS: Record<NonNullable<AudioSettings['input_mode']>, string> = {
+  auto: '自动', left: '左声道', right: '右声道', mix: '混合',
+}
+function setInputMode(e: Event) {
+  const v = (e.target as HTMLSelectElement).value
+  audio.value.input_mode = (v in INPUT_LABELS ? v : 'auto') as AudioSettings['input_mode']
+  void applyAudio()
+}
 
 // denoiseIdx 降噪强度当前档位（computed 双向：关↔denoise=false，其余↔strength）。
 const denoiseIdx = ref(2)
@@ -71,6 +99,9 @@ onMounted(async () => {
   hibMode.value = (await goApp().GetHibernateMode()) as typeof hibMode.value
   closeToTray.value = await goApp().GetCloseToTray()
   audio.value = await goApp().GetAudioSettings()
+  // omitempty 字段（0/空值不序列化）在 UI 侧补默认，避免滑杆/下拉空值。
+  audio.value.input_mode ??= 'auto'
+  audio.value.pre_gain_db ??= 0
   syncDenoiseIdx()
   const devs = await goApp().ListAudioDevices()
   caps.value = devs.capture
@@ -99,28 +130,50 @@ async function applyDevice() {
   await goApp().SetAudioDevices(settings.captureDevice, settings.playbackDevice)
 }
 
-// testMic 麦克风自检：Go 侧用当前选择的设备采样 2 秒，按 RMS 判定。
-// rms ≥ 150 视为有信号（目标：设备能收音，而非判定语音——门限低于
-// dsp 的 RMSEnter=500，避免轻声说话假阴性；安静环境底噪本身即说明设备可用）。
-// 注意必须在采样 2 秒内对着麦克风说话，否则任何设备都会「未检测到」。
+// testMic 麦克风自检：Go 侧用当前选择的设备采样 2 秒，按 RMS 判定设备可用
+// （门限 150 低于说话判定的自适应底噪+12dB，避免轻声说话假阴性）。
+// 测试期间 StartLevelMonitor 推送 audio:level（100ms 节流）驱动实时电平条，
+// 结束（含异常）必定 StopLevelMonitor 并注销监听。
 async function testMic() {
   if (testingMic.value) return
   testingMic.value = true
+  cancelLevel = eventsOn('audio:level', (data) => {
+    lvl.value = data as AudioLevel
+  })
+  try {
+    await levelBridge().StartLevelMonitor?.()
+  } catch {
+    // 监视启动失败（如设备忙）不阻断 2 秒自检本身
+  }
   try {
     const r = await goApp().TestMicrophone()
     console.log('[device-test] mic rms=%d peak=%d', r.rms, r.peak)
     if (r.rms >= 150) {
-      const pct = Math.min(100, Math.round((r.rms / 32767) * 100))
-      toast.value?.show(`麦克风正常（输入电平 ${pct}%）`)
+      const db = 20 * Math.log10(r.rms / 32767)
+      toast.value?.show(`麦克风正常（输入电平 ${db.toFixed(0)} dB）`)
     } else {
       toast.value?.show('未检测到声音——测试时请对着麦克风说话；若已说话仍如此，请检查麦克风权限或所选设备', true)
     }
   } catch (e) {
     toast.value?.show(`麦克风测试失败：${e}`, true)
   } finally {
+    try {
+      await levelBridge().StopLevelMonitor?.()
+    } catch {
+      // 幂等停止，失败无须提示
+    }
+    cancelLevel?.()
+    cancelLevel = null
     testingMic.value = false
   }
 }
+
+// 离开设置页：注销电平监听并停止监视（进程退出路径由 Go 侧兜底）。
+onUnmounted(() => {
+  cancelLevel?.()
+  cancelLevel = null
+  void levelBridge().StopLevelMonitor?.().catch(() => {})
+})
 
 // testSpeaker 扬声器自检：播放 880Hz 测试音 1.5 秒（Go 阻塞至播完）。
 async function testSpeaker() {
@@ -210,6 +263,22 @@ async function applyAudio() {
             <Mic :size="13" />{{ testingMic ? '请说话…' : '测试' }}
           </button>
         </div>
+        <!-- 输入声道下混：单声道有信号的耳麦在 auto 下不再被各声道平均压掉 -->
+        <div class="s-row">
+          <div class="k">输入声道</div>
+          <select :value="audio.input_mode ?? 'auto'" @change="setInputMode">
+            <option v-for="(label, mode) in INPUT_LABELS" :key="mode" :value="mode">{{ label }}</option>
+          </select>
+        </div>
+        <!-- 实时电平条（-60~0dBFS）：测试期间更新；细线为说话进入门限（只读） -->
+        <div class="s-row">
+          <div class="k">输入电平</div>
+          <div class="lvl" role="img" :aria-label="`输入电平 ${lvlText}`">
+            <div class="lvl-fill" :style="{ transform: `scaleX(${lvlScale})` }" />
+            <div v-if="lvl.threshold > -60" class="lvl-mark" :style="{ left: lvlMark }" />
+          </div>
+          <span class="v">{{ lvlText }}</span>
+        </div>
         <div class="s-row">
           <div class="k">扬声器</div>
           <select v-model="settings.playbackDevice" @change="applyDevice">
@@ -232,6 +301,12 @@ async function applyAudio() {
                     @click="applyDenoiseIdx(i)">{{ label }}</button>
           </div>
         </div>
+        <!-- 前置增益：施加在降噪之前，补偿 -40dBFS 级弱麦；输出音量在下面的「麦克风音量」 -->
+        <div class="s-row">
+          <div class="k">前置增益（弱麦补偿）</div>
+          <input v-model.number="audio.pre_gain_db" type="range" min="-12" max="24" step="1" @change="applyAudio">
+          <span class="v">{{ audio.pre_gain_db }} dB</span>
+        </div>
         <div class="s-row">
           <div class="k">麦克风音量</div>
           <input v-model.number="audio.mic_volume" type="range" min="0" max="120" step="5" @change="applyAudio">
@@ -243,7 +318,7 @@ async function applyAudio() {
           <span class="v">{{ audio.playback_volume }}</span>
         </div>
         <div class="s-row">
-          <div class="k">自动增益 AGC（实验性）</div>
+          <div class="k">自动增益 AGC</div>
           <label class="switch">
             <input v-model="audio.agc" type="checkbox" @change="applyAudio"><i />
           </label>
@@ -419,4 +494,22 @@ input[type="range"] { flex: 0 0 140px; accent-color: var(--brand-500); }
 }
 .mini-btn:hover { background: var(--brand-200); color: var(--ink-900); }
 .mini-btn:disabled { opacity: 0.55; cursor: default; }
+
+/* 实时电平条：-60~0dBFS；填充用 transform: scaleX（动画只走 transform） */
+.lvl {
+  position: relative; flex: 0 0 160px; height: 8px;
+  border-radius: 4px; background: var(--surface);
+  border: 1px solid var(--line); overflow: hidden;
+}
+.lvl-fill {
+  position: absolute; inset: 0;
+  transform-origin: left center; transform: scaleX(0);
+  background: var(--brand-500);
+  transition: transform 0.1s linear;
+}
+/* 说话进入门限标线（只读） */
+.lvl-mark {
+  position: absolute; top: 0; bottom: 0; width: 2px;
+  margin-left: -1px; background: var(--ink-400);
+}
 </style>

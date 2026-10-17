@@ -76,6 +76,10 @@ type App struct {
 	user       state.UserProfile
 
 	audioCtx *audio.Context // 设备枚举用，惰性创建
+
+	// levelMon 设置页实时电平推送（audio:level，100ms 节流）；仅麦克风测试
+	// 期间活跃。a.mu 保护指针本身，Stop 在锁外等待监视 goroutine 退出。
+	levelMon *audio.LevelMonitor
 }
 
 // NewApp 创建应用实例
@@ -442,6 +446,16 @@ func (a *App) WindowClose() {
 	a.closeToTrayOrQuit()
 }
 
+// ShowMainWindow 唤起主窗（单实例二次启动 OnSecondInstanceLaunch 调用）：
+// 复用托盘唤醒逻辑（destroy 模式按记忆位置重建 / Show / 已最小化则 Restore），
+// 再前置聚焦。回调来自 wails 单实例监听 goroutine，与托盘回调同级，无新约束。
+func (a *App) ShowMainWindow() {
+	a.showFromTray()
+	if win := a.getWindow(); win != nil {
+		win.Focus()
+	}
+}
+
 // ---------- 设置 ----------
 
 // GetHibernateMode 休眠模式：off（不休眠）/ hibernate（卸载业务组件）/ destroy（整页重载）。
@@ -629,6 +643,27 @@ func (a *App) Logout() error {
 	return nil
 }
 
+// onKicked 被服务端踢下线（同类设备在其他设备登录，契约 §0.5/§0.6）：
+// 停信令退避重试（loginGen+1）→ 断会话 → 清内存 refresh（游客连同落盘
+// 令牌一并作废，否则下次启动会拿它续出一个无人在线的会话）→ 通知前端。
+// 只在被踢路径调用：主动 Logout 不发 auth:kicked，登出不弹「已在其他设备登录」。
+func (a *App) onKicked(reason string) {
+	a.loginGen.Add(1) // 停 startSession 的后台重试循环
+	a.disconnectSession()
+	a.mu.Lock()
+	a.refreshTok = ""
+	isGuest := a.user.IsGuest
+	a.mu.Unlock()
+	if isGuest {
+		_ = a.cfg.SetGuestRefresh("")
+	}
+	if reason == "" {
+		reason = "login_elsewhere"
+	}
+	log.Printf("session kicked: %s", reason)
+	a.emit("auth:kicked", map[string]any{"reason": reason})
+}
+
 // GetMe 当前用户档案。
 func (a *App) GetMe() (*state.UserProfile, error) {
 	a.mu.Lock()
@@ -697,9 +732,10 @@ func (a *App) GetAudioDeviceSelection() *AudioDeviceSelection {
 }
 
 // TestMicrophone 麦克风自检：用持久化选择的采集设备采样 2 秒，返回 RMS 与峰值
-// （设置页「测试」按钮；独立于会话管线，不动通话状态）。
+// （设置页「测试」按钮；独立于会话管线，不动通话状态；下混模式与通话链路一致）。
 func (a *App) TestMicrophone() (map[string]float64, error) {
-	rms, peak, err := audio.TestCapture(a.cfg.Get().AudioCapture, 2*time.Second)
+	as := a.cfg.GetAudioSettings()
+	rms, peak, err := audio.TestCapture(a.cfg.Get().AudioCapture, audio.ParseInputMode(as.InputMode), 2*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -709,6 +745,41 @@ func (a *App) TestMicrophone() (map[string]float64, error) {
 // TestSpeaker 扬声器自检：播放 880Hz 正弦测试音 1.5 秒（阻塞至播完）。
 func (a *App) TestSpeaker() error {
 	return audio.TestPlayback(a.cfg.Get().AudioPlayback, 880, 1500*time.Millisecond)
+}
+
+// StartLevelMonitor 启动设置页实时电平推送（audio:level 事件，100ms 节流）。
+// 仅麦克风测试期间调用（TestMicrophone 启动、结束时 StopLevelMonitor）；
+// 重复调用为无害 no-op。设备/下混模式取持久化配置，与通话链路一致。
+func (a *App) StartLevelMonitor() error {
+	as := a.cfg.GetAudioSettings()
+	selector := a.cfg.Get().AudioCapture
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.levelMon != nil {
+		return nil
+	}
+	mon, err := audio.StartLevelMonitor(selector, audio.ParseInputMode(as.InputMode), func(s audio.LevelSample) {
+		// 监视 goroutine 上回调：只投递事件，不做任何阻塞操作。
+		a.emit("audio:level", map[string]any{
+			"peak": s.PeakDB, "rms": s.RmsDB, "threshold": s.ThresholdDB,
+		})
+	})
+	if err != nil {
+		return err
+	}
+	a.levelMon = mon
+	return nil
+}
+
+// StopLevelMonitor 停止电平推送并释放设备（幂等；锁外等待监视退出，避免死锁）。
+func (a *App) StopLevelMonitor() {
+	a.mu.Lock()
+	mon := a.levelMon
+	a.levelMon = nil
+	a.mu.Unlock()
+	if mon != nil {
+		mon.Stop()
+	}
 }
 
 // ---------- 语音会话 ----------
@@ -812,6 +883,17 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 		// 前端 toast 明确提示，JoinChannel 会返回同因错误。
 		OnVoiceUnavailable: func(errMsg string) {
 			a.emit("voice:unavailable", map[string]string{"error": errMsg})
+		},
+		// 被踢（session.kicked / WS 4001）：回调跑在 ws 读循环 goroutine（会话
+		// wg 内），而断开会话要 wg.Wait 这条读循环——同步执行必死锁，故异步。
+		OnKicked: func(reason string) {
+			go a.onKicked(reason)
+		},
+		// 语音被抢占（session.voice_taken，契约 §0.10）：Go 侧已本地退房，
+		// 此处只把事实转给前端（toast + 清房间态）。同样跑在 ws 读循环
+		// goroutine 上，不得同步断开会话。
+		OnVoiceTaken: func() {
+			a.emit("voice:taken", nil)
 		},
 	}
 	server := a.cfg.Resolve().WSURL
@@ -1111,6 +1193,8 @@ func (a *App) runtimeAudio() audio.RuntimeSettings {
 		PlaybackGain:    float64(as.PlaybackVolume) / 100,
 		VADSens:         derefInt(as.VADSens, 2),
 		Complexity:      complexity,
+		InputMode:       audio.ParseInputMode(as.InputMode),
+		PreGainDB:       as.PreGainDB,
 	}
 }
 
@@ -1147,6 +1231,12 @@ func (a *App) SetAudioSettings(s config.AudioSettings) error {
 	}
 	if s.PlaybackVolume < 0 || s.PlaybackVolume > 120 {
 		return fmt.Errorf("扬声器音量非法: %d", s.PlaybackVolume)
+	}
+	if s.InputMode != "" && !config.InputModes[s.InputMode] {
+		return fmt.Errorf("输入声道模式非法: %s", s.InputMode)
+	}
+	if s.PreGainDB < config.PreGainMinDB || s.PreGainDB > config.PreGainMaxDB {
+		return fmt.Errorf("前置增益越界: %.1fdB", s.PreGainDB)
 	}
 	if err := a.cfg.SetAudioSettings(s); err != nil {
 		return err

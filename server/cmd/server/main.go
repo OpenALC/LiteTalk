@@ -82,6 +82,7 @@ func main() {
 	refreshStore := auth.NewRefreshStore(kv)
 	codes := auth.NewEmailCodes(kv)
 	limits := auth.NewRateLimit(kv)
+	sessIndex := auth.NewSessionIndex(st, kv)
 
 	// SFU：ICE-Lite + 单 UDP mux（§5.2）
 	sfuInst, err := sfu.New(sfu.Config{
@@ -103,26 +104,27 @@ func main() {
 	}
 	var authenticator signal.Authenticator
 	if devAuth {
-		authenticator = func(token string) (string, string, error) {
+		authenticator = func(token string) (signal.Identity, error) {
 			if !strings.HasPrefix(token, "dev-") {
 				if claims, err := jwtSigner.ParseAccess(token); err == nil {
-					return strconv.FormatInt(claims.UserID, 10), claims.Nickname, nil
+					return identityFromClaims(claims), nil
 				}
 			}
+			// dev- 令牌无会话概念：SkipSessionCheck 跳过握手 sid 比对（仅 dev 构建可达）。
 			return signal.DevAuthenticator(token)
 		}
 		log.Println("WS 鉴权: JWT + dev-token 兜底（开发模式）")
 	} else {
-		authenticator = func(token string) (string, string, error) {
+		authenticator = func(token string) (signal.Identity, error) {
 			claims, err := jwtSigner.ParseAccess(token)
 			if err != nil {
-				return "", "", signal.ErrUnauthorized
+				return signal.Identity{}, signal.ErrUnauthorized
 			}
-			return strconv.FormatInt(claims.UserID, 10), claims.Nickname, nil
+			return identityFromClaims(claims), nil
 		}
 		log.Println("WS 鉴权: JWT")
 	}
-	hub := signal.NewHub(sfuInst, authenticator, log.Default(), 0, signal.ChatDeps{
+	hub := signal.NewHub(sfuInst, authenticator, sessIndex, log.Default(), 0, signal.ChatDeps{
 		Store:  st,
 		Limits: limits,
 		Dev:    dev,
@@ -189,6 +191,10 @@ func main() {
 		// 可信反代（Nginx 等）的 IP/CIDR，命中 RemoteAddr 才采用 X-Real-IP；
 		// 不配置则只信 RemoteAddr。详见 deploy/env/litetalk.env.example。
 		TrustedProxies: splitList(os.Getenv("LITETALK_TRUSTED_PROXIES")),
+		// 多设备会话索引（v1.1.0 迁移 0004）：REST 中间件/WS 握手比对 sid。
+		Session: sessIndex,
+		// 信令 hub：登出/重置密码踢 WS（api.Hub 接口避免 signal→api 循环）。
+		Hub: hub,
 	})
 
 	mux := http.NewServeMux()
@@ -234,10 +240,25 @@ func healthzHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// identityFromClaims 从 JWT Claims 构造信令身份。IssuedAt 透传供握手侧
+// 旧版本令牌（无 sid）过渡期判定（v1.1.0 兼容窗口）。
+func identityFromClaims(claims *auth.Claims) signal.Identity {
+	id := signal.Identity{
+		UserID:   strconv.FormatInt(claims.UserID, 10),
+		Username: claims.Nickname,
+		Sid:      claims.Sid,
+		Dev:      claims.Dev,
+	}
+	if claims.IssuedAt != nil {
+		id.IssuedAt = claims.IssuedAt.Unix()
+	}
+	return id
+}
+
 // devUserID 把 M2 开发令牌映射为用户 ID（M3 换 JWT 时同步替换）。
 func devUserID(token string) (string, error) {
-	id, _, err := signal.DevAuthenticator(token)
-	return id, err
+	id, err := signal.DevAuthenticator(token)
+	return id.UserID, err
 }
 
 // ---- 环境变量小工具 ----

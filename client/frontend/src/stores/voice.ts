@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import { eventsOff, eventsOn, goApp } from '../api/bridge'
+import { eventsOn, goApp } from '../api/bridge'
 import type { PeerView } from '../api/types'
 import { useNotifyStore } from './notify'
 
@@ -40,10 +40,17 @@ export const useVoiceStore = defineStore('voice', () => {
 
   async function leave() {
     if (!channelId.value) return
+    resetRoom()
+    await goApp().LeaveChannel()
+  }
+
+  // resetRoom 本地清空房间态（主动退房 / 语音被抢占）。不发 LeaveChannel——
+  // 抢占路径下 Go 侧已本地退房，再发会把抢占端也带离房间。
+  function resetRoom() {
     channelId.value = ''
     members.value = []
     latencyMs.value = 0 // Q4：挂断即归零，避免 voice-bar 重开瞬间残留旧延迟
-    await goApp().LeaveChannel()
+    connected.value = false
   }
 
   async function setMute(v: boolean) {
@@ -92,22 +99,25 @@ export const useVoiceStore = defineStore('voice', () => {
     }
   }
 
-  // 事件订阅（app 层 EventsEmit）。
+  // 事件订阅（app 层 EventsEmit）。eventsOn 返回按监听器的取消函数，
+  // 卸载时逐个注销——不按事件名整体 Off（会清掉别人注册的同名监听）。
+  const offs: Array<() => void> = []
+
   function bindEvents() {
     const notify = useNotifyStore()
-    eventsOn('voice:self', (id) => {
+    offs.push(eventsOn('voice:self', (id) => {
       _selfId = id as string
-    })
-    eventsOn('voice:peer-join', (p) => {
+    }))
+    offs.push(eventsOn('voice:peer-join', (p) => {
       const peer = p as PeerView
       if (!members.value.some((m) => m.user_id === peer.user_id)) {
         members.value.push(peer)
       }
-    })
-    eventsOn('voice:peer-leave', (id) => {
+    }))
+    offs.push(eventsOn('voice:peer-leave', (id) => {
       members.value = members.value.filter((m) => m.user_id !== (id as string))
-    })
-    eventsOn('voice:speaking', (p) => {
+    }))
+    offs.push(eventsOn('voice:speaking', (p) => {
       const d = p as PeerView
       const m = members.value.find((x) => x.user_id === d.user_id)
       if (m) {
@@ -115,15 +125,15 @@ export const useVoiceStore = defineStore('voice', () => {
         m.mute = d.mute
         m.deafen = d.deafen
       }
-    })
-    eventsOn('voice:stats', (s) => {
+    }))
+    offs.push(eventsOn('voice:stats', (s) => {
       try {
         const st = JSON.parse(s as string)
         latencyMs.value = st.latency_ms ?? 0
       } catch { /* 忽略坏包 */ }
-    })
+    }))
     // voice.state_request：他人请求我闭麦/静音——toast 带「接受」按钮，由我决定执行。
-    eventsOn('voice:state_request', (d) => {
+    offs.push(eventsOn('voice:state_request', (d) => {
       const req = d as { nickname?: string; mute?: boolean; deafen?: boolean }
       const name = req.nickname ?? '有成员'
       const what = req.mute ? '闭麦' : req.deafen ? '静音' : '调整状态'
@@ -131,19 +141,24 @@ export const useVoiceStore = defineStore('voice', () => {
         if (req.mute) void setMute(true)
         if (req.deafen) void setDeafen(true)
       })
-    })
+    }))
+    // 语音被抢占（session.voice_taken）：同账号另一设备进了语音房，服务端已把
+    // 本端摘出。Go 侧同步做了本地退房，这里清房间态（否则成员列表留着幽灵），
+    // 并说明原因——不说明的话用户只会看到房间突然空了。
+    offs.push(eventsOn('voice:taken', () => {
+      resetRoom()
+      notify.show('已在其他设备加入语音')
+    }))
   }
 
-  // unbindEvents 休眠态清理：解除全部事件订阅。
+  // unbindEvents 休眠态清理：逐个注销本 store 注册的监听器。
   function unbindEvents() {
-    for (const n of ['voice:self', 'voice:peer-join', 'voice:peer-leave', 'voice:speaking', 'voice:stats', 'voice:state_request']) {
-      eventsOff(n)
-    }
+    while (offs.length) offs.pop()!()
   }
 
   return {
     channelId, members, muted, deafened, dualOff, latencyMs, connected, peerVolumes,
-    selfId, setSelf, join, leave, setMute, setDeafen, setPeerVolume,
+    selfId, setSelf, join, leave, resetRoom, setMute, setDeafen, setPeerVolume,
     requestVoiceState, restoreFromGo, bindEvents, unbindEvents,
   }
 })

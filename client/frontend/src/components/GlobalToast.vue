@@ -10,7 +10,9 @@ const notify = useNotifyStore()
 
 <template>
   <Transition name="toast">
-    <div v-if="notify.visible" class="toast" :class="{ err: notify.isError, actionable: !!notify.actionLabel }">
+    <!-- role=status：提示是状态播报（如「已在其他设备加入语音」），
+         辅助技术应 passively 读出，不该抢焦点。 -->
+    <div v-if="notify.visible" class="toast" :class="{ err: notify.isError, actionable: !!notify.actionLabel }" role="status">
       <CircleAlert v-if="notify.isError" :size="16" />
       <CircleCheck v-else :size="16" />
       <span>{{ notify.text }}</span>

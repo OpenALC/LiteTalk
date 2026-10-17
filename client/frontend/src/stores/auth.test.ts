@@ -35,3 +35,42 @@ describe('auth store 信令状态', () => {
     expect(auth.signalOk).toBe(true)
   })
 })
+
+// 被踢横幅的数据源：kickedReason 由 store 层 auth:kicked 监听写入，
+// LoginView 进入时取走并清（横幅只活在本次登录页访问）。
+describe('auth store 被踢原因', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+  })
+
+  it('默认无被踢原因', () => {
+    expect(useAuthStore().kickedReason).toBe('')
+  })
+
+  it('setKickedReason 写入原因', () => {
+    const auth = useAuthStore()
+    auth.setKickedReason('login_elsewhere')
+    expect(auth.kickedReason).toBe('login_elsewhere')
+  })
+
+  it('空原因回落 login_elsewhere（契约 §0.5 约定值）', () => {
+    const auth = useAuthStore()
+    auth.setKickedReason('')
+    expect(auth.kickedReason).toBe('login_elsewhere')
+  })
+
+  it('clearKickedReason 清空（进入登录页取走后不留到下次）', () => {
+    const auth = useAuthStore()
+    auth.setKickedReason('login_elsewhere')
+    auth.clearKickedReason()
+    expect(auth.kickedReason).toBe('')
+  })
+
+  it('setSignalOk 不影响被踢原因（两态独立）', () => {
+    const auth = useAuthStore()
+    auth.setKickedReason('login_elsewhere')
+    auth.setSignalOk(true)
+    expect(auth.kickedReason).toBe('login_elsewhere')
+    expect(auth.signalOk).toBe(true)
+  })
+})

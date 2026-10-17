@@ -143,16 +143,17 @@ var ErrRoomFull = fmt.Errorf("房间已满")
 
 // HandleOffer 处理客户端初始 rtc.offer：创建/复用 PeerConnection、应答、
 // 并把房间既有成员的轨道补发给新成员（触发 SFU 侧重协商 offer）。
+// connID 为归属 WS 连接标识（§0.9）：LeaveIf 按此核对，避免误清新连接的 peer。
 // 返回 rtc.answer 的 SDP。
-func (s *SFU) HandleOffer(roomID, userID, sdp string, sig SignalSender) (string, error) {
+func (s *SFU) HandleOffer(roomID, userID, connID, sdp string, sig SignalSender) (string, error) {
 	room := s.getOrCreateRoom(roomID)
-	peer, err := room.addPeer(userID, sig)
+	peer, err := room.addPeer(userID, connID, sig)
 	if err != nil {
 		return "", err
 	}
 	answerSDP, err := peer.handleInitialOffer(sdp)
 	if err != nil {
-		room.removePeer(userID)
+		room.removePeerIf(userID, connID)
 		s.removeRoomIfEmpty(roomID)
 		return "", err
 	}
@@ -179,13 +180,15 @@ func (s *SFU) AddICECandidate(roomID, userID string, c webrtc.ICECandidateInit) 
 	return peer.addICECandidate(c)
 }
 
-// Leave 成员离开：移除路由、关闭其 PeerConnection；其他成员的 outbound 惰性保留（停写即可）。
-func (s *SFU) Leave(roomID, userID string) {
+// LeaveIf 成员离开（§0.9 身份核对）：仅当 peer 归属 connID 时移除路由、关闭其
+// PeerConnection；同 uid 的新连接已顶替旧 peer 时这里是无操作，不会误删。
+// 其他成员的 outbound track 惰性保留（停写即可）。
+func (s *SFU) LeaveIf(roomID, userID, connID string) {
 	room := s.findRoom(roomID)
 	if room == nil {
 		return
 	}
-	room.removePeer(userID)
+	room.removePeerIf(userID, connID)
 	s.removeRoomIfEmpty(roomID)
 }
 

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"sync"
 	"time"
@@ -20,6 +21,7 @@ type Mem struct {
 	categories  map[int64]*Category
 	messages    map[int64]*Message
 	invites     map[string]*Invite
+	sessions    map[int64]map[string]*UserSession // userID → deviceType → session
 
 	nextID map[string]int64
 
@@ -44,6 +46,7 @@ func NewMem() *Mem {
 		categories:  map[int64]*Category{},
 		messages:    map[int64]*Message{},
 		invites:     map[string]*Invite{},
+		sessions:    map[int64]map[string]*UserSession{},
 		nextID:      map[string]int64{},
 		kv:          map[string]kvEntry{},
 		kvTimed:     map[string]*time.Timer{},
@@ -567,6 +570,62 @@ func (m *Mem) UseInvite(_ context.Context, code string) error {
 	return nil
 }
 
+// ---- user_sessions（v1.1.0 迁移 0004） ----
+
+func (m *Mem) UpsertUserSession(_ context.Context, s *UserSession) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	if m.sessions[s.UserID] == nil {
+		m.sessions[s.UserID] = map[string]*UserSession{}
+	}
+	if old, ok := m.sessions[s.UserID][s.DeviceType]; ok {
+		s.CreatedAt = old.CreatedAt
+	} else {
+		s.CreatedAt = now
+	}
+	s.UpdatedAt = now
+	cp := *s
+	m.sessions[s.UserID][s.DeviceType] = &cp
+	return nil
+}
+
+func (m *Mem) GetUserSession(_ context.Context, userID int64, deviceType string) (*UserSession, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	devs, ok := m.sessions[userID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	s, ok := devs[deviceType]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	cp := *s
+	return &cp, nil
+}
+
+func (m *Mem) DeleteUserSession(_ context.Context, userID int64, deviceType string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	devs, ok := m.sessions[userID]
+	if !ok {
+		return ErrNotFound
+	}
+	if _, ok := devs[deviceType]; !ok {
+		return ErrNotFound
+	}
+	delete(devs, deviceType)
+	return nil
+}
+
+func (m *Mem) DeleteAllUserSessions(_ context.Context, userID int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.sessions, userID)
+	return nil
+}
+
 // ---- KV ----
 
 func (m *Mem) Get(_ context.Context, key string) (string, error) {
@@ -644,6 +703,35 @@ func (m *Mem) Incr(_ context.Context, key string, ttl time.Duration) (int64, err
 		m.kv[key] = e
 	}
 	return n, nil
+}
+
+// Eval 在锁内模拟 CASScript 语义：KEYS[1] 当前值等于 ARGV[1] 时替换为 ARGV[2]
+// 并把 TTL 重置为 ARGV[3] 秒，返回 int64(1)；否则返回 int64(0)。
+// Mem 的全部 KV 操作都排在 m.mu 之后，GET 比对与 SET 之间插不进其他写，等价原子，
+// 故无需真 Lua。传入其他脚本一律报错（fail-closed，防止新脚本被套上 CAS 语义）。
+func (m *Mem) Eval(_ context.Context, script string, keys []string, args ...string) (any, error) {
+	if script != CASScript {
+		return nil, errors.New("mem: 仅支持 CASScript")
+	}
+	if len(keys) != 1 || len(args) != 3 {
+		return nil, errors.New("mem: CASScript 需要 1 个 key 与 3 个参数")
+	}
+	ttl, err := time.ParseDuration(args[2] + "s")
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e, ok := m.kv[keys[0]]
+	// 键不存在或已过期视作比对失败（与 Lua 中 GET 返回 false 同理）。
+	if !ok || (!e.exp.IsZero() && time.Now().After(e.exp)) {
+		return int64(0), nil
+	}
+	if e.value != args[0] {
+		return int64(0), nil
+	}
+	m.setLocked(keys[0], args[1], ttl)
+	return int64(1), nil
 }
 
 func itoa(n int64) string {

@@ -131,6 +131,17 @@ type Invite struct {
 	ExpiresAt *time.Time `json:"expires_at,omitempty" db:"expires_at"`
 }
 
+// UserSession 用户会话（v1.1.0 迁移 0004）：每设备一个会话，登录/注册/游客成功时覆盖写入
+// （覆盖即吊销旧会话）。sid 是 32 hex 随机串，写入时由调用方生成。
+type UserSession struct {
+	UserID     int64     `json:"user_id" db:"user_id"`
+	DeviceType string    `json:"device_type" db:"device_type"`
+	Sid        string    `json:"sid" db:"sid"`
+	IP         string    `json:"ip" db:"ip"`
+	CreatedAt  time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at" db:"updated_at"`
+}
+
 // Store 数据访问接口（MySQL 与内存实现共同契约）。
 type Store interface {
 	// users
@@ -185,6 +196,15 @@ type Store interface {
 	InviteByCode(ctx context.Context, code string) (*Invite, error)
 	// UseInvite 自增使用次数（超过 max_uses 返回 ErrConflict）。
 	UseInvite(ctx context.Context, code string) error
+
+	// user_sessions（v1.1.0 迁移 0004，多设备会话）
+	UpsertUserSession(ctx context.Context, s *UserSession) error
+	// GetUserSession 返回该设备当前会话；未命中返回 ErrNotFound。
+	GetUserSession(ctx context.Context, userID int64, deviceType string) (*UserSession, error)
+	// DeleteUserSession 删除指定设备会话；未命中返回 ErrNotFound。
+	DeleteUserSession(ctx context.Context, userID int64, deviceType string) error
+	// DeleteAllUserSessions 删除该用户全部设备会话（重置密码用）。
+	DeleteAllUserSessions(ctx context.Context, userID int64) error
 }
 
 // KV 键值抽象（Redis 与内存实现共同契约；auth 的验证码/刷新令牌/限流使用）。
@@ -194,7 +214,24 @@ type KV interface {
 	Del(ctx context.Context, keys ...string) error
 	// Incr 自增并返回新值；key 不存在时从 0 开始并设置 ttl。
 	Incr(ctx context.Context, key string, ttl time.Duration) (int64, error)
+	// Eval 执行 Lua 脚本（Redis）或锁内等价模拟（Mem）。
+	// 当前唯一脚本是 CASScript；实现方不认识脚本应报错而非猜语义（fail-closed）。
+	Eval(ctx context.Context, script string, keys []string, args ...string) (any, error)
 }
+
+// CASScript 比较交换（compare-and-swap）脚本：
+// KEYS[1] 当前值与 ARGV[1] 相等时替换为 ARGV[2]、TTL 重置为 ARGV[3] 秒并返回 1，否则返回 0。
+// Redis 单线程执行 EVAL，GET 比对与 SET 之间插不进其他写——auth 的刷新令牌旋转靠它
+// 杜绝并发重放（同一令牌被多个 goroutine 同时旋转时只有一个成功）。
+// Mem.Eval 在全局锁内模拟同一语义（GET+SET 排队执行，等价原子）。
+const CASScript = `
+local cur = redis.call('GET', KEYS[1])
+if cur == ARGV[1] then
+  redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+  return 1
+end
+return 0
+`
 
 // ErrKVNotFound Get 未命中（区别于其他错误）。
 var ErrKVNotFound = errors.New("kv: key not found")

@@ -105,7 +105,7 @@ func newTestClient(t *testing.T, s *SFU, roomID, userID string) *testClient {
 		t.Fatal(err)
 	}
 
-	answerSDP, err := s.HandleOffer(roomID, userID, offer.SDP, c)
+	answerSDP, err := s.HandleOffer(roomID, userID, userID, offer.SDP, c)
 	if err != nil {
 		t.Fatalf("[%s] HandleOffer: %v", userID, err)
 	}
@@ -328,7 +328,7 @@ func TestForwardStopsAfterLeave(t *testing.T) {
 	}
 	t.Log("A→B 已通，bob 离开房间")
 
-	s.Leave("c1", "bob")
+	s.LeaveIf("c1", "bob", "bob")
 
 	// 离开后 A 继续发带新前缀的包，B 一个都不应收到
 	sentPost := newSentSet()
@@ -362,8 +362,46 @@ func TestRoomFull(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.HandleOffer("c1", "carol", offer.SDP, nil); err != ErrRoomFull {
+	if _, err := s.HandleOffer("c1", "carol", "carol", offer.SDP, nil); err != ErrRoomFull {
 		t.Fatalf("期望 ErrRoomFull，实际 %v", err)
 	}
 	t.Log("满员房间拒绝第三人加入，返回 ErrRoomFull")
+}
+
+// TestLeaveIfConnIDIdentity peer 归属核对（§0.9）：同 room 同 uid 仅一个 peer，
+// 新 connID 顶替旧的；LeaveIf 异 connID 无操作、同 connID 才移除并销毁空房。
+func TestLeaveIfConnIDIdentity(t *testing.T) {
+	s := newTestSFU(t, 10)
+	room := s.getOrCreateRoom("c1")
+
+	pOld, err := room.addPeer("alice", "conn-1", nil)
+	if err != nil {
+		t.Fatalf("addPeer conn-1: %v", err)
+	}
+	pNew, err := room.addPeer("alice", "conn-2", nil) // 同 uid 异 connID：顶替
+	if err != nil {
+		t.Fatalf("addPeer conn-2: %v", err)
+	}
+	if pNew == pOld {
+		t.Fatal("新 connID 应顶替旧 peer")
+	}
+	if got := room.getPeer("alice"); got != pNew {
+		t.Fatalf("登记的 peer 应为 conn-2 的新 peer")
+	}
+	<-time.After(100 * time.Millisecond) // 旧 peer 由 go old.close() 异步关闭
+
+	// 旧 connID 清理：身份不符，不动新 peer。
+	s.LeaveIf("c1", "alice", "conn-1")
+	if got := room.getPeer("alice"); got != pNew {
+		t.Fatal("异 connID 的 LeaveIf 误删了新 peer")
+	}
+
+	// 新 connID 清理：移除并销毁空房。
+	s.LeaveIf("c1", "alice", "conn-2")
+	if got := room.getPeer("alice"); got != nil {
+		t.Fatal("同 connID 的 LeaveIf 应移除 peer")
+	}
+	if s.findRoom("c1") != nil {
+		t.Fatal("全员离开后房间应被销毁")
+	}
 }

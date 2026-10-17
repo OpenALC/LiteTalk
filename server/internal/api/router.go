@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/OpenALC/LiteTalk/server/internal/auth"
 	"github.com/OpenALC/LiteTalk/server/internal/mailer"
@@ -22,6 +23,12 @@ const (
 	AuthModeSimple = "simple"
 )
 
+// Hub abstracts signal.Hub for logout/reset-password session kicking.
+// Defined here to avoid an import cycle (signal imports store, api imports signal would cycle via main wiring).
+type Hub interface {
+	Kick(uid, dev, reason string)
+}
+
 // Server API 依赖集合。
 type Server struct {
 	store    store.Store
@@ -32,7 +39,9 @@ type Server struct {
 	mailer   mailer.Mailer
 	authMode string
 	log      *log.Logger
-	trusted  []*net.IPNet // 可信反代（RemoteAddr 命中才采用 X-Real-IP）
+	trusted  []*net.IPNet       // 可信反代（RemoteAddr 命中才采用 X-Real-IP）
+	sess     *auth.SessionIndex // 多设备会话索引（v1.1.0 迁移 0004）
+	hub      Hub                // WS 信令 hub（登出/重置密码踢线；nil=不踢）
 }
 
 // Config 构造配置。
@@ -48,6 +57,10 @@ type Config struct {
 	// TrustedProxies 可信反代的 IP/CIDR 列表（逗号分隔 env 在 main 解析后传入）。
 	// 空 = 不信任任何代理：直接取 RemoteAddr，伪造 X-Real-IP 无法绕过限流（P1）。
 	TrustedProxies []string
+	// Session 多设备会话索引（nil 时跳过 sid 校验，仅供测试/迁移期过渡）。
+	Session *auth.SessionIndex
+	// Hub 信令 hub（登出/重置密码踢线；nil 时仅清会话不踢 WS，测试常用）。
+	Hub Hub
 }
 
 // New 构造 API Server。
@@ -74,6 +87,8 @@ func New(cfg Config) *Server {
 		authMode: mode,
 		log:      lg,
 		trusted:  parseTrustedProxies(lg, cfg.TrustedProxies),
+		sess:     cfg.Session,
+		hub:      cfg.Hub,
 	}
 }
 
@@ -171,7 +186,14 @@ func currentUser(r *http.Request) *auth.Claims {
 	return c
 }
 
+// legacyTokenGrace 旧版本令牌（无 sid）过渡期：与 signal 侧同值同时长，
+// 服务端升级后已签发令牌在有效期内仍可用，给用户留重新登录窗口（P1-3）。
+const legacyTokenGrace = 2*time.Hour + 5*time.Minute
+
 // auth 鉴权中间件：Authorization: Bearer <access_jwt>。
+// 多设备会话（v1.1.0）：比对 claims.Sid 与当前会话 sid；不符 → 401 session_replaced。
+// 旧版本令牌（sid 空）在 legacyTokenGrace 过渡期内放行（兼容 v1.0.x 客户端）；
+// sess 为 nil 时整段跳过（测试/降级路径，生产不可达）。
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		h := r.Header.Get("Authorization")
@@ -184,6 +206,23 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 		if err != nil {
 			writeErr(w, http.StatusUnauthorized, "unauthorized", "访问令牌无效或已过期")
 			return
+		}
+		if s.sess != nil {
+			if claims.Sid == "" {
+				// 旧版本令牌：过渡期内放行，超期拒绝。
+				if claims.IssuedAt == nil || time.Since(claims.IssuedAt.Time) >= legacyTokenGrace {
+					w.Header().Set("X-LiteTalk-Auth", "session_replaced")
+					writeErr(w, http.StatusUnauthorized, "session_replaced", "登录状态已过期，请重新登录")
+					return
+				}
+			} else {
+				curSid, err := s.sess.Get(r.Context(), claims.UserID, claims.Dev)
+				if err != nil || curSid == "" || claims.Sid != curSid {
+					w.Header().Set("X-LiteTalk-Auth", "session_replaced")
+					writeErr(w, http.StatusUnauthorized, "session_replaced", "账号已在其他设备登录")
+					return
+				}
+			}
 		}
 		next(w, r.WithContext(context.WithValue(r.Context(), userKey, claims)))
 	}

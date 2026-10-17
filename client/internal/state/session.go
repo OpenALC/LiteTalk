@@ -35,6 +35,14 @@ type Events struct {
 	OnStateRequest func(fromID, fromNickname string, mute, deafen *bool)
 	// OnVoiceUnavailable 媒体管线初始化失败（音频不可用但信令照常连接）。
 	OnVoiceUnavailable func(errMsg string)
+	// OnKicked 被服务端踢下线（session.kicked 消息 / WS 4001：同类设备新登录，
+	// 契约 §0.5）。reason 约定值 login_elsewhere。回调可能跑在 ws 读循环
+	// goroutine（会话 wg 内）：实现侧不得同步 Close 会话，须异步执行。
+	OnKicked func(reason string)
+	// OnVoiceTaken 同账号另一会话抢占语音（session.voice_taken，契约 §0.10）：
+	// 服务端已把本端摘出房间，本地按退房清理完毕。与 OnKicked 同样可能跑在
+	// ws 读循环 goroutine（会话 wg 内），实现侧不得同步 Close 会话。
+	OnVoiceTaken func()
 }
 
 // VoiceStats 推给 UI 的语音房统计快照。
@@ -140,6 +148,10 @@ func (s *Session) Connect(serverURL string) {
 		}
 		s.stopMedia()
 	}
+	// WS close 4001 / 握手 401 带 session_replaced 头：session.kicked 消息在
+	// 服务端发送窗口内可能丢帧，close code 是可靠的那一半。回调跑在 ws Run
+	// goroutine（会话 wg 内），app 侧 OnKicked 已异步化，此处直接调出口即可。
+	wsCfg.OnKicked = func(reason string) { s.handleKicked(reason) }
 	s.ws = signal.NewClient(wsCfg)
 	s.registerHandlers()
 
@@ -373,6 +385,55 @@ func (s *Session) registerHandlers() {
 			s.ev.OnStateRequest(d.From.ID, d.From.Nickname, d.Mute, d.Deafen)
 		}
 	})
+	// session.kicked：同类设备在其他设备登录，服务端踢本连接（契约 §0.5）。
+	// 断开与清令牌在 app 层 OnKicked 完成，此处只上报原因。
+	// 消息本身「尽力而为」（发送窗口内丢帧即无踪），WS close 4001 与握手
+	// 401 的 session_replaced 头是兜底，见 wsCfg.OnKicked。
+	s.ws.On(signal.TypeSessionKicked, func(env signal.Envelope) {
+		var d signal.SessionKickedData
+		reason := signal.KickReasonLoginElsewhere
+		if env.Decode(&d) == nil && d.Reason != "" {
+			reason = d.Reason
+		}
+		s.handleKicked(reason)
+	})
+	// session.voice_taken：同账号另一会话抢占语音（契约 §0.10）。服务端已把
+	// 本端摘出成员表，本地按退房清理——但绝不发 channel.leave：那条 leave 按
+	// uid 处理，会把抢占端一起带离房间。
+	s.ws.On(signal.TypeSessionVoiceTaken, func(env signal.Envelope) {
+		s.leaveRoomLocal()
+		if s.ev.OnVoiceTaken != nil {
+			s.ev.OnVoiceTaken()
+		}
+	})
+}
+
+// leaveRoomLocal 本地退房（不发 channel.leave）。仅用于服务端已单方面把本端
+// 摘出房间的路径（session.voice_taken）：再发 leave 会让服务端按 uid 把抢占端
+// 也带离房间。成员表必须清——否则 UI 拿着旧 members 显示「幽灵在房」。
+func (s *Session) leaveRoomLocal() {
+	s.stopMedia()
+	s.roomID.Store("")
+	if p := s.peerRef.Swap(nil); p != nil {
+		_ = p.Close()
+	}
+	if s.remoteMgr != nil {
+		s.remoteMgr.RemoveAll()
+	}
+	if s.mixer != nil {
+		s.mixer.SetDeafen(false)
+	}
+	s.mu.Lock()
+	s.members = make(map[string]PeerView)
+	s.mu.Unlock()
+}
+
+// handleKicked 上报被踢原因（session.kicked 消息、WS close 4001、握手 401 的
+// session_replaced/session_replaced 头，三条路径的统一出口）。
+func (s *Session) handleKicked(reason string) {
+	if s.ev.OnKicked != nil {
+		s.ev.OnKicked(reason)
+	}
 }
 
 // setupPeer 建立对 SFU 的单条 PeerConnection（初始 offer 一次，此后只应答）。
@@ -509,6 +570,7 @@ func (s *Session) RestartDevices(captureID, playbackID string) error {
 // ApplyAudio 把运行时音频设置热应用到媒体管线（通话中可调，未 Connect 时空操作）。
 // Opus 参数经 ResolveOpusConfig 回落默认；逐项应用，返回首个错误（不中断）。
 // v0.1.2 扩展：复杂度/降噪强度/AGC/扬声器总音量（mixer master gain）。
+// v1.1 扩展：前置增益（原子热生效）/输入声道模式（热重启采集流）。
 func (s *Session) ApplyAudio(rs audio.RuntimeSettings) error {
 	if s.pipe == nil {
 		return nil
@@ -523,6 +585,8 @@ func (s *Session) ApplyAudio(rs audio.RuntimeSettings) error {
 		{"dtx", func() error { return s.pipe.SetOpusDTX(*rs.Opus.DTX) }},
 		{"fec", func() error { return s.pipe.SetOpusFEC(*rs.Opus.FEC) }},
 		{"packet_loss", func() error { return s.pipe.SetOpusPacketLoss(rs.Opus.PacketLoss) }},
+		{"pre_gain", func() error { return s.pipe.SetPreGainDB(rs.PreGainDB) }},
+		{"input_mode", func() error { return s.pipe.SetInputMode(rs.InputMode) }},
 	}
 	if rs.Complexity > 0 {
 		steps = append(steps, struct {
@@ -591,12 +655,14 @@ func (s *Session) Stats() string {
 }
 
 // SendChat 发送文字消息（chat.send，chat.message 由 WS 回落）。
+// type 字段是服务端 chat.send 的必填校验（v1.1.0 §0.12：本期仅 text）。
 func (s *Session) SendChat(channelID, content string) error {
 	if s.ws == nil {
 		return fmt.Errorf("session not connected")
 	}
 	return s.ws.Send(signal.TypeChatSend, map[string]string{
 		"channel_id": channelID,
+		"type":       "text",
 		"content":    content,
 	})
 }
