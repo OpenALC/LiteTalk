@@ -6,5 +6,5 @@ Comment=Lightweight voice chat
 Exec=litetalk
 Icon=io.github.openalc.LiteTalk
 Terminal=false
-Categories=Network;AudioVideo;Audio;
+Categories=AudioVideo;Audio;
 StartupWMClass=io.github.openalc.LiteTalk
