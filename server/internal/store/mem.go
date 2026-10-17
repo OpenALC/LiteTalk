@@ -476,6 +476,64 @@ func (m *Mem) DeleteCategoryWithChannels(_ context.Context, id int64) error {
 	return nil
 }
 
+func (m *Mem) UpdateCategory(_ context.Context, c *Category) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	old, ok := m.categories[c.ID]
+	if !ok {
+		return ErrNotFound
+	}
+	cp := *c
+	// created_at 不可变；不允许挪服务器（跨服务器移动不在范围）。
+	cp.CreatedAt = old.CreatedAt
+	cp.ServerID = old.ServerID
+	m.categories[c.ID] = &cp
+	return nil
+}
+
+// ReorderCategories 把 id 移到 position（越界夹到首/尾）并重排同服务器分类为 0..n-1，
+// 与 MySQL 事务版语义一致（原子性由 m.mu 保证）。
+func (m *Mem) ReorderCategories(_ context.Context, serverID, id int64, position int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	target, ok := m.categories[id]
+	if !ok || target.ServerID != serverID {
+		return ErrNotFound
+	}
+	list := []*Category{}
+	for _, c := range m.categories {
+		if c.ServerID == serverID {
+			list = append(list, c)
+		}
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].Position != list[j].Position {
+			return list[i].Position < list[j].Position
+		}
+		return list[i].ID < list[j].ID
+	})
+	rest := make([]*Category, 0, len(list))
+	for _, c := range list {
+		if c.ID != id {
+			rest = append(rest, c)
+		}
+	}
+	if position < 0 {
+		position = 0
+	}
+	if position > len(rest) {
+		position = len(rest)
+	}
+	out := make([]*Category, 0, len(list))
+	out = append(out, rest[:position]...)
+	out = append(out, target)
+	out = append(out, rest[position:]...)
+	for i, c := range out {
+		c.Position = i
+	}
+	return nil
+}
+
 // ---- messages ----
 
 func (m *Mem) CreateMessage(_ context.Context, msg *Message) error {

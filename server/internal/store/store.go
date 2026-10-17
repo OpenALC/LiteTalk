@@ -185,6 +185,11 @@ type Store interface {
 	CategoriesOfServer(ctx context.Context, serverID int64) ([]Category, error)
 	// DeleteCategoryWithChannels 单事务删除分类及其下全部频道（含各频道消息）。
 	DeleteCategoryWithChannels(ctx context.Context, id int64) error
+	// UpdateCategory 全量写 name/position（不动 created_at/所属服务器）。
+	UpdateCategory(ctx context.Context, c *Category) error
+	// ReorderCategories 把 id 移到 position（0-based，越界夹到首/尾），同服务器
+	// 其它分类相对顺序保持并重排为 0..n-1。
+	ReorderCategories(ctx context.Context, serverID, id int64, position int) error
 
 	// messages
 	CreateMessage(ctx context.Context, m *Message) error
