@@ -6,6 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
+	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -463,7 +466,8 @@ func (s *Session) setupPeer() {
 	}
 	peer, err := rtc.NewPeer(rtc.PeerConfig{
 		StreamID:        streamID,
-		IncludeLoopback: true, // 本机 SFU 宣告 127.0.0.1；公网部署应关闭
+		ICEServers:      s.fetchICEServers(),
+		IncludeLoopback: IsLoopbackURL(s.api.Base()), // 环回候选仅本机/内网 SFU 需要
 		Callbacks: rtc.PeerCallbacks{
 			OnLocalSDP: func(sdp webrtc.SessionDescription) {
 				msgType := signal.TypeRTCOffer
@@ -800,6 +804,45 @@ func (s *Session) SignalConnected() bool { return s.ws != nil && s.ws.Connected(
 func (s *Session) InRoom() bool {
 	room, _ := s.roomID.Load().(string)
 	return room != ""
+}
+
+// IsLoopbackURL 判断服务器基址是否指向环回（127.0.0.0/8、::1、localhost）。
+// 环回目标仅本机/内网 SFU 需要收集环回 ICE 候选；公网部署必须关闭，
+// 否则本机环回地址会作为候选暴露给远端对端。
+// 解析失败视为非环回（安全侧，不收集环回候选）。
+func IsLoopbackURL(base string) bool {
+	u, err := url.Parse(strings.TrimSpace(base))
+	if err != nil || u.Host == "" {
+		return false
+	}
+	host := u.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// fetchICEServers 拉取 STUN/TURN 凭证并转成 pion 格式。失败或服务端未配置
+// TURN（dev 环境常见）时降级为空 ICE 列表——本机/内网直连仍可通，不阻断进房。
+func (s *Session) fetchICEServers() []webrtc.ICEServer {
+	resp, err := s.api.RTCCredentials()
+	if err != nil {
+		s.log.Printf("rtc credentials: %v（降级为空 ICE 列表）", err)
+		return nil
+	}
+	if resp == nil || len(resp.ICEServers) == 0 {
+		return nil
+	}
+	out := make([]webrtc.ICEServer, 0, len(resp.ICEServers))
+	for _, srv := range resp.ICEServers {
+		out = append(out, webrtc.ICEServer{
+			URLs:       srv.URLs,
+			Username:   srv.Username,
+			Credential: srv.Credential,
+		})
+	}
+	return out
 }
 
 // iceFromPion / iceToPion 信令线格式 ↔ pion（与 calltest 同款）。
