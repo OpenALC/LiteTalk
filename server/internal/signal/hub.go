@@ -294,6 +294,28 @@ func (h *Hub) Kick(uid, dev, reason string) {
 	}
 }
 
+// Shutdown 优雅关闭广播（#21）：对全部连接投递 server.shutdown，150ms 发送窗口后 CloseNow。
+func (h *Hub) Shutdown(reason string) {
+	if reason == "" {
+		reason = "shutdown"
+	}
+	h.mu.Lock()
+	targets := make([]*client, 0, len(h.conns))
+	for _, c := range h.conns {
+		targets = append(targets, c)
+	}
+	h.mu.Unlock()
+	for _, c := range targets {
+		h.sendJSON(c, TypeServerShutdown, ServerShutdownData{Reason: reason, TS: time.Now().UnixMilli()})
+	}
+	if len(targets) > 0 {
+		time.Sleep(150 * time.Millisecond) // 发送窗口：让下行队列把 shutdown 消息写出去
+	}
+	for _, c := range targets {
+		c.closeNow()
+	}
+}
+
 // writeLoop 唯一写者：保证 coder/websocket 单写者约束。
 // 出错（写超时/对端关闭）→ cancel 读循环 ctx + CloseNow（§0.7）。
 func (c *client) writeLoop(ctx context.Context) {

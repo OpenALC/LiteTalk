@@ -36,6 +36,8 @@ const (
 	// session.voice_taken：同账号另一会话抢占语音，本端按本地退房处理（不关连接）。
 	TypeSessionVoiceTaken = "session.voice_taken"
 	TypeError             = "error"
+	// server.shutdown：优雅关闭广播（v1.3.0 #21）。
+	TypeServerShutdown = "server.shutdown"
 )
 
 // WS close code（§0.6，4000~4999 为应用自定义区间）。
@@ -55,6 +57,12 @@ const KickReasonLoginElsewhere = "login_elsewhere"
 type SessionKickedData struct {
 	Reason     string `json:"reason"`      // login_elsewhere 等
 	DeviceType string `json:"device_type"` // 被踢连接自身的设备类型
+}
+
+// ServerShutdownData S→C server.shutdown：优雅关闭广播（v1.3.0 #21）。
+type ServerShutdownData struct {
+	Reason string `json:"reason"` // 固定 "shutdown"
+	TS     int64  `json:"ts"`
 }
 
 // 下行 error 消息的 code 取值

@@ -265,14 +265,16 @@ func (s *Server) writeStoreErr(w http.ResponseWriter, r *http.Request, err error
 	}
 }
 
-// decodeJSON 读取并校验请求体。
+// decodeJSON 读取并校验请求体。MaxBytesReader 对 chunked 请求同样生效（#21）。
 func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
-	if r.ContentLength > 1<<20 { // 1MB 上限
-		writeErr(w, http.StatusRequestEntityTooLarge, "too_large", "请求体过大")
-		return false
-	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB 上限
 	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(v); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeErr(w, http.StatusRequestEntityTooLarge, "too_large", "请求体过大")
+			return false
+		}
 		writeErr(w, http.StatusBadRequest, "bad_request", "请求体不是合法 JSON")
 		return false
 	}
