@@ -14,16 +14,25 @@ import (
 )
 
 // newTestServer 构造内存态 API Server（无 MySQL/Redis 依赖）。
+// 注入 SessionIndex：登录/刷新/鉴权中间件的会话校验是 v1.1.0 的核心路径，
+// 不注入等于把 PR #2 审查 P0-1（sid 恒空）那类 bug 全部放行。
 func newTestServer(t *testing.T) (*Server, *store.Mem) {
 	t.Helper()
+	return newTestServerMode(t, AuthModeFull)
+}
+
+// newTestServerNoSession 无 SessionIndex 的 simple 模式变体：仅用于验证 sess==nil 时
+// 会话校验整段跳过的降级路径（生产不会出现，main.go 恒注入）。
+func newTestServerNoSessionMode(t *testing.T) (*Server, *store.Mem) {
+	t.Helper()
 	mem := store.NewMem()
-	jwt := auth.NewJWT("test-secret")
 	return New(Config{
-		Store:   mem,
-		JWT:     jwt,
-		Refresh: auth.NewRefreshStore(mem),
-		Codes:   auth.NewEmailCodes(mem),
-		Limits:  auth.NewRateLimit(mem),
+		Store:    mem,
+		JWT:      auth.NewJWT("test-secret"),
+		Refresh:  auth.NewRefreshStore(mem),
+		Codes:    auth.NewEmailCodes(mem),
+		Limits:   auth.NewRateLimit(mem),
+		AuthMode: AuthModeSimple,
 	}), mem
 }
 

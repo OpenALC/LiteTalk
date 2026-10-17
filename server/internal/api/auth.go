@@ -479,16 +479,20 @@ func (s *Server) handlePasswordReset(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// issueTokens 签发 access+refresh 并响应。dev=设备类型（desktop/mobile/…）。
+// issueTokens 签发 access+refresh 并响应。dev=设备类型（desktop/mobile）。
 func (s *Server) issueTokens(w http.ResponseWriter, r *http.Request, user *store.User, dev string, status int) {
 	// 登录/注册/游客成功时覆盖会话（新 sid 即吊销旧会话）。
-	sid := ""
-	if s.sess != nil {
-		sid, err := s.sess.Upsert(r.Context(), user.ID, dev, s.clientIP(r))
-		if err != nil {
-			s.log.Printf("[session] upsert 失败 uid=%d dev=%s err=%v", user.ID, dev, err)
-		}
-		_ = sid
+	// Upsert 失败必须 500：降级签发无 sid 的令牌会让 auth 中间件把登录态
+	// 全部判成 session_replaced（PR #2 审查 P0-1），宁可不发令牌。
+	if s.sess == nil {
+		writeErr(w, http.StatusInternalServerError, "internal", "会话服务未初始化")
+		return
+	}
+	sid, err := s.sess.Upsert(r.Context(), user.ID, dev, s.clientIP(r))
+	if err != nil {
+		s.log.Printf("[session] upsert 失败 uid=%d dev=%s err=%v", user.ID, dev, err)
+		writeErr(w, http.StatusInternalServerError, "internal", "创建会话失败")
+		return
 	}
 	access, err := s.jwt.SignAccess(user.ID, user.Nickname, user.Tag, sid, dev)
 	if err != nil {
