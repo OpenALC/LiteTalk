@@ -530,6 +530,31 @@ type ChannelDTO struct {
 	ServerID int64  `json:"server_id"`
 	Name     string `json:"name"`
 	Type     string `json:"type"` // text | voice
+	// CategoryID 分类归属（0 = 无分类/未分类，映射自服务端 NULL）；Position 同服务器序。
+	CategoryID *int64 `json:"category_id"`
+	Position   int    `json:"position"`
+}
+
+// ServerChannels GET /servers/{id}/channels 响应（categories + channels 两数组）。
+type ServerChannels struct {
+	Categories []CategoryDTO `json:"categories"`
+	Channels   []ChannelDTO  `json:"channels"`
+}
+
+// ListChannels 列出服务器的分类与频道（成员可读）。重启后频道列表恢复用。
+func (c *APIClient) ListChannels(serverID int64) (*ServerChannels, error) {
+	status, data, err := c.get(fmt.Sprintf("/servers/%d/channels", serverID))
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, decodeError(status, data)
+	}
+	var out ServerChannels
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("decode server channels: %w", err)
+	}
+	return &out, nil
 }
 
 // ListServers 列出当前用户加入的服务器。

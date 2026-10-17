@@ -192,8 +192,9 @@ async function onBlankConfirm(value: string) {
   } catch (e) { notify.fromErr(e) }
 }
 
-// createChannelInGroup：真实频道创建后归到指定分类（REST 频道暂按类型默认组，
-// 分类归属待 GET channels 端点接齐后由服务端 category_id 驱动，见 store 注释）。
+// createChannelInGroup：新建频道。服务端 createChannelReq 支持 category_id，
+// 但客户端 CreateChannel 未接（#12/#16 未覆盖频道挂分类），暂按类型默认组显示，
+// 重启后由 ListChannels 按服务端数据归位（见 store 注释）。
 async function createChannelInGroup(serverId: string, name: string, _group: string) {
   const s = servers.findServer(serverId)
   if (!s) return
@@ -239,6 +240,11 @@ async function onCatSelect(key: string) {
 
     <!-- data-ctx：允许自定义右键菜单（全局拦截的白名单容器） -->
     <div class="chan-scroll" data-ctx @contextmenu.prevent="openBlankCtx">
+      <!-- 空服务器空态（#12）：右键空白处仍可创建频道 -->
+      <div v-if="groups.length === 0" class="empty">
+        <Hash :size="26" />
+        <span>暂无频道</span>
+      </div>
       <div v-for="g in groups" :key="g.name" class="cat"
            :class="{ closed: collapsed[g.name] }">
         <!-- 分类头：左键折叠/展开，右键删除分类 -->
@@ -366,6 +372,13 @@ async function onCatSelect(key: string) {
 /* 全折叠时箭头旋起，与分组头折叠态一致 */
 .server-head :deep(svg.rotated) { transform: rotate(-90deg); }
 .chan-scroll { flex: 1; overflow-y: auto; padding: 10px 10px 12px; }
+/* 空服务器空态（#12）：四色内的弱化灰，不用 emoji */
+.empty {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 10px; padding: 36px 12px;
+  color: var(--ink-400); font-size: 12.5px;
+}
+.empty :deep(svg) { color: var(--ink-300); }
 .cat { margin-bottom: 14px; }
 .cat-head {
   display: flex; align-items: center; gap: 3px;

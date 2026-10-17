@@ -141,4 +141,13 @@ export interface ChannelDTO {
   server_id: number
   name: string
   type: 'text' | 'voice'
+  // 分类归属（0 = 未分类，映射自服务端 NULL）与同服务器序；旧桩可能缺省。
+  category_id?: number | null
+  position?: number
+}
+
+// ServerChannels GET /servers/{id}/channels 响应（分类 + 频道两数组）。
+export interface ServerChannels {
+  categories: CategoryDTO[]
+  channels: ChannelDTO[]
 }
