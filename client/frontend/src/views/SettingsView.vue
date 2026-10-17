@@ -3,14 +3,18 @@
 // 分区：连接/账号/常规/音频设备/语音/快捷键/关于；改动即热应用 + 落盘 config.json。
 // 语音默认值全部由 Go 侧 GetAudioSettings 回落（零值 → 默认），UI 只消费完整值。
 import { onMounted, onUnmounted, ref, computed } from 'vue'
-import { ArrowLeft, LogOut, Mic, Volume2 } from 'lucide-vue-next'
+import { ArrowLeft, CircleAlert, Keyboard, LogOut, Mic, Volume2 } from 'lucide-vue-next'
 import { useRouter } from 'vue-router'
 import { goApp, eventsOn, type AudioDeviceDTO } from '../api/bridge'
-import type { AudioLevel, AudioSettings } from '../api/types'
+import type { AudioLevel, AudioSettings, HotkeySettings } from '../api/types'
 import { useAuthStore } from '../stores/auth'
 import { useSettingsStore } from '../stores/data'
 import { useHibernateStore } from '../stores/hibernate'
-import { HOTKEYS } from '../composables/useHotkeys'
+import { HOTKEYS, isTypingTarget } from '../composables/useHotkeys'
+import {
+  HOTKEY_ACTIONS, bindingFromKeyEvent, bindingFromMouseEvent, bindingLabel,
+  findHotkeyConflicts, normalizeBinding, type HotkeyActionID,
+} from '../utils/hotkeySpec'
 import ServerConnPanel from '../components/ServerConnPanel.vue'
 import Toast from '../components/Toast.vue'
 
@@ -102,6 +106,20 @@ onMounted(async () => {
   // omitempty 字段（0/空值不序列化）在 UI 侧补默认，避免滑杆/下拉空值。
   audio.value.input_mode ??= 'auto'
   audio.value.pre_gain_db ??= 0
+  // 热键读取单独兜异常：Go 侧绑定缺失时只回落默认值，不连带弄崩下面设备列表的加载。
+  try {
+    hk.value = await goApp().GetHotkeySettings()
+    hk.value.tail_ms ??= 250
+    hkAvailable.value = await goApp().GetHotkeyAvailability()
+    // 可用性可能在首屏之后才确定（如等待系统权限）：hotkey:available 确定后推一次。
+    cancelHkAvail = eventsOn('hotkey:available', (d) => {
+      const p = d as { available?: boolean; reason?: string } | null
+      if (typeof p?.available === 'boolean') hkAvailable.value = p.available
+      hkReason.value = p?.reason ?? ''
+    })
+  } catch {
+    // 保持默认值（等价 Go 侧 DefaultSettings）；改动时 applyHotkey 会提示保存失败
+  }
   syncDenoiseIdx()
   const devs = await goApp().ListAudioDevices()
   caps.value = devs.capture
@@ -172,6 +190,9 @@ async function testMic() {
 onUnmounted(() => {
   cancelLevel?.()
   cancelLevel = null
+  stopRecord()
+  cancelHkAvail?.()
+  cancelHkAvail = null
   void levelBridge().StopLevelMonitor?.().catch(() => {})
 })
 
@@ -196,6 +217,113 @@ async function applyAudio() {
   } catch (e) {
     toast.value?.show(`语音设置保存失败：${e}`, true)
   }
+}
+
+// 全局热键（按键说话）：Go 侧返回已 Sanitize 的值；omitempty 字段在 UI 侧补默认。
+const hk = ref<HotkeySettings>({ enabled: false, mode: 0, tail_ms: 250, cue_sound: false })
+// 平台可用性：false 时明确告知「已退化为语音激活」，不是把控件灰掉了事。
+const hkAvailable = ref(true)
+const hkReason = ref('')
+// 说话模式三档（与 Go 侧 hotkey.Mode 对齐）：0 按住说话 / 1 语音激活 / 2 常开。
+const HK_MODE_LABELS = ['按住说话', '语音激活', '常开'] as const
+// 录制态：正在录制的动作 id（空串 = 未录制）。
+const recording = ref('')
+// 冲突组合：同一规范化组合被多个动作占用（UI 标红 + 禁止静默覆盖）。
+const hkConflicts = computed(() => findHotkeyConflicts(hk.value))
+let cancelHkAvail: (() => void) | null = null
+
+function setHkMode(i: number) {
+  hk.value.mode = (i >= 0 && i <= 2 ? i : 0) as HotkeySettings['mode']
+  void applyHotkey()
+}
+
+// applyHotkey 热保存：有冲突先提示且不落盘——两个动作绑同一组合时后写会静默
+// 顶掉前一个，用户看不出少了一个热键。
+async function applyHotkey() {
+  const conflicts = findHotkeyConflicts(hk.value)
+  if (conflicts.length) {
+    toast.value?.show(`热键冲突：${conflicts.map(bindingLabel).join('、')} 被多个动作占用`, true)
+    return
+  }
+  try {
+    await goApp().SetHotkeySettings({ ...hk.value })
+  } catch (e) {
+    toast.value?.show(`按键说话设置保存失败：${e}`, true)
+  }
+}
+
+function isConflict(id: HotkeyActionID): boolean {
+  const b = normalizeBinding(hk.value[id] ?? '')
+  return !!b && hkConflicts.value.includes(b)
+}
+
+function bindingText(id: HotkeyActionID): string {
+  return bindingLabel(hk.value[id]) || '未绑定'
+}
+
+// 录制态：挂 window 的 keydown / mouseup（capture）直到绑定成功、Esc 或窗口失焦。
+// mouseup 先于 click 派发，故在 click 处理器里同步挂监听收不到启动那一次点击；
+// recStartedAt 再兜一层：早于进入录制态的事件一律忽略。
+let recStartedAt = 0
+
+function startRecord(id: string) {
+  stopRecord()
+  recording.value = id
+  recStartedAt = performance.now()
+  window.addEventListener('keydown', onRecKey, true)
+  window.addEventListener('mouseup', onRecMouse, true)
+  // 录制态屏蔽系统右键菜单，否则绑定 mouse2 时会弹菜单
+  window.addEventListener('contextmenu', onRecCtx, true)
+  window.addEventListener('blur', onRecBlur)
+}
+
+function stopRecord() {
+  if (!recording.value) return
+  recording.value = ''
+  window.removeEventListener('keydown', onRecKey, true)
+  window.removeEventListener('mouseup', onRecMouse, true)
+  window.removeEventListener('contextmenu', onRecCtx, true)
+  window.removeEventListener('blur', onRecBlur)
+}
+
+function onRecBlur() {
+  stopRecord()
+}
+
+function onRecCtx(e: Event) {
+  e.preventDefault()
+}
+
+function onRecKey(e: KeyboardEvent) {
+  // Esc 取消优先于一切（含焦点在输入框内），否则输入框里退不出录制态
+  if (e.key === 'Escape') {
+    e.preventDefault()
+    stopRecord()
+    return
+  }
+  if (isTypingTarget(e.target)) return
+  const spec = bindingFromKeyEvent(e)
+  if (!spec) return // 纯修饰键 / 不可绑定键：继续等待
+  e.preventDefault()
+  // capture 阶段就拦断，避免应用内快捷键（useHotkeys 在冒泡阶段监听）被连带触发
+  e.stopPropagation()
+  bindRecording(spec)
+}
+
+function onRecMouse(e: MouseEvent) {
+  if (e.timeStamp < recStartedAt) return
+  const spec = bindingFromMouseEvent(e)
+  if (!spec) return
+  e.preventDefault()
+  bindRecording(spec)
+}
+
+function bindRecording(spec: string) {
+  const id = recording.value as HotkeyActionID
+  stopRecord()
+  if (!id) return
+  hk.value[id] = spec
+  void applyHotkey()
 }
 </script>
 
@@ -376,9 +504,54 @@ async function applyAudio() {
 
       <section class="s-sec">
         <h3>快捷键</h3>
+        <div class="s-sub">应用内</div>
         <div v-for="h in HOTKEYS" :key="h.id" class="s-row">
           <div class="k">{{ h.label }}</div><span class="v">{{ h.combo }}</span>
         </div>
+
+        <div class="s-sub">全局热键</div>
+        <div class="s-row">
+          <div class="k">启用全局热键</div>
+          <label class="switch">
+            <input v-model="hk.enabled" type="checkbox" @change="applyHotkey"><i />
+          </label>
+        </div>
+        <!-- 平台不支持时如实说明降级结果；控件保持可用，配置照常落盘 -->
+        <p v-if="!hkAvailable" class="s-note s-warn">
+          <CircleAlert :size="13" />当前平台不支持全局热键，已退化为语音激活<span v-if="hkReason">（{{ hkReason }}）</span>
+        </p>
+        <div class="s-row">
+          <div class="k">说话模式</div>
+          <div class="seg-mini">
+            <button v-for="(label, i) in HK_MODE_LABELS" :key="i"
+                    :class="{ on: hk.mode === i }"
+                    @click="setHkMode(i)">{{ label }}</button>
+          </div>
+        </div>
+        <!-- 尾包延迟只有按住说话有意义：松手后继续发包的缓冲窗，避免话音被切掉尾巴 -->
+        <div v-if="hk.mode === 0" class="s-row">
+          <div class="k">尾包延迟</div>
+          <input v-model.number="hk.tail_ms" type="range" min="0" max="1000" step="50" @change="applyHotkey">
+          <span class="v">{{ hk.tail_ms ?? 250 }} ms</span>
+        </div>
+        <div class="s-row">
+          <div class="k">按下提示音</div>
+          <label class="switch">
+            <input v-model="hk.cue_sound" type="checkbox" @change="applyHotkey"><i />
+          </label>
+        </div>
+        <div v-for="a in HOTKEY_ACTIONS" :key="a.id" class="s-row">
+          <div class="k" :class="{ bad: isConflict(a.id) }">{{ a.label }}</div>
+          <button class="mini-btn bind" :class="{ rec: recording === a.id, bad: isConflict(a.id) }"
+                  :title="recording === a.id ? '按 Esc 取消' : '点击后按下任意键绑定'"
+                  @click="recording === a.id ? stopRecord() : startRecord(a.id)">
+            <Keyboard :size="13" />
+            {{ recording === a.id ? '按下任意键…' : bindingText(a.id) }}
+          </button>
+        </div>
+        <p v-if="hkConflicts.length" class="s-note s-warn">
+          <CircleAlert :size="13" />{{ hkConflicts.map(bindingLabel).join('、') }} 被多个动作占用，请改绑其中一个
+        </p>
       </section>
 
       <section class="s-sec">
@@ -482,6 +655,28 @@ input[type="range"] { flex: 0 0 140px; accent-color: var(--brand-500); }
   margin: -4px 0 10px;
   font-size: 11px; color: var(--ink-300);
 }
+
+/* 分区内次级标签（应用内 / 全局热键） */
+.s-sub {
+  margin: 16px 0 8px;
+  font-size: 12px; font-weight: 600; color: var(--ink-400);
+}
+.s-sec h3 + .s-sub { margin-top: 0; }
+
+/* 降级 / 冲突提示：图标与文字同色，跟随小字排版 */
+.s-warn {
+  display: flex; align-items: center; gap: 6px;
+  color: var(--orange);
+}
+.s-warn svg { flex: none; }
+
+/* 冲突行：行名与按钮同时标红，避免只靠提示小字被忽略 */
+.bad { color: var(--red); }
+
+/* 录制态：实心主色，明确「正在等待按键」 */
+.mini-btn.rec { background: var(--brand-500); color: var(--surface); }
+/* 绑定按钮：等宽，四个动作的按钮对齐，录制态文字变长不跳版 */
+.mini-btn.bind { min-width: 116px; justify-content: center; }
 
 /* 设备测试小按钮：次级弱化的行内按钮，与下拉并排 */
 .mini-btn {
