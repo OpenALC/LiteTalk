@@ -144,6 +144,10 @@ func (s *Session) Connect(serverURL string) {
 		}
 		s.stopMedia()
 	}
+	// WS close 4001 / 握手 401 带 session_replaced 头：session.kicked 消息在
+	// 服务端发送窗口内可能丢帧，close code 是可靠的那一半。回调跑在 ws Run
+	// goroutine（会话 wg 内），app 侧 OnKicked 已异步化，此处直接调出口即可。
+	wsCfg.OnKicked = func(reason string) { s.handleKicked(reason) }
 	s.ws = signal.NewClient(wsCfg)
 	s.registerHandlers()
 
@@ -379,12 +383,11 @@ func (s *Session) registerHandlers() {
 	})
 	// session.kicked：同类设备在其他设备登录，服务端踢本连接（契约 §0.5）。
 	// 断开与清令牌在 app 层 OnKicked 完成，此处只上报原因。
-	// 字面量对齐契约消息类型；signal/protocol.go 补 TypeSessionKicked 后可换常量。
-	s.ws.On("session.kicked", func(env signal.Envelope) {
-		var d struct {
-			Reason string `json:"reason"`
-		}
-		reason := "login_elsewhere"
+	// 消息本身「尽力而为」（发送窗口内丢帧即无踪），WS close 4001 与握手
+	// 401 的 session_replaced 头是兜底，见 wsCfg.OnKicked。
+	s.ws.On(signal.TypeSessionKicked, func(env signal.Envelope) {
+		var d signal.SessionKickedData
+		reason := signal.KickReasonLoginElsewhere
 		if env.Decode(&d) == nil && d.Reason != "" {
 			reason = d.Reason
 		}
@@ -392,8 +395,8 @@ func (s *Session) registerHandlers() {
 	})
 }
 
-// handleKicked 上报被踢原因（session.kicked 消息的统一出口，后续 WS 4001
-// 错误映射也走这里）。
+// handleKicked 上报被踢原因（session.kicked 消息、WS close 4001、握手 401 的
+// session_replaced/session_replaced 头，三条路径的统一出口）。
 func (s *Session) handleKicked(reason string) {
 	if s.ev.OnKicked != nil {
 		s.ev.OnKicked(reason)

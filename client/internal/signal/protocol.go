@@ -7,6 +7,8 @@ package signal
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 // nowMillis 当前 Unix 毫秒（信封 ts）。
@@ -36,6 +38,20 @@ const (
 	TypeSessionKicked     = "session.kicked"      // S→C 同类设备新登录踢线，随后 close 4001
 	TypeSessionVoiceTaken = "session.voice_taken" // S→C 同账号另一会话抢占语音，本端本地退房
 )
+
+// WS close code（契约 §0.6，4000~4999 为应用自定义区间；与
+// server/internal/signal/protocol.go 逐字同步）。
+const (
+	// CloseCodeSessionReplaced 4000：同会话（同 sid）半开连接被新连接替换——
+	// 静默关闭，不发 session.kicked（客户端停止重连，服务端已有新连接）。
+	CloseCodeSessionReplaced = websocket.StatusCode(4000)
+	// CloseCodeNewLogin 4001：同类设备新登录（或登出/重置密码踢线）——
+	// 旧连接先收 session.kicked，300~500ms 发送窗口后以此码关闭。
+	CloseCodeNewLogin = websocket.StatusCode(4001)
+)
+
+// KickReasonLoginElsewhere session.kicked.reason 的标准取值（同类设备新登录）。
+const KickReasonLoginElsewhere = "login_elsewhere"
 
 // 下行 error 消息的 code 取值（与 server/internal/signal/protocol.go 对齐）。
 const (

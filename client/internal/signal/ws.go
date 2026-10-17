@@ -22,6 +22,11 @@ var ErrNotConnected = errors.New("signal: not connected")
 // ErrAuthFatal 鉴权失败（HTTP 401/403），Run 直接返回，不再重连。
 var ErrAuthFatal = errors.New("signal: authentication failed")
 
+// ErrSilentReplace 同 sid 的半开连接被服务端的新连接替换（WS close 4000，
+// 契约 §0.6）。服务端那条新连接已经跑起来，本端重连只会把它再顶掉、互相踢，
+// 因此 Run 直接返回，由上层决定后续（通常是跟着一次新的登录流程）。
+var ErrSilentReplace = errors.New("signal: connection replaced by a newer session")
+
 // Handler 信令消息处理器。在读循环 goroutine 上同步调用，必须快速、不阻塞。
 type Handler func(Envelope)
 
@@ -43,6 +48,12 @@ type Config struct {
 	OnConnect func(c *Client)
 	// OnDisconnect 连接断开（准备重连或退出）时回调。
 	OnDisconnect func(err error)
+	// OnKicked 被服务端踢下线时回调（契约 §0.5/§0.6）。session.kicked 消息
+	// 是「尽力而为」，发送窗口内丢帧就什么都不剩，因此 close 4001 与握手 401
+	// 的 session_replaced/session_replayed 头是可靠的那一半——本回调就是兜底。
+	// reason 约定值见 KickReasonLoginElsewhere。在 Run 的 goroutine 上同步调用，
+	// 实现侧不得同步 Close 本客户端（Close 会等 Run 退出，自成死锁）。
+	OnKicked func(reason string)
 	// Logger 为 nil 时静默。
 	Logger *log.Logger
 }
@@ -155,7 +166,8 @@ func (c *Client) Close() {
 }
 
 // Run 连接并维持信令会话：断线指数退避自动重连，直到 ctx 取消、
-// Close 或鉴权失败（ErrAuthFatal）。其余错误只会触发重连，不会返回。
+// Close、鉴权失败（ErrAuthFatal）或被新会话替换（ErrSilentReplace）。
+// 其余错误只会触发重连，不会返回。
 func (c *Client) Run(ctx context.Context) error {
 	backoff := c.cfg.ReconnectMin
 	for {
@@ -178,6 +190,13 @@ func (c *Client) Run(ctx context.Context) error {
 		cancel()
 		if err != nil {
 			if isAuthFailure(resp) {
+				// 被踢类 401（session_replaced/session_replayed）必须先走被踢链路：
+				// 只打日志返 ErrAuthFatal 的话，用户看到的只是「登录后一片空白」。
+				if reason := kickedFromHeader(resp); reason != "" {
+					c.logf("auth rejected: %s (HTTP %d)", reason, resp.StatusCode)
+					c.fireKicked(reason)
+					return ErrAuthFatal
+				}
 				c.logf("auth failed (HTTP %d), giving up", resp.StatusCode)
 				return ErrAuthFatal
 			}
@@ -198,6 +217,17 @@ func (c *Client) Run(ctx context.Context) error {
 		if c.closed.Load() || ctx.Err() != nil {
 			return nil
 		}
+		// close code 只在连接自然断开时判定：Close/取消 ctx 会带上
+		// StatusNormalClosure 或 StatusAbnormalClosure，掺和进来会误判。
+		if code := websocket.CloseStatus(err); code != -1 {
+			switch code {
+			case CloseCodeNewLogin:
+				c.fireKicked(KickReasonLoginElsewhere)
+			case CloseCodeSessionReplaced:
+				c.logf("close %d: same-session connection replaced, not reconnecting", code)
+				return ErrSilentReplace
+			}
+		}
 		if c.cfg.OnDisconnect != nil {
 			c.cfg.OnDisconnect(err)
 		}
@@ -206,6 +236,13 @@ func (c *Client) Run(ctx context.Context) error {
 			return nil
 		}
 		backoff = nextBackoff(backoff, c.cfg.ReconnectMax)
+	}
+}
+
+// fireKicked 触发 OnKicked（未注册时空转）。
+func (c *Client) fireKicked(reason string) {
+	if c.cfg.OnKicked != nil {
+		c.cfg.OnKicked(reason)
 	}
 }
 
@@ -321,6 +358,25 @@ func (c *Client) wsURL(ctx context.Context) (string, error) {
 
 func (c *Client) logf(format string, args ...any) {
 	c.log.Printf("signal: "+format, args...)
+}
+
+// authHeader 鉴权失败原因响应头：握手 401 与 REST 401 都会带上
+// （服务端 signal/hub.go 与 api/router.go 写入）。客户端据此区分
+// 「该静默刷新令牌」（token_expired）与「本端已被踢」（session_replaced/
+// session_replayed）——后者必须走被踢链路，否则用户看到的是静默的登录失败。
+const authHeader = "X-LiteTalk-Auth"
+
+// kickedFromHeader 从 401 响应解析被踢原因；非被踢类（token_expired、缺头）
+// 返回空串，由调用方按普通鉴权失败处理。
+func kickedFromHeader(resp *http.Response) string {
+	if resp == nil {
+		return ""
+	}
+	switch resp.Header.Get(authHeader) {
+	case "session_replaced", "session_replayed":
+		return KickReasonLoginElsewhere
+	}
+	return ""
 }
 
 // isAuthFailure 通过 Dial 返回的 HTTP 响应判断鉴权失败（401/403）。

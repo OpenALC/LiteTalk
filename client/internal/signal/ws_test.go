@@ -3,6 +3,7 @@ package signal
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -24,6 +25,13 @@ type stubServer struct {
 	tokens   []string    // 每次拨号携带的 token（校验 TokenFunc 每次拨号调用）
 	dropOnce atomic.Bool // 首条连接收到首条业务消息后异常断开（测重连）
 
+	// closeWith 一次性 close code：非 0 时首条连接下发 hello 后以该码关闭
+	// （测 4001 被踢 / 4000 静默替换）。Swap(0) 取用即清，只作用一次。
+	closeWith atomic.Int32
+	// rejectWith 非空时握手直接 401，并带 X-LiteTalk-Auth: <值> 响应头
+	// （测被踢类鉴权失败与 token_expired 的区分）。
+	rejectWith atomic.Value // string
+
 	received chan Envelope
 }
 
@@ -33,6 +41,12 @@ func newStubServer(t *testing.T) *stubServer {
 	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tok := r.URL.Query().Get("token")
 		if !strings.HasPrefix(tok, "dev-") {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		// 握手即拒：带 X-LiteTalk-Auth 头（测被踢类 401）。
+		if v, _ := s.rejectWith.Load().(string); v != "" {
+			w.Header().Set(authHeader, v)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -57,6 +71,11 @@ func newStubServer(t *testing.T) *stubServer {
 		// 鉴权成功：先下发 hello。
 		hello, _ := json.Marshal(Envelope{Type: TypeHello, Data: json.RawMessage(`{"user":{"user_id":"` + tok + `"}}`), TS: 1})
 		if err := conn.Write(r.Context(), websocket.MessageText, hello); err != nil {
+			return
+		}
+		// 一次性 close：首条连接下发 hello 后以指定 code 关闭（踢线/静默替换）。
+		if code := s.closeWith.Swap(0); code != 0 && connIdx == 1 {
+			_ = conn.Close(websocket.StatusCode(code), "test close")
 			return
 		}
 		firstMsg := true
@@ -195,6 +214,105 @@ func TestWSAuthFailure(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after 401")
+	}
+}
+
+// TestWSHandshake401KickedHeader 握手 401 的 X-LiteTalk-Auth 头区分两类失败：
+// session_replaced/session_replayed = 本端已被踢，必须走被踢链路（此前只打日志，
+// 用户看到的是静默的登录失败）；token_expired = REST 侧刷新已处理，不惊动用户。
+func TestWSHandshake401KickedHeader(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		header   string
+		wantKick bool
+	}{
+		{"session_replaced 走被踢", "session_replaced", true},
+		{"session_replayed 走被踢", "session_replayed", true},
+		{"token_expired 不惊动用户", "token_expired", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := newStubServer(t)
+			stub.rejectWith.Store(tc.header)
+			c := NewClient(testConfig(stub.wsURL(), "dev-alice"))
+			defer c.Close()
+
+			kicked := make(chan string, 1)
+			c.cfg.OnKicked = func(reason string) { kicked <- reason }
+			done := make(chan error, 1)
+			go func() { done <- c.Run(context.Background()) }()
+
+			select {
+			case err := <-done:
+				if err != ErrAuthFatal {
+					t.Fatalf("Run err = %v, want ErrAuthFatal", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Run did not return after 401")
+			}
+			select {
+			case got := <-kicked:
+				if !tc.wantKick {
+					t.Fatalf("header %q 不应触发被踢，却收到 reason=%q", tc.header, got)
+				}
+				if got != KickReasonLoginElsewhere {
+					t.Fatalf("kicked reason = %q, want %q", got, KickReasonLoginElsewhere)
+				}
+			default:
+				if tc.wantKick {
+					t.Fatalf("header %q 应触发被踢，OnKicked 未调用", tc.header)
+				}
+			}
+		})
+	}
+}
+
+// TestWSClose4001Kicked session.kicked 消息在服务端发送窗口内丢帧就什么都不剩，
+// close 4001 是可靠的那一半：必须补走被踢链路。
+func TestWSClose4001Kicked(t *testing.T) {
+	stub := newStubServer(t)
+	stub.closeWith.Store(4001)
+	c := NewClient(testConfig(stub.wsURL(), "dev-alice"))
+	defer c.Close()
+
+	kicked := make(chan string, 4)
+	c.cfg.OnKicked = func(reason string) { kicked <- reason }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+
+	select {
+	case got := <-kicked:
+		if got != KickReasonLoginElsewhere {
+			t.Fatalf("kicked reason = %q, want %q", got, KickReasonLoginElsewhere)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no OnKicked after close 4001")
+	}
+}
+
+// TestWSClose4000SilentReplace close 4000 = 同 sid 半开连接被新连接替换，
+// 服务端已有新连接在跑：Run 必须直接返回 ErrSilentReplace 且绝不重连
+// （重连只会把新连接再顶掉，互相踢）。
+func TestWSClose4000SilentReplace(t *testing.T) {
+	stub := newStubServer(t)
+	stub.closeWith.Store(4000)
+	c := NewClient(testConfig(stub.wsURL(), "dev-bob"))
+	defer c.Close()
+
+	done := make(chan error, 1)
+	go func() { done <- c.Run(context.Background()) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrSilentReplace) {
+			t.Fatalf("Run err = %v, want ErrSilentReplace", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after close 4000")
+	}
+	// 退避窗口足以重连好几次：稳态后服务端仍只应见到一条连接。
+	time.Sleep(300 * time.Millisecond)
+	if n := stub.connCount(); n != 1 {
+		t.Fatalf("connCount = %d, want 1 (silent replace must not reconnect)", n)
 	}
 }
 
