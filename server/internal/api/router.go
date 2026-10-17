@@ -246,8 +246,8 @@ func writeErr(w http.ResponseWriter, status int, code, msg string) {
 	writeJSON(w, status, apiError{Code: code, Message: msg})
 }
 
-// writeStoreErr 把 store 领域错误映射为 HTTP。
-func writeStoreErr(w http.ResponseWriter, err error) {
+// writeStoreErr 把 store 领域错误映射为 HTTP。500 时记录底层错误与请求路径（§0.1.3）。
+func (s *Server) writeStoreErr(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "not_found", "资源不存在")
@@ -256,6 +256,11 @@ func writeStoreErr(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrForbidden):
 		writeErr(w, http.StatusForbidden, "forbidden", "无权操作")
 	default:
+		path := ""
+		if r != nil && r.URL != nil {
+			path = r.URL.Path
+		}
+		s.log.Printf("[500] %s: %v", path, err)
 		writeErr(w, http.StatusInternalServerError, "internal", "服务器内部错误")
 	}
 }

@@ -140,7 +140,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	hash, err := auth.HashPassword(req.Password)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 
@@ -167,7 +167,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		break
 	}
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	s.issueTokens(w, r, user, dev, http.StatusCreated)
@@ -217,7 +217,7 @@ func (s *Server) handleGuest(w http.ResponseWriter, r *http.Request) {
 		break
 	}
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	s.log.Printf("[audit] guest created user=%d ip=%s", user.ID, s.clientIP(r))
@@ -308,12 +308,12 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	}
 	user, err := s.store.UserByID(r.Context(), uid)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	access, err := s.jwt.SignAccess(user.ID, user.Nickname, user.Tag, sid, dev)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, tokenPair{
@@ -400,7 +400,7 @@ func (s *Server) handleEmailCode(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusTooManyRequests, "daily_limit", "今日发送次数已达上限")
 		return
 	case err != nil:
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	if err := s.mailer.SendCode(req.Email, req.Purpose, code); err != nil {
@@ -445,12 +445,12 @@ func (s *Server) handlePasswordReset(w http.ResponseWriter, r *http.Request) {
 	}
 	hash, err := auth.HashPassword(req.Password)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	user.PasswordHash = hash
 	if err := s.store.UpdateUser(r.Context(), user); err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	// 重置后吊销全部刷新令牌。
@@ -484,12 +484,12 @@ func (s *Server) issueTokens(w http.ResponseWriter, r *http.Request, user *store
 	}
 	access, err := s.jwt.SignAccess(user.ID, user.Nickname, user.Tag, sid, dev)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	refresh, err := s.refresh.IssueWithUID(r.Context(), user.ID, dev, sid)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	writeJSON(w, status, tokenPair{

@@ -11,7 +11,7 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	c := currentUser(r)
 	user, err := s.store.UserByID(r.Context(), c.UserID)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, user)
@@ -30,7 +30,7 @@ func (s *Server) handlePatchMe(w http.ResponseWriter, r *http.Request) {
 	}
 	user, err := s.store.UserByID(r.Context(), c.UserID)
 	if err != nil {
-		writeStoreErr(w, err)
+		s.writeStoreErr(w, r, err)
 		return
 	}
 	if req.Nickname != nil {
@@ -48,7 +48,7 @@ func (s *Server) handlePatchMe(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 				if err != store.ErrConflict {
-					writeStoreErr(w, err)
+					s.writeStoreErr(w, r, err)
 					return
 				}
 			}
