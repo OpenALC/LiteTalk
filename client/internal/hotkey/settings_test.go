@@ -2,6 +2,8 @@ package hotkey
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -111,14 +113,40 @@ func TestSettingsJSONTags(t *testing.T) {
 		t.Errorf("反序列化结果不符：%+v", s)
 	}
 
-	// omitempty：空绑定/零尾包/关提示音都不该出现在 json 里
+	// 绑定与提示音仍是 omitempty，零值不出现；tail_ms 则恒出现（见下）
 	out, err := json.Marshal(Settings{Enabled: true, Mode: ModePTT})
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = `{"enabled":true,"mode":0}`
+	const want = `{"enabled":true,"mode":0,"tail_ms":0}`
 	if string(out) != want {
 		t.Errorf("Marshal = %s，期望 %s", out, want)
+	}
+}
+
+// TestSettingsTailMSAlwaysSerialized 锁住 tail_ms 不带 omitempty。
+// 「section 未配置」由外层 *Settings 的 nil 表达；section 一旦存在，该字段
+// 必须显式出现，否则用户主动设的 0（不要尾包）与「没写」不可区分，
+// 老配置会被误读成没有尾包窗。
+func TestSettingsTailMSAlwaysSerialized(t *testing.T) {
+	for _, tail := range []int{0, 1, 250, 1000} {
+		out, err := json.Marshal(Settings{Enabled: true, TailMS: tail})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(out), fmt.Sprintf(`"tail_ms":%d`, tail)) {
+			t.Errorf("TailMS=%d 应显式序列化，实际 %s", tail, out)
+		}
+		var back Settings
+		if err := json.Unmarshal(out, &back); err != nil {
+			t.Fatal(err)
+		}
+		if back.TailMS != tail {
+			t.Errorf("TailMS=%d 往返后变成 %d", tail, back.TailMS)
+		}
+		if back.Sanitize().TailMS != tail {
+			t.Errorf("TailMS=%d 被 Sanitize 改掉", tail)
+		}
 	}
 }
 

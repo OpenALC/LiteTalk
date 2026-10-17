@@ -199,14 +199,17 @@ func isKeyToken(tok string) bool {
 
 // Settings 持久化配置（json tag snake_case，与前端 types.ts 逐字对齐）。
 type Settings struct {
-	Enabled  bool   `json:"enabled"`
-	Mode     Mode   `json:"mode"`
-	PTT      string `json:"ptt,omitempty"`
-	Mute     string `json:"mute,omitempty"`
-	Deafen   string `json:"deafen,omitempty"`
-	Dual     string `json:"dual,omitempty"`
-	TailMS   int    `json:"tail_ms,omitempty"`
-	CueSound bool   `json:"cue_sound,omitempty"`
+	Enabled bool   `json:"enabled"`
+	Mode    Mode   `json:"mode"`
+	PTT     string `json:"ptt,omitempty"`
+	Mute    string `json:"mute,omitempty"`
+	Deafen  string `json:"deafen,omitempty"`
+	Dual    string `json:"dual,omitempty"`
+	// TailMS 刻意不加 omitempty：整个 section 的「未配置」已由外层 *Settings 的
+	// nil 表达，section 一旦存在，tail_ms 就必须显式出现，否则 0（用户主动关尾包）
+	// 与「没写这个字段」不可区分。测试见 TestSettingsTailMSAlwaysSerialized。
+	TailMS   int  `json:"tail_ms"`
+	CueSound bool `json:"cue_sound,omitempty"`
 }
 
 // DefaultTailMS 尾包窗默认 250ms：松键后补一小段话音，避免末字被硬切。
