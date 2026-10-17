@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/OpenALC/LiteTalk/client/internal/hotkey"
 )
 
 // Defaults 默认服务器地址（本机开发）。
@@ -38,16 +40,17 @@ const (
 
 // Config config.json 的持久化结构。
 type Config struct {
-	ServerBase          string         `json:"server_base,omitempty"`           // 服务端基址，如 https://example.com
-	HibernateOnMinimize *bool          `json:"hibernate_on_minimize,omitempty"` // 最小化时休眠界面（旧版布尔，已由 HibernateMode 取代，保留读取做迁移）
-	HibernateMode       string         `json:"hibernate_mode,omitempty"`        // 休眠模式：off 不休眠 / hibernate 卸载业务组件 / destroy 整页重载（默认 off）
-	CloseToTray         *bool          `json:"close_to_tray,omitempty"`         // 关闭窗口时最小化到托盘（默认 true；false=退出程序）
-	SavedEmail          string         `json:"saved_email,omitempty"`           // 记住的登录邮箱
-	EncPassword         string         `json:"enc_password,omitempty"`          // 记住的密码（DPAPI 密文 base64；非 Windows 恒空）
-	EncGuestRefresh     string         `json:"enc_guest_refresh,omitempty"`     // 记住的游客 refresh_token（Windows DPAPI 密文 / Linux base64+0600 降级；其余平台恒空）
-	Audio               *AudioSettings `json:"audio,omitempty"`                 // 语音设置（码率/VBR/DTX/FEC/丢包率/降噪/增益/VAD 灵敏度）
-	AudioCapture        string         `json:"audio_capture,omitempty"`         // 采集设备 ID（空=默认）
-	AudioPlayback       string         `json:"audio_playback,omitempty"`        // 播放设备 ID（空=默认）
+	ServerBase          string           `json:"server_base,omitempty"`           // 服务端基址，如 https://example.com
+	HibernateOnMinimize *bool            `json:"hibernate_on_minimize,omitempty"` // 最小化时休眠界面（旧版布尔，已由 HibernateMode 取代，保留读取做迁移）
+	HibernateMode       string           `json:"hibernate_mode,omitempty"`        // 休眠模式：off 不休眠 / hibernate 卸载业务组件 / destroy 整页重载（默认 off）
+	CloseToTray         *bool            `json:"close_to_tray,omitempty"`         // 关闭窗口时最小化到托盘（默认 true；false=退出程序）
+	SavedEmail          string           `json:"saved_email,omitempty"`           // 记住的登录邮箱
+	EncPassword         string           `json:"enc_password,omitempty"`          // 记住的密码（DPAPI 密文 base64；非 Windows 恒空）
+	EncGuestRefresh     string           `json:"enc_guest_refresh,omitempty"`     // 记住的游客 refresh_token（Windows DPAPI 密文 / Linux base64+0600 降级；其余平台恒空）
+	Audio               *AudioSettings   `json:"audio,omitempty"`                 // 语音设置（码率/VBR/DTX/FEC/丢包率/降噪/增益/VAD 灵敏度）
+	AudioCapture        string           `json:"audio_capture,omitempty"`         // 采集设备 ID（空=默认）
+	AudioPlayback       string           `json:"audio_playback,omitempty"`        // 播放设备 ID（空=默认）
+	Hotkeys             *hotkey.Settings `json:"hotkeys,omitempty"`               // 全局热键与按键说话（v1.2.0；默认关闭，见 hotkey 包）
 	// v0.1.2：界面销毁休眠/首页服务器/介绍页隐藏（客户端级偏好，无需服务端）。
 	UIDestroyOnHibernate *bool  `json:"ui_destroy_on_hibernate,omitempty"` // 休眠时 WindowReloadApp 卸载界面（默认 false）
 	HomeServerID         string `json:"home_server_id,omitempty"`          // 首页服务器 id（空 = 介绍页 __intro__）
@@ -191,6 +194,36 @@ func (m *Manager) GetAudioSettings() AudioSettings {
 func (m *Manager) SetAudioSettings(s AudioSettings) error {
 	return m.Update(func(c *Config) error {
 		c.Audio = &s
+		return nil
+	})
+}
+
+// ---------- 全局热键与按键说话（v1.2.0） ----------
+
+// HotkeySettings 热键设置别名：app.go 绑定方法与文档统一用它，字段/json tag
+// 只在 hotkey 包定义一份（再抄一份就是两处真相，日后增删键位必然只改一边）。
+type HotkeySettings = hotkey.Settings
+
+// DefaultHotkeySettings 出厂值：默认关闭（全局钩子侵入性强）、PTT 模式、
+// 无绑定、尾包 250ms。
+func DefaultHotkeySettings() hotkey.Settings { return hotkey.DefaultSettings() }
+
+// GetHotkeySettings 读路径：未配置回落默认；已配置经 Sanitize 收敛
+// （模式越界→PTT、尾包夹到 [0,1000]、非法绑定按未绑定清空）。
+// tail_ms 无 omitempty，不需要"0 补默认"的特例——0 是用户主动关尾包。
+func (m *Manager) GetHotkeySettings() hotkey.Settings {
+	c := m.Get()
+	if c.Hotkeys == nil {
+		return DefaultHotkeySettings()
+	}
+	return c.Hotkeys.Sanitize()
+}
+
+// SetHotkeySettings 持久化热键设置（调用方传完整值；非法值校验在 app 层，
+// 读路径的 Sanitize 只兜手改 config.json 的情况）。
+func (m *Manager) SetHotkeySettings(s hotkey.Settings) error {
+	return m.Update(func(c *Config) error {
+		c.Hotkeys = &s
 		return nil
 	})
 }

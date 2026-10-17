@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/OpenALC/LiteTalk/client/internal/hotkey"
 )
 
 func tmpManager(t *testing.T) *Manager {
@@ -129,6 +131,58 @@ func TestAudioSettingsLegacy(t *testing.T) {
 	m3 := NewWithPath(path)
 	if v := *m3.GetAudioSettings().VADSens; v != 1 {
 		t.Fatalf("新刻度 1 不应被旧映射改写，实际 %d", v)
+	}
+}
+
+// TestHotkeySettings 全局热键设置三段式：默认回落 / 自定义往返（新实例重读盘）/
+// 读路径越界收敛（手改 config.json）。
+func TestHotkeySettings(t *testing.T) {
+	m := tmpManager(t)
+
+	// 未配置：回落出厂值（默认关闭、PTT 模式、无绑定、尾包 250ms）。
+	d := m.GetHotkeySettings()
+	if d.Enabled || d.Mode != hotkey.ModePTT || d.TailMS != hotkey.DefaultTailMS ||
+		d.PTT != "" || d.Mute != "" || d.Deafen != "" || d.Dual != "" || d.CueSound {
+		t.Fatalf("默认热键设置异常: %+v", d)
+	}
+	if DefaultHotkeySettings() != d {
+		t.Fatalf("DefaultHotkeySettings 与读路径不一致: %+v vs %+v", DefaultHotkeySettings(), d)
+	}
+
+	// 自定义值往返。tail_ms=0 必须能往返：该字段没有 omitempty，0 是用户主动
+	// 关尾包，不是"没写这个字段"。
+	custom := hotkey.Settings{
+		Enabled: true, Mode: hotkey.ModeVoice,
+		PTT: "ctrl+shift+m", Mute: "mouse4", Deafen: "f13", Dual: "ctrl+alt+mouse5",
+		TailMS: 0, CueSound: true,
+	}
+	if err := m.SetHotkeySettings(custom); err != nil {
+		t.Fatalf("SetHotkeySettings: %v", err)
+	}
+	m2 := NewWithPath(m.Path())
+	got := m2.GetHotkeySettings()
+	if got != custom {
+		t.Fatalf("热键设置未按原样持久化: got %+v want %+v", got, custom)
+	}
+
+	// 读路径收敛：手改 config.json 的越界值（模式越界→PTT、尾包夹到 [0,1000]、
+	// 非法绑定按未绑定清空）。
+	if err := m.Update(func(c *Config) error {
+		c.Hotkeys = &hotkey.Settings{
+			Enabled: true, Mode: hotkey.Mode(9),
+			PTT: "ctrl+ctrl+m", Mute: "boguskey", Deafen: "", Dual: "shift",
+			TailMS: 5000,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("注入越界值: %v", err)
+	}
+	got = m.GetHotkeySettings()
+	if got.Mode != hotkey.ModePTT || got.TailMS != 1000 {
+		t.Fatalf("越界值未收敛: %+v", got)
+	}
+	if got.PTT != "" || got.Mute != "" || got.Dual != "" {
+		t.Fatalf("非法绑定应被清空: %+v", got)
 	}
 }
 
