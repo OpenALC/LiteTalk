@@ -353,13 +353,62 @@ export const useServersStore = defineStore('servers', () => {
     }
   }
 
+  // renameCategory 重命名分类：真实服务器走 PATCH；内置示例仅本地（重启还原）。
+  // 本地同步分类名与其下频道的 group——Channel.group 是分类名，按名归组的过渡方案
+  // 必须改名即同步，否则归组失联（同名分类仍会合并显示，见 groupsOf 注释）。
+  // 未分类/内置自带组（chan: id）只改本地标签，重启后还原。
+  async function renameCategory(serverId: string, catId: string, name: string) {
+    const s = findServer(serverId)
+    if (!s) return
+    const list = extraGroups.value[serverId] ?? []
+    const g = list.find((x) => x.id === catId)
+    const old = g ? g.name : catId.startsWith('chan:') ? catId.slice(5) : ''
+    if (!old) return
+    if (!s.builtin && isRealID(catId)) {
+      await goApp().RenameCategory(Number(catId), name)
+    }
+    if (g) {
+      extraGroups.value = {
+        ...extraGroups.value,
+        [serverId]: list.map((x) => (x.id === catId ? { ...x, name } : x)),
+      }
+    }
+    s.channels = s.channels.map((c) => (c.group === old ? { ...c, group: name } : c))
+  }
+
+  // reorderCategory 把分类移到目标序（0-based，相对 extraGroups 列表）：乐观改本地
+  // 顺序与 position，落盘 PATCH（position = 最终序）；失败回滚快照并抛给 UI。
+  // 内置示例/本地分类只改本地状态。
+  async function reorderCategory(serverId: string, catId: string, position: number) {
+    const prev = (extraGroups.value[serverId] ?? []).map((g) => ({ ...g }))
+    const from = prev.findIndex((g) => g.id === catId)
+    if (from < 0) return
+    const list = [...prev]
+    const [moved] = list.splice(from, 1)
+    const to = Math.max(0, Math.min(position, list.length))
+    if (from === to) return
+    list.splice(to, 0, moved)
+    extraGroups.value = {
+      ...extraGroups.value,
+      [serverId]: list.map((g, i) => ({ ...g, position: i })),
+    }
+    const s = findServer(serverId)
+    if (!s || s.builtin || !isRealID(catId)) return
+    try {
+      await goApp().UpdateCategory(Number(catId), '', to)
+    } catch (e) {
+      extraGroups.value = { ...extraGroups.value, [serverId]: prev }
+      throw e
+    }
+  }
+
   return {
     servers, currentServerId, currentChannelId, currentServer, currentChannel,
     homeId, introHidden, initHome, setHome, setIntroHidden,
     selectServer, selectChannel, findServer,
     loadRemoteServers, createServer, joinServer, renameServer, removeServer,
     createChannel, renameChannel, deleteChannel,
-    extraGroups, groupsOf, createCategory, deleteCategory,
+    extraGroups, groupsOf, createCategory, deleteCategory, renameCategory, reorderCategory,
   }
 })
 

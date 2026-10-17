@@ -65,6 +65,9 @@ type GoApp = {
   DeleteChannel(id: number): Promise<void>
   CreateCategory(serverID: number, name: string): Promise<CategoryDTO>
   DeleteCategory(id: number, withChannels: boolean): Promise<void>
+  // 分类改名/排序（PATCH /categories/{id}）：name 空串 = 不改名，position < 0 = 不改位置。
+  RenameCategory(id: number, name: string): Promise<void>
+  UpdateCategory(id: number, name: string, position: number): Promise<CategoryDTO>
   SendFriendRequest(target: string): Promise<void>
   // 好友真实 REST（v0.1.2 批次③消费）
   ListFriends(): Promise<FriendDTO[]>
@@ -201,6 +204,10 @@ const mockApp: GoApp = {
     return { id: Date.now(), server_id: serverID, name, position: 0 }
   },
   async DeleteCategory() {},
+  async RenameCategory() {},
+  async UpdateCategory(id: number, name: string, position: number) {
+    return { id, server_id: 0, name: name || `分类${id}`, position: position < 0 ? 0 : position }
+  },
   async SendFriendRequest() {},
   // 好友真实 REST 桩：空列表（浏览器开发环境无可联调数据）。
   async ListFriends() { return [] },
