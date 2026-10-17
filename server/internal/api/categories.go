@@ -85,3 +85,59 @@ func (s *Server) handleDeleteCategory(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
+
+type patchCategoryReq struct {
+	Name     *string `json:"name"`
+	Position *int    `json:"position"`
+}
+
+// handlePatchCategory PATCH /api/v1/categories/{id}（owner/admin，0.1.2）。
+// name/position 都可选但至少给一个；position 为目标序（0-based），服务端把该分类
+// 移到此位置并重排同服务器其它分类为 0..n-1（相对顺序保持）。分类名复用
+// validCategoryName（与 POST 同一口径），不单独收紧。
+func (s *Server) handlePatchCategory(w http.ResponseWriter, r *http.Request) {
+	c := currentUser(r)
+	id, ok := pathID(w, r, "id")
+	if !ok {
+		return
+	}
+	cat, err := s.store.CategoryByID(r.Context(), id)
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	// 权限按「分类所属服务器」的 owner/admin 判定：成员只读，不够改。
+	if !s.requireRole(w, r, cat.ServerID, c.UserID, store.RoleAdmin) {
+		return
+	}
+	var req patchCategoryReq
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Name == nil && req.Position == nil {
+		writeErr(w, http.StatusBadRequest, "bad_request", "name 与 position 至少给一个")
+		return
+	}
+	if req.Name != nil {
+		if !validCategoryName(*req.Name) {
+			writeErr(w, http.StatusBadRequest, "bad_name", "分类名需为 1–32 个字符")
+			return
+		}
+		cat.Name = *req.Name
+		if err := s.store.UpdateCategory(r.Context(), cat); err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+	}
+	if req.Position != nil {
+		if err := s.store.ReorderCategories(r.Context(), cat.ServerID, id, *req.Position); err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		// 重排后重新读回，响应里的 position 是最终序号。
+		if updated, err := s.store.CategoryByID(r.Context(), id); err == nil {
+			cat = updated
+		}
+	}
+	writeJSON(w, http.StatusOK, cat)
+}
