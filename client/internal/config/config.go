@@ -555,29 +555,29 @@ func (m *Manager) ClearSavedCredentials() error {
 
 // ---------- 记住游客身份（refresh_token 轮换维持同一游客） ----------
 
+// 机密存储模式（sys:secret 事件的 mode 取值，见契约 §0.6）：
+// keyring = Secret Service（Linux 优先）；file = 0600 文件弱保护（Linux 回落）；
+// dpapi = Windows DPAPI。
+const (
+	SecretModeKeyring = "keyring"
+	SecretModeFile    = "file"
+	SecretModeDPAPI   = "dpapi"
+)
+
+// SecretMode 当前机密存储模式（平台相关，见 secret_*.go）。UI 据此提示降级。
+func SecretMode() string { return secretMode() }
+
 // GetGuestRefresh 读取记住的游客 refresh_token（平台保护后解密/解码）。
 // 解密失败/不支持的平台返回空（视为无记住的游客）。
 func (m *Manager) GetGuestRefresh() string {
-	enc := m.Get().EncGuestRefresh
-	if enc == "" {
-		return ""
-	}
-	if plain, err := unprotectString(enc); err == nil {
-		return plain
-	}
-	return ""
+	return guestTokenGet(m.Get().EncGuestRefresh)
 }
 
 // SetGuestRefresh 保存游客 refresh_token（平台保护后落盘）。
 // 传空串清除。保护失败（不支持的 platform）不保存——游客没有密码兜底，
 // 存不了就下次新建，绝不明文落盘。
 func (m *Manager) SetGuestRefresh(token string) error {
-	enc := ""
-	if token != "" {
-		if s, err := protectString(token); err == nil {
-			enc = s
-		}
-	}
+	enc := guestTokenPut(token)
 	return m.Update(func(c *Config) error {
 		c.EncGuestRefresh = enc
 		return nil
