@@ -100,7 +100,7 @@ function onCtxSelect(key: string) {
   const m = c.member
   switch (key) {
     case 'add-friend':
-      addTarget.value = m.nickname
+      addTarget.value = m.tag ? `${m.nickname}#${m.tag}` : m.nickname
       break
     case 'volume':
       toggleMore(m.user_id)
@@ -164,7 +164,7 @@ async function invite() {
         <SoundOrb :user-id="m.user_id" :speaking="m.speaking"
                   :muted="m.mute" :deafen="m.deafen" />
         <div class="vname">
-          {{ m.nickname }}
+          {{ m.nickname }}<span v-if="m.tag" class="vtag">#{{ m.tag }}</span>
           <span v-if="m.user_id === voice.selfId()" class="me-tag">我</span>
         </div>
         <span v-if="chipFor(m)" class="chip" :class="chipFor(m)!.cls">
@@ -274,6 +274,10 @@ async function invite() {
 .vcard:hover .more { opacity: 1; }
 .vcard .more:hover { background: var(--brand-50); color: var(--ink-600); }
 .vname { font-size: 15px; font-weight: 600; }
+.vtag {
+  font-size: 11px; font-weight: 400;
+  color: var(--ink-400, #8A9BB0); margin-left: 3px; vertical-align: 1px;
+}
 .me-tag {
   font-size: 11px; font-weight: 600;
   color: var(--brand-600); background: rgba(79, 164, 243, 0.12);
