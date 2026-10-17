@@ -73,6 +73,13 @@ static int liteTalkXIReady(Display *dpy) {
     return major >= 2;
 }
 
+// liteTalkKeyDown 测试 XQueryKeymap 位图里某个 keycode 是否按下。
+// 必须定义在 liteTalkModsOfKeymap 之前：C 里先用后定义会按隐式声明
+// （返回 int、无参）处理，再遇到真声明就报 conflicting types。
+static int liteTalkKeyDown(const char *keys, KeyCode kc) {
+    return (keys[kc / 8] & (1 << (kc % 8))) != 0;
+}
+
 // liteTalkModsOfKeymap 用 XQueryKeymap 取当前修饰键位，折算成 X 修饰键掩码，
 // 并掩掉 Lock（CapsLock）、Mod2（NumLock）、Mod3：绑定不该受大小写锁定和数字
 // 键盘锁影响。
@@ -85,7 +92,6 @@ static int liteTalkXIReady(Display *dpy) {
 static unsigned int liteTalkModsOfKeymap(Display *dpy) {
     char keys[32];
     XQueryKeymap(dpy, keys);
-    KeyCode kc;
     unsigned int v = 0;
     if ((liteTalkKeyDown(keys, XKeysymToKeycode(dpy, XK_Control_L)) != 0) ||
         (liteTalkKeyDown(keys, XKeysymToKeycode(dpy, XK_Control_R)) != 0)) {
@@ -104,11 +110,6 @@ static unsigned int liteTalkModsOfKeymap(Display *dpy) {
         v |= Mod4Mask;
     }
     return v;
-}
-
-// liteTalkKeyDown 测试 XQueryKeymap 位图里某个 keycode 是否按下。
-static int liteTalkKeyDown(const char *keys, KeyCode kc) {
-    return (keys[kc / 8] & (1 << (kc % 8))) != 0;
 }
 
 static int lkXIOpcode = 0;
