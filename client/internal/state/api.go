@@ -115,6 +115,9 @@ func (c *APIClient) Token() string {
 	return c.access
 }
 
+// Base 返回 REST 基址（会话侧据此判环回候选，见 IsLoopbackURL）。
+func (c *APIClient) Base() string { return c.base }
+
 // do 执行一次请求；401（token_expired/unauthorized）且带鉴权时先合并刷新
 // 再用新令牌原样重放一次（retried 防递归）；仍 401 才返回错误。
 // 401 且会话被顶替/重放（X-LiteTalk-Auth: session_replaced/session_replayed）
