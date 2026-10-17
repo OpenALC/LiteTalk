@@ -65,7 +65,7 @@ onMounted(async () => {
             <b>连接服务器</b>
             <button class="cm-close" title="关闭" @click="showConn = false"><X :size="16" /></button>
           </div>
-          <p class="cm-sub">填入后端地址，保存后重启生效</p>
+          <p class="cm-sub">填入后端地址，保存后即时生效</p>
           <ServerConnPanel />
         </div>
       </div>

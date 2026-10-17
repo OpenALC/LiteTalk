@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // ServerConnPanel 服务器地址配置面板（设置页「连接」组与登录页弹层共用）。
-// 地址输入 + 来源徽标 + 测试连接（healthz 探活）+ 保存（重启生效）。
+// 地址输入 + 来源徽标 + 测试连接（healthz 探活）+ 保存（热切换即时生效）。
 import { onMounted, ref } from 'vue'
 import { Server, Wifi, RefreshCw } from 'lucide-vue-next'
 import { goApp } from '../api/bridge'
@@ -42,16 +42,19 @@ async function testConn() {
   }
 }
 
-// 保存：持久化后重启生效（运行中不热切换信令）。
+// 保存：探活通过后落盘并热切换（REST 重定向 + 信令重建），即时生效。
 async function saveConn() {
   try {
     await goApp().SetServerConfig(serverInput.value.trim())
     conn.value = await goApp().GetServerConfig()
+    testResult.value = '' // 清掉上次测试结果，让「已保存」提示露出来
     savedHint.value = true
     emit('saved')
-  } catch {
+  } catch (e) {
+    // Go 侧失败会带原因（如「切换失败，已恢复原地址: …」），原样展示，不吞成固定文案。
+    savedHint.value = false
     testOk.value = false
-    testResult.value = '地址无效'
+    testResult.value = String(e) || '地址无效'
   }
 }
 </script>
@@ -78,7 +81,7 @@ async function saveConn() {
       <span v-if="testResult" class="scp-result" :class="{ ok: testOk }">
         <Wifi :size="13" class="scp-btn-icon" />{{ testResult }}
       </span>
-      <span v-else-if="savedHint" class="scp-result ok">已保存，重启生效</span>
+      <span v-else-if="savedHint" class="scp-result ok">已保存</span>
     </div>
   </div>
 </template>

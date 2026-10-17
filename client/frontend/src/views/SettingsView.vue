@@ -357,7 +357,7 @@ function bindRecording(spec: string) {
     <div class="s-body">
       <section class="s-sec">
         <h3>连接</h3>
-        <ServerConnPanel @saved="toast?.show('已保存，重启后生效')" />
+        <ServerConnPanel @saved="toast?.show('已保存')" />
       </section>
 
       <section class="s-sec">

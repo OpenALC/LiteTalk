@@ -9,9 +9,9 @@ export const useAuthStore = defineStore('auth', () => {
   // 信令连接态：false 时主界面顶部显示「信令连接中」提示条（Go 侧重试中）。
   const signalOk = ref(true)
 
-  // kickedReason 被踢下线原因（auth:kicked 载荷 reason）：非空表示本端已在
-  // 其他设备登录被登出。跨组件的传输通道——LoginView 进入时取走并清，
-  // 横幅文案固定，不按 reason 分支。
+  // kickedReason 被踢下线原因（auth:kicked 载荷 reason）：非空表示本端会话已被
+  // Go 侧清除。跨组件的传输通道——LoginView 进入时取走并清，横幅文案按 reason
+  // 分支（server_changed 是服务器热切换换端拒绝令牌，区别于 login_elsewhere）。
   const kickedReason = ref('')
 
   // 服务端能力开关（启动时拉取一次，注册/找回页据此适配 UI）。
