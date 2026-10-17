@@ -7,7 +7,7 @@
 import { computed, onMounted, ref } from 'vue'
 import {
   ChevronDown, Eye, Hash, Lock, Mic, Volume2, Headphones, HeadphoneOff,
-  MicOff, Settings, Pencil, Trash2, FolderPlus, Folder,
+  MicOff, Settings, Pencil, Trash2, FolderPlus, Folder, CircleAlert,
 } from 'lucide-vue-next'
 import { useRouter } from 'vue-router'
 import { useServersStore, catDropIndex } from '../stores/data'
@@ -308,10 +308,11 @@ async function onCatDrop(e: DragEvent, gi: number) {
 
     <!-- data-ctx：允许自定义右键菜单（全局拦截的白名单容器） -->
     <div class="chan-scroll" data-ctx @contextmenu.prevent="openBlankCtx">
-      <!-- 空服务器空态（#12）：右键空白处仍可创建频道 -->
+      <!-- 空服务器空态（#12）：右键空白处仍可创建频道；加载失败给解释而不是恒空 -->
       <div v-if="groups.length === 0" class="empty">
-        <Hash :size="26" />
-        <span>暂无频道</span>
+        <CircleAlert v-if="servers.currentServer.unavailable" :size="26" />
+        <Hash v-else :size="26" />
+        <span>{{ servers.currentServer.unavailable ? '无法加载频道' : '暂无频道' }}</span>
       </div>
       <div v-for="(g, gi) in groups" :key="g.name" class="cat"
            :class="{ closed: collapsed[g.name], dragging: dragCat === g.id, 'drop-target': dropIdx === gi && dragCat !== null && dragCat !== g.id }"

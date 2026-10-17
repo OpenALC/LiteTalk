@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { goApp } from '../api/bridge'
 import type { ServerChannels } from '../api/types'
+import { useNotifyStore } from './notify'
 
 // 频道/服务器/好友数据域。
 // 服务器/频道的管理操作已接真实 REST（批次①）；频道列表经
@@ -29,6 +30,9 @@ export interface Server {
   // 是语音联调的演练场；它们不是服务端实体，管理操作（重命名/删除/邀请）
   // 对其一律提示不可编辑。REST 创建的频道会获得数字 ID，WS 同样可加入。
   builtin?: boolean
+  // unavailable 频道列表加载失败（多为被踢出/成员数据异常的 403）：频道区据此
+  // 给出解释而不是恒空（#12）。
+  unavailable?: boolean
 }
 
 export interface Friend {
@@ -162,7 +166,7 @@ export const useServersStore = defineStore('servers', () => {
   // ---- 真实 REST（批次①接线） ----
 
   // loadRemoteServers 登录后拉取真实服务器并恢复各自频道列表（数字 ID 与内置示例不冲突）。
-  // 逐服调 ListChannels、单服失败只跳过（403/网络错误都不重试），不阻断其它服。
+  // 逐服调 ListChannels；单服失败标记 unavailable 并提示（#12，不重试），不阻断其它服。
   async function loadRemoteServers() {
     const list = await goApp().ListServers()
     for (const s of list) {
@@ -175,16 +179,27 @@ export const useServersStore = defineStore('servers', () => {
   }
 
   // loadChannels 拉服务器的分类与频道：channel.group 取分类名（无分类归「未分类」），
-  // 空分类也进 extraGroups（空分类重启后不丢）。失败静默跳过，由调用方决定是否提示。
+  // 空分类也进 extraGroups（空分类重启后不丢）。失败不再静默（#12）：标记
+  // unavailable 并 toast——被踢出（403）与网络错误都给解释，频道区不能恒空。
   async function loadChannels(serverId: string) {
     const s = findServer(serverId)
     if (!s || s.builtin) return
     let out: ServerChannels
     try {
       out = await goApp().ListChannels(Number(serverId))
-    } catch {
+    } catch (e) {
+      s.unavailable = true
+      // 403 判定走服务端错误码前缀（bridge 只传 message 字符串，与 RegisterView 同法）。
+      const msg = String((e as Error)?.message ?? e)
+      const notify = useNotifyStore()
+      if (msg.includes('forbidden')) {
+        notify.show(`「${s.name}」不可访问，可能已退出该服务器`, true)
+      } else {
+        notify.show(`「${s.name}」频道加载失败`, true)
+      }
       return
     }
+    s.unavailable = false
     const nameOf = new Map<number, string>()
     for (const c of out.categories ?? []) nameOf.set(c.id, c.name)
     s.channels = (out.channels ?? []).map((c) => ({

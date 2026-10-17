@@ -1,5 +1,6 @@
 // data store 频道恢复（#12）：登录后 ListChannels 填回频道/分类，重启不丢列表；
-// 无分类频道归「未分类」；单服拉取失败只跳过（不重试）；分类显示序跟服务端 position。
+// 无分类频道归「未分类」；单服拉取失败不阻断其它服，但标记 unavailable 并提示
+// （403/网络错误文案不同，不再静默）；分类显示序跟服务端 position。
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
 
@@ -16,6 +17,7 @@ const mockGoApp = vi.hoisted(() => ({
 vi.mock('../api/bridge', () => ({ goApp: () => mockGoApp }))
 
 import { useServersStore, UNCATEGORIZED } from './data'
+import { useNotifyStore } from './notify'
 
 // resetMock 每例前清桩：mockReset 连实现一起清，需补回默认实现。
 function resetMock() {
@@ -76,14 +78,56 @@ describe('频道列表恢复', () => {
     expect(s.groupsOf('8', srv.channels).map((g) => g.name)).toEqual(['有组', UNCATEGORIZED])
   })
 
-  it('单服 ListChannels 失败只跳过不抛错', async () => {
+  it('单服 ListChannels 403 不抛错但不再静默：标记不可用并提示被踢出', async () => {
     mockGoApp.ListServers.mockResolvedValue([
       { id: 9, name: '服九', owner_id: 1, icon_name: 'music', icon_color: '#4FA4F3' },
     ])
-    mockGoApp.ListChannels.mockRejectedValue(new Error('403 forbidden'))
+    // bridge 只传 message：含服务端错误码 forbidden（APIError.Error() 嵌 code）。
+    mockGoApp.ListChannels.mockRejectedValue(
+      new Error('get /servers/9/channels: forbidden: 不是该服务器成员'))
     const s = useServersStore()
+    const notify = useNotifyStore()
     await expect(s.loadRemoteServers()).resolves.toBeUndefined()
+
     expect(s.findServer('9')?.channels).toEqual([])
+    expect(s.findServer('9')?.unavailable).toBe(true)
+    expect(notify.isError).toBe(true)
+    expect(notify.text).toContain('不可访问')
+    expect(notify.text).toContain('服九')
+  })
+
+  it('网络错误同样标记并提示，文案与 403 区分', async () => {
+    mockGoApp.ListServers.mockResolvedValue([
+      { id: 9, name: '服九', owner_id: 1, icon_name: 'music', icon_color: '#4FA4F3' },
+    ])
+    mockGoApp.ListChannels.mockRejectedValue(
+      new Error('get /servers/9/channels: dial tcp: connection refused'))
+    const s = useServersStore()
+    const notify = useNotifyStore()
+    await expect(s.loadRemoteServers()).resolves.toBeUndefined()
+
+    expect(s.findServer('9')?.unavailable).toBe(true)
+    expect(notify.isError).toBe(true)
+    expect(notify.text).toContain('频道加载失败')
+    expect(notify.text).not.toContain('不可访问')
+  })
+
+  it('加载成功清除 unavailable 标记', async () => {
+    mockGoApp.ListServers.mockResolvedValue([
+      { id: 9, name: '服九', owner_id: 1, icon_name: 'music', icon_color: '#4FA4F3' },
+    ])
+    mockGoApp.ListChannels.mockRejectedValue(new Error('forbidden: 不是该服务器成员'))
+    const s = useServersStore()
+    await s.loadRemoteServers()
+    expect(s.findServer('9')?.unavailable).toBe(true)
+
+    mockGoApp.ListChannels.mockResolvedValue({
+      categories: [],
+      channels: [{ id: 91, server_id: 9, name: '大厅', type: 'voice', category_id: 0, position: 0 }],
+    })
+    await s.loadRemoteServers()
+    expect(s.findServer('9')?.unavailable).toBeFalsy()
+    expect(s.findServer('9')?.channels).toHaveLength(1)
   })
 })
 
