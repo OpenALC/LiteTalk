@@ -14,8 +14,6 @@ vars:
 tasks:
   build:
     summary: 构建 Windows 客户端
-    deps:
-      - task: common:go:mod:tidy
     preconditions:
       - sh: '"{{.MINGW_BIN}}/gcc.exe" --version'
         msg: "未找到 {{.MINGW_BIN}}/gcc.exe（cgo 必需）。安装 winlibs mingw64 到 C:/tools/mingw64，或设 LITETALK_MINGW 指向其 bin 目录"

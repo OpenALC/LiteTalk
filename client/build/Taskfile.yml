@@ -4,7 +4,7 @@ version: '3'
 
 tasks:
   go:mod:tidy:
-    summary: go mod tidy
+    summary: go mod tidy（手动执行；dev/构建流程不自动跑，避免在本机改写 go.mod 制造 git 噪音）
     internal: true
     cmds:
       - go mod tidy

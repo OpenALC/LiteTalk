@@ -38,8 +38,9 @@ dev_mode:
     # vite dev server：端口由 wails3 dev 经 WAILS_VITE_PORT 注入（见 frontend/vite.config.ts）。
     - cmd: wails3 task common:dev:frontend
       type: background
-    - cmd: go mod tidy
-      type: blocking
+    # 不在这里跑 go mod tidy：blocking 类型的 executes 会随每次 *.go 变更重跑，
+    # 在本机（core.autocrlf=true）把 go.mod 改写、在 git status 里制造噪音。
+    # 依赖一致性由 CI 的 go mod tidy -diff 门禁保证，需要时手动 wails3 task common:go:mod:tidy。
     # 每次 *.go 变更：重建（dev 构建，无 production 标签 → 开发版 runtime.js + 走 FRONTEND_DEVSERVER_URL）。
     - cmd: wails3 task build
       type: blocking

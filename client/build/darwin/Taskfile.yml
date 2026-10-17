@@ -8,8 +8,6 @@ includes:
 tasks:
   build:
     summary: 构建 macOS 客户端
-    deps:
-      - task: common:go:mod:tidy
     cmds:
       - go build {{.BUILD_FLAGS}} -o {{.BIN_DIR}}/{{.APP_NAME}}.app/Contents/MacOS/{{.APP_NAME}} .
     vars:
