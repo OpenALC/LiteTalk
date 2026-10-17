@@ -23,6 +23,19 @@ const auth = useAuthStore()
 const settings = useSettingsStore()
 const hibernateStore = useHibernateStore()
 const version = ref('dev')
+
+// 登出确认弹层（文案克制：「退出登录？」/「取消」「退出」）
+const confirmLogout = ref(false)
+
+async function doLogout() {
+  confirmLogout.value = false
+  try {
+    await auth.logout()
+    router.push({ name: 'login' }).catch(() => {})
+  } catch {
+    toast.value?.show('登出失败', true)
+  }
+}
 // 休眠模式三态（v0.1.2 合并旧版双开关）：
 //   off      不休眠
 //   hibernate 最小化/关窗时卸载界面组件——webview 进程仍在，内存下降有限
@@ -353,6 +366,11 @@ function bindRecording(spec: string) {
           <div><div class="k">昵称</div><div class="v">{{ auth.user?.nickname ?? '—' }}</div></div>
           <div><div class="k">邮箱</div><div class="v">{{ auth.user?.email ?? '—' }}</div></div>
         </div>
+        <div class="s-row">
+          <button class="logout-btn" @click="confirmLogout = true">
+            <LogOut :size="14" class="btn-icon" />退出登录
+          </button>
+        </div>
       </section>
 
       <section class="s-sec">
@@ -567,6 +585,16 @@ function bindRecording(spec: string) {
       </section>
     </div>
     <Toast ref="toast" />
+    <!-- 登出确认弹层（文案克制） -->
+    <div v-if="confirmLogout" class="logout-overlay" @click.self="confirmLogout = false">
+      <div class="logout-card">
+        <p>退出登录？</p>
+        <div class="logout-acts">
+          <button class="logout-cancel" @click="confirmLogout = false">取消</button>
+          <button class="logout-ok" @click="doLogout">退出</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -656,6 +684,39 @@ input[type="range"] { flex: 0 0 140px; accent-color: var(--brand-500); }
 }
 .quit-btn:hover { background: rgba(232, 91, 91, 0.18); }
 .btn-icon { flex: none; }
+
+/* 登出按钮（账号分区）：主色调低调，与退出程序区分 */
+.logout-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 32px; padding: 0 14px; border-radius: 8px;
+  font-size: 13px; font-weight: 600;
+  color: var(--brand-700); background: var(--brand-50);
+  transition: background 0.2s var(--ease);
+}
+.logout-btn:hover { background: var(--brand-100); }
+
+/* 登出确认弹层 */
+.logout-overlay {
+  position: fixed; inset: 0; z-index: 200;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(23, 50, 75, 0.25);
+}
+.logout-card {
+  background: var(--surface); border-radius: 12px; padding: 24px 28px;
+  min-width: 220px; text-align: center;
+  box-shadow: var(--shadow-2, 0 8px 32px rgba(23,50,75,0.18));
+}
+.logout-card p { margin: 0 0 16px; font-size: 15px; font-weight: 600; color: var(--ink); }
+.logout-acts { display: flex; gap: 10px; justify-content: center; }
+.logout-cancel, .logout-ok {
+  height: 32px; padding: 0 18px; border-radius: 8px;
+  font-size: 13px; font-weight: 600;
+  transition: background 0.2s var(--ease);
+}
+.logout-cancel { color: var(--ink-2); background: var(--bg); }
+.logout-cancel:hover { background: var(--bg-2); }
+.logout-ok { color: #fff; background: var(--brand); }
+.logout-ok:hover { background: var(--brand-700); }
 
 /* 说明小字（如休眠「暂不生效」注记）：11px 灰，贴近上一行 */
 .s-note {
