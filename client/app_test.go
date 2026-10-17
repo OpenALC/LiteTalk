@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/OpenALC/LiteTalk/client/internal/config"
 	"github.com/OpenALC/LiteTalk/client/internal/hotkey"
@@ -347,6 +349,76 @@ func TestSetServerConfigHotSwitch(t *testing.T) {
 	}
 	if got := app.api.Base(); got != ok.URL {
 		t.Fatalf("切换失败后 API 基址应保持 %s，实际 %s", ok.URL, got)
+	}
+}
+
+// TestSetServerConfigSerializesRetarget 并发保存必须串行：第一个保存卡在
+// retarget 的 Me() 预检期间，第二个不得抢先落盘，否则终态配置与会话错位（#17）。
+func TestSetServerConfigSerializesRetarget(t *testing.T) {
+	inMe := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	healthzAnd401 := func(block bool) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/api/v1/healthz":
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"status":"ok","version":"t"}`))
+			case "/api/v1/users/me":
+				if block {
+					once.Do(func() { close(inMe) })
+					<-release
+				}
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"code":"unauthorized","message":"rejected"}`))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+	}
+	slow, fast := healthzAnd401(true), healthzAnd401(false)
+	defer slow.Close()
+	defer fast.Close()
+	defer releaseAll() // 断言中途失败也放行，避免 goroutine 悬挂
+
+	m := config.NewWithPath(filepath.Join(t.TempDir(), "config.json"))
+	app := newAppWithConfig(m)
+	app.api = state.NewAPIClient(slow.URL)
+	app.api.SetToken("tok")
+	app.mu.Lock()
+	app.user = state.UserProfile{ID: 1, Nickname: "a"}
+	app.mu.Unlock()
+
+	first := make(chan error, 1)
+	go func() { first <- app.SetServerConfig(slow.URL) }()
+	select {
+	case <-inMe:
+	case <-time.After(5 * time.Second):
+		t.Fatal("第一个保存未进入 retarget 的 Me() 预检")
+	}
+
+	second := make(chan error, 1)
+	go func() { second <- app.SetServerConfig(fast.URL) }()
+	time.Sleep(300 * time.Millisecond)
+	if got := app.GetServerConfig().BaseURL; got != slow.URL {
+		t.Fatalf("第一个切换未完成时配置已被第二个保存改写: %s", got)
+	}
+
+	releaseAll()
+	if err := <-first; err != nil {
+		t.Fatalf("第一个保存: %v", err)
+	}
+	if err := <-second; err != nil {
+		t.Fatalf("第二个保存: %v", err)
+	}
+	// 终态一致：最后完成的保存同时决定配置与 REST 基址。
+	if got, want := app.GetServerConfig().BaseURL, fast.URL; got != want {
+		t.Fatalf("终态配置 = %s，期望 %s", got, want)
+	}
+	if got := app.api.Base(); got != fast.URL {
+		t.Fatalf("终态 REST 基址 = %s，期望 %s", got, fast.URL)
 	}
 }
 
