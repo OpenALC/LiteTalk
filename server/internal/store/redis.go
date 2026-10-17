@@ -69,3 +69,34 @@ func (r *RedisKV) Eval(ctx context.Context, script string, keys []string, args .
 	}
 	return r.rdb.Eval(ctx, script, keys, argv...).Result()
 }
+
+// incrCapScript Lua 原子自增限幅（#22）：新值 > cap 时不增长、返回 cap+1；
+// key 不存在时从 1 开始并设置 ttl（已有 key 沿用原 TTL）。Redis 单线程执行保证原子。
+const incrCapScript = `
+local cur = redis.call('GET', KEYS[1])
+local n
+if cur then
+  n = tonumber(cur) + 1
+else
+  n = 1
+end
+if n > tonumber(ARGV[2]) then
+  return tonumber(ARGV[2]) + 1
+end
+if cur then
+  redis.call('INCR', KEYS[1])
+else
+  redis.call('SET', KEYS[1], n, 'EX', ARGV[1])
+end
+return n
+`
+
+// IncrCap 原子自增并限幅（#22）。
+func (r *RedisKV) IncrCap(ctx context.Context, key string, ttl time.Duration, cap int64) (int64, error) {
+	n, err := r.rdb.Eval(ctx, incrCapScript, []string{key},
+		int(ttl.Seconds()), cap).Int64()
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}

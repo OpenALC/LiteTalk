@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/OpenALC/LiteTalk/server/internal/store"
@@ -47,10 +48,15 @@ func (s *Server) handlePatchMe(w http.ResponseWriter, r *http.Request) {
 				if err == nil {
 					break
 				}
-				if err != store.ErrConflict {
+				if !errors.Is(err, store.ErrConflict) {
 					s.writeStoreErr(w, r, err)
 					return
 				}
+			}
+			// 5 次重试仍冲突 → 409（#22）。
+			if err != nil {
+				s.writeStoreErr(w, r, err)
+				return
 			}
 		}
 	}

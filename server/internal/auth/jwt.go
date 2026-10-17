@@ -84,6 +84,7 @@ type kvStore interface {
 	Set(ctx context.Context, key, value string, ttl time.Duration) error
 	Del(ctx context.Context, keys ...string) error
 	Incr(ctx context.Context, key string, ttl time.Duration) (int64, error)
+	IncrCap(ctx context.Context, key string, ttl time.Duration, cap int64) (int64, error)
 	Eval(ctx context.Context, script string, keys []string, args ...string) (any, error)
 }
 

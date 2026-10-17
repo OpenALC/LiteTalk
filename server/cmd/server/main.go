@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	ossignal "os/signal"
@@ -80,6 +81,11 @@ func main() {
 	if err := validateJWTSecret(jwtSecret, dev); err != nil {
 		log.Fatalf("LITETALK_JWT_SECRET 不合法：%v（请设为至少 32 字节的随机串，如 openssl rand -hex 32）", err)
 	}
+	// SFU IP 校验：生产拒环回（#22）。
+	sfuIP := envOr("LITETALK_SFU_IP", "127.0.0.1")
+	if err := validateSFUIP(sfuIP, dev); err != nil {
+		log.Fatalf("LITETALK_SFU_IP 不合法：%v", err)
+	}
 	jwtSigner := auth.NewJWT(jwtSecret)
 	refreshStore := auth.NewRefreshStore(kv)
 	codes := auth.NewEmailCodes(kv)
@@ -89,7 +95,7 @@ func main() {
 	// SFU：ICE-Lite + 单 UDP mux（§5.2）
 	sfuInst, err := sfu.New(sfu.Config{
 		UDPPort:    envInt("LITETALK_SFU_UDP", 7845),
-		NAT1To1IP:  envOr("LITETALK_SFU_IP", "127.0.0.1"),
+		NAT1To1IP:  sfuIP,
 		MaxMembers: envInt("LITETALK_SFU_MAX", 10),
 		Logger:     log.Default(),
 	})
@@ -292,6 +298,22 @@ func validateJWTSecret(secret string, dev bool) error {
 		return errors.New("密钥仍是公开示例值（litetalk-dev-secret-change-me / CHANGE_ME），必须更换")
 	case len(secret) < 32:
 		return fmt.Errorf("密钥长度 %d 字节，不足 32 字节", len(secret))
+	}
+	return nil
+}
+
+// validateSFUIP 生产模式拒环回地址（#22）：SFU 对外通告 IP 为环回时客户端 ICE 候选不可达。
+// dev 模式允许（本机联调）。
+func validateSFUIP(ip string, dev bool) error {
+	if dev {
+		return nil
+	}
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return fmt.Errorf("不是合法 IP: %q", ip)
+	}
+	if parsed.IsLoopback() {
+		return fmt.Errorf("生产模式禁止环回地址（127.0.0.0/8、::1），实际 %q", ip)
 	}
 	return nil
 }
