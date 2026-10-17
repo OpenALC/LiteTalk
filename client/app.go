@@ -889,6 +889,12 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 		OnKicked: func(reason string) {
 			go a.onKicked(reason)
 		},
+		// 语音被抢占（session.voice_taken，契约 §0.10）：Go 侧已本地退房，
+		// 此处只把事实转给前端（toast + 清房间态）。同样跑在 ws 读循环
+		// goroutine 上，不得同步断开会话。
+		OnVoiceTaken: func() {
+			a.emit("voice:taken", nil)
+		},
 	}
 	server := a.cfg.Resolve().WSURL
 	sess := state.NewSession(a.api, token, nickname, ev, log.Default())

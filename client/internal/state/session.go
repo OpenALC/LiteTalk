@@ -39,6 +39,10 @@ type Events struct {
 	// 契约 §0.5）。reason 约定值 login_elsewhere。回调可能跑在 ws 读循环
 	// goroutine（会话 wg 内）：实现侧不得同步 Close 会话，须异步执行。
 	OnKicked func(reason string)
+	// OnVoiceTaken 同账号另一会话抢占语音（session.voice_taken，契约 §0.10）：
+	// 服务端已把本端摘出房间，本地按退房清理完毕。与 OnKicked 同样可能跑在
+	// ws 读循环 goroutine（会话 wg 内），实现侧不得同步 Close 会话。
+	OnVoiceTaken func()
 }
 
 // VoiceStats 推给 UI 的语音房统计快照。
@@ -393,6 +397,35 @@ func (s *Session) registerHandlers() {
 		}
 		s.handleKicked(reason)
 	})
+	// session.voice_taken：同账号另一会话抢占语音（契约 §0.10）。服务端已把
+	// 本端摘出成员表，本地按退房清理——但绝不发 channel.leave：那条 leave 按
+	// uid 处理，会把抢占端一起带离房间。
+	s.ws.On(signal.TypeSessionVoiceTaken, func(env signal.Envelope) {
+		s.leaveRoomLocal()
+		if s.ev.OnVoiceTaken != nil {
+			s.ev.OnVoiceTaken()
+		}
+	})
+}
+
+// leaveRoomLocal 本地退房（不发 channel.leave）。仅用于服务端已单方面把本端
+// 摘出房间的路径（session.voice_taken）：再发 leave 会让服务端按 uid 把抢占端
+// 也带离房间。成员表必须清——否则 UI 拿着旧 members 显示「幽灵在房」。
+func (s *Session) leaveRoomLocal() {
+	s.stopMedia()
+	s.roomID.Store("")
+	if p := s.peerRef.Swap(nil); p != nil {
+		_ = p.Close()
+	}
+	if s.remoteMgr != nil {
+		s.remoteMgr.RemoveAll()
+	}
+	if s.mixer != nil {
+		s.mixer.SetDeafen(false)
+	}
+	s.mu.Lock()
+	s.members = make(map[string]PeerView)
+	s.mu.Unlock()
 }
 
 // handleKicked 上报被踢原因（session.kicked 消息、WS close 4001、握手 401 的
