@@ -231,7 +231,12 @@ func TestNullBackendRun(t *testing.T) {
 			time.Sleep(time.Millisecond)
 		}
 	}
-	waitFor(func() bool { return p.Stats().PacketsEncoded >= 10 }, "10 encoded packets")
+	// encoded 与 decoded 由不同 goroutine 推进（解码滞后编码）：必须等两者都
+	// 到 10 再读快照，否则 Stop 时刻 decoded 可能还是 9（CI -race 负载下必现）。
+	waitFor(func() bool {
+		st := p.Stats()
+		return st.PacketsEncoded >= 10 && st.PacketsDecoded >= 10
+	}, "10 encoded+decoded packets")
 	st := p.Stats()
 	p.Stop()
 
