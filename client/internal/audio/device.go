@@ -25,7 +25,14 @@ func NewContext(logf func(string)) (*Context, error) {
 	if logf == nil {
 		logf = func(string) {}
 	}
-	ctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, logf)
+	// PulseAudio 后端在 connect 时读 pApplicationName（pavucontrol 等音量面板按它
+	// 显示应用名）。malgo 的 DeviceConfig.Pulse 只暴露 StreamName*，应用名在
+	// ContextConfig.Pulse.PApplicationName——只能在 init context 时设置一次。
+	// 指针需活到 InitContext 返回：局部字节串栈/堆分配期间被 C 只读取，够用。
+	cfg := malgo.ContextConfig{}
+	pulseName := append([]byte("LiteTalk"), 0)
+	cfg.Pulse.PApplicationName = &pulseName[0]
+	ctx, err := malgo.InitContext(nil, cfg, logf)
 	if err != nil {
 		return nil, fmt.Errorf("init audio context: %w", err)
 	}

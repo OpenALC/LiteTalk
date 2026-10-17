@@ -206,6 +206,11 @@ func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) 
 func (a *App) setupTray() {
 	t := a.wails.SystemTray.New()
 	t.SetIcon(tray.IconForRuntime()).SetTooltip("轻音 LiteTalk")
+	// 左键单击托盘 = 显示主界面（与 Windows 行为一致；v3 SystemTray 的点击回调
+	// 两平台共用同一路径，Linux StatusNotifierItem 同样可达）。
+	t.OnClick(func() {
+		a.showFromTray()
+	})
 
 	menu := a.wails.Menu.New()
 	showItem := menu.Add("显示主界面")
@@ -308,7 +313,11 @@ func (a *App) showFromTray() {
 			Hidden:           true, // 先隐藏创建，恢复最大化态后再 Show，避免闪烁
 		}
 		if a.savedBounds != nil && a.savedBounds.Width > 0 {
-			opts.X, opts.Y = a.savedBounds.X, a.savedBounds.Y
+			// Wayland 协议不允许应用定位窗口（坐标写入被忽略或告警）：只记忆尺寸，
+			// 不写 X/Y，改由 Focus 前置（见下方 show 分支）。X11/Windows 保留完整位置记忆。
+			if !isWaylandSession() {
+				opts.X, opts.Y = a.savedBounds.X, a.savedBounds.Y
+			}
 			opts.Width, opts.Height = a.savedBounds.Width, a.savedBounds.Height
 		}
 		win = a.buildWindow(opts)
@@ -329,7 +338,29 @@ func (a *App) showFromTray() {
 	if win.IsMinimised() {
 		win.Restore()
 	}
+	// Wayland 无坐标可用，靠 Focus 抢输入焦点完成前置（X11/Windows 由坐标记忆保证位置）。
+	if isWaylandSession() {
+		win.Focus()
+	}
 	a.emit("sys:wake", nil)
+}
+
+// isWaylandEnv 按给定环境判定 Wayland 会话（纯函数，便于测试注入）：
+// Linux 下有 WAYLAND_DISPLAY 即 Wayland；无 DISPLAY（纯 Wayland、无 XWayland）也算。
+// 非 Linux 恒 false。
+func isWaylandEnv(goos, waylandDisplay, x11Display string) bool {
+	if goos != "linux" {
+		return false
+	}
+	if waylandDisplay != "" {
+		return true
+	}
+	return x11Display == ""
+}
+
+// isWaylandSession 进程环境的 Wayland 会话判定（Wayland 下禁止坐标定位窗口）。
+func isWaylandSession() bool {
+	return isWaylandEnv(runtime.GOOS, os.Getenv("WAYLAND_DISPLAY"), os.Getenv("DISPLAY"))
 }
 
 // emitHibernate 休眠处理（设置页「休眠模式」三态之一 hibernate）：
