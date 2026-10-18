@@ -58,6 +58,10 @@ type Hub struct {
 	maxConns  int
 	joinRate  int
 	offerRate int
+
+	// protoMax 服务端宣布的协议版本上限（LITETALK_PROTOCOL_MAX 逃生阀，#29）。
+	// 0 = 用构建期 ProtocolVersionMax；启动前用 SetProtoMax 设置，运行期只读。
+	protoMax int
 }
 
 // connKey 连接索引键：uid + "\x00" + dev（§0.8；NUL 分隔避免与 ID 内容歧义）。
@@ -92,6 +96,11 @@ type client struct {
 	roomID string // 当前所在频道（空 = 未加入）
 	state  VoiceStateData
 	rate   map[string]*rateWin // 单连接消息频控窗口（#20，随连接销毁丢弃）
+
+	// protoVer 协议版本（#29）：protoVerUnnegotiated=未收 client.hello（按 v1 处理）、
+	// protoVerIncompatible=版本无交集（拒收业务消息但不断连，裁定 #9）、≥1=协商结果。
+	// 读循环 goroutine 写、任意 goroutine 读 → atomic。
+	protoVer atomic.Int64
 }
 
 // rateWin 固定窗计数（1 分钟窗，#20）。
@@ -156,6 +165,10 @@ func NewHub(s *sfu.SFU, authn Authenticator, sess *auth.SessionIndex, logger *lo
 		conns:          make(map[connKey]*client),
 	}
 }
+
+// SetProtoMax 设置服务端宣布的协议版本上限（LITETALK_PROTOCOL_MAX 逃生阀）。
+// n <= 0 恢复默认（构建期 ProtocolVersionMax）。仅限启动阶段调用。
+func (h *Hub) SetProtoMax(n int) { h.protoMax = n }
 
 // ServeWS 处理 GET /ws?token=<jwt|dev-xxx>。
 func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
@@ -469,11 +482,26 @@ func (h *Hub) sendError(c *client, code, message string) {
 	h.sendJSON(c, TypeError, ErrorData{Code: code, Message: message})
 }
 
+// protoVer 哨兵值（#29）。
+const (
+	protoVerUnnegotiated = 0  // 未收到 client.hello：按协议 v1 处理（老客户端路径）
+	protoVerIncompatible = -1 // 版本无交集：拒收业务消息，但绝不主动断连（裁定 #9）
+)
+
 // handleMessage 分发一条上行信令。
 func (h *Hub) handleMessage(c *client, data []byte) {
 	var env Envelope
 	if err := json.Unmarshal(data, &env); err != nil {
 		h.sendError(c, ErrCodeBadMessage, "信封不是合法 JSON")
+		return
+	}
+	// 协商消息优先于版本门控：无交集后仍允许重复收到 client.hello（回同样的拒绝）。
+	if env.Type == TypeClientHello {
+		h.handleClientHello(c, env)
+		return
+	}
+	if c.protoVer.Load() == protoVerIncompatible {
+		h.sendError(c, ErrCodeProtocolUnsupported, "协议版本无交集，本连接不接受业务消息")
 		return
 	}
 	switch env.Type {
@@ -545,6 +573,76 @@ func (h *Hub) handleMessage(c *client, data []byte) {
 	default:
 		h.sendError(c, ErrCodeBadMessage, "未知消息类型: "+env.Type)
 	}
+}
+
+// handleClientHello 协议版本协商（#29）。
+//
+//	选定 v = min(serverMax, clientMax)，且须 v ≥ max(clientMin, serverMin)。
+//
+// 无交集只回 error{protocol_unsupported} 并拒收后续业务消息，**绝不主动断连**（裁定 #9）——
+// 断连会触发客户端重连风暴，且老服务端→新客户端的不兼容提示需要在带内送达。
+// 老客户端不发本消息：protoVer 保持 protoVerUnnegotiated，按 v1 处理、行为与今天一致。
+func (h *Hub) handleClientHello(c *client, env Envelope) {
+	var d ClientHelloData
+	if err := env.Decode(&d); err != nil {
+		h.sendError(c, ErrCodeBadMessage, "client.hello 需要 min 与 max")
+		return
+	}
+	if d.Min < 1 || d.Max < d.Min {
+		h.sendError(c, ErrCodeBadMessage, "client.hello 版本区间非法")
+		return
+	}
+	// 重复协商只回当前结果，不重开区间（防止先报宽区间、再收窄绕过选择）。
+	if cur := c.protoVer.Load(); cur != protoVerUnnegotiated {
+		if cur == protoVerIncompatible {
+			h.sendError(c, ErrCodeProtocolUnsupported, "协议版本无交集")
+			return
+		}
+		h.sendJSON(c, TypeServerHello, ServerHelloData{Version: cur})
+		return
+	}
+	serverMax := h.serverMax()
+	v, ok := negotiateProtocol(d.Min, d.Max, ProtocolVersionMin, serverMax)
+	if !ok {
+		c.protoVer.Store(protoVerIncompatible)
+		h.sendError(c, ErrCodeProtocolUnsupported,
+			"协议版本无交集：服务端 "+strconv.FormatInt(ProtocolVersionMin, 10)+".."+
+				strconv.FormatInt(serverMax, 10)+"，客户端 "+strconv.FormatInt(d.Min, 10)+".."+
+				strconv.FormatInt(d.Max, 10))
+		return
+	}
+	c.protoVer.Store(v)
+	h.sendJSON(c, TypeServerHello, ServerHelloData{Version: v})
+	h.log.Printf("ws: %s 协商协议版本 v%d（客户端 %d..%d）", c.userID, v, d.Min, d.Max)
+}
+
+// negotiateProtocol 选定协议版本：v = min(serverMax, clientMax)，
+// 且 v ≥ max(clientMin, serverMin)，否则无交集。区间非法（min<1 或 max<min）也视为无交集。
+func negotiateProtocol(clientMin, clientMax, serverMin, serverMax int64) (int64, bool) {
+	if clientMin < 1 || clientMax < clientMin {
+		return 0, false
+	}
+	if serverMax < serverMin {
+		serverMax = serverMin
+	}
+	v := min(clientMax, serverMax)
+	if v < max(clientMin, serverMin) {
+		return 0, false
+	}
+	return v, true
+}
+
+// serverMax 服务端宣布的协议版本上限：LITETALK_PROTOCOL_MAX 逃生阀与构建期
+// ProtocolVersionMax 取小，且不低于 ProtocolVersionMin。
+func (h *Hub) serverMax() int64 {
+	m := int64(ProtocolVersionMax)
+	if h.protoMax > 0 && int64(h.protoMax) < m {
+		m = int64(h.protoMax)
+	}
+	if m < ProtocolVersionMin {
+		m = ProtocolVersionMin
+	}
+	return m
 }
 
 // authorizeChannelJoin 进房权限校验（P0 S1）：返回 (错误码, 消息)，code 为空即放行。

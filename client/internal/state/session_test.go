@@ -545,3 +545,27 @@ func TestRTCFailedStaleIgnored(t *testing.T) {
 		t.Fatal("陈旧 rtc.failed 不得重发 channel.join（#19）")
 	}
 }
+
+// TestServerHelloRecordsVersion server.hello（#29）：协商结果记入 Session，
+// 供版本相关行为（如 v2 停发 voice.state{speaking}）门控。
+func TestServerHelloRecordsVersion(t *testing.T) {
+	stub, _ := newDownlinkStubData(t, signal.Envelope{
+		Type: signal.TypeServerHello, TS: 1,
+		Data: json.RawMessage(`{"version":2}`),
+	})
+	s := NewSession(NewAPIClient(stub.wsURL()), "tok", "n", Events{}, nil)
+	s.ws = signal.NewClient(signal.Config{URL: stub.wsURL(), ReconnectMin: 20 * time.Millisecond})
+	defer s.ws.Close()
+	s.registerHandlers()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.ws.Run(ctx)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && s.ProtocolVersion() != 2 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if s.ProtocolVersion() != 2 {
+		t.Fatalf("ProtocolVersion = %d, want 2（server.hello 未记录）", s.ProtocolVersion())
+	}
+}
