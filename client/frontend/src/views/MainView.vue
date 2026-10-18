@@ -80,10 +80,13 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <!-- 信令未连上（登录后连接失败重试中 / 中途断线）：顶部提示条 -->
-  <div v-if="auth.loggedIn && !auth.signalOk" class="signal-bar" role="status">
+  <!-- 信令未连上（登录后连接失败重试中 / 中途断线）：顶部提示条。
+       服务端主动关闭（sys:shutdown）时改口明示——Go 侧已停重连，
+       继续说「信令连接中」等于骗用户它还会回来。 -->
+  <div v-if="auth.loggedIn && (auth.shutdown || !auth.signalOk)"
+       class="signal-bar" :class="{ steady: !!auth.shutdown }" role="status">
     <WifiOff :size="14" />
-    <span>信令连接中，语音暂不可用</span>
+    <span>{{ auth.shutdown ? '服务端已关闭' : '信令连接中，语音暂不可用' }}</span>
   </div>
   <div class="app">
     <ServerRail />
@@ -139,6 +142,8 @@ onUnmounted(() => {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.72; }
 }
+/* steady 终态（服务端已关闭）：脉冲暗示「正在重试」，这里没有重试可等。 */
+.signal-bar.steady { animation: none; }
 .app {
   flex: 1; min-height: 0;
   display: flex;

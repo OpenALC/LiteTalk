@@ -2,12 +2,18 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { eventsOn, goApp } from '../api/bridge'
 import type { ServerConfig, UserProfile } from '../api/types'
+import { useNotifyStore } from './notify'
 
 export const useAuthStore = defineStore('auth', () => {
   const user = ref<UserProfile | null>(null)
   const loggedIn = ref(false)
   // 信令连接态：false 时主界面顶部显示「信令连接中」提示条（Go 侧重试中）。
   const signalOk = ref(true)
+
+  // shutdown 服务端优雅关闭原因（sys:shutdown 载荷 reason）：非空表示 Go 侧已停
+  // 自动重连、信令不会再连上。此时提示条要改口为「服务端已关闭」——继续显示
+  // 「信令连接中」是在骗用户（那边根本没在重试）。
+  const shutdown = ref('')
 
   // kickedReason 被踢下线原因（auth:kicked 载荷 reason）：非空表示本端会话已被
   // Go 侧清除。跨组件的传输通道——LoginView 进入时取走并清，横幅文案按 reason
@@ -33,6 +39,7 @@ export const useAuthStore = defineStore('auth', () => {
     loggedIn.value = true
     signalOk.value = r.session_ok !== false
     clearKickedReason() // 新登录覆盖被踢态，下次进登录页不残留横幅
+    clearShutdown() // 同理：连上的是新会话，旧的「服务端已关闭」不该带过来
   }
 
   async function register(nickname: string, email: string, password: string, code: string) {
@@ -41,6 +48,7 @@ export const useAuthStore = defineStore('auth', () => {
     loggedIn.value = true
     signalOk.value = r.session_ok !== false
     clearKickedReason()
+    clearShutdown()
   }
 
   // 游客一键进入（simple 模式）。Go 侧负责复用已记住的游客身份（refresh 轮换）。
@@ -50,6 +58,7 @@ export const useAuthStore = defineStore('auth', () => {
     loggedIn.value = true
     signalOk.value = r.session_ok !== false
     clearKickedReason()
+    clearShutdown()
   }
 
   // setSignalOk 由 MainView 订阅 auth:session 事件调用（Go 侧重试/断线状态变化）。
@@ -63,6 +72,14 @@ export const useAuthStore = defineStore('auth', () => {
 
   function clearKickedReason() {
     kickedReason.value = ''
+  }
+
+  function setShutdown(reason: string) {
+    shutdown.value = reason || 'shutdown'
+  }
+
+  function clearShutdown() {
+    shutdown.value = ''
   }
 
   async function sendEmailCode(email: string, purpose: 'register' | 'reset') {
@@ -79,6 +96,7 @@ export const useAuthStore = defineStore('auth', () => {
     loggedIn.value = false
     signalOk.value = true
     clearKickedReason()
+    clearShutdown()
     // 清理各业务 store 的本地缓存（B2：chat.clear 此前是死代码，
     // 登出后换账号登录会继承上一账号的聊天记录）。
     // setup 风格 store 无 $reset，用显式 resetAll。
@@ -108,6 +126,14 @@ export const useAuthStore = defineStore('auth', () => {
       const r = (d as { reason?: unknown } | null)?.reason
       handleKicked(typeof r === 'string' && r !== '' ? r : 'login_elsewhere').catch(() => {})
     })
+    // 服务端关闭（sys:shutdown，#21）：Go 侧已停自动重连。挂 store 层同上——
+    // 事件到达时用户可能在设置页（MainView 未挂载），不能只等组件订阅。
+    // toast 走既有 notify 通道；提示条据 shutdown 改口见 MainView。
+    eventsOn('sys:shutdown', (d) => {
+      const r = (d as { reason?: unknown } | null)?.reason
+      setShutdown(typeof r === 'string' && r !== '' ? r : 'shutdown')
+      useNotifyStore().show('服务端已关闭', true)
+    })
   }
 
   async function fetchMe() {
@@ -117,8 +143,8 @@ export const useAuthStore = defineStore('auth', () => {
 
   return {
     user, loggedIn, signalOk, serverCfg, simpleMode, mailConfigured,
-    kickedReason,
+    kickedReason, shutdown,
     loadConfig, login, register, guest, sendEmailCode, resetPassword, logout, fetchMe,
-    setSignalOk, setKickedReason, clearKickedReason,
+    setSignalOk, setKickedReason, clearKickedReason, setShutdown, clearShutdown,
   }
 })
