@@ -39,6 +39,10 @@ func NewJWT(secret string) *JWT {
 	return &JWT{secret: []byte(secret)}
 }
 
+// Secret 返回签名密钥材料（含空密钥回落值）。仅供 bootstrap 邀请码派生校验
+// （#27）——派生必须与令牌同源，勿用于其它用途。
+func (j *JWT) Secret() []byte { return j.secret }
+
 // SignAccess 签发访问令牌（2h）。sid/dev 可为空（旧版本令牌仍兼容）。
 func (j *JWT) SignAccess(userID int64, nickname, tag string, sid, dev string) (string, error) {
 	now := time.Now()

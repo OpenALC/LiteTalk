@@ -18,11 +18,12 @@ import (
 // ---- 请求/响应结构 ----
 
 type registerReq struct {
-	Nickname string `json:"nickname"`
-	Email    string `json:"email"`
-	Password string `json:"password"`
-	Code     string `json:"code"`
-	Device   string `json:"device"` // 设备类型，空=desktop
+	Nickname  string `json:"nickname"`
+	Email     string `json:"email"`
+	Password  string `json:"password"`
+	Code      string `json:"code"`
+	Device    string `json:"device"`    // 设备类型，空=desktop
+	Bootstrap string `json:"bootstrap"` // 可选：管理员邀请码（#27，空=不使用）
 }
 
 type loginReq struct {
@@ -130,6 +131,14 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_password", "密码需 8–72 个字符")
 		return
 	}
+	// 管理员邀请码（#27）：带码则先校验合法且未消费，再走注册；
+	// 不合法/已用 → 400 bad_bootstrap（不建用户，避免半成品账号）。
+	if req.Bootstrap != "" {
+		if err := s.checkBootstrap(r.Context(), req.Bootstrap); err != nil {
+			writeErr(w, http.StatusBadRequest, "bad_bootstrap", "邀请码无效或已被使用")
+			return
+		}
+	}
 	// 验证邮箱验证码（simple 模式免验证码）。
 	if !s.simpleMode() {
 		if err := s.codes.Verify(r.Context(), auth.PurposeRegister, req.Email, req.Code); err != nil {
@@ -169,6 +178,10 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.writeStoreErr(w, r, err)
 		return
+	}
+	// 邀请码认领（#27）：以该用户为 owner 建默认服务器并作废该码。
+	if req.Bootstrap != "" {
+		s.claimBootstrap(r.Context(), req.Bootstrap, user)
 	}
 	s.issueTokens(w, r, user, dev, http.StatusCreated)
 }
