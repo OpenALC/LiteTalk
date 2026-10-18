@@ -699,9 +699,9 @@ func (a *App) Login(email, password string) (*state.AuthResult, error) {
 	return r, nil
 }
 
-// Register 注册并自动登录。
-func (a *App) Register(nickname, email, password, code string) (*state.AuthResult, error) {
-	r, err := a.api.Register(nickname, email, password, code)
+// Register 注册并自动登录。bootstrap 为可选管理员邀请码（#27，空=不使用）。
+func (a *App) Register(nickname, email, password, code, bootstrap string) (*state.AuthResult, error) {
+	r, err := a.api.Register(nickname, email, password, code, bootstrap)
 	if err != nil {
 		return nil, err
 	}

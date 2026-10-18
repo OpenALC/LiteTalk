@@ -24,6 +24,9 @@ export const useAuthStore = defineStore('auth', () => {
   const serverCfg = ref<ServerConfig>({ auth_mode: 'full', mail_configured: false })
   const simpleMode = computed(() => serverCfg.value.auth_mode === 'simple')
   const mailConfigured = computed(() => serverCfg.value.mail_configured)
+  // 自托管引导（#27）：self_host 或邀请码未消费时注册页显示可选邀请码输入。
+  const showInviteField = computed(() => !!serverCfg.value.self_host || !!serverCfg.value.bootstrap_required)
+  const bootstrapRequired = computed(() => !!serverCfg.value.bootstrap_required)
 
   async function loadConfig() {
     try {
@@ -42,8 +45,8 @@ export const useAuthStore = defineStore('auth', () => {
     clearShutdown() // 同理：连上的是新会话，旧的「服务端已关闭」不该带过来
   }
 
-  async function register(nickname: string, email: string, password: string, code: string) {
-    const r = await goApp().Register(nickname, email, password, code)
+  async function register(nickname: string, email: string, password: string, code: string, bootstrap = '') {
+    const r = await goApp().Register(nickname, email, password, code, bootstrap)
     user.value = r.user
     loggedIn.value = true
     signalOk.value = r.session_ok !== false
@@ -143,6 +146,7 @@ export const useAuthStore = defineStore('auth', () => {
 
   return {
     user, loggedIn, signalOk, serverCfg, simpleMode, mailConfigured,
+    showInviteField, bootstrapRequired,
     kickedReason, shutdown,
     loadConfig, login, register, guest, sendEmailCode, resetPassword, logout, fetchMe,
     setSignalOk, setKickedReason, clearKickedReason, setShutdown, clearShutdown,
