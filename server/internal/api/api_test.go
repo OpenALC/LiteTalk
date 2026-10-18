@@ -33,6 +33,7 @@ func newTestServerNoSessionMode(t *testing.T) (*Server, *store.Mem) {
 		Codes:    auth.NewEmailCodes(mem),
 		Limits:   auth.NewRateLimit(mem),
 		AuthMode: AuthModeSimple,
+		Presence: mem,
 	}), mem
 }
 

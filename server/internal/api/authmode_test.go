@@ -21,6 +21,7 @@ func newTestServerMode(t *testing.T, mode string) (*Server, *store.Mem) {
 		Limits:   auth.NewRateLimit(mem),
 		AuthMode: mode,
 		Session:  auth.NewSessionIndex(mem, mem),
+		Presence: mem, // 在线状态（presence:{uid}）与生产一样走 KV
 	}), mem
 }
 

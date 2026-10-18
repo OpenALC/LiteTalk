@@ -37,6 +37,7 @@ const (
 	// 批次 2 多设备会话（契约 §0.5，只增不改；与 server/internal/signal/protocol.go 同步）。
 	TypeSessionKicked     = "session.kicked"      // S→C 同类设备新登录踢线，随后 close 4001
 	TypeSessionVoiceTaken = "session.voice_taken" // S→C 同账号另一会话抢占语音，本端本地退房
+	TypeServerShutdown    = "server.shutdown"     // S→C 优雅关闭广播（#21，与服务端同步）
 )
 
 // WS close code（契约 §0.6，4000~4999 为应用自定义区间；与
@@ -64,6 +65,8 @@ const (
 	ErrCodeForbidden     = "forbidden"
 	ErrCodeNotFound      = "not_found"
 	ErrCodeRateLimited   = "rate_limited"
+	// ErrCodeQuotaExceeded 容量超限（房间数/每房人数/连接数，#20）。REST 侧对应 429 quota_exceeded。
+	ErrCodeQuotaExceeded = "quota_exceeded"
 )
 
 // Envelope 信令信封。Data 延迟解析，由订阅者按 Type 自行解码。
@@ -199,6 +202,21 @@ type ErrorData struct {
 type SessionKickedData struct {
 	Reason     string `json:"reason"`
 	DeviceType string `json:"device_type"`
+}
+
+// PresenceUpdateData S→C presence.update 载荷（#11，与服务端逐字同步）：
+// UserID 为状态变化的用户（不是接收者），只推给互为已接受好友的在线连接。
+type PresenceUpdateData struct {
+	UserID string `json:"user_id"`
+	Online bool   `json:"online"`
+	TS     int64  `json:"ts"`
+}
+
+// ServerShutdownData S→C server.shutdown 载荷（#21，与服务端逐字同步）：
+// 优雅关闭广播，收到后停止自动重连并提示「服务端已关闭」。
+type ServerShutdownData struct {
+	Reason string `json:"reason"` // 固定 "shutdown"
+	TS     int64  `json:"ts"`
 }
 
 // Bool 返回 b 的指针（构造可选增量字段用）。
