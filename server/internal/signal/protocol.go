@@ -87,6 +87,8 @@ const (
 	ErrCodeForbidden     = "forbidden"
 	ErrCodeNotFound      = "not_found"
 	ErrCodeRateLimited   = "rate_limited"
+	// ErrCodeQuotaExceeded 容量超限（房间数/每房人数/连接数，#20）。REST 侧对应 429 quota_exceeded。
+	ErrCodeQuotaExceeded = "quota_exceeded"
 )
 
 // Envelope 信令信封：{ "type": "...", "data": {...}, "ts": 1734500000000 }
