@@ -1,6 +1,6 @@
 # LiteTalk REST 契约（唯一事实来源，OpenAPI 3.0.3）。
-# 改 REST 形状必须先改本文件，再运行生成器：
-#   go -C api/tools run ./openapigen
+# 改 REST 形状必须先改本文件，再运行生成器（server 模块内，与 signalgen 同布局）：
+#   go run -C server ./api/tools/openapigen
 # 生成物：server/internal/api/api.gen.go、client/frontend/src/api/types.gen.ts。
 # 手写实现层（server/internal/api/*.go）只实现生成的接口，禁止手改生成物。
 #
