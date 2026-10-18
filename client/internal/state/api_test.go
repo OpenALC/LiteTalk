@@ -48,7 +48,7 @@ func TestAuthDecode(t *testing.T) {
 	defer srv.Close()
 
 	c := NewAPIClient(srv.URL)
-	r, err := c.Register("游客-2733", "x@y.com", "password123", "")
+	r, err := c.Register("游客-2733", "x@y.com", "password123", "", "")
 	if err != nil {
 		t.Fatalf("Register 解码失败（id 类型契约被破坏？）: %v", err)
 	}
