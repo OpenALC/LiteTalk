@@ -35,7 +35,7 @@ func (s *Server) ListMessages(ctx context.Context, request ListMessagesRequestOb
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	return ListMessages200JSONResponse(msgs), nil
+	return ListMessages200JSONResponse(messageViews(msgs)), nil
 }
 
 // 消息发送频控：20 条/分钟/用户。
@@ -77,5 +77,5 @@ func (s *Server) CreateMessage(ctx context.Context, request CreateMessageRequest
 		return nil, s.writeStoreErr(ctx, err)
 	}
 	msg.SenderNickname, msg.SenderTag = c.Nickname, c.Tag
-	return CreateMessage201JSONResponse(*msg), nil
+	return CreateMessage201JSONResponse(messageView(msg)), nil
 }

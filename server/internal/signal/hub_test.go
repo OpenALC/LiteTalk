@@ -71,9 +71,10 @@ func newChatFixture(t *testing.T) *chatFixture {
 	st := store.NewMem()
 	ctx := context.Background()
 
-	// 用户（ID 由 mem 自增，这里假定 1、2；下方断言兜底）。
-	u1 := &store.User{Email: "alice@x", Nickname: "alice", Tag: "0001", PasswordHash: "x"}
-	u2 := &store.User{Email: "bob@x", Nickname: "bob", Tag: "0002", PasswordHash: "x"}
+	// 用户 ID 预置 1、2（testAuthenticator 的 token→uid 映射按这两个值走）。
+	// Snowflake 赋值后显式预置不再被覆盖，夹具保持确定性。
+	u1 := &store.User{ID: 1, Email: "alice@x", Nickname: "alice", Tag: "0001", PasswordHash: "x"}
+	u2 := &store.User{ID: 2, Email: "bob@x", Nickname: "bob", Tag: "0002", PasswordHash: "x"}
 	if err := st.CreateUser(ctx, u1); err != nil {
 		t.Fatalf("CreateUser: %v", err)
 	}

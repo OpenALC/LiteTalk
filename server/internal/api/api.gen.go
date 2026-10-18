@@ -15,9 +15,26 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/OpenALC/LiteTalk/server/internal/store"
 	"github.com/oapi-codegen/runtime"
 )
+
+// Defines values for ChannelInfoType.
+const (
+	ChannelInfoTypeText  ChannelInfoType = "text"
+	ChannelInfoTypeVoice ChannelInfoType = "voice"
+)
+
+// Valid indicates whether the value is a known member of the ChannelInfoType enum.
+func (e ChannelInfoType) Valid() bool {
+	switch e {
+	case ChannelInfoTypeText:
+		return true
+	case ChannelInfoTypeVoice:
+		return true
+	default:
+		return false
+	}
+}
 
 // Defines values for CreateChannelRequestType.
 const (
@@ -70,6 +87,27 @@ func (e FriendEntryStatus) Valid() bool {
 	case Blocked:
 		return true
 	case Pending:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for MemberInfoRole.
+const (
+	Admin  MemberInfoRole = "admin"
+	Member MemberInfoRole = "member"
+	Owner  MemberInfoRole = "owner"
+)
+
+// Valid indicates whether the value is a known member of the MemberInfoRole enum.
+func (e MemberInfoRole) Valid() bool {
+	switch e {
+	case Admin:
+		return true
+	case Member:
+		return true
+	case Owner:
 		return true
 	default:
 		return false
@@ -139,11 +177,29 @@ type ApiError struct {
 	Message string `json:"message"`
 }
 
-// CategoryInfo defines model for CategoryInfo.
-type CategoryInfo = store.Category
+// CategoryInfo 频道分类。ID 为十进制字符串（#31）。
+type CategoryInfo struct {
+	CreatedAt time.Time `json:"created_at"`
+	Id        ID        `json:"id"`
+	Name      string    `json:"name"`
+	Position  int       `json:"position"`
+	ServerId  ID        `json:"server_id"`
+}
 
-// ChannelInfo defines model for ChannelInfo.
-type ChannelInfo = store.Channel
+// ChannelInfo 频道。ID 为十进制字符串（#31）。
+type ChannelInfo struct {
+	// CategoryId 分类归属；null = 未分类（请求侧 0 也表示未分类）
+	CategoryId *ID             `json:"category_id"`
+	CreatedAt  time.Time       `json:"created_at"`
+	Id         ID              `json:"id"`
+	Name       string          `json:"name"`
+	Position   int             `json:"position"`
+	ServerId   ID              `json:"server_id"`
+	Type       ChannelInfoType `json:"type"`
+}
+
+// ChannelInfoType defines model for ChannelInfo.Type.
+type ChannelInfoType string
 
 // CreateCategoryRequest defines model for CreateCategoryRequest.
 type CreateCategoryRequest struct {
@@ -153,8 +209,8 @@ type CreateCategoryRequest struct {
 
 // CreateChannelRequest defines model for CreateChannelRequest.
 type CreateChannelRequest struct {
-	// CategoryId 0 或缺省 = 未分类
-	CategoryId *int64 `json:"category_id,omitempty"`
+	// CategoryId 0/缺省 = 未分类；请求侧数字与字符串双接受（#31）
+	CategoryId *ID `json:"category_id,omitempty"`
 
 	// Name 1–64 字符
 	Name     string                   `json:"name"`
@@ -206,7 +262,7 @@ type FriendEntry struct {
 	Group string `json:"group"`
 
 	// Id 关系行 ID（请求数）
-	Id int64 `json:"id"`
+	Id ID `json:"id"`
 
 	// Incoming true = 对端发起（我是被请求方）
 	Incoming bool              `json:"incoming"`
@@ -225,8 +281,17 @@ type GuestRequest struct {
 	Device *string `json:"device,omitempty"`
 }
 
-// Invite defines model for Invite.
-type Invite = store.Invite
+// Invite 邀请码。ID 为十进制字符串（#31）。
+type Invite struct {
+	Code      string     `json:"code"`
+	CreatorId ID         `json:"creator_id"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+
+	// MaxUses 0 = 不限
+	MaxUses  int `json:"max_uses"`
+	ServerId ID  `json:"server_id"`
+	Uses     int `json:"uses"`
+}
 
 // JoinServerRequest defines model for JoinServerRequest.
 type JoinServerRequest struct {
@@ -245,11 +310,29 @@ type LogoutRequest struct {
 	RefreshToken string `json:"refresh_token"`
 }
 
-// MemberInfo 服务器成员（内存实现直接内联昵称/tag）。
-type MemberInfo = store.ServerMember
+// MemberInfo 服务器成员（内联昵称/tag）。ID 为十进制字符串（#31）。
+type MemberInfo struct {
+	JoinedAt time.Time      `json:"joined_at"`
+	Nickname *string        `json:"nickname,omitempty"`
+	Role     MemberInfoRole `json:"role"`
+	ServerId ID             `json:"server_id"`
+	Tag      *string        `json:"tag,omitempty"`
+	UserId   ID             `json:"user_id"`
+}
 
-// Message 文字频道消息（发送者昵称/tag 内联，不含邮箱）。
-type Message = store.Message
+// MemberInfoRole defines model for MemberInfo.Role.
+type MemberInfoRole string
+
+// Message 文字频道消息（发送者昵称/tag 内联，不含邮箱）。ID 为十进制字符串（#31）。
+type Message struct {
+	ChannelId      ID        `json:"channel_id"`
+	Content        string    `json:"content"`
+	CreatedAt      time.Time `json:"created_at"`
+	Id             ID        `json:"id"`
+	SenderNickname *string   `json:"sender_nickname,omitempty"`
+	SenderTag      *string   `json:"sender_tag,omitempty"`
+	UserId         ID        `json:"user_id"`
+}
 
 // PasswordResetRequest defines model for PasswordResetRequest.
 type PasswordResetRequest struct {
@@ -268,8 +351,8 @@ type PatchCategoryRequest struct {
 
 // PatchChannelRequest defines model for PatchChannelRequest.
 type PatchChannelRequest struct {
-	// CategoryId 0 = 显式移出分类
-	CategoryId *int64                   `json:"category_id,omitempty"`
+	// CategoryId 0 = 显式移出分类；请求侧数字与字符串双接受（#31）
+	CategoryId *ID                      `json:"category_id,omitempty"`
 	Name       *string                  `json:"name,omitempty"`
 	Position   *int                     `json:"position,omitempty"`
 	Type       *PatchChannelRequestType `json:"type,omitempty"`
@@ -299,11 +382,11 @@ type PatchServerRequest struct {
 	Name      *string `json:"name,omitempty"`
 }
 
-// PublicUser 对外用户视图（好友/成员等他人信息），不含 email。
+// PublicUser 对外用户视图（好友/成员等他人信息），不含 email。ID 为十进制字符串（#31）。
 type PublicUser struct {
 	CreatedAt     time.Time `json:"created_at"`
 	EmailVerified bool      `json:"email_verified"`
-	Id            int64     `json:"id"`
+	Id            ID        `json:"id"`
 	IsGuest       bool      `json:"is_guest"`
 	Nickname      string    `json:"nickname"`
 
@@ -361,8 +444,17 @@ type ServerConfig struct {
 // ServerConfigAuthMode defines model for ServerConfig.AuthMode.
 type ServerConfigAuthMode string
 
-// ServerInfo 服务器（群组）。图标为预设 Lucide 图标名 + 颜色，无图片。
-type ServerInfo = store.Server
+// ServerInfo 服务器（群组）。图标为预设 Lucide 图标名 + 颜色，无图片。ID 为十进制字符串（#31）。
+type ServerInfo struct {
+	CreatedAt time.Time `json:"created_at"`
+
+	// IconColor #RRGGBB
+	IconColor string `json:"icon_color"`
+	IconName  string `json:"icon_name"`
+	Id        ID     `json:"id"`
+	Name      string `json:"name"`
+	OwnerId   ID     `json:"owner_id"`
+}
 
 // StatusOk 删除/吊销类操作的固定成功体。
 type StatusOk struct {
@@ -380,12 +472,26 @@ type TokenPair struct {
 	ExpiresIn    int64  `json:"expires_in"`
 	RefreshToken string `json:"refresh_token"`
 
-	// User 自响应用户（/users/me、登录/注册/游客/刷新），含 email。
+	// User 自响应用户（/users/me、登录/注册/游客/刷新），含 email。ID 为十进制字符串（#31）。
 	User User `json:"user"`
 }
 
-// User 自响应用户（/users/me、登录/注册/游客/刷新），含 email。
-type User = store.User
+// User 自响应用户（/users/me、登录/注册/游客/刷新），含 email。ID 为十进制字符串（#31）。
+type User struct {
+	CreatedAt     time.Time `json:"created_at"`
+	Email         string    `json:"email"`
+	EmailVerified bool      `json:"email_verified"`
+	Id            ID        `json:"id"`
+	IsGuest       bool      `json:"is_guest"`
+	Nickname      string    `json:"nickname"`
+
+	// Status 账号状态枚举
+	Status int32 `json:"status"`
+
+	// Tag 四位定宽数字串
+	Tag       string    `json:"tag"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
 
 // IDPath defines model for IDPath.
 type IDPath = int64

@@ -952,7 +952,7 @@ components:
       name: id
       in: path
       required: true
-      description: 资源数字 ID（>0；#31 起改为字符串 ID）
+      description: 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串）
       schema:
         type: integer
         format: int64
@@ -1048,15 +1048,12 @@ components:
     User:
       type: object
       title: User
-      description: 自响应用户（/users/me、登录/注册/游客/刷新），含 email。
-      x-go-type: store.User
-      x-go-type-import:
-        path: github.com/OpenALC/LiteTalk/server/internal/store
+      description: 自响应用户（/users/me、登录/注册/游客/刷新），含 email。ID 为十进制字符串（#31）。
       required: [id, email, nickname, tag, email_verified, is_guest, status, created_at, updated_at]
       properties:
         id:
-          type: integer
-          format: int64
+          type: string
+          x-go-type: ID
         email:
           type: string
         nickname:
@@ -1081,12 +1078,12 @@ components:
     PublicUser:
       type: object
       title: PublicUser
-      description: 对外用户视图（好友/成员等他人信息），不含 email。
+      description: 对外用户视图（好友/成员等他人信息），不含 email。ID 为十进制字符串（#31）。
       required: [id, nickname, tag, email_verified, is_guest, status, online, created_at, updated_at]
       properties:
         id:
-          type: integer
-          format: int64
+          type: string
+          x-go-type: ID
         nickname:
           type: string
         tag:
@@ -1125,20 +1122,17 @@ components:
     ServerInfo:
       type: object
       title: ServerInfo
-      description: 服务器（群组）。图标为预设 Lucide 图标名 + 颜色，无图片。
-      x-go-type: store.Server
-      x-go-type-import:
-        path: github.com/OpenALC/LiteTalk/server/internal/store
+      description: 服务器（群组）。图标为预设 Lucide 图标名 + 颜色，无图片。ID 为十进制字符串（#31）。
       required: [id, name, owner_id, icon_name, icon_color, created_at]
       properties:
         id:
-          type: integer
-          format: int64
+          type: string
+          x-go-type: ID
         name:
           type: string
         owner_id:
-          type: integer
-          format: int64
+          type: string
+          x-go-type: ID
         icon_name:
           type: string
         icon_color:
@@ -1150,26 +1144,24 @@ components:
     ChannelInfo:
       type: object
       title: ChannelInfo
-      x-go-type: store.Channel
-      x-go-type-import:
-        path: github.com/OpenALC/LiteTalk/server/internal/store
-      required: [id, server_id, name, type, position, created_at]
+      description: 频道。ID 为十进制字符串（#31）。
+      required: [id, server_id, name, type, category_id, position, created_at]
       properties:
         id:
-          type: integer
-          format: int64
+          type: string
+          x-go-type: ID
         server_id:
-          type: integer
-          format: int64
+          type: string
+          x-go-type: ID
         name:
           type: string
         type:
           type: string
           enum: [text, voice]
         category_id:
-          type: integer
-          format: int64
+          type: string
           nullable: true
+          x-go-type: ID
           description: 分类归属；null = 未分类（请求侧 0 也表示未分类）
         position:
           type: integer
@@ -1179,17 +1171,15 @@ components:
     CategoryInfo:
       type: object
       title: CategoryInfo
-      x-go-type: store.Category
-      x-go-type-import:
-        path: github.com/OpenALC/LiteTalk/server/internal/store
+      description: 频道分类。ID 为十进制字符串（#31）。
       required: [id, server_id, name, position, created_at]
       properties:
         id:
-          type: integer
-          format: int64
+          type: string
+          x-go-type: ID
         server_id:
-          type: integer
-          format: int64
+          type: string
+          x-go-type: ID
         name:
           type: string
         position:
@@ -1200,18 +1190,15 @@ components:
     MemberInfo:
       type: object
       title: MemberInfo
-      description: 服务器成员（内存实现直接内联昵称/tag）。
-      x-go-type: store.ServerMember
-      x-go-type-import:
-        path: github.com/OpenALC/LiteTalk/server/internal/store
+      description: 服务器成员（内联昵称/tag）。ID 为十进制字符串（#31）。
       required: [server_id, user_id, role, joined_at]
       properties:
         server_id:
-          type: integer
-          format: int64
+          type: string
+          x-go-type: ID
         user_id:
-          type: integer
-          format: int64
+          type: string
+          x-go-type: ID
         role:
           type: string
           enum: [owner, admin, member]
@@ -1225,21 +1212,18 @@ components:
     Message:
       type: object
       title: Message
-      description: 文字频道消息（发送者昵称/tag 内联，不含邮箱）。
-      x-go-type: store.Message
-      x-go-type-import:
-        path: github.com/OpenALC/LiteTalk/server/internal/store
+      description: 文字频道消息（发送者昵称/tag 内联，不含邮箱）。ID 为十进制字符串（#31）。
       required: [id, channel_id, user_id, content, created_at]
       properties:
         id:
-          type: integer
-          format: int64
+          type: string
+          x-go-type: ID
         channel_id:
-          type: integer
-          format: int64
+          type: string
+          x-go-type: ID
         user_id:
-          type: integer
-          format: int64
+          type: string
+          x-go-type: ID
         content:
           type: string
         created_at:
@@ -1252,19 +1236,17 @@ components:
     Invite:
       type: object
       title: Invite
-      x-go-type: store.Invite
-      x-go-type-import:
-        path: github.com/OpenALC/LiteTalk/server/internal/store
+      description: 邀请码。ID 为十进制字符串（#31）。
       required: [code, server_id, creator_id, max_uses, uses]
       properties:
         code:
           type: string
         server_id:
-          type: integer
-          format: int64
+          type: string
+          x-go-type: ID
         creator_id:
-          type: integer
-          format: int64
+          type: string
+          x-go-type: ID
         max_uses:
           type: integer
           description: 0 = 不限
@@ -1283,8 +1265,8 @@ components:
       required: [id, status, incoming, remark, group, user]
       properties:
         id:
-          type: integer
-          format: int64
+          type: string
+          x-go-type: ID
           description: 关系行 ID（请求数）
         status:
           type: string
@@ -1479,10 +1461,10 @@ components:
           type: string
           enum: [text, voice]
         category_id:
-          type: integer
-          format: int64
+          type: string
           nullable: true
-          description: 0 或缺省 = 未分类
+          x-go-type: ID
+          description: 0/缺省 = 未分类；请求侧数字与字符串双接受（#31）
         position:
           type: integer
     PatchChannelRequest:
@@ -1497,10 +1479,10 @@ components:
           nullable: true
           enum: [text, voice]
         category_id:
-          type: integer
-          format: int64
+          type: string
           nullable: true
-          description: 0 = 显式移出分类
+          x-go-type: ID
+          description: 0 = 显式移出分类；请求侧数字与字符串双接受（#31）
         position:
           type: integer
           nullable: true

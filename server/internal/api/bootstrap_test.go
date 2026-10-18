@@ -109,11 +109,7 @@ func TestRegisterBootstrapInvalid(t *testing.T) {
 	}
 }
 
-// itoaJSON 把 JSON number（float64）转成路径用的十进制串。
+// itoaJSON 把响应里的 ID（字符串或 JSON number）转成路径用的十进制串。
 func itoaJSON(v any) string {
-	f, ok := v.(float64)
-	if !ok {
-		return "0"
-	}
-	return strconv.FormatInt(int64(f), 10)
+	return strconv.FormatInt(asID(v), 10)
 }

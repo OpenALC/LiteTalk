@@ -67,7 +67,7 @@ func register(addr, nickname string) (email, token string, id int64, ice []ICESe
 	var pair struct {
 		AccessToken string `json:"access_token"`
 		User        struct {
-			ID int64 `json:"id"`
+			ID jsonID `json:"id"`
 		} `json:"user"`
 	}
 	if code != http.StatusCreated {
@@ -89,7 +89,7 @@ func register(addr, nickname string) (email, token string, id int64, ice []ICESe
 	if cresp.StatusCode == http.StatusOK {
 		_ = json.NewDecoder(cresp.Body).Decode(&creds)
 	}
-	return email, pair.AccessToken, pair.User.ID, creds.ICEServers, nil
+	return email, pair.AccessToken, int64(pair.User.ID), creds.ICEServers, nil
 }
 
 func main() {

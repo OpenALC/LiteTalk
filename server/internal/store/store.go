@@ -7,6 +7,8 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"github.com/OpenALC/LiteTalk/server/internal/snowflake"
 )
 
 // 领域错误（API 层据此映射 HTTP 状态码）。
@@ -16,6 +18,15 @@ var (
 	ErrForbidden = errors.New("forbidden")
 	ErrExpired   = errors.New("expired")
 )
+
+// newID 新行主键（#31）：调用方未预置时取 Snowflake，显式赋值优先（测试夹具用）。
+// 各 Create 显式带 id 列插入，不再依赖 AUTO_INCREMENT；列上的 AUTO_INCREMENT 保留不动。
+func newID(id int64) int64 {
+	if id != 0 {
+		return id
+	}
+	return snowflake.Next()
+}
 
 // User 用户（§6.1 users 表）。无头像字段。
 type User struct {
@@ -151,6 +162,8 @@ type Store interface {
 	UserByEmail(ctx context.Context, email string) (*User, error)
 	UserByNicknameTag(ctx context.Context, nickname, tag string) (*User, error)
 	UpdateUser(ctx context.Context, u *User) error
+	// HasUsers 库内是否已有用户（首启探测用；UserByID(1) 随 Snowflake 失效）。
+	HasUsers(ctx context.Context) (bool, error)
 
 	// friendships
 	CreateFriendship(ctx context.Context, f *Friendship) error

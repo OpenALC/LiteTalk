@@ -529,11 +529,10 @@ export interface components {
         };
         /**
          * User
-         * @description 自响应用户（/users/me、登录/注册/游客/刷新），含 email。
+         * @description 自响应用户（/users/me、登录/注册/游客/刷新），含 email。ID 为十进制字符串（#31）。
          */
         User: {
-            /** Format: int64 */
-            id: number;
+            id: string;
             email: string;
             nickname: string;
             /** @description 四位定宽数字串 */
@@ -552,11 +551,10 @@ export interface components {
         };
         /**
          * PublicUser
-         * @description 对外用户视图（好友/成员等他人信息），不含 email。
+         * @description 对外用户视图（好友/成员等他人信息），不含 email。ID 为十进制字符串（#31）。
          */
         PublicUser: {
-            /** Format: int64 */
-            id: number;
+            id: string;
             nickname: string;
             tag: string;
             email_verified: boolean;
@@ -583,44 +581,41 @@ export interface components {
         };
         /**
          * ServerInfo
-         * @description 服务器（群组）。图标为预设 Lucide 图标名 + 颜色，无图片。
+         * @description 服务器（群组）。图标为预设 Lucide 图标名 + 颜色，无图片。ID 为十进制字符串（#31）。
          */
         ServerInfo: {
-            /** Format: int64 */
-            id: number;
+            id: string;
             name: string;
-            /** Format: int64 */
-            owner_id: number;
+            owner_id: string;
             icon_name: string;
             /** @description #RRGGBB */
             icon_color: string;
             /** Format: date-time */
             created_at: string;
         };
-        /** ChannelInfo */
+        /**
+         * ChannelInfo
+         * @description 频道。ID 为十进制字符串（#31）。
+         */
         ChannelInfo: {
-            /** Format: int64 */
-            id: number;
-            /** Format: int64 */
-            server_id: number;
+            id: string;
+            server_id: string;
             name: string;
             /** @enum {string} */
             type: "text" | "voice";
-            /**
-             * Format: int64
-             * @description 分类归属；null = 未分类（请求侧 0 也表示未分类）
-             */
-            category_id?: number | null;
+            /** @description 分类归属；null = 未分类（请求侧 0 也表示未分类） */
+            category_id: string | null;
             position: number;
             /** Format: date-time */
             created_at: string;
         };
-        /** CategoryInfo */
+        /**
+         * CategoryInfo
+         * @description 频道分类。ID 为十进制字符串（#31）。
+         */
         CategoryInfo: {
-            /** Format: int64 */
-            id: number;
-            /** Format: int64 */
-            server_id: number;
+            id: string;
+            server_id: string;
             name: string;
             position: number;
             /** Format: date-time */
@@ -628,13 +623,11 @@ export interface components {
         };
         /**
          * MemberInfo
-         * @description 服务器成员（内存实现直接内联昵称/tag）。
+         * @description 服务器成员（内联昵称/tag）。ID 为十进制字符串（#31）。
          */
         MemberInfo: {
-            /** Format: int64 */
-            server_id: number;
-            /** Format: int64 */
-            user_id: number;
+            server_id: string;
+            user_id: string;
             /** @enum {string} */
             role: "owner" | "admin" | "member";
             /** Format: date-time */
@@ -644,28 +637,26 @@ export interface components {
         };
         /**
          * Message
-         * @description 文字频道消息（发送者昵称/tag 内联，不含邮箱）。
+         * @description 文字频道消息（发送者昵称/tag 内联，不含邮箱）。ID 为十进制字符串（#31）。
          */
         Message: {
-            /** Format: int64 */
-            id: number;
-            /** Format: int64 */
-            channel_id: number;
-            /** Format: int64 */
-            user_id: number;
+            id: string;
+            channel_id: string;
+            user_id: string;
             content: string;
             /** Format: date-time */
             created_at: string;
             sender_nickname?: string;
             sender_tag?: string;
         };
-        /** Invite */
+        /**
+         * Invite
+         * @description 邀请码。ID 为十进制字符串（#31）。
+         */
         Invite: {
             code: string;
-            /** Format: int64 */
-            server_id: number;
-            /** Format: int64 */
-            creator_id: number;
+            server_id: string;
+            creator_id: string;
             /** @description 0 = 不限 */
             max_uses: number;
             uses: number;
@@ -677,11 +668,8 @@ export interface components {
          * @description 好友条目。remark/group 仅发起方视角非空（被请求方恒空串）。 user 为 PublicUser（无 email）。
          */
         FriendEntry: {
-            /**
-             * Format: int64
-             * @description 关系行 ID（请求数）
-             */
-            id: number;
+            /** @description 关系行 ID（请求数） */
+            id: string;
             /** @enum {string} */
             status: "pending" | "accepted" | "blocked";
             /** @description true = 对端发起（我是被请求方） */
@@ -809,11 +797,8 @@ export interface components {
             name: string;
             /** @enum {string} */
             type: "text" | "voice";
-            /**
-             * Format: int64
-             * @description 0 或缺省 = 未分类
-             */
-            category_id?: number | null;
+            /** @description 0/缺省 = 未分类；请求侧数字与字符串双接受（#31） */
+            category_id?: string | null;
             position?: number;
         };
         /** PatchChannelRequest */
@@ -821,11 +806,8 @@ export interface components {
             name?: string | null;
             /** @enum {string|null} */
             type?: "text" | "voice" | null;
-            /**
-             * Format: int64
-             * @description 0 = 显式移出分类
-             */
-            category_id?: number | null;
+            /** @description 0 = 显式移出分类；请求侧数字与字符串双接受（#31） */
+            category_id?: string | null;
             position?: number | null;
         };
         /** CreateCategoryRequest */
@@ -923,7 +905,7 @@ export interface components {
         };
     };
     parameters: {
-        /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+        /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
         IDPath: number;
     };
     requestBodies: never;
@@ -1255,7 +1237,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1283,7 +1265,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1364,7 +1346,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1393,7 +1375,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1421,7 +1403,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1483,7 +1465,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1510,7 +1492,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1541,7 +1523,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1568,7 +1550,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1599,7 +1581,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1627,7 +1609,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1659,7 +1641,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1693,7 +1675,7 @@ export interface operations {
             };
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1722,7 +1704,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1759,7 +1741,7 @@ export interface operations {
             };
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1787,7 +1769,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;

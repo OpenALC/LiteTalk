@@ -36,7 +36,7 @@ func (s *Server) CreateCategory(ctx context.Context, request CreateCategoryReque
 	if err := s.store.CreateCategory(ctx, cat); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	return CreateCategory201JSONResponse(*cat), nil
+	return CreateCategory201JSONResponse(categoryView(cat)), nil
 }
 
 // DeleteCategory DELETE /api/v1/categories/{id}（owner/admin，v0.1.2）。
@@ -117,5 +117,5 @@ func (s *Server) PatchCategory(ctx context.Context, request PatchCategoryRequest
 			cat = updated
 		}
 	}
-	return PatchCategory200JSONResponse(*cat), nil
+	return PatchCategory200JSONResponse(categoryView(cat)), nil
 }

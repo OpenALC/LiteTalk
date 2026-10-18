@@ -36,20 +36,20 @@ func (s *Server) CreateChannel(ctx context.Context, request CreateChannelRequest
 	// 分类归属校验（与 PATCH 同规则）：存在且属于本服务器，防止跨服挂载/悬空 id。
 	// 0 = 显式无分类，落库前归一成 NULL——否则 0 与 NULL 两种「无分类」并存，
 	// 而 PATCH 那侧一律落 NULL（见 PatchChannel）。
-	categoryID := req.CategoryId
-	if categoryID != nil && *categoryID != 0 {
-		cat, err := s.store.CategoryByID(ctx, *categoryID)
+	var catID *int64
+	if req.CategoryId != nil && *req.CategoryId != 0 {
+		cat, err := s.store.CategoryByID(ctx, int64(*req.CategoryId))
 		if err != nil || cat.ServerID != request.Id {
 			return nil, errf(http.StatusBadRequest, "bad_category", "分类不存在或不属于该服务器")
 		}
-	} else {
-		categoryID = nil
+		v := int64(*req.CategoryId)
+		catID = &v
 	}
 	ch := &store.Channel{
 		ServerID:   request.Id,
 		Name:       req.Name,
 		Type:       chType,
-		CategoryID: categoryID,
+		CategoryID: catID,
 	}
 	if req.Position != nil {
 		ch.Position = *req.Position
@@ -57,7 +57,7 @@ func (s *Server) CreateChannel(ctx context.Context, request CreateChannelRequest
 	if err := s.store.CreateChannel(ctx, ch); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	return CreateChannel201JSONResponse(*ch), nil
+	return CreateChannel201JSONResponse(channelView(ch)), nil
 }
 
 // PatchChannel PATCH /api/v1/channels/{id}（owner/admin）
@@ -95,11 +95,12 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 			ch.CategoryID = nil // 显式移出分类（0 = 无分类）
 		} else {
 			// 校验分类归属本服务器，防止跨服挂载。
-			cat, err := s.store.CategoryByID(ctx, *req.CategoryId)
+			cat, err := s.store.CategoryByID(ctx, int64(*req.CategoryId))
 			if err != nil || cat.ServerID != ch.ServerID {
 				return nil, errf(http.StatusBadRequest, "bad_category", "分类不存在或不属于该服务器")
 			}
-			ch.CategoryID = req.CategoryId
+			v := int64(*req.CategoryId)
+			ch.CategoryID = &v
 		}
 	}
 	if req.Position != nil {
@@ -108,7 +109,7 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 	if err := s.store.UpdateChannel(ctx, ch); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	return PatchChannel200JSONResponse(*ch), nil
+	return PatchChannel200JSONResponse(channelView(ch)), nil
 }
 
 // DeleteChannel DELETE /api/v1/channels/{id}（owner/admin）
@@ -160,5 +161,5 @@ func (s *Server) ListChannels(ctx context.Context, request ListChannelsRequestOb
 	if categories == nil {
 		categories = []store.Category{}
 	}
-	return ListChannels200JSONResponse{Categories: categories, Channels: channels}, nil
+	return ListChannels200JSONResponse{Categories: categoryViews(categories), Channels: channelViews(channels)}, nil
 }
