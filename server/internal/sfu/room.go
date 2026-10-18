@@ -91,13 +91,33 @@ func (r *Room) removePeerIf(userID, connID string) bool {
 	}
 	delete(r.peers, userID)
 	r.mu.Unlock()
-	r.dropRoutesFrom(userID)
+	r.teardownPeer(p)
+	return true
+}
+
+// removePeerInstance 按实例摘除（#19 ICE 失败路径专用）：同 WS 连接重入房会以
+// 同一 connID 建新 peer，connID 核对分不清「失败的旧实例」与「重入的新实例」，
+// 只有指针核对可以。返回是否真实摘除。
+func (r *Room) removePeerInstance(p *Peer) bool {
+	r.mu.Lock()
+	if r.peers[p.userID] != p {
+		r.mu.Unlock()
+		return false
+	}
+	delete(r.peers, p.userID)
+	r.mu.Unlock()
+	r.teardownPeer(p)
+	return true
+}
+
+// teardownPeer 摘除收尾：先摘其余成员指向它的下行路由，再关其 PC。
+func (r *Room) teardownPeer(p *Peer) {
+	r.dropRoutesFrom(p.userID)
 	p.close()
 	r.mu.RLock()
 	n := len(r.peers)
 	r.mu.RUnlock()
-	r.sfu.log.Printf("sfu: 成员 %s 离开房间 %s（connID %s，剩余 %d 人）", userID, r.id, connID, n)
-	return true
+	r.sfu.log.Printf("sfu: 成员 %s 离开房间 %s（connID %s，剩余 %d 人）", p.userID, r.id, p.connID, n)
 }
 
 // dropRoutesFrom 摘除其余成员指向 srcUserID 的下行路由（离房/ICE 失败/连接顶替）。

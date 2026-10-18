@@ -221,3 +221,14 @@ type ServerShutdownData struct {
 
 // Bool 返回 b 的指针（构造可选增量字段用）。
 func Bool(b bool) *bool { return &b }
+
+// rtc.failed：SFU 因 ICE 失败移除本端 PeerConnection（v1.3.0 #19）。只发给该 peer
+// 的连接；客户端收到后销毁本地 PC 并重新入房（同 channel_id 重发 channel.join），
+// 其余成员走既有 channel.peer_left。与另一侧 protocol.go 逐字同步，只增不改。
+const TypeRTCFailed = "rtc.failed"
+
+// RTCFailedData S→C rtc.failed 载荷（#19，两侧逐字同步）。
+type RTCFailedData struct {
+	ChannelID string `json:"channel_id"`
+	Reason    string `json:"reason"` // 固定 "ice_failed"
+}
