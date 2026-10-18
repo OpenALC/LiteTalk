@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +27,7 @@ import (
 	"github.com/OpenALC/LiteTalk/server/internal/sfu"
 	"github.com/OpenALC/LiteTalk/server/internal/signal"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/internal/turn"
 	"github.com/OpenALC/LiteTalk/server/migrations"
 )
 
@@ -92,9 +95,13 @@ func main() {
 	limits := auth.NewRateLimit(kv)
 	sessIndex := auth.NewSessionIndex(st, kv)
 
-	// SFU：ICE-Lite + 单 UDP mux（§5.2）
+	// SFU：ICE-Lite + 单 UDP mux（§5.2）+ 可选 ICE-TCP mux（#25）
+	sfuUDPPort := envInt("LITETALK_SFU_UDP", 7845)
+	// ICE-TCP 默认与 UDP 同号（各自独立 socket，不是共 socket 复用）；0 = 关闭。
+	sfuTCPPort := envInt("LITETALK_SFU_TCP", sfuUDPPort)
 	sfuInst, err := sfu.New(sfu.Config{
-		UDPPort:    envInt("LITETALK_SFU_UDP", 7845),
+		UDPPort:    sfuUDPPort,
+		TCPPort:    sfuTCPPort,
 		NAT1To1IP:  sfuIP,
 		MaxMembers: envInt("LITETALK_SFU_MAX", 10),
 		MaxRooms:   envInt("LITETALK_MAX_ROOMS", 50),
@@ -104,6 +111,40 @@ func main() {
 		log.Fatalf("SFU 初始化失败: %v", err)
 	}
 	defer sfuInst.Close()
+
+	// ---- 内置 TURN（#25）：UDP+TCP 双监听，与 rtcapi 短期凭证互通 ----
+	// LITETALK_TURN_PORT=0 关闭（走外部 coturn）；默认 3478。
+	turnPort := envInt("LITETALK_TURN_PORT", 3478)
+	turnSecret := os.Getenv("LITETALK_TURN_SECRET")
+	if turnPort != 0 && turnSecret == "" {
+		// 一键自托管：未设密钥则进程内随机生成（签发与校验同进程，互通无碍）。
+		// 重启后旧凭证失效，客户端会重新取凭证，12h TTL 内可接受。
+		buf := make([]byte, 32)
+		if _, err := rand.Read(buf); err != nil {
+			log.Fatalf("生成 TURN 凭证密钥失败: %v", err)
+		}
+		turnSecret = hex.EncodeToString(buf)
+		log.Println("TURN: 未设 LITETALK_TURN_SECRET，已生成随机凭证密钥（重启后旧凭证失效）")
+	}
+	var turnSrv *turn.Server
+	if turnPort != 0 {
+		relayMin := uint16(envInt("LITETALK_TURN_RELAY_PORT", 49152))
+		relayMax := uint16(envInt("LITETALK_TURN_RELAY_PORT_END", 49200))
+		turnSrv, err = turn.New(turn.Config{
+			UDPPort:      turnPort,
+			TCPPort:      turnPort, // 同号 TCP：禁 UDP 网络的中继兜底（#25 裁定）
+			RelayIP:      net.ParseIP(sfuIP),
+			RelayMinPort: relayMin,
+			RelayMaxPort: relayMax,
+			Realm:        envOr("LITETALK_TURN_REALM", envOr("LITETALK_DOMAIN", "litetalk")),
+			Secret:       turnSecret,
+			Logger:       log.Default(),
+		})
+		if err != nil {
+			log.Fatalf("内置 TURN 启动失败: %v", err)
+		}
+		defer turnSrv.Close()
+	}
 
 	// WS 信令 hub：默认 JWT 鉴权；dev 模式下 LITETALK_DEV_AUTH=1 可用 dev- 前缀令牌兜底（JWT 优先）。
 	// dev 令牌把 dev-<名字> 映射为真实身份且不做签名校验，生产构建（注入了版本号）必须拒绝启动。
@@ -163,10 +204,30 @@ func main() {
 			return strconv.FormatInt(claims.UserID, 10), nil
 		}
 	}
+	// TURN 短期凭证签发 URLs（§0.4）：显式 env 优先；未设且内置 TURN 启用则按
+	// host（LITETALK_DOMAIN，否则 LITETALK_SFU_IP）回填。host 别一个用 IP 一个用域名。
+	turnURLs := splitList(os.Getenv("LITETALK_TURN_URLS"))
+	stunURLs := splitList(os.Getenv("LITETALK_STUN_URLS"))
+	if len(turnURLs) == 0 || len(stunURLs) == 0 {
+		host := envOr("LITETALK_DOMAIN", sfuIP)
+		if turnPort != 0 {
+			if len(turnURLs) == 0 && len(stunURLs) == 0 {
+				turnURLs, stunURLs = rtcapi.DefaultURLs(host, turnPort)
+			}
+		} else {
+			// 内置 TURN 关闭且未显式配置：保持既有开发默认值（仅本机联调可达）。
+			if len(turnURLs) == 0 {
+				turnURLs = []string{"turn:127.0.0.1:3478"}
+			}
+			if len(stunURLs) == 0 {
+				stunURLs = []string{"stun:127.0.0.1:3478"}
+			}
+		}
+	}
 	rtcCreds := rtcapi.NewHandler(rtcapi.Config{
-		Secret:   os.Getenv("LITETALK_TURN_SECRET"),
-		TurnURLs: splitList(envOr("LITETALK_TURN_URLS", "turn:127.0.0.1:3478")),
-		StunURLs: splitList(envOr("LITETALK_STUN_URLS", "stun:127.0.0.1:3478")),
+		Secret:   turnSecret,
+		TurnURLs: turnURLs,
+		StunURLs: stunURLs,
 		TTL:      12 * time.Hour,
 	}, rtcAuth, log.Default())
 
@@ -232,7 +293,8 @@ func main() {
 	defer stop()
 
 	go func() {
-		log.Printf("litetalk server %s 监听 %s（SFU UDP %d）", version, addr, sfuInst.Port())
+		log.Printf("litetalk server %s 监听 %s（SFU UDP %d / ICE-TCP %d，TURN %d）",
+			version, addr, sfuInst.Port(), sfuInst.TCPPort(), turnPort)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("HTTP 服务异常退出: %v", err)
 			stop() // 触发主 goroutine 走优雅关闭路径
