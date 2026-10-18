@@ -232,6 +232,8 @@ func main() {
 		MaxConns:  envInt("LITETALK_MAX_CONNS", 8),
 		JoinRate:  envInt("LITETALK_JOIN_RATE", 30),
 		OfferRate: envInt("LITETALK_OFFER_RATE", 60),
+		// 每会话事件环条数（#32）：断线续传窗口 = min(环容量, 30min 空闲 TTL)。
+		Backlog: cfg.gatewayBacklog,
 	})
 	// LITETALK_PROTOCOL_MAX：服务端宣布的协议版本上限（#29 逃生阀）。
 	// 0/缺省 = 构建期 ProtocolVersionMax；调小可临时挡住过新的客户端区间。
