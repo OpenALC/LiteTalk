@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,6 +28,9 @@ type testClient struct {
 	received     []*rtp.Packet
 	remoteSet    bool
 	pendingCands []webrtc.ICECandidateInit
+
+	tracksUp atomic.Int64 // OnTrack 次数（重入房断言用：订阅端必须拿到新 OnTrack）
+	gen      atomic.Int64 // 读取代际：stopTrackReaders 后旧循环停计数（模拟 peer_left 拆读取循环）
 }
 
 func newTestSFU(t *testing.T, maxMembers int) *SFU {
@@ -81,14 +85,19 @@ func newTestClient(t *testing.T, s *SFU, roomID, userID string) *testClient {
 		}
 	})
 
-	// 下行轨道：读循环记录所有收到的 RTP
+	// 下行轨道：读循环记录所有收到的 RTP（代际计数：peer_left 后旧循环停记，模拟真实客户端拆读取循环）
 	pc.OnTrack(func(remote *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+		c.tracksUp.Add(1)
 		t.Logf("[%s] 下行轨道建立 ssrc=%d", userID, remote.SSRC())
+		gen := c.gen.Load()
 		go func() {
 			for {
 				pkt, _, err := remote.ReadRTP()
 				if err != nil {
 					return
+				}
+				if c.gen.Load() != gen {
+					continue // 已按 peer_left 语义拆除读取（不再交付应用层）
 				}
 				c.mu.Lock()
 				c.received = append(c.received, pkt)
@@ -238,6 +247,11 @@ func (c *testClient) countMatching(sent *sentSet) int {
 	}
 	return n
 }
+
+// stopTrackReaders 模拟真实客户端收到 channel.peer_left 后拆除该路读取循环
+// （remote.RemovePeer）：旧读取循环不再向应用层交付包。之后新 OnTrack 的读取循环
+// 以新代际继续计数。
+func (c *testClient) stopTrackReaders() { c.gen.Add(1) }
 
 // ---- 集成测试 ----
 

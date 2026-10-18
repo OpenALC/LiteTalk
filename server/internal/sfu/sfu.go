@@ -194,7 +194,7 @@ func (s *SFU) AddICECandidate(roomID, userID string, c webrtc.ICECandidateInit) 
 
 // LeaveIf 成员离开（§0.9 身份核对）：仅当 peer 归属 connID 时移除路由、关闭其
 // PeerConnection；同 uid 的新连接已顶替旧 peer 时这里是无操作，不会误删。
-// 其他成员的 outbound track 惰性保留（停写即可）。
+// 其他成员指向它的下行轨道一并摘除（#23：惰性保留会让重入房拿不到新 OnTrack）。
 func (s *SFU) LeaveIf(roomID, userID, connID string) {
 	room := s.findRoom(roomID)
 	if room == nil {
