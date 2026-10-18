@@ -31,6 +31,24 @@ type testClient struct {
 
 	tracksUp atomic.Int64 // OnTrack 次数（重入房断言用：订阅端必须拿到新 OnTrack）
 	gen      atomic.Int64 // 读取代际：stopTrackReaders 后旧循环停计数（模拟 peer_left 拆读取循环）
+
+	failedMu sync.Mutex
+	failed   []string // SendFailed 记录（#19）："<channelID>|<userID>|<reason>"
+}
+
+// SendFailed 实现 SignalSender（#19）：ICE 失败通知本端，记录供断言。
+// 不用 t.Logf：清理期的异步状态回调可能在测试结束后到达（go test 禁止后置日志）。
+func (c *testClient) SendFailed(channelID, userID, reason string) {
+	c.failedMu.Lock()
+	c.failed = append(c.failed, channelID+"|"+userID+"|"+reason)
+	c.failedMu.Unlock()
+}
+
+// failedCalls 返回 SendFailed 记录快照。
+func (c *testClient) failedCalls() []string {
+	c.failedMu.Lock()
+	defer c.failedMu.Unlock()
+	return append([]string(nil), c.failed...)
 }
 
 func newTestSFU(t *testing.T, maxMembers int) *SFU {

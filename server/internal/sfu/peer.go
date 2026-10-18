@@ -93,10 +93,38 @@ func newPeer(room *Room, userID, connID string, sig SignalSender) (*Peer, error)
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		p.room.sfu.log.Printf("sfu: %s 连接状态 %s（房间 %s）", p.userID, state, p.room.id)
-		// M2：断连清理由 WS 层驱动；ICE 失败仅记录，待 M3 接入 ICE restart
+		// ICE 失败 / 非主动关闭（对端销毁 PC、DTLS CloseNotify）→ 清理（#19）。
+		// 主动 close（离房、连接顶替）不动：closed 先于 pc.Close 置位，据此分辨。
+		if state != webrtc.PeerConnectionStateFailed && state != webrtc.PeerConnectionStateClosed {
+			return
+		}
+		p.mu.Lock()
+		deliberate := p.closed
+		p.mu.Unlock()
+		if deliberate {
+			return
+		}
+		p.onConnFailed()
 	})
 
 	return p, nil
+}
+
+// reasonICEFailed rtc.failed.reason 的标准取值（契约 0.2 固定 "ice_failed"）。
+const reasonICEFailed = "ice_failed"
+
+// onConnFailed ICE 失败清理（#19）：按**实例**核对摘除本 peer（含其余成员指向
+// 本端的下行路由，#23），并只通知本端连接 rtc.failed。同 WS 连接重入的新 peer
+// 与本实例共享 connID，只有指针核对不会误杀它。其余成员的 channel.peer_left 由
+// 信令层（signal/fail.go）在收到 SendFailed 后广播。
+func (p *Peer) onConnFailed() {
+	if !p.room.removePeerInstance(p) {
+		return
+	}
+	p.room.sfu.log.Printf("sfu: %s 连接失败清理完成（房间 %s）", p.userID, p.room.id)
+	if p.signal != nil {
+		p.signal.SendFailed(p.room.id, p.userID, reasonICEFailed)
+	}
 }
 
 // handleInitialOffer 处理客户端初始 offer（每个 peer 仅一次），返回 answer SDP。

@@ -1052,6 +1052,11 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 		OnServerShutdown: func(reason string) {
 			a.emit("sys:shutdown", map[string]any{"reason": reason})
 		},
+		// ICE 失败重建（rtc.failed，#19）：Go 侧已销毁 PC 并重发 join，前端仅
+		// 提示语音链路重建中。回调跑在 ws 读循环 goroutine，不得同步断开会话。
+		OnRTCFailed: func(channelID string) {
+			a.emit("rtc:failed", map[string]any{"channel_id": channelID})
+		},
 	}
 	server := a.cfg.Resolve().WSURL
 	sess := state.NewSession(a.api, token, nickname, ev, log.Default())
