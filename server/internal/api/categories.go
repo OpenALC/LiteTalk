@@ -36,7 +36,7 @@ func (s *Server) CreateCategory(ctx context.Context, request CreateCategoryReque
 	if err := s.store.CreateCategory(ctx, cat); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	return CreateCategory201JSONResponse(*cat), nil
+	return CreateCategory201JSONResponse(categoryView(cat)), nil
 }
 
 // DeleteCategory DELETE /api/v1/categories/{id}（owner/admin，v0.1.2）。
@@ -83,7 +83,8 @@ func (s *Server) PatchCategory(ctx context.Context, request PatchCategoryRequest
 	if e := checkID(request.Id); e != nil {
 		return nil, e
 	}
-	if request.Body == nil {
+	req := patchBody(request.JSONBody, request.ApplicationMergePatchPlusJSONBody)
+	if req == nil {
 		return nil, bodyMissing()
 	}
 	c := currentUser(ctx)
@@ -95,21 +96,25 @@ func (s *Server) PatchCategory(ctx context.Context, request PatchCategoryRequest
 	if e := s.requireRole(ctx, cat.ServerID, c.UserID, store.RoleAdmin); e != nil {
 		return nil, e
 	}
-	req := request.Body
-	if req.Name == nil && req.Position == nil {
+	// Merge Patch（#31）：缺省不改，null = 清空（name 不可清 → 校验拒 400；
+	// position 的 null 拒 400）。至少给一个字段。
+	if !req.Name.Set && !req.Position.Set {
 		return nil, errf(http.StatusBadRequest, "bad_request", "name 与 position 至少给一个")
 	}
-	if req.Name != nil {
-		if !validCategoryName(*req.Name) {
+	if req.Name.Set {
+		if !validCategoryName(req.Name.Val) {
 			return nil, errf(http.StatusBadRequest, "bad_name", "分类名需为 1–32 个字符")
 		}
-		cat.Name = *req.Name
+		cat.Name = req.Name.Val
 		if err := s.store.UpdateCategory(ctx, cat); err != nil {
 			return nil, s.writeStoreErr(ctx, err)
 		}
 	}
-	if req.Position != nil {
-		if err := s.store.ReorderCategories(ctx, cat.ServerID, request.Id, *req.Position); err != nil {
+	if req.Position.Set {
+		if req.Position.Clearing() {
+			return nil, errf(http.StatusBadRequest, "bad_request", "position 不可清除")
+		}
+		if err := s.store.ReorderCategories(ctx, cat.ServerID, request.Id, req.Position.Val); err != nil {
 			return nil, s.writeStoreErr(ctx, err)
 		}
 		// 重排后重新读回，响应里的 position 是最终序号。
@@ -117,5 +122,5 @@ func (s *Server) PatchCategory(ctx context.Context, request PatchCategoryRequest
 			cat = updated
 		}
 	}
-	return PatchCategory200JSONResponse(*cat), nil
+	return PatchCategory200JSONResponse(categoryView(cat)), nil
 }

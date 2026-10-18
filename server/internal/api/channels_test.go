@@ -18,17 +18,17 @@ func TestCreateChannelCategory(t *testing.T) {
 		resp := postJSON(t, h, "/api/v1/servers", aAccess, map[string]string{
 			"name": name, "icon_name": "music", "icon_color": "#4FA4F3",
 		}, http.StatusCreated)
-		return int64(resp["id"].(float64))
+		return asID(resp["id"])
 	}
 	s1 := mk("服一")
 	s2 := mk("服二")
 
 	catResp := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/categories", s1), aAccess,
 		map[string]string{"name": "甲组"}, http.StatusCreated)
-	catID := int64(catResp["id"].(float64))
+	catID := asID(catResp["id"])
 	cat2Resp := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/categories", s2), aAccess,
 		map[string]string{"name": "乙组"}, http.StatusCreated)
-	cat2ID := int64(cat2Resp["id"].(float64))
+	cat2ID := asID(cat2Resp["id"])
 
 	// 显式归入分类：落库后 ListChannels 原样带回。
 	postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/channels", s1), aAccess,
@@ -39,7 +39,7 @@ func TestCreateChannelCategory(t *testing.T) {
 		t.Fatalf("频道数应为 1，实际 %d", len(chans))
 	}
 	got := chans[0].(map[string]any)
-	if got["category_id"] != float64(catID) {
+	if asID(got["category_id"]) != catID {
 		t.Fatalf("category_id 应为 %d，实际 %v", catID, got["category_id"])
 	}
 

@@ -1197,7 +1197,8 @@ func (a *App) ListServers() ([]state.ServerDTO, error) {
 }
 
 // ListChannels 列出服务器的分类与频道（成员可读）；重启后频道列表恢复用。
-func (a *App) ListChannels(serverID int64) (*state.ServerChannels, error) {
+// ID 参数一律十进制字符串（#31：Snowflake 超出 JS Number 精度，桥上不用数字）。
+func (a *App) ListChannels(serverID string) (*state.ServerChannels, error) {
 	return a.api.ListChannels(serverID)
 }
 
@@ -1212,54 +1213,54 @@ func (a *App) JoinServerByCode(code string) (*state.ServerDTO, error) {
 }
 
 // RenameServer 重命名服务器（owner/admin）。
-func (a *App) RenameServer(id int64, name string) error {
+func (a *App) RenameServer(id string, name string) error {
 	return a.api.RenameServer(id, name)
 }
 
 // DeleteServer 删除服务器（仅 owner）。
-func (a *App) DeleteServer(id int64) error {
+func (a *App) DeleteServer(id string) error {
 	return a.api.DeleteServer(id)
 }
 
 // CreateInviteCode 为服务器生成邀请码（admin 及以上），返回纯 code。
-func (a *App) CreateInviteCode(serverID int64) (string, error) {
+func (a *App) CreateInviteCode(serverID string) (string, error) {
 	return a.api.CreateInvite(serverID)
 }
 
-// CreateChannel 新建频道（typ: text / voice；categoryID 0 = 不归类）。
-func (a *App) CreateChannel(serverID int64, name, typ string, categoryID int64) (*state.ChannelDTO, error) {
+// CreateChannel 新建频道（typ: text / voice；categoryID 空串/「0」= 不归类）。
+func (a *App) CreateChannel(serverID string, name, typ string, categoryID string) (*state.ChannelDTO, error) {
 	return a.api.CreateChannel(serverID, name, typ, categoryID)
 }
 
 // RenameChannel 重命名频道（owner/admin）。
-func (a *App) RenameChannel(id int64, name string) error {
+func (a *App) RenameChannel(id string, name string) error {
 	return a.api.RenameChannel(id, name)
 }
 
 // DeleteChannel 删除频道（owner/admin）。
-func (a *App) DeleteChannel(id int64) error {
+func (a *App) DeleteChannel(id string) error {
 	return a.api.DeleteChannel(id)
 }
 
 // CreateCategory 创建频道分类（owner/admin；1–32 字）。
-func (a *App) CreateCategory(serverID int64, name string) (*state.CategoryDTO, error) {
+func (a *App) CreateCategory(serverID string, name string) (*state.CategoryDTO, error) {
 	return a.api.CreateCategory(serverID, name)
 }
 
 // DeleteCategory 删除分类；withChannels=true 级联删除其下频道（服务端单事务）。
-func (a *App) DeleteCategory(id int64, withChannels bool) error {
+func (a *App) DeleteCategory(id string, withChannels bool) error {
 	return a.api.DeleteCategory(id, withChannels)
 }
 
 // RenameCategory 重命名分类（owner/admin；1–32 字）。
-func (a *App) RenameCategory(id int64, name string) error {
+func (a *App) RenameCategory(id string, name string) error {
 	return a.api.RenameCategory(id, name)
 }
 
 // UpdateCategory 改分类名/位置（owner/admin）。Wails 绑定不用指针参数：
 // name 为空串表示不改名，position < 0 表示不改位置；position 为目标序（0-based），
 // 服务端移到此位置并重排同服务器其它分类为 0..n-1。
-func (a *App) UpdateCategory(id int64, name string, position int) (*state.CategoryDTO, error) {
+func (a *App) UpdateCategory(id string, name string, position int) (*state.CategoryDTO, error) {
 	var n *string
 	if name != "" {
 		n = &name
@@ -1282,13 +1283,13 @@ func (a *App) SendFriendRequest(target string) error {
 func (a *App) ListFriends() ([]state.FriendDTO, error) { return a.api.ListFriends() }
 
 // AcceptFriend 接受好友请求（仅被请求方）。
-func (a *App) AcceptFriend(id int64) error { return a.api.AcceptFriend(id) }
+func (a *App) AcceptFriend(id string) error { return a.api.AcceptFriend(id) }
 
 // RemoveFriend 删除好友关系。
-func (a *App) RemoveFriend(id int64) error { return a.api.RemoveFriend(id) }
+func (a *App) RemoveFriend(id string) error { return a.api.RemoveFriend(id) }
 
 // UpdateFriend 设置好友备注/分组（仅发起方向；空串清除）。
-func (a *App) UpdateFriend(id int64, remark, group string) error {
+func (a *App) UpdateFriend(id string, remark, group string) error {
 	return a.api.UpdateFriend(id, remark, group)
 }
 

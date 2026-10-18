@@ -54,29 +54,30 @@ type GoApp = {
   SendChat(channelID: string, content: string): Promise<void>
   GetVoiceMembers(): Promise<PeerView[]>
   LogFromWeb(level: string, msg: string): Promise<void>
-  // 服务器/频道/好友 REST CRUD（服务端已有端点；批次①接线）
+  // 服务器/频道/好友 REST CRUD（服务端已有端点；批次①接线）。
+  // ID 一律十进制字符串（#31：Snowflake 超出 JS Number 精度）。
   ListServers(): Promise<ServerDTO[]>
-  ListChannels(serverID: number): Promise<ServerChannels>
+  ListChannels(serverID: string): Promise<ServerChannels>
   CreateServer(name: string): Promise<ServerDTO>
   JoinServerByCode(code: string): Promise<ServerDTO>
-  RenameServer(id: number, name: string): Promise<void>
-  DeleteServer(id: number): Promise<void>
-  CreateInviteCode(serverID: number): Promise<string>
-  // categoryID 0 = 不归类（#72 新建即归组，不用等重启对账）。
-  CreateChannel(serverID: number, name: string, typ: string, categoryID: number): Promise<ChannelDTO>
-  RenameChannel(id: number, name: string): Promise<void>
-  DeleteChannel(id: number): Promise<void>
-  CreateCategory(serverID: number, name: string): Promise<CategoryDTO>
-  DeleteCategory(id: number, withChannels: boolean): Promise<void>
+  RenameServer(id: string, name: string): Promise<void>
+  DeleteServer(id: string): Promise<void>
+  CreateInviteCode(serverID: string): Promise<string>
+  // categoryID 空串/「0」= 不归类（#72 新建即归组，不用等重启对账）。
+  CreateChannel(serverID: string, name: string, typ: string, categoryID: string): Promise<ChannelDTO>
+  RenameChannel(id: string, name: string): Promise<void>
+  DeleteChannel(id: string): Promise<void>
+  CreateCategory(serverID: string, name: string): Promise<CategoryDTO>
+  DeleteCategory(id: string, withChannels: boolean): Promise<void>
   // 分类改名/排序（PATCH /categories/{id}）：name 空串 = 不改名，position < 0 = 不改位置。
-  RenameCategory(id: number, name: string): Promise<void>
-  UpdateCategory(id: number, name: string, position: number): Promise<CategoryDTO>
+  RenameCategory(id: string, name: string): Promise<void>
+  UpdateCategory(id: string, name: string, position: number): Promise<CategoryDTO>
   SendFriendRequest(target: string): Promise<void>
   // 好友真实 REST（v0.1.2 批次③消费）
   ListFriends(): Promise<FriendDTO[]>
-  AcceptFriend(id: number): Promise<void>
-  RemoveFriend(id: number): Promise<void>
-  UpdateFriend(id: number, remark: string, group: string): Promise<void>
+  AcceptFriend(id: string): Promise<void>
+  RemoveFriend(id: string): Promise<void>
+  UpdateFriend(id: string, remark: string, group: string): Promise<void>
   // 介绍页/首页（v0.1.2：客户端级偏好，存 config.json）
   GetHomeServer(): Promise<string>
   SetHomeServer(id: string): Promise<void>
@@ -134,7 +135,7 @@ const mockApp: GoApp = {
     return {
       access_token: 'dev-token', refresh_token: 'dev-refresh',
       user: {
-        id: 1, nickname: email.split('@')[0] || 'dev', tag: '0001', email,
+        id: '1', nickname: email.split('@')[0] || 'dev', tag: '0001', email,
         email_verified: true, is_guest: false, status: 0, online: true,
         created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z',
       },
@@ -149,7 +150,7 @@ const mockApp: GoApp = {
     return {
       access_token: 'dev-token', refresh_token: 'dev-refresh',
       user: {
-        id: 2, nickname: '游客-0000', tag: '0000', email: '',
+        id: '2', nickname: '游客-0000', tag: '0000', email: '',
         email_verified: false, is_guest: true, status: 0, online: true,
         created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z',
       },
@@ -157,7 +158,7 @@ const mockApp: GoApp = {
   },
   async GetMe() {
     return {
-      id: 1, nickname: 'dev', tag: '0001', email: 'dev@example.com',
+      id: '1', nickname: 'dev', tag: '0001', email: 'dev@example.com',
       email_verified: true, is_guest: false, status: 0, online: true,
       created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z',
     }
@@ -198,37 +199,38 @@ const mockApp: GoApp = {
   async GetVoiceState() { return { channel_id: '', muted: false, deafened: false } },
   async RequestVoiceState() {},
   // 以下为批次①新增的服务器/频道/好友桩：返回可联调 UI 的假数据。
+  // ID 均为字符串（#31 wire 口径）。
   async ListServers() { return [] },
-  async ListChannels(serverID: number) {
+  async ListChannels(serverID: string) {
     return {
-      categories: [{ id: 1, server_id: serverID, name: '默认分类', position: 0, created_at: '2026-01-01T00:00:00Z' }],
-      channels: [{ id: 11, server_id: serverID, name: '大厅', type: 'voice' as const, category_id: 1, position: 0, created_at: '2026-01-01T00:00:00Z' }],
+      categories: [{ id: '1', server_id: serverID, name: '默认分类', position: 0, created_at: '2026-01-01T00:00:00Z' }],
+      channels: [{ id: '11', server_id: serverID, name: '大厅', type: 'voice' as const, category_id: '1', position: 0, created_at: '2026-01-01T00:00:00Z' }],
     }
   },
   async CreateServer(name: string) {
-    return { id: Date.now(), name, owner_id: 1, icon_name: 'messages-square', icon_color: '#4FA4F3', created_at: '2026-01-01T00:00:00Z' }
+    return { id: String(Date.now()), name, owner_id: '1', icon_name: 'messages-square', icon_color: '#4FA4F3', created_at: '2026-01-01T00:00:00Z' }
   },
   async JoinServerByCode() {
-    return { id: Date.now(), name: '加入的服务器', owner_id: 2, icon_name: 'messages-square', icon_color: '#4FA4F3', created_at: '2026-01-01T00:00:00Z' }
+    return { id: String(Date.now()), name: '加入的服务器', owner_id: '2', icon_name: 'messages-square', icon_color: '#4FA4F3', created_at: '2026-01-01T00:00:00Z' }
   },
   async RenameServer() {},
   async DeleteServer() {},
   async CreateInviteCode() { return 'mock-invite-code' },
-  async CreateChannel(serverID: number, name: string, typ: string, categoryID: number) {
+  async CreateChannel(serverID: string, name: string, typ: string, categoryID: string) {
     return {
-      id: Date.now(), server_id: serverID, name, type: typ as 'text' | 'voice',
+      id: String(Date.now()), server_id: serverID, name, type: typ as 'text' | 'voice',
       category_id: categoryID || null, position: 0, created_at: '2026-01-01T00:00:00Z',
     }
   },
   async RenameChannel() {},
   async DeleteChannel() {},
-  async CreateCategory(serverID: number, name: string) {
-    return { id: Date.now(), server_id: serverID, name, position: 0, created_at: '2026-01-01T00:00:00Z' }
+  async CreateCategory(serverID: string, name: string) {
+    return { id: String(Date.now()), server_id: serverID, name, position: 0, created_at: '2026-01-01T00:00:00Z' }
   },
   async DeleteCategory() {},
   async RenameCategory() {},
-  async UpdateCategory(id: number, name: string, position: number) {
-    return { id, server_id: 0, name: name || `分类${id}`, position: position < 0 ? 0 : position, created_at: '2026-01-01T00:00:00Z' }
+  async UpdateCategory(id: string, name: string, position: number) {
+    return { id, server_id: '0', name: name || `分类${id}`, position: position < 0 ? 0 : position, created_at: '2026-01-01T00:00:00Z' }
   },
   async SendFriendRequest() {},
   // 好友真实 REST 桩：空列表（浏览器开发环境无可联调数据）。

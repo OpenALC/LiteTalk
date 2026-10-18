@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -9,7 +10,9 @@ import (
 	"github.com/OpenALC/LiteTalk/server/internal/store"
 )
 
-// ListMessages GET /api/v1/channels/{id}/messages?before_id=&limit=（分页 50 条）
+// ListMessages GET /api/v1/channels/{id}/messages?before=&after=&limit=（游标分页 50 条，#31）
+// 游标语义：before 取更旧一页（ID 小于游标最新 limit 条）、after 取更新一页，
+// 均按旧→新正序返回。禁 offset。before_id 是 before 的旧别名（兼容一个版本）。
 func (s *Server) ListMessages(ctx context.Context, request ListMessagesRequestObject) (ListMessagesResponseObject, error) {
 	if e := checkID(request.Id); e != nil {
 		return nil, e
@@ -23,25 +26,41 @@ func (s *Server) ListMessages(ctx context.Context, request ListMessagesRequestOb
 	if _, err := s.store.Member(ctx, ch.ServerID, c.UserID); err != nil {
 		return nil, errf(http.StatusForbidden, "forbidden", "不是服务器成员")
 	}
-	var beforeID int64
-	if v := request.Params.BeforeId; v != nil {
+	// 游标互斥：before（含旧别名 before_id）优先于 after。
+	var beforeID, afterID int64
+	if v := request.Params.Before; v != nil {
 		beforeID = *v
+	} else if v := request.Params.BeforeId; v != nil {
+		beforeID = *v // 旧参数别名（#31 兼容窗口，一个版本后移除）
+	} else if v := request.Params.After; v != nil {
+		afterID = *v
+	}
+	if beforeID < 0 || afterID < 0 {
+		return nil, errf(http.StatusBadRequest, "bad_cursor", "游标须为非负 ID")
 	}
 	limit := 50
 	if v := request.Params.Limit; v != nil && *v > 0 && *v <= 50 {
 		limit = *v
 	}
+	if afterID > 0 {
+		msgs, err := s.store.MessagesAfter(ctx, ch.ID, afterID, limit)
+		if err != nil {
+			return nil, s.writeStoreErr(ctx, err)
+		}
+		return ListMessages200JSONResponse(messageViews(msgs)), nil
+	}
 	msgs, err := s.store.MessagesBefore(ctx, ch.ID, beforeID, limit)
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	return ListMessages200JSONResponse(msgs), nil
+	return ListMessages200JSONResponse(messageViews(msgs)), nil
 }
 
 // 消息发送频控：20 条/分钟/用户。
 const msgRateLimit = 20
 
-// CreateMessage POST /api/v1/channels/{id}/messages（≤2000 字 + 频控）
+// CreateMessage POST /api/v1/channels/{id}/messages（≤2000 字 + 频控 + nonce 幂等，#31）
+// nonce 幂等：同用户同 nonce 只落一条，重复提交回读原消息 200（弱网重试对账）。
 func (s *Server) CreateMessage(ctx context.Context, request CreateMessageRequestObject) (CreateMessageResponseObject, error) {
 	if e := checkID(request.Id); e != nil {
 		return nil, e
@@ -64,18 +83,33 @@ func (s *Server) CreateMessage(ctx context.Context, request CreateMessageRequest
 	if n := len([]rune(content)); n == 0 || n > 2000 {
 		return nil, errf(http.StatusBadRequest, "bad_content", "消息长度需为 1–2000 字符")
 	}
-	allowed, err := s.limits.Allow(ctx, "msg:"+strconv.FormatInt(c.UserID, 10), msgRateLimit, time.Minute)
-	if err != nil || !allowed {
-		return nil, errf(http.StatusTooManyRequests, "rate_limited", "发送过于频繁")
+	var nonce string
+	if request.Body.Nonce != nil {
+		nonce = *request.Body.Nonce
+		if len(nonce) > 64 {
+			return nil, errf(http.StatusBadRequest, "bad_nonce", "nonce 需为 0–64 字符")
+		}
+	}
+	if e := s.allowRate(ctx, "msg:"+strconv.FormatInt(c.UserID, 10), msgRateLimit, time.Minute, "发送过于频繁"); e != nil {
+		return nil, e
 	}
 	msg := &store.Message{
 		ChannelID: ch.ID,
 		UserID:    c.UserID,
 		Content:   content,
+		Nonce:     nonce,
 	}
 	if err := s.store.CreateMessage(ctx, msg); err != nil {
+		// 撞 (user_id, nonce) 唯一索引 = 幂等重放：回读原消息返回 200。
+		if nonce != "" && errors.Is(err, store.ErrConflict) {
+			orig, rerr := s.store.MessageByNonce(ctx, c.UserID, nonce)
+			if rerr != nil {
+				return nil, s.writeStoreErr(ctx, rerr)
+			}
+			return CreateMessage200JSONResponse(messageView(orig)), nil
+		}
 		return nil, s.writeStoreErr(ctx, err)
 	}
 	msg.SenderNickname, msg.SenderTag = c.Nickname, c.Tag
-	return CreateMessage201JSONResponse(*msg), nil
+	return CreateMessage201JSONResponse(messageView(msg)), nil
 }

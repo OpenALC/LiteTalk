@@ -38,7 +38,7 @@ func TestFriendsResponseNoEmail(t *testing.T) {
 		map[string]string{"nickname": fmt.Sprintf("隐私B#%s", bu.Tag)}, 201)
 	assertNoEmail(t, fr)
 
-	fid := int(fr["id"].(float64))
+	fid := int(asID(fr["id"]))
 
 	// B 接受（响应对 A 视角）。
 	acc := postJSON(t, h, fmt.Sprintf("/api/v1/friends/requests/%d/accept", fid), bTok, nil, 200)
@@ -86,7 +86,7 @@ func TestPatchFriendRemark(t *testing.T) {
 	}
 	req := postJSON(t, h, "/api/v1/friends/requests", aTok,
 		map[string]string{"nickname": fmt.Sprintf("好友B#%s", bu.Tag)}, 201)
-	fid := req["id"].(float64)
+	fid := asID(req["id"])
 	postJSON(t, h, fmt.Sprintf("/api/v1/friends/requests/%d/accept", int(fid)), bTok, nil, 200)
 
 	// A（发起方）设置备注与分组。
@@ -122,7 +122,7 @@ func TestCategoriesCRUD(t *testing.T) {
 
 	// A 建服务器。
 	sv := postJSON(t, h, "/api/v1/servers", aTok, map[string]string{"name": "测试服"}, 201)
-	sid := int(sv["id"].(float64))
+	sid := int(asID(sv["id"]))
 	// B 经邀请加入（成员可读频道）。
 	inv := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/invites", sid), aTok, map[string]any{}, 201)
 	postJSON(t, h, "/api/v1/servers/join", bTok, map[string]string{"code": inv["code"].(string)}, 200)
@@ -130,12 +130,12 @@ func TestCategoriesCRUD(t *testing.T) {
 	// 创建分类。
 	cat := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/categories", sid), aTok,
 		map[string]string{"name": "语音分组"}, 201)
-	catID := int(cat["id"].(float64))
+	catID := int(asID(cat["id"]))
 
 	// 在分类下建频道（先建频道再 PATCH 归属，createChannelReq 无 category 字段）。
 	ch := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/channels", sid), aTok,
 		map[string]any{"name": "开黑房", "type": "voice"}, 201)
-	chID := int(ch["id"].(float64))
+	chID := int(asID(ch["id"]))
 	patchJSON(t, h, fmt.Sprintf("/api/v1/channels/%d", chID), aTok,
 		map[string]any{"category_id": catID}, 200)
 
@@ -149,7 +149,7 @@ func TestCategoriesCRUD(t *testing.T) {
 	found := false
 	for _, c := range chans {
 		m := c.(map[string]any)
-		if m["category_id"] != nil && int(m["category_id"].(float64)) == catID {
+		if m["category_id"] != nil && int(asID(m["category_id"])) == catID {
 			found = true
 		}
 	}
@@ -176,7 +176,7 @@ func TestCategoryForbidden(t *testing.T) {
 	aTok, _ := registerUser(t, h, mem, "da@ex.com", "权限A", "password123")
 	bTok, _ := registerUser(t, h, mem, "db@ex.com", "权限B", "password123")
 	sv := postJSON(t, h, "/api/v1/servers", aTok, map[string]string{"name": "权限服"}, 201)
-	sid := int(sv["id"].(float64))
+	sid := int(asID(sv["id"]))
 	inv := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/invites", sid), aTok, map[string]any{}, 201)
 	postJSON(t, h, "/api/v1/servers/join", bTok, map[string]string{"code": inv["code"].(string)}, 200)
 
@@ -195,7 +195,7 @@ func TestPatchCategory(t *testing.T) {
 	cTok, _ := registerUser(t, h, mem, "pc@ex.com", "路人C", "password123")
 
 	sv := postJSON(t, h, "/api/v1/servers", aTok, map[string]string{"name": "改名服"}, 201)
-	sid := int(sv["id"].(float64))
+	sid := int(asID(sv["id"]))
 	inv := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/invites", sid), aTok, map[string]any{}, 201)
 	postJSON(t, h, "/api/v1/servers/join", bTok, map[string]string{"code": inv["code"].(string)}, 200)
 
@@ -204,7 +204,7 @@ func TestPatchCategory(t *testing.T) {
 	for _, name := range []string{"甲", "乙", "丙"} {
 		cat := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/categories", sid), aTok,
 			map[string]string{"name": name}, 201)
-		catIDs = append(catIDs, int(cat["id"].(float64)))
+		catIDs = append(catIDs, int(asID(cat["id"])))
 	}
 
 	// 未登录 → 401。
@@ -231,7 +231,7 @@ func TestPatchCategory(t *testing.T) {
 	// owner 改名 → 200，响应回带最终字段。
 	out = patchJSON(t, h, fmt.Sprintf("/api/v1/categories/%d", catIDs[0]), aTok,
 		map[string]any{"name": "甲改"}, 200)
-	if out["name"] != "甲改" || int(out["id"].(float64)) != catIDs[0] {
+	if out["name"] != "甲改" || int(asID(out["id"])) != catIDs[0] {
 		t.Fatalf("改名响应 = %+v", out)
 	}
 
