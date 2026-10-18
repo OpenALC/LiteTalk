@@ -15,6 +15,10 @@
 *.json  text eol=lf
 *.sql   text eol=lf
 
+# 容器构建（#27）：CRLF 会打断 Dockerfile 的反斜杠续行
+Dockerfile     text eol=lf
+.dockerignore  text eol=lf
+
 # 前端（Vue/TS 源码与工程配置）
 *.ts    text eol=lf
 *.tsx   text eol=lf

@@ -1,0 +1,65 @@
+# LiteTalk 服务端一键起服（#27）：单二进制 + SQLite + 进程内 KV，无外部依赖。
+# 用法：
+#   LITETALK_JWT_SECRET=$(openssl rand -hex 32) \
+#   LITETALK_DOMAIN=voice.example.com docker compose up -d
+# 起服后管理员邀请码打印在容器日志：docker logs litetalk
+services:
+  litetalk:
+    build:
+      context: .
+      args:
+        VERSION: "${VERSION:-dev}"
+    image: litetalk-server:${VERSION:-dev}
+    container_name: litetalk
+    restart: unless-stopped
+    environment:
+      # 必填：至少 32 字节随机串。生产守卫拒绝 CHANGE_ME 等公开示例值。
+      LITETALK_JWT_SECRET: "${LITETALK_JWT_SECRET:?请设置 LITETALK_JWT_SECRET}"
+      # 域名非空即启用 ACME 自动签发（80/443 双监听），并自动推导 SFU 宣告地址
+      #——无需手填 LITETALK_SFU_IP（#27）。留空 = 纯 HTTP，仅限开发。
+      LITETALK_DOMAIN: "${LITETALK_DOMAIN:-}"
+      LITETALK_DATA_DIR: /data
+      LITETALK_STORE: sqlite
+      # 无域名部署（--behind-proxy 等）必须显式设公网 IP，否则生产拒环回：
+      # LITETALK_SFU_IP: 203.0.113.10
+      # 反代终结 TLS 时取消注释（不启 ACME）：
+      # LITETALK_BEHIND_PROXY: "1"
+      # LITETALK_TRUSTED_PROXIES: 172.16.0.0/12
+    volumes:
+      - ./data:/data
+    ports:
+      - "80:80"            # ACME HTTP-01 挑战与 301（无 TLS 时也可用）
+      - "443:443"          # TLS（ACME 自动签发）
+      - "8077:8077"        # 纯 HTTP API（未启用 TLS 时的 LITETALK_ADDR）
+      - "7845:7845/udp"    # SFU 媒体（ICE-Lite UDP mux）
+      - "7845:7845/tcp"    # ICE-TCP（UDP 被封网络直连）
+      - "3478:3478/udp"    # 内置 TURN
+      - "3478:3478/tcp"
+      - "49152-49200:49152-49200/udp" # TURN 中继段（LITETALK_TURN_RELAY_PORT[_END]）
+    # 非 root 镜像绑定 80/443（ACME）：把特权端口下限调为 0（内核 ≥4.11 / Docker ≥20.10）。
+    # 不支持的环境改用 `user: root`，或 --behind-proxy + 反代终结 TLS。
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "0"
+
+  # ---- 可选扩展：MySQL / Redis / 外部 coturn（默认不起，保持单二进制卖点）----
+  # 需要 MySQL 持久化时取消注释，并给 litetalk 配 LITETALK_MYSQL_DSN；
+  # 多实例部署必须配 LITETALK_REDIS_ADDR（单机进程内 KV 够用）。
+  # 外部 coturn 仅在关闭内置 TURN（LITETALK_TURN_PORT=0）时才需要。
+  # mysql:
+  #   image: mysql:8.4
+  #   restart: unless-stopped
+  #   environment:
+  #     MYSQL_DATABASE: litetalk
+  #     MYSQL_USER: litetalk
+  #     MYSQL_PASSWORD: ${MYSQL_PASSWORD:?请设置}
+  #     MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?请设置}
+  #   volumes:
+  #     - mysql-data:/var/lib/mysql
+  # redis:
+  #   image: redis:7.4
+  #   restart: unless-stopped
+  #   volumes:
+  #     - redis-data:/data
+# volumes:
+#   mysql-data:
+#   redis-data:
