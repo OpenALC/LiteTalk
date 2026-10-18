@@ -6,6 +6,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,9 +26,10 @@ type config struct {
 	printAdminInvite bool   // -print-admin-invite：打印管理员邀请码后退出（#27 T4 填实现）
 
 	// 校验输入（启动序步骤 2 集中把关；本批无对应 flag，仅 env）
-	jwtSecret string
-	sfuIP     string
-	authMode  string
+	jwtSecret     string
+	sfuIP         string
+	sfuIPExplicit bool // LITETALK_SFU_IP 显式设置过（显式 > --domain 推导）
+	authMode      string
 }
 
 // loadConfig 解析 flag 与 env。output 为 flag 用法/错误输出（main 传 os.Stderr，测试传 io.Discard）。
@@ -63,6 +66,7 @@ func loadConfig(args []string, output io.Writer) (*config, error) {
 		printAdminInvite: *printAdminInvite,
 		jwtSecret:        os.Getenv("LITETALK_JWT_SECRET"),
 		sfuIP:            envOr("LITETALK_SFU_IP", "127.0.0.1"),
+		sfuIPExplicit:    os.Getenv("LITETALK_SFU_IP") != "",
 		authMode:         envOr("LITETALK_AUTH_MODE", "full"),
 	}
 	if cfg.dataDir == "" {
@@ -90,6 +94,46 @@ func envBool(key string) bool {
 	return v == "1" || strings.EqualFold(v, "true")
 }
 
+// lookupIP 域名解析（测试可替换；生产 = net.LookupIP）。
+var lookupIP = net.LookupIP
+
+// resolveSFUIPFromDomain LITETALK_SFU_IP 未设且 --domain 已设时，解析域名取 IP 作为
+// SFU/TURN 宣告地址（#27 裁定 14）：ACME 能签下来就说明 DNS 已指向本机，解析出的
+// 公网 IP 正是 ICE 该宣告的地址（NAT 场景下也是网关公网 IP）。
+// 解析失败则报错并要求手动设置——不静默回落环回（那会把 ICE 候选宣告成不可达地址）。
+// 这不削弱 #22 的守卫：推导结果仍走 validateSFUIP，环回照样拒。
+func (c *config) resolveSFUIPFromDomain() error {
+	if c.sfuIPExplicit || c.domain == "" {
+		return nil
+	}
+	ips, err := lookupIP(c.domain)
+	if err != nil {
+		return fmt.Errorf("域名 %q 解析失败（%v），无法推导 SFU 宣告地址——请手动设置 LITETALK_SFU_IP", c.domain, err)
+	}
+	if len(ips) == 0 {
+		return fmt.Errorf("域名 %q 未解析到任何 IP，无法推导 SFU 宣告地址——请手动设置 LITETALK_SFU_IP", c.domain)
+	}
+	c.sfuIP = pickSFUIP(ips)
+	log.Printf("SFU 宣告地址: %s（由 --domain %s 解析推导；如不正确请显式设置 LITETALK_SFU_IP）", c.sfuIP, c.domain)
+	return nil
+}
+
+// pickSFUIP 优先非环回 IPv4（NAT1To1 的常见形态），再次非环回任意，最后兜底首个
+// （环回只在 dev 放行；生产由 validateSFUIP 拒掉）。
+func pickSFUIP(ips []net.IP) string {
+	for _, ip := range ips {
+		if ip.To4() != nil && !ip.IsLoopback() {
+			return ip.String()
+		}
+	}
+	for _, ip := range ips {
+		if !ip.IsLoopback() {
+			return ip.String()
+		}
+	}
+	return ips[0].String()
+}
+
 // validate 启动序步骤 2 集中校验（§0.6）：JWT secret、SFU IP 拒环回、auth mode、域名形态。
 // store 选型合法性由持久化区段的 pickStoreKind switch 把关（打开任何连接之前同样会拒）。
 // 生产三件套里的 KV 守卫在持久化区段（#24 已放宽：未配 Redis 走进程内 MemKV + 明示日志）。
@@ -97,8 +141,11 @@ func (c *config) validate(dev bool) error {
 	if err := validateJWTSecret(c.jwtSecret, dev); err != nil {
 		return fmt.Errorf("LITETALK_JWT_SECRET 不合法: %w（请设为至少 32 字节的随机串，如 openssl rand -hex 32）", err)
 	}
-	if err := validateSFUIP(c.sfuIP, dev); err != nil {
-		return fmt.Errorf("LITETALK_SFU_IP 不合法: %w", err)
+	if c.printAdminInvite {
+		// -print-admin-invite 只派生并打印邀请码就退出（#27），不起 SFU：
+		// 跳过 SFU IP 校验与域名推导，免得 DNS/网卡问题挡住邀请码找回。
+		// JWT 密钥仍必须校验——码由它派生，密钥不对打出来的是废码。
+		return nil
 	}
 	if c.authMode != "full" && c.authMode != "simple" {
 		return fmt.Errorf("LITETALK_AUTH_MODE 只支持 full / simple，实际为 %q", c.authMode)
@@ -108,6 +155,13 @@ func (c *config) validate(dev bool) error {
 		if strings.ContainsAny(c.domain, "/:\\ ") {
 			return fmt.Errorf("LITETALK_DOMAIN 只应是域名本身（不含协议/路径/端口），实际 %q", c.domain)
 		}
+	}
+	// LITETALK_SFU_IP 未设且 --domain 已设 → 解析域名推导宣告地址（#27 裁定 14）。
+	if err := c.resolveSFUIPFromDomain(); err != nil {
+		return err
+	}
+	if err := validateSFUIP(c.sfuIP, dev); err != nil {
+		return fmt.Errorf("LITETALK_SFU_IP 不合法: %w", err)
 	}
 	return nil
 }

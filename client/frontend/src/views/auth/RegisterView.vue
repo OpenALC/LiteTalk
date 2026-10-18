@@ -2,7 +2,7 @@
 // RegisterView 注册页（对齐 Auth.html：昵称/邮箱/验证码倒计时/密码强度）。
 import { computed, onUnmounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { Check, Eye, EyeOff, LockKeyhole, Mail, ShieldCheck, UserRound } from 'lucide-vue-next'
+import { Check, Eye, EyeOff, KeyRound, LockKeyhole, Mail, ShieldCheck, UserRound } from 'lucide-vue-next'
 import AuthLayout from './AuthLayout.vue'
 import Toast from '../../components/Toast.vue'
 import { useAuthStore } from '../../stores/auth'
@@ -13,7 +13,7 @@ const auth = useAuthStore()
 const toast = ref<InstanceType<typeof Toast>>()
 auth.loadConfig()
 
-const form = reactive({ nickname: '', email: '', code: '', password: '' })
+const form = reactive({ nickname: '', email: '', code: '', password: '', invite: '' })
 const invalid = reactive({ name: false, email: false, code: false, password: false })
 const showPwd = ref(false)
 const loading = ref(false)
@@ -48,6 +48,7 @@ function friendlyErr(e: unknown, fallback = auth.mailConfigured ? '操作失败�
   if (s.includes('daily_limit') || s.includes('上限')) return '今日发送次数已达上限'
   if (s.includes('email_taken') || s.includes('已注册')) return '邮箱已注册'
   if (s.includes('bad_credentials') || s.includes('密码错误')) return '邮箱或密码错误'
+  if (s.includes('bad_bootstrap') || s.includes('邀请码无效')) return '邀请码无效或已被使用'
   return fallback
 }
 
@@ -72,7 +73,7 @@ async function submit() {
   loading.value = true
   try {
     await auth.register(form.nickname.trim(), form.email.trim(), form.password,
-      auth.simpleMode ? '' : form.code)
+      auth.simpleMode ? '' : form.code, form.invite.trim())
     toast.value?.show('注册成功')
     router.push('/')
   } catch (e) {
@@ -127,6 +128,17 @@ onUnmounted(() => { if (cdTimer) clearInterval(cdTimer) })
                  maxlength="6" inputmode="numeric" @input="invalid.code = false">
         </div>
         <p class="field-err">请输入 6 位验证码</p>
+      </div>
+
+      <!-- 管理员邀请码（#27）：自托管引导，可选 -->
+      <div v-if="auth.showInviteField" class="field">
+        <label>邀请码</label>
+        <div class="input-wrap">
+          <KeyRound :size="17" />
+          <input v-model="form.invite" type="text" placeholder="管理员邀请码（选填）"
+                 maxlength="32" autocomplete="off">
+        </div>
+        <p v-if="auth.bootstrapRequired" class="field-hint">填入服务端终端打印的邀请码，创建你的服务器</p>
       </div>
 
       <div class="field" :class="{ invalid: invalid.password }">

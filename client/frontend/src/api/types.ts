@@ -20,6 +20,9 @@ export interface AuthResult {
 export interface ServerConfig {
   auth_mode: 'full' | 'simple'
   mail_configured: boolean
+  // 一键自托管形态与管理员邀请码是否未消费（#27）：注册页据此显示邀请码输入。
+  self_host?: boolean
+  bootstrap_required?: boolean
 }
 
 export interface PeerView {

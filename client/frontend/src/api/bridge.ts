@@ -27,7 +27,7 @@ type GoApp = {
   SendEmailCode(email: string, purpose: string): Promise<void>
   Login(email: string, password: string): Promise<AuthResult>
   LoginAsGuest(): Promise<AuthResult>
-  Register(nickname: string, email: string, password: string, code: string): Promise<AuthResult>
+  Register(nickname: string, email: string, password: string, code: string, bootstrap: string): Promise<AuthResult>
   ResetPassword(email: string, code: string, newPassword: string): Promise<void>
   Logout(): Promise<void>
   GetMe(): Promise<UserProfile>
@@ -105,7 +105,10 @@ declare global {
 // mock：浏览器开发环境的桩（登录一律成功、设备返回虚拟项）。
 const mockApp: GoApp = {
   async GetVersion() { return 'dev' },
-  async GetAuthConfig() { return { auth_mode: 'full', mail_configured: false } },
+  async GetAuthConfig() {
+    // mock 打开自托管引导，便于浏览器开发时看到注册页邀请码输入。
+    return { auth_mode: 'full' as const, mail_configured: false, self_host: true, bootstrap_required: true }
+  },
   async GetHibernateMode() { return 'off' },
   async SetHibernateMode() {},
   async QuitApp() {},

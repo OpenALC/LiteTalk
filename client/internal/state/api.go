@@ -348,8 +348,10 @@ func decodeError(status int, data []byte) error {
 
 // ServerConfig 服务端能力开关（GET /api/v1/config，免鉴权）。
 type ServerConfig struct {
-	AuthMode       string `json:"auth_mode"`       // full | simple
-	MailConfigured bool   `json:"mail_configured"` // 发信是否为真实投递
+	AuthMode          string `json:"auth_mode"`          // full | simple
+	MailConfigured    bool   `json:"mail_configured"`    // 发信是否为真实投递
+	SelfHost          bool   `json:"self_host"`          // 一键自托管形态（#26/#27）
+	BootstrapRequired bool   `json:"bootstrap_required"` // 管理员邀请码未消费（#27）
 }
 
 // GetServerConfig 获取服务端 Auth 模式与发信配置（客户端适配 UI 用）。
@@ -383,13 +385,15 @@ func (c *APIClient) SendEmailCode(email, purpose string) error {
 	return nil
 }
 
-// Register 注册（昵称+邮箱+密码+验证码）。
-func (c *APIClient) Register(nickname, email, password, code string) (*AuthResult, error) {
+// Register 注册（昵称+邮箱+密码+验证码+可选管理员邀请码 bootstrap，#27）。
+// bootstrap 空 = 不使用邀请码（字段仍上送，服务端视空为缺省）。
+func (c *APIClient) Register(nickname, email, password, code, bootstrap string) (*AuthResult, error) {
 	status, data, err := c.post("/auth/register", map[string]string{
-		"nickname": nickname,
-		"email":    email,
-		"password": password,
-		"code":     code,
+		"nickname":  nickname,
+		"email":     email,
+		"password":  password,
+		"code":      code,
+		"bootstrap": bootstrap,
 	}, false)
 	if err != nil {
 		return nil, err
