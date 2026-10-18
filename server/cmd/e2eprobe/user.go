@@ -193,7 +193,7 @@ func (u *probeUser) readLoop(ctx context.Context) {
 			u.joinedN.Add(1)
 		case signal.TypeChannelPeerLeft:
 			u.peerLeftN.Add(1)
-			var d signal.ChannelPeerLeftData
+			var d signal.PeerLeftData
 			if env.Decode(&d) == nil {
 				u.stopTrack(d.UserID) // 与真实客户端一致：peer_left 即拆该路读取（remote.RemovePeer）
 			}
@@ -216,7 +216,7 @@ func (u *probeUser) readLoop(ctx context.Context) {
 			if env.Decode(&d) == nil {
 				u.handleRenegotiation(d.SDP)
 			}
-		case signal.TypeRTCICE:
+		case signal.TypeRTCIce:
 			var d webrtc.ICECandidateInit
 			if env.Decode(&d) == nil {
 				u.applyCandidate(d)
@@ -308,7 +308,7 @@ func (u *probeUser) startPeer() error {
 
 	pc.OnICECandidate(func(ic *webrtc.ICECandidate) {
 		if ic != nil {
-			_ = u.wsSend(signal.TypeRTCICE, ic.ToJSON())
+			_ = u.wsSend(signal.TypeRTCIce, ic.ToJSON())
 		}
 	})
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {

@@ -514,13 +514,13 @@ func (h *Hub) handleMessage(c *client, data []byte) {
 			return
 		}
 		h.handleRTCAnswer(c, d.SDP)
-	case TypeRTCICE:
-		var d ICECandidateData
+	case TypeRTCIce:
+		var d ICEData
 		if err := env.Decode(&d); err != nil {
 			h.sendError(c, ErrCodeBadMessage, "rtc.ice 需要 candidate")
 			return
 		}
-		h.handleRTCCandidate(c, d)
+		h.handleRTCCandidate(c, toICECandidate(d))
 	case TypeVoiceState:
 		var d VoiceStateData
 		if err := env.Decode(&d); err != nil {
@@ -709,7 +709,7 @@ func (h *Hub) finishLeave(w leaveWork) {
 	}
 	h.log.Printf("ws: %s 离开频道 %s", w.c.userID, w.roomID)
 	for _, m := range w.remaining {
-		h.sendJSON(m, TypeChannelPeerLeft, ChannelPeerLeftData{
+		h.sendJSON(m, TypeChannelPeerLeft, PeerLeftData{
 			ChannelID: w.roomID,
 			UserID:    w.c.userID,
 		})
@@ -796,7 +796,8 @@ func (h *Hub) handleVoiceState(c *client, d VoiceStateData) {
 		h.sendError(c, ErrCodeNotInChannel, "不在频道中")
 		return
 	}
-	bcast := VoiceStateBroadcast{
+	// 下行广播的 user_id 由服务端补上；上行 VoiceStateData 不带（schema 同一载荷）。
+	bcast := VoiceStateData{
 		UserID:   c.userID,
 		Speaking: d.Speaking,
 		Mute:     d.Mute,
@@ -1031,5 +1032,5 @@ func (s *clientSignal) SendOffer(sdp string) {
 }
 
 func (s *clientSignal) SendCandidate(cand webrtc.ICECandidateInit) {
-	s.hub.sendJSON(s.c, TypeRTCICE, ICECandidateData(cand))
+	s.hub.sendJSON(s.c, TypeRTCIce, fromICECandidate(cand))
 }
