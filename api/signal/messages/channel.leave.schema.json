@@ -6,6 +6,7 @@
   "x-go-const": "TypeChannelLeave",
   "x-direction": "C2S",
   "x-since": 1,
+  "x-namespace": "voice",
   "description": "离开频道。载荷与 channel.join 同形；服务端以连接当前所在房间为准，channel_id 仅作回显。",
   "type": "object",
   "properties": {

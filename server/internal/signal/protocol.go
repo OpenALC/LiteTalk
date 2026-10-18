@@ -22,14 +22,16 @@ import (
 )
 
 // Envelope 信令信封：{ "type": "...", "data": {...}, "ts": 1734500000000 }。
-// seq 字段（协议 2 起可选）见 api/signal/envelope.schema.json，由 #32 接线。
+// seq（协议 2 起可选，#32）：事件面下行消息的会话（sid）内单调序号，
+// 见 api/signal/envelope.schema.json。语音面与连接控制消息不带（omitempty 不写）。
 type Envelope struct {
 	Type string          `json:"type"`
 	Data json.RawMessage `json:"data,omitempty"`
 	TS   int64           `json:"ts"`
+	Seq  int64           `json:"seq,omitempty"`
 }
 
-// MarshalEnvelope 打包一条下行消息，ts 取当前毫秒时间戳。
+// MarshalEnvelope 打包一条下行消息，ts 取当前毫秒时间戳（不带 seq）。
 func MarshalEnvelope(msgType string, data any) ([]byte, error) {
 	var raw json.RawMessage
 	if data != nil {
@@ -40,6 +42,12 @@ func MarshalEnvelope(msgType string, data any) ([]byte, error) {
 		raw = b
 	}
 	return json.Marshal(Envelope{Type: msgType, Data: raw, TS: time.Now().UnixMilli()})
+}
+
+// MarshalEnvelopePayload 用已序列化的 data 打包下行消息（#32）：
+// 事件环与线上投递共用同一份 payload，避免二次序列化。seq<=0 不写出。
+func MarshalEnvelopePayload(msgType string, payload json.RawMessage, ts, seq int64) ([]byte, error) {
+	return json.Marshal(Envelope{Type: msgType, Data: payload, TS: ts, Seq: seq})
 }
 
 // Decode 将信封 data 反序列化到 v。缺 data 视为错误（服务端上行必须带载荷）。

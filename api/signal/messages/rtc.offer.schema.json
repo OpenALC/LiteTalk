@@ -6,6 +6,7 @@
   "x-go-const": "TypeRTCOffer",
   "x-direction": "BOTH",
   "x-since": 1,
+  "x-namespace": "voice",
   "description": "SDP offer。载荷与 rtc.answer 同型，见 components.SDPData。",
   "$ref": "components.schema.json#/$defs/SDPData"
 }

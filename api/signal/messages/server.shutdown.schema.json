@@ -6,6 +6,7 @@
   "x-go-const": "TypeServerShutdown",
   "x-direction": "S2C",
   "x-since": 1,
+  "x-namespace": "event",
   "description": "优雅关闭广播。收到后停止自动重连并提示服务端已关闭。",
   "type": "object",
   "properties": {

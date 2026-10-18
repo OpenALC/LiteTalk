@@ -6,6 +6,7 @@
   "x-go-const": "TypeVoiceState",
   "x-direction": "BOTH",
   "x-since": 1,
+  "x-namespace": "voice",
   "description": "说话/静音/耳聋状态，字段均为可选增量（nil=本次未变）。上行 C→S 不带 user_id；下行广播由服务端补 user_id 标识来源。协议 2 起 speaking 由服务端按 RFC 6464 电平判定（v2 客户端停发 speaking），mute/deafen 仍走上行。",
   "type": "object",
   "properties": {

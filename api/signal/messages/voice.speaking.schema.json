@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litetalk:signal:voice.speaking",
+  "title": "VoiceSpeakingData",
+  "x-wire-type": "voice.speaking",
+  "x-go-const": "TypeVoiceSpeaking",
+  "x-direction": "S2C",
+  "x-since": 2,
+  "x-namespace": "event",
+  "description": "说话状态翻转（#33 接线，#32 先定契约）：服务端按 RFC 6464 电平统一判定，经网关事件面下发，替代 voice.state{speaking} 的客户端上报广播。只在翻转时发，不带电平值；v1 客户端仍走 voice.state{speaking} 兼容路径。",
+  "type": "object",
+  "properties": {
+    "channel_id": { "type": "string" },
+    "user_id": { "type": "string" },
+    "speaking": { "type": "boolean" }
+  },
+  "required": ["channel_id", "user_id", "speaking"],
+  "additionalProperties": false
+}
