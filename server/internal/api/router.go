@@ -30,6 +30,12 @@ type Hub interface {
 	KickChannel(channelID, reason string)
 }
 
+// PresenceReader 在线状态读取（#11）：presence:{uid} 存在 = 在线。
+// store.KV 满足；nil 时 user.online 恒 false。键格式与 signal 包手工同步。
+type PresenceReader interface {
+	Get(ctx context.Context, key string) (string, error)
+}
+
 // Server API 依赖集合。
 type Server struct {
 	store    store.Store
@@ -43,6 +49,7 @@ type Server struct {
 	trusted  []*net.IPNet       // 可信反代（RemoteAddr 命中才采用 X-Real-IP）
 	sess     *auth.SessionIndex // 多设备会话索引（v1.1.0 迁移 0004）
 	hub      Hub                // WS 信令 hub（登出/重置密码踢线；nil=不踢）
+	presence PresenceReader     // 在线状态（好友列表 user.online 用；nil=恒离线）
 }
 
 // Config 构造配置。
@@ -62,6 +69,8 @@ type Config struct {
 	Session *auth.SessionIndex
 	// Hub 信令 hub（登出/重置密码踢线；nil 时仅清会话不踢 WS，测试常用）。
 	Hub Hub
+	// Presence 在线状态读取（presence:{uid}，好友列表 user.online 填值用；nil=恒离线）。
+	Presence PresenceReader
 }
 
 // New 构造 API Server。
@@ -90,6 +99,7 @@ func New(cfg Config) *Server {
 		trusted:  parseTrustedProxies(lg, cfg.TrustedProxies),
 		sess:     cfg.Session,
 		hub:      cfg.Hub,
+		presence: cfg.Presence,
 	}
 }
 

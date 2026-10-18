@@ -40,12 +40,14 @@ type Hub struct {
 	maxPer    int // 房间人数上限（与 SFU 一致）
 	chatStore ChatStore
 	limits    RateLimiter
-	dev       bool // 开发模式：放行非数字的内置房间（生产必须为 false）
+	dev       bool          // 开发模式：放行非数字的内置房间（生产必须为 false）
+	presence  PresenceStore // 在线状态（presence:{uid}，#11）；nil=不做 presence
 
 	// 心跳参数（默认值见包常量；测试可缩短）
 	heartbeatEvery time.Duration
 	pongWait       time.Duration
 	readIdle       time.Duration
+	presenceTTL    time.Duration // 在线态 TTL（默认 defaultPresenceTTL，测试可缩短）
 
 	mu         sync.Mutex
 	rooms      map[string]*roomState
@@ -101,6 +103,8 @@ func (c *client) closeNow() {
 type ChatDeps struct {
 	Store  ChatStore
 	Limits RateLimiter
+	// Presence 在线状态存储（presence:{uid}）与好友关系查询（#11）；nil 不做 presence。
+	Presence PresenceStore
 	// Dev 开发模式：放行非数字的内置房间 ID（M2 遗留场景，无 store 频道实体）。
 	// 生产构建（注入了版本号）必须为 false，否则任意字符串房间都可进入。
 	Dev bool
@@ -123,6 +127,7 @@ func NewHub(s *sfu.SFU, authn Authenticator, sess *auth.SessionIndex, logger *lo
 		maxPer:         maxMembers,
 		chatStore:      chat.Store,
 		limits:         chat.Limits,
+		presence:       chat.Presence,
 		dev:            chat.Dev,
 		heartbeatEvery: defaultHeartbeatEvery,
 		pongWait:       defaultPongWait,
@@ -180,6 +185,7 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 	if old != nil {
 		h.replace(old, c)
 	}
+	h.markOnline(c)
 
 	h.sendJSON(c, TypeHello, HelloData{
 		User:     UserBrief{ID: id.UserID, Nickname: id.Username},
@@ -399,15 +405,18 @@ func (h *Hub) heartbeatLoop(ctx context.Context, c *client) {
 				return
 			}
 			c.lastAct.Store(time.Now().UnixNano())
+			h.renewPresence(c) // 心跳成功续期 presence:{uid}（25s 一拍，TTL 90s）
 		}
 	}
 }
 
-// cleanup 断连收尾：摘连接索引、离房（触发 SFU 归属清理 + peer_left 广播）。
-// 两处均做身份核对（conns[key]==c、members[uid]==c），被顶替的旧连接不会误删新连接（§0.8）。
+// cleanup 断连收尾：摘连接索引、离房（触发 SFU 归属清理 + peer_left 广播）、
+// 该 uid 无其它连接时下线 presence。均做身份核对（conns[key]==c、members[uid]==c），
+// 被顶替的旧连接不会误删新连接（§0.8）。多处调用（defer/心跳超时/写失败），全程幂等。
 func (h *Hub) cleanup(c *client) {
 	h.unregister(c)
 	h.leaveRoom(c)
+	h.markOffline(c.userID)
 	h.log.Printf("ws: %s 已断开", c.userID)
 }
 
@@ -853,6 +862,20 @@ func (h *Hub) connCount(uid string) int {
 		}
 	}
 	return n
+}
+
+// connsOfUID 某 uid 的全部设备连接快照（presence 推送用）。持 h.mu。
+func (h *Hub) connsOfUID(uid string) []*client {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	prefix := uid + "\x00"
+	out := make([]*client, 0, 1)
+	for k, c := range h.conns {
+		if strings.HasPrefix(string(k), prefix) {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // ---- client / roomState 辅助 ----
