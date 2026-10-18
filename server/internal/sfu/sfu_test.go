@@ -368,11 +368,41 @@ func TestRoomFull(t *testing.T) {
 	t.Log("满员房间拒绝第三人加入，返回 ErrRoomFull")
 }
 
+// TestTooManyRooms 房间数上限（#20）：建满 MaxRooms 间后拒建新房，已有房间不受影响。
+func TestTooManyRooms(t *testing.T) {
+	s := newTestSFU(t, 10)
+	s.cfg.MaxRooms = 2
+
+	r1, err := s.getOrCreateRoom("r1")
+	if err != nil || r1 == nil {
+		t.Fatalf("第 1 间应创建成功: %v", err)
+	}
+	if _, err := s.getOrCreateRoom("r2"); err != nil {
+		t.Fatalf("第 2 间应创建成功: %v", err)
+	}
+	if _, err := s.getOrCreateRoom("r3"); err != ErrTooManyRooms {
+		t.Fatalf("第 3 间应 ErrTooManyRooms，实际 %v", err)
+	}
+	// 已有房间不受影响（复用不占新名额）。
+	if r, err := s.getOrCreateRoom("r1"); err != nil || r != r1 {
+		t.Fatalf("已有房间应复用: %v", err)
+	}
+	// MaxRooms=0 不限。
+	s.cfg.MaxRooms = 0
+	if _, err := s.getOrCreateRoom("r3"); err != nil {
+		t.Fatalf("MaxRooms=0 应不限房间数，实际 %v", err)
+	}
+	t.Log("房间数达到上限拒绝新建，已有房间可复用")
+}
+
 // TestLeaveIfConnIDIdentity peer 归属核对（§0.9）：同 room 同 uid 仅一个 peer，
 // 新 connID 顶替旧的；LeaveIf 异 connID 无操作、同 connID 才移除并销毁空房。
 func TestLeaveIfConnIDIdentity(t *testing.T) {
 	s := newTestSFU(t, 10)
-	room := s.getOrCreateRoom("c1")
+	room, err := s.getOrCreateRoom("c1")
+	if err != nil {
+		t.Fatalf("getOrCreateRoom: %v", err)
+	}
 
 	pOld, err := room.addPeer("alice", "conn-1", nil)
 	if err != nil {

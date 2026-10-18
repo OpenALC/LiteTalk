@@ -97,6 +97,7 @@ func main() {
 		UDPPort:    envInt("LITETALK_SFU_UDP", 7845),
 		NAT1To1IP:  sfuIP,
 		MaxMembers: envInt("LITETALK_SFU_MAX", 10),
+		MaxRooms:   envInt("LITETALK_MAX_ROOMS", 50),
 		Logger:     log.Default(),
 	})
 	if err != nil {
@@ -133,9 +134,13 @@ func main() {
 		log.Println("WS 鉴权: JWT")
 	}
 	hub := signal.NewHub(sfuInst, authenticator, sessIndex, log.Default(), 0, signal.ChatDeps{
-		Store:  st,
-		Limits: limits,
-		Dev:    dev,
+		Store:     st,
+		Limits:    limits,
+		Presence:  presenceDeps{kv: kv, st: st},
+		Dev:       dev,
+		MaxConns:  envInt("LITETALK_MAX_CONNS", 8),
+		JoinRate:  envInt("LITETALK_JOIN_RATE", 30),
+		OfferRate: envInt("LITETALK_OFFER_RATE", 60),
 	})
 
 	// TURN 短期凭证签发（coturn use-auth-secret，§5.4）
@@ -203,6 +208,8 @@ func main() {
 		Session: sessIndex,
 		// 信令 hub：登出/重置密码踢 WS（api.Hub 接口避免 signal→api 循环）。
 		Hub: hub,
+		// 在线状态读取（presence:{uid}，好友列表 user.online 填值）。
+		Presence: kv,
 	})
 
 	mux := http.NewServeMux()
@@ -355,4 +362,27 @@ func resolveMigrations() fs.FS {
 		return os.DirFS(dir)
 	}
 	return migrations.FS
+}
+
+// presenceDeps 把 KV（presence 键）与 Store（好友关系）拼成 signal.PresenceStore：
+// 两者在 main 里是不同实例（Redis+MySQL 或双 Mem），需按方法分发到各自后端。
+type presenceDeps struct {
+	kv store.KV
+	st store.Store
+}
+
+func (p presenceDeps) Get(ctx context.Context, key string) (string, error) {
+	return p.kv.Get(ctx, key)
+}
+
+func (p presenceDeps) Set(ctx context.Context, key, value string, ttl time.Duration) error {
+	return p.kv.Set(ctx, key, value, ttl)
+}
+
+func (p presenceDeps) Del(ctx context.Context, keys ...string) error {
+	return p.kv.Del(ctx, keys...)
+}
+
+func (p presenceDeps) FriendshipsOfUser(ctx context.Context, userID int64) ([]store.Friendship, error) {
+	return p.st.FriendshipsOfUser(ctx, userID)
 }

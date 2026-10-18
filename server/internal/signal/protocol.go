@@ -38,6 +38,8 @@ const (
 	TypeError             = "error"
 	// server.shutdown：优雅关闭广播（v1.3.0 #21）。
 	TypeServerShutdown = "server.shutdown"
+	// presence.update：好友在线状态变化（v1.3.0 #11）。只推给互为已接受好友的在线连接。
+	TypePresenceUpdate = "presence.update"
 )
 
 // WS close code（§0.6，4000~4999 为应用自定义区间）。
@@ -65,6 +67,15 @@ type ServerShutdownData struct {
 	TS     int64  `json:"ts"`
 }
 
+// PresenceUpdateData S→C presence.update：某用户在线状态变化（v1.3.0 #11）。
+// UserID 为状态变化的用户（不是接收者）；只推给与其互为已接受好友的在线连接，
+// 且状态未变不发（去抖）。
+type PresenceUpdateData struct {
+	UserID string `json:"user_id"`
+	Online bool   `json:"online"`
+	TS     int64  `json:"ts"`
+}
+
 // 下行 error 消息的 code 取值
 const (
 	ErrCodeBadMessage    = "bad_message"
@@ -76,6 +87,8 @@ const (
 	ErrCodeForbidden     = "forbidden"
 	ErrCodeNotFound      = "not_found"
 	ErrCodeRateLimited   = "rate_limited"
+	// ErrCodeQuotaExceeded 容量超限（房间数/每房人数/连接数，#20）。REST 侧对应 429 quota_exceeded。
+	ErrCodeQuotaExceeded = "quota_exceeded"
 )
 
 // Envelope 信令信封：{ "type": "...", "data": {...}, "ts": 1734500000000 }

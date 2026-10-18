@@ -329,3 +329,115 @@ func TestFetchICEServers(t *testing.T) {
 		t.Fatalf("空 iceServers 应返回 nil，实际 %v", got3)
 	}
 }
+
+// newDownlinkStubData 同 downlinkStub，但下行消息带 data 载荷；并计数连接次数
+// （server.shutdown 停重连断言用：停了就只会有 1 次连接）。
+func newDownlinkStubData(t *testing.T, env signal.Envelope) (*downlinkStub, *int32) {
+	t.Helper()
+	s := &downlinkStub{}
+	var conns int32
+	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&conns, 1)
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		raw, err := json.Marshal(env)
+		if err != nil {
+			return
+		}
+		if err := conn.Write(r.Context(), websocket.MessageText, raw); err != nil {
+			return
+		}
+		for {
+			if _, _, err := conn.Read(r.Context()); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(s.Server.Close)
+	return s, &conns
+}
+
+// TestPresenceUpdateForwards presence.update 解码后转给 OnPresenceUpdate（#11）；
+// 缺 user_id 的坏包不回调。
+func TestPresenceUpdateForwards(t *testing.T) {
+	got := make(chan struct {
+		uid    string
+		online bool
+	}, 2)
+	stub, _ := newDownlinkStubData(t, signal.Envelope{
+		Type: signal.TypePresenceUpdate, TS: 1,
+		Data: json.RawMessage(`{"user_id":"42","online":true,"ts":1}`),
+	})
+	s := NewSession(NewAPIClient(stub.wsURL()), "tok", "n", Events{
+		OnPresenceUpdate: func(userID string, online bool) {
+			got <- struct {
+				uid    string
+				online bool
+			}{userID, online}
+		},
+	}, nil)
+	s.ws = signal.NewClient(signal.Config{URL: stub.wsURL(), ReconnectMin: 20 * time.Millisecond})
+	defer s.ws.Close()
+	s.registerHandlers()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.ws.Run(ctx)
+
+	select {
+	case d := <-got:
+		if d.uid != "42" || !d.online {
+			t.Fatalf("回调参数错误: %+v", d)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("未收到 OnPresenceUpdate")
+	}
+}
+
+// TestServerShutdownStopsReconnect server.shutdown（#21）：回调一次后停掉自动
+// 重连——桩保持在线，若未停应反复重连收到多条；计数 1 次即证明已停。
+func TestServerShutdownStopsReconnect(t *testing.T) {
+	got := make(chan string, 4)
+	stub, conns := newDownlinkStubData(t, signal.Envelope{
+		Type: signal.TypeServerShutdown, TS: 1,
+		Data: json.RawMessage(`{"reason":"shutdown","ts":1}`),
+	})
+	s := NewSession(NewAPIClient(stub.wsURL()), "tok", "n", Events{
+		OnServerShutdown: func(reason string) { got <- reason },
+	}, nil)
+	s.ws = signal.NewClient(signal.Config{
+		URL:          stub.wsURL(),
+		ReconnectMin: 20 * time.Millisecond,
+		ReconnectMax: 50 * time.Millisecond,
+	})
+	defer s.ws.Close()
+	s.registerHandlers()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.ws.Run(ctx) }()
+
+	select {
+	case reason := <-got:
+		if reason != "shutdown" {
+			t.Fatalf("reason = %q, want shutdown", reason)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("未收到 OnServerShutdown")
+	}
+	// Run 应随即返回（Close 停止重连），且连接计数不再增长。
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("server.shutdown 后 Run 未退出（重连未停）")
+	}
+	time.Sleep(150 * time.Millisecond)
+	if n := atomic.LoadInt32(conns); n != 1 {
+		t.Fatalf("应只拨号 1 次（已停止重连），实际 %d", n)
+	}
+	if len(got) != 0 {
+		t.Fatalf("shutdown 只应上报一次，实际还有 %d 条", len(got))
+	}
+}
