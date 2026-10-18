@@ -501,12 +501,23 @@ export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
         /**
-         * ApiError
-         * @description 统一错误体。code 为机器可读错误码，message 为中文提示。
+         * Problem
+         * @description RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示（旧 message 字段改名为 detail）。
          */
-        ApiError: {
+        Problem: {
+            /** @description 问题类型 URI（urn:litetalk:error:<code>） */
+            type: string;
+            /** @description 问题类型摘要（随 status 定，不随实例变） */
+            title: string;
+            /**
+             * Format: int32
+             * @description HTTP 状态码（与响应行一致）
+             */
+            status: number;
+            /** @description 机器可读错误码（扩展字段） */
             code: string;
-            message: string;
+            /** @description 本次出错的中文提示 */
+            detail: string;
         };
         /**
          * StatusOk
@@ -841,7 +852,7 @@ export interface components {
                 [name: string]: unknown;
             };
             content: {
-                "application/json": components["schemas"]["ApiError"];
+                "application/problem+json": components["schemas"]["Problem"];
             };
         };
         /** @description 未登录或令牌失效（body.code：unauthorized / session_replaced / session_replayed / bad_credentials）。session_* 另带响应头 X-LiteTalk-Auth。 */
@@ -850,7 +861,7 @@ export interface components {
                 [name: string]: unknown;
             };
             content: {
-                "application/json": components["schemas"]["ApiError"];
+                "application/problem+json": components["schemas"]["Problem"];
             };
         };
         /** @description 无权操作（body.code：forbidden / guest_disabled / reset_unavailable 等） */
@@ -859,7 +870,7 @@ export interface components {
                 [name: string]: unknown;
             };
             content: {
-                "application/json": components["schemas"]["ApiError"];
+                "application/problem+json": components["schemas"]["Problem"];
             };
         };
         /** @description 资源不存在（body.code：not_found / bad_code 等） */
@@ -868,7 +879,7 @@ export interface components {
                 [name: string]: unknown;
             };
             content: {
-                "application/json": components["schemas"]["ApiError"];
+                "application/problem+json": components["schemas"]["Problem"];
             };
         };
         /** @description 资源冲突（body.code：conflict / email_taken / already_friends / request_exists / bad_state / code_exhausted / category_not_empty 等） */
@@ -877,7 +888,7 @@ export interface components {
                 [name: string]: unknown;
             };
             content: {
-                "application/json": components["schemas"]["ApiError"];
+                "application/problem+json": components["schemas"]["Problem"];
             };
         };
         /** @description 已过期（body.code：code_expired） */
@@ -886,7 +897,7 @@ export interface components {
                 [name: string]: unknown;
             };
             content: {
-                "application/json": components["schemas"]["ApiError"];
+                "application/problem+json": components["schemas"]["Problem"];
             };
         };
         /** @description 触发限流（body.code：rate_limited） */
@@ -895,7 +906,7 @@ export interface components {
                 [name: string]: unknown;
             };
             content: {
-                "application/json": components["schemas"]["ApiError"];
+                "application/problem+json": components["schemas"]["Problem"];
             };
         };
         /** @description 服务端错误（body.code：internal / conflict / not_found / code_expired，store 错误映射） */
@@ -904,7 +915,7 @@ export interface components {
                 [name: string]: unknown;
             };
             content: {
-                "application/json": components["schemas"]["ApiError"];
+                "application/problem+json": components["schemas"]["Problem"];
             };
         };
     };

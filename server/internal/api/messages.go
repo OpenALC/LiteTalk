@@ -90,9 +90,8 @@ func (s *Server) CreateMessage(ctx context.Context, request CreateMessageRequest
 			return nil, errf(http.StatusBadRequest, "bad_nonce", "nonce 需为 0–64 字符")
 		}
 	}
-	allowed, err := s.limits.Allow(ctx, "msg:"+strconv.FormatInt(c.UserID, 10), msgRateLimit, time.Minute)
-	if err != nil || !allowed {
-		return nil, errf(http.StatusTooManyRequests, "rate_limited", "发送过于频繁")
+	if e := s.allowRate(ctx, "msg:"+strconv.FormatInt(c.UserID, 10), msgRateLimit, time.Minute, "发送过于频繁"); e != nil {
+		return nil, e
 	}
 	msg := &store.Message{
 		ChannelID: ch.ID,

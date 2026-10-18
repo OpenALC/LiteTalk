@@ -331,15 +331,35 @@ func (c *APIClient) del(path string) (int, []byte, error) {
 	return status, data, nil
 }
 
-// APIError 服务端错误响应 {code,message}。Status 为对应 HTTP 状态码，
-// 不入 JSON——调用方据它区分「明确 401（清令牌）」与「网络错误（保留重试）」。
+// APIError 服务端错误响应（#31 RFC 9457 problem+json）：{type,title,status,code,detail}。
+// code 为机器码（扩展字段，与旧版一致）；Message 取 detail（旧 message 字段兼容读）。
+// Status 为对应 HTTP 状态码，不入 JSON——调用方据它区分「明确 401（清令牌）」与
+// 「网络错误（保留重试）」。
 type APIError struct {
 	Code    string `json:"code"`
-	Message string `json:"message"`
+	Message string `json:"detail"`
 	Status  int    `json:"-"`
 }
 
 func (e *APIError) Error() string { return fmt.Sprintf("%s: %s", e.Code, e.Message) }
+
+// UnmarshalJSON 兼容 problem+json 的 detail 与旧版 message 两种提示字段。
+func (e *APIError) UnmarshalJSON(b []byte) error {
+	var raw struct {
+		Code   string `json:"code"`
+		Detail string `json:"detail"`
+		Legacy string `json:"message"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	e.Code = raw.Code
+	e.Message = raw.Detail
+	if e.Message == "" {
+		e.Message = raw.Legacy
+	}
+	return nil
+}
 
 // decodeError 从响应体解析错误。
 func decodeError(status int, data []byte) error {
