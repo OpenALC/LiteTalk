@@ -109,14 +109,15 @@ export interface VoiceStateView {
 }
 
 // FriendDTO 好友（服务端 friendView；批次③好友真实 REST 用）。
-// user.status：0 离线 / 1 在线 / 2 离开 / 3 忙碌（好友归组用，与 Go UserProfile.Status 对齐）。
+// user.online：真实在线态（#11，服务端 presence:{uid}）；user.status 为账号状态
+// 枚举（好友归组用，与 Go UserProfile.Status 对齐），在线点一律以 online 为准。
 export interface FriendDTO {
   id: number
   status: string // pending / accepted / blocked
   incoming: boolean
   remark: string
   group: string
-  user: { id: number; nickname: string; tag: string; status: number }
+  user: { id: number; nickname: string; tag: string; status: number; online: boolean }
 }
 
 // CategoryDTO 频道分类（服务端实体）。

@@ -4,8 +4,9 @@
 //   组内在线在前离线置灰；搜索过滤跨组。
 // - 右键：设置备注 / 移动分组 / 删除好友（删除二次确认）。
 // - 私聊仍为占位提示（服务端无私聊实体）；「加入TA的频道」因服务端无
-//   好友在线/所在频道数据暂不显示（inChannel 恒 false）。
-import { computed, onMounted, ref } from 'vue'
+//   「好友所在频道」数据暂不显示（inChannel 恒 false）。在线点接真实
+//   presence（#11），两态：在线/离线。
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import {
   ChevronDown, MessageCircle, Search, UserPlus, AudioLines,
   Pencil, FolderInput, Trash2,
@@ -26,6 +27,11 @@ const closedGroups = ref<Record<string, boolean>>({})
 onMounted(() => {
   // 拉取好友列表；失败静默（不影响主界面）。
   friends.loadFriends().catch(() => {})
+  // presence:update 增量刷在线点（#11）；卸载时按监听器注销。
+  friends.bindEvents()
+})
+onUnmounted(() => {
+  friends.unbindEvents()
 })
 
 // 搜索过滤（跨全部组）。
