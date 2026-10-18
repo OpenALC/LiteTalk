@@ -37,17 +37,22 @@ type AuthTokens struct {
 // UserProfile 用户档案（无头像——硬性约束）。
 // id 与服务端 store.User 一致为数字（曾误声明 string，导致登录/注册/游客
 // 响应解码全部失败——服务端 wire 是 int64）。
+// 字段与 api/openapi.yaml 的 User/PublicUser 对齐（#28）；Online 为桥接层
+// 补充字段（REST User 无，PublicUser 有）。
 // Status：服务端 users.status（在线状态），好友列表按它归组 online/offline 用。
 type UserProfile struct {
-	ID       int64  `json:"id"`
-	Nickname string `json:"nickname"`
-	Tag      string `json:"tag"`
-	Email    string `json:"email"`
-	IsGuest  bool   `json:"is_guest"`
-	Status   int    `json:"status"` // 0=离线 1=在线 2=离开 3=忙碌（与服务端 users.status 对齐）
+	ID            int64  `json:"id"`
+	Nickname      string `json:"nickname"`
+	Tag           string `json:"tag"`
+	Email         string `json:"email"`
+	EmailVerified bool   `json:"email_verified"`
+	IsGuest       bool   `json:"is_guest"`
+	Status        int    `json:"status"` // 0=离线 1=在线 2=离开 3=忙碌（与服务端 users.status 对齐）
 	// Online 好友在线态（#11，服务端 presence:{uid}）：好友列表的 user.online；
 	// /me 等自响应恒 false（服务端不填）。
-	Online bool `json:"online"`
+	Online    bool      `json:"online"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // AuthResult 登录/注册成功后的载荷。SessionOK 报告信令会话是否已连上：
@@ -550,24 +555,26 @@ func (c *APIClient) RTCCredentials() (*ICEServersResponse, error) {
 
 // ---------- 服务器 / 频道 / 好友（REST CRUD，服务端已有端点） ----------
 
-// ServerDTO 服务器（与 store.Server wire 对齐；图标为 Lucide 预设名）。
+// ServerDTO 服务器（与 store.Server / 契约 ServerInfo wire 对齐；图标为 Lucide 预设名）。
 type ServerDTO struct {
-	ID        int64  `json:"id"`
-	Name      string `json:"name"`
-	OwnerID   int64  `json:"owner_id"`
-	IconName  string `json:"icon_name"`
-	IconColor string `json:"icon_color"`
+	ID        int64     `json:"id"`
+	Name      string    `json:"name"`
+	OwnerID   int64     `json:"owner_id"`
+	IconName  string    `json:"icon_name"`
+	IconColor string    `json:"icon_color"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
-// ChannelDTO 频道（与 store.Channel wire 对齐）。
+// ChannelDTO 频道（与 store.Channel / 契约 ChannelInfo wire 对齐）。
 type ChannelDTO struct {
 	ID       int64  `json:"id"`
 	ServerID int64  `json:"server_id"`
 	Name     string `json:"name"`
 	Type     string `json:"type"` // text | voice
 	// CategoryID 分类归属（0 = 无分类/未分类，映射自服务端 NULL）；Position 同服务器序。
-	CategoryID *int64 `json:"category_id"`
-	Position   int    `json:"position"`
+	CategoryID *int64    `json:"category_id"`
+	Position   int       `json:"position"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 // ServerChannels GET /servers/{id}/channels 响应（categories + channels 两数组）。
@@ -726,12 +733,13 @@ func (c *APIClient) DeleteChannel(id int64) error {
 	return nil
 }
 
-// CategoryDTO 频道分类（与服务端 store.Category 对齐）。
+// CategoryDTO 频道分类（与 store.Category / 契约 CategoryInfo 对齐）。
 type CategoryDTO struct {
-	ID       int64  `json:"id"`
-	ServerID int64  `json:"server_id"`
-	Name     string `json:"name"`
-	Position int    `json:"position"`
+	ID        int64     `json:"id"`
+	ServerID  int64     `json:"server_id"`
+	Name      string    `json:"name"`
+	Position  int       `json:"position"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // CreateCategory 创建频道分类（owner/admin；1–32 字）。
