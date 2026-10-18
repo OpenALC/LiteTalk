@@ -1,0 +1,28 @@
+{
+  "$comment": "信令信封（#29）。type/data/ts 为 v1 现状；seq 是协议 2 起的可选事件序号（#32 填充），先在契约里定形避免二次改形状。Envelope 结构体是手写层（两侧 protocol.go），不生成。",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litetalk:signal:envelope",
+  "title": "Envelope",
+  "type": "object",
+  "properties": {
+    "type": {
+      "type": "string",
+      "description": "消息类型常量（见 messages/*.schema.json 的 x-wire-type）"
+    },
+    "data": {
+      "description": "消息载荷，结构由对应消息 schema 约束；无载荷消息省略"
+    },
+    "ts": {
+      "type": "integer",
+      "description": "发送时刻 Unix 毫秒"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1,
+      "x-since": 2,
+      "description": "会话（sid）内单调递增事件序号；仅 S→C 事件面下发，协议 2 起可选"
+    }
+  },
+  "required": ["type", "ts"],
+  "additionalProperties": false
+}

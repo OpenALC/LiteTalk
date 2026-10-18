@@ -65,7 +65,7 @@ func TestICEFailNotifiesOnlyPeerAndAllowsRejoin(t *testing.T) {
 	}
 
 	env = b.recvUntil(TypeChannelPeerLeft)
-	var pl ChannelPeerLeftData
+	var pl PeerLeftData
 	if err := env.Decode(&pl); err != nil {
 		t.Fatalf("decode peer_left: %v", err)
 	}

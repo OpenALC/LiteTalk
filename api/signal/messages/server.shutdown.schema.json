@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litetalk:signal:server.shutdown",
+  "title": "ServerShutdownData",
+  "x-wire-type": "server.shutdown",
+  "x-go-const": "TypeServerShutdown",
+  "x-direction": "S2C",
+  "x-since": 1,
+  "description": "优雅关闭广播。收到后停止自动重连并提示服务端已关闭。",
+  "type": "object",
+  "properties": {
+    "reason": {
+      "type": "string",
+      "description": "固定 shutdown"
+    },
+    "ts": { "type": "integer" }
+  },
+  "required": ["reason", "ts"],
+  "additionalProperties": false
+}
