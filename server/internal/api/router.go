@@ -50,6 +50,9 @@ type Server struct {
 	sess     *auth.SessionIndex // 多设备会话索引（v1.1.0 迁移 0004）
 	hub      Hub                // WS 信令 hub（登出/重置密码踢线；nil=不踢）
 	presence PresenceReader     // 在线状态（好友列表 user.online 用；nil=恒离线）
+	selfHost bool               // 一键自托管形态（GET /api/v1/config 自描述，#26）
+	// bootstrapRequired 管理员邀请码是否未消费（#27 T4 接线；nil=恒 false）。
+	bootstrapRequired func() bool
 }
 
 // Config 构造配置。
@@ -71,6 +74,11 @@ type Config struct {
 	Hub Hub
 	// Presence 在线状态读取（presence:{uid}，好友列表 user.online 填值用；nil=恒离线）。
 	Presence PresenceReader
+	// SelfHost 一键自托管形态（SQLite/进程内单机部署）：客户端显示自托管引导（#26）。
+	SelfHost bool
+	// BootstrapRequired 管理员邀请码是否尚未被消费；注册页提示「等待管理员邀请」。
+	// nil=恒 false（bootstrap 流程未启用，#27 T4 接线）。
+	BootstrapRequired func() bool
 }
 
 // New 构造 API Server。
@@ -88,18 +96,20 @@ func New(cfg Config) *Server {
 		mode = AuthModeFull
 	}
 	return &Server{
-		store:    cfg.Store,
-		jwt:      cfg.JWT,
-		refresh:  cfg.Refresh,
-		codes:    cfg.Codes,
-		limits:   cfg.Limits,
-		mailer:   m,
-		authMode: mode,
-		log:      lg,
-		trusted:  parseTrustedProxies(lg, cfg.TrustedProxies),
-		sess:     cfg.Session,
-		hub:      cfg.Hub,
-		presence: cfg.Presence,
+		store:             cfg.Store,
+		jwt:               cfg.JWT,
+		refresh:           cfg.Refresh,
+		codes:             cfg.Codes,
+		limits:            cfg.Limits,
+		mailer:            m,
+		authMode:          mode,
+		log:               lg,
+		trusted:           parseTrustedProxies(lg, cfg.TrustedProxies),
+		sess:              cfg.Session,
+		hub:               cfg.Hub,
+		presence:          cfg.Presence,
+		selfHost:          cfg.SelfHost,
+		bootstrapRequired: cfg.BootstrapRequired,
 	}
 }
 

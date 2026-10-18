@@ -93,17 +93,23 @@ func TestConfigEndpoint(t *testing.T) {
 	if cfg["mail_configured"] != false {
 		t.Fatalf("mail_configured = %v, want false (Console)", cfg["mail_configured"])
 	}
+	if cfg["self_host"] != false || cfg["bootstrap_required"] != false {
+		t.Fatalf("未配置自托管引导时 self_host/bootstrap_required 应为 false，实际 %v/%v",
+			cfg["self_host"], cfg["bootstrap_required"])
+	}
 
 	// 配置真实发信通道后 mail_configured 为 true。
 	mem := store.NewMem()
 	srv2 := New(Config{
-		Store:    mem,
-		JWT:      auth.NewJWT("test-secret"),
-		Refresh:  auth.NewRefreshStore(mem),
-		Codes:    auth.NewEmailCodes(mem),
-		Limits:   auth.NewRateLimit(mem),
-		Mailer:   &mailer.Webhook{URL: "https://example.invalid/hook"},
-		AuthMode: AuthModeFull,
+		Store:             mem,
+		JWT:               auth.NewJWT("test-secret"),
+		Refresh:           auth.NewRefreshStore(mem),
+		Codes:             auth.NewEmailCodes(mem),
+		Limits:            auth.NewRateLimit(mem),
+		Mailer:            &mailer.Webhook{URL: "https://example.invalid/hook"},
+		AuthMode:          AuthModeFull,
+		SelfHost:          true,
+		BootstrapRequired: func() bool { return true },
 	})
 	cfg2, _ := getJSON(t, srv2.Handler(), "/api/v1/config", "", http.StatusOK).(map[string]any)
 	if cfg2["mail_configured"] != true {
@@ -111,5 +117,8 @@ func TestConfigEndpoint(t *testing.T) {
 	}
 	if cfg2["auth_mode"] != "full" {
 		t.Fatalf("auth_mode = %v, want full", cfg2["auth_mode"])
+	}
+	if cfg2["self_host"] != true || cfg2["bootstrap_required"] != true {
+		t.Fatalf("自托管引导应透传到 config，实际 %v/%v", cfg2["self_host"], cfg2["bootstrap_required"])
 	}
 }
