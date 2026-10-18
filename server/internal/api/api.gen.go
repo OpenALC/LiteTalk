@@ -234,6 +234,9 @@ type CreateInviteRequest struct {
 type CreateMessageRequest struct {
 	// Content 1–2000 字符
 	Content string `json:"content"`
+
+	// Nonce 幂等键（#31，≤64 字符）；同用户重复提交回读原消息（200）。缺省不去重。
+	Nonce *string `json:"nonce,omitempty"`
 }
 
 // CreateServerRequest defines model for CreateServerRequest.
@@ -325,13 +328,16 @@ type MemberInfoRole string
 
 // Message 文字频道消息（发送者昵称/tag 内联，不含邮箱）。ID 为十进制字符串（#31）。
 type Message struct {
-	ChannelId      ID        `json:"channel_id"`
-	Content        string    `json:"content"`
-	CreatedAt      time.Time `json:"created_at"`
-	Id             ID        `json:"id"`
-	SenderNickname *string   `json:"sender_nickname,omitempty"`
-	SenderTag      *string   `json:"sender_tag,omitempty"`
-	UserId         ID        `json:"user_id"`
+	ChannelId ID        `json:"channel_id"`
+	Content   string    `json:"content"`
+	CreatedAt time.Time `json:"created_at"`
+	Id        ID        `json:"id"`
+
+	// Nonce 幂等键（#31）；未带 nonce 的消息无此字段
+	Nonce          *string `json:"nonce,omitempty"`
+	SenderNickname *string `json:"sender_nickname,omitempty"`
+	SenderTag      *string `json:"sender_tag,omitempty"`
+	UserId         ID      `json:"user_id"`
 }
 
 // PasswordResetRequest defines model for PasswordResetRequest.
@@ -528,7 +534,14 @@ type DeleteCategoryParams struct {
 
 // ListMessagesParams defines parameters for ListMessages.
 type ListMessagesParams struct {
-	// BeforeId 游标：只取 ID 小于该值的消息（0/缺省 = 最新一页）
+	// Before 游标：只取 ID 小于该值的消息（缺省 = 最新一页）
+	Before *int64 `form:"before,omitempty" json:"before,omitempty"`
+
+	// After 游标：只取 ID 大于该值的消息（向前翻更新；缺省 = 最旧一页）
+	After *int64 `form:"after,omitempty" json:"after,omitempty"`
+
+	// BeforeId before 的旧别名（兼容一个版本，#31；与 before 同义）
+	// Deprecated: this property has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 	BeforeId *int64 `form:"before_id,omitempty" json:"before_id,omitempty"`
 
 	// Limit 条数上限（1–50，越界回落 50）
@@ -627,10 +640,10 @@ type ServerInterface interface {
 	// PatchChannel 改频道（owner/admin）
 	// (PATCH /api/v1/channels/{id})
 	PatchChannel(w http.ResponseWriter, r *http.Request, id IDPath)
-	// ListMessages 消息分页（倒序，游标 before_id）
+	// ListMessages 消息分页（游标，倒序取页正序返回）
 	// (GET /api/v1/channels/{id}/messages)
 	ListMessages(w http.ResponseWriter, r *http.Request, id IDPath, params ListMessagesParams)
-	// CreateMessage 发送文字消息（≤2000 字 + 频控 20/分）
+	// CreateMessage 发送文字消息（≤2000 字 + 频控 20/分 + nonce 幂等）
 	// (POST /api/v1/channels/{id}/messages)
 	CreateMessage(w http.ResponseWriter, r *http.Request, id IDPath)
 	// GetConfig 服务端能力开关
@@ -933,6 +946,32 @@ func (siw *ServerInterfaceWrapper) ListMessages(w http.ResponseWriter, r *http.R
 
 	// Parameter object where we will unmarshal all parameters from the context
 	var params ListMessagesParams
+
+	// ------------- Optional query parameter "before" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "before", r.URL.Query(), &params.Before, runtime.BindQueryParameterOptions{Type: "integer", Format: "int64"})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "before"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "before", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "after" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "after", r.URL.Query(), &params.After, runtime.BindQueryParameterOptions{Type: "integer", Format: "int64"})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "after"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "after", Err: err})
+		}
+		return
+	}
 
 	// ------------- Optional query parameter "before_id" -------------
 
@@ -2609,6 +2648,20 @@ type CreateMessageResponseObject interface {
 	VisitCreateMessageResponse(w http.ResponseWriter) error
 }
 
+type CreateMessage200JSONResponse Message
+
+func (response CreateMessage200JSONResponse) VisitCreateMessageResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
 type CreateMessage201JSONResponse Message
 
 func (response CreateMessage201JSONResponse) VisitCreateMessageResponse(w http.ResponseWriter) error {
@@ -4187,10 +4240,10 @@ type StrictServerInterface interface {
 	// PatchChannel 改频道（owner/admin）
 	// (PATCH /api/v1/channels/{id})
 	PatchChannel(ctx context.Context, request PatchChannelRequestObject) (PatchChannelResponseObject, error)
-	// ListMessages 消息分页（倒序，游标 before_id）
+	// ListMessages 消息分页（游标，倒序取页正序返回）
 	// (GET /api/v1/channels/{id}/messages)
 	ListMessages(ctx context.Context, request ListMessagesRequestObject) (ListMessagesResponseObject, error)
-	// CreateMessage 发送文字消息（≤2000 字 + 频控 20/分）
+	// CreateMessage 发送文字消息（≤2000 字 + 频控 20/分 + nonce 幂等）
 	// (POST /api/v1/channels/{id}/messages)
 	CreateMessage(ctx context.Context, request CreateMessageRequestObject) (CreateMessageResponseObject, error)
 	// GetConfig 服务端能力开关
