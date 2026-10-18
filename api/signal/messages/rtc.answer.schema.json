@@ -6,6 +6,7 @@
   "x-go-const": "TypeRTCAnswer",
   "x-direction": "BOTH",
   "x-since": 1,
+  "x-namespace": "voice",
   "description": "SDP answer。载荷与 rtc.offer 同型，见 components.SDPData。",
   "$ref": "components.schema.json#/$defs/SDPData"
 }

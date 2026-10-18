@@ -6,6 +6,7 @@
   "x-go-const": "TypeChannelJoined",
   "x-direction": "S2C",
   "x-since": 1,
+  "x-namespace": "voice",
   "description": "房间成员全量。成员变化时向房间内每个成员重发全量（Self 为接收者本人的快照）。",
   "type": "object",
   "properties": {

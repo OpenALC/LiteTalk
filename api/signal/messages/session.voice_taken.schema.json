@@ -6,6 +6,7 @@
   "x-go-const": "TypeSessionVoiceTaken",
   "x-direction": "S2C",
   "x-since": 1,
+  "x-namespace": "voice",
   "description": "同账号另一会话抢占语音，本端按本地退房处理（不关连接）。载荷为空（data 省略），不生成 Go 载荷类型。",
   "x-go-payload": "none",
   "type": "object",
