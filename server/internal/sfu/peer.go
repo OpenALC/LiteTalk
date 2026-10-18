@@ -9,6 +9,14 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
+// outRoute 一条下行路由：outbound 轨道 + 其 RTPSender（摘除时 RemoveTrack 要用）。
+// 离房/ICE 失败/连接顶替必须成对摘掉（#23）：惰性保留会让 srcUserID 重入后
+// ensureRoute 见旧条目跳过，订阅端拿不到新 OnTrack。
+type outRoute struct {
+	track  *webrtc.TrackLocalStaticRTP
+	sender *webrtc.RTPSender
+}
+
 // Peer 房间中的一个成员：每客户端恰好一条 PeerConnection
 // （一条上行 track，N 条下行 track，§5.2）。
 //
@@ -28,9 +36,9 @@ type Peer struct {
 	debounce func(func())
 
 	mu                sync.Mutex
-	inbound           []*webrtc.TrackRemote                  // 本成员上行轨道
-	outbound          map[string]*webrtc.TrackLocalStaticRTP // 源 userID → 下行轨道
-	pendingCandidates []webrtc.ICECandidateInit              // 初始 answer 前到达的 trickle 候选
+	inbound           []*webrtc.TrackRemote     // 本成员上行轨道
+	outbound          map[string]*outRoute      // 源 userID → 下行路由
+	pendingCandidates []webrtc.ICECandidateInit // 初始 answer 前到达的 trickle 候选
 	initialAnswered   bool
 	negotiateAgain    bool
 	closed            bool
@@ -47,7 +55,7 @@ func newPeer(room *Room, userID, connID string, sig SignalSender) (*Peer, error)
 		room:     room,
 		pc:       pc,
 		signal:   sig,
-		outbound: make(map[string]*webrtc.TrackLocalStaticRTP),
+		outbound: make(map[string]*outRoute),
 		debounce: newDebouncer(50 * time.Millisecond),
 	}
 
