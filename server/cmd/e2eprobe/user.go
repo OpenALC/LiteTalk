@@ -231,6 +231,18 @@ func (u *probeUser) srvErr() string {
 	return s
 }
 
+// selectedProtocol 返回 ICE 选中候选对的传输协议描述（"tcp"/"udp"）。
+func (u *probeUser) selectedProtocol() string {
+	if u.pc == nil {
+		return ""
+	}
+	pair, err := u.pc.SCTP().Transport().ICETransport().GetSelectedCandidatePair()
+	if err != nil || pair == nil {
+		return ""
+	}
+	return pair.Local.Protocol.String()
+}
+
 // ---- WebRTC ----
 
 func (u *probeUser) startPeer() error {
@@ -241,6 +253,10 @@ func (u *probeUser) startPeer() error {
 	se := webrtc.SettingEngine{}
 	if u.cfg.loopback {
 		se.SetIncludeLoopbackCandidate(true)
+	}
+	// -tcp：只启用 TCP 网络类型（等价禁 UDP 网络），验证 ICE-TCP 直连（#25）
+	if u.cfg.tcpOnly {
+		se.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeTCP4, webrtc.NetworkTypeTCP6})
 	}
 	// 服务端下发的 STUN/TURN（生产配置，可能为空/不可达——退 host/prflx）
 	var servers []webrtc.ICEServer

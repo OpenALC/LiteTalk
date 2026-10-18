@@ -30,6 +30,9 @@ type SignalSender interface {
 type Config struct {
 	// UDPPort ICE-Lite UDP mux 端口（env LITETALK_SFU_UDP，默认 7845）；0 = 随机端口（测试用）
 	UDPPort int
+	// TCPPort ICE-TCP mux 端口（env LITETALK_SFU_TCP，默认同 UDPPort 号，0 = 关闭）。
+	// 与 UDP 同号时是两个独立 socket（TCP/UDP 各一），不是共 socket 复用（#25）。
+	TCPPort int
 	// NAT1To1IP 对外宣告的 IP（env LITETALK_SFU_IP，默认 127.0.0.1）
 	NAT1To1IP string
 	// MaxMembers 房间人数上限（§5.2 默认 10）
@@ -42,10 +45,12 @@ type Config struct {
 
 // SFU 进程级单例：持有一套 webrtc.API（ICE-Lite + UDP mux + Opus MediaEngine）与房间表。
 type SFU struct {
-	api  *webrtc.API
-	conn *net.UDPConn
-	cfg  Config
-	log  *log.Logger
+	api    *webrtc.API
+	conn   *net.UDPConn
+	tcpMux ice.TCPMux
+	tcpLn  net.Listener // 留引用查 LocalAddr（ice.TCPMux 接口不含该方法）
+	cfg    Config
+	log    *log.Logger
 
 	mu    sync.RWMutex
 	rooms map[string]*Room
@@ -87,30 +92,83 @@ func New(cfg Config) (*SFU, error) {
 	se := webrtc.SettingEngine{}
 	se.SetLite(true)
 	se.SetNAT1To1IPs([]string{cfg.NAT1To1IP}, webrtc.ICECandidateTypeHost)
+	// NAT1To1 为环回（本地开发/测试）时放行环回候选：TCP mux 按「连接落到的本端 IP」
+	// 归属 ufrag，环回被 gather 排除时候选归属 IP 与实际 accept 的 IP 对不上，TCP 候选
+	// 会失联。生产已由 validateSFUIP 拒绝环回 NAT1To1，不受此影响。
+	if ip := net.ParseIP(cfg.NAT1To1IP); ip != nil && ip.IsLoopback() {
+		se.SetIncludeLoopbackCandidate(true)
+	}
 	udpMux := ice.NewUDPMuxDefault(ice.UDPMuxParams{
 		Logger:  logging.NewDefaultLoggerFactory().NewLogger("udpmux"),
 		UDPConn: conn,
 	})
 	se.SetICEUDPMux(udpMux)
 
+	// ICE-TCP mux（#25）：UDP 被封的网络靠 TCP 候选直连，不依赖外部 coturn。
+	// 与 SFU UDP 同号时各占一个 socket（TCP/UDP 协议栈天然隔离），不是共 socket。
+	var tcpMux ice.TCPMux
+	var tcpLn net.Listener
+	if cfg.TCPPort != 0 {
+		// TCP mux 按「accept 的本端 IP」归属 ufrag 连接，gather 侧按网卡 IP 注册。
+		// NAT1To1 为环回（dev/测试）时必须把监听绑到该环回地址：否则多网卡机器上
+		// gather 注册在第一块网卡的 key 上，环回连接的 accept key 对不上，检查包
+		// 会进一个没有候选认领的 conn。生产 NAT1To1 是 NAT 网关地址（本机不可绑），
+		// 仍绑 0.0.0.0——单网卡下 accept 的本端 IP 等于网卡 IP，key 天然一致。
+		bindIP := net.IPv4zero
+		if ip := net.ParseIP(cfg.NAT1To1IP); ip != nil && ip.IsLoopback() {
+			bindIP = ip
+		}
+		ln, err := net.ListenTCP("tcp", &net.TCPAddr{IP: bindIP, Port: cfg.TCPPort})
+		if err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("SFU ICE-TCP 监听失败（端口 %d）: %w", cfg.TCPPort, err)
+		}
+		tcpMux = ice.NewTCPMuxDefault(ice.TCPMuxParams{
+			Listener: ln,
+			Logger:   logging.NewDefaultLoggerFactory().NewLogger("tcpmux"),
+			// 读缓冲按 pion 示例取值；写缓冲 4MB（pion 推荐），防突发反压丢包。
+			ReadBufferSize:  8,
+			WriteBufferSize: 4 * 1024 * 1024,
+		})
+		se.SetICETCPMux(tcpMux)
+		tcpLn = ln
+		// webrtc 的 supportedNetworkTypes 默认只有 UDP（TCP 注释为 Not supported yet），
+		// 不显式打开则 TCP mux 一个候选都采不到。只在启用 TCP mux 时扩展网络类型，
+		// TCPPort=0 的旧部署行为不变。
+		se.SetNetworkTypes([]webrtc.NetworkType{
+			webrtc.NetworkTypeUDP4,
+			webrtc.NetworkTypeUDP6,
+			webrtc.NetworkTypeTCP4,
+			webrtc.NetworkTypeTCP6,
+		})
+	}
+
 	// 默认拦截器（#19）：NACK 生成/应答 + RTCP SR/RR。音频仍靠 FEC/PLC 兜底，
 	// 但 RTCP 反馈链路必须能跑（此前无拦截器不发 SR/RR、无 NACK）。
 	ir := &interceptor.Registry{}
 	if err := webrtc.RegisterDefaultInterceptors(me, ir); err != nil {
 		_ = conn.Close()
+		if tcpMux != nil {
+			_ = tcpMux.Close()
+		}
 		return nil, fmt.Errorf("注册默认拦截器失败: %w", err)
 	}
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(me), webrtc.WithInterceptorRegistry(ir), webrtc.WithSettingEngine(se))
 
 	s := &SFU{
-		api:   api,
-		conn:  conn,
-		cfg:   cfg,
-		log:   logger,
-		rooms: make(map[string]*Room),
+		api:    api,
+		conn:   conn,
+		tcpMux: tcpMux,
+		tcpLn:  tcpLn,
+		cfg:    cfg,
+		log:    logger,
+		rooms:  make(map[string]*Room),
 	}
 	logger.Printf("sfu: ICE-Lite UDP mux 就绪 %s（宣告 IP %s，房间上限 %d）",
 		conn.LocalAddr(), cfg.NAT1To1IP, cfg.MaxMembers)
+	if tcpLn != nil {
+		logger.Printf("sfu: ICE-TCP mux 就绪 %s（UDP 被封网络的直连路径）", tcpLn.Addr())
+	}
 	return s, nil
 }
 
@@ -119,12 +177,24 @@ func (s *SFU) Port() int {
 	return s.conn.LocalAddr().(*net.UDPAddr).Port
 }
 
+// TCPPort 返回 ICE-TCP mux 实际绑定端口；未启用返回 0。
+func (s *SFU) TCPPort() int {
+	if s.tcpLn == nil {
+		return 0
+	}
+	addr, ok := s.tcpLn.Addr().(*net.TCPAddr)
+	if !ok {
+		return 0
+	}
+	return addr.Port
+}
+
 // MaxMembers 房间人数上限。
 func (s *SFU) MaxMembers() int { return s.cfg.MaxMembers }
 
-// Close 关闭 UDP mux，所有 PeerConnection 随之中断。先逐个主动关闭 peer（置
+// Close 关闭 UDP/TCP mux，所有 PeerConnection 随之中断。先逐个主动关闭 peer（置
 // closed 再关 PC）：否则关机路径的连接状态回调会被当成 ICE 失败，向已死的
-// 下游发 rtc.failed（#19）。
+// 下游发 rtc.failed（#19）。TCP mux 必须一并关，否则监听端口不释放。
 func (s *SFU) Close() error {
 	s.mu.Lock()
 	rooms := s.rooms
@@ -139,7 +209,13 @@ func (s *SFU) Close() error {
 			p.close()
 		}
 	}
-	return s.conn.Close()
+	err := s.conn.Close()
+	if s.tcpMux != nil {
+		if tcpErr := s.tcpMux.Close(); tcpErr != nil && err == nil {
+			err = tcpErr
+		}
+	}
+	return err
 }
 
 func (s *SFU) getOrCreateRoom(id string) (*Room, error) {

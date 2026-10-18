@@ -38,6 +38,7 @@ type config struct {
 	relay       bool
 	presence    bool
 	rejoin      bool
+	tcpOnly     bool // -tcp：禁 UDP 场景，客户端只启用 TCP 网络类型（#25）
 }
 
 // register 注册（邮箱撞库则登录），返回注册邮箱、access token、用户 ID 与 iceServers。
@@ -101,6 +102,7 @@ func main() {
 	flag.BoolVar(&cfg.relay, "relay", false, "验证 TURN 凭证含 turn/turns 中继地址（需 LITETALK_TURN_SECRET 已配）")
 	flag.BoolVar(&cfg.presence, "presence", false, "在线状态场景：好友 online 随 WS 连断翻转")
 	flag.BoolVar(&cfg.rejoin, "rejoin", false, "重入房场景：离房再入房，B 须恢复收听（#23）")
+	flag.BoolVar(&cfg.tcpOnly, "tcp", false, "禁 UDP 场景：客户端只启用 TCP 候选，验证 ICE-TCP 直连（#25）")
 	flag.Parse()
 	if cfg.users < 2 {
 		fmt.Fprintln(os.Stderr, "users ≥ 2")
@@ -128,7 +130,8 @@ func main() {
 		os.Exit(code)
 	}
 
-	fmt.Printf("E2E 探测 %s：%d 人同房，%s 媒体，loopback=%v\n", cfg.addr, cfg.users, cfg.duration, cfg.loopback)
+	fmt.Printf("E2E 探测 %s：%d 人同房，%s 媒体，loopback=%v tcpOnly=%v\n",
+		cfg.addr, cfg.users, cfg.duration, cfg.loopback, cfg.tcpOnly)
 
 	total := cfg.users
 	users := make([]*probeUser, 0, total)
@@ -229,6 +232,19 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("阶段 1/2：%d/%d ICE connected\n", total, total)
+
+	// -tcp：断言选中的是 TCP 候选对（禁 UDP 场景的 ICE-TCP 直连证明）
+	if cfg.tcpOnly {
+		for _, u := range users {
+			proto := u.selectedProtocol()
+			fmt.Printf("  %s 选中候选对: %s\n", u.id, proto)
+			if !strings.Contains(proto, "tcp") {
+				fmt.Fprintf(os.Stderr, "-tcp 失败：%s 选中候选协议 %q，必须是 tcp\n", u.id, proto)
+				os.Exit(1)
+			}
+		}
+		fmt.Println("  -tcp OK：全部经 ICE-TCP 候选对建连（禁 UDP 网络等价）")
+	}
 
 	// 等所有端到达发包闸门（下行轨齐或超时），再统一开闸，保证完整发包窗口
 	for _, u := range users {
