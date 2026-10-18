@@ -8,6 +8,8 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/pion/ice/v4"
 	"github.com/pion/interceptor"
@@ -26,6 +28,47 @@ type SignalSender interface {
 	SendFailed(channelID, userID, reason string)
 }
 
+// OnSpeakingFn 上行说话状态翻转回调（#33）：判定 ticker 上触发，必须非阻塞。
+type OnSpeakingFn func(channelID, userID string, speaking bool)
+
+// RFC 6464 音频电平（#33）：SDP 协商的头扩展 URI，与客户端 rtc 包一致。
+const audioLevelURI = "urn:ietf:params:rtp-hdrext:ssrc-audio-level"
+
+// 说话判定门限（RFC 6464 电平：0=0dB 满幅 … 127=静音，越小越响）。
+// 数值对齐客户端 DSP 静音环境默认（底噪 -50dBFS + 12/+6dB ⇒ enter≈-38dBFS、
+// exit≈-44dBFS，dBov 与 dBFS 同满幅基准）。服务端看的是 AGC 后的上行电平，
+// 跨客户端刻度已被拉齐，先用固定门限；数值可随实测再调。
+const (
+	speakEnterLevel = 38 // 电平 ≤38（≥-38dBov）进入说话
+	speakExitLevel  = 44 // 电平 >44 计入退出（39..44 之间保持原态，双门限迟滞）
+	speakEnterTicks = 1  // 1 tick 起判（100ms 粒度下最接近客户端 30ms）
+	speakExitTicks  = 2  // 2 tick 挂起（200ms，对齐客户端 150ms 量级）
+)
+
+// 活跃转发门控（#33 Phase 1）：进入=进 top-N 且达电平门限；跌出=持续低于
+// 门限 gateGraceTicks（500ms）或掉出 top-N，且在 active 至少保持 ActiveHoldMS。
+const (
+	gateGraceTicks  = 5 // 500ms 低电平宽限（100ms/tick）
+	levelStaleTicks = 2 // 连续 2 tick 无新包（≥200ms）按静音处理（muted/DTX/断流）
+)
+
+// audioLevelExtID 在协商到的头扩展里找 RFC 6464 电平的本地 ID（RFC 8285
+// 单字节头 ID 取值 1..14；未协商返回 0）。
+func audioLevelExtID(exts []webrtc.RTPHeaderExtensionParameter) uint8 {
+	for _, e := range exts {
+		if e.URI == audioLevelURI {
+			if e.ID < 1 || e.ID > 14 {
+				return 0
+			}
+			return uint8(e.ID)
+		}
+	}
+	return 0
+}
+
+// speakingTick 判定与门控的采样周期。
+const speakingTick = 100 * time.Millisecond
+
 // Config SFU 配置。
 type Config struct {
 	// UDPPort ICE-Lite UDP mux 端口（env LITETALK_SFU_UDP，默认 7845）；0 = 随机端口（测试用）
@@ -39,6 +82,12 @@ type Config struct {
 	MaxMembers int
 	// MaxRooms 房间数上限（env LITETALK_MAX_ROOMS，默认 50；#20）。0 = 不限。
 	MaxRooms int
+	// ActiveN 活跃转发路数（#33，env LITETALK_SFU_ACTIVE_N，默认 5）：只对 top-N
+	// 活跃源 WriteRTP，其余源的包直接丢弃（包级门控，不摘 track 不重协商）。
+	// ≤0 = 关闭门控全转发。
+	ActiveN int
+	// ActiveHoldMS 活跃源最少保持毫秒（#33，env LITETALK_SFU_ACTIVE_HOLD_MS，默认 1000）。
+	ActiveHoldMS int
 	// Logger 日志；nil 则丢弃
 	Logger *log.Logger
 }
@@ -52,6 +101,12 @@ type SFU struct {
 	cfg    Config
 	log    *log.Logger
 
+	// onSpeaking 说话翻转回调（#33）：启动阶段 SetOnSpeaking 注入，ticker 读。
+	onSpeaking atomic.Value // OnSpeakingFn
+	tickDone   chan struct{}
+	tickWG     sync.WaitGroup
+	closed     atomic.Bool // Close 幂等（tickDone 只准关一次）
+
 	mu    sync.RWMutex
 	rooms map[string]*Room
 }
@@ -63,6 +118,11 @@ func New(cfg Config) (*SFU, error) {
 	}
 	if cfg.NAT1To1IP == "" {
 		cfg.NAT1To1IP = "127.0.0.1"
+	}
+	// 零值回落安全默认（§0.11）：活跃源最少保持 1s。
+	// ActiveN 不在此处兜底：配置层（flag/env）缺省取 5，传进来的 ≤0 是显式关闭门控。
+	if cfg.ActiveHoldMS <= 0 {
+		cfg.ActiveHoldMS = 1000
 	}
 	logger := cfg.Logger
 	if logger == nil {
@@ -81,6 +141,13 @@ func New(cfg Config) (*SFU, error) {
 		PayloadType: 111,
 	}, webrtc.RTPCodecTypeAudio); err != nil {
 		return nil, fmt.Errorf("注册 Opus 编解码失败: %w", err)
+	}
+	// RFC 6464 电平扩展（#33）：协商上才收得到客户端/浏览器的电平字节；
+	// 未协商（v1 客户端）则读不到扩展，说话判定/活跃门控自动跳过该源。
+	if err := me.RegisterHeaderExtension(webrtc.RTPHeaderExtensionCapability{
+		URI: audioLevelURI,
+	}, webrtc.RTPCodecTypeAudio); err != nil {
+		return nil, fmt.Errorf("注册音频电平扩展失败: %w", err)
 	}
 
 	// 单 UDP mux：SFU 侧只需开放 1 个 UDP 端口
@@ -156,20 +223,68 @@ func New(cfg Config) (*SFU, error) {
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(me), webrtc.WithInterceptorRegistry(ir), webrtc.WithSettingEngine(se))
 
 	s := &SFU{
-		api:    api,
-		conn:   conn,
-		tcpMux: tcpMux,
-		tcpLn:  tcpLn,
-		cfg:    cfg,
-		log:    logger,
-		rooms:  make(map[string]*Room),
+		api:      api,
+		conn:     conn,
+		tcpMux:   tcpMux,
+		tcpLn:    tcpLn,
+		cfg:      cfg,
+		log:      logger,
+		tickDone: make(chan struct{}),
+		rooms:    make(map[string]*Room),
 	}
+	s.tickWG.Add(1)
+	go s.speakingLoop()
 	logger.Printf("sfu: ICE-Lite UDP mux 就绪 %s（宣告 IP %s，房间上限 %d）",
 		conn.LocalAddr(), cfg.NAT1To1IP, cfg.MaxMembers)
 	if tcpLn != nil {
 		logger.Printf("sfu: ICE-TCP mux 就绪 %s（UDP 被封网络的直连路径）", tcpLn.Addr())
 	}
 	return s, nil
+}
+
+// SetOnSpeaking 注入说话翻转回调（#33）。启动阶段调用一次；nil 则翻转不下发。
+// 存的是包装后的非 nil 接口（atomic.Value 不收裸 nil）。
+func (s *SFU) SetOnSpeaking(fn OnSpeakingFn) {
+	s.onSpeaking.Store(fn)
+}
+
+// speakingFn 取当前回调；未注入返回 nil。
+func (s *SFU) speakingFn() OnSpeakingFn {
+	if v := s.onSpeaking.Load(); v != nil {
+		return v.(OnSpeakingFn)
+	}
+	return nil
+}
+
+// speakingLoop 说话判定与活跃门控的 ticker（#33）：100ms 采样各源的 RFC 6464
+// 电平，跑迟滞状态机；翻转走回调，门控结果写各源的 fwdActive 原子位。
+// forward 热路径不参与任何判定，只读这两个原子。
+func (s *SFU) speakingLoop() {
+	defer s.tickWG.Done()
+	t := time.NewTicker(speakingTick)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.tickDone:
+			return
+		case <-t.C:
+			s.tickAll()
+		}
+	}
+}
+
+// tickAll 遍历全部房间做一次判定。房间快照后在锁外处理，翻转回调不得持任何 SFU 锁
+// （回调进 WS 层，反过来 hub 会在持自己锁时调 SFU，必须避免交叉持锁）。
+func (s *SFU) tickAll() {
+	s.mu.RLock()
+	rooms := make([]*Room, 0, len(s.rooms))
+	for _, r := range s.rooms {
+		rooms = append(rooms, r)
+	}
+	s.mu.RUnlock()
+	for _, r := range rooms {
+		r.tick(s.speakingFn())
+	}
 }
 
 // Port 返回 UDP mux 实际绑定端口（测试用随机端口时查询用）。
@@ -196,6 +311,11 @@ func (s *SFU) MaxMembers() int { return s.cfg.MaxMembers }
 // closed 再关 PC）：否则关机路径的连接状态回调会被当成 ICE 失败，向已死的
 // 下游发 rtc.failed（#19）。TCP mux 必须一并关，否则监听端口不释放。
 func (s *SFU) Close() error {
+	if s.closed.Swap(true) {
+		return nil
+	}
+	close(s.tickDone)
+	s.tickWG.Wait()
 	s.mu.Lock()
 	rooms := s.rooms
 	s.rooms = make(map[string]*Room)

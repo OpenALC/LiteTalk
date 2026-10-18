@@ -275,6 +275,48 @@ func (h *Hub) broadcastEvent(uids map[string]bool, msgType string, data any) {
 	}
 }
 
+// broadcastVoiceSpeaking 说话翻转下发（#33）：SFU 按 RFC 6464 电平统一判定后
+// 经此投递网关事件面。按连接协议版本分流（裁定 #5 兼容过渡，一个版本周期）：
+//   - 协议 ≥2：voice.speaking 走事件面进环带 seq，含本人（自己的声波球同源）；
+//   - 协议 <2（v1/未协商）：退化为 voice.state{speaking}——老客户端只认这条路，
+//     行为与今天一致（不含本人：v1 的自我指示由本地 DSP 驱动）。
+//
+// 调用方（SFU 判定 ticker）不持任何 SFU 锁；本函数不得反调 SFU。
+func (h *Hub) broadcastVoiceSpeaking(channelID, userID string, speaking bool) {
+	h.mu.Lock()
+	var legacy []*client
+	v2 := make(map[string]bool)
+	if room := h.rooms[channelID]; room != nil {
+		for uid, m := range room.members {
+			if m.protoVer.Load() >= 2 {
+				v2[uid] = true
+			} else {
+				legacy = append(legacy, m)
+			}
+		}
+		// 成员内存态同步：channel.joined 快照里的 speaking 据此回填。
+		if m := room.members[userID]; m != nil {
+			m.mu.Lock()
+			m.state.Speaking = &speaking
+			m.mu.Unlock()
+		}
+	}
+	h.mu.Unlock()
+
+	if len(v2) > 0 {
+		h.broadcastEvent(v2, TypeVoiceSpeaking, VoiceSpeakingData{
+			ChannelID: channelID, UserID: userID, Speaking: speaking,
+		})
+	}
+	for _, c := range legacy {
+		if c.userID == userID {
+			continue
+		}
+		sp := speaking
+		h.sendJSON(c, TypeVoiceState, VoiceStateData{UserID: userID, Speaking: &sp})
+	}
+}
+
 // handleGatewayResume 处理 C→S gateway.resume{session_id, last_seq}（#32）。
 //
 // 补发窗口 = 环容量（LITETALK_GATEWAY_BACKLOG）∩ 空闲 TTL（30min）∩ 进程存活——
