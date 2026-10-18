@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	ossignal "os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -45,38 +46,64 @@ func main() {
 	// 生产模式下内存降级、默认密钥、dev 令牌开关等开发便利项全部拒绝启动。
 	dev := version == "dev"
 
-	// ---- 持久化（MySQL + Redis，env 注入 DSN；不可用时内存降级） ----
+	// ---- 持久化（Store 选型 + KV；§0.3）----
+	// Store：LITETALK_STORE 显式 > LITETALK_MYSQL_DSN 非空 → mysql（向后兼容）> 默认 sqlite。
+	// KV：显式 LITETALK_REDIS_ADDR 必须连通（拒绝静默降级）；未配置默认进程内 MemKV（#24）。
 	var st store.Store
 	var kv store.KV
-	if dsn := os.Getenv("LITETALK_MYSQL_DSN"); dsn != "" {
+	switch pickStoreKind() {
+	case "mysql":
+		dsn := os.Getenv("LITETALK_MYSQL_DSN")
+		if dsn == "" {
+			log.Fatal("LITETALK_STORE=mysql 但未配置 LITETALK_MYSQL_DSN")
+		}
 		my, err := store.OpenMySQL(dsn)
 		if err != nil {
 			log.Fatalf("MySQL 连接失败: %v", err)
 		}
 		defer my.Close()
-		migFS := resolveMigrations()
-		if err := my.Migrate(context.Background(), migFS); err != nil {
+		if err := my.Migrate(context.Background(), resolveMigrationsMySQL()); err != nil {
 			log.Fatalf("数据库迁移失败: %v", err)
 		}
 		st = my
 		log.Println("持久化: MySQL")
-	} else if dev {
+	case "sqlite":
+		path := os.Getenv("LITETALK_SQLITE_PATH")
+		if path == "" {
+			path = filepath.Join(envOr("LITETALK_DATA_DIR", "./data"), "litetalk.db")
+		}
+		sq, err := store.OpenSQLite(path)
+		if err != nil {
+			log.Fatalf("SQLite 打开失败: %v", err)
+		}
+		defer sq.Close()
+		if err := sq.Migrate(context.Background(), resolveMigrationsSQLite()); err != nil {
+			log.Fatalf("数据库迁移失败: %v", err)
+		}
+		st = sq
+		log.Printf("持久化: SQLite（%s）", path)
+	case "mem":
+		// 内存存储重启即失（用户/服务器/消息全丢），生产拒绝，仅 dev 本地开发。
+		if !dev {
+			log.Fatal("LITETALK_STORE=mem 仅限 dev 模式：生产请用 sqlite 或 mysql")
+		}
 		st = store.NewMem()
-		log.Println("持久化: 内存（设置 LITETALK_MYSQL_DSN 启用 MySQL）")
-	} else {
-		// 生产模式拒绝内存降级：重启后用户/服务器/消息全部丢失，属静默数据事故。
-		log.Fatal("未配置 LITETALK_MYSQL_DSN：生产模式必须以 MySQL 启动（内存存储仅限 dev 模式本地开发）")
+		log.Println("持久化: 内存（仅 dev）")
+	default:
+		log.Fatalf("LITETALK_STORE=%q 不支持：可选 mysql / sqlite / mem", pickStoreKind())
 	}
-	if rdb, err := store.OpenRedis(os.Getenv("LITETALK_REDIS_ADDR")); err == nil {
+	if addr := os.Getenv("LITETALK_REDIS_ADDR"); addr != "" {
+		rdb, err := store.OpenRedis(addr)
+		if err != nil {
+			log.Fatalf("Redis 连接失败（%v）：已配置 LITETALK_REDIS_ADDR，必须可用，拒绝降级内存 KV", err)
+		}
 		defer rdb.Close()
 		kv = rdb
 		log.Println("KV: Redis")
-	} else if dev {
-		kv = store.NewMem()
-		log.Println("KV: 内存（LITETALK_REDIS_ADDR 不可达，降级内存）")
 	} else {
-		// 生产模式拒绝内存 KV：刷新令牌/验证码/限流重启即失，会话全灭。
-		log.Fatalf("Redis 连接失败（%v）：生产模式必须配置可用的 LITETALK_REDIS_ADDR，拒绝降级内存 KV", err)
+		// #24 放宽生产 KV 守卫：单机自托管不该被 Redis 缺失挡住启动。
+		kv = store.NewMemKV()
+		log.Println("KV: 进程内（会话/验证码/限流不跨重启；多实例部署必须配置 LITETALK_REDIS_ADDR）")
 	}
 
 	// ---- 账号安全 ----
@@ -417,13 +444,41 @@ func splitList(s string) []string {
 	return out
 }
 
-// resolveMigrations 返回迁移 SQL 的文件系统：
-// LITETALK_MIGRATIONS_DIR 非空时用磁盘目录覆盖（本地调试）；否则用 embed 的 migrations.FS。
-func resolveMigrations() fs.FS {
+// pickStoreKind 决定存储后端（§0.3）：LITETALK_STORE 显式指定 > LITETALK_MYSQL_DSN
+// 非空 → mysql（向后兼容，现有部署零改动）> 默认 sqlite（本批新默认）。
+// 只解析不校验合法性——合法性在 main 的 switch 分支里按 dev/生产分别把关。
+func pickStoreKind() string {
+	if k := strings.ToLower(strings.TrimSpace(os.Getenv("LITETALK_STORE"))); k != "" {
+		return k
+	}
+	if os.Getenv("LITETALK_MYSQL_DSN") != "" {
+		return "mysql"
+	}
+	return "sqlite"
+}
+
+// resolveMigrationsMySQL 返回 MySQL 方言迁移 SQL 的文件系统：
+// LITETALK_MIGRATIONS_DIR 非空时磁盘目录根覆盖（本地调试），否则 embed 的 migrations.FS 根。
+// 根目录 *.sql 即 MySQL 方言；sqlite/ 子目录由 resolveMigrationsSQLite 负责，
+// Migrate 的 fs.ReadDir + !e.IsDir() 天然跳过该目录。
+func resolveMigrationsMySQL() fs.FS {
 	if dir := os.Getenv("LITETALK_MIGRATIONS_DIR"); dir != "" {
 		return os.DirFS(dir)
 	}
 	return migrations.FS
+}
+
+// resolveMigrationsSQLite 返回 SQLite 方言迁移 SQL（migrations/sqlite 子目录，同号同名）。
+func resolveMigrationsSQLite() fs.FS {
+	if dir := os.Getenv("LITETALK_MIGRATIONS_DIR"); dir != "" {
+		return os.DirFS(filepath.Join(dir, "sqlite"))
+	}
+	sub, err := fs.Sub(migrations.FS, "sqlite")
+	if err != nil {
+		// embed 布局由 //go:embed *.sql sqlite/*.sql 编译期锁定，走到这里即打包坏了。
+		log.Fatalf("migrations: 缺少 sqlite 子目录: %v", err)
+	}
+	return sub
 }
 
 // presenceDeps 把 KV（presence 键）与 Store（好友关系）拼成 signal.PresenceStore：
