@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litetalk:signal:channel.joined",
+  "title": "ChannelJoinedData",
+  "x-wire-type": "channel.joined",
+  "x-go-const": "TypeChannelJoined",
+  "x-direction": "S2C",
+  "x-since": 1,
+  "description": "房间成员全量。成员变化时向房间内每个成员重发全量（Self 为接收者本人的快照）。",
+  "type": "object",
+  "properties": {
+    "channel_id": { "type": "string" },
+    "members": {
+      "type": "array",
+      "items": { "$ref": "components.schema.json#/$defs/MemberInfo" }
+    },
+    "self": { "$ref": "components.schema.json#/$defs/MemberInfo" }
+  },
+  "required": ["channel_id", "members", "self"],
+  "additionalProperties": false
+}

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litetalk:signal:session.kicked",
+  "title": "SessionKickedData",
+  "x-wire-type": "session.kicked",
+  "x-go-const": "TypeSessionKicked",
+  "x-direction": "S2C",
+  "x-since": 1,
+  "description": "同类设备新登录踢线。踢前尽力下发，随后 close 4001；发送窗口内丢帧时 close code 是可靠兜底。",
+  "type": "object",
+  "properties": {
+    "reason": {
+      "type": "string",
+      "description": "标准取值见 kick_reasons"
+    },
+    "device_type": {
+      "type": "string",
+      "description": "被踢连接自身的设备类型"
+    }
+  },
+  "required": ["reason", "device_type"],
+  "additionalProperties": false
+}
