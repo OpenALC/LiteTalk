@@ -136,7 +136,8 @@ func (s *Server) PatchFriend(ctx context.Context, request PatchFriendRequestObje
 	if e := checkID(request.Id); e != nil {
 		return nil, e
 	}
-	if request.Body == nil {
+	req := patchBody(request.JSONBody, request.ApplicationMergePatchPlusJSONBody)
+	if req == nil {
 		return nil, bodyMissing()
 	}
 	c := currentUser(ctx)
@@ -148,17 +149,20 @@ func (s *Server) PatchFriend(ctx context.Context, request PatchFriendRequestObje
 	if f.UserID != c.UserID {
 		return nil, errf(http.StatusForbidden, "forbidden", "仅发起方可设置备注与分组")
 	}
-	if req := request.Body; req.Remark != nil {
-		if n := len([]rune(*req.Remark)); n > 64 {
+	// Merge Patch（#31）：缺省不改，null/空串清除，值设置。
+	if req.Remark.Set {
+		v := req.Remark.Val
+		if n := len([]rune(v)); n > 64 {
 			return nil, errf(http.StatusBadRequest, "bad_remark", "备注需为 0–64 个字符")
 		}
-		f.Remark = *req.Remark
+		f.Remark = v
 	}
-	if req := request.Body; req.Group != nil {
-		if n := len([]rune(*req.Group)); n > 32 {
+	if req.Group.Set {
+		v := req.Group.Val
+		if n := len([]rune(v)); n > 32 {
 			return nil, errf(http.StatusBadRequest, "bad_group", "分组名需为 0–32 个字符")
 		}
-		f.GroupName = *req.Group
+		f.GroupName = v
 	}
 	if err := s.store.UpdateFriendship(ctx, f); err != nil {
 		return nil, s.writeStoreErr(ctx, err)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/OpenALC/LiteTalk/server/internal/auth"
@@ -52,16 +53,49 @@ const (
 	reqPathKey strictCtxKey = iota + 1
 	clientIPKey
 	respWriterKey
+	httpReqKey
 )
 
-// withStrictCtx 把请求路径、客户端 IP 与响应写入器放进 ctx（strict 方法拿不到
-// *http.Request / ResponseWriter；限流头要写在响应上，#31）。
+// withStrictCtx 把请求路径、客户端 IP、响应写入器与原始请求放进 ctx（strict 方法
+// 拿不到 *http.Request / ResponseWriter；限流头与 If-None-Match 协商要用，#31）。
 func (s *Server) withStrictCtx(f StrictHandlerFunc, _ string) StrictHandlerFunc {
 	return func(ctx context.Context, w http.ResponseWriter, r *http.Request, request any) (any, error) {
 		ctx = context.WithValue(ctx, reqPathKey, r.URL.Path)
 		ctx = context.WithValue(ctx, clientIPKey, s.clientIP(r))
 		ctx = context.WithValue(ctx, respWriterKey, w)
+		ctx = context.WithValue(ctx, httpReqKey, r)
 		return f(ctx, w, r, request)
+	}
+}
+
+// ifNoneMatch 取请求的 If-None-Match（ETag 协商，#31）；无则空串。
+func ifNoneMatch(ctx context.Context) string {
+	r, _ := ctx.Value(httpReqKey).(*http.Request)
+	if r == nil {
+		return ""
+	}
+	return r.Header.Get("If-None-Match")
+}
+
+// etagMatch 判断 If-None-Match 是否命中当前 ETag：支持 *、W/ 弱前缀与逗号列表。
+func etagMatch(ifNoneMatch, etag string) bool {
+	if ifNoneMatch == "" {
+		return false
+	}
+	for _, part := range strings.Split(ifNoneMatch, ",") {
+		part = strings.TrimSpace(part)
+		if part == "*" || part == etag || strings.TrimPrefix(part, "W/") == etag {
+			return true
+		}
+	}
+	return false
+}
+
+// setETag 写响应 ETag（#31 协商缓存）。
+func setETag(ctx context.Context, etag string) {
+	w, _ := ctx.Value(respWriterKey).(http.ResponseWriter)
+	if w != nil {
+		w.Header().Set("ETag", etag)
 	}
 }
 

@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"time"
+	"strings"
 
 	"github.com/oapi-codegen/runtime"
 )
@@ -114,24 +114,6 @@ func (e MemberInfoRole) Valid() bool {
 	}
 }
 
-// Defines values for PatchChannelRequestType.
-const (
-	PatchChannelRequestTypeText  PatchChannelRequestType = "text"
-	PatchChannelRequestTypeVoice PatchChannelRequestType = "voice"
-)
-
-// Valid indicates whether the value is a known member of the PatchChannelRequestType enum.
-func (e PatchChannelRequestType) Valid() bool {
-	switch e {
-	case PatchChannelRequestTypeText:
-		return true
-	case PatchChannelRequestTypeVoice:
-		return true
-	default:
-		return false
-	}
-}
-
 // Defines values for ServerConfigAuthMode.
 const (
 	Full   ServerConfigAuthMode = "full"
@@ -173,18 +155,18 @@ type AddFriendRequest struct {
 
 // CategoryInfo 频道分类。ID 为十进制字符串（#31）。
 type CategoryInfo struct {
-	CreatedAt time.Time `json:"created_at"`
-	Id        ID        `json:"id"`
-	Name      string    `json:"name"`
-	Position  int       `json:"position"`
-	ServerId  ID        `json:"server_id"`
+	CreatedAt Time   `json:"created_at"`
+	Id        ID     `json:"id"`
+	Name      string `json:"name"`
+	Position  int    `json:"position"`
+	ServerId  ID     `json:"server_id"`
 }
 
 // ChannelInfo 频道。ID 为十进制字符串（#31）。
 type ChannelInfo struct {
 	// CategoryId 分类归属；null = 未分类（请求侧 0 也表示未分类）
 	CategoryId *ID             `json:"category_id"`
-	CreatedAt  time.Time       `json:"created_at"`
+	CreatedAt  Time            `json:"created_at"`
 	Id         ID              `json:"id"`
 	Name       string          `json:"name"`
 	Position   int             `json:"position"`
@@ -280,9 +262,9 @@ type GuestRequest struct {
 
 // Invite 邀请码。ID 为十进制字符串（#31）。
 type Invite struct {
-	Code      string     `json:"code"`
-	CreatorId ID         `json:"creator_id"`
-	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	Code      string `json:"code"`
+	CreatorId ID     `json:"creator_id"`
+	ExpiresAt *Time  `json:"expires_at,omitempty"`
 
 	// MaxUses 0 = 不限
 	MaxUses  int `json:"max_uses"`
@@ -309,7 +291,7 @@ type LogoutRequest struct {
 
 // MemberInfo 服务器成员（内联昵称/tag）。ID 为十进制字符串（#31）。
 type MemberInfo struct {
-	JoinedAt time.Time      `json:"joined_at"`
+	JoinedAt Time           `json:"joined_at"`
 	Nickname *string        `json:"nickname,omitempty"`
 	Role     MemberInfoRole `json:"role"`
 	ServerId ID             `json:"server_id"`
@@ -322,10 +304,10 @@ type MemberInfoRole string
 
 // Message 文字频道消息（发送者昵称/tag 内联，不含邮箱）。ID 为十进制字符串（#31）。
 type Message struct {
-	ChannelId ID        `json:"channel_id"`
-	Content   string    `json:"content"`
-	CreatedAt time.Time `json:"created_at"`
-	Id        ID        `json:"id"`
+	ChannelId ID     `json:"channel_id"`
+	Content   string `json:"content"`
+	CreatedAt Time   `json:"created_at"`
+	Id        ID     `json:"id"`
 
 	// Nonce 幂等键（#31）；未带 nonce 的消息无此字段
 	Nonce          *string `json:"nonce,omitempty"`
@@ -341,46 +323,20 @@ type PasswordResetRequest struct {
 	Password string `json:"password"`
 }
 
-// PatchCategoryRequest name 与 position 至少给一个。
-type PatchCategoryRequest struct {
-	Name *string `json:"name,omitempty"`
+// PatchCategoryRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name 不可清， 空值被校验拒 400；position 的 null 拒 400），值 = 设置。 name 与 position 至少给一个。
+type PatchCategoryRequest = PatchCategoryBody
 
-	// Position 目标序（0-based）；服务端重排同服务器其它分类
-	Position *int `json:"position,omitempty"`
-}
+// PatchChannelRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name/type 不可清，空值被校验拒 400；category_id 的 null = 移出分类；position 的 null 拒 400——「删除位置」无语义），值 = 设置。
+type PatchChannelRequest = PatchChannelBody
 
-// PatchChannelRequest defines model for PatchChannelRequest.
-type PatchChannelRequest struct {
-	// CategoryId 0 = 显式移出分类；请求侧数字与字符串双接受（#31）
-	CategoryId *ID                      `json:"category_id,omitempty"`
-	Name       *string                  `json:"name,omitempty"`
-	Position   *int                     `json:"position,omitempty"`
-	Type       *PatchChannelRequestType `json:"type,omitempty"`
-}
+// PatchFriendRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null/空串 = 清除备注/ 移出分组，值 = 设置。仅发起方向可写。
+type PatchFriendRequest = PatchFriendBody
 
-// PatchChannelRequestType defines model for PatchChannelRequest.Type.
-type PatchChannelRequestType string
+// PatchMeRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（昵称不可清， 空值被校验拒 400），值 = 设置。部分更新（当前仅 nickname）。
+type PatchMeRequest = PatchMeBody
 
-// PatchFriendRequest 部分更新；空串清除备注/移出分组。
-type PatchFriendRequest struct {
-	// Group 0–32 字符
-	Group *string `json:"group,omitempty"`
-
-	// Remark 0–64 字符
-	Remark *string `json:"remark,omitempty"`
-}
-
-// PatchMeRequest 部分更新（当前仅 nickname）。
-type PatchMeRequest struct {
-	Nickname *string `json:"nickname,omitempty"`
-}
-
-// PatchServerRequest defines model for PatchServerRequest.
-type PatchServerRequest struct {
-	IconColor *string `json:"icon_color,omitempty"`
-	IconName  *string `json:"icon_name,omitempty"`
-	Name      *string `json:"name,omitempty"`
-}
+// PatchServerRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（名称/图标 不可清，空值被校验拒 400），值 = 设置。
+type PatchServerRequest = PatchServerBody
 
 // Problem RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示（旧 message 字段改名为 detail）。
 type Problem struct {
@@ -402,17 +358,17 @@ type Problem struct {
 
 // PublicUser 对外用户视图（好友/成员等他人信息），不含 email。ID 为十进制字符串（#31）。
 type PublicUser struct {
-	CreatedAt     time.Time `json:"created_at"`
-	EmailVerified bool      `json:"email_verified"`
-	Id            ID        `json:"id"`
-	IsGuest       bool      `json:"is_guest"`
-	Nickname      string    `json:"nickname"`
+	CreatedAt     Time   `json:"created_at"`
+	EmailVerified bool   `json:"email_verified"`
+	Id            ID     `json:"id"`
+	IsGuest       bool   `json:"is_guest"`
+	Nickname      string `json:"nickname"`
 
 	// Online 在线态（presence）；仅 friends 相关响应填真实值，其余恒 false
-	Online    bool      `json:"online"`
-	Status    int32     `json:"status"`
-	Tag       string    `json:"tag"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Online    bool   `json:"online"`
+	Status    int32  `json:"status"`
+	Tag       string `json:"tag"`
+	UpdatedAt Time   `json:"updated_at"`
 }
 
 // RefreshRequest defines model for RefreshRequest.
@@ -464,7 +420,7 @@ type ServerConfigAuthMode string
 
 // ServerInfo 服务器（群组）。图标为预设 Lucide 图标名 + 颜色，无图片。ID 为十进制字符串（#31）。
 type ServerInfo struct {
-	CreatedAt time.Time `json:"created_at"`
+	CreatedAt Time `json:"created_at"`
 
 	// IconColor #RRGGBB
 	IconColor string `json:"icon_color"`
@@ -496,19 +452,19 @@ type TokenPair struct {
 
 // User 自响应用户（/users/me、登录/注册/游客/刷新），含 email。ID 为十进制字符串（#31）。
 type User struct {
-	CreatedAt     time.Time `json:"created_at"`
-	Email         string    `json:"email"`
-	EmailVerified bool      `json:"email_verified"`
-	Id            ID        `json:"id"`
-	IsGuest       bool      `json:"is_guest"`
-	Nickname      string    `json:"nickname"`
+	CreatedAt     Time   `json:"created_at"`
+	Email         string `json:"email"`
+	EmailVerified bool   `json:"email_verified"`
+	Id            ID     `json:"id"`
+	IsGuest       bool   `json:"is_guest"`
+	Nickname      string `json:"nickname"`
 
 	// Status 账号状态枚举
 	Status int32 `json:"status"`
 
 	// Tag 四位定宽数字串
-	Tag       string    `json:"tag"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Tag       string `json:"tag"`
+	UpdatedAt Time   `json:"updated_at"`
 }
 
 // IDPath defines model for IDPath.
@@ -560,6 +516,18 @@ type ListMessagesParams struct {
 	Limit *int `form:"limit,omitempty" json:"limit,omitempty"`
 }
 
+// ListChannelsParams defines parameters for ListChannels.
+type ListChannelsParams struct {
+	// IfNoneMatch 上次响应的 ETag；命中回 304（#31 协商缓存）
+	IfNoneMatch *string `json:"If-None-Match,omitempty"`
+}
+
+// ListServerMembersParams defines parameters for ListServerMembers.
+type ListServerMembersParams struct {
+	// IfNoneMatch 上次响应的 ETag；命中回 304
+	IfNoneMatch *string `json:"If-None-Match,omitempty"`
+}
+
 // SendEmailCodeJSONRequestBody defines body for SendEmailCode for application/json ContentType.
 type SendEmailCodeJSONRequestBody = EmailCodeRequest
 
@@ -584,8 +552,14 @@ type RegisterJSONRequestBody = RegisterRequest
 // PatchCategoryJSONRequestBody defines body for PatchCategory for application/json ContentType.
 type PatchCategoryJSONRequestBody = PatchCategoryRequest
 
+// PatchCategoryApplicationMergePatchPlusJSONRequestBody defines body for PatchCategory for application/merge-patch+json ContentType.
+type PatchCategoryApplicationMergePatchPlusJSONRequestBody = PatchCategoryRequest
+
 // PatchChannelJSONRequestBody defines body for PatchChannel for application/json ContentType.
 type PatchChannelJSONRequestBody = PatchChannelRequest
+
+// PatchChannelApplicationMergePatchPlusJSONRequestBody defines body for PatchChannel for application/merge-patch+json ContentType.
+type PatchChannelApplicationMergePatchPlusJSONRequestBody = PatchChannelRequest
 
 // CreateMessageJSONRequestBody defines body for CreateMessage for application/json ContentType.
 type CreateMessageJSONRequestBody = CreateMessageRequest
@@ -596,6 +570,9 @@ type CreateFriendRequestJSONRequestBody = AddFriendRequest
 // PatchFriendJSONRequestBody defines body for PatchFriend for application/json ContentType.
 type PatchFriendJSONRequestBody = PatchFriendRequest
 
+// PatchFriendApplicationMergePatchPlusJSONRequestBody defines body for PatchFriend for application/merge-patch+json ContentType.
+type PatchFriendApplicationMergePatchPlusJSONRequestBody = PatchFriendRequest
+
 // CreateServerJSONRequestBody defines body for CreateServer for application/json ContentType.
 type CreateServerJSONRequestBody = CreateServerRequest
 
@@ -604,6 +581,9 @@ type JoinServerJSONRequestBody = JoinServerRequest
 
 // PatchServerJSONRequestBody defines body for PatchServer for application/json ContentType.
 type PatchServerJSONRequestBody = PatchServerRequest
+
+// PatchServerApplicationMergePatchPlusJSONRequestBody defines body for PatchServer for application/merge-patch+json ContentType.
+type PatchServerApplicationMergePatchPlusJSONRequestBody = PatchServerRequest
 
 // CreateCategoryJSONRequestBody defines body for CreateCategory for application/json ContentType.
 type CreateCategoryJSONRequestBody = CreateCategoryRequest
@@ -616,6 +596,9 @@ type CreateInviteJSONRequestBody = CreateInviteRequest
 
 // PatchMeJSONRequestBody defines body for PatchMe for application/json ContentType.
 type PatchMeJSONRequestBody = PatchMeRequest
+
+// PatchMeApplicationMergePatchPlusJSONRequestBody defines body for PatchMe for application/merge-patch+json ContentType.
+type PatchMeApplicationMergePatchPlusJSONRequestBody = PatchMeRequest
 
 // ServerInterface represents all server handlers.
 type ServerInterface interface {
@@ -696,7 +679,7 @@ type ServerInterface interface {
 	CreateCategory(w http.ResponseWriter, r *http.Request, id IDPath)
 	// ListChannels 服务器的分类与频道（成员可读）
 	// (GET /api/v1/servers/{id}/channels)
-	ListChannels(w http.ResponseWriter, r *http.Request, id IDPath)
+	ListChannels(w http.ResponseWriter, r *http.Request, id IDPath, params ListChannelsParams)
 	// CreateChannel 创建频道（owner/admin）
 	// (POST /api/v1/servers/{id}/channels)
 	CreateChannel(w http.ResponseWriter, r *http.Request, id IDPath)
@@ -705,7 +688,7 @@ type ServerInterface interface {
 	CreateInvite(w http.ResponseWriter, r *http.Request, id IDPath)
 	// ListServerMembers 服务器成员列表（成员可读）
 	// (GET /api/v1/servers/{id}/members)
-	ListServerMembers(w http.ResponseWriter, r *http.Request, id IDPath)
+	ListServerMembers(w http.ResponseWriter, r *http.Request, id IDPath, params ListServerMembersParams)
 	// GetMe 当前用户（自响应，含 email）
 	// (GET /api/v1/users/me)
 	GetMe(w http.ResponseWriter, r *http.Request)
@@ -1303,8 +1286,32 @@ func (siw *ServerInterfaceWrapper) ListChannels(w http.ResponseWriter, r *http.R
 		return
 	}
 
+	// Parameter object where we will unmarshal all parameters from the context
+	var params ListChannelsParams
+
+	headers := r.Header
+
+	// ------------- Optional header parameter "If-None-Match" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("If-None-Match")]; found {
+		var IfNoneMatch string
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "If-None-Match", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "If-None-Match", valueList[0], &IfNoneMatch, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "If-None-Match", Err: err})
+			return
+		}
+
+		params.IfNoneMatch = &IfNoneMatch
+
+	}
+
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		siw.Handler.ListChannels(w, r, id)
+		siw.Handler.ListChannels(w, r, id, params)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -1381,8 +1388,32 @@ func (siw *ServerInterfaceWrapper) ListServerMembers(w http.ResponseWriter, r *h
 		return
 	}
 
+	// Parameter object where we will unmarshal all parameters from the context
+	var params ListServerMembersParams
+
+	headers := r.Header
+
+	// ------------- Optional header parameter "If-None-Match" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("If-None-Match")]; found {
+		var IfNoneMatch string
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "If-None-Match", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "If-None-Match", valueList[0], &IfNoneMatch, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "If-None-Match", Err: err})
+			return
+		}
+
+		params.IfNoneMatch = &IfNoneMatch
+
+	}
+
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		siw.Handler.ListServerMembers(w, r, id)
+		siw.Handler.ListServerMembers(w, r, id, params)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -2321,8 +2352,9 @@ func (response DeleteCategorydefaultApplicationProblemPlusJSONResponse) VisitDel
 }
 
 type PatchCategoryRequestObject struct {
-	Id   IDPath `json:"id"`
-	Body *PatchCategoryJSONRequestBody
+	Id                                IDPath `json:"id"`
+	JSONBody                          *PatchCategoryJSONRequestBody
+	ApplicationMergePatchPlusJSONBody *PatchCategoryApplicationMergePatchPlusJSONRequestBody
 }
 
 type PatchCategoryResponseObject interface {
@@ -2528,8 +2560,9 @@ func (response DeleteChanneldefaultApplicationProblemPlusJSONResponse) VisitDele
 }
 
 type PatchChannelRequestObject struct {
-	Id   IDPath `json:"id"`
-	Body *PatchChannelJSONRequestBody
+	Id                                IDPath `json:"id"`
+	JSONBody                          *PatchChannelJSONRequestBody
+	ApplicationMergePatchPlusJSONBody *PatchChannelApplicationMergePatchPlusJSONRequestBody
 }
 
 type PatchChannelResponseObject interface {
@@ -3270,8 +3303,9 @@ func (response DeleteFrienddefaultApplicationProblemPlusJSONResponse) VisitDelet
 }
 
 type PatchFriendRequestObject struct {
-	Id   IDPath `json:"id"`
-	Body *PatchFriendJSONRequestBody
+	Id                                IDPath `json:"id"`
+	JSONBody                          *PatchFriendJSONRequestBody
+	ApplicationMergePatchPlusJSONBody *PatchFriendApplicationMergePatchPlusJSONRequestBody
 }
 
 type PatchFriendResponseObject interface {
@@ -3721,8 +3755,9 @@ func (response DeleteServerdefaultApplicationProblemPlusJSONResponse) VisitDelet
 }
 
 type PatchServerRequestObject struct {
-	Id   IDPath `json:"id"`
-	Body *PatchServerJSONRequestBody
+	Id                                IDPath `json:"id"`
+	JSONBody                          *PatchServerJSONRequestBody
+	ApplicationMergePatchPlusJSONBody *PatchServerApplicationMergePatchPlusJSONRequestBody
 }
 
 type PatchServerResponseObject interface {
@@ -3913,7 +3948,8 @@ func (response CreateCategorydefaultApplicationProblemPlusJSONResponse) VisitCre
 }
 
 type ListChannelsRequestObject struct {
-	Id IDPath `json:"id"`
+	Id     IDPath `json:"id"`
+	Params ListChannelsParams
 }
 
 type ListChannelsResponseObject interface {
@@ -3932,6 +3968,14 @@ func (response ListChannels200JSONResponse) VisitListChannelsResponse(w http.Res
 	w.WriteHeader(200)
 	_, err := buf.WriteTo(w)
 	return err
+}
+
+type ListChannels304Response struct {
+}
+
+func (response ListChannels304Response) VisitListChannelsResponse(w http.ResponseWriter) error {
+	w.WriteHeader(304)
+	return nil
 }
 
 type ListChannels400ApplicationProblemPlusJSONResponse struct {
@@ -4176,7 +4220,8 @@ func (response CreateInvitedefaultApplicationProblemPlusJSONResponse) VisitCreat
 }
 
 type ListServerMembersRequestObject struct {
-	Id IDPath `json:"id"`
+	Id     IDPath `json:"id"`
+	Params ListServerMembersParams
 }
 
 type ListServerMembersResponseObject interface {
@@ -4195,6 +4240,14 @@ func (response ListServerMembers200JSONResponse) VisitListServerMembersResponse(
 	w.WriteHeader(200)
 	_, err := buf.WriteTo(w)
 	return err
+}
+
+type ListServerMembers304Response struct {
+}
+
+func (response ListServerMembers304Response) VisitListServerMembersResponse(w http.ResponseWriter) error {
+	w.WriteHeader(304)
+	return nil
 }
 
 type ListServerMembers400ApplicationProblemPlusJSONResponse struct {
@@ -4333,7 +4386,8 @@ func (response GetMedefaultApplicationProblemPlusJSONResponse) VisitGetMeRespons
 }
 
 type PatchMeRequestObject struct {
-	Body *PatchMeJSONRequestBody
+	JSONBody                          *PatchMeJSONRequestBody
+	ApplicationMergePatchPlusJSONBody *PatchMeApplicationMergePatchPlusJSONRequestBody
 }
 
 type PatchMeResponseObject interface {
@@ -4807,13 +4861,26 @@ func (sh *strictHandler) PatchCategory(w http.ResponseWriter, r *http.Request, i
 	var request PatchCategoryRequestObject
 
 	request.Id = id
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 
-	var body PatchCategoryJSONRequestBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
-		return
+		var body PatchCategoryJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.JSONBody = &body
+
 	}
-	request.Body = &body
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/merge-patch+json") {
+
+		var body PatchCategoryApplicationMergePatchPlusJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.ApplicationMergePatchPlusJSONBody = &body
+
+	}
 
 	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
 		return sh.ssi.PatchCategory(ctx, request.(PatchCategoryRequestObject))
@@ -4866,13 +4933,26 @@ func (sh *strictHandler) PatchChannel(w http.ResponseWriter, r *http.Request, id
 	var request PatchChannelRequestObject
 
 	request.Id = id
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 
-	var body PatchChannelJSONRequestBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
-		return
+		var body PatchChannelJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.JSONBody = &body
+
 	}
-	request.Body = &body
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/merge-patch+json") {
+
+		var body PatchChannelApplicationMergePatchPlusJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.ApplicationMergePatchPlusJSONBody = &body
+
+	}
 
 	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
 		return sh.ssi.PatchChannel(ctx, request.(PatchChannelRequestObject))
@@ -5090,13 +5170,26 @@ func (sh *strictHandler) PatchFriend(w http.ResponseWriter, r *http.Request, id 
 	var request PatchFriendRequestObject
 
 	request.Id = id
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 
-	var body PatchFriendJSONRequestBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
-		return
+		var body PatchFriendJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.JSONBody = &body
+
 	}
-	request.Body = &body
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/merge-patch+json") {
+
+		var body PatchFriendApplicationMergePatchPlusJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.ApplicationMergePatchPlusJSONBody = &body
+
+	}
 
 	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
 		return sh.ssi.PatchFriend(ctx, request.(PatchFriendRequestObject))
@@ -5235,13 +5328,26 @@ func (sh *strictHandler) PatchServer(w http.ResponseWriter, r *http.Request, id 
 	var request PatchServerRequestObject
 
 	request.Id = id
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 
-	var body PatchServerJSONRequestBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
-		return
+		var body PatchServerJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.JSONBody = &body
+
 	}
-	request.Body = &body
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/merge-patch+json") {
+
+		var body PatchServerApplicationMergePatchPlusJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.ApplicationMergePatchPlusJSONBody = &body
+
+	}
 
 	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
 		return sh.ssi.PatchServer(ctx, request.(PatchServerRequestObject))
@@ -5297,10 +5403,11 @@ func (sh *strictHandler) CreateCategory(w http.ResponseWriter, r *http.Request, 
 }
 
 // ListChannels operation middleware
-func (sh *strictHandler) ListChannels(w http.ResponseWriter, r *http.Request, id IDPath) {
+func (sh *strictHandler) ListChannels(w http.ResponseWriter, r *http.Request, id IDPath, params ListChannelsParams) {
 	var request ListChannelsRequestObject
 
 	request.Id = id
+	request.Params = params
 
 	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
 		return sh.ssi.ListChannels(ctx, request.(ListChannelsRequestObject))
@@ -5389,10 +5496,11 @@ func (sh *strictHandler) CreateInvite(w http.ResponseWriter, r *http.Request, id
 }
 
 // ListServerMembers operation middleware
-func (sh *strictHandler) ListServerMembers(w http.ResponseWriter, r *http.Request, id IDPath) {
+func (sh *strictHandler) ListServerMembers(w http.ResponseWriter, r *http.Request, id IDPath, params ListServerMembersParams) {
 	var request ListServerMembersRequestObject
 
 	request.Id = id
+	request.Params = params
 
 	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
 		return sh.ssi.ListServerMembers(ctx, request.(ListServerMembersRequestObject))
@@ -5442,12 +5550,26 @@ func (sh *strictHandler) GetMe(w http.ResponseWriter, r *http.Request) {
 func (sh *strictHandler) PatchMe(w http.ResponseWriter, r *http.Request) {
 	var request PatchMeRequestObject
 
-	var body PatchMeJSONRequestBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
-		return
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+
+		var body PatchMeJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.JSONBody = &body
+
 	}
-	request.Body = &body
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/merge-patch+json") {
+
+		var body PatchMeApplicationMergePatchPlusJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.ApplicationMergePatchPlusJSONBody = &body
+
+	}
 
 	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
 		return sh.ssi.PatchMe(ctx, request.(PatchMeRequestObject))

@@ -349,7 +349,7 @@ export interface paths {
         };
         /**
          * 服务器成员列表（成员可读）
-         * @description code：bad_request、路径参数不合法；401；403 forbidden； 5xx internal。user_id 为数字 ID（#31 前现状）。
+         * @description 支持 ETag 协商缓存（#31）：响应带 ETag，带 If-None-Match 命中回 304 无 body。 code：bad_request、路径参数不合法；401；403 forbidden； 5xx internal。user_id 为十进制 ID 字符串（#31）。
          */
         get: operations["listServerMembers"];
         put?: never;
@@ -500,6 +500,21 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * Attachment
+         * @description 附件元数据（#31 预留 schema 占位，实现移出本批另单跟踪）。 计划端点：POST /api/v1/attachments（multipart，登录可传）返回本结构， 消息体以 attachment_ids 引用；存储后端可插拔（本地磁盘 / S3 兼容）。 本批不实现端点，字段形状以实现落地时为准。
+         */
+        Attachment: {
+            /** @description 附件 ID（十进制字符串） */
+            id: string;
+            filename: string;
+            /**
+             * Format: int64
+             * @description 字节数
+             */
+            size: number;
+            content_type: string;
+        };
         /**
          * Problem
          * @description RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示（旧 message 字段改名为 detail）。
@@ -749,7 +764,7 @@ export interface components {
         };
         /**
          * PatchMeRequest
-         * @description 部分更新（当前仅 nickname）。
+         * @description JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（昵称不可清， 空值被校验拒 400），值 = 设置。部分更新（当前仅 nickname）。
          */
         PatchMeRequest: {
             nickname?: string | null;
@@ -764,7 +779,7 @@ export interface components {
         };
         /**
          * PatchFriendRequest
-         * @description 部分更新；空串清除备注/移出分组。
+         * @description JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null/空串 = 清除备注/ 移出分组，值 = 设置。仅发起方向可写。
          */
         PatchFriendRequest: {
             /** @description 0–64 字符 */
@@ -781,7 +796,10 @@ export interface components {
             /** @description #RRGGBB；空 = #4FA4F3 */
             icon_color?: string;
         };
-        /** PatchServerRequest */
+        /**
+         * PatchServerRequest
+         * @description JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（名称/图标 不可清，空值被校验拒 400），值 = 设置。
+         */
         PatchServerRequest: {
             name?: string | null;
             icon_name?: string | null;
@@ -814,7 +832,10 @@ export interface components {
             category_id?: string | null;
             position?: number;
         };
-        /** PatchChannelRequest */
+        /**
+         * PatchChannelRequest
+         * @description JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name/type 不可清，空值被校验拒 400；category_id 的 null = 移出分类；position 的 null 拒 400——「删除位置」无语义），值 = 设置。
+         */
         PatchChannelRequest: {
             name?: string | null;
             /** @enum {string|null} */
@@ -830,7 +851,7 @@ export interface components {
         };
         /**
          * PatchCategoryRequest
-         * @description name 与 position 至少给一个。
+         * @description JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name 不可清， 空值被校验拒 400；position 的 null 拒 400），值 = 设置。 name 与 position 至少给一个。
          */
         PatchCategoryRequest: {
             name?: string | null;
@@ -1177,6 +1198,7 @@ export interface operations {
         };
         requestBody: {
             content: {
+                "application/merge-patch+json": components["schemas"]["PatchMeRequest"];
                 "application/json": components["schemas"]["PatchMeRequest"];
             };
         };
@@ -1287,6 +1309,7 @@ export interface operations {
         };
         requestBody: {
             content: {
+                "application/merge-patch+json": components["schemas"]["PatchFriendRequest"];
                 "application/json": components["schemas"]["PatchFriendRequest"];
             };
         };
@@ -1425,6 +1448,7 @@ export interface operations {
         };
         requestBody: {
             content: {
+                "application/merge-patch+json": components["schemas"]["PatchServerRequest"];
                 "application/json": components["schemas"]["PatchServerRequest"];
             };
         };
@@ -1478,7 +1502,10 @@ export interface operations {
     listServerMembers: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description 上次响应的 ETag；命中回 304 */
+                "If-None-Match"?: string;
+            };
             path: {
                 /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
@@ -1495,6 +1522,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["MemberInfo"][];
                 };
+            };
+            /** @description ETag 命中（If-None-Match），无 body（#31） */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
@@ -1536,7 +1570,10 @@ export interface operations {
     listChannels: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description 上次响应的 ETag；命中回 304（#31 协商缓存） */
+                "If-None-Match"?: string;
+            };
             path: {
                 /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
@@ -1553,6 +1590,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["ServerChannels"];
                 };
+            };
+            /** @description ETag 命中（If-None-Match），无 body（#31） */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
@@ -1631,6 +1675,7 @@ export interface operations {
         };
         requestBody: {
             content: {
+                "application/merge-patch+json": components["schemas"]["PatchChannelRequest"];
                 "application/json": components["schemas"]["PatchChannelRequest"];
             };
         };
@@ -1726,6 +1771,7 @@ export interface operations {
         };
         requestBody: {
             content: {
+                "application/merge-patch+json": components["schemas"]["PatchCategoryRequest"];
                 "application/json": components["schemas"]["PatchCategoryRequest"];
             };
         };
