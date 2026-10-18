@@ -50,9 +50,20 @@ func TestMySQLMigrateAndCRUD(t *testing.T) {
 		t.Fatalf("重复迁移应幂等: %v", err)
 	}
 
-	// 回滚验证 down 迁移。
-	if err := m.RollbackLast(ctx, migFS); err != nil {
-		t.Fatalf("回滚失败: %v", err)
+	// 回滚验证 down 迁移。迁移是叠放的，RollbackLast 只撤最新一个——只回滚一次
+	// 就断言 users 消失，是只有 0001_init 的年代写的，0002+ 落地后恒失败。
+	// 这里逐个回滚到空库，再验 users 确实没了。
+	for {
+		var left int
+		if err := m.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&left); err != nil {
+			t.Fatal(err)
+		}
+		if left == 0 {
+			break
+		}
+		if err := m.RollbackLast(ctx, migFS); err != nil {
+			t.Fatalf("回滚失败: %v", err)
+		}
 	}
 	var cnt int
 	if err := m.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='litetalk_test' AND table_name='users'").Scan(&cnt); err != nil || cnt != 0 {
