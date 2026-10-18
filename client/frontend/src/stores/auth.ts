@@ -21,7 +21,7 @@ export const useAuthStore = defineStore('auth', () => {
   const kickedReason = ref('')
 
   // 服务端能力开关（启动时拉取一次，注册/找回页据此适配 UI）。
-  const serverCfg = ref<ServerConfig>({ auth_mode: 'full', mail_configured: false })
+  const serverCfg = ref<ServerConfig>({ auth_mode: 'full', mail_configured: false, self_host: false, bootstrap_required: false })
   const simpleMode = computed(() => serverCfg.value.auth_mode === 'simple')
   const mailConfigured = computed(() => serverCfg.value.mail_configured)
   // 自托管引导（#27）：self_host 或邀请码未消费时注册页显示可选邀请码输入。
