@@ -13,10 +13,36 @@ const mockGoApp = vi.hoisted(() => ({
   })),
   GetHomeServer: vi.fn(async () => ''),
   GetIntroHidden: vi.fn(async () => false),
+  ListFriends: vi.fn(async (): Promise<unknown[]> => []),
 }))
-vi.mock('../api/bridge', () => ({ goApp: () => mockGoApp }))
+// eventsOn 桩：记录各事件的监听器，测试直接调用处理器模拟事件到达；
+// 返回按监听器的取消函数（与 bridge 约定一致）。
+const mockEventsOn = vi.hoisted(() => {
+  const handlers = new Map<string, Array<(...args: unknown[]) => void>>()
+  return {
+    handlers,
+    on(name: string, cb: (...args: unknown[]) => void) {
+      const list = handlers.get(name) ?? []
+      list.push(cb)
+      handlers.set(name, list)
+      return () => {
+        handlers.set(
+          name,
+          (handlers.get(name) ?? []).filter((h) => h !== cb),
+        )
+      }
+    },
+    reset() {
+      handlers.clear()
+    },
+    fire(name: string, data: unknown) {
+      for (const h of handlers.get(name) ?? []) h(data)
+    },
+  }
+})
+vi.mock('../api/bridge', () => ({ goApp: () => mockGoApp, eventsOn: mockEventsOn.on }))
 
-import { useServersStore, UNCATEGORIZED } from './data'
+import { useServersStore, useFriendsStore, UNCATEGORIZED } from './data'
 import { useNotifyStore } from './notify'
 
 // resetMock 每例前清桩：mockReset 连实现一起清，需补回默认实现。
@@ -27,6 +53,8 @@ function resetMock() {
   mockGoApp.UpdateCategory.mockReset().mockImplementation(async (id, name, position) => ({
     id, server_id: 0, name: name || `分类${id}`, position: position < 0 ? 0 : position,
   }))
+  mockGoApp.ListFriends.mockReset().mockResolvedValue([])
+  mockEventsOn.reset()
 }
 
 describe('频道列表恢复', () => {
@@ -206,5 +234,72 @@ describe('分类改名与排序', () => {
     expect(mockGoApp.UpdateCategory).toHaveBeenCalledWith(3, '', 0)
     expect(s.extraGroups['22'].map((g) => g.name)).toEqual(['丙', '甲', '乙'])
     expect(s.groupsOf('22', []).map((g) => g.name)).toEqual(['丙', '甲', '乙'])
+  })
+})
+
+// 好友在线点（#11）：user.online 是唯一数据源（两态），presence:update 增量移组。
+describe('好友在线态', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    resetMock()
+  })
+
+  const friendDTO = (id: number, uid: number, online: boolean) => ({
+    id,
+    status: 'accepted',
+    incoming: false,
+    remark: '',
+    group: '',
+    user: { id: uid, nickname: `用户${uid}`, tag: '0001', status: 1, online },
+  })
+
+  it('loadFriends 按 user.online 分组，status 收敛为两态', async () => {
+    mockGoApp.ListFriends.mockResolvedValue([
+      friendDTO(1, 10, true),
+      friendDTO(2, 20, false),
+      { ...friendDTO(3, 30, true), status: 'pending', incoming: true },
+    ])
+    const s = useFriendsStore()
+    await s.loadFriends()
+    expect(s.online.map((f) => f.userId)).toEqual([10])
+    expect(s.offline.map((f) => f.userId)).toEqual([20])
+    expect(s.online[0].status).toBe('online')
+    expect(s.online[0].sub).toBe('在线')
+    expect(s.offline[0].status).toBe('offline')
+    expect(s.offline[0].sub).toBe('离线')
+    expect(s.pending.map((p) => p.id)).toEqual([3])
+  })
+
+  it('presence:update 增量移组并保持排序，未知用户忽略', async () => {
+    mockGoApp.ListFriends.mockResolvedValue([friendDTO(1, 10, true), friendDTO(2, 20, false)])
+    const s = useFriendsStore()
+    await s.loadFriends()
+    s.bindEvents()
+
+    mockEventsOn.fire('presence:update', { user_id: '20', online: true })
+    expect(s.online.map((f) => f.userId)).toEqual([10, 20])
+    expect(s.offline).toEqual([])
+    expect(s.online[1].sub).toBe('在线')
+
+    mockEventsOn.fire('presence:update', { user_id: '10', online: false })
+    expect(s.offline.map((f) => f.userId)).toEqual([10])
+    expect(s.online.map((f) => f.userId)).toEqual([20])
+
+    // 未知用户 / 坏包不抛错不改状态。
+    mockEventsOn.fire('presence:update', { user_id: '999', online: true })
+    mockEventsOn.fire('presence:update', null)
+    expect(s.online.map((f) => f.userId)).toEqual([20])
+    expect(s.offline.map((f) => f.userId)).toEqual([10])
+  })
+
+  it('unbindEvents 注销后不再收 presence:update', async () => {
+    mockGoApp.ListFriends.mockResolvedValue([friendDTO(1, 10, false)])
+    const s = useFriendsStore()
+    await s.loadFriends()
+    s.bindEvents()
+    s.unbindEvents()
+    mockEventsOn.fire('presence:update', { user_id: '10', online: true })
+    expect(s.online).toEqual([])
+    expect(s.offline.map((f) => f.userId)).toEqual([10])
   })
 })

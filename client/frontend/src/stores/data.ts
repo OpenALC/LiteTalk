@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import { goApp } from '../api/bridge'
+import { eventsOn, goApp } from '../api/bridge'
 import type { ServerChannels } from '../api/types'
 import { useNotifyStore } from './notify'
 
@@ -37,11 +37,13 @@ export interface Server {
 
 export interface Friend {
   id: number // friendship id（备注/分组/删除 REST 的目标）
+  userId: number // 对端 user.id（presence:update 按它匹配，#11）
   name: string // 显示名 = remark || nickname（服务端 remark 仅发起方向可写，对方视角恒空回落昵称——预期行为）
   nickname: string // 原始昵称（添加好友/请求静音等场景用）
   remark: string // 备注原文（空 = 未设置；编辑弹层初值用）
-  status: 'online' | 'idle' | 'busy' | 'offline'
-  sub: string // 状态行文案（在线/离开/忙碌/离线）
+  // 在线态收敛为两态（#11，真实数据源 presence）：idle/busy 无数据源，不造状态。
+  status: 'online' | 'offline'
+  sub: string // 状态行文案（在线/离线）
   inChannel?: boolean // 服务端暂无「好友所在频道」数据，恒 false（按钮隐藏）
   group: string // 好友分组（显示值，空归「好友」默认组；提交时映射回空串）
   incoming: boolean // 对方发起=我接受的行。服务端 PATCH 仅发起方向可写——
@@ -439,7 +441,7 @@ export const useServersStore = defineStore('servers', () => {
 })
 
 export const useFriendsStore = defineStore('friends', () => {
-  // v0.1.2：mock 已删，全部来自 ListFriends REST。accepted 按 user.status
+  // v0.1.2：mock 已删，全部来自 ListFriends REST。accepted 按 user.online
   // 分 online/offline 两组；pending+incoming 进「待处理」区（带接受按钮）。
   const online = ref<Friend[]>([])
   const offline = ref<Friend[]>([])
@@ -447,7 +449,8 @@ export const useFriendsStore = defineStore('friends', () => {
   // !incoming=我发出待对方回应（仅展示，S3：此前完全不可见）。
   const pending = ref<{ id: number; name: string; outgoing: boolean }[]>([])
 
-  const STATUS_TEXT = { online: '在线', idle: '离开', busy: '忙碌', offline: '离线' } as const
+  // 在线态只有两态（#11）：数据源是 presence:{uid}，不再造 idle/busy。
+  const STATUS_TEXT = { online: '在线', offline: '离线' } as const
 
   // loadFriends 拉取并归组。服务端 friendships.remark/group 仅「发起方向」可写，
   // 对方视角恒为空——显示名回落 nickname 属预期，不补双侧字段（服务端规格如此）。
@@ -462,10 +465,10 @@ export const useFriendsStore = defineStore('friends', () => {
         continue
       }
       if (f.status !== 'accepted') continue
-      const key: Friend['status'] =
-        f.user.status === 1 ? 'online' : f.user.status === 2 ? 'idle' : f.user.status === 3 ? 'busy' : 'offline'
+      const key: Friend['status'] = f.user.online ? 'online' : 'offline'
       const entry: Friend = {
         id: f.id,
+        userId: f.user.id,
         name: f.remark || f.user.nickname,
         nickname: f.user.nickname,
         remark: f.remark,
@@ -481,6 +484,21 @@ export const useFriendsStore = defineStore('friends', () => {
     online.value = on.sort(byName)
     offline.value = off.sort(byName)
     pending.value = pend
+  }
+
+  // setPresence presence:update 增量刷新单个好友的在线态（#11）：组间移动并保持排序。
+  // 不在「来源组」= 状态已一致或本就不在好友列表，直接忽略（去抖）。
+  function setPresence(userId: number | string, isOnline: boolean) {
+    const uid = Number(userId)
+    const from = isOnline ? offline : online
+    const to = isOnline ? online : offline
+    const idx = from.value.findIndex((f) => f.userId === uid)
+    if (idx < 0) return
+    const [f] = from.value.splice(idx, 1)
+    f.status = isOnline ? 'online' : 'offline'
+    f.sub = STATUS_TEXT[f.status]
+    to.value.push(f)
+    to.value.sort((a, b) => a.name.localeCompare(b.name, 'zh'))
   }
 
   // sendRequest 发送好友请求（REST；target 形如 昵称#1234，服务端拆分）。
@@ -513,7 +531,29 @@ export const useFriendsStore = defineStore('friends', () => {
     return [...online.value, ...offline.value].find((f) => f.id === id)
   }
 
-  return { online, offline, pending, loadFriends, sendRequest, acceptRequest, removeFriend, setMeta, findById }
+  // 事件订阅（presence:update，#11）。eventsOn 返回按监听器的取消函数，
+  // 卸载时逐个注销——不按事件名整体 Off（会清掉别人注册的同名监听）。
+  const offs: Array<() => void> = []
+
+  function bindEvents() {
+    if (offs.length) return // 幂等：重复绑定会叠监听
+    offs.push(
+      eventsOn('presence:update', (d) => {
+        const p = d as { user_id?: string; online?: boolean } | null
+        if (p?.user_id == null || typeof p.online !== 'boolean') return
+        setPresence(p.user_id, p.online)
+      }),
+    )
+  }
+
+  function unbindEvents() {
+    while (offs.length) offs.pop()!()
+  }
+
+  return {
+    online, offline, pending, loadFriends, sendRequest, acceptRequest, removeFriend, setMeta, findById,
+    setPresence, bindEvents, unbindEvents,
+  }
 })
 
 export const useSettingsStore = defineStore('settings', () => {
