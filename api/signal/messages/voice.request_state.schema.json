@@ -6,6 +6,7 @@
   "x-go-const": "TypeVoiceRequestState",
   "x-direction": "C2S",
   "x-since": 1,
+  "x-namespace": "voice",
   "description": "请求目标成员闭麦/静音。仅「请求」语义：服务端定向转发给目标，由目标自行决定是否执行（无权限强制）。",
   "type": "object",
   "properties": {

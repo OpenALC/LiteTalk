@@ -24,6 +24,7 @@ type config struct {
 	addrExplicit     bool   // LITETALK_ADDR 显式配置过则绝不自动改端口
 	acme             bool   // 启用内置 ACME（domain 非空且未 behind-proxy）
 	printAdminInvite bool   // -print-admin-invite：打印管理员邀请码后退出（#27 T4 填实现）
+	gatewayBacklog   int    // -gateway-backlog / LITETALK_GATEWAY_BACKLOG：每会话事件环条数（#32）
 
 	// 校验输入（启动序步骤 2 集中把关；本批无对应 flag，仅 env）
 	jwtSecret     string
@@ -51,6 +52,8 @@ func loadConfig(args []string, output io.Writer) (*config, error) {
 		"数据目录（SQLite 库、证书缓存、bootstrap 状态）")
 	printAdminInvite := fs.Bool("print-admin-invite", false,
 		"重新打印管理员邀请码后退出")
+	gatewayBacklog := fs.Int("gateway-backlog", envInt("LITETALK_GATEWAY_BACKLOG", 256),
+		"每会话事件环条数（#32 断线续传窗口；<=0 回落 256）")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -64,6 +67,7 @@ func loadConfig(args []string, output io.Writer) (*config, error) {
 		behindProxy:      *behindProxy,
 		dataDir:          *dataDir,
 		printAdminInvite: *printAdminInvite,
+		gatewayBacklog:   *gatewayBacklog,
 		jwtSecret:        os.Getenv("LITETALK_JWT_SECRET"),
 		sfuIP:            envOr("LITETALK_SFU_IP", "127.0.0.1"),
 		sfuIPExplicit:    os.Getenv("LITETALK_SFU_IP") != "",

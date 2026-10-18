@@ -16,27 +16,30 @@ const (
 
 // 信令消息类型（wire 值见 api/signal/messages/*.schema.json 的 x-wire-type）。
 const (
-	TypeChannelJoin       = "channel.join"        // C→S
-	TypeChannelJoined     = "channel.joined"      // S→C
-	TypeChannelLeave      = "channel.leave"       // C→S
-	TypeChannelPeerLeft   = "channel.peer_left"   // S→C
-	TypeChatMessage       = "chat.message"        // S→C
-	TypeChatSend          = "chat.send"           // C→S
-	TypeClientHello       = "client.hello"        // C→S · since 2
-	TypeError             = "error"               // S→C
-	TypeHello             = "hello"               // S→C
-	TypePresenceUpdate    = "presence.update"     // S→C
-	TypeRTCAnswer         = "rtc.answer"          // 双向
-	TypeRTCFailed         = "rtc.failed"          // S→C
-	TypeRTCIce            = "rtc.ice"             // 双向
-	TypeRTCOffer          = "rtc.offer"           // 双向
-	TypeServerHello       = "server.hello"        // S→C · since 2
-	TypeServerShutdown    = "server.shutdown"     // S→C
-	TypeSessionKicked     = "session.kicked"      // S→C
-	TypeSessionVoiceTaken = "session.voice_taken" // S→C
-	TypeVoiceRequestState = "voice.request_state" // C→S
-	TypeVoiceState        = "voice.state"         // 双向
-	TypeVoiceStateRequest = "voice.state_request" // S→C
+	TypeChannelJoin           = "channel.join"            // C→S
+	TypeChannelJoined         = "channel.joined"          // S→C
+	TypeChannelLeave          = "channel.leave"           // C→S
+	TypeChannelPeerLeft       = "channel.peer_left"       // S→C
+	TypeChatMessage           = "chat.message"            // S→C
+	TypeChatSend              = "chat.send"               // C→S
+	TypeClientHello           = "client.hello"            // C→S · since 2
+	TypeError                 = "error"                   // S→C
+	TypeGatewayInvalidSession = "gateway.invalid_session" // S→C · since 2
+	TypeGatewayResume         = "gateway.resume"          // C→S · since 2
+	TypeHello                 = "hello"                   // S→C
+	TypePresenceUpdate        = "presence.update"         // S→C
+	TypeRTCAnswer             = "rtc.answer"              // 双向
+	TypeRTCFailed             = "rtc.failed"              // S→C
+	TypeRTCIce                = "rtc.ice"                 // 双向
+	TypeRTCOffer              = "rtc.offer"               // 双向
+	TypeServerHello           = "server.hello"            // S→C · since 2
+	TypeServerShutdown        = "server.shutdown"         // S→C
+	TypeSessionKicked         = "session.kicked"          // S→C
+	TypeSessionVoiceTaken     = "session.voice_taken"     // S→C
+	TypeVoiceRequestState     = "voice.request_state"     // C→S
+	TypeVoiceSpeaking         = "voice.speaking"          // S→C · since 2
+	TypeVoiceState            = "voice.state"             // 双向
+	TypeVoiceStateRequest     = "voice.state_request"     // S→C
 )
 
 // 下行 error 消息的 code 取值（api/signal/catalog.json error_codes）。
@@ -141,6 +144,17 @@ type ErrorData struct {
 	Message string `json:"message"`
 }
 
+// GatewayInvalidSessionData 续传失败（#32）。reason=unknown_session：会话未知或与当前连接不符；seq_expired：缺失事件已滚出环（含序号超前于环现状）。客户端收到后放弃补发，走 REST 全量补拉（服务器/频道/好友/最近消息），更新本地后继续收新事件；本地按消息 id 幂等去重（补拉与在途增量可能重叠）。
+type GatewayInvalidSessionData struct {
+	Reason string `json:"reason"` // 失败原因
+}
+
+// GatewayResumeData 断线续传请求（#32）：同会话重连后发送（在 client.hello 之后、收到 server.hello 确认同会话之后）。session_id 为 server.hello.session_id 的回传，last_seq 为已收到的最后事件序号（0=一条未收）。环内可补则按 seq 升序补发后继续流式；补不上回 gateway.invalid_session，客户端走 REST 全量补拉。只在协商到协议 ≥2 后发送，老服务端不受影响。
+type GatewayResumeData struct {
+	SessionID string `json:"session_id"` // 会话 ID（server.hello.session_id 回传；须与当前连接的会话一致）
+	LastSeq   int64  `json:"last_seq"`   // 已收到的最后事件序号；0 表示一条都没收到
+}
+
 // HelloData 鉴权成功后下发的全量初始数据。servers/friends/presence 是无结构占位（M3 前恒空），契约如实描述为无约束容器。
 type HelloData struct {
 	User     UserBrief      `json:"user"`
@@ -172,7 +186,8 @@ type ICEData struct {
 
 // ServerHelloData 协议版本协商结果：服务端选定 v = min(serverMax, clientMax)，且 v ≥ max(clientMin, serverMin)。无交集时不发本消息，改走 error{protocol_unsupported}，且绝不因协商失败断连（裁定 #9）。
 type ServerHelloData struct {
-	Version int64 `json:"version"` // 本次会话采用的协议版本
+	Version   int64  `json:"version"`              // 本次会话采用的协议版本
+	SessionID string `json:"session_id,omitempty"` // 本次会话的会话 ID（#32）。gateway.resume 回传它做续传；旧版本令牌（无会话）为空串
 }
 
 // ServerShutdownData 优雅关闭广播。收到后停止自动重连并提示服务端已关闭。
@@ -193,6 +208,13 @@ type VoiceRequestStateData struct {
 	TargetID  string `json:"target_id"`
 	Mute      *bool  `json:"mute,omitempty"`
 	Deafen    *bool  `json:"deafen,omitempty"`
+}
+
+// VoiceSpeakingData 说话状态翻转（#33 接线，#32 先定契约）：服务端按 RFC 6464 电平统一判定，经网关事件面下发，替代 voice.state{speaking} 的客户端上报广播。只在翻转时发，不带电平值；v1 客户端仍走 voice.state{speaking} 兼容路径。
+type VoiceSpeakingData struct {
+	ChannelID string `json:"channel_id"`
+	UserID    string `json:"user_id"`
+	Speaking  bool   `json:"speaking"`
 }
 
 // VoiceStateData 说话/静音/耳聋状态，字段均为可选增量（nil=本次未变）。上行 C→S 不带 user_id；下行广播由服务端补 user_id 标识来源。协议 2 起 speaking 由服务端按 RFC 6464 电平判定（v2 客户端停发 speaking），mute/deafen 仍走上行。

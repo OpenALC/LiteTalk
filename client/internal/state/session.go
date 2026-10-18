@@ -8,11 +8,13 @@ import (
 	"log"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/OpenALC/LiteTalk/client/internal/audio"
+	"github.com/OpenALC/LiteTalk/client/internal/gateway"
 	"github.com/OpenALC/LiteTalk/client/internal/hotkey"
 	"github.com/OpenALC/LiteTalk/client/internal/rtc"
 	"github.com/OpenALC/LiteTalk/client/internal/signal"
@@ -57,6 +59,11 @@ type Events struct {
 	// 会话已完成本地重建（销毁 PC、清远端链路、重发 channel.join），此处只报 UI。
 	// 与 OnKicked 同线程约定（ws 读循环 goroutine，实现侧不得同步 Close 会话）。
 	OnRTCFailed func(channelID string)
+	// OnResync 事件面续传失败后的全量补拉提示（#32，gateway.invalid_session）：
+	// 消息与好友在线态已由会话内部补拉完毕，服务器/频道等 REST 视图可能已过期，
+	// UI 层应重新拉取（绑定方法 ListServers/ListChannels/ListFriends 都在）。
+	// 跑在独立 goroutine，可安全触发网络请求；nil = 不通知。
+	OnResync func()
 }
 
 // VoiceStats 推给 UI 的语音房统计快照。
@@ -110,6 +117,9 @@ type Session struct {
 	// v2 客户端据此停发 voice.state{speaking} 等版本相关行为（#33 接线）。
 	protoVer atomic.Int64
 
+	// gw 事件面追踪（#32）：seq 去重/重排、gateway.resume 决策、invalid_session 补拉。
+	gw *gateway.Tracker
+
 	// sendGate 按键说话发送门（PTT/语音激活/常开）。App 层长期持有的值对象，
 	// 会话重建不换门——用户按住的 PTT 状态不能因为重连丢掉。建管线时转交
 	// Pipeline，之后由 Pipeline 每帧自行 Load。
@@ -121,9 +131,11 @@ type Session struct {
 	iceMu      sync.RWMutex
 	iceServers []webrtc.ICEServer
 
-	mu      sync.Mutex
-	members map[string]PeerView
-	selfID  string
+	mu        sync.Mutex
+	members   map[string]PeerView
+	selfID    string
+	chatFn    func(channelID, msgID, userID, nickname, content, ts string) // ChatHandler 注入
+	seenChans map[string]bool                                              // 本会话收过 chat.message 的频道（补拉范围）
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -141,7 +153,9 @@ func NewSession(api *APIClient, token, nickname string, ev Events, logger *log.L
 		token:     token,
 		name:      nickname,
 		members:   make(map[string]PeerView),
+		seenChans: make(map[string]bool),
 		voiceSend: make(chan signal.VoiceStateData, 1),
+		gw:        gateway.New(),
 	}
 	s.roomID.Store("")
 	return s
@@ -182,6 +196,13 @@ func (s *Session) Connect(serverURL string) {
 	// 服务端发送窗口内可能丢帧，close code 是可靠的那一半。回调跑在 ws Run
 	// goroutine（会话 wg 内），app 侧 OnKicked 已异步化，此处直接调出口即可。
 	wsCfg.OnKicked = func(reason string) { s.handleKicked(reason) }
+	// 事件面门（#32）：seq 去重/重排由 gateway.Tracker 承担，invalid_session
+	// 在门内消化并异步触发 fullResync（独立 goroutine，REST 不进读循环）。
+	wsCfg.Gate = s.gw.Gate
+	s.gw.OnResync(func(reason string) {
+		s.log.Printf("gateway: 续传失败（%s），全量补拉", reason)
+		s.fullResync()
+	})
 	s.ws = signal.NewClient(wsCfg)
 	s.registerHandlers()
 
@@ -309,6 +330,14 @@ func (s *Session) registerHandlers() {
 			return
 		}
 		s.protoVer.Store(d.Version)
+		// 同会话重连：server.hello 确认 session_id 未变后才发 gateway.resume（#32）。
+		// 等确认再发是为了避开两类误伤：新登录（新会话，无需补发，登录流程已带全量）
+		// 与老服务端（无 server.hello，也就没有 seq/续传概念）。发送失败按普通断线重连处理。
+		if resume, ok := s.gw.OnServerHello(d.SessionID, d.Version); ok {
+			if err := s.ws.Send(signal.TypeGatewayResume, resume); err != nil {
+				s.log.Printf("gateway: resume 发送失败: %v", err)
+			}
+		}
 		s.log.Printf("signal: 协商协议版本 v%d", d.Version)
 	})
 	s.ws.On(signal.TypeChannelJoined, func(env signal.Envelope) {
@@ -828,10 +857,14 @@ func (s *Session) VoiceState() VoiceStateView {
 // ChatHandler 注入 chat.message 处理（app 层补挂）。
 // msgID 为服务端消息 ID（文字消息按频道隔离与去重需要真实 ID，
 // 此前回调丢弃了 ID，前端只能拿时间戳当 key，无法可靠去重）。
+// 同时记录收过消息的频道（#32 全量补拉的范围），fn 回灌路径复用同一回调。
 func (s *Session) ChatHandler(fn func(channelID, msgID, userID, nickname, content, ts string)) {
 	if s.ws == nil {
 		return
 	}
+	s.mu.Lock()
+	s.chatFn = fn
+	s.mu.Unlock()
 	s.ws.On(signal.TypeChatMessage, func(env signal.Envelope) {
 		var d struct {
 			ID        string `json:"id"`
@@ -846,8 +879,65 @@ func (s *Session) ChatHandler(fn func(channelID, msgID, userID, nickname, conten
 		if env.Decode(&d) != nil {
 			return
 		}
+		s.mu.Lock()
+		s.seenChans[d.ChannelID] = true
+		s.mu.Unlock()
 		fn(d.ChannelID, d.ID, d.User.ID, d.User.Nickname, d.Content, fmt.Sprintf("%d", d.TS))
 	})
+}
+
+// resyncRecentMessages 单频道补拉的消息条数（最新 N 条，覆盖断线窗口）。
+const resyncRecentMessages = 50
+
+// fullResync 事件面续传失败后的全量补拉（#32）。跑在独立 goroutine
+// （gateway.Tracker 异步触发），可安全做 REST I/O——WS 读循环禁止阻塞。
+// 范围：
+//  1. 本会话收过消息的频道各拉最近消息，回灌 ChatHandler（前端按消息 id 幂等，
+//     与在途增量重叠也不重复）；
+//  2. 好友在线态回灌 OnPresenceUpdate（状态型更新，幂等）；
+//  3. Events.OnResync 通知 UI 层刷新服务器/频道等 REST 视图（列表由前端经
+//     绑定方法自取，会话内不维护，只发提示不代拉）。
+func (s *Session) fullResync() {
+	s.mu.Lock()
+	chans := make([]string, 0, len(s.seenChans))
+	for ch := range s.seenChans {
+		chans = append(chans, ch)
+	}
+	chatFn := s.chatFn
+	s.mu.Unlock()
+
+	for _, ch := range chans {
+		cid, err := strconv.ParseInt(ch, 10, 64)
+		if err != nil {
+			continue // dev 内置房间无 REST 实体，无历史可拉
+		}
+		msgs, err := s.api.ListMessages(cid, resyncRecentMessages)
+		if err != nil {
+			s.log.Printf("gateway: 补拉频道 %s 消息失败: %v", ch, err)
+			continue
+		}
+		if chatFn == nil {
+			continue
+		}
+		for _, m := range msgs {
+			chatFn(ch, m.ID.String(), m.UserID.String(), m.SenderNickname, m.Content,
+				strconv.FormatInt(m.CreatedAt.UnixMilli(), 10))
+		}
+	}
+
+	if friends, err := s.api.ListFriends(); err != nil {
+		s.log.Printf("gateway: 补拉好友在线态失败: %v", err)
+	} else if s.ev.OnPresenceUpdate != nil {
+		for _, f := range friends {
+			if f.Status == "accepted" {
+				s.ev.OnPresenceUpdate(strconv.FormatInt(f.User.ID, 10), f.User.Online)
+			}
+		}
+	}
+
+	if s.ev.OnResync != nil {
+		s.ev.OnResync()
+	}
 }
 
 // ErrorHandler 注入服务端 error 帧处理（app 层补挂）。

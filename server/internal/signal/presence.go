@@ -71,8 +71,9 @@ func (h *Hub) renewPresence(c *client) {
 	}
 }
 
-// pushPresence 把 uid 的在线状态推给其互为已接受好友的在线连接（§0.2）。
-// 单向好友（pending/blocked）不推；好友数量小，逐个查 conns 前缀即可。
+// pushPresence 把 uid 的在线状态推给其互为已接受好友的会话（#32 事件面）。
+// 单向好友（pending/blocked）不推；好友数量小，逐个查关系即可。
+// 目标是好友的**全部会话**（在线实时投递 + 断线续传窗口内进环），不只在线连接。
 func (h *Hub) pushPresence(uid string, online bool) {
 	ctx := context.Background()
 	id, err := parseUID(uid)
@@ -85,6 +86,7 @@ func (h *Hub) pushPresence(uid string, online bool) {
 		return
 	}
 	data := PresenceUpdateData{UserID: uid, Online: online, TS: time.Now().UnixMilli()}
+	uids := make(map[string]bool, len(fs))
 	for _, f := range fs {
 		if f.Status != store.FriendAccepted {
 			continue
@@ -93,10 +95,9 @@ func (h *Hub) pushPresence(uid string, online bool) {
 		if f.FriendID == id {
 			other = f.UserID
 		}
-		for _, cl := range h.connsOfUID(formatUID(other)) {
-			h.sendJSON(cl, TypePresenceUpdate, data)
-		}
+		uids[formatUID(other)] = true
 	}
+	h.broadcastEvent(uids, TypePresenceUpdate, data)
 }
 
 // ttl presence TTL：Hub 字段可被测试缩短，零值回落默认。

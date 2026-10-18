@@ -6,6 +6,7 @@
   "x-go-const": "TypeChannelPeerLeft",
   "x-direction": "S2C",
   "x-since": 1,
+  "x-namespace": "voice",
   "description": "有成员离开频道（含 rtc.failed 后的旁路通知）。",
   "type": "object",
   "properties": {

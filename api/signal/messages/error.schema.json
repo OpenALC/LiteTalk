@@ -6,6 +6,7 @@
   "x-go-const": "TypeError",
   "x-direction": "S2C",
   "x-since": 1,
+  "x-namespace": "session",
   "description": "下行错误。code 取值见 catalog.json error_codes。",
   "type": "object",
   "properties": {

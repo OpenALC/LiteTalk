@@ -6,6 +6,7 @@
   "x-go-const": "TypeChatSend",
   "x-direction": "C2S",
   "x-since": 1,
+  "x-namespace": "event",
   "description": "向频道发一条文字消息。type 为消息种类，本期仅支持 text，其他值拒收。",
   "type": "object",
   "properties": {

@@ -54,6 +54,10 @@ type Config struct {
 	// reason 约定值见 KickReasonLoginElsewhere。在 Run 的 goroutine 上同步调用，
 	// 实现侧不得同步 Close 本客户端（Close 会等 Run 退出，自成死锁）。
 	OnKicked func(reason string)
+	// Gate 事件面排序/去重门（#32）：对每条下行信封返回应投递给订阅者的信封
+	//（按返回序投递；通常 0 或 1 条，补发窗口的乱序回填可能一次多条）。
+	// nil = 全部直通（老路径）。gateway.Tracker.Gate 是标准实现。
+	Gate func(Envelope) []Envelope
 	// Logger 为 nil 时静默。
 	Logger *log.Logger
 }
@@ -262,6 +266,10 @@ func (c *Client) serve(ctx context.Context, conn *websocket.Conn) error {
 	}
 
 	// 心跳：服务端 Redis presence TTL 90s，默认 30s 一拍。
+	// serveCtx 在本连接读循环退出时取消，让心跳 goroutine 立即退出——否则
+	// 连接已死却要等下一个 Ping tick（默认 30s）才解除阻塞，重连被无谓拖慢
+	//（#32 断线续传依赖快速重连；Wi-Fi/4G 切换场景尤其明显）。
+	serveCtx, stopPing := context.WithCancel(ctx)
 	pingDone := make(chan struct{})
 	go func() {
 		defer close(pingDone)
@@ -269,7 +277,7 @@ func (c *Client) serve(ctx context.Context, conn *websocket.Conn) error {
 		defer t.Stop()
 		for {
 			select {
-			case <-pingDone:
+			case <-serveCtx.Done():
 				return
 			case <-c.done:
 				return
@@ -285,7 +293,7 @@ func (c *Client) serve(ctx context.Context, conn *websocket.Conn) error {
 			}
 		}
 	}()
-	defer func() { <-pingDone }() // 等心跳 goroutine 退出（conn 关闭后 Ping 必然失败返回）
+	defer func() { stopPing(); <-pingDone }() // 读循环退出即放行重连，不等下一个 tick
 
 	first := true
 	for {
@@ -300,7 +308,14 @@ func (c *Client) serve(ctx context.Context, conn *websocket.Conn) error {
 			continue
 		}
 		c.Stats.MessagesReceived.Add(1)
-		c.dispatch(env)
+		// Gate（#32）：事件面消息去重/重排后投递；一次可返回多条（乱序回填）。
+		if c.cfg.Gate != nil {
+			for _, out := range c.cfg.Gate(env) {
+				c.dispatch(out)
+			}
+		} else {
+			c.dispatch(env)
+		}
 		if first {
 			first = false
 			if c.cfg.OnConnect != nil {

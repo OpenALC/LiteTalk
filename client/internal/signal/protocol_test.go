@@ -154,3 +154,64 @@ func TestClientHelloTolerant(t *testing.T) {
 		t.Fatalf("协商失败引发重连: reconnects=%d", c.Stats.Reconnects.Load())
 	}
 }
+
+// TestWireGatewayJSON 网关事件面消息（#32）：gateway.resume / gateway.invalid_session /
+// voice.speaking 的 wire 字段与服务端生成物一致（两侧 protocol_gen.go 字节相同）。
+func TestWireGatewayJSON(t *testing.T) {
+	raw, err := json.Marshal(GatewayResumeData{SessionID: "abc", LastSeq: 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{`"session_id":"abc"`, `"last_seq":7`} {
+		if !strings.Contains(string(raw), key) {
+			t.Fatalf("GatewayResumeData JSON 缺 %s: %s", key, raw)
+		}
+	}
+	raw, err = json.Marshal(GatewayInvalidSessionData{Reason: "unknown_session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"reason":"unknown_session"`) {
+		t.Fatalf("GatewayInvalidSessionData JSON 字段不一致: %s", raw)
+	}
+	raw, err = json.Marshal(VoiceSpeakingData{ChannelID: "3", UserID: "1", Speaking: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{`"channel_id":"3"`, `"user_id":"1"`, `"speaking":true`} {
+		if !strings.Contains(string(raw), key) {
+			t.Fatalf("VoiceSpeakingData JSON 缺 %s: %s", key, raw)
+		}
+	}
+	if TypeGatewayResume != "gateway.resume" || TypeGatewayInvalidSession != "gateway.invalid_session" {
+		t.Fatalf("常量值漂移: %q %q", TypeGatewayResume, TypeGatewayInvalidSession)
+	}
+	// server.hello 的 session_id 是可选（omitempty）：老服务端/旧令牌不带。
+	raw, _ = json.Marshal(ServerHelloData{Version: 2})
+	if strings.Contains(string(raw), "session_id") {
+		t.Fatalf("ServerHelloData 无会话时应省略 session_id: %s", raw)
+	}
+	raw, _ = json.Marshal(ServerHelloData{Version: 2, SessionID: "abc"})
+	if !strings.Contains(string(raw), `"session_id":"abc"`) {
+		t.Fatalf("ServerHelloData 带会话时缺 session_id: %s", raw)
+	}
+}
+
+// TestEnvelopeSeqDecode 信封 seq 解码（#32）：带 seq 的事件面消息与不带的
+// 语音面/控制消息共用同一信封；0 值即「无 seq」。
+func TestEnvelopeSeqDecode(t *testing.T) {
+	var env Envelope
+	if err := json.Unmarshal([]byte(`{"type":"chat.message","data":{},"ts":1,"seq":9}`), &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Seq != 9 {
+		t.Fatalf("seq = %d, want 9", env.Seq)
+	}
+	env = Envelope{}
+	if err := json.Unmarshal([]byte(`{"type":"voice.state","data":{},"ts":1}`), &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Seq != 0 {
+		t.Fatalf("无 seq 应解码为 0: %+v", env)
+	}
+}

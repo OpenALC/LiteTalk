@@ -20,11 +20,13 @@ import (
 func nowMillis() int64 { return time.Now().UnixMilli() }
 
 // Envelope 信令信封。Data 延迟解析，由订阅者按 Type 自行解码。
-// seq 字段（协议 2 起可选）见 api/signal/envelope.schema.json，由 #32 接线。
+// seq（协议 2 起可选，#32）：事件面下行消息的会话内单调序号，0=不带
+// （语音面/连接控制消息或老服务端）。续传去重与排序由 gateway.Tracker 消费。
 type Envelope struct {
 	Type string          `json:"type"`
 	Data json.RawMessage `json:"data,omitempty"`
 	TS   int64           `json:"ts"`
+	Seq  int64           `json:"seq,omitempty"`
 }
 
 // NewEnvelope 打包一条待发消息（ts 取当前 Unix 毫秒）。

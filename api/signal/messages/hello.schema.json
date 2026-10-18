@@ -6,6 +6,7 @@
   "x-go-const": "TypeHello",
   "x-direction": "S2C",
   "x-since": 1,
+  "x-namespace": "session",
   "description": "鉴权成功后下发的全量初始数据。servers/friends/presence 是无结构占位（M3 前恒空），契约如实描述为无约束容器。",
   "type": "object",
   "properties": {
