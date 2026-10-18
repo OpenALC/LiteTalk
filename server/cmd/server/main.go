@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io/fs"
 	"log"
@@ -21,8 +22,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/OpenALC/LiteTalk/server/internal/acme"
 	"github.com/OpenALC/LiteTalk/server/internal/api"
 	"github.com/OpenALC/LiteTalk/server/internal/auth"
+	"github.com/OpenALC/LiteTalk/server/internal/bootstrap"
 	"github.com/OpenALC/LiteTalk/server/internal/mailer"
 	"github.com/OpenALC/LiteTalk/server/internal/rtcapi"
 	"github.com/OpenALC/LiteTalk/server/internal/sfu"
@@ -39,12 +42,30 @@ var version = "dev"
 const defaultAddr = ":8077"
 
 func main() {
-	addr := envOr("LITETALK_ADDR", defaultAddr)
+	// 启动序（§0.6）：1 解析 flag/env → 2 校验 → 3 Store+Migrate → 4 KV → 5 SFU
+	// → 6 内置 TURN → 7 hub/api/rtcapi/mailer → 8 bootstrap → 9 HTTP → 10 关闭序。
+	cfg, err := loadConfig(os.Args[1:], os.Stderr)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			os.Exit(0)
+		}
+		os.Exit(2)
+	}
+	// -domain 解析结果回写环境变量：TURN realm / URL 回填区段仍按 os.Getenv 读取
+	//（该区段属 T2，不改），回写使 flag > env 优先级在全部区段生效。
+	if cfg.domain != "" {
+		os.Setenv("LITETALK_DOMAIN", cfg.domain)
+	}
 
 	// dev 模式判定：本地 go run / go build 未注入版本号时 version 为 "dev"；
 	// CI 打包始终 -X main.version=<tag> 注入真实版本号，故发布产物一律视为生产模式，
 	// 生产模式下内存降级、默认密钥、dev 令牌开关等开发便利项全部拒绝启动。
 	dev := version == "dev"
+
+	// ---- 配置校验（§0.6 步骤 2）：JWT secret、SFU IP 拒环回、auth mode、域名形态 ----
+	if err := cfg.validate(dev); err != nil {
+		log.Fatalf("启动配置校验失败: %v", err)
+	}
 
 	// ---- 持久化（Store 选型 + KV；§0.3）----
 	// Store：LITETALK_STORE 显式 > LITETALK_MYSQL_DSN 非空 → mysql（向后兼容）> 默认 sqlite。
@@ -70,7 +91,8 @@ func main() {
 	case "sqlite":
 		path := os.Getenv("LITETALK_SQLITE_PATH")
 		if path == "" {
-			path = filepath.Join(envOr("LITETALK_DATA_DIR", "./data"), "litetalk.db")
+			// -data / LITETALK_DATA_DIR 经 config 解析（flag > env > 默认）。
+			path = filepath.Join(cfg.dataDir, "litetalk.db")
 		}
 		sq, err := store.OpenSQLite(path)
 		if err != nil {
@@ -106,16 +128,17 @@ func main() {
 		log.Println("KV: 进程内（会话/验证码/限流不跨重启；多实例部署必须配置 LITETALK_REDIS_ADDR）")
 	}
 
+	// -print-admin-invite：重新打印管理员邀请码后退出（#27 T4 填实现），不启动 SFU/TURN/HTTP。
+	// 需要 KV 判定消费标记，故放在 Store/KV 就绪之后。
+	if cfg.printAdminInvite {
+		bootstrap.PrintAdminInvite(context.Background(), kv, st, cfg.jwtSecret, log.Default())
+		return
+	}
+
 	// ---- 账号安全 ----
-	jwtSecret := os.Getenv("LITETALK_JWT_SECRET")
-	if err := validateJWTSecret(jwtSecret, dev); err != nil {
-		log.Fatalf("LITETALK_JWT_SECRET 不合法：%v（请设为至少 32 字节的随机串，如 openssl rand -hex 32）", err)
-	}
-	// SFU IP 校验：生产拒环回（#22）。
-	sfuIP := envOr("LITETALK_SFU_IP", "127.0.0.1")
-	if err := validateSFUIP(sfuIP, dev); err != nil {
-		log.Fatalf("LITETALK_SFU_IP 不合法：%v", err)
-	}
+	// JWT secret 与 SFU IP 校验已并入 cfg.validate（§0.6 步骤 2，持久化之前）。
+	jwtSecret := cfg.jwtSecret
+	sfuIP := cfg.sfuIP
 	jwtSigner := auth.NewJWT(jwtSecret)
 	refreshStore := auth.NewRefreshStore(kv)
 	codes := auth.NewEmailCodes(kv)
@@ -270,11 +293,9 @@ func main() {
 	}, log.Default())
 	log.Printf("发信通道: %s", mailName)
 
-	// Auth 模式：full（默认，验证码流程）/ simple（免验证码，私域部署从简）
-	authMode := envOr("LITETALK_AUTH_MODE", "full")
-	if authMode != "full" && authMode != "simple" {
-		log.Fatalf("LITETALK_AUTH_MODE 只支持 full / simple，实际为 %q", authMode)
-	}
+	// Auth 模式：full（默认，验证码流程）/ simple（免验证码，私域部署从简）。
+	// 合法性已在 cfg.validate（步骤 2）把关。
+	authMode := cfg.authMode
 	if authMode == "simple" {
 		log.Println("Auth 模式: simple（注册/找回免验证码，仅建议私域部署）")
 	}
@@ -298,6 +319,11 @@ func main() {
 		Hub: hub,
 		// 在线状态读取（presence:{uid}，好友列表 user.online 填值）。
 		Presence: kv,
+		// 自托管形态自描述（GET /api/v1/config，#26）：SQLite/进程内单机部署 = true，
+		// MySQL 全栈部署 = false。客户端据此显示自托管引导（邀请码等）。
+		SelfHost: pickStoreKind() != "mysql",
+		// 管理员邀请码是否未消费（#27 T4 填 bootstrap.Required 实现）。
+		BootstrapRequired: func() bool { return bootstrap.Required(context.Background(), kv) },
 	})
 
 	mux := http.NewServeMux()
@@ -306,41 +332,105 @@ func main() {
 	mux.Handle("/api/v1/", apiSrv.Handler())
 	mux.HandleFunc("GET /ws", hub.ServeWS)
 
-	srv := &http.Server{
-		Addr:              addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       120 * time.Second,
-	}
+	// ---- bootstrap（§0.6 步骤 8）：首启生成管理员邀请码并打印（幂等）；#27 T4 填实现 ----
+	bootstrap.Ensure(context.Background(), kv, st, cfg.jwtSecret, log.Default())
 
 	// 捕获 SIGINT / SIGTERM，触发优雅关闭
 	ctx, stop := ossignal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	go func() {
-		log.Printf("litetalk server %s 监听 %s（SFU UDP %d / ICE-TCP %d，TURN %d）",
-			version, addr, sfuInst.Port(), sfuInst.TCPPort(), turnPort)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("HTTP 服务异常退出: %v", err)
-			stop() // 触发主 goroutine 走优雅关闭路径
-		}
-	}()
+	// ---- 起 HTTP（§0.6 步骤 9）：ACME TLS + :80 挑战，或纯 HTTP ----
+	servers := startHTTP(cfg, mux, stop)
+	log.Printf("litetalk server %s 监听 %s（SFU UDP %d / ICE-TCP %d，TURN %d）",
+		version, cfg.addr, sfuInst.Port(), sfuInst.TCPPort(), turnPort)
 
 	<-ctx.Done()
 	log.Println("收到退出信号，开始优雅关闭")
 
-	// 关闭序：hub 广播 server.shutdown → HTTP 优雅关闭 → SFU 关闭。
-	// defer 的 LIFO 会先关 SFU 再关 MySQL，与正常退出顺序一致。
+	// 关闭序（§0.6 步骤 10）：hub 广播 server.shutdown → HTTP(S) 优雅关闭 → SFU/TURN/store。
+	// defer 的 LIFO 会先关 TURN/SFU 再关存储，与正常退出顺序一致。
 	hub.Shutdown("shutdown")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("优雅关闭失败: %v", err)
+	for _, s := range servers {
+		if err := s.Shutdown(shutdownCtx); err != nil {
+			log.Printf("优雅关闭失败: %v", err)
+		}
 	}
 	log.Println("服务已停止")
+}
+
+// startHTTP 按配置启动监听（§0.5 三种形态）：
+//   - ACME（--domain 且未 --behind-proxy）：cfg.addr TLS（TLS-ALPN-01 动态签发）
+//   - :80 HTTP-01 挑战与 301；
+//   - --behind-proxy：纯 HTTP，TLS 由前置反代终结，不占 80/443；
+//   - 无 domain 无 behind-proxy：纯 HTTP（开发/自测）。
+//
+// 任一监听失败走正常退出路径（不 log.Fatalf），保证另一个 server 与 SFU 能优雅关闭。
+func startHTTP(cfg *config, mux http.Handler, stop context.CancelFunc) []*http.Server {
+	newServer := func(addr string, handler http.Handler) *http.Server {
+		// 超时加固值（批次 3 #21）原样保留；WS 长连接在 Hijack 后不受这些超时约束。
+		return &http.Server{
+			Addr:              addr,
+			Handler:           handler,
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       15 * time.Second,
+			WriteTimeout:      30 * time.Second,
+			IdleTimeout:       120 * time.Second,
+		}
+	}
+	listen := func(name string, srv *http.Server, serve func() error, privPort bool) {
+		go func() {
+			if err := serve(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				if privPort && isPermError(err) {
+					log.Printf("%s 启动失败: %v（特权端口需 root 或 setcap cap_net_bind_service=+ep）", name, err)
+				} else {
+					log.Printf("%s 服务异常退出: %v", name, err)
+				}
+				stop() // 触发主 goroutine 走优雅关闭路径
+			}
+		}()
+	}
+
+	if cfg.acme {
+		mgr, err := acme.New(cfg.domain, cfg.acmeCache)
+		if err != nil {
+			log.Printf("ACME 初始化失败: %v", err)
+			stop()
+			return nil
+		}
+		httpsSrv := newServer(cfg.addr, mux)
+		httpsSrv.TLSConfig = mgr.TLSConfig()
+		httpSrv := newServer(":80", mgr.HTTPHandler())
+		log.Printf("ACME: 单域 %s 自动签发（TLS-ALPN-01 + HTTP-01），证书缓存 %s", cfg.domain, cfg.acmeCache)
+		listen("HTTPS "+cfg.addr, httpsSrv, func() error { return httpsSrv.ListenAndServeTLS("", "") }, true)
+		listen("HTTP :80", httpSrv, httpSrv.ListenAndServe, true)
+		return []*http.Server{httpsSrv, httpSrv}
+	}
+
+	srv := newServer(cfg.addr, mux)
+	if cfg.behindProxy {
+		log.Println("TLS: 前置反代终结（--behind-proxy），本进程纯 HTTP，不占 80/443")
+		// 不动 clientIP 语义：X-Real-IP 仍只在 RemoteAddr 命中 LITETALK_TRUSTED_PROXIES
+		// 时采信（v1.0.2 修复），--behind-proxy 不自动放宽，防伪造头绕过限流。
+		if len(splitList(os.Getenv("LITETALK_TRUSTED_PROXIES"))) == 0 {
+			log.Println("提示: 未配置 LITETALK_TRUSTED_PROXIES，X-Real-IP 不会被采信，限流/审计记录的是反代 IP")
+		}
+	} else {
+		log.Println("未启用 TLS；公网部署请用 --domain 或 --behind-proxy + 反代")
+	}
+	listen("HTTP "+cfg.addr, srv, srv.ListenAndServe, false)
+	return []*http.Server{srv}
+}
+
+// isPermError 端口绑定权限不足（Linux 低段端口需 root / CAP_NET_BIND_SERVICE）。
+func isPermError(err error) bool {
+	if errors.Is(err, os.ErrPermission) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "permission denied") || strings.Contains(msg, "access is denied")
 }
 
 // healthzHandler 健康检查：GET /api/v1/healthz
