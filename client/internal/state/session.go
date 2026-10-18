@@ -47,6 +47,12 @@ type Events struct {
 	// 服务端已把本端摘出房间，本地按退房清理完毕。与 OnKicked 同样可能跑在
 	// ws 读循环 goroutine（会话 wg 内），实现侧不得同步 Close 会话。
 	OnVoiceTaken func()
+	// OnPresenceUpdate 好友在线状态变化（presence.update，#11）。
+	// 跑在 ws 读循环 goroutine，实现侧只做转发。
+	OnPresenceUpdate func(userID string, online bool)
+	// OnServerShutdown 服务端优雅关闭（server.shutdown，#21）：停自动重连并提示。
+	// 与 OnKicked 同线程约定。
+	OnServerShutdown func(reason string)
 }
 
 // VoiceStats 推给 UI 的语音房统计快照。
@@ -426,6 +432,29 @@ func (s *Session) registerHandlers() {
 		if s.ev.OnVoiceTaken != nil {
 			s.ev.OnVoiceTaken()
 		}
+	})
+	// presence.update：好友在线状态变化（#11），原样转给 UI 层。
+	s.ws.On(signal.TypePresenceUpdate, func(env signal.Envelope) {
+		var d signal.PresenceUpdateData
+		if env.Decode(&d) != nil || d.UserID == "" {
+			return
+		}
+		if s.ev.OnPresenceUpdate != nil {
+			s.ev.OnPresenceUpdate(d.UserID, d.Online)
+		}
+	})
+	// server.shutdown：服务端优雅关闭（#21）。停掉 ws 自动重连并转给 UI 层提示。
+	// Close 必须异步：同步调用会与读循环互等（Close 等 Run 退出、Run 等读循环返回）。
+	s.ws.On(signal.TypeServerShutdown, func(env signal.Envelope) {
+		var d signal.ServerShutdownData
+		reason := "shutdown"
+		if env.Decode(&d) == nil && d.Reason != "" {
+			reason = d.Reason
+		}
+		if s.ev.OnServerShutdown != nil {
+			s.ev.OnServerShutdown(reason)
+		}
+		go s.ws.Close()
 	})
 }
 

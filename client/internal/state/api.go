@@ -45,6 +45,9 @@ type UserProfile struct {
 	Email    string `json:"email"`
 	IsGuest  bool   `json:"is_guest"`
 	Status   int    `json:"status"` // 0=离线 1=在线 2=离开 3=忙碌（与服务端 users.status 对齐）
+	// Online 好友在线态（#11，服务端 presence:{uid}）：好友列表的 user.online；
+	// /me 等自响应恒 false（服务端不填）。
+	Online bool `json:"online"`
 }
 
 // AuthResult 登录/注册成功后的载荷。SessionOK 报告信令会话是否已连上：
