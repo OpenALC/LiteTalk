@@ -136,25 +136,88 @@ func (m *MySQL) RollbackLast(ctx context.Context, fsys fs.FS) error {
 	return err
 }
 
-// splitSQL 按行分割简单 SQL 脚本（迁移文件不含存储过程/触发器，按分号切分即可）。
+// splitSQL 按分号切分简单 SQL 脚本（迁移文件不含存储过程/触发器，BEGIN…END
+// 内的分号仍会切碎）。扫描时同步识别注释与引号：注释里的半角分号不再把语句
+// 切碎（#75），先剥注释再切分的语义在一趟扫描里完成。
+//
+// 字符串字面量与引号标识符整体原样拷贝，其中的 ;、--、# 一律不动；引号转义
+// 只认成对引号转义（连续两个单引号 / 双引号 / 反引号），不认反斜杠（MySQL
+// 专有，迁移里不应出现）。
+// -- 与 # 按行注释剥到行尾（MySQL 的 1--2 紧贴算术写法会被吃掉，不要写）；
+// 普通块注释剥掉并补一个空格防 token 粘连；MySQL 的 /*! 与 /*+ 有真语义，
+// 整体保留（其中的分号同样不切分）。
 func splitSQL(s string) []string {
-	out := []string{}
-	for _, part := range strings.Split(s, ";") {
-		stmt := strings.TrimSpace(part)
-		// 忽略空段与纯注释段。
-		lines := strings.Split(stmt, "\n")
-		var kept []string
-		for _, l := range lines {
-			t := strings.TrimSpace(l)
-			if t == "" || strings.HasPrefix(t, "--") {
-				continue
-			}
-			kept = append(kept, l)
+	var out []string
+	var b strings.Builder
+	flush := func() {
+		if stmt := strings.TrimSpace(b.String()); stmt != "" {
+			out = append(out, stmt)
 		}
-		if len(kept) > 0 {
-			out = append(out, strings.Join(kept, "\n"))
-		}
+		b.Reset()
 	}
+	for i := 0; i < len(s); {
+		c := s[i]
+		// 引号区域（字符串字面量 / 引号标识符）：原样拷贝，只认成对引号转义。
+		if c == '\'' || c == '"' || c == '`' {
+			b.WriteByte(c)
+			i++
+			for i < len(s) {
+				b.WriteByte(s[i])
+				if s[i] != c {
+					i++
+					continue
+				}
+				if i+1 < len(s) && s[i+1] == c { // '' 形式转义，仍在引号内
+					b.WriteByte(c)
+					i += 2
+					continue
+				}
+				i++
+				break
+			}
+			continue
+		}
+		// 行注释剥到行尾；换行留下，不改变后续语句的行结构。
+		if c == '#' || (c == '-' && i+1 < len(s) && s[i+1] == '-') {
+			for i < len(s) && s[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		// 块注释：/*! 与 /*+ 原样保留，其余剥掉补空格防相邻 token 粘连。
+		if c == '/' && i+1 < len(s) && s[i+1] == '*' {
+			keep := i+2 < len(s) && (s[i+2] == '!' || s[i+2] == '+')
+			if keep {
+				b.WriteString(s[i : i+3])
+				i += 3
+			} else {
+				b.WriteByte(' ')
+				i += 2
+			}
+			for i < len(s) {
+				if s[i] == '*' && i+1 < len(s) && s[i+1] == '/' {
+					if keep {
+						b.WriteString("*/")
+					}
+					i += 2
+					break
+				}
+				if keep {
+					b.WriteByte(s[i])
+				}
+				i++
+			}
+			continue
+		}
+		if c == ';' {
+			flush()
+			i++
+			continue
+		}
+		b.WriteByte(c)
+		i++
+	}
+	flush()
 	return out
 }
 
