@@ -6,6 +6,7 @@
   "x-go-const": "TypeChannelJoin",
   "x-direction": "C2S",
   "x-since": 1,
+  "x-namespace": "voice",
   "description": "加入语音频道。",
   "type": "object",
   "properties": {

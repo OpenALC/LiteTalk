@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -567,5 +568,198 @@ func TestServerHelloRecordsVersion(t *testing.T) {
 	}
 	if s.ProtocolVersion() != 2 {
 		t.Fatalf("ProtocolVersion = %d, want 2（server.hello 未记录）", s.ProtocolVersion())
+	}
+}
+
+// ---- gateway.resume 续传集成（#32）----
+
+// gatewayStub 续传集成桩：每条连接发 server.hello{2,S1}，记录上行信封
+// （含载荷），测试可向当前连接推送下行信封；CloseConn 模拟断线。
+type gatewayStub struct {
+	*httptest.Server
+	mu    sync.Mutex
+	cur   *websocket.Conn
+	up    []signal.Envelope
+	conns int
+}
+
+func newGatewayStub(t *testing.T) *gatewayStub {
+	t.Helper()
+	s := &gatewayStub{}
+	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		s.mu.Lock()
+		s.cur = conn
+		s.conns++
+		s.mu.Unlock()
+		hello := signal.Envelope{Type: signal.TypeServerHello, TS: 1,
+			Data: json.RawMessage(`{"version":2,"session_id":"S1"}`)}
+		raw, _ := json.Marshal(hello)
+		_ = conn.Write(r.Context(), websocket.MessageText, raw)
+		for {
+			_, data, err := conn.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var e signal.Envelope
+			if json.Unmarshal(data, &e) != nil {
+				continue
+			}
+			s.mu.Lock()
+			s.up = append(s.up, e)
+			s.mu.Unlock()
+		}
+	}))
+	t.Cleanup(s.Server.Close)
+	return s
+}
+
+func (s *gatewayStub) wsURL() string {
+	return "ws" + strings.TrimPrefix(s.URL, "http") + "/ws"
+}
+
+// push 向当前连接推一条下行信封（seq>0 即事件面）。
+func (s *gatewayStub) push(t *testing.T, seq int64, msgID string) {
+	t.Helper()
+	env := signal.Envelope{Type: signal.TypeChatMessage, TS: seq, Seq: seq,
+		Data: json.RawMessage(`{"id":"` + msgID + `","channel_id":"1","content":"c","ts":1,"user":{"id":"2","nickname":"b"}}`)}
+	raw, err := json.Marshal(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	conn := s.cur
+	s.mu.Unlock()
+	if conn == nil {
+		t.Fatal("无连接可推送")
+	}
+	if err := conn.Write(context.Background(), websocket.MessageText, raw); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+}
+
+func (s *gatewayStub) closeConn() {
+	s.mu.Lock()
+	conn := s.cur
+	s.cur = nil
+	s.mu.Unlock()
+	if conn != nil {
+		_ = conn.CloseNow()
+	}
+}
+
+func (s *gatewayStub) resumeSeq() (int64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, e := range s.up {
+		if e.Type != signal.TypeGatewayResume {
+			continue
+		}
+		var d signal.GatewayResumeData
+		if json.Unmarshal(e.Data, &d) == nil {
+			return d.LastSeq, true
+		}
+	}
+	return 0, false
+}
+
+// TestGatewayResumeAfterReconnect 断线重连后事件不丢不重（#32 验收）：
+// 断线前收到 seq 1..2，重连经 server.hello 确认同会话后发 gateway.resume{S1,2}，
+// 补发的 seq 3 与实时流续接，ChatHandler 逐条各收到一次。
+func TestGatewayResumeAfterReconnect(t *testing.T) {
+	stub := newGatewayStub(t)
+	var mu sync.Mutex
+	got := map[string]int{}
+	s := NewSession(NewAPIClient(stub.wsURL()), "tok", "n", Events{}, nil)
+	s.ws = signal.NewClient(signal.Config{
+		URL:          stub.wsURL(),
+		ReconnectMin: 20 * time.Millisecond,
+		Gate:         s.gw.Gate,
+	})
+	s.ChatHandler(func(channelID, msgID, userID, nickname, content, ts string) {
+		mu.Lock()
+		got[msgID]++
+		mu.Unlock()
+	})
+	s.registerHandlers()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.ws.Run(ctx)
+	defer s.ws.Close()
+
+	// 等首连建立（Run 异步拨号），否则 push 无连接可写。
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		stub.mu.Lock()
+		ready := stub.cur != nil
+		stub.mu.Unlock()
+		if ready {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// 首连：server.hello 只记录会话，不发 resume；随后收 seq 1..2。
+	stub.push(t, 1, "m1")
+	stub.push(t, 2, "m2")
+	waitForMsg := func(id string, n int) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			mu.Lock()
+			c := got[id]
+			mu.Unlock()
+			if c >= n {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		mu.Lock()
+		snapshot := fmt.Sprintf("%v", got)
+		c := got[id]
+		mu.Unlock()
+		t.Fatalf("消息 %s 未及时到达（%d/%d）: %s", id, c, n, snapshot)
+	}
+	waitForMsg("m1", 1)
+	waitForMsg("m2", 1)
+	if s.gw.LastSeq() != 2 {
+		t.Fatalf("LastSeq = %d, want 2", s.gw.LastSeq())
+	}
+	if _, ok := stub.resumeSeq(); ok {
+		t.Fatal("首连不应发 gateway.resume")
+	}
+
+	// 断线重连：新连接的 server.hello 确认同会话 → 必须发 resume{last_seq=2}。
+	stub.closeConn()
+	reconnectDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(reconnectDeadline) {
+		if _, ok := stub.resumeSeq(); ok {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	last, ok := stub.resumeSeq()
+	if !ok {
+		stub.mu.Lock()
+		diag := fmt.Sprintf("conns=%d up=%d cur=%v", stub.conns, len(stub.up), stub.cur != nil)
+		stub.mu.Unlock()
+		t.Fatalf("重连后未发 gateway.resume（%s）", diag)
+	}
+	if last != 2 {
+		t.Fatalf("resume.last_seq = %d, want 2", last)
+	}
+	// 补发 seq 3 + 重复 seq 2（补发与实时重叠）：只各投一次。
+	stub.push(t, 2, "m2")
+	stub.push(t, 3, "m3")
+	waitForMsg("m3", 1)
+	time.Sleep(50 * time.Millisecond) // 留出重复投递的窗口（应被 seq 去重）
+	mu.Lock()
+	defer mu.Unlock()
+	for id, n := range map[string]int{"m1": 1, "m2": 1, "m3": 1} {
+		if got[id] != n {
+			t.Fatalf("消息 %s 收到 %d 次, want %d（全量: %v）", id, got[id], n, got)
+		}
 	}
 }

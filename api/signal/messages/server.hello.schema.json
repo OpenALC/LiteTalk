@@ -6,10 +6,16 @@
   "x-go-const": "TypeServerHello",
   "x-direction": "S2C",
   "x-since": 2,
+  "x-namespace": "session",
   "description": "协议版本协商结果：服务端选定 v = min(serverMax, clientMax)，且 v ≥ max(clientMin, serverMin)。无交集时不发本消息，改走 error{protocol_unsupported}，且绝不因协商失败断连（裁定 #9）。",
   "type": "object",
   "properties": {
-    "version": { "type": "integer", "minimum": 1, "description": "本次会话采用的协议版本" }
+    "version": { "type": "integer", "minimum": 1, "description": "本次会话采用的协议版本" },
+    "session_id": {
+      "type": "string",
+      "x-go-omitempty": true,
+      "description": "本次会话的会话 ID（#32）。gateway.resume 回传它做续传；旧版本令牌（无会话）为空串"
+    }
   },
   "required": ["version"],
   "additionalProperties": false

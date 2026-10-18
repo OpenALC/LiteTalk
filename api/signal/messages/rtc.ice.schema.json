@@ -6,6 +6,7 @@
   "x-go-const": "TypeRTCIce",
   "x-direction": "BOTH",
   "x-since": 1,
+  "x-namespace": "voice",
   "description": "trickle ICE 候选。字段名沿用 WebRTC 标准（sdpMid/sdpMLineIndex/usernameFragment），生成物不 import pion；服务端手写层保留 ICECandidateData = webrtc.ICECandidateInit 别名与互转。",
   "type": "object",
   "properties": {

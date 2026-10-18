@@ -6,6 +6,7 @@
   "x-go-const": "TypeRTCFailed",
   "x-direction": "S2C",
   "x-since": 1,
+  "x-namespace": "voice",
   "description": "SFU 因 ICE 失败移除本端 PeerConnection。只发给该 peer 的连接；客户端收到后销毁本地 PC 并重新入房，其余成员走 channel.peer_left。",
   "type": "object",
   "properties": {

@@ -125,6 +125,11 @@ func TestWireKeyMessagesJSON(t *testing.T) {
 		{"ICEData", ICEData{Candidate: "c", SDPMid: "0"}, []string{`"candidate":"c"`, `"sdpMid":"0"`}},
 		{"ChatMessageData", ChatMessageData{ID: "9", ChannelID: "3", Content: "hi", TS: 5, User: UserBrief{ID: "1"}},
 			[]string{`"id":"9"`, `"channel_id":"3"`, `"content":"hi"`, `"ts":5`}},
+		{"ServerHelloData 带会话", ServerHelloData{Version: 2, SessionID: "abc"}, []string{`"version":2`, `"session_id":"abc"`}},
+		{"GatewayResumeData", GatewayResumeData{SessionID: "abc", LastSeq: 7}, []string{`"session_id":"abc"`, `"last_seq":7`}},
+		{"GatewayInvalidSessionData", GatewayInvalidSessionData{Reason: "seq_expired"}, []string{`"reason":"seq_expired"`}},
+		{"VoiceSpeakingData", VoiceSpeakingData{ChannelID: "3", UserID: "1", Speaking: true},
+			[]string{`"channel_id":"3"`, `"user_id":"1"`, `"speaking":true`}},
 	}
 	for _, tc := range cases {
 		raw, err := json.Marshal(tc.val)
@@ -145,6 +150,39 @@ func TestWireKeyMessagesJSON(t *testing.T) {
 	raw, _ = json.Marshal(ICEData{Candidate: "c"})
 	if strings.Contains(string(raw), "sdpMid") {
 		t.Errorf("ICEData 空可选字段应省略: %s", raw)
+	}
+	raw, _ = json.Marshal(ServerHelloData{Version: 2})
+	if strings.Contains(string(raw), "session_id") {
+		t.Errorf("ServerHelloData 无会话时应省略 session_id: %s", raw)
+	}
+}
+
+// TestEnvelopeSeq 信封 seq（#32）：seq<=0 不写出（老客户端/语音面不变），
+// seq>=1 写出；MarshalEnvelopePayload 复用预序列化 payload 且保留 ts/seq。
+func TestEnvelopeSeq(t *testing.T) {
+	raw, err := MarshalEnvelope(TypeChatMessage, ChatMessageData{ID: "1"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "seq") {
+		t.Errorf("无 seq 的信封不应写出 seq 字段: %s", raw)
+	}
+	payload, _ := json.Marshal(ChatMessageData{ID: "1"})
+	raw, err = MarshalEnvelopePayload(TypeChatMessage, payload, 42, 7)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	var env Envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if env.Seq != 7 || env.TS != 42 || env.Type != TypeChatMessage {
+		t.Fatalf("envelope = %+v, want seq=7 ts=42", env)
+	}
+	// round-trip 后 data 仍可解码。
+	var d ChatMessageData
+	if err := env.Decode(&d); err != nil || d.ID != "1" {
+		t.Fatalf("decode data: %v %+v", err, d)
 	}
 }
 
