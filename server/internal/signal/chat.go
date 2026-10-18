@@ -15,6 +15,9 @@ type ChatStore interface {
 	CreateMessage(ctx context.Context, msg *store.Message) error
 	ChannelByID(ctx context.Context, id int64) (*store.Channel, error)
 	Member(ctx context.Context, serverID, userID int64) (*store.ServerMember, error)
+	// MembersOfServer 全量成员（#32 事件面广播定向：成员的全部会话进环，
+	// 不再只推在线连接——断线续传窗口内的会话要能补发）。
+	MembersOfServer(ctx context.Context, serverID int64) ([]store.ServerMember, error)
 }
 
 // RateLimiter 发送频控接口（auth.RateLimit 满足；nil 时不限流）。
@@ -30,8 +33,8 @@ const (
 )
 
 // handleChatSend 文字消息发送：内容/类型校验 → 频控 → 权限（在房间 或 频道成员）→ 落库 → 广播。
-// 广播范围（§0.12）：该频道所属服务器的全部在线成员（conns ∩ Member），
-// 并始终回执发送者（前端以广播替换本地回显）；dev 内置房间回退为房内广播。
+// 广播范围（#32 事件面）：该频道所属服务器**全部成员的会话**——在线实时投递，
+// 断线续传窗口内的进事件环补发，不再依赖是否在语音房；dev 内置房间回退为房内广播。
 func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 	if d.ChannelID == "" {
 		h.sendError(c, ErrCodeBadMessage, "chat.send 需要 channel_id")
@@ -97,55 +100,26 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 		out.ID = strconv.FormatInt(out.TS, 10)
 	}
 
-	// 广播：store 频道 → 该服务器全部在线成员；dev 房间 → 房内成员。
-	var recips []*client
+	// 广播（#32 事件面）：store 频道 → 该服务器全部成员的会话（在线实时投递，
+	// 断线续传窗口内的会话进事件环供 gateway.resume 补发）；dev 房间 → 房内成员。
+	// 发送者恒在目标内（前端以广播替换本地回显，不另做回执）。
+	uids := map[string]bool{c.userID: true}
 	if msg != nil {
-		recips = h.serverOnlineMembers(ctx, serverID)
+		members, err := h.chatStore.MembersOfServer(ctx, serverID)
+		if err != nil {
+			h.log.Printf("chat: 查服务器 %d 成员失败: %v", serverID, err)
+		}
+		for _, m := range members {
+			uids[formatUID(m.UserID)] = true
+		}
 	} else {
 		h.mu.Lock()
 		if room := h.rooms[d.ChannelID]; room != nil {
-			recips = room.snapshotLocked()
+			for _, m := range room.members {
+				uids[m.userID] = true
+			}
 		}
 		h.mu.Unlock()
 	}
-	sawSelf := false
-	for _, m := range recips {
-		if m == c {
-			sawSelf = true
-		}
-		h.sendJSON(m, TypeChatMessage, out)
-	}
-	if !sawSelf {
-		h.sendJSON(c, TypeChatMessage, out)
-	}
-}
-
-// serverOnlineMembers 该服务器全部在线连接中具备成员身份的连接（§0.12）。
-// 成员查询按 uid 去重：同账号多设备只查一次 store（O(n)，n=连接数，可接受）。
-func (h *Hub) serverOnlineMembers(ctx context.Context, serverID int64) []*client {
-	h.mu.Lock()
-	conns := make([]*client, 0, len(h.conns))
-	for _, cl := range h.conns {
-		conns = append(conns, cl)
-	}
-	h.mu.Unlock()
-
-	isMember := make(map[int64]bool, len(conns))
-	var out []*client
-	for _, cl := range conns {
-		uid, err := strconv.ParseInt(cl.userID, 10, 64)
-		if err != nil {
-			continue
-		}
-		ok, seen := isMember[uid]
-		if !seen {
-			_, err := h.chatStore.Member(ctx, serverID, uid)
-			ok = err == nil
-			isMember[uid] = ok
-		}
-		if ok {
-			out = append(out, cl)
-		}
-	}
-	return out
+	h.broadcastEvent(uids, TypeChatMessage, out)
 }

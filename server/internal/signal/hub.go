@@ -54,6 +54,10 @@ type Hub struct {
 	conns      map[connKey]*client // uid+"\x00"+dev → 当前连接（§0.8）
 	nextConnID uint64              // 连接标识自增（SFU peer 归属核对用）
 
+	// evlog 事件面每会话事件环（#32）：seq 分配与断线续传补发。
+	// 实现为进程内环形队列（单实例假设，见 gateway.go 头注释）。
+	evlog EventLog
+
 	// 配额与频控（#20）：maxConns 单 uid 连接数；joinRate/offerRate 每分钟每连接。
 	maxConns  int
 	joinRate  int
@@ -134,6 +138,8 @@ type ChatDeps struct {
 	// JoinRate / OfferRate 单连接 channel.join、rtc.offer 的每分钟次数上限（#20）；0 = 不限。
 	JoinRate  int
 	OfferRate int
+	// Backlog 每会话事件环条数（LITETALK_GATEWAY_BACKLOG，#32）；0 = 默认 256。
+	Backlog int
 }
 
 // NewHub 构造信令 hub。maxMembers <= 0 时取 SFU 的上限。
@@ -163,6 +169,7 @@ func NewHub(s *sfu.SFU, authn Authenticator, sess *auth.SessionIndex, logger *lo
 		readIdle:       defaultReadIdle,
 		rooms:          make(map[string]*roomState),
 		conns:          make(map[connKey]*client),
+		evlog:          newMemEventLog(chat.Backlog),
 	}
 }
 
@@ -223,6 +230,8 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 
 	// 注册（§0.6 踢人序）：先登记新连接，再处理被顶替的旧连接。
 	old := h.register(c)
+	// 事件环登记（#32）：会话（sid）订阅随首次连接建立，断线后环保留供 resume 补发。
+	h.evlog.Bind(c.sid, c.userID)
 	go c.writeLoop(ctx)
 	go h.heartbeatLoop(ctx, c)
 	if old != nil {
@@ -308,7 +317,7 @@ func (h *Hub) replace(old, c *client) {
 		return
 	}
 	go func() {
-		h.sendJSON(old, TypeSessionKicked, SessionKickedData{
+		h.sendEvent(old, TypeSessionKicked, SessionKickedData{
 			Reason:     KickReasonLoginElsewhere,
 			DeviceType: old.dev,
 		})
@@ -337,7 +346,7 @@ func (h *Hub) Kick(uid, dev, reason string) {
 	h.mu.Unlock()
 	for _, c := range targets {
 		go func(c *client) {
-			h.sendJSON(c, TypeSessionKicked, SessionKickedData{Reason: reason, DeviceType: c.dev})
+			h.sendEvent(c, TypeSessionKicked, SessionKickedData{Reason: reason, DeviceType: c.dev})
 			time.Sleep(kickSendWindow)
 			_ = c.conn.Close(CloseCodeNewLogin, "login elsewhere")
 		}(c)
@@ -356,7 +365,7 @@ func (h *Hub) Shutdown(reason string) {
 	}
 	h.mu.Unlock()
 	for _, c := range targets {
-		h.sendJSON(c, TypeServerShutdown, ServerShutdownData{Reason: reason, TS: time.Now().UnixMilli()})
+		h.sendEvent(c, TypeServerShutdown, ServerShutdownData{Reason: reason, TS: time.Now().UnixMilli()})
 	}
 	if len(targets) > 0 {
 		time.Sleep(150 * time.Millisecond) // 发送窗口：让下行队列把 shutdown 消息写出去
@@ -1003,20 +1012,6 @@ func (h *Hub) connCount(uid string) int {
 		}
 	}
 	return n
-}
-
-// connsOfUID 某 uid 的全部设备连接快照（presence 推送用）。持 h.mu。
-func (h *Hub) connsOfUID(uid string) []*client {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	prefix := uid + "\x00"
-	out := make([]*client, 0, 1)
-	for k, c := range h.conns {
-		if strings.HasPrefix(string(k), prefix) {
-			out = append(out, c)
-		}
-	}
-	return out
 }
 
 // connQuotaOK 单 uid 连接数配额（#20）：同 uid+dev 的重连是顶替（净增 0），
