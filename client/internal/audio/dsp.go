@@ -139,6 +139,7 @@ type DSP struct {
 	preGainBits  atomic.Uint64 // math.Float64bits(前置线性增益)，热可调
 	denoiseOn    atomic.Bool
 	speaking     atomic.Bool
+	levelBits    atomic.Uint32 // RFC 6464 电平（0=0dB … 127=静音，#33）：updateSpeaking 写、SendOpus 读
 	vadEnterBits atomic.Uint64 // math.Float32bits(VADEnter)，热可调
 	vadExitBits  atomic.Uint64 // math.Float32bits(VADExit)，热可调
 	agcOn        atomic.Bool   // 自动增益开关（v1.1 默认开，nil→true 见 config 层）
@@ -330,6 +331,9 @@ func (d *DSP) VADExit() float32 {
 // Speaking 返回当前说话状态。
 func (d *DSP) Speaking() bool { return d.speaking.Load() }
 
+// AudioLevel 返回最近一帧的 RFC 6464 电平（0=0dB … 127=静音，#33）。
+func (d *DSP) AudioLevel() uint8 { return uint8(d.levelBits.Load()) }
+
 // Process 处理一个 480 采样（10ms）帧：前置增益 → 降噪 → AGC → 固定增益 → RMS/VAD 说话判定。
 // out 与 in 长度都必须 >= FrameSize 且不得重叠；返回 VAD 概率（降噪关闭时为 0）。
 // 全程在预分配缓冲上操作，零堆分配。
@@ -430,9 +434,27 @@ func (d *DSP) nextAGCGain(rms float64) float64 {
 	return g
 }
 
+// rmsToLevel 帧 RMS（int16 域）→ RFC 6464 电平（0=0dB 满幅 … 127=静音）。
+// 只做标量换算：RMS 是 updateSpeaking 已算好的量，不在这里二次遍历帧缓冲。
+func rmsToLevel(rms float64) uint8 {
+	if rms <= 0 {
+		return 127
+	}
+	l := int(math.Round(-20 * math.Log10(rms/32767.0)))
+	if l < 0 {
+		return 0
+	}
+	if l > 127 {
+		return 127
+	}
+	return uint8(l)
+}
+
 // updateSpeaking 双门限 + 迟滞帧数的状态机（v1.1：RMS 门限自适应底噪）。
-// 仅处理 goroutine 调用。
+// 仅处理 goroutine 调用。顺带把换算后的 RFC 6464 电平写入 levelBits（#33）：
+// SendOpus 读它写 RTP 头扩展，电平与说话判定共用同一次 RMS，零新增计算。
 func (d *DSP) updateSpeaking(vad float32, rms float64) {
+	d.levelBits.Store(uint32(rmsToLevel(rms)))
 	vadAvailable := d.denoiseOn.Load()
 	speaking := d.speaking.Load()
 	enterLin := dbToAmp(enterThresholdDB(d.noise.floorDB()))

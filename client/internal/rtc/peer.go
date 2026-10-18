@@ -26,6 +26,10 @@ const opusSDPFmtpLine = "minptime=10;useinbandfec=1"
 // rtpTimestampStep 20ms Opus 帧的 RTP 时戳步进（48kHz × 0.02s）。
 const rtpTimestampStep = 960
 
+// audioLevelURI RFC 6464 音频电平头扩展（#33）：SDP 由 MediaEngine 协商，
+// RTP 载荷为 one-byte 元素数据 V|level（0x00=0dB … 0x7F=静音）。
+const audioLevelURI = "urn:ietf:params:rtp-hdrext:ssrc-audio-level"
+
 // PeerCallbacks 事件回调。除 OnLocalSDP/OnLocalICE 由 Peer 内部 goroutine
 // 触发外，OnTrack/OnConnectionStateChange 由 pion 回调触发；均不得阻塞。
 type PeerCallbacks struct {
@@ -52,6 +56,10 @@ type PeerConfig struct {
 	// 对本机 SFU（宣告 IP 127.0.0.1）联调必须开启；对公网服务端保持 false。
 	IncludeLoopback bool
 
+	// LevelFn 返回当前帧 RFC 6464 电平（0=0dB … 127=静音），SendOpus 每包读一次
+	//（#33，接 audio.Pipeline.AudioLevel）。必须无锁零分配；nil = 不带电平扩展。
+	LevelFn func() uint8
+
 	Callbacks PeerCallbacks
 	Logger    *log.Logger // nil 静默
 }
@@ -76,11 +84,17 @@ type PeerStats struct {
 type Peer struct {
 	pc        *webrtc.PeerConnection
 	sendTrack *webrtc.TrackLocalStaticRTP
+	sender    *webrtc.RTPSender // AddTrack 返回值：查协商到的头扩展 ID 用
 	cb        PeerCallbacks
 	log       *log.Logger
 
 	sendMu sync.Mutex
 	pkt    rtp.Packet // 复用的打包结构（仅头部字段递增）
+	// levelExt RFC 6464 one-byte 元素数据缓冲（#33）：协商完成后挂上 pkt.Header，
+	// 之后每包只改写 levelExt[0]，元素头由 pion marshal 按 Extensions[].id 生成。
+	levelExt      [1]byte
+	levelAttached bool // sendMu 保护；SetExtension 只做一次（append 在初始化期）
+	levelFn       func() uint8
 
 	muted atomic.Bool
 
@@ -105,6 +119,8 @@ func NewPeer(cfg PeerConfig) (*Peer, error) {
 		cfg.Logger = log.New(nopWriter{}, "", 0)
 	}
 
+	// RFC 6464 电平扩展（#33）：必须在 RegisterDefaultInterceptors 之前注册——
+	// 拦截器注册的 transport-cc 等扩展排在其后，SDP extmap ID 按注册序分配。
 	me := &webrtc.MediaEngine{}
 	if err := me.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
@@ -116,6 +132,13 @@ func NewPeer(cfg PeerConfig) (*Peer, error) {
 		PayloadType: OpusPayloadType,
 	}, webrtc.RTPCodecTypeAudio); err != nil {
 		return nil, fmt.Errorf("register opus codec: %w", err)
+	}
+	if cfg.LevelFn != nil {
+		if err := me.RegisterHeaderExtension(webrtc.RTPHeaderExtensionCapability{
+			URI: audioLevelURI,
+		}, webrtc.RTPCodecTypeAudio); err != nil {
+			return nil, fmt.Errorf("register audio level ext: %w", err)
+		}
 	}
 
 	ir := &interceptor.Registry{}
@@ -144,12 +167,13 @@ func NewPeer(cfg PeerConfig) (*Peer, error) {
 		_ = pc.Close()
 		return nil, fmt.Errorf("new send track: %w", err)
 	}
-	if _, err = pc.AddTrack(track); err != nil {
+	sender, err := pc.AddTrack(track)
+	if err != nil {
 		_ = pc.Close()
 		return nil, fmt.Errorf("add send track: %w", err)
 	}
 
-	p := &Peer{pc: pc, sendTrack: track, cb: cfg.Callbacks, log: cfg.Logger}
+	p := &Peer{pc: pc, sendTrack: track, sender: sender, cb: cfg.Callbacks, log: cfg.Logger, levelFn: cfg.LevelFn}
 
 	// 随机 SSRC / 起始序号与时戳（RFC3550 推荐）。
 	var rnd [8]byte
@@ -276,6 +300,44 @@ func (p *Peer) markRemoteDescSet() {
 			p.logf("add queued ice candidate: %v", err)
 		}
 	}
+	p.attachLevelExt()
+}
+
+// attachLevelExt 把 RFC 6464 电平扩展挂到复用的 pkt.Header（#33）。
+// 只能在远端描述就位后调用（extmap ID 此刻才定）；幂等，SetExtension 只真正
+// append 一次，此后每包只改写 levelExt[0]。未协商上该扩展（对端不支持）则不挂。
+func (p *Peer) attachLevelExt() {
+	if p.levelFn == nil || p.sender == nil {
+		return
+	}
+	id, ok := audioLevelExtID(p.sender.GetParameters().HeaderExtensions)
+	if !ok {
+		return
+	}
+	p.sendMu.Lock()
+	defer p.sendMu.Unlock()
+	if p.levelAttached {
+		return
+	}
+	if err := p.pkt.Header.SetExtension(id, p.levelExt[:]); err != nil {
+		p.logf("attach audio level ext: %v", err)
+		return
+	}
+	p.levelAttached = true
+}
+
+// audioLevelExtID 在协商到的头扩展里找 RFC 6464 电平的本地 ID（RFC 8285
+// 单字节头 ID 取值 1..14；0/15 保留）。
+func audioLevelExtID(exts []webrtc.RTPHeaderExtensionParameter) (uint8, bool) {
+	for _, e := range exts {
+		if e.URI == audioLevelURI {
+			if e.ID < 1 || e.ID > 14 {
+				return 0, false
+			}
+			return uint8(e.ID), true
+		}
+	}
+	return 0, false
 }
 
 // SendOpus 把一个 Opus 包打包为 RTP 发出（seq 自增 1，时戳步进 960）。
@@ -307,6 +369,10 @@ func (p *Peer) SendOpus(payload []byte) error {
 	p.pkt.SequenceNumber++
 	p.pkt.Timestamp += rtpTimestampStep
 	p.pkt.Payload = payload
+	// RFC 6464 电平（#33）：只改写预分配的 levelExt[0]，零分配。
+	if p.levelAttached {
+		p.levelExt[0] = p.levelFn()
+	}
 	err := p.sendTrack.WriteRTP(&p.pkt)
 	p.sendMu.Unlock()
 	if err != nil {
