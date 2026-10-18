@@ -141,3 +141,19 @@ func TestRateLimitCodesUnified(t *testing.T) {
 		}
 	}
 }
+
+// TestContentTypeCharset 响应头与旧 writeJSON 同口径：application/json 必带 charset
+// （strict 迁移后生成 Visit 写裸 application/json，由 contentTypeFixer 改写）。
+func TestContentTypeCharset(t *testing.T) {
+	srv, _ := newTestServerMode(t, AuthModeFull)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d", rec.Code)
+	}
+	const want = "application/json; charset=utf-8"
+	if got := rec.Header().Get("Content-Type"); got != want {
+		t.Fatalf("Content-Type 期望 %q，实际 %q", want, got)
+	}
+}
