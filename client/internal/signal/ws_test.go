@@ -411,9 +411,11 @@ func TestWSTokenFuncPerDial(t *testing.T) {
 
 	waitFor(t, "first connect", 3*time.Second, func() bool { return connects.Load() >= 1 })
 
-	// 首连后换令牌；发一条业务消息触发桩掐线（dropOnce），强制重连。
+	// 首连后换令牌。桩的 dropOnce 在收到首条上行（client.hello）时即掐线，
+	// 本条 Send 只是业务面探活：可能正撞断线窗口，ErrNotConnected 与重连无关
+	//（重连由桩掐线触发），其余错误才是真失败。
 	tok.Store("dev-second")
-	if err := c.Send(TypeChannelJoin, ChannelJoinData{ChannelID: "x"}); err != nil {
+	if err := c.Send(TypeChannelJoin, ChannelJoinData{ChannelID: "x"}); err != nil && !errors.Is(err, ErrNotConnected) {
 		t.Fatalf("Send: %v", err)
 	}
 	waitFor(t, "reconnect with new token", 5*time.Second, func() bool {
