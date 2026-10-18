@@ -233,6 +233,9 @@ func main() {
 		JoinRate:  envInt("LITETALK_JOIN_RATE", 30),
 		OfferRate: envInt("LITETALK_OFFER_RATE", 60),
 	})
+	// LITETALK_PROTOCOL_MAX：服务端宣布的协议版本上限（#29 逃生阀）。
+	// 0/缺省 = 构建期 ProtocolVersionMax；调小可临时挡住过新的客户端区间。
+	hub.SetProtoMax(envInt("LITETALK_PROTOCOL_MAX", 0))
 
 	// TURN 短期凭证签发（coturn use-auth-secret，§5.4）
 	var rtcAuth rtcapi.UserFromToken
