@@ -28,7 +28,7 @@ type SignalSender interface {
 	SendFailed(channelID, userID, reason string)
 }
 
-// OnSpeakingFn 上行说话状态翻转回调（#33）：判定 ticker 上触发，必须非阻塞。
+// OnSpeakingFn 上行说话状态翻转回调（#33）：说话判定循环上触发，必须非阻塞。
 type OnSpeakingFn func(channelID, userID string, speaking bool)
 
 // RFC 6464 音频电平（#33）：SDP 协商的头扩展 URI，与客户端 rtc 包一致。
@@ -38,18 +38,22 @@ const audioLevelURI = "urn:ietf:params:rtp-hdrext:ssrc-audio-level"
 // 数值对齐客户端 DSP 静音环境默认（底噪 -50dBFS + 12/+6dB ⇒ enter≈-38dBFS、
 // exit≈-44dBFS，dBov 与 dBFS 同满幅基准）。服务端看的是 AGC 后的上行电平，
 // 跨客户端刻度已被拉齐，先用固定门限；数值可随实测再调。
+//
+// 迟滞拍数按 speakingTick 折算，**时间常数不变**（对齐客户端 DSP：
+// EnterFrames=3=30ms 起判、ExitFrames=15=150ms 挂起）。退出挂起和停流判定
+// 都是防字间停顿/丢包闪断的宽限，压短会闪断——换判定周期只折算拍数，不改时长。
 const (
 	speakEnterLevel = 38 // 电平 ≤38（≥-38dBov）进入说话
 	speakExitLevel  = 44 // 电平 >44 计入退出（39..44 之间保持原态，双门限迟滞）
-	speakEnterTicks = 1  // 1 tick 起判（100ms 粒度下最接近客户端 30ms）
-	speakExitTicks  = 2  // 2 tick 挂起（200ms，对齐客户端 150ms 量级）
+	speakEnterTicks = 1  // 20ms/tick → 20ms 起判（≤客户端现状 30ms）
+	speakExitTicks  = 10 // 20ms/tick → 200ms 挂起（时间常数同旧 2 拍×100ms，对齐客户端 150ms 量级）
+	levelStaleTicks = 10 // 20ms/tick → 200ms 停流按静音（时间常数同旧 2 拍×100ms）
 )
 
 // 活跃转发门控（#33 Phase 1）：进入=进 top-N 且达电平门限；跌出=持续低于
 // 门限 gateGraceTicks（500ms）或掉出 top-N，且在 active 至少保持 ActiveHoldMS。
 const (
-	gateGraceTicks  = 5 // 500ms 低电平宽限（100ms/tick）
-	levelStaleTicks = 2 // 连续 2 tick 无新包（≥200ms）按静音处理（muted/DTX/断流）
+	gateGraceTicks = 5 // 500ms 低电平宽限（activeTick 100ms/tick，与说话判定不同周期）
 )
 
 // audioLevelExtID 在协商到的头扩展里找 RFC 6464 电平的本地 ID（RFC 8285
@@ -66,8 +70,15 @@ func audioLevelExtID(exts []webrtc.RTPHeaderExtensionParameter) uint8 {
 	return 0
 }
 
-// speakingTick 判定与门控的采样周期。
-const speakingTick = 100 * time.Millisecond
+// speakingTick 说话翻转判定的采样周期。贴 Opus 帧周期（48kHz/960 样本 = 20ms，
+// 上行 50pps）：判定粒度即一帧，比它更快看不到新样本，比它更慢只加指示延迟。
+// 起判 1 拍 ⇒ 「电平到达服务端 → 翻转下发」worst case ≈ 1×20ms + 广播，
+// 不高于客户端现状（dsp EnterFrames=3=30ms）。
+const speakingTick = 20 * time.Millisecond
+
+// activeTick 活跃转发 top-N 的排序周期。这是带宽决策不是指示：切太频会让活跃
+// 说话人在 top-N 里来回跳（thrash），100ms 足够，**不跟说话判定一起加速**。
+const activeTick = 100 * time.Millisecond
 
 // Config SFU 配置。
 type Config struct {
@@ -101,11 +112,16 @@ type SFU struct {
 	cfg    Config
 	log    *log.Logger
 
-	// onSpeaking 说话翻转回调（#33）：启动阶段 SetOnSpeaking 注入，ticker 读。
+	// onSpeaking 说话翻转回调（#33）：启动阶段 SetOnSpeaking 注入，判定循环读。
 	onSpeaking atomic.Value // OnSpeakingFn
 	tickDone   chan struct{}
 	tickWG     sync.WaitGroup
 	closed     atomic.Bool // Close 幂等（tickDone 只准关一次）
+
+	// tickRooms 房间快照缓冲（复用免分配；仅 speakingLoop goroutine 访问）。
+	// 快照后必须在锁外跑判定：翻转回调进 WS 层，反过来 hub 会持自己锁时调
+	// SFU，交叉持锁必死锁。
+	tickRooms []*Room
 
 	mu    sync.RWMutex
 	rooms map[string]*Room
@@ -256,34 +272,51 @@ func (s *SFU) speakingFn() OnSpeakingFn {
 	return nil
 }
 
-// speakingLoop 说话判定与活跃门控的 ticker（#33）：100ms 采样各源的 RFC 6464
-// 电平，跑迟滞状态机；翻转走回调，门控结果写各源的 fwdActive 原子位。
-// forward 热路径不参与任何判定，只读这两个原子。
+// speakingLoop 说话翻转判定与活跃门控的驱动循环（#33）。两个独立周期：
+//   - speakingTick 只跑说话迟滞——指示要求低延迟，贴帧采样；
+//   - activeTick 只跑活跃门 top-N——带宽决策，慢以免 thrash。
+//
+// forward 热路径不参与任何判定，只读电平/包计数/转发门这几个原子。
 func (s *SFU) speakingLoop() {
 	defer s.tickWG.Done()
-	t := time.NewTicker(speakingTick)
-	defer t.Stop()
+	spk := time.NewTicker(speakingTick)
+	defer spk.Stop()
+	act := time.NewTicker(activeTick)
+	defer act.Stop()
 	for {
 		select {
 		case <-s.tickDone:
 			return
-		case <-t.C:
-			s.tickAll()
+		case <-spk.C:
+			s.tickSpeakAll()
+		case <-act.C:
+			s.tickActiveAll()
 		}
 	}
 }
 
-// tickAll 遍历全部房间做一次判定。房间快照后在锁外处理，翻转回调不得持任何 SFU 锁
-// （回调进 WS 层，反过来 hub 会在持自己锁时调 SFU，必须避免交叉持锁）。
-func (s *SFU) tickAll() {
+// roomSnap 把当前房间快照进 s.tickRooms（复用缓冲）。
+func (s *SFU) roomSnap() []*Room {
 	s.mu.RLock()
-	rooms := make([]*Room, 0, len(s.rooms))
+	s.tickRooms = s.tickRooms[:0]
 	for _, r := range s.rooms {
-		rooms = append(rooms, r)
+		s.tickRooms = append(s.tickRooms, r)
 	}
 	s.mu.RUnlock()
-	for _, r := range rooms {
-		r.tick(s.speakingFn())
+	return s.tickRooms
+}
+
+// tickSpeakAll 遍历全部房间做一次说话判定（speakingTick）。
+func (s *SFU) tickSpeakAll() {
+	for _, r := range s.roomSnap() {
+		r.tickSpeak(s.speakingFn())
+	}
+}
+
+// tickActiveAll 遍历全部房间做一次活跃门 top-N（activeTick）。
+func (s *SFU) tickActiveAll() {
+	for _, r := range s.roomSnap() {
+		r.tickActive()
 	}
 }
 
