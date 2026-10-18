@@ -679,10 +679,12 @@ func (c *APIClient) CreateInvite(serverID int64) (string, error) {
 	return inv.Code, nil
 }
 
-// CreateChannel 在服务器下新建频道（owner/admin）。typ 为 text / voice。成功返回 201。
-func (c *APIClient) CreateChannel(serverID int64, name, typ string) (*ChannelDTO, error) {
+// CreateChannel 在服务器下新建频道（owner/admin）。typ 为 text / voice。
+// categoryID 为目标分类（0 = 不归类，服务端落 NULL）——带上它频道才在会话内
+// 就归位，不用等重启后 ListChannels 对账（#72）。成功返回 201。
+func (c *APIClient) CreateChannel(serverID int64, name, typ string, categoryID int64) (*ChannelDTO, error) {
 	status, data, err := c.post(fmt.Sprintf("/servers/%d/channels", serverID),
-		map[string]string{"name": name, "type": typ}, true)
+		map[string]any{"name": name, "type": typ, "category_id": categoryID}, true)
 	if err != nil {
 		return nil, err
 	}

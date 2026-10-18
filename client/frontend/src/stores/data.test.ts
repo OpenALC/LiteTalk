@@ -7,6 +7,7 @@ import { createPinia, setActivePinia } from 'pinia'
 const mockGoApp = vi.hoisted(() => ({
   ListServers: vi.fn(),
   ListChannels: vi.fn(),
+  CreateChannel: vi.fn(),
   RenameCategory: vi.fn(async () => {}),
   UpdateCategory: vi.fn(async (id: number, name: string, position: number) => ({
     id, server_id: 0, name: name || `分类${id}`, position: position < 0 ? 0 : position,
@@ -49,6 +50,7 @@ import { useNotifyStore } from './notify'
 function resetMock() {
   mockGoApp.ListServers.mockReset()
   mockGoApp.ListChannels.mockReset()
+  mockGoApp.CreateChannel.mockReset()
   mockGoApp.RenameCategory.mockReset().mockResolvedValue(undefined)
   mockGoApp.UpdateCategory.mockReset().mockImplementation(async (id, name, position) => ({
     id, server_id: 0, name: name || `分类${id}`, position: position < 0 ? 0 : position,
@@ -301,5 +303,73 @@ describe('好友在线态', () => {
     mockEventsOn.fire('presence:update', { user_id: '10', online: true })
     expect(s.online).toEqual([])
     expect(s.offline.map((f) => f.userId)).toEqual([10])
+  })
+})
+
+// 新建频道归入分类（#72）：显式 category_id 必须带给服务端，本地 group 同时取
+// 分类名——#16 的按名归组靠 group 名落位，只带 id 不改名仍会掉进类型默认组。
+describe('新建频道归入分类', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    resetMock()
+    mockGoApp.ListServers.mockResolvedValue([
+      { id: 31, name: '服31', owner_id: 1, icon_name: 'music', icon_color: '#4FA4F3' },
+    ])
+    mockGoApp.ListChannels.mockResolvedValue({
+      categories: [
+        { id: 311, server_id: 31, name: '甲组', position: 0 },
+        { id: 312, server_id: 31, name: '乙组', position: 1 },
+      ],
+      channels: [],
+    })
+    mockGoApp.CreateChannel.mockImplementation(
+      async (serverID: number, name: string, typ: string, categoryID: number) => ({
+        id: 3101, server_id: serverID, name, type: typ, category_id: categoryID || null,
+      }),
+    )
+  })
+
+  it('显式分类：category_id 带给服务端，group 取分类名即可落位', async () => {
+    const s = useServersStore()
+    await s.loadRemoteServers()
+
+    await s.createChannel('31', '开黑', 'voice', '312')
+
+    expect(mockGoApp.CreateChannel).toHaveBeenCalledWith(31, '开黑', 'voice', 312)
+    const ch = s.findServer('31')!.channels[0]
+    expect(ch.group).toBe('乙组')
+    // 不重启就已在目标分类下（groupsOf 按名归组命中真实分类）。
+    expect(s.groupsOf('31', s.findServer('31')!.channels).map((g) => g.name))
+      .toEqual(['甲组', '乙组'])
+  })
+
+  it('缺省分类走旧路径：不带 category_id，落类型默认组名', async () => {
+    const s = useServersStore()
+    await s.loadRemoteServers()
+
+    await s.createChannel('31', '散装', 'voice')
+
+    expect(mockGoApp.CreateChannel).toHaveBeenCalledWith(31, '散装', 'voice', 0)
+    expect(s.findServer('31')!.channels[0].group).toBe('语音频道')
+  })
+
+  it('显式「未分类」不算缺省：group 落「未分类」，category_id 传 0', async () => {
+    const s = useServersStore()
+    await s.loadRemoteServers()
+
+    await s.createChannel('31', '野队', 'text', '')
+
+    expect(mockGoApp.CreateChannel).toHaveBeenCalledWith(31, '野队', 'text', 0)
+    expect(s.findServer('31')!.channels[0].group).toBe(UNCATEGORIZED)
+  })
+
+  it('找不到分类名时归「未分类」，不造类型默认假分组', async () => {
+    const s = useServersStore()
+    await s.loadRemoteServers()
+
+    await s.createChannel('31', '越界', 'voice', '999')
+
+    expect(mockGoApp.CreateChannel).toHaveBeenCalledWith(31, '越界', 'voice', 999)
+    expect(s.findServer('31')!.channels[0].group).toBe(UNCATEGORIZED)
   })
 })

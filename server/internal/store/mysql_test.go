@@ -135,6 +135,9 @@ func TestMySQLMigrateAndCRUD(t *testing.T) {
 	if list[1].Name != "a2" {
 		t.Fatalf("改名未生效: %+v", list[1])
 	}
+
+	// 频道分类归属（#72）：与 Mem 共用同一套断言，两边语义漂移会直接测挂。
+	assertChannelCategoryPersist(t, m)
 }
 
 // findMigrations 定位迁移文件：优先 embed（migrations.FS），回退磁盘目录。

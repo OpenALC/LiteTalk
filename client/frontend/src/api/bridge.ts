@@ -62,7 +62,8 @@ type GoApp = {
   RenameServer(id: number, name: string): Promise<void>
   DeleteServer(id: number): Promise<void>
   CreateInviteCode(serverID: number): Promise<string>
-  CreateChannel(serverID: number, name: string, typ: string): Promise<ChannelDTO>
+  // categoryID 0 = 不归类（#72 新建即归组，不用等重启对账）。
+  CreateChannel(serverID: number, name: string, typ: string, categoryID: number): Promise<ChannelDTO>
   RenameChannel(id: number, name: string): Promise<void>
   DeleteChannel(id: number): Promise<void>
   CreateCategory(serverID: number, name: string): Promise<CategoryDTO>
@@ -198,8 +199,11 @@ const mockApp: GoApp = {
   async RenameServer() {},
   async DeleteServer() {},
   async CreateInviteCode() { return 'mock-invite-code' },
-  async CreateChannel(serverID: number, name: string, typ: string) {
-    return { id: Date.now(), server_id: serverID, name, type: typ as 'text' | 'voice' }
+  async CreateChannel(serverID: number, name: string, typ: string, categoryID: number) {
+    return {
+      id: Date.now(), server_id: serverID, name, type: typ as 'text' | 'voice',
+      category_id: categoryID || null,
+    }
   },
   async RenameChannel() {},
   async DeleteChannel() {},
