@@ -4,11 +4,9 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"log"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -152,48 +150,20 @@ func (s *Server) mailConfigured() bool {
 }
 
 // Handler 返回挂载全部路由的 http.Handler（前缀 /api/v1）。
+// 路由表由 api.gen.go 按 openapi.yaml 注册；authMux 在注册时对非免鉴权
+// 路由包 auth 中间件（顺序与旧 s.auth(s.handleXxx) 一致）。
 func (s *Server) Handler() http.Handler {
-	mux := http.NewServeMux()
-	// config（免鉴权，客户端据此适配 UI）
-	mux.HandleFunc("GET /api/v1/config", s.handleConfig)
-	// auth
-	mux.HandleFunc("POST /api/v1/auth/register", s.handleRegister)
-	mux.HandleFunc("POST /api/v1/auth/login", s.handleLogin)
-	mux.HandleFunc("POST /api/v1/auth/guest", s.handleGuest)
-	mux.HandleFunc("POST /api/v1/auth/refresh", s.handleRefresh)
-	mux.HandleFunc("POST /api/v1/auth/logout", s.handleLogout)
-	mux.HandleFunc("POST /api/v1/auth/email-code", s.handleEmailCode)
-	mux.HandleFunc("POST /api/v1/auth/password/reset", s.handlePasswordReset)
-	// users
-	mux.HandleFunc("GET /api/v1/users/me", s.auth(s.handleMe))
-	mux.HandleFunc("PATCH /api/v1/users/me", s.auth(s.handlePatchMe))
-	// friends
-	mux.HandleFunc("GET /api/v1/friends", s.auth(s.handleListFriends))
-	mux.HandleFunc("POST /api/v1/friends/requests", s.auth(s.handleFriendRequest))
-	mux.HandleFunc("POST /api/v1/friends/requests/{id}/accept", s.auth(s.handleFriendAccept))
-	mux.HandleFunc("DELETE /api/v1/friends/{id}", s.auth(s.handleFriendDelete))
-	mux.HandleFunc("PATCH /api/v1/friends/{id}", s.auth(s.handlePatchFriend))
-	// servers
-	mux.HandleFunc("POST /api/v1/servers", s.auth(s.handleCreateServer))
-	mux.HandleFunc("GET /api/v1/servers", s.auth(s.handleListServers))
-	mux.HandleFunc("PATCH /api/v1/servers/{id}", s.auth(s.handlePatchServer))
-	mux.HandleFunc("DELETE /api/v1/servers/{id}", s.auth(s.handleDeleteServer))
-	mux.HandleFunc("POST /api/v1/servers/join", s.auth(s.handleJoinServer))
-	mux.HandleFunc("GET /api/v1/servers/{id}/members", s.auth(s.handleServerMembers))
-	mux.HandleFunc("POST /api/v1/servers/{id}/invites", s.auth(s.handleCreateInvite))
-	// channels
-	mux.HandleFunc("POST /api/v1/servers/{id}/channels", s.auth(s.handleCreateChannel))
-	mux.HandleFunc("GET /api/v1/servers/{id}/channels", s.auth(s.handleListChannels))
-	mux.HandleFunc("PATCH /api/v1/channels/{id}", s.auth(s.handlePatchChannel))
-	mux.HandleFunc("DELETE /api/v1/channels/{id}", s.auth(s.handleDeleteChannel))
-	// categories（v0.1.2 迁移 0003）
-	mux.HandleFunc("POST /api/v1/servers/{id}/categories", s.auth(s.handleCreateCategory))
-	mux.HandleFunc("PATCH /api/v1/categories/{id}", s.auth(s.handlePatchCategory))
-	mux.HandleFunc("DELETE /api/v1/categories/{id}", s.auth(s.handleDeleteCategory))
-	// messages
-	mux.HandleFunc("GET /api/v1/channels/{id}/messages", s.auth(s.handleListMessages))
-	mux.HandleFunc("POST /api/v1/channels/{id}/messages", s.auth(s.handleCreateMessage))
-	return mux
+	si := NewStrictHandlerWithOptions(s, []StrictMiddlewareFunc{s.withStrictCtx}, StrictHTTPServerOptions{
+		RequestErrorHandlerFunc:  s.requestErrorHandler,
+		ResponseErrorHandlerFunc: s.responseErrorHandler,
+	})
+	return HandlerWithOptions(si, StdHTTPServerOptions{
+		BaseRouter:  &authMux{ServeMux: http.NewServeMux(), s: s},
+		Middlewares: []MiddlewareFunc{limitBody},
+		ErrorHandlerFunc: func(w http.ResponseWriter, r *http.Request, err error) {
+			writeErr(w, http.StatusBadRequest, "bad_request", "路径参数不合法")
+		},
+	})
 }
 
 // ---- 上下文 ----
@@ -201,12 +171,6 @@ func (s *Server) Handler() http.Handler {
 type ctxKey int
 
 const userKey ctxKey = 1
-
-// currentUser 从请求上下文取当前用户（auth 中间件注入）。
-func currentUser(r *http.Request) *auth.Claims {
-	c, _ := r.Context().Value(userKey).(*auth.Claims)
-	return c
-}
 
 // legacyTokenGrace 旧版本令牌（无 sid）过渡期：与 signal 侧同值同时长，
 // 服务端升级后已签发令牌在有效期内仍可用，给用户留重新登录窗口（P1-3）。
@@ -258,62 +222,9 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// apiError 统一错误体 {"code","message"}。
-type apiError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-}
-
+// writeErr 统一错误体 {"code","message"}（契约 ApiError）。
 func writeErr(w http.ResponseWriter, status int, code, msg string) {
-	writeJSON(w, status, apiError{Code: code, Message: msg})
-}
-
-// writeStoreErr 把 store 领域错误映射为 HTTP。500 时记录底层错误与请求路径（§0.1.3）。
-func (s *Server) writeStoreErr(w http.ResponseWriter, r *http.Request, err error) {
-	switch {
-	case errors.Is(err, store.ErrNotFound):
-		writeErr(w, http.StatusNotFound, "not_found", "资源不存在")
-	case errors.Is(err, store.ErrConflict):
-		writeErr(w, http.StatusConflict, "conflict", "资源冲突")
-	case errors.Is(err, store.ErrForbidden):
-		writeErr(w, http.StatusForbidden, "forbidden", "无权操作")
-	case errors.Is(err, store.ErrExpired):
-		writeErr(w, http.StatusGone, "code_expired", "邀请码已过期")
-	default:
-		path := ""
-		if r != nil && r.URL != nil {
-			path = r.URL.Path
-		}
-		s.log.Printf("[500] %s: %v", path, err)
-		writeErr(w, http.StatusInternalServerError, "internal", "服务器内部错误")
-	}
-}
-
-// decodeJSON 读取并校验请求体。MaxBytesReader 对 chunked 请求同样生效（#21）。
-func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB 上限
-	dec := json.NewDecoder(r.Body)
-	if err := dec.Decode(v); err != nil {
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			writeErr(w, http.StatusRequestEntityTooLarge, "too_large", "请求体过大")
-			return false
-		}
-		writeErr(w, http.StatusBadRequest, "bad_request", "请求体不是合法 JSON")
-		return false
-	}
-	return true
-}
-
-// pathID 读取路径参数 {id}。
-func pathID(w http.ResponseWriter, r *http.Request, name string) (int64, bool) {
-	raw := r.PathValue(name)
-	id, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || id <= 0 {
-		writeErr(w, http.StatusBadRequest, "bad_request", "路径参数不合法")
-		return 0, false
-	}
-	return id, true
+	writeJSON(w, status, ApiError{Code: code, Message: msg})
 }
 
 // clientIP 取客户端 IP：仅当 RemoteAddr 命中可信代理列表时才采用 X-Real-IP。

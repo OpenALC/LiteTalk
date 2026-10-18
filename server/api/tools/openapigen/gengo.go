@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"go/format"
 	"os"
 	"sort"
 	"strings"
@@ -39,7 +40,12 @@ func genGo(specPath, outPath string) error {
 		return fmt.Errorf("生成 Go: %w", err)
 	}
 	src = ensureBanner(src) + publicPatternsSource(swagger)
-	if err := os.WriteFile(outPath, []byte(src), 0o644); err != nil {
+	// 整文件再过一遍 gofmt：banner/路由表拼接后缩进可能不齐，CI 的 gofmt 门会拦。
+	formatted, err := format.Source([]byte(src))
+	if err != nil {
+		return fmt.Errorf("gofmt 生成物: %w", err)
+	}
+	if err := os.WriteFile(outPath, formatted, 0o644); err != nil {
 		return fmt.Errorf("写 %s: %w", outPath, err)
 	}
 	return nil

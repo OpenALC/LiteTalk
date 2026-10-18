@@ -1,64 +1,55 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net/http"
 
 	"github.com/OpenALC/LiteTalk/server/internal/store"
 )
 
-// handleMe GET /api/v1/users/me
-func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
-	c := currentUser(r)
-	user, err := s.store.UserByID(r.Context(), c.UserID)
+// GetMe GET /api/v1/users/me（自响应含 email）
+func (s *Server) GetMe(ctx context.Context, request GetMeRequestObject) (GetMeResponseObject, error) {
+	c := currentUser(ctx)
+	user, err := s.store.UserByID(ctx, c.UserID)
 	if err != nil {
-		s.writeStoreErr(w, r, err)
-		return
+		return nil, s.writeStoreErr(ctx, err)
 	}
-	writeJSON(w, http.StatusOK, user)
+	return GetMe200JSONResponse(*user), nil
 }
 
-type patchMeReq struct {
-	Nickname *string `json:"nickname"`
-}
-
-// handlePatchMe PATCH /api/v1/users/me（昵称可改；无头像字段）
-func (s *Server) handlePatchMe(w http.ResponseWriter, r *http.Request) {
-	c := currentUser(r)
-	var req patchMeReq
-	if !decodeJSON(w, r, &req) {
-		return
+// PatchMe PATCH /api/v1/users/me（昵称可改；无头像字段）
+func (s *Server) PatchMe(ctx context.Context, request PatchMeRequestObject) (PatchMeResponseObject, error) {
+	if request.Body == nil {
+		return nil, bodyMissing()
 	}
-	user, err := s.store.UserByID(r.Context(), c.UserID)
+	c := currentUser(ctx)
+	user, err := s.store.UserByID(ctx, c.UserID)
 	if err != nil {
-		s.writeStoreErr(w, r, err)
-		return
+		return nil, s.writeStoreErr(ctx, err)
 	}
-	if req.Nickname != nil {
+	if req := request.Body; req.Nickname != nil {
 		if !validNickname(*req.Nickname) {
-			writeErr(w, http.StatusBadRequest, "bad_nickname", "昵称需为 2–16 个字符")
-			return
+			return nil, errf(http.StatusBadRequest, "bad_nickname", "昵称需为 2–16 个字符")
 		}
 		if *req.Nickname != user.Nickname {
 			// 昵称变更后 tag 需重新分配保证 (nickname,tag) 不冲突。
 			user.Nickname = *req.Nickname
 			for i := 0; i < 5; i++ {
 				user.Tag = fmtTag(int(user.ID*7919+int64(i*104729)) % 10000)
-				err = s.store.UpdateUser(r.Context(), user)
+				err = s.store.UpdateUser(ctx, user)
 				if err == nil {
 					break
 				}
 				if !errors.Is(err, store.ErrConflict) {
-					s.writeStoreErr(w, r, err)
-					return
+					return nil, s.writeStoreErr(ctx, err)
 				}
 			}
 			// 5 次重试仍冲突 → 409（#22）。
 			if err != nil {
-				s.writeStoreErr(w, r, err)
-				return
+				return nil, s.writeStoreErr(ctx, err)
 			}
 		}
 	}
-	writeJSON(w, http.StatusOK, user)
+	return PatchMe200JSONResponse(*user), nil
 }
