@@ -25,7 +25,7 @@ func (h *Hub) failICE(c *client, channelID, reason string) {
 	if w != nil && w.removed {
 		h.log.Printf("ws: %s 离开频道 %s（ICE 失败）", w.c.userID, w.roomID)
 		for _, m := range w.remaining {
-			h.sendJSON(m, TypeChannelPeerLeft, ChannelPeerLeftData{
+			h.sendJSON(m, TypeChannelPeerLeft, PeerLeftData{
 				ChannelID: w.roomID,
 				UserID:    w.c.userID,
 			})

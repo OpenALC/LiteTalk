@@ -611,7 +611,7 @@ func (s *Session) LeaveChannel() error {
 		return nil
 	}
 	s.roomID.Store("")
-	if err := s.ws.Send(signal.TypeChannelLeave, signal.ChannelJoinData{ChannelID: room}); err != nil {
+	if err := s.ws.Send(signal.TypeChannelLeave, signal.ChannelLeaveData{ChannelID: room}); err != nil {
 		return err
 	}
 	if p := s.peerRef.Swap(nil); p != nil {
@@ -771,10 +771,10 @@ func (s *Session) SendChat(channelID, content string) error {
 	if s.ws == nil {
 		return fmt.Errorf("session not connected")
 	}
-	return s.ws.Send(signal.TypeChatSend, map[string]string{
-		"channel_id": channelID,
-		"type":       "text",
-		"content":    content,
+	return s.ws.Send(signal.TypeChatSend, signal.ChatSendData{
+		ChannelID: channelID,
+		Type:      "text",
+		Content:   content,
 	})
 }
 
