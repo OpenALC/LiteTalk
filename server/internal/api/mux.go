@@ -14,11 +14,15 @@ type authMux struct {
 }
 
 func (a *authMux) HandleFunc(pattern string, h func(http.ResponseWriter, *http.Request)) {
+	// contentTypeFixer 包在最外层：生成 Visit 写 application/json，线上口径带 charset。
+	wrap := func(w http.ResponseWriter, r *http.Request) {
+		h(contentTypeFixer{w}, r)
+	}
 	if PublicRoutePatterns[pattern] {
-		a.ServeMux.HandleFunc(pattern, h)
+		a.ServeMux.HandleFunc(pattern, wrap)
 		return
 	}
-	a.ServeMux.HandleFunc(pattern, a.s.auth(h))
+	a.ServeMux.HandleFunc(pattern, a.s.auth(wrap))
 }
 
 // limitBody 请求体 1MB 上限（与旧 decodeJSON 一致）；超限在解码报错里区分。
