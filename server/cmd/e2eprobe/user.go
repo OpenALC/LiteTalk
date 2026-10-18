@@ -72,6 +72,7 @@ type probeUser struct {
 	wsErr       atomic.Int64
 	recvMu      sync.Mutex
 	recv        map[string]*atomic.Int64
+	trackStop   map[string]chan struct{} // 每 src 一路读取循环的拆除信号（-rejoin：peer_left 语义）
 	tracksUp    atomic.Int64
 	trackErr    atomic.Int64
 
@@ -80,6 +81,8 @@ type probeUser struct {
 	gotKicked     atomic.Bool
 	gotVoiceTaken atomic.Bool
 	joinedRoom    atomic.Bool
+	joinedN       atomic.Int64  // channel.joined 计数（-rejoin：二次入房断言）
+	peerLeftN     atomic.Int64  // channel.peer_left 计数（-rejoin）
 	closeCode     atomic.Int32  // 0 = 尚未收到服务端 close 帧；-1 = 异常断开（非 close 帧）
 	lastSrvErr    atomic.Value  // string "code: message"，最近一条下行 error（诊断用）
 	readDone      chan struct{} // readLoop 退出信号
@@ -94,7 +97,7 @@ func newUser(cfg *config, room, id, token string, ice []ICEServer, others []stri
 	}
 	return &probeUser{cfg: cfg, id: id, room: room, token: token, ice: ice,
 		connected: make(chan struct{}), atGate: make(chan struct{}), recv: recv,
-		readDone: make(chan struct{})}
+		trackStop: make(map[string]chan struct{}), readDone: make(chan struct{})}
 }
 
 func (u *probeUser) run(ctx context.Context, sendStart, sendStop <-chan struct{}) error {
@@ -187,6 +190,13 @@ func (u *probeUser) readLoop(ctx context.Context) {
 			u.gotHello.Store(true)
 		case signal.TypeChannelJoined:
 			u.joinedRoom.Store(true)
+			u.joinedN.Add(1)
+		case signal.TypeChannelPeerLeft:
+			u.peerLeftN.Add(1)
+			var d signal.ChannelPeerLeftData
+			if env.Decode(&d) == nil {
+				u.stopTrack(d.UserID) // 与真实客户端一致：peer_left 即拆该路读取（remote.RemovePeer）
+			}
 		case signal.TypeError:
 			var d signal.ErrorData
 			if env.Decode(&d) == nil {
@@ -298,11 +308,21 @@ func (u *probeUser) startPeer() error {
 		src := strings.TrimPrefix(remote.ID(), "audio-")
 		u.recvMu.Lock()
 		counter := u.recv[src]
+		stop := make(chan struct{})
+		if old, ok := u.trackStop[src]; ok {
+			close(old) // 同 src 旧读取循环退役（重入房换轨）
+		}
+		u.trackStop[src] = stop
 		u.recvMu.Unlock()
 		for {
 			_, _, err := remote.ReadRTP()
 			if err != nil {
 				return
+			}
+			select {
+			case <-stop:
+				return // peer_left 后不再向应用层交付（真实客户端 remote.RemovePeer 语义）
+			default:
 			}
 			if counter != nil {
 				counter.Add(1)
@@ -390,6 +410,25 @@ func (u *probeUser) sendLoop(stop <-chan struct{}) {
 		} else {
 			u.sent.Add(1)
 		}
+	}
+}
+
+// stopTrack 拆除某 src 的下行读取循环（channel.peer_left 处理：真实客户端
+// 会 RemovePeer 销毁该路解码链路，重入房后必须靠新 OnTrack 恢复）。
+func (u *probeUser) stopTrack(src string) {
+	u.recvMu.Lock()
+	if stop, ok := u.trackStop[src]; ok {
+		close(stop)
+		delete(u.trackStop, src)
+	}
+	u.recvMu.Unlock()
+}
+
+// closePC 只关 PeerConnection（-rejoin：离房后信令连接保留，供二次入房）。
+func (u *probeUser) closePC() {
+	if u.pc != nil {
+		_ = u.pc.Close()
+		u.pc = nil
 	}
 }
 
