@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litetalk:signal:voice.state_request",
+  "title": "VoiceStateRequestData",
+  "x-wire-type": "voice.state_request",
+  "x-go-const": "TypeVoiceStateRequest",
+  "x-direction": "S2C",
+  "x-since": 1,
+  "description": "他人对你发出的闭麦/静音请求（voice.request_state 的定向投递）。",
+  "type": "object",
+  "properties": {
+    "from": { "$ref": "components.schema.json#/$defs/UserBrief" },
+    "mute": {
+      "type": "boolean",
+      "x-go-type": "*bool",
+      "x-go-omitempty": true
+    },
+    "deafen": {
+      "type": "boolean",
+      "x-go-type": "*bool",
+      "x-go-omitempty": true
+    },
+    "ts": { "type": "integer" }
+  },
+  "required": ["from", "ts"],
+  "additionalProperties": false
+}

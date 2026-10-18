@@ -1,0 +1,50 @@
+{
+  "$comment": "信令契约目录（#29）。消息类型/错误码/close code/协议版本的唯一事实来源；两侧 protocol_gen.go 由 server/api/tools/signalgen 生成。只增不改：删字段或改语义须升协议版本并征得用户同意。",
+  "protocol_versions": {
+    "min": 1,
+    "max": 2,
+    "current": 2
+  },
+  "close_codes": [
+    {
+      "go_name": "CloseCodeSessionReplaced",
+      "value": 4000,
+      "comment": "同会话（同 sid）半开连接被新连接替换——静默关闭，不发 session.kicked"
+    },
+    {
+      "go_name": "CloseCodeNewLogin",
+      "value": 4001,
+      "comment": "同类设备新登录（或登出/重置密码踢线）——旧连接先收 session.kicked 后以此码关闭"
+    },
+    {
+      "go_name": "CloseCodeProtocolUnsupported",
+      "value": 4002,
+      "since": 2,
+      "comment": "协议版本无交集。当前行为不主动断连（裁定 #9），此码保留给将来服务端/客户端主动收尾用"
+    }
+  ],
+  "error_codes": [
+    { "go_name": "ErrCodeBadMessage", "value": "bad_message" },
+    { "go_name": "ErrCodeNotInChannel", "value": "not_in_channel" },
+    { "go_name": "ErrCodeAlreadyInChan", "value": "already_in_channel" },
+    { "go_name": "ErrCodeRoomFull", "value": "room_full" },
+    { "go_name": "ErrCodeRTC", "value": "rtc_error" },
+    { "go_name": "ErrCodeInternal", "value": "internal" },
+    { "go_name": "ErrCodeForbidden", "value": "forbidden" },
+    { "go_name": "ErrCodeNotFound", "value": "not_found" },
+    { "go_name": "ErrCodeRateLimited", "value": "rate_limited" },
+    { "go_name": "ErrCodeQuotaExceeded", "value": "quota_exceeded" },
+    {
+      "go_name": "ErrCodeProtocolUnsupported",
+      "value": "protocol_unsupported",
+      "since": 2
+    }
+  ],
+  "kick_reasons": [
+    {
+      "go_name": "KickReasonLoginElsewhere",
+      "value": "login_elsewhere",
+      "comment": "session.kicked.reason 的标准取值（同类设备新登录）"
+    }
+  ]
+}
