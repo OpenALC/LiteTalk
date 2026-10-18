@@ -94,7 +94,8 @@ func (s *Server) PatchServer(ctx context.Context, request PatchServerRequestObje
 	if e := checkID(request.Id); e != nil {
 		return nil, e
 	}
-	if request.Body == nil {
+	req := patchBody(request.JSONBody, request.ApplicationMergePatchPlusJSONBody)
+	if req == nil {
 		return nil, bodyMissing()
 	}
 	c := currentUser(ctx)
@@ -105,18 +106,18 @@ func (s *Server) PatchServer(ctx context.Context, request PatchServerRequestObje
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	req := request.Body
-	if req.Name != nil {
-		if !validServerName(*req.Name) {
+	// Merge Patch（#31）：缺省不改，null = 清空（名称/图标不可清 → 校验拒 400）。
+	if req.Name.Set {
+		if !validServerName(req.Name.Val) {
 			return nil, errf(http.StatusBadRequest, "bad_name", "名称需为 2–32 个字符")
 		}
-		srv.Name = *req.Name
+		srv.Name = req.Name.Val
 	}
-	if req.IconName != nil {
-		srv.IconName = *req.IconName
+	if req.IconName.Set {
+		srv.IconName = req.IconName.Val
 	}
-	if req.IconColor != nil {
-		srv.IconColor = *req.IconColor
+	if req.IconColor.Set {
+		srv.IconColor = req.IconColor.Val
 	}
 	if !validIcon(srv.IconName, srv.IconColor) {
 		return nil, errf(http.StatusBadRequest, "bad_icon", "图标或颜色不合法")
@@ -205,7 +206,14 @@ func (s *Server) ListServerMembers(ctx context.Context, request ListServerMember
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	return ListServerMembers200JSONResponse(memberViews(members)), nil
+	// ETag 协商（#31）：内容哈希弱标签，命中 If-None-Match 回 304。
+	view := memberViews(members)
+	etag := contentETag(view)
+	setETag(ctx, etag)
+	if etagMatch(ifNoneMatch(ctx), etag) {
+		return ListServerMembers304Response{}, nil
+	}
+	return ListServerMembers200JSONResponse(view), nil
 }
 
 // CreateInvite POST /api/v1/servers/{id}/invites

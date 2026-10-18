@@ -27,8 +27,8 @@ func publicUser(u *store.User) *PublicUser {
 		EmailVerified: u.EmailVerified,
 		IsGuest:       u.IsGuest,
 		Status:        int32(u.Status),
-		CreatedAt:     u.CreatedAt,
-		UpdatedAt:     u.UpdatedAt,
+		CreatedAt:     timeOf(u.CreatedAt),
+		UpdatedAt:     timeOf(u.UpdatedAt),
 	}
 }
 
@@ -42,8 +42,8 @@ func userSelf(u *store.User) User {
 		EmailVerified: u.EmailVerified,
 		IsGuest:       u.IsGuest,
 		Status:        int32(u.Status),
-		CreatedAt:     u.CreatedAt,
-		UpdatedAt:     u.UpdatedAt,
+		CreatedAt:     timeOf(u.CreatedAt),
+		UpdatedAt:     timeOf(u.UpdatedAt),
 	}
 }
 
@@ -54,7 +54,7 @@ func serverView(sv *store.Server) ServerInfo {
 		OwnerId:   idOf(sv.OwnerID),
 		IconName:  sv.IconName,
 		IconColor: sv.IconColor,
-		CreatedAt: sv.CreatedAt,
+		CreatedAt: timeOf(sv.CreatedAt),
 	}
 }
 
@@ -65,7 +65,7 @@ func channelView(c *store.Channel) ChannelInfo {
 		Name:      c.Name,
 		Type:      ChannelInfoType(c.Type),
 		Position:  c.Position,
-		CreatedAt: c.CreatedAt,
+		CreatedAt: timeOf(c.CreatedAt),
 	}
 	if c.CategoryID != nil {
 		out.CategoryId = idPtr(*c.CategoryID)
@@ -79,7 +79,7 @@ func categoryView(c *store.Category) CategoryInfo {
 		ServerId:  idOf(c.ServerID),
 		Name:      c.Name,
 		Position:  c.Position,
-		CreatedAt: c.CreatedAt,
+		CreatedAt: timeOf(c.CreatedAt),
 	}
 }
 
@@ -88,7 +88,7 @@ func memberView(m *store.ServerMember) MemberInfo {
 		ServerId: idOf(m.ServerID),
 		UserId:   idOf(m.UserID),
 		Role:     MemberInfoRole(m.Role),
-		JoinedAt: m.JoinedAt,
+		JoinedAt: timeOf(m.JoinedAt),
 	}
 	if m.Nickname != "" {
 		n := m.Nickname
@@ -107,7 +107,7 @@ func messageView(m *store.Message) Message {
 		ChannelId: idOf(m.ChannelID),
 		UserId:    idOf(m.UserID),
 		Content:   m.Content,
-		CreatedAt: m.CreatedAt,
+		CreatedAt: timeOf(m.CreatedAt),
 	}
 	if m.Nonce != "" {
 		n := m.Nonce
@@ -133,7 +133,7 @@ func inviteView(inv *store.Invite) Invite {
 		Uses:      inv.Uses,
 	}
 	if inv.ExpiresAt != nil {
-		t := *inv.ExpiresAt
+		t := timeOf(*inv.ExpiresAt)
 		out.ExpiresAt = &t
 	}
 	return out

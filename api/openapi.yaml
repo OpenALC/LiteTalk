@@ -290,6 +290,9 @@ paths:
       requestBody:
         required: true
         content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/PatchMeRequest'
           application/json:
             schema:
               $ref: '#/components/schemas/PatchMeRequest'
@@ -400,6 +403,9 @@ paths:
       requestBody:
         required: true
         content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/PatchFriendRequest'
           application/json:
             schema:
               $ref: '#/components/schemas/PatchFriendRequest'
@@ -507,6 +513,9 @@ paths:
       requestBody:
         required: true
         content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/PatchServerRequest'
           application/json:
             schema:
               $ref: '#/components/schemas/PatchServerRequest'
@@ -591,11 +600,18 @@ paths:
       operationId: listServerMembers
       summary: 服务器成员列表（成员可读）
       description: >
+        支持 ETag 协商缓存（#31）：响应带 ETag，带 If-None-Match 命中回 304 无 body。
         code：bad_request、路径参数不合法；401；403 forbidden；
-        5xx internal。user_id 为数字 ID（#31 前现状）。
+        5xx internal。user_id 为十进制 ID 字符串（#31）。
       tags: [servers]
       parameters:
         - $ref: '#/components/parameters/IDPath'
+        - name: If-None-Match
+          in: header
+          required: false
+          description: 上次响应的 ETag；命中回 304
+          schema:
+            type: string
       responses:
         '200':
           description: 成员数组
@@ -605,6 +621,8 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/MemberInfo'
+        '304':
+          description: ETag 命中（If-None-Match），无 body（#31）
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -685,6 +703,12 @@ paths:
       tags: [channels]
       parameters:
         - $ref: '#/components/parameters/IDPath'
+        - name: If-None-Match
+          in: header
+          required: false
+          description: 上次响应的 ETag；命中回 304（#31 协商缓存）
+          schema:
+            type: string
       responses:
         '200':
           description: 分类 + 频道
@@ -692,6 +716,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ServerChannels'
+        '304':
+          description: ETag 命中（If-None-Match），无 body（#31）
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -714,6 +740,9 @@ paths:
       requestBody:
         required: true
         content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/PatchChannelRequest'
           application/json:
             schema:
               $ref: '#/components/schemas/PatchChannelRequest'
@@ -805,6 +834,9 @@ paths:
       requestBody:
         required: true
         content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/PatchCategoryRequest'
           application/json:
             schema:
               $ref: '#/components/schemas/PatchCategoryRequest'
@@ -1036,6 +1068,27 @@ components:
           schema:
             $ref: '#/components/schemas/Problem'
   schemas:
+    Attachment:
+      type: object
+      title: Attachment
+      description: >
+        附件元数据（#31 预留 schema 占位，实现移出本批另单跟踪）。
+        计划端点：POST /api/v1/attachments（multipart，登录可传）返回本结构，
+        消息体以 attachment_ids 引用；存储后端可插拔（本地磁盘 / S3 兼容）。
+        本批不实现端点，字段形状以实现落地时为准。
+      required: [id, filename, size, content_type]
+      properties:
+        id:
+          type: string
+          description: 附件 ID（十进制字符串）
+        filename:
+          type: string
+        size:
+          type: integer
+          format: int64
+          description: 字节数
+        content_type:
+          type: string
     Problem:
       type: object
       title: Problem
@@ -1114,9 +1167,11 @@ components:
         created_at:
           type: string
           format: date-time
+          x-go-type: Time
         updated_at:
           type: string
           format: date-time
+          x-go-type: Time
     PublicUser:
       type: object
       title: PublicUser
@@ -1143,9 +1198,11 @@ components:
         created_at:
           type: string
           format: date-time
+          x-go-type: Time
         updated_at:
           type: string
           format: date-time
+          x-go-type: Time
     TokenPair:
       type: object
       title: TokenPair
@@ -1183,6 +1240,7 @@ components:
         created_at:
           type: string
           format: date-time
+          x-go-type: Time
     ChannelInfo:
       type: object
       title: ChannelInfo
@@ -1210,6 +1268,7 @@ components:
         created_at:
           type: string
           format: date-time
+          x-go-type: Time
     CategoryInfo:
       type: object
       title: CategoryInfo
@@ -1229,6 +1288,7 @@ components:
         created_at:
           type: string
           format: date-time
+          x-go-type: Time
     MemberInfo:
       type: object
       title: MemberInfo
@@ -1247,6 +1307,7 @@ components:
         joined_at:
           type: string
           format: date-time
+          x-go-type: Time
         nickname:
           type: string
         tag:
@@ -1274,6 +1335,7 @@ components:
         created_at:
           type: string
           format: date-time
+          x-go-type: Time
         sender_nickname:
           type: string
         sender_tag:
@@ -1300,6 +1362,7 @@ components:
         expires_at:
           type: string
           format: date-time
+          x-go-type: Time
           nullable: true
     FriendEntry:
       type: object
@@ -1420,7 +1483,10 @@ components:
     PatchMeRequest:
       type: object
       title: PatchMeRequest
-      description: 部分更新（当前仅 nickname）。
+      x-go-type: PatchMeBody
+      description: >
+        JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（昵称不可清，
+        空值被校验拒 400），值 = 设置。部分更新（当前仅 nickname）。
       properties:
         nickname:
           type: string
@@ -1438,7 +1504,10 @@ components:
     PatchFriendRequest:
       type: object
       title: PatchFriendRequest
-      description: 部分更新；空串清除备注/移出分组。
+      x-go-type: PatchFriendBody
+      description: >
+        JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null/空串 = 清除备注/
+        移出分组，值 = 设置。仅发起方向可写。
       properties:
         remark:
           type: string
@@ -1465,6 +1534,10 @@ components:
     PatchServerRequest:
       type: object
       title: PatchServerRequest
+      x-go-type: PatchServerBody
+      description: >
+        JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（名称/图标
+        不可清，空值被校验拒 400），值 = 设置。
       properties:
         name:
           type: string
@@ -1515,6 +1588,11 @@ components:
     PatchChannelRequest:
       type: object
       title: PatchChannelRequest
+      x-go-type: PatchChannelBody
+      description: >
+        JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name/type
+        不可清，空值被校验拒 400；category_id 的 null = 移出分类；position 的
+        null 拒 400——「删除位置」无语义），值 = 设置。
       properties:
         name:
           type: string
@@ -1526,7 +1604,6 @@ components:
         category_id:
           type: string
           nullable: true
-          x-go-type: ID
           description: 0 = 显式移出分类；请求侧数字与字符串双接受（#31）
         position:
           type: integer
@@ -1542,7 +1619,11 @@ components:
     PatchCategoryRequest:
       type: object
       title: PatchCategoryRequest
-      description: name 与 position 至少给一个。
+      x-go-type: PatchCategoryBody
+      description: >
+        JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name 不可清，
+        空值被校验拒 400；position 的 null 拒 400），值 = 设置。
+        name 与 position 至少给一个。
       properties:
         name:
           type: string
