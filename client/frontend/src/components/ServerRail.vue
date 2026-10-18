@@ -120,7 +120,7 @@ async function onCtxSelect(key: string) {
       // 邀请码为服务端实体操作；内置示例服务器无对应实体。
       if (server.builtin) { notify.show('示例服务器无邀请码', true); return }
       try {
-        const code = await goApp().CreateInviteCode(Number(c.id))
+        const code = await goApp().CreateInviteCode(c.id)
         await navigator.clipboard.writeText(code)
         notify.show('邀请码已复制')
       } catch (e) { notify.fromErr(e) }

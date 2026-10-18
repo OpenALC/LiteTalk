@@ -47,7 +47,7 @@ func registerTagged(addr, nickname string) (*probePair, error) {
 	var out struct {
 		AccessToken string `json:"access_token"`
 		User        struct {
-			ID       int64  `json:"id"`
+			ID       jsonID `json:"id"`
 			Nickname string `json:"nickname"`
 			Tag      string `json:"tag"`
 		} `json:"user"`
@@ -56,7 +56,7 @@ func registerTagged(addr, nickname string) (*probePair, error) {
 		return nil, fmt.Errorf("register 响应解析失败: %s", body)
 	}
 	return &probePair{
-		id: out.User.ID, nick: out.User.Nickname, tag: out.User.Tag, token: out.AccessToken,
+		id: int64(out.User.ID), nick: out.User.Nickname, tag: out.User.Tag, token: out.AccessToken,
 	}, nil
 }
 
@@ -97,17 +97,17 @@ func friendOnline(addr, token string, target int64) (online, found bool, err err
 		return false, false, fmt.Errorf("friends HTTP %d: %s", code, b)
 	}
 	var list []struct {
-		ID   int64 `json:"id"`
+		ID   jsonID `json:"id"`
 		User struct {
-			ID     int64 `json:"id"`
-			Online bool  `json:"online"`
+			ID     jsonID `json:"id"`
+			Online bool   `json:"online"`
 		} `json:"user"`
 	}
 	if err := json.Unmarshal(b, &list); err != nil {
 		return false, false, fmt.Errorf("friends 解析: %w (%s)", err, b)
 	}
 	for _, f := range list {
-		if f.User.ID == target {
+		if int64(f.User.ID) == target {
 			return f.User.Online, true, nil
 		}
 	}
@@ -149,11 +149,11 @@ func runPresence(ctx context.Context, cfg *config) int {
 		return 1
 	}
 	var fr struct {
-		ID int64 `json:"id"`
+		ID jsonID `json:"id"`
 	}
 	_ = json.Unmarshal(body, &fr)
 	code, body, err = restJSON("POST", cfg.addr,
-		fmt.Sprintf("/api/v1/friends/requests/%d/accept", fr.ID), a.token, nil)
+		fmt.Sprintf("/api/v1/friends/requests/%s/accept", fr.ID), a.token, nil)
 	if err != nil || code != http.StatusOK {
 		fmt.Printf("接受好友失败: code=%d err=%v body=%s\n", code, err, body)
 		return 1

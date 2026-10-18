@@ -15,7 +15,7 @@ func (s *Server) GetMe(ctx context.Context, request GetMeRequestObject) (GetMeRe
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	return GetMe200JSONResponse(*user), nil
+	return GetMe200JSONResponse(userSelf(user)), nil
 }
 
 // PatchMe PATCH /api/v1/users/me（昵称可改；无头像字段）
@@ -51,5 +51,5 @@ func (s *Server) PatchMe(ctx context.Context, request PatchMeRequestObject) (Pat
 			}
 		}
 	}
-	return PatchMe200JSONResponse(*user), nil
+	return PatchMe200JSONResponse(userSelf(user)), nil
 }

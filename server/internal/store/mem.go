@@ -23,8 +23,6 @@ type Mem struct {
 	invites     map[string]*Invite
 	sessions    map[int64]map[string]*UserSession // userID → deviceType → session
 
-	nextID map[string]int64
-
 	*MemKV // KV 部分（Get/Set/Del/Incr/IncrCap/Eval 由 MemKV 提供）
 }
 
@@ -40,14 +38,8 @@ func NewMem() *Mem {
 		messages:    map[int64]*Message{},
 		invites:     map[string]*Invite{},
 		sessions:    map[int64]map[string]*UserSession{},
-		nextID:      map[string]int64{},
 		MemKV:       NewMemKV(),
 	}
-}
-
-func (m *Mem) next(kind string) int64 {
-	m.nextID[kind]++
-	return m.nextID[kind]
 }
 
 // ---- users ----
@@ -64,7 +56,7 @@ func (m *Mem) CreateUser(_ context.Context, u *User) error {
 		}
 	}
 	now := time.Now()
-	u.ID = m.next("user")
+	u.ID = newID(u.ID)
 	u.CreatedAt, u.UpdatedAt = now, now
 	cp := *u
 	m.users[u.ID] = &cp
@@ -126,6 +118,13 @@ func (m *Mem) UpdateUser(_ context.Context, u *User) error {
 	return nil
 }
 
+// HasUsers 库内是否已有用户（首启探测；UserByID(1) 随 Snowflake 失效）。
+func (m *Mem) HasUsers(_ context.Context) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.users) > 0, nil
+}
+
 // ---- friendships ----
 
 func (m *Mem) CreateFriendship(_ context.Context, f *Friendship) error {
@@ -137,7 +136,7 @@ func (m *Mem) CreateFriendship(_ context.Context, f *Friendship) error {
 			return ErrConflict
 		}
 	}
-	f.ID = m.next("friendship")
+	f.ID = newID(f.ID)
 	f.CreatedAt = time.Now()
 	cp := *f
 	m.friendships[f.ID] = &cp
@@ -205,7 +204,7 @@ func (m *Mem) DeleteFriendship(_ context.Context, id int64) error {
 func (m *Mem) CreateServer(_ context.Context, s *Server) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	s.ID = m.next("server")
+	s.ID = newID(s.ID)
 	s.CreatedAt = time.Now()
 	cp := *s
 	m.servers[s.ID] = &cp
@@ -343,7 +342,7 @@ func (m *Mem) CreateChannel(_ context.Context, c *Channel) error {
 	if _, ok := m.servers[c.ServerID]; !ok {
 		return ErrNotFound
 	}
-	c.ID = m.next("channel")
+	c.ID = newID(c.ID)
 	c.CreatedAt = time.Now()
 	cp := *c
 	m.channels[c.ID] = &cp
@@ -407,7 +406,7 @@ func (m *Mem) CreateCategory(_ context.Context, c *Category) error {
 	if _, ok := m.servers[c.ServerID]; !ok {
 		return ErrNotFound
 	}
-	c.ID = m.next("category")
+	c.ID = newID(c.ID)
 	c.CreatedAt = time.Now()
 	cp := *c
 	m.categories[c.ID] = &cp
@@ -534,7 +533,7 @@ func (m *Mem) CreateMessage(_ context.Context, msg *Message) error {
 	if _, ok := m.channels[msg.ChannelID]; !ok {
 		return ErrNotFound
 	}
-	msg.ID = m.next("message")
+	msg.ID = newID(msg.ID)
 	msg.CreatedAt = time.Now()
 	cp := *msg
 	m.messages[msg.ID] = &cp

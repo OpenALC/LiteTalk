@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/OpenALC/LiteTalk/server/internal/auth"
@@ -123,6 +124,25 @@ func delJSON(t *testing.T, h http.Handler, path, token string, wantStatus int) m
 	return out
 }
 
+// asID 从解码结果取 ID：Snowflake 后 wire 为字符串（#31），兼容旧 JSON 数字。
+// 测试解码进 map[string]any，大数字走 float64 会掉精度——只认字符串/整数形态。
+func asID(v any) int64 {
+	switch x := v.(type) {
+	case string:
+		n, err := strconv.ParseInt(x, 10, 64)
+		if err != nil {
+			return 0
+		}
+		return n
+	case json.Number:
+		n, _ := x.Int64()
+		return n
+	case float64:
+		return int64(x)
+	}
+	return 0
+}
+
 // registerUser 注册一个测试用户并返回 (access, refresh)。
 func registerUser(t *testing.T, h http.Handler, mem *store.Mem, email, nickname, password string) (string, string) {
 	t.Helper()
@@ -222,7 +242,7 @@ func TestFriendsFlow(t *testing.T) {
 	if len(list) != 1 {
 		t.Fatalf("B 好友列表应有 1 条，实际 %d", len(list))
 	}
-	fid := int64(fr["id"].(float64))
+	fid := asID(fr["id"])
 	postJSON(t, h, fmt.Sprintf("/api/v1/friends/requests/%d/accept", fid), bAccess, nil, http.StatusOK)
 
 	// 双方列表都是 accepted。
@@ -258,12 +278,12 @@ func TestServerChannelMessageFlow(t *testing.T) {
 	serverResp := postJSON(t, h, "/api/v1/servers", aAccess, map[string]string{
 		"name": "测试服务器", "icon_name": "music", "icon_color": "#4FA4F3",
 	}, http.StatusCreated)
-	serverID := int64(serverResp["id"].(float64))
+	serverID := asID(serverResp["id"])
 
 	// 建频道。
 	chResp := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/channels", serverID), aAccess,
 		map[string]string{"name": "闲聊广场", "type": "text"}, http.StatusCreated)
-	chID := int64(chResp["id"].(float64))
+	chID := asID(chResp["id"])
 
 	// 邀请码。
 	invResp := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/invites", serverID), aAccess,

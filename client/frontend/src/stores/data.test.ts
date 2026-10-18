@@ -9,8 +9,8 @@ const mockGoApp = vi.hoisted(() => ({
   ListChannels: vi.fn(),
   CreateChannel: vi.fn(),
   RenameCategory: vi.fn(async () => {}),
-  UpdateCategory: vi.fn(async (id: number, name: string, position: number) => ({
-    id, server_id: 0, name: name || `分类${id}`, position: position < 0 ? 0 : position,
+  UpdateCategory: vi.fn(async (id: string, name: string, position: number) => ({
+    id, server_id: '0', name: name || `分类${id}`, position: position < 0 ? 0 : position,
   })),
   GetHomeServer: vi.fn(async () => ''),
   GetIntroHidden: vi.fn(async () => false),
@@ -53,7 +53,7 @@ function resetMock() {
   mockGoApp.CreateChannel.mockReset()
   mockGoApp.RenameCategory.mockReset().mockResolvedValue(undefined)
   mockGoApp.UpdateCategory.mockReset().mockImplementation(async (id, name, position) => ({
-    id, server_id: 0, name: name || `分类${id}`, position: position < 0 ? 0 : position,
+    id, server_id: '0', name: name || `分类${id}`, position: position < 0 ? 0 : position,
   }))
   mockGoApp.ListFriends.mockReset().mockResolvedValue([])
   mockEventsOn.reset()
@@ -193,7 +193,7 @@ describe('分类改名与排序', () => {
 
     await s.renameCategory('21', '211', '新名')
 
-    expect(mockGoApp.RenameCategory).toHaveBeenCalledWith(211, '新名')
+    expect(mockGoApp.RenameCategory).toHaveBeenCalledWith('211', '新名')
     expect(s.extraGroups['21'][0].name).toBe('新名')
     expect(s.findServer('21')!.channels[0].group).toBe('新名')
   })
@@ -233,7 +233,7 @@ describe('分类改名与排序', () => {
 
     mockGoApp.UpdateCategory.mockResolvedValue({ id: 3, server_id: 22, name: '丙', position: 0 })
     await s.reorderCategory('22', '3', 0)
-    expect(mockGoApp.UpdateCategory).toHaveBeenCalledWith(3, '', 0)
+    expect(mockGoApp.UpdateCategory).toHaveBeenCalledWith('3', '', 0)
     expect(s.extraGroups['22'].map((g) => g.name)).toEqual(['丙', '甲', '乙'])
     expect(s.groupsOf('22', []).map((g) => g.name)).toEqual(['丙', '甲', '乙'])
   })
@@ -246,13 +246,13 @@ describe('好友在线态', () => {
     resetMock()
   })
 
-  const friendDTO = (id: number, uid: number, online: boolean) => ({
-    id,
+  const friendDTO = (id: number | string, uid: number | string, online: boolean) => ({
+    id: String(id),
     status: 'accepted',
     incoming: false,
     remark: '',
     group: '',
-    user: { id: uid, nickname: `用户${uid}`, tag: '0001', status: 1, online },
+    user: { id: String(uid), nickname: `用户${uid}`, tag: '0001', status: 1, online },
   })
 
   it('loadFriends 按 user.online 分组，status 收敛为两态', async () => {
@@ -263,13 +263,13 @@ describe('好友在线态', () => {
     ])
     const s = useFriendsStore()
     await s.loadFriends()
-    expect(s.online.map((f) => f.userId)).toEqual([10])
-    expect(s.offline.map((f) => f.userId)).toEqual([20])
+    expect(s.online.map((f) => f.userId)).toEqual(['10'])
+    expect(s.offline.map((f) => f.userId)).toEqual(['20'])
     expect(s.online[0].status).toBe('online')
     expect(s.online[0].sub).toBe('在线')
     expect(s.offline[0].status).toBe('offline')
     expect(s.offline[0].sub).toBe('离线')
-    expect(s.pending.map((p) => p.id)).toEqual([3])
+    expect(s.pending.map((p) => p.id)).toEqual(['3'])
   })
 
   it('presence:update 增量移组并保持排序，未知用户忽略', async () => {
@@ -279,19 +279,19 @@ describe('好友在线态', () => {
     s.bindEvents()
 
     mockEventsOn.fire('presence:update', { user_id: '20', online: true })
-    expect(s.online.map((f) => f.userId)).toEqual([10, 20])
+    expect(s.online.map((f) => f.userId)).toEqual(['10', '20'])
     expect(s.offline).toEqual([])
     expect(s.online[1].sub).toBe('在线')
 
     mockEventsOn.fire('presence:update', { user_id: '10', online: false })
-    expect(s.offline.map((f) => f.userId)).toEqual([10])
-    expect(s.online.map((f) => f.userId)).toEqual([20])
+    expect(s.offline.map((f) => f.userId)).toEqual(['10'])
+    expect(s.online.map((f) => f.userId)).toEqual(['20'])
 
     // 未知用户 / 坏包不抛错不改状态。
     mockEventsOn.fire('presence:update', { user_id: '999', online: true })
     mockEventsOn.fire('presence:update', null)
-    expect(s.online.map((f) => f.userId)).toEqual([20])
-    expect(s.offline.map((f) => f.userId)).toEqual([10])
+    expect(s.online.map((f) => f.userId)).toEqual(['20'])
+    expect(s.offline.map((f) => f.userId)).toEqual(['10'])
   })
 
   it('unbindEvents 注销后不再收 presence:update', async () => {
@@ -302,7 +302,7 @@ describe('好友在线态', () => {
     s.unbindEvents()
     mockEventsOn.fire('presence:update', { user_id: '10', online: true })
     expect(s.online).toEqual([])
-    expect(s.offline.map((f) => f.userId)).toEqual([10])
+    expect(s.offline.map((f) => f.userId)).toEqual(['10'])
   })
 })
 
@@ -323,8 +323,8 @@ describe('新建频道归入分类', () => {
       channels: [],
     })
     mockGoApp.CreateChannel.mockImplementation(
-      async (serverID: number, name: string, typ: string, categoryID: number) => ({
-        id: 3101, server_id: serverID, name, type: typ, category_id: categoryID || null,
+      async (serverID: string, name: string, typ: string, categoryID: string) => ({
+        id: '3101', server_id: serverID, name, type: typ, category_id: categoryID || null,
       }),
     )
   })
@@ -335,7 +335,7 @@ describe('新建频道归入分类', () => {
 
     await s.createChannel('31', '开黑', 'voice', '312')
 
-    expect(mockGoApp.CreateChannel).toHaveBeenCalledWith(31, '开黑', 'voice', 312)
+    expect(mockGoApp.CreateChannel).toHaveBeenCalledWith('31', '开黑', 'voice', '312')
     const ch = s.findServer('31')!.channels[0]
     expect(ch.group).toBe('乙组')
     // 不重启就已在目标分类下（groupsOf 按名归组命中真实分类）。
@@ -349,17 +349,17 @@ describe('新建频道归入分类', () => {
 
     await s.createChannel('31', '散装', 'voice')
 
-    expect(mockGoApp.CreateChannel).toHaveBeenCalledWith(31, '散装', 'voice', 0)
+    expect(mockGoApp.CreateChannel).toHaveBeenCalledWith('31', '散装', 'voice', '')
     expect(s.findServer('31')!.channels[0].group).toBe('语音频道')
   })
 
-  it('显式「未分类」不算缺省：group 落「未分类」，category_id 传 0', async () => {
+  it('显式「未分类」不算缺省：group 落「未分类」，category_id 传空', async () => {
     const s = useServersStore()
     await s.loadRemoteServers()
 
     await s.createChannel('31', '野队', 'text', '')
 
-    expect(mockGoApp.CreateChannel).toHaveBeenCalledWith(31, '野队', 'text', 0)
+    expect(mockGoApp.CreateChannel).toHaveBeenCalledWith('31', '野队', 'text', '')
     expect(s.findServer('31')!.channels[0].group).toBe(UNCATEGORIZED)
   })
 
@@ -369,7 +369,7 @@ describe('新建频道归入分类', () => {
 
     await s.createChannel('31', '越界', 'voice', '999')
 
-    expect(mockGoApp.CreateChannel).toHaveBeenCalledWith(31, '越界', 'voice', 999)
+    expect(mockGoApp.CreateChannel).toHaveBeenCalledWith('31', '越界', 'voice', '999')
     expect(s.findServer('31')!.channels[0].group).toBe(UNCATEGORIZED)
   })
 })

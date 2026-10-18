@@ -137,7 +137,7 @@ async function invite() {
     return
   }
   try {
-    const code = await goApp().CreateInviteCode(Number(s.id))
+    const code = await goApp().CreateInviteCode(s.id)
     try {
       await navigator.clipboard.writeText(code)
       notify.show('邀请码已复制，发给朋友吧')

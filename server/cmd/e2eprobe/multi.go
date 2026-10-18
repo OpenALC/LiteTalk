@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"strconv"
 	"time"
 
 	"github.com/OpenALC/LiteTalk/server/internal/signal"
@@ -210,7 +209,7 @@ func createVoiceChannel(addr, token string) (string, error) {
 		return "", fmt.Errorf("create server HTTP %d: %s", code, b)
 	}
 	var srv struct {
-		ID int64 `json:"id"`
+		ID jsonID `json:"id"`
 	}
 	if err := json.Unmarshal(b, &srv); err != nil || srv.ID == 0 {
 		return "", fmt.Errorf("server id 解析失败: %s", b)
@@ -224,12 +223,12 @@ func createVoiceChannel(addr, token string) (string, error) {
 		return "", fmt.Errorf("create channel HTTP %d: %s", code, b)
 	}
 	var ch struct {
-		ID int64 `json:"id"`
+		ID jsonID `json:"id"`
 	}
 	if err := json.Unmarshal(b, &ch); err != nil || ch.ID == 0 {
 		return "", fmt.Errorf("channel id 解析失败: %s", b)
 	}
-	return strconv.FormatInt(ch.ID, 10), nil
+	return ch.ID.String(), nil
 }
 
 // restPost JSON POST（可带 Bearer），返回状态码与响应体。

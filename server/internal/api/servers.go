@@ -76,7 +76,7 @@ func (s *Server) CreateServer(ctx context.Context, request CreateServerRequestOb
 	if err := s.store.AddMember(ctx, mem); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	return CreateServer201JSONResponse(*srv), nil
+	return CreateServer201JSONResponse(serverView(srv)), nil
 }
 
 // ListServers GET /api/v1/servers
@@ -86,7 +86,7 @@ func (s *Server) ListServers(ctx context.Context, request ListServersRequestObje
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	return ListServers200JSONResponse(servers), nil
+	return ListServers200JSONResponse(serverViews(servers)), nil
 }
 
 // PatchServer PATCH /api/v1/servers/{id}（仅 owner/admin）
@@ -124,7 +124,7 @@ func (s *Server) PatchServer(ctx context.Context, request PatchServerRequestObje
 	if err := s.store.UpdateServer(ctx, srv); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	return PatchServer200JSONResponse(*srv), nil
+	return PatchServer200JSONResponse(serverView(srv)), nil
 }
 
 // DeleteServer DELETE /api/v1/servers/{id}（仅 owner）
@@ -169,7 +169,7 @@ func (s *Server) JoinServer(ctx context.Context, request JoinServerRequestObject
 	// 已是成员直接返回。
 	if _, err := s.store.Member(ctx, inv.ServerID, c.UserID); err == nil {
 		srv, _ := s.store.ServerByID(ctx, inv.ServerID)
-		return JoinServer200JSONResponse(*srv), nil
+		return JoinServer200JSONResponse(serverView(srv)), nil
 	}
 	if err := s.store.UseInvite(ctx, inv.Code); err != nil {
 		if errors.Is(err, store.ErrConflict) {
@@ -188,7 +188,7 @@ func (s *Server) JoinServer(ctx context.Context, request JoinServerRequestObject
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	return JoinServer200JSONResponse(*srv), nil
+	return JoinServer200JSONResponse(serverView(srv)), nil
 }
 
 // ListServerMembers GET /api/v1/servers/{id}/members
@@ -205,7 +205,7 @@ func (s *Server) ListServerMembers(ctx context.Context, request ListServerMember
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	return ListServerMembers200JSONResponse(members), nil
+	return ListServerMembers200JSONResponse(memberViews(members)), nil
 }
 
 // CreateInvite POST /api/v1/servers/{id}/invites
@@ -240,7 +240,7 @@ func (s *Server) CreateInvite(ctx context.Context, request CreateInviteRequestOb
 	if err := s.store.CreateInvite(ctx, inv); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	return CreateInvite201JSONResponse(*inv), nil
+	return CreateInvite201JSONResponse(inviteView(inv)), nil
 }
 
 // requireRole 校验成员角色；返回 nil 表示通过（错误文案区分「不是成员/权限不足」）。

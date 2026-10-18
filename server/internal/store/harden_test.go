@@ -75,11 +75,12 @@ func TestMemIncrCapSingle(t *testing.T) {
 func TestMemUseInviteRace(t *testing.T) {
 	m := NewMem()
 	ctx := context.Background()
-	// 邀请校验前置：须先建服务器。
-	if err := m.CreateServer(ctx, &Server{Name: "s", OwnerID: 1}); err != nil {
+	// 邀请校验前置：须先建服务器（ID 由 Snowflake 赋值，不能写死 1）。
+	sv := &Server{Name: "s", OwnerID: 1}
+	if err := m.CreateServer(ctx, sv); err != nil {
 		t.Fatalf("CreateServer: %v", err)
 	}
-	inv := &Invite{Code: "race-invite", ServerID: 1, CreatorID: 1, MaxUses: 5}
+	inv := &Invite{Code: "race-invite", ServerID: sv.ID, CreatorID: 1, MaxUses: 5}
 	if err := m.CreateInvite(ctx, inv); err != nil {
 		t.Fatalf("CreateInvite: %v", err)
 	}
@@ -110,11 +111,12 @@ func TestMemUseInviteRace(t *testing.T) {
 func TestMemUseInviteExpired(t *testing.T) {
 	m := NewMem()
 	ctx := context.Background()
-	if err := m.CreateServer(ctx, &Server{Name: "s", OwnerID: 1}); err != nil {
+	sv := &Server{Name: "s", OwnerID: 1}
+	if err := m.CreateServer(ctx, sv); err != nil {
 		t.Fatalf("CreateServer: %v", err)
 	}
 	past := time.Now().Add(-time.Hour)
-	inv := &Invite{Code: "expired", ServerID: 1, CreatorID: 1, MaxUses: 0, ExpiresAt: &past}
+	inv := &Invite{Code: "expired", ServerID: sv.ID, CreatorID: 1, MaxUses: 0, ExpiresAt: &past}
 	if err := m.CreateInvite(ctx, inv); err != nil {
 		t.Fatalf("CreateInvite: %v", err)
 	}

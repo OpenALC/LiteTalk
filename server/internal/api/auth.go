@@ -297,7 +297,7 @@ func (s *Server) Refresh(ctx context.Context, request RefreshRequestObject) (Ref
 		AccessToken:  access,
 		RefreshToken: plain,
 		ExpiresIn:    int64(auth.AccessTokenTTL / time.Second),
-		User:         *user,
+		User:         userSelf(user),
 	}), nil
 }
 
@@ -449,6 +449,6 @@ func (s *Server) issueTokens(ctx context.Context, user *store.User, dev string) 
 		AccessToken:  access,
 		RefreshToken: refresh,
 		ExpiresIn:    int64(auth.AccessTokenTTL / time.Second),
-		User:         *user,
+		User:         userSelf(user),
 	}, nil
 }

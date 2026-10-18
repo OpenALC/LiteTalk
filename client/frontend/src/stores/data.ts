@@ -36,8 +36,8 @@ export interface Server {
 }
 
 export interface Friend {
-  id: number // friendship id（备注/分组/删除 REST 的目标）
-  userId: number // 对端 user.id（presence:update 按它匹配，#11）
+  id: string // friendship id（备注/分组/删除 REST 的目标；#31 字符串 wire）
+  userId: string // 对端 user.id（presence:update 按它匹配，#11）
   name: string // 显示名 = remark || nickname（服务端 remark 仅发起方向可写，对方视角恒空回落昵称——预期行为）
   nickname: string // 原始昵称（添加好友/请求静音等场景用）
   remark: string // 备注原文（空 = 未设置；编辑弹层初值用）
@@ -188,7 +188,7 @@ export const useServersStore = defineStore('servers', () => {
     if (!s || s.builtin) return
     let out: ServerChannels
     try {
-      out = await goApp().ListChannels(Number(serverId))
+      out = await goApp().ListChannels(serverId)
     } catch (e) {
       s.unavailable = true
       // 403 判定走服务端错误码前缀（bridge 只传 message 字符串，与 RegisterView 同法）。
@@ -202,7 +202,7 @@ export const useServersStore = defineStore('servers', () => {
       return
     }
     s.unavailable = false
-    const nameOf = new Map<number, string>()
+    const nameOf = new Map<string, string>()
     for (const c of out.categories ?? []) nameOf.set(c.id, c.name)
     s.channels = (out.channels ?? []).map((c) => ({
       id: String(c.id),
@@ -243,7 +243,7 @@ export const useServersStore = defineStore('servers', () => {
     const s = findServer(id)
     if (!s) return
     if (s.builtin) throw new Error('示例服务器不可编辑')
-    await goApp().RenameServer(Number(id), name)
+    await goApp().RenameServer(id, name)
     s.name = name
   }
 
@@ -253,7 +253,7 @@ export const useServersStore = defineStore('servers', () => {
     const s = findServer(id)
     if (!s) return
     if (s.builtin) throw new Error('示例服务器不可删除')
-    await goApp().DeleteServer(Number(id))
+    await goApp().DeleteServer(id)
     servers.value = servers.value.filter((x) => x.id !== id)
     if (homeId.value === id) {
       // 回落介绍页；若介绍页此前已被隐藏（S6：幽灵首页），改落第一个真实服务器。
@@ -279,8 +279,8 @@ export const useServersStore = defineStore('servers', () => {
     const s = findServer(serverId)
     if (!s) return
     if (s.builtin) throw new Error('示例服务器不可新建频道')
-    const catId = categoryId ? Number(categoryId) : 0
-    const c = await goApp().CreateChannel(Number(serverId), name, type, catId)
+    const catId = categoryId ?? ''
+    const c = await goApp().CreateChannel(serverId, name, type, catId)
     const cat = categoryId ? (extraGroups.value[serverId] ?? []).find((g) => g.id === categoryId) : undefined
     s.channels.push({
       id: String(c.id), name: c.name, type,
@@ -297,7 +297,7 @@ export const useServersStore = defineStore('servers', () => {
     const ch = findServer(serverId)?.channels.find((c) => c.id === chId)
     if (!ch) return
     if (isRealID(chId)) {
-      await goApp().RenameChannel(Number(chId), name)
+      await goApp().RenameChannel(chId, name)
     }
     ch.name = name
   }
@@ -307,7 +307,7 @@ export const useServersStore = defineStore('servers', () => {
     const s = findServer(serverId)
     if (!s) return
     if (isRealID(chId)) {
-      await goApp().DeleteChannel(Number(chId))
+      await goApp().DeleteChannel(chId)
     }
     s.channels = s.channels.filter((c) => c.id !== chId)
     if (currentChannelId.value === chId) {
@@ -361,7 +361,7 @@ export const useServersStore = defineStore('servers', () => {
       }
       return
     }
-    const c = await goApp().CreateCategory(Number(serverId), name)
+    const c = await goApp().CreateCategory(serverId, name)
     const list = extraGroups.value[serverId] ?? []
     extraGroups.value = {
       ...extraGroups.value,
@@ -375,7 +375,7 @@ export const useServersStore = defineStore('servers', () => {
     const s = findServer(serverId)
     if (!s) return
     if (!s.builtin && isRealID(catId)) {
-      await goApp().DeleteCategory(Number(catId), true) // with_channels=1 级联
+      await goApp().DeleteCategory(catId, true) // with_channels=1 级联
       s.channels = s.channels.filter((c) => c.group !== catName)
     } else {
       for (const ch of [...s.channels.filter((c) => c.group === catName)]) {
@@ -401,7 +401,7 @@ export const useServersStore = defineStore('servers', () => {
     const old = g ? g.name : catId.startsWith('chan:') ? catId.slice(5) : ''
     if (!old) return
     if (!s.builtin && isRealID(catId)) {
-      await goApp().RenameCategory(Number(catId), name)
+      await goApp().RenameCategory(catId, name)
     }
     if (g) {
       extraGroups.value = {
@@ -431,7 +431,7 @@ export const useServersStore = defineStore('servers', () => {
     const s = findServer(serverId)
     if (!s || s.builtin || !isRealID(catId)) return
     try {
-      await goApp().UpdateCategory(Number(catId), '', to)
+      await goApp().UpdateCategory(catId, '', to)
     } catch (e) {
       extraGroups.value = { ...extraGroups.value, [serverId]: prev }
       throw e
@@ -455,7 +455,7 @@ export const useFriendsStore = defineStore('friends', () => {
   const offline = ref<Friend[]>([])
   // pending：待处理的好友请求。incoming=对方发给我（可接受）；
   // !incoming=我发出待对方回应（仅展示，S3：此前完全不可见）。
-  const pending = ref<{ id: number; name: string; outgoing: boolean }[]>([])
+  const pending = ref<{ id: string; name: string; outgoing: boolean }[]>([])
 
   // 在线态只有两态（#11）：数据源是 presence:{uid}，不再造 idle/busy。
   const STATUS_TEXT = { online: '在线', offline: '离线' } as const
@@ -466,7 +466,7 @@ export const useFriendsStore = defineStore('friends', () => {
     const list = await goApp().ListFriends()
     const on: Friend[] = []
     const off: Friend[] = []
-    const pend: { id: number; name: string; outgoing: boolean }[] = []
+    const pend: { id: string; name: string; outgoing: boolean }[] = []
     for (const f of list) {
       if (f.status === 'pending') {
         pend.push({ id: f.id, name: f.user.nickname, outgoing: !f.incoming })
@@ -496,8 +496,8 @@ export const useFriendsStore = defineStore('friends', () => {
 
   // setPresence presence:update 增量刷新单个好友的在线态（#11）：组间移动并保持排序。
   // 不在「来源组」= 状态已一致或本就不在好友列表，直接忽略（去抖）。
-  function setPresence(userId: number | string, isOnline: boolean) {
-    const uid = Number(userId)
+  function setPresence(userId: string, isOnline: boolean) {
+    const uid = String(userId)
     const from = isOnline ? offline : online
     const to = isOnline ? online : offline
     const idx = from.value.findIndex((f) => f.userId === uid)
@@ -515,13 +515,13 @@ export const useFriendsStore = defineStore('friends', () => {
   }
 
   // acceptRequest 接受好友请求后刷新列表。
-  async function acceptRequest(id: number) {
+  async function acceptRequest(id: string) {
     await goApp().AcceptFriend(id)
     await loadFriends()
   }
 
   // removeFriend 删除好友（UI 已做二次确认）。
-  async function removeFriend(id: number) {
+  async function removeFriend(id: string) {
     await goApp().RemoveFriend(id)
     await loadFriends()
   }
@@ -529,13 +529,13 @@ export const useFriendsStore = defineStore('friends', () => {
   // setMeta 改备注或分组（UpdateFriend 全量写 remark+group，调用方传原值保持另一字段）。
   // 默认组显示值「好友」提交时映射回空串——服务端空=默认组，持久化字面量会
   // 把「空」语义写脏且回不去（review S2）。
-  async function setMeta(id: number, remark: string, group: string) {
+  async function setMeta(id: string, remark: string, group: string) {
     await goApp().UpdateFriend(id, remark, group === '好友' ? '' : group)
     await loadFriends()
   }
 
   // findById 列表内查条目（改备注/分组时取原值用）。
-  function findById(id: number): Friend | undefined {
+  function findById(id: string): Friend | undefined {
     return [...online.value, ...offline.value].find((f) => f.id === id)
   }
 

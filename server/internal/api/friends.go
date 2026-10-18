@@ -28,7 +28,7 @@ func (s *Server) ListFriends(ctx context.Context, request ListFriendsRequestObje
 			continue
 		}
 		// 备注/分组是发起方视角的字段：被请求方看到空串。
-		entry := FriendEntry{Id: f.ID, Status: FriendEntryStatus(f.Status), Incoming: incoming, User: s.userView(ctx, u)}
+		entry := FriendEntry{Id: idOf(f.ID), Status: FriendEntryStatus(f.Status), Incoming: incoming, User: s.userView(ctx, u)}
 		if !incoming {
 			entry.Remark, entry.Group = f.Remark, f.GroupName
 		}
@@ -77,7 +77,7 @@ func (s *Server) CreateFriendRequest(ctx context.Context, request CreateFriendRe
 		return nil, s.writeStoreErr(ctx, err)
 	}
 	return CreateFriendRequest201JSONResponse{
-		Id: f.ID, Status: FriendEntryStatus(f.Status), Incoming: false,
+		Id: idOf(f.ID), Status: FriendEntryStatus(f.Status), Incoming: false,
 		User: s.userView(ctx, target),
 	}, nil
 }
@@ -105,7 +105,7 @@ func (s *Server) AcceptFriendRequest(ctx context.Context, request AcceptFriendRe
 	}
 	other, _ := s.store.UserByID(ctx, f.UserID)
 	return AcceptFriendRequest200JSONResponse{
-		Id: f.ID, Status: FriendEntryStatus(f.Status), Incoming: true,
+		Id: idOf(f.ID), Status: FriendEntryStatus(f.Status), Incoming: true,
 		User: s.userView(ctx, other),
 	}, nil
 }
@@ -165,7 +165,7 @@ func (s *Server) PatchFriend(ctx context.Context, request PatchFriendRequestObje
 	}
 	other, _ := s.store.UserByID(ctx, f.FriendID)
 	return PatchFriend200JSONResponse{
-		Id: f.ID, Status: FriendEntryStatus(f.Status),
+		Id: idOf(f.ID), Status: FriendEntryStatus(f.Status),
 		Remark: f.Remark, Group: f.GroupName,
 		User: s.userView(ctx, other),
 	}, nil
