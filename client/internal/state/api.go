@@ -881,3 +881,58 @@ func (c *APIClient) UpdateFriend(id int64, remark, group string) error {
 	}
 	return nil
 }
+
+// ---------- 频道消息（#32 全量补拉） ----------
+
+// flexID 兼容数字与字符串两种 JSON ID 形态：#31 把 ID 字符串化前后的响应都能解。
+// 输出一律字符串（调用方按 string 消费，不再关心 wire 形态）。
+type flexID string
+
+func (f *flexID) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		*f = flexID(s)
+		return nil
+	}
+	var n json.Number
+	if err := json.Unmarshal(b, &n); err != nil {
+		return fmt.Errorf("id 需为数字或字符串: %s", b)
+	}
+	*f = flexID(n.String())
+	return nil
+}
+
+// String 归一后的字符串形态。
+func (f flexID) String() string { return string(f) }
+
+// MessageDTO 频道消息（GET /channels/{id}/messages，与 store.Message 的 wire 对齐）。
+// ID 用 flexID 吸收 #31 的字符串化；CreatedAt 解析 RFC3339（含 Nano）。
+type MessageDTO struct {
+	ID             flexID    `json:"id"`
+	ChannelID      flexID    `json:"channel_id"`
+	UserID         flexID    `json:"user_id"`
+	Content        string    `json:"content"`
+	CreatedAt      time.Time `json:"created_at"`
+	SenderNickname string    `json:"sender_nickname,omitempty"`
+	SenderTag      string    `json:"sender_tag,omitempty"`
+}
+
+// ListMessages 拉频道最近消息（旧→新，limit 上限 50）。不带游标只取最新——
+// 断线续传失败后的全量补拉就是这个用法；游标翻页是 REST 列表页的事。
+func (c *APIClient) ListMessages(channelID int64, limit int) ([]MessageDTO, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 50
+	}
+	status, data, err := c.get(fmt.Sprintf("/channels/%d/messages?limit=%d", channelID, limit))
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, decodeError(status, data)
+	}
+	var list []MessageDTO
+	if err := json.Unmarshal(data, &list); err != nil {
+		return nil, fmt.Errorf("decode messages: %w", err)
+	}
+	return list, nil
+}
