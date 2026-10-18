@@ -10,16 +10,20 @@ import (
 	"sync"
 
 	"github.com/pion/ice/v4"
+	"github.com/pion/interceptor"
 	"github.com/pion/logging"
 	"github.com/pion/webrtc/v4"
 )
 
-// SignalSender 由 WS 层实现：SFU 侧主动下发的两类消息（重协商 offer 与 trickle ICE）。
+// SignalSender 由 WS 层实现：SFU 侧主动下发的消息（重协商 offer、trickle ICE、ICE 失败）。
 type SignalSender interface {
 	// SendOffer 下发 rtc.offer（S→C 重协商；初始协商之后只允许 SFU 发 offer）
 	SendOffer(sdp string)
 	// SendCandidate 下发 rtc.ice（S→C trickle）
 	SendCandidate(c webrtc.ICECandidateInit)
+	// SendFailed 本端 PeerConnection 因 ICE 失败被移除（#19）：只通知该 peer 的
+	// 连接（rtc.failed，0.2），客户端销毁本地 PC 后重新入房；其余成员走 peer_left。
+	SendFailed(channelID, userID, reason string)
 }
 
 // Config SFU 配置。
@@ -89,7 +93,14 @@ func New(cfg Config) (*SFU, error) {
 	})
 	se.SetICEUDPMux(udpMux)
 
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(me), webrtc.WithSettingEngine(se))
+	// 默认拦截器（#19）：NACK 生成/应答 + RTCP SR/RR。音频仍靠 FEC/PLC 兜底，
+	// 但 RTCP 反馈链路必须能跑（此前无拦截器不发 SR/RR、无 NACK）。
+	ir := &interceptor.Registry{}
+	if err := webrtc.RegisterDefaultInterceptors(me, ir); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("注册默认拦截器失败: %w", err)
+	}
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(me), webrtc.WithInterceptorRegistry(ir), webrtc.WithSettingEngine(se))
 
 	s := &SFU{
 		api:   api,
@@ -111,8 +122,25 @@ func (s *SFU) Port() int {
 // MaxMembers 房间人数上限。
 func (s *SFU) MaxMembers() int { return s.cfg.MaxMembers }
 
-// Close 关闭 UDP mux，所有 PeerConnection 随之中断。
-func (s *SFU) Close() error { return s.conn.Close() }
+// Close 关闭 UDP mux，所有 PeerConnection 随之中断。先逐个主动关闭 peer（置
+// closed 再关 PC）：否则关机路径的连接状态回调会被当成 ICE 失败，向已死的
+// 下游发 rtc.failed（#19）。
+func (s *SFU) Close() error {
+	s.mu.Lock()
+	rooms := s.rooms
+	s.rooms = make(map[string]*Room)
+	s.mu.Unlock()
+	for _, r := range rooms {
+		r.mu.Lock()
+		peers := r.peers
+		r.peers = make(map[string]*Peer)
+		r.mu.Unlock()
+		for _, p := range peers {
+			p.close()
+		}
+	}
+	return s.conn.Close()
+}
 
 func (s *SFU) getOrCreateRoom(id string) (*Room, error) {
 	s.mu.Lock()
@@ -194,7 +222,7 @@ func (s *SFU) AddICECandidate(roomID, userID string, c webrtc.ICECandidateInit) 
 
 // LeaveIf 成员离开（§0.9 身份核对）：仅当 peer 归属 connID 时移除路由、关闭其
 // PeerConnection；同 uid 的新连接已顶替旧 peer 时这里是无操作，不会误删。
-// 其他成员的 outbound track 惰性保留（停写即可）。
+// 其他成员指向它的下行轨道一并摘除（#23：惰性保留会让重入房拿不到新 OnTrack）。
 func (s *SFU) LeaveIf(roomID, userID, connID string) {
 	room := s.findRoom(roomID)
 	if room == nil {

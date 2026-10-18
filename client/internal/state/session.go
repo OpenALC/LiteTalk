@@ -53,6 +53,10 @@ type Events struct {
 	// OnServerShutdown 服务端优雅关闭（server.shutdown，#21）：停自动重连并提示。
 	// 与 OnKicked 同线程约定。
 	OnServerShutdown func(reason string)
+	// OnRTCFailed 本端 PeerConnection 因 ICE 失败被 SFU 移除（rtc.failed，#19）：
+	// 会话已完成本地重建（销毁 PC、清远端链路、重发 channel.join），此处只报 UI。
+	// 与 OnKicked 同线程约定（ws 读循环 goroutine，实现侧不得同步 Close 会话）。
+	OnRTCFailed func(channelID string)
 }
 
 // VoiceStats 推给 UI 的语音房统计快照。
@@ -456,6 +460,44 @@ func (s *Session) registerHandlers() {
 		}
 		go s.ws.Close()
 	})
+	// rtc.failed：SFU 因 ICE 失败移除本端（#19）。服务端已把本端摘出成员表并
+	// 给他人广播 peer_left，本地销毁 PC 与远端链路后重发 channel.join 重建
+	//（channel.joined 见 peerRef 为空会 setupPeer 建新 PC）。契约 0.2。
+	s.ws.On(signal.TypeRTCFailed, func(env signal.Envelope) {
+		var d signal.RTCFailedData
+		if env.Decode(&d) != nil {
+			return
+		}
+		s.rebuildAfterICEFail(d.ChannelID)
+	})
+}
+
+// rebuildAfterICEFail ICE 失败重建入房（#19）：销毁本地 PC 与远端链路，重发
+// channel.join 重建（读循环内禁网络 I/O，ICE 用缓存，与 OnConnect 重连同款）。
+// 陈旧通知不折腾：不在该房（已手动离开/换房）忽略；本地 PC 已连通说明是
+// 迟到的失败通知，再拆一次只会把健康链路打断。
+func (s *Session) rebuildAfterICEFail(channelID string) {
+	room, _ := s.roomID.Load().(string)
+	if room == "" || (channelID != "" && channelID != room) {
+		return
+	}
+	if p := s.peerRef.Load(); p != nil &&
+		p.ConnectionState() == webrtc.PeerConnectionStateConnected {
+		return
+	}
+	if p := s.peerRef.Swap(nil); p != nil {
+		_ = p.Close()
+	}
+	if s.remoteMgr != nil {
+		s.remoteMgr.RemoveAll()
+	}
+	if s.ws != nil {
+		_ = s.ws.Send(signal.TypeChannelJoin, signal.ChannelJoinData{ChannelID: room})
+	}
+	s.log.Printf("session: ICE 失败重建入房 %s（#19）", room)
+	if s.ev.OnRTCFailed != nil {
+		s.ev.OnRTCFailed(room)
+	}
 }
 
 // leaveRoomLocal 本地退房（不发 channel.leave）。仅用于服务端已单方面把本端

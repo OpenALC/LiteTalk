@@ -330,8 +330,8 @@ func TestFetchICEServers(t *testing.T) {
 	}
 }
 
-// newDownlinkStubData 同 downlinkStub，但下行消息带 data 载荷；并计数连接次数
-// （server.shutdown 停重连断言用：停了就只会有 1 次连接）。
+// newDownlinkStubData 同 downlinkStub，但下行消息带 data 载荷；记录上行消息类型
+// （rtc.failed 重建断言用）并计数连接次数（server.shutdown 停重连断言用）。
 func newDownlinkStubData(t *testing.T, env signal.Envelope) (*downlinkStub, *int32) {
 	t.Helper()
 	s := &downlinkStub{}
@@ -351,9 +351,17 @@ func newDownlinkStubData(t *testing.T, env signal.Envelope) (*downlinkStub, *int
 			return
 		}
 		for {
-			if _, _, err := conn.Read(r.Context()); err != nil {
+			_, data, err := conn.Read(r.Context())
+			if err != nil {
 				return
 			}
+			var e signal.Envelope
+			if json.Unmarshal(data, &e) != nil {
+				continue
+			}
+			s.mu.Lock()
+			s.received = append(s.received, e.Type)
+			s.mu.Unlock()
 		}
 	}))
 	t.Cleanup(s.Server.Close)
@@ -439,5 +447,101 @@ func TestServerShutdownStopsReconnect(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Fatalf("shutdown 只应上报一次，实际还有 %d 条", len(got))
+	}
+}
+
+// TestRTCFailedRebuildsPeer rtc.failed（#19）：销毁本地 PC、清空远端链路、
+// 重发 channel.join 重建（契约 0.2），并上报 OnRTCFailed。绝不发 channel.leave。
+func TestRTCFailedRebuildsPeer(t *testing.T) {
+	got := make(chan string, 2)
+	stub, _ := newDownlinkStubData(t, signal.Envelope{
+		Type: signal.TypeRTCFailed, TS: 1,
+		Data: json.RawMessage(`{"channel_id":"room1","reason":"ice_failed"}`),
+	})
+	s := NewSession(NewAPIClient(stub.wsURL()), "tok", "n", Events{
+		OnRTCFailed: func(channelID string) { got <- channelID },
+	}, nil)
+	s.ws = signal.NewClient(signal.Config{URL: stub.wsURL(), ReconnectMin: 20 * time.Millisecond})
+	defer s.ws.Close()
+	s.registerHandlers()
+	s.roomID.Store("room1")
+	s.remoteMgr = audio.NewRemoteManager(audio.NewMixer(func([]int16) int { return 0 }), nil)
+	peer, err := rtc.NewPeer(rtc.PeerConfig{StreamID: "u1"})
+	if err != nil {
+		t.Fatalf("NewPeer: %v", err)
+	}
+	s.peerRef.Store(peer)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.ws.Run(ctx)
+
+	select {
+	case ch := <-got:
+		if ch != "room1" {
+			t.Fatalf("OnRTCFailed channelID = %q, want room1", ch)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("未收到 OnRTCFailed（#19）")
+	}
+	if p := s.peerRef.Load(); p != nil {
+		t.Fatal("peerRef 应清空（channel.joined 建新 PC 的入口条件）")
+	}
+	if st := peer.ConnectionState(); st != webrtc.PeerConnectionStateClosed {
+		t.Fatalf("旧 PC 应关闭，实际 %v", st)
+	}
+	if ids := s.remoteMgr.PeerIDs(); len(ids) != 0 {
+		t.Fatalf("远端链路应清空，实际 %v", ids)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if stub.saw(signal.TypeChannelJoin) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !stub.saw(signal.TypeChannelJoin) {
+		t.Fatal("必须重发 channel.join 重建入房（#19）")
+	}
+	if stub.saw(signal.TypeChannelLeave) {
+		t.Fatal("重建不得发 channel.leave")
+	}
+}
+
+// TestRTCFailedStaleIgnored 陈旧 rtc.failed（channel_id 非当前房）不得拆掉会话
+// （#19）：误拆会把健康链路打断；已手动离开（roomID 空）同样忽略。
+func TestRTCFailedStaleIgnored(t *testing.T) {
+	got := make(chan string, 2)
+	stub, _ := newDownlinkStubData(t, signal.Envelope{
+		Type: signal.TypeRTCFailed, TS: 1,
+		Data: json.RawMessage(`{"channel_id":"other-room","reason":"ice_failed"}`),
+	})
+	s := NewSession(NewAPIClient(stub.wsURL()), "tok", "n", Events{
+		OnRTCFailed: func(channelID string) { got <- channelID },
+	}, nil)
+	s.ws = signal.NewClient(signal.Config{URL: stub.wsURL(), ReconnectMin: 20 * time.Millisecond})
+	defer s.ws.Close()
+	s.registerHandlers()
+	s.roomID.Store("room1")
+	peer, err := rtc.NewPeer(rtc.PeerConfig{StreamID: "u1"})
+	if err != nil {
+		t.Fatalf("NewPeer: %v", err)
+	}
+	s.peerRef.Store(peer)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.ws.Run(ctx)
+
+	select {
+	case ch := <-got:
+		t.Fatalf("陈旧通知不应触发重建回调，收到 %q（#19）", ch)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if p := s.peerRef.Load(); p != peer {
+		t.Fatal("陈旧 rtc.failed 不得拆掉当前 PC（#19）")
+	}
+	if stub.saw(signal.TypeChannelJoin) {
+		t.Fatal("陈旧 rtc.failed 不得重发 channel.join（#19）")
 	}
 }
