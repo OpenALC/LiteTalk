@@ -49,6 +49,16 @@ Linux 产物以 **Ubuntu 24.04**（glibc 2.39）为构建基线，CI 校验产�
 见 **[server/deploy/README.md](server/deploy/README.md)**：端口、MySQL/Redis/coturn/Nginx/systemd
 全套配置文件与验证清单，RockyLinux 9.5 按步骤照抄即可。
 
+TLS 三种模式（详见部署手册）：
+
+| 模式 | 做法 | 说明 |
+|---|---|---|
+| 内置 ACME 自动签发 | `./litetalk-server --domain voice.example.com` | 443 + 80 双监听自动申请/续期证书，免 nginx；443 需 root 或 `CAP_NET_BIND_SERVICE` |
+| 前置反代 | `./litetalk-server --behind-proxy` + nginx/Caddy | 反代终结 TLS，服务端纯 HTTP；配 `LITETALK_TRUSTED_PROXIES` 后才采信 `X-Real-IP` |
+| 纯 HTTP | 都不设 | 仅开发/内网，启动日志会提示 |
+
+证书缓存默认在 `$LITETALK_DATA_DIR/autocert`（0700），自动续期无需 cron。
+
 ## 配置速查
 
 | 项 | 方式 |
