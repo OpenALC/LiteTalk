@@ -1,6 +1,6 @@
 -- 0001_init.up.sql — LiteTalk 核心表（SQLite 方言；与 MySQL 侧同号同名，version 一致）
 -- 约定：id INTEGER PRIMARY KEY（rowid 天然自增，不写 AUTOINCREMENT）；ENUM → TEXT CHECK；
--- 索引独立 CREATE INDEX；不写 ENGINE/CHARSET/AFTER/触发器（splitSQL 按 ; 切分会碎）。
+-- 索引独立 CREATE INDEX；不写 ENGINE/CHARSET/AFTER/触发器（splitSQL 按分号切分会碎）。
 CREATE TABLE users (
     id            INTEGER      PRIMARY KEY,
     email         VARCHAR(255) NOT NULL,
