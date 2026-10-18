@@ -106,6 +106,10 @@ type Session struct {
 	muted        atomic.Bool
 	deafened     atomic.Bool
 
+	// protoVer 服务端协商到的协议版本（#29）：0=尚未收到 server.hello（按 v1 行为）。
+	// v2 客户端据此停发 voice.state{speaking} 等版本相关行为（#33 接线）。
+	protoVer atomic.Int64
+
 	// sendGate 按键说话发送门（PTT/语音激活/常开）。App 层长期持有的值对象，
 	// 会话重建不换门——用户按住的 PTT 状态不能因为重连丢掉。建管线时转交
 	// Pipeline，之后由 Pipeline 每帧自行 Load。
@@ -296,6 +300,16 @@ func (s *Session) registerHandlers() {
 		if env.Decode(&d) == nil && d.User.ID != "" {
 			s.selfID = d.User.ID
 		}
+	})
+	// server.hello：协议版本协商结果（#29）。hello（初始数据）可能先到也可能后到，
+	// 与本消息的相对顺序不作假设（老服务端根本不发 server.hello，按 v1 继续）。
+	s.ws.On(signal.TypeServerHello, func(env signal.Envelope) {
+		var d signal.ServerHelloData
+		if env.Decode(&d) != nil || d.Version < 1 {
+			return
+		}
+		s.protoVer.Store(d.Version)
+		s.log.Printf("signal: 协商协议版本 v%d", d.Version)
 	})
 	s.ws.On(signal.TypeChannelJoined, func(env signal.Envelope) {
 		var d signal.ChannelJoinedData
@@ -611,7 +625,7 @@ func (s *Session) LeaveChannel() error {
 		return nil
 	}
 	s.roomID.Store("")
-	if err := s.ws.Send(signal.TypeChannelLeave, signal.ChannelJoinData{ChannelID: room}); err != nil {
+	if err := s.ws.Send(signal.TypeChannelLeave, signal.ChannelLeaveData{ChannelID: room}); err != nil {
 		return err
 	}
 	if p := s.peerRef.Swap(nil); p != nil {
@@ -771,10 +785,10 @@ func (s *Session) SendChat(channelID, content string) error {
 	if s.ws == nil {
 		return fmt.Errorf("session not connected")
 	}
-	return s.ws.Send(signal.TypeChatSend, map[string]string{
-		"channel_id": channelID,
-		"type":       "text",
-		"content":    content,
+	return s.ws.Send(signal.TypeChatSend, signal.ChatSendData{
+		ChannelID: channelID,
+		Type:      "text",
+		Content:   content,
 	})
 }
 
@@ -881,6 +895,10 @@ func (s *Session) Close() {
 
 // SignalConnected 报告信令 WS 当前是否有活跃连接（app 层据首次连接结果定 session_ok）。
 func (s *Session) SignalConnected() bool { return s.ws != nil && s.ws.Connected() }
+
+// ProtocolVersion 返回服务端协商到的协议版本（#29）。
+// 0 = 尚未收到 server.hello（老服务端或还没协商完）——按 v1 行为处理。
+func (s *Session) ProtocolVersion() int64 { return s.protoVer.Load() }
 
 // InRoom 报告当前是否在语音频道（app 层 voice:stats ticker 据它门控发送）。
 func (s *Session) InRoom() bool {

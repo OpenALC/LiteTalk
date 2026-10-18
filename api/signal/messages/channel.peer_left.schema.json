@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litetalk:signal:channel.peer_left",
+  "title": "PeerLeftData",
+  "x-wire-type": "channel.peer_left",
+  "x-go-const": "TypeChannelPeerLeft",
+  "x-direction": "S2C",
+  "x-since": 1,
+  "description": "有成员离开频道（含 rtc.failed 后的旁路通知）。",
+  "type": "object",
+  "properties": {
+    "channel_id": { "type": "string" },
+    "user_id": { "type": "string" }
+  },
+  "required": ["channel_id", "user_id"],
+  "additionalProperties": false
+}

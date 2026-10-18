@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litetalk:signal:rtc.ice",
+  "title": "ICEData",
+  "x-wire-type": "rtc.ice",
+  "x-go-const": "TypeRTCIce",
+  "x-direction": "BOTH",
+  "x-since": 1,
+  "description": "trickle ICE 候选。字段名沿用 WebRTC 标准（sdpMid/sdpMLineIndex/usernameFragment），生成物不 import pion；服务端手写层保留 ICECandidateData = webrtc.ICECandidateInit 别名与互转。",
+  "type": "object",
+  "properties": {
+    "candidate": { "type": "string" },
+    "sdpMid": {
+      "type": "string",
+      "x-go-omitempty": true
+    },
+    "sdpMLineIndex": {
+      "type": "integer",
+      "minimum": 0,
+      "x-go-type": "*uint16",
+      "x-go-omitempty": true
+    },
+    "usernameFragment": {
+      "type": "string",
+      "x-go-omitempty": true
+    }
+  },
+  "required": ["candidate"],
+  "additionalProperties": false
+}

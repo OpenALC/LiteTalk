@@ -1,0 +1,47 @@
+{
+  "$comment": "信令共享类型（#29）。被 messages/ 下的消息 schema 以 $ref 引用；生成两侧 protocol_gen.go 时按类型名去重。",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litetalk:signal:components",
+  "$defs": {
+    "UserBrief": {
+      "title": "UserBrief",
+      "description": "用户简要信息。M2 中 id 即用户名。",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "nickname": { "type": "string" }
+      },
+      "required": ["id", "nickname"],
+      "additionalProperties": false
+    },
+    "MemberInfo": {
+      "title": "MemberInfo",
+      "description": "房间成员快照（含语音状态，供晚加入者拿到当前状态）。",
+      "type": "object",
+      "properties": {
+        "user_id": { "type": "string" },
+        "nickname": { "type": "string" },
+        "tag": {
+          "type": "string",
+          "x-go-omitempty": true,
+          "description": "昵称#tag 的 tag，好友请求用"
+        },
+        "mute": { "type": "boolean" },
+        "deafen": { "type": "boolean" },
+        "speaking": { "type": "boolean" }
+      },
+      "required": ["user_id", "nickname", "mute", "deafen", "speaking"],
+      "additionalProperties": false
+    },
+    "SDPData": {
+      "title": "SDPData",
+      "description": "rtc.offer / rtc.answer 的载荷。",
+      "type": "object",
+      "properties": {
+        "sdp": { "type": "string" }
+      },
+      "required": ["sdp"],
+      "additionalProperties": false
+    }
+  }
+}

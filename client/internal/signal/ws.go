@@ -252,6 +252,15 @@ func (c *Client) serve(ctx context.Context, conn *websocket.Conn) error {
 	c.setConn(conn)
 	c.logf("connected to %s", c.cfg.URL)
 
+	// 协议版本协商（#29）：连上立刻声明可接受区间，再进读循环。
+	// 老服务端不认识 client.hello 会回 error{bad_message}——上层容忍、按 v1 继续，
+	// 不因协商失败重连。发不出去说明连接已废，返回错误走正常断线重连。
+	if err := c.Send(TypeClientHello, ClientHelloData{
+		Min: ProtocolVersionMin, Max: ProtocolVersionMax,
+	}); err != nil {
+		return fmt.Errorf("client.hello: %w", err)
+	}
+
 	// 心跳：服务端 Redis presence TTL 90s，默认 30s 一拍。
 	pingDone := make(chan struct{})
 	go func() {

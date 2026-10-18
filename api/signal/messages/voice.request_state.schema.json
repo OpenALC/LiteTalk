@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litetalk:signal:voice.request_state",
+  "title": "VoiceRequestStateData",
+  "x-wire-type": "voice.request_state",
+  "x-go-const": "TypeVoiceRequestState",
+  "x-direction": "C2S",
+  "x-since": 1,
+  "description": "请求目标成员闭麦/静音。仅「请求」语义：服务端定向转发给目标，由目标自行决定是否执行（无权限强制）。",
+  "type": "object",
+  "properties": {
+    "channel_id": { "type": "string" },
+    "target_id": { "type": "string" },
+    "mute": {
+      "type": "boolean",
+      "x-go-type": "*bool",
+      "x-go-omitempty": true
+    },
+    "deafen": {
+      "type": "boolean",
+      "x-go-type": "*bool",
+      "x-go-omitempty": true
+    }
+  },
+  "required": ["channel_id", "target_id"],
+  "additionalProperties": false
+}
