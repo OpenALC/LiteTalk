@@ -16,15 +16,16 @@ import (
 type fakeSFU struct {
 	pc *webrtc.PeerConnection
 
-	mu      sync.Mutex
-	uplink  *webrtc.TrackRemote // 客户端的上行轨
-	gotRTP  chan *rtp.Packet
-	onTrack chan struct{}
+	mu       sync.Mutex
+	uplink   *webrtc.TrackRemote // 客户端的上行轨
+	gotRTP   chan *rtp.Packet
+	onTrack  chan struct{}
+	skipRead bool // 基准模式：不读上行（ReadRTP 的 Unmarshal 会污染发送侧分配计数）
 
 	downTrack *webrtc.TrackLocalStaticRTP
 }
 
-func newFakeSFU(t *testing.T) *fakeSFU {
+func newFakeSFU(t testing.TB) *fakeSFU {
 	t.Helper()
 	me := &webrtc.MediaEngine{}
 	if err := me.RegisterCodec(webrtc.RTPCodecParameters{
@@ -37,6 +38,12 @@ func newFakeSFU(t *testing.T) *fakeSFU {
 		PayloadType: OpusPayloadType,
 	}, webrtc.RTPCodecTypeAudio); err != nil {
 		t.Fatalf("sfu register codec: %v", err)
+	}
+	// 与客户端对齐（#33）：协商 RFC 6464 电平扩展，否则 answer 会拒掉它。
+	if err := me.RegisterHeaderExtension(webrtc.RTPHeaderExtensionCapability{
+		URI: audioLevelURI,
+	}, webrtc.RTPCodecTypeAudio); err != nil {
+		t.Fatalf("sfu register audio level ext: %v", err)
 	}
 	ir := &interceptor.Registry{}
 	if err := webrtc.RegisterDefaultInterceptors(me, ir); err != nil {
@@ -51,8 +58,12 @@ func newFakeSFU(t *testing.T) *fakeSFU {
 	pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
 		s.mu.Lock()
 		s.uplink = track
+		skip := s.skipRead
 		s.mu.Unlock()
 		s.onTrack <- struct{}{}
+		if skip {
+			return
+		}
 		go func() {
 			for {
 				pkt, _, err := track.ReadRTP()
@@ -68,7 +79,7 @@ func newFakeSFU(t *testing.T) *fakeSFU {
 }
 
 // waitConnected 等两侧连接建立。
-func waitConnected(t *testing.T, peer *Peer, sfu *fakeSFU) {
+func waitConnected(t testing.TB, peer *Peer, sfu *fakeSFU) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {

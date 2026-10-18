@@ -618,6 +618,10 @@ func (p *Pipeline) SetOpusPacketLoss(pct int) error {
 // Speaking 当前说话状态。
 func (p *Pipeline) Speaking() bool { return p.dsp.Speaking() }
 
+// AudioLevel 最近一帧的 RFC 6464 电平（0=0dB … 127=静音，#33）。
+// SendOpus 每包读取写入 RTP 头扩展；跨 goroutine 无锁（atomic）。
+func (p *Pipeline) AudioLevel() uint8 { return p.dsp.AudioLevel() }
+
 // SetSendGate 设置按键说话发送门（传 nil 清除）。Gate 是零分配的值对象，
 // 可在会话建立时注入一次、长期复用；热路径只做一次原子指针 Load。
 func (p *Pipeline) SetSendGate(g *hotkey.Gate) { p.sendGate.Store(g) }
