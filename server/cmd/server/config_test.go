@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"io"
+	"net"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -142,7 +144,8 @@ func TestConfigValidate(t *testing.T) {
 	}
 
 	cfg.jwtSecret = strings.Repeat("a", 32)
-	cfg.sfuIP = "8.8.8.8" // 生产拒环回（#22），合法用例先给非环回
+	cfg.sfuIP = "8.8.8.8"    // 生产拒环回（#22），合法用例先给非环回
+	cfg.sfuIPExplicit = true // 直接赋值模拟显式配置，跳过域名推导（#27）
 	if err := cfg.validate(false); err != nil {
 		t.Fatalf("生产合法配置应放行: %v", err)
 	}
@@ -171,5 +174,89 @@ func TestConfigValidate(t *testing.T) {
 	cfg.domain = "voice.example.com"
 	if err := cfg.validate(true); err != nil {
 		t.Fatalf("合法域名应放行: %v", err)
+	}
+}
+
+// TestResolveSFUIPFromDomain #27 裁定 14：LITETALK_SFU_IP 未设 + --domain 已设时
+// 解析域名推导 SFU 宣告地址；解析失败要求手动设置；显式设置优先；#22 拒环回守卫不变。
+func TestResolveSFUIPFromDomain(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("LITETALK_JWT_SECRET", strings.Repeat("a", 32)) // 生产密钥合规，专测 SFU IP 路径
+	defer func(old func(string) ([]net.IP, error)) { lookupIP = old }(lookupIP)
+
+	// 推导：域名解析出公网 IP → SFU 宣告地址。
+	lookupIP = func(host string) ([]net.IP, error) {
+		if host != "voice.example.com" {
+			t.Fatalf("解析主机 = %q", host)
+		}
+		return []net.IP{net.ParseIP("203.0.113.10")}, nil
+	}
+	cfg, err := loadConfig([]string{"-domain", "voice.example.com"}, io.Discard)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if err := cfg.validate(false); err != nil {
+		t.Fatalf("生产 + 域名推导应放行: %v", err)
+	}
+	if cfg.sfuIP != "203.0.113.10" {
+		t.Fatalf("sfuIP = %q，应为域名解析结果", cfg.sfuIP)
+	}
+
+	// 解析失败：报错并提示手动设置 LITETALK_SFU_IP，不静默回落环回。
+	lookupIP = func(string) ([]net.IP, error) { return nil, errors.New("nxdomain") }
+	cfg2, err := loadConfig([]string{"-domain", "no.such.host.invalid"}, io.Discard)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	err = cfg2.validate(false)
+	if err == nil || !strings.Contains(err.Error(), "LITETALK_SFU_IP") {
+		t.Fatalf("解析失败应要求手动设置 LITETALK_SFU_IP，实际 %v", err)
+	}
+
+	// 显式 LITETALK_SFU_IP 优先，不触发域名解析。
+	lookupIP = func(string) ([]net.IP, error) { return nil, errors.New("不应被调用") }
+	t.Setenv("LITETALK_SFU_IP", "198.51.100.7")
+	cfg3, err := loadConfig([]string{"-domain", "voice.example.com"}, io.Discard)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if err := cfg3.validate(false); err != nil {
+		t.Fatalf("显式 SFU IP 应放行: %v", err)
+	}
+	if cfg3.sfuIP != "198.51.100.7" {
+		t.Fatalf("显式设置不应被推导覆盖，实际 %q", cfg3.sfuIP)
+	}
+
+	// #22 守卫不变：推导出环回照样拒（域名指到 127.0.0.1 的错误配置不放行）。
+	t.Setenv("LITETALK_SFU_IP", "")
+	lookupIP = func(string) ([]net.IP, error) { return []net.IP{net.ParseIP("127.0.0.1")}, nil }
+	cfg4, err := loadConfig([]string{"-domain", "voice.example.com"}, io.Discard)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	err = cfg4.validate(false)
+	if err == nil || !strings.Contains(err.Error(), "环回") {
+		t.Fatalf("推导出环回在生产应拒绝，实际 %v", err)
+	}
+}
+
+// TestValidatePrintAdminInvite -print-admin-invite 跳过 SFU IP 校验（邀请码找回不被
+// DNS/环回问题挡住），但 JWT 密钥仍把关（码由它派生）。
+func TestValidatePrintAdminInvite(t *testing.T) {
+	clearConfigEnv(t)
+	defer func(old func(string) ([]net.IP, error)) { lookupIP = old }(lookupIP)
+	lookupIP = func(string) ([]net.IP, error) { return nil, errors.New("nxdomain") }
+
+	cfg, err := loadConfig([]string{"-print-admin-invite", "-domain", "voice.example.com"}, io.Discard)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	// dev：空密钥 + 解析失败的域名也应放行（只打码）。
+	if err := cfg.validate(true); err != nil {
+		t.Fatalf("print-admin-invite 应跳过 SFU/域名校验: %v", err)
+	}
+	// 生产：密钥不合法仍拒——派生不出正确码。
+	if err := cfg.validate(false); err == nil || !strings.Contains(err.Error(), "LITETALK_JWT_SECRET") {
+		t.Fatalf("生产缺密钥应拒绝，实际 %v", err)
 	}
 }
