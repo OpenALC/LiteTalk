@@ -41,7 +41,7 @@ func (s *Server) handleListFriends(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		// 备注/分组是发起方视角的字段：被请求方看到空串。
-		view := friendView{ID: f.ID, Status: f.Status, Incoming: incoming, User: publicUser(u)}
+		view := friendView{ID: f.ID, Status: f.Status, Incoming: incoming, User: s.userView(r.Context(), u)}
 		if !incoming {
 			view.Remark, view.Group = f.Remark, f.GroupName
 		}
@@ -98,7 +98,7 @@ func (s *Server) handleFriendRequest(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, friendView{ID: f.ID, Status: f.Status, Incoming: false, User: publicUser(target)})
+	writeJSON(w, http.StatusCreated, friendView{ID: f.ID, Status: f.Status, Incoming: false, User: s.userView(r.Context(), target)})
 }
 
 // handleFriendAccept POST /api/v1/friends/requests/{id}/accept
@@ -128,7 +128,7 @@ func (s *Server) handleFriendAccept(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	other, _ := s.store.UserByID(r.Context(), f.UserID)
-	writeJSON(w, http.StatusOK, friendView{ID: f.ID, Status: f.Status, Incoming: true, User: publicUser(other)})
+	writeJSON(w, http.StatusOK, friendView{ID: f.ID, Status: f.Status, Incoming: true, User: s.userView(r.Context(), other)})
 }
 
 // handleFriendDelete DELETE /api/v1/friends/{id}
@@ -203,5 +203,5 @@ func (s *Server) handlePatchFriend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	other, _ := s.store.UserByID(r.Context(), f.FriendID)
-	writeJSON(w, http.StatusOK, friendView{ID: f.ID, Status: f.Status, Remark: f.Remark, Group: f.GroupName, User: publicUser(other)})
+	writeJSON(w, http.StatusOK, friendView{ID: f.ID, Status: f.Status, Remark: f.Remark, Group: f.GroupName, User: s.userView(r.Context(), other)})
 }
