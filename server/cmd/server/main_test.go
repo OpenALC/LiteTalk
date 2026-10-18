@@ -95,13 +95,13 @@ func TestValidateSFUIP(t *testing.T) {
 	}
 }
 func TestResolveMigrations(t *testing.T) {
-	// 默认走 embed。
+	// 默认走 embed：MySQL 侧读根目录，SQLite 侧读 sqlite/ 子目录。
 	t.Setenv("LITETALK_MIGRATIONS_DIR", "")
-	got := resolveMigrations()
-	if _, ok := got.(fs.FS); !ok {
+	myFS := resolveMigrationsMySQL()
+	if _, ok := myFS.(fs.FS); !ok {
 		t.Fatal("应返回 fs.FS")
 	}
-	entries, err := fs.ReadDir(got, ".")
+	entries, err := fs.ReadDir(myFS, ".")
 	if err != nil {
 		t.Fatalf("embed FS 不可读: %v", err)
 	}
@@ -114,15 +114,56 @@ func TestResolveMigrations(t *testing.T) {
 	if !hasUp {
 		t.Fatal("embed FS 应包含 0001_init.up.sql")
 	}
+	sqFS := resolveMigrationsSQLite()
+	if _, err := fs.ReadFile(sqFS, "0001_init.up.sql"); err != nil {
+		t.Fatalf("SQLite 子目录应可读: %v", err)
+	}
 
-	// 磁盘覆盖模式。
+	// 磁盘覆盖模式：布局与 server/migrations/ 一致（根 = MySQL，sqlite/ = SQLite）。
 	dir := t.TempDir()
 	if err := os.WriteFile(dir+"/0001_init.up.sql", []byte("SELECT 1"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Mkdir(dir+"/sqlite", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/sqlite/0001_init.up.sql", []byte("SELECT 2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("LITETALK_MIGRATIONS_DIR", dir)
-	got = resolveMigrations()
-	if _, err := fs.ReadFile(got, "0001_init.up.sql"); err != nil {
-		t.Fatalf("磁盘 FS 应可读: %v", err)
+	if _, err := fs.ReadFile(resolveMigrationsMySQL(), "0001_init.up.sql"); err != nil {
+		t.Fatalf("磁盘 MySQL FS 应可读: %v", err)
+	}
+	body, err := fs.ReadFile(resolveMigrationsSQLite(), "0001_init.up.sql")
+	if err != nil {
+		t.Fatalf("磁盘 SQLite FS 应可读: %v", err)
+	}
+	if string(body) != "SELECT 2" {
+		t.Fatalf("SQLite FS 应读到子目录文件，实际 %q", body)
+	}
+}
+
+// TestPickStoreKind 选型推断链（§0.3）：显式 > MYSQL_DSN 非空 > 默认 sqlite。
+func TestPickStoreKind(t *testing.T) {
+	t.Setenv("LITETALK_STORE", "")
+	t.Setenv("LITETALK_MYSQL_DSN", "")
+	if got := pickStoreKind(); got != "sqlite" {
+		t.Fatalf("都未设应默认 sqlite，实际 %q", got)
+	}
+	t.Setenv("LITETALK_MYSQL_DSN", "user:pass@tcp(127.0.0.1:3306)/x")
+	if got := pickStoreKind(); got != "mysql" {
+		t.Fatalf("有 DSN 应选 mysql，实际 %q", got)
+	}
+	t.Setenv("LITETALK_STORE", "sqlite")
+	if got := pickStoreKind(); got != "sqlite" {
+		t.Fatalf("显式指定应优先，实际 %q", got)
+	}
+	t.Setenv("LITETALK_STORE", " MySQL ")
+	if got := pickStoreKind(); got != "mysql" {
+		t.Fatalf("大小写与空白应归一，实际 %q", got)
+	}
+	t.Setenv("LITETALK_STORE", "mem")
+	if got := pickStoreKind(); got != "mem" {
+		t.Fatalf("mem 应透传由 main 拒绝/放行，实际 %q", got)
 	}
 }
