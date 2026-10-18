@@ -57,6 +57,22 @@ func SignCredential(secret, username string) string {
 	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
 }
 
+// DefaultURLs 内置 TURN 启用时的 STUN/TURN URL 回填（§0.4）：显式 env 优先，
+// 未设时按 host + 端口生成。TURN 监听 UDP 与 TCP 同号端口，禁 UDP 网络走
+// transport=tcp 条目。host 取 --domain，否则 LITETALK_SFU_IP。
+func DefaultURLs(host string, turnPort int) (turnURLs, stunURLs []string) {
+	if host == "" || turnPort <= 0 {
+		return nil, nil
+	}
+	base := fmt.Sprintf("%s:%d", host, turnPort)
+	stunURLs = []string{"stun:" + base}
+	turnURLs = []string{
+		"turn:" + base + "?transport=udp",
+		"turn:" + base + "?transport=tcp",
+	}
+	return turnURLs, stunURLs
+}
+
 // Issue 为 uid 生成一对短期凭证：username=<expiry_unix>:<uid>。
 func (c Config) Issue(uid string) (username, credential string, expiry time.Time) {
 	now := time.Now()

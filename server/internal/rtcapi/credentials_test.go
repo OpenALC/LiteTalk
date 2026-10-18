@@ -140,3 +140,24 @@ func TestHandlerSecretNotConfigured(t *testing.T) {
 		t.Fatalf("期望 503，实际 %d", rec.Result().StatusCode)
 	}
 }
+
+// TestDefaultURLs 内置 TURN 回填：host+端口生成 STUN 与 TURN(udp/tcp) 三条 URL。
+func TestDefaultURLs(t *testing.T) {
+	turnURLs, stunURLs := DefaultURLs("voice.example.com", 3478)
+	if len(stunURLs) != 1 || stunURLs[0] != "stun:voice.example.com:3478" {
+		t.Fatalf("stun URLs = %v", stunURLs)
+	}
+	if len(turnURLs) != 2 {
+		t.Fatalf("turn URLs 应有 udp/tcp 两条，实际 %v", turnURLs)
+	}
+	if turnURLs[0] != "turn:voice.example.com:3478?transport=udp" || turnURLs[1] != "turn:voice.example.com:3478?transport=tcp" {
+		t.Fatalf("turn URLs = %v", turnURLs)
+	}
+	// host 或端口非法时返回空（不回填，交由显式 env 或 503 路径）
+	if u, s := DefaultURLs("", 3478); u != nil || s != nil {
+		t.Fatalf("空 host 应不回填，实际 %v %v", u, s)
+	}
+	if u, s := DefaultURLs("h", 0); u != nil || s != nil {
+		t.Fatalf("端口 0 应不回填，实际 %v %v", u, s)
+	}
+}
