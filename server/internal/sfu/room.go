@@ -17,6 +17,9 @@ type Room struct {
 
 	mu    sync.RWMutex
 	peers map[string]*Peer // userID → Peer
+
+	// tickPeers 成员快照缓冲（复用免分配；仅 speakingLoop goroutine 访问）。
+	tickPeers []*Peer
 }
 
 func newRoom(s *SFU, id string) *Room {
@@ -242,7 +245,7 @@ func (r *Room) ensureRoute(target *Peer, srcUserID string, src *webrtc.TrackRemo
 // 房间内其他成员的对应 outbound track。不解包、不分析 payload。
 // inbound 读失败（对端 PC 关闭/轨道结束）即退出，自然停止所有转发。
 //
-// #33：每包先读 RFC 6464 电平写原子（判定 ticker 侧消费），再过活跃门——
+// #33：每包先读 RFC 6464 电平写原子（说话判定循环侧消费），再过活跃门——
 // 非活跃源整包丢弃但 track 保持挂载（Phase 1 包级门控；RemoveTrack 会触发
 // 重协商风暴，#23 踩过，这里禁止）。循环内不加锁不分配（pion ReadRTP 除外）。
 func (r *Room) forward(src *Peer, srcTrack *webrtc.TrackRemote, levelExtID uint8) {
@@ -279,43 +282,48 @@ func (r *Room) forward(src *Peer, srcTrack *webrtc.TrackRemote, levelExtID uint8
 	}
 }
 
-// speakFlip 一次说话翻转（ticker 累积后统一触发回调）。
+// speakFlip 一次说话翻转（tickSpeak 累积后统一触发回调）。
 type speakFlip struct {
 	userID   string
 	speaking bool
 }
 
-// activeCand 活跃门候选（判定 ticker 内部用）。
+// activeCand 活跃门候选（tickActive 内部用）。
 type activeCand struct {
 	p     *Peer
 	level int32
 }
 
-// tick 一次说话判定 + 活跃门控（#33）。仅判定 ticker goroutine 调用；对 peer
-// 快照后在锁外处理，回调（进 WS 层）不得持任何 SFU 锁——hub 会持自己的锁调
-// SFU，交叉持锁必死锁。
-func (r *Room) tick(onSpeak OnSpeakingFn) {
+// snapPeers 成员快照进 r.tickPeers（复用缓冲，仅 speakingLoop goroutine 访问）。
+func (r *Room) snapPeers() []*Peer {
 	r.mu.RLock()
-	peers := make([]*Peer, 0, len(r.peers))
+	r.tickPeers = r.tickPeers[:0]
 	for _, p := range r.peers {
-		peers = append(peers, p)
+		r.tickPeers = append(r.tickPeers, p)
 	}
 	r.mu.RUnlock()
+	return r.tickPeers
+}
+
+// tickSpeak 一次说话翻转判定（#33，speakingTick 周期）。仅 speakingLoop
+// goroutine 调用；对 peer 快照后在锁外处理，回调（进 WS 层）不得持任何 SFU
+// 锁——hub 会持自己的锁调 SFU，交叉持锁必死锁。
+//
+// 顺带把停流折算后的**有效电平**写进 p.effLvl（单写者免锁），供 activeTick 的
+// tickActive 取用，免得活跃门再养一套停流计数。
+func (r *Room) tickSpeak(onSpeak OnSpeakingFn) {
+	peers := r.snapPeers()
 	if len(peers) == 0 {
 		return
 	}
 
 	var flips []speakFlip
-	now := time.Now()
-	// 活跃候选（达门限或低电平宽限内），按电平升序取 top-N。
-	var cands []activeCand
-
 	for _, p := range peers {
 		lvl := p.level.Load()
 		if lvl < 0 {
 			// 无电平（v1 客户端/未协商扩展）：说话判定不做（v1 走 voice.state 上报
 			// 广播），活跃门不生效（恒转发，兼容老客户端）。
-			p.fwdActive.Store(true)
+			p.effLvl = lvl
 			continue
 		}
 		// 停流视同静音（muted/DTX/断流后无包，最后一包电平不能把态卡住）。
@@ -328,6 +336,7 @@ func (r *Room) tick(onSpeak OnSpeakingFn) {
 		if p.staleRun >= levelStaleTicks {
 			lvl = 127
 		}
+		p.effLvl = lvl
 
 		// 说话迟滞（对齐客户端 DSP：双门限 + 连续 tick 防抖）。
 		switch {
@@ -355,7 +364,31 @@ func (r *Room) tick(onSpeak OnSpeakingFn) {
 			p.spkEnterRun = 0
 			p.spkExitRun = 0
 		}
+	}
 
+	if onSpeak != nil {
+		for _, f := range flips {
+			onSpeak(r.id, f.userID, f.speaking)
+		}
+	}
+}
+
+// tickActive 一次活跃门 top-N（#33 Phase 1，activeTick 周期）。仅 speakingLoop
+// goroutine 调用。有效电平取 tickSpeak 存下的 p.effLvl。
+func (r *Room) tickActive() {
+	peers := r.snapPeers()
+	if len(peers) == 0 {
+		return
+	}
+	now := time.Now()
+	// 活跃候选（达门限或低电平宽限内），按电平升序取 top-N。
+	var cands []activeCand
+	for _, p := range peers {
+		lvl := p.effLvl
+		if lvl < 0 {
+			p.fwdActive.Store(true) // 无电平源恒转发
+			continue
+		}
 		// 活跃门候选：达进入门限，或 active 中且低电平宽限未满。
 		if lvl > speakExitLevel {
 			p.gateExitRun++
@@ -366,13 +399,7 @@ func (r *Room) tick(onSpeak OnSpeakingFn) {
 			cands = append(cands, activeCand{p, lvl})
 		}
 	}
-
 	r.rankActive(cands, peers, now)
-	if onSpeak != nil {
-		for _, f := range flips {
-			onSpeak(r.id, f.userID, f.speaking)
-		}
-	}
 }
 
 // rankActive 活跃门 top-N 选取（#33 Phase 1 包级门控）：
@@ -381,7 +408,7 @@ func (r *Room) tick(onSpeak OnSpeakingFn) {
 //   - active 且非 winner：ActiveHoldMS 内保留（防 top-N 抖动），期满清位——
 //     只清 fwdActive（forward 停发包），track 全程挂载，绝不 RemoveTrack。
 //
-// 仅 ticker goroutine 调用。ActiveN<=0（门控关闭）时不动任何状态。
+// 仅 speakingLoop goroutine 调用。ActiveN<=0（门控关闭）时不动任何状态。
 func (r *Room) rankActive(cands []activeCand, peers []*Peer, now time.Time) {
 	if r.sfu.cfg.ActiveN <= 0 {
 		return
@@ -398,8 +425,8 @@ func (r *Room) rankActive(cands []activeCand, peers []*Peer, now time.Time) {
 	}
 	hold := time.Duration(r.sfu.cfg.ActiveHoldMS) * time.Millisecond
 	for _, p := range peers {
-		if p.level.Load() < 0 {
-			continue // 无电平源恒转发，上面已置位
+		if p.effLvl < 0 {
+			continue // 无电平源恒转发，tickActive 已置位
 		}
 		win := winners[p]
 		active := p.fwdActive.Load()

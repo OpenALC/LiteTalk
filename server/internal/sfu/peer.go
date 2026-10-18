@@ -45,22 +45,23 @@ type Peer struct {
 	closed            bool
 
 	// —— RFC 6464 电平与活跃门控（#33）——
-	// level 最近一包的电平（0=0dB … 127=静音；-1=尚未收到）。forward 写、ticker 读。
+	// level 最近一包的电平（0=0dB … 127=静音；-1=尚未收到）。forward 写、判定循环读。
 	level atomic.Int32
-	// pktSeq 上行包计数（forward 每包 +1）：ticker 对比发现停流（muted/DTX/断流）
+	// pktSeq 上行包计数（forward 每包 +1）：判定循环对比发现停流（muted/DTX/断流）
 	// 后按静音处理，避免最后一包的电平把说话态永久卡住。
 	pktSeq atomic.Uint64
-	// fwdActive 活跃转发门（#33 Phase 1 包级门控）：ticker 写、forward 读。
+	// fwdActive 活跃转发门（#33 Phase 1 包级门控）：tickActive 写、forward 读。
 	// true=该源的包参与扇出 WriteRTP；false=只收不发（track 保持挂载，禁 RemoveTrack）。
 	fwdActive atomic.Bool
 
-	// —— 以下仅判定 ticker goroutine 访问（单写者，免锁）——
+	// —— 以下仅 speakingLoop goroutine 访问（单写者，免锁）——
+	effLvl       int32     // 停流折算后的有效电平（tickSpeak 写、tickActive 读）
 	spkEnterRun  int       // 连续达进入门限的 tick 数
 	spkExitRun   int       // 连续低于退出门限的 tick 数
 	speaking     bool      // 当前说话态（翻转时经 OnSpeakingFn 下发）
 	gateExitRun  int       // 连续低于退出门限的 tick 数（活跃门 500ms 宽限）
 	gateHoldFrom time.Time // 进入 fwdActive 的时刻（ActiveHoldMS 最少保持）
-	seenSeq      uint64    // 上次 tick 时的 pktSeq（停流检测）
+	seenSeq      uint64    // 上次判定时的 pktSeq（停流检测）
 	staleRun     int       // 连续无新包的 tick 数
 }
 
@@ -79,8 +80,9 @@ func newPeer(room *Room, userID, connID string, sig SignalSender) (*Peer, error)
 		debounce: newDebouncer(50 * time.Millisecond),
 	}
 	// 电平初值 -1=未收到（说话判定跳过；活跃门不拦，v1 兼容）。
-	// fwdActive 初值 true：首包前不丢包，ticker 下一拍（≤100ms）再收紧。
+	// fwdActive 初值 true：首包前不丢包，tickActive 下一拍（≤100ms）再收紧。
 	p.level.Store(-1)
+	p.effLvl = -1
 	p.fwdActive.Store(true)
 
 	// SFU 侧 trickle：候选随收随发
