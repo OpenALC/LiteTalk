@@ -170,21 +170,40 @@ function openBlankCtx(e: MouseEvent) {
 
 const blankPrompt = ref<{ mode: 'channel' | 'category' } | null>(null)
 
+// catChoices 归入分类候选（#72）：真实分类 + 末位「未分类」。
+// groupsOf 的合成组（chan: 前缀，如内置示例自带组）不是服务端分类，不能当归宿。
+const catChoices = computed(() => [
+  ...groups.value.filter((g) => !g.id.startsWith('chan:')).map((g) => ({ value: g.id, label: g.name })),
+  { value: '', label: '未分类' },
+])
+
+// defaultCatId 默认归入当前选中频道所在的分类，没有选中或该频道不在真实分类时
+// 取第一个分类——用户打开对话框就能直接确认，不必每次手动选。
+const defaultCatId = computed(() => {
+  const s = servers.currentServer
+  const ch = s.channels.find((c) => c.id === servers.currentChannelId)
+  const real = groups.value.filter((g) => !g.id.startsWith('chan:'))
+  if (ch) {
+    const g = real.find((x) => x.name === ch.group)
+    if (g) return g.id
+  }
+  return real[0]?.id ?? ''
+})
+
 function onBlankSelect(key: string) {
   if (key === 'new-channel' || key === 'new-category') {
     blankPrompt.value = { mode: key === 'new-channel' ? 'channel' : 'category' }
   }
 }
 
-async function onBlankConfirm(value: string) {
+async function onBlankConfirm(value: string, _option: string, option2: string) {
   const p = blankPrompt.value
   blankPrompt.value = null
   if (!p) return
   try {
     if (p.mode === 'channel') {
-      // 新频道落在该服务器的第一个分类（无分类时服务端/本地默认组）。
-      const firstGroup = groups.value[0]?.name ?? '语音频道'
-      await createChannelInGroup(servers.currentServerId, value, firstGroup)
+      // 第三参数是归入分类 id（'' = 未分类）：显式带 category_id 新建（#72）。
+      await createChannelInGroup(servers.currentServerId, value, option2)
       notify.show('频道已创建')
     } else {
       await servers.createCategory(servers.currentServerId, value)
@@ -193,17 +212,16 @@ async function onBlankConfirm(value: string) {
   } catch (e) { notify.fromErr(e) }
 }
 
-// createChannelInGroup：新建频道。服务端 createChannelReq 支持 category_id，
-// 但客户端 CreateChannel 未接（#12/#16 未覆盖频道挂分类），暂按类型默认组显示，
-// 重启后由 ListChannels 按服务端数据归位（见 store 注释）。
-async function createChannelInGroup(serverId: string, name: string, _group: string) {
+// createChannelInGroup：新建频道并显式归入分类（#72）。categoryId 是服务端分类
+// id（'' = 不归类）；显式分类优先生效，缺省才由 store 走按名归组的旧路径。
+async function createChannelInGroup(serverId: string, name: string, categoryId: string) {
   const s = servers.findServer(serverId)
   if (!s) return
   if (s.builtin) {
     // 内置示例不支持新建（与 ServerRail 右键策略一致）。
     throw new Error('示例服务器不可新建频道')
   }
-  await servers.createChannel(serverId, name, 'voice')
+  await servers.createChannel(serverId, name, 'voice', categoryId)
 }
 
 // ---- 分类头右键：重命名 / 删除分类（含频道，二次确认） ----
@@ -419,8 +437,11 @@ async function onCatDrop(e: DragEvent, gi: number) {
     <!-- 分类名上限 32（服务端 validCategoryName）：上限放到 64 会打到 400 才报错（#16） -->
     <PromptDialog v-if="catRenaming" title="重命名分类" :initial="catRenaming.initial" cta="保存"
                   :maxlen="32" @confirm="onCatRenameConfirm" @close="catRenaming = null" />
+    <!-- 归入分类是显式选择（#72）：默认当前选中频道所在分类，改选即可换宿。 -->
     <PromptDialog v-if="blankPrompt?.mode === 'channel'" title="创建频道"
                   placeholder="频道名称" cta="创建"
+                  :options2="catChoices" :option2-default="defaultCatId"
+                  options2-label="归入分类"
                   @confirm="onBlankConfirm" @close="blankPrompt = null" />
     <PromptDialog v-else-if="blankPrompt?.mode === 'category'" title="创建分类"
                   placeholder="分类名称" cta="创建"

@@ -42,12 +42,16 @@ func (s *Server) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 分类归属校验（与 PATCH 同规则）：存在且属于本服务器，防止跨服挂载/悬空 id。
+	// 0 = 显式无分类，落库前归一成 NULL——否则 0 与 NULL 两种「无分类」并存，
+	// 而 PATCH 那侧一律落 NULL（见 handlePatchChannel）。
 	if req.CategoryID != nil && *req.CategoryID != 0 {
 		cat, err := s.store.CategoryByID(r.Context(), *req.CategoryID)
 		if err != nil || cat.ServerID != serverID {
 			writeErr(w, http.StatusBadRequest, "bad_category", "分类不存在或不属于该服务器")
 			return
 		}
+	} else {
+		req.CategoryID = nil
 	}
 	ch := &store.Channel{
 		ServerID:   serverID,

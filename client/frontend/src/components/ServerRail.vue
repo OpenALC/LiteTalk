@@ -91,6 +91,25 @@ const prompt = ref<
   | null
 >(null)
 
+// newChannelCats 归入分类候选（#72）：目标服务器的真实分类 + 末位「未分类」。
+// 目标是右键的服务器，不一定当前选中，故按 prompt.id 取；groupsOf 的合成组
+// （chan: 前缀）不是服务端分类，不能当归宿。
+const newChannelCats = computed(() => {
+  const p = prompt.value
+  if (!p || p.mode !== 'new-channel') return []
+  const s = store.findServer(p.id)
+  return [
+    ...store.groupsOf(p.id, s?.channels ?? [])
+      .filter((g) => !g.id.startsWith('chan:'))
+      .map((g) => ({ value: g.id, label: g.name })),
+    { value: '', label: '未分类' },
+  ]
+})
+
+// newChannelDefaultCat 本入口没有「当前选中分类」语境，默认取第一个真实分类。
+const newChannelDefaultCat = computed(() =>
+  newChannelCats.value.find((c) => c.value !== '')?.value ?? '')
+
 async function onCtxSelect(key: string) {
   const c = ctx.value
   if (!c) return
@@ -126,7 +145,7 @@ async function onCtxSelect(key: string) {
   }
 }
 
-async function onPromptConfirm(value: string, option: string) {
+async function onPromptConfirm(value: string, option: string, option2: string) {
   const p = prompt.value
   prompt.value = null
   if (!p) return
@@ -135,7 +154,8 @@ async function onPromptConfirm(value: string, option: string) {
       await store.renameServer(p.id, value)
       notify.show('已重命名')
     } else {
-      await store.createChannel(p.id, value, option === 'voice' ? 'voice' : 'text')
+      // option 是类型、option2 是归入分类 id（'' = 不归类，#72）。
+      await store.createChannel(p.id, value, option === 'voice' ? 'voice' : 'text', option2)
       notify.show('频道已创建')
     }
   } catch (e) { notify.fromErr(e) }
@@ -192,6 +212,8 @@ async function removeServer(id: string) {
                   placeholder="频道名称" cta="创建"
                   :options="[{ value: 'voice', label: '语音频道' }, { value: 'text', label: '文字频道' }]"
                   option-default="voice"
+                  :options2="newChannelCats" :option2-default="newChannelDefaultCat"
+                  options2-label="归入分类"
                   @confirm="onPromptConfirm" @close="prompt = null" />
   </nav>
 </template>

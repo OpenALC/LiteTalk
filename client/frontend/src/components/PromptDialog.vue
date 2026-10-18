@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // PromptDialog 单输入对话框：重命名 / 新建频道 / 添加好友等轻量输入场景。
 // 父组件用 v-if 挂载（每次打开重新挂载，initial 即初值）；Esc / 点遮罩关闭。
-// 可选 options 单选行（如频道类型 文字/语音）。
+// 可选两组单选行：options（如频道类型 文字/语音）与 options2（如归入分类，#72）。
 import { ref } from 'vue'
 import { X } from 'lucide-vue-next'
 
@@ -15,20 +15,25 @@ const props = withDefaults(defineProps<{
   maxlen?: number
   options?: { value: string; label: string }[]
   optionDefault?: string
+  // options2 第二组单选：与 options 互不影响，各行自带 label 区分用途。
+  options2?: { value: string; label: string }[]
+  option2Default?: string
+  options2Label?: string
 }>(), { placeholder: '', cta: '确定', initial: '', maxlen: 64 })
 
 const emit = defineEmits<{
-  (e: 'confirm', value: string, option: string): void
+  (e: 'confirm', value: string, option: string, option2: string): void
   (e: 'close'): void
 }>()
 
 const value = ref(props.initial)
 const option = ref(props.optionDefault ?? props.options?.[0]?.value ?? '')
+const option2 = ref(props.option2Default ?? props.options2?.[0]?.value ?? '')
 
 function submit() {
   const v = value.value.trim()
   if (!v) return
-  emit('confirm', v, option.value)
+  emit('confirm', v, option.value, option2.value)
 }
 </script>
 
@@ -45,6 +50,13 @@ function submit() {
       <div v-if="options?.length" class="pd-opts">
         <button v-for="o in options" :key="o.value" type="button"
                 :class="{ on: option === o.value }" @click="option = o.value">
+          {{ o.label }}
+        </button>
+      </div>
+      <div v-if="options2?.length" class="pd-opts pd-opts2">
+        <span v-if="options2Label" class="pd-opts-label">{{ options2Label }}</span>
+        <button v-for="o in options2" :key="o.value" type="button"
+                :class="{ on: option2 === o.value }" @click="option2 = o.value">
           {{ o.label }}
         </button>
       </div>
@@ -91,6 +103,12 @@ function submit() {
 .pd-opts button.on {
   background: rgba(79, 164, 243, 0.12); color: var(--brand-700); font-weight: 600;
 }
+/* 第二组单选（归入分类）：分类数不定，允许换行；行首小字标明用途 */
+.pd-opts2 { flex-wrap: wrap; }
+.pd-opts2 .pd-opts-label {
+  width: 100%; font-size: 11.5px; letter-spacing: 0.4px; color: var(--ink-400);
+}
+.pd-opts2 button { flex: 1 0 auto; min-width: 64px; }
 .pd-acts { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
 .pd-cancel {
   height: 36px; padding: 0 16px; border-radius: 10px;

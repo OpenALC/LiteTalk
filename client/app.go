@@ -1226,9 +1226,9 @@ func (a *App) CreateInviteCode(serverID int64) (string, error) {
 	return a.api.CreateInvite(serverID)
 }
 
-// CreateChannel 新建频道（typ: text / voice）。
-func (a *App) CreateChannel(serverID int64, name, typ string) (*state.ChannelDTO, error) {
-	return a.api.CreateChannel(serverID, name, typ)
+// CreateChannel 新建频道（typ: text / voice；categoryID 0 = 不归类）。
+func (a *App) CreateChannel(serverID int64, name, typ string, categoryID int64) (*state.ChannelDTO, error) {
+	return a.api.CreateChannel(serverID, name, typ, categoryID)
 }
 
 // RenameChannel 重命名频道（owner/admin）。

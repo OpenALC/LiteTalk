@@ -7,8 +7,8 @@ import { useNotifyStore } from './notify'
 // 频道/服务器/好友数据域。
 // 服务器/频道的管理操作已接真实 REST（批次①）；频道列表经
 // GET /servers/{id}/channels 在登录后逐服恢复（#12）——重启不再丢列表。
-// 服务端已建频道挂到分类下，但客户端新建频道暂不带 category_id（issue 未覆盖），
-// 会话内新建的频道落在类型默认组，重启后随服务端数据归位（见 loadChannels）。
+// 新建频道可显式指定分类（#72）：category_id 由服务端落库，本地 group 取分类名，
+// 与 #16 的按名归组同一套显示语义；不指定时仍按类型默认组名过渡。
 
 export const UNCATEGORIZED = '未分类'
 
@@ -271,15 +271,23 @@ export const useServersStore = defineStore('servers', () => {
     }
   }
 
-  // createChannel 新建频道（REST），拿到真实数字 ID 后按类型入对应分组。
-  async function createChannel(serverId: string, name: string, type: 'text' | 'voice') {
+  // createChannel 新建频道（REST）。categoryId 显式指定归属：分类 id，'' = 未分类；
+  // 不传 = 不指定，留给调用方走旧路径。显式指定优先——group 取该分类名，groupsOf
+  // 的按名归组立刻把它挂对（#72），不用等重启后 ListChannels 对账；缺省才退回
+  // 类型默认组名（#16 按名归组的过渡语义，两种入口不要打架）。
+  async function createChannel(serverId: string, name: string, type: 'text' | 'voice', categoryId?: string) {
     const s = findServer(serverId)
     if (!s) return
     if (s.builtin) throw new Error('示例服务器不可新建频道')
-    const c = await goApp().CreateChannel(Number(serverId), name, type)
+    const catId = categoryId ? Number(categoryId) : 0
+    const c = await goApp().CreateChannel(Number(serverId), name, type, catId)
+    const cat = categoryId ? (extraGroups.value[serverId] ?? []).find((g) => g.id === categoryId) : undefined
     s.channels.push({
       id: String(c.id), name: c.name, type,
-      group: type === 'voice' ? '语音频道' : '文字频道',
+      // 显式指定但找不到分类名：归「未分类」等下次加载修正，别塞类型默认组造假分组。
+      group: categoryId === undefined
+        ? (type === 'voice' ? '语音频道' : '文字频道')
+        : (cat?.name ?? UNCATEGORIZED),
     })
   }
 
