@@ -102,6 +102,47 @@ func TestSpeakingDetection(t *testing.T) {
 	t.Logf("speaking OFF after %d frames of silence (%dms)", offAt, offAt*10)
 }
 
+// TestAudioLevel RFC 6464 电平（#33）：复用 updateSpeaking 的帧 RMS 换算，
+// 响亮→小值、静音→127；rmsToLevel 的刻度与 dbFS 同基准（满幅 32767）。
+func TestAudioLevel(t *testing.T) {
+	d := newTestDSP(t, func(c *DSPConfig) { c.Denoise = false })
+
+	in := make([]int16, FrameSize)
+	out := make([]int16, FrameSize)
+	var phase float64
+	var rng uint32 = 0xC0FFEE
+
+	for f := 0; f < 20; f++ {
+		sineNoiseFrame(in, &phase, 12000, 2000, &rng)
+		if _, err := d.Process(out, in); err != nil {
+			t.Fatalf("Process: %v", err)
+		}
+	}
+	if lv := d.AudioLevel(); lv > 40 {
+		t.Fatalf("loud frame level = %d, want <= 40", lv)
+	}
+	for f := 0; f < 5; f++ {
+		clear(in)
+		if _, err := d.Process(out, in); err != nil {
+			t.Fatalf("Process: %v", err)
+		}
+	}
+	if lv := d.AudioLevel(); lv != 127 {
+		t.Fatalf("silence level = %d, want 127", lv)
+	}
+
+	// 换算刻度：rms=32767 → 0dB → 0；每 -20dB(×0.1) 电平 +20。
+	if lv := rmsToLevel(32767); lv != 0 {
+		t.Fatalf("rmsToLevel(32767) = %d, want 0", lv)
+	}
+	if lv := rmsToLevel(327.67); lv < 38 || lv > 41 {
+		t.Fatalf("rmsToLevel(327.67) = %d, want ≈40", lv)
+	}
+	if lv := rmsToLevel(0); lv != 127 {
+		t.Fatalf("rmsToLevel(0) = %d, want 127", lv)
+	}
+}
+
 // TestNoiseGate 低电平纯白噪声不应触发说话（spike 发现其 VAD 均值 0.569 偏高，
 // 必须由 RMS 门限拦住）。
 func TestNoiseGate(t *testing.T) {

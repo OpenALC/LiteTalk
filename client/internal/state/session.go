@@ -216,6 +216,11 @@ func (s *Session) Connect(serverURL string) {
 	pcfg.DSP.OnSpeakingChange = func(speaking bool) {
 		// DSP 回调跑在音频 goroutine 上，必须非阻塞：投递到容量 1 的
 		// voiceSend，由下方专用 goroutine 发送；积压时丢弃旧值只留最新。
+		// v2 停发（#33 裁定 #5）：说话态改由服务端按 RFC 6464 电平统一判定
+		//（voice.speaking 回来驱动 UI）；这条上报只留给 v1 兼容路径。
+		if s.protoVer.Load() >= 2 {
+			return
+		}
 		if s.muted.Load() {
 			speaking = false
 		}
@@ -431,6 +436,33 @@ func (s *Session) registerHandlers() {
 		}
 		s.mu.Unlock()
 	})
+	// voice.speaking：服务端按 RFC 6464 电平统一判定的说话翻转（#33），含自己
+	//（自己的声波球同源，v1「自己不亮」的问题随本消息消失）。mute/deafen 电平
+	// 表达不了，仍走 voice.state。
+	s.ws.On(signal.TypeVoiceSpeaking, func(env signal.Envelope) {
+		var d signal.VoiceSpeakingData
+		if env.Decode(&d) != nil || d.UserID == "" {
+			return
+		}
+		s.mu.Lock()
+		if v, ok := s.members[d.UserID]; ok {
+			v.Speaking = d.Speaking
+			s.members[d.UserID] = v
+		}
+		selfID := s.selfID
+		s.mu.Unlock()
+		if d.UserID == selfID {
+			// 自己的 mute/deafen 以本地状态为准：StateTable 无 self 条目，
+			// 用表值回填会把前端的闭麦显示冲掉。
+			if s.ev.OnPeerSpeaking != nil {
+				s.ev.OnPeerSpeaking(d.UserID, d.Speaking, s.muted.Load(), s.deafened.Load())
+			}
+			return
+		}
+		if s.states != nil {
+			s.states.Apply(d.UserID, &d.Speaking, nil, nil)
+		}
+	})
 	s.ws.On(signal.TypeChannelPeerLeft, func(env signal.Envelope) {
 		var d signal.PeerLeftData
 		if env.Decode(&d) != nil {
@@ -590,6 +622,8 @@ func (s *Session) setupPeer() {
 		// 处理器里，同步拉凭证会把信令收发停摆到撞心跳预算（#13）。
 		ICEServers:      s.cachedICE(),
 		IncludeLoopback: IsLoopbackURL(s.api.Base()), // 环回候选仅本机/内网 SFU 需要
+		// RFC 6464 电平源（#33）：管线 DSP 已算好的帧电平，SendOpus 每包读一次。
+		LevelFn: s.pipe.AudioLevel,
 		Callbacks: rtc.PeerCallbacks{
 			OnLocalSDP: func(sdp webrtc.SessionDescription) {
 				msgType := signal.TypeRTCOffer

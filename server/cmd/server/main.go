@@ -150,12 +150,14 @@ func main() {
 	// ICE-TCP 默认与 UDP 同号（各自独立 socket，不是共 socket 复用）；0 = 关闭。
 	sfuTCPPort := envInt("LITETALK_SFU_TCP", sfuUDPPort)
 	sfuInst, err := sfu.New(sfu.Config{
-		UDPPort:    sfuUDPPort,
-		TCPPort:    sfuTCPPort,
-		NAT1To1IP:  sfuIP,
-		MaxMembers: envInt("LITETALK_SFU_MAX", 10),
-		MaxRooms:   envInt("LITETALK_MAX_ROOMS", 50),
-		Logger:     log.Default(),
+		UDPPort:      sfuUDPPort,
+		TCPPort:      sfuTCPPort,
+		NAT1To1IP:    sfuIP,
+		MaxMembers:   envInt("LITETALK_SFU_MAX", 10),
+		MaxRooms:     envInt("LITETALK_MAX_ROOMS", 50),
+		ActiveN:      cfg.sfuActiveN,
+		ActiveHoldMS: cfg.sfuActiveHoldMS,
+		Logger:       log.Default(),
 	})
 	if err != nil {
 		log.Fatalf("SFU 初始化失败: %v", err)

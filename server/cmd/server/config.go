@@ -25,6 +25,8 @@ type config struct {
 	acme             bool   // 启用内置 ACME（domain 非空且未 behind-proxy）
 	printAdminInvite bool   // -print-admin-invite：打印管理员邀请码后退出（#27 T4 填实现）
 	gatewayBacklog   int    // -gateway-backlog / LITETALK_GATEWAY_BACKLOG：每会话事件环条数（#32）
+	sfuActiveN       int    // -sfu-active-n / LITETALK_SFU_ACTIVE_N：活跃转发路数（#33，<=0 关闭门控）
+	sfuActiveHoldMS  int    // -sfu-active-hold-ms / LITETALK_SFU_ACTIVE_HOLD_MS：活跃源最少保持毫秒（#33）
 
 	// 校验输入（启动序步骤 2 集中把关；本批无对应 flag，仅 env）
 	jwtSecret     string
@@ -54,6 +56,10 @@ func loadConfig(args []string, output io.Writer) (*config, error) {
 		"重新打印管理员邀请码后退出")
 	gatewayBacklog := fs.Int("gateway-backlog", envInt("LITETALK_GATEWAY_BACKLOG", 256),
 		"每会话事件环条数（#32 断线续传窗口；<=0 回落 256）")
+	sfuActiveN := fs.Int("sfu-active-n", envInt("LITETALK_SFU_ACTIVE_N", 5),
+		"活跃转发路数（#33 只转发 top-N 说话源；<=0 关闭门控全转发）")
+	sfuActiveHold := fs.Int("sfu-active-hold-ms", envInt("LITETALK_SFU_ACTIVE_HOLD_MS", 1000),
+		"活跃源最少保持毫秒（#33 防 top-N 抖动；<=0 回落 1000）")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -68,6 +74,8 @@ func loadConfig(args []string, output io.Writer) (*config, error) {
 		dataDir:          *dataDir,
 		printAdminInvite: *printAdminInvite,
 		gatewayBacklog:   *gatewayBacklog,
+		sfuActiveN:       *sfuActiveN,
+		sfuActiveHoldMS:  *sfuActiveHold,
 		jwtSecret:        os.Getenv("LITETALK_JWT_SECRET"),
 		sfuIP:            envOr("LITETALK_SFU_IP", "127.0.0.1"),
 		sfuIPExplicit:    os.Getenv("LITETALK_SFU_IP") != "",

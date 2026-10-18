@@ -53,8 +53,16 @@ func (c *testClient) failedCalls() []string {
 
 func newTestSFU(t *testing.T, maxMembers int) *SFU {
 	t.Helper()
-	logger := log.New(os.Stderr, "[sfu] ", log.Lmicroseconds)
-	s, err := New(Config{UDPPort: 0, NAT1To1IP: "127.0.0.1", MaxMembers: maxMembers, Logger: logger})
+	return newTestSFUCfg(t, Config{UDPPort: 0, NAT1To1IP: "127.0.0.1", MaxMembers: maxMembers})
+}
+
+// newTestSFUCfg 按完整配置建 SFU（ActiveN 等必须构造期确定，ticker 在跑）。
+func newTestSFUCfg(t *testing.T, cfg Config) *SFU {
+	t.Helper()
+	if cfg.Logger == nil {
+		cfg.Logger = log.New(os.Stderr, "[sfu] ", log.Lmicroseconds)
+	}
+	s, err := New(cfg)
 	if err != nil {
 		t.Fatalf("创建 SFU: %v", err)
 	}
@@ -73,6 +81,12 @@ func newTestClientNet(t *testing.T, s *SFU, roomID, userID string, tcpOnly bool)
 	t.Helper()
 	me := &webrtc.MediaEngine{}
 	if err := me.RegisterDefaultCodecs(); err != nil {
+		t.Fatal(err)
+	}
+	// RFC 6464 电平扩展（#33）：与真实客户端一致，协商上才测得到电平路径。
+	if err := me.RegisterHeaderExtension(webrtc.RTPHeaderExtensionCapability{
+		URI: audioLevelURI,
+	}, webrtc.RTPCodecTypeAudio); err != nil {
 		t.Fatal(err)
 	}
 	// 本机测试：SFU 宣告 127.0.0.1，客户端必须带 loopback 候选才能配对
