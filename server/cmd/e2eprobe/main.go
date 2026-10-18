@@ -9,6 +9,7 @@
 //	go run ./cmd/e2eprobe -addr 127.0.0.1:8077 -loopback   # 本机服务端
 //	go run ./cmd/e2eprobe -addr 127.0.0.1:8077 -multi-device  # 多设备会话场景（踢线/共存/语音抢占）
 //	go run ./cmd/e2eprobe -addr 127.0.0.1:8077 -presence  # 在线状态场景（好友 online 随连断翻转）
+//	go run ./cmd/e2eprobe -addr 127.0.0.1:8077 -rejoin -loopback  # 重入房场景（离房再入房，B 须恢复收听）
 package main
 
 import (
@@ -36,6 +37,7 @@ type config struct {
 	multiDevice bool
 	relay       bool
 	presence    bool
+	rejoin      bool
 }
 
 // register 注册（邮箱撞库则登录），返回注册邮箱、access token、用户 ID 与 iceServers。
@@ -98,6 +100,7 @@ func main() {
 	flag.BoolVar(&cfg.multiDevice, "multi-device", false, "多设备会话场景：同设备踢线/异设备共存/语音抢占")
 	flag.BoolVar(&cfg.relay, "relay", false, "验证 TURN 凭证含 turn/turns 中继地址（需 LITETALK_TURN_SECRET 已配）")
 	flag.BoolVar(&cfg.presence, "presence", false, "在线状态场景：好友 online 随 WS 连断翻转")
+	flag.BoolVar(&cfg.rejoin, "rejoin", false, "重入房场景：离房再入房，B 须恢复收听（#23）")
 	flag.Parse()
 	if cfg.users < 2 {
 		fmt.Fprintln(os.Stderr, "users ≥ 2")
@@ -106,6 +109,12 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	if cfg.rejoin {
+		code := runRejoin(ctx, cfg)
+		stop()
+		os.Exit(code)
+	}
 
 	if cfg.presence {
 		code := runPresence(ctx, cfg)
