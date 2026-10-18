@@ -151,7 +151,7 @@ func NewHub(s *sfu.SFU, authn Authenticator, sess *auth.SessionIndex, logger *lo
 	if logger == nil {
 		logger = log.Default()
 	}
-	return &Hub{
+	h := &Hub{
 		sfu:            s,
 		auth:           authn,
 		sess:           sess,
@@ -171,6 +171,9 @@ func NewHub(s *sfu.SFU, authn Authenticator, sess *auth.SessionIndex, logger *lo
 		conns:          make(map[connKey]*client),
 		evlog:          newMemEventLog(chat.Backlog),
 	}
+	// SFU 说话翻转 → 网关事件面（#33）：判定在 SFU ticker，下发在 WS 层。
+	s.SetOnSpeaking(h.broadcastVoiceSpeaking)
+	return h
 }
 
 // SetProtoMax 设置服务端宣布的协议版本上限（LITETALK_PROTOCOL_MAX 逃生阀）。
@@ -882,7 +885,12 @@ func (h *Hub) handleRTCCandidate(c *client, cand ICECandidateData) {
 }
 
 // handleVoiceState 更新内存态成员表并向房间其他成员广播（服务端不校验）。
+// v2 客户端的 speaking 字段被忽略（#33 裁定 #5）：协议 2 起说话判定走 RFC 6464
+// 电平（voice.speaking），voice.state 只承载 mute/deafen；v1 客户端照旧全收全发。
 func (h *Hub) handleVoiceState(c *client, d VoiceStateData) {
+	if c.protoVer.Load() >= 2 {
+		d.Speaking = nil
+	}
 	h.mu.Lock()
 	roomID := c.roomIDLocked()
 	c.mu.Lock()

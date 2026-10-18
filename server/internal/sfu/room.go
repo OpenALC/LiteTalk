@@ -1,7 +1,9 @@
 package sfu
 
 import (
+	"sort"
 	"sync"
+	"time"
 
 	"github.com/pion/webrtc/v4"
 )
@@ -239,19 +241,32 @@ func (r *Room) ensureRoute(target *Peer, srcUserID string, src *webrtc.TrackRemo
 // forward 单条 inbound track 的透传循环：逐包 ReadRTP，扇出 WriteRTP 到
 // 房间内其他成员的对应 outbound track。不解包、不分析 payload。
 // inbound 读失败（对端 PC 关闭/轨道结束）即退出，自然停止所有转发。
-func (r *Room) forward(srcUserID string, src *webrtc.TrackRemote) {
+//
+// #33：每包先读 RFC 6464 电平写原子（判定 ticker 侧消费），再过活跃门——
+// 非活跃源整包丢弃但 track 保持挂载（Phase 1 包级门控；RemoveTrack 会触发
+// 重协商风暴，#23 踩过，这里禁止）。循环内不加锁不分配（pion ReadRTP 除外）。
+func (r *Room) forward(src *Peer, srcTrack *webrtc.TrackRemote, levelExtID uint8) {
 	for {
-		pkt, _, err := src.ReadRTP()
+		pkt, _, err := srcTrack.ReadRTP()
 		if err != nil {
 			return
 		}
+		if levelExtID != 0 {
+			if ext := pkt.Header.GetExtension(levelExtID); len(ext) > 0 {
+				src.level.Store(int32(ext[0] & 0x7F))
+			}
+			src.pktSeq.Add(1) // 停流检测（muted/DTX 后无包，ticker 据此按静音处理）
+		}
+		if !src.fwdActive.Load() {
+			continue
+		}
 		r.mu.RLock()
 		for uid, p := range r.peers {
-			if uid == srcUserID {
+			if uid == src.userID {
 				continue
 			}
 			p.mu.Lock()
-			route := p.outbound[srcUserID]
+			route := p.outbound[src.userID]
 			p.mu.Unlock()
 			if route == nil {
 				continue
@@ -261,5 +276,144 @@ func (r *Room) forward(srcUserID string, src *webrtc.TrackRemote) {
 			_ = route.track.WriteRTP(pkt)
 		}
 		r.mu.RUnlock()
+	}
+}
+
+// speakFlip 一次说话翻转（ticker 累积后统一触发回调）。
+type speakFlip struct {
+	userID   string
+	speaking bool
+}
+
+// activeCand 活跃门候选（判定 ticker 内部用）。
+type activeCand struct {
+	p     *Peer
+	level int32
+}
+
+// tick 一次说话判定 + 活跃门控（#33）。仅判定 ticker goroutine 调用；对 peer
+// 快照后在锁外处理，回调（进 WS 层）不得持任何 SFU 锁——hub 会持自己的锁调
+// SFU，交叉持锁必死锁。
+func (r *Room) tick(onSpeak OnSpeakingFn) {
+	r.mu.RLock()
+	peers := make([]*Peer, 0, len(r.peers))
+	for _, p := range r.peers {
+		peers = append(peers, p)
+	}
+	r.mu.RUnlock()
+	if len(peers) == 0 {
+		return
+	}
+
+	var flips []speakFlip
+	now := time.Now()
+	// 活跃候选（达门限或低电平宽限内），按电平升序取 top-N。
+	var cands []activeCand
+
+	for _, p := range peers {
+		lvl := p.level.Load()
+		if lvl < 0 {
+			// 无电平（v1 客户端/未协商扩展）：说话判定不做（v1 走 voice.state 上报
+			// 广播），活跃门不生效（恒转发，兼容老客户端）。
+			p.fwdActive.Store(true)
+			continue
+		}
+		// 停流视同静音（muted/DTX/断流后无包，最后一包电平不能把态卡住）。
+		if seq := p.pktSeq.Load(); seq == p.seenSeq {
+			p.staleRun++
+		} else {
+			p.seenSeq = seq
+			p.staleRun = 0
+		}
+		if p.staleRun >= levelStaleTicks {
+			lvl = 127
+		}
+
+		// 说话迟滞（对齐客户端 DSP：双门限 + 连续 tick 防抖）。
+		switch {
+		case lvl <= speakEnterLevel:
+			p.spkExitRun = 0
+			if !p.speaking {
+				p.spkEnterRun++
+				if p.spkEnterRun >= speakEnterTicks {
+					p.spkEnterRun = 0
+					p.speaking = true
+					flips = append(flips, speakFlip{p.userID, true})
+				}
+			}
+		case lvl > speakExitLevel:
+			p.spkEnterRun = 0
+			if p.speaking {
+				p.spkExitRun++
+				if p.spkExitRun >= speakExitTicks {
+					p.spkExitRun = 0
+					p.speaking = false
+					flips = append(flips, speakFlip{p.userID, false})
+				}
+			}
+		default:
+			p.spkEnterRun = 0
+			p.spkExitRun = 0
+		}
+
+		// 活跃门候选：达进入门限，或 active 中且低电平宽限未满。
+		if lvl > speakExitLevel {
+			p.gateExitRun++
+		} else {
+			p.gateExitRun = 0
+		}
+		if lvl <= speakEnterLevel || (p.fwdActive.Load() && p.gateExitRun < gateGraceTicks) {
+			cands = append(cands, activeCand{p, lvl})
+		}
+	}
+
+	r.rankActive(cands, peers, now)
+	if onSpeak != nil {
+		for _, f := range flips {
+			onSpeak(r.id, f.userID, f.speaking)
+		}
+	}
+}
+
+// rankActive 活跃门 top-N 选取（#33 Phase 1 包级门控）：
+//   - 候选按电平升序（响者优先）取前 N 为 winner；
+//   - 未 active 且 winner → 置位并记保持起点；
+//   - active 且非 winner：ActiveHoldMS 内保留（防 top-N 抖动），期满清位——
+//     只清 fwdActive（forward 停发包），track 全程挂载，绝不 RemoveTrack。
+//
+// 仅 ticker goroutine 调用。ActiveN<=0（门控关闭）时不动任何状态。
+func (r *Room) rankActive(cands []activeCand, peers []*Peer, now time.Time) {
+	if r.sfu.cfg.ActiveN <= 0 {
+		return
+	}
+	sort.Slice(cands, func(i, j int) bool {
+		if cands[i].level != cands[j].level {
+			return cands[i].level < cands[j].level
+		}
+		return cands[i].p.userID < cands[j].p.userID
+	})
+	winners := make(map[*Peer]bool, r.sfu.cfg.ActiveN)
+	for i := 0; i < len(cands) && i < r.sfu.cfg.ActiveN; i++ {
+		winners[cands[i].p] = true
+	}
+	hold := time.Duration(r.sfu.cfg.ActiveHoldMS) * time.Millisecond
+	for _, p := range peers {
+		if p.level.Load() < 0 {
+			continue // 无电平源恒转发，上面已置位
+		}
+		win := winners[p]
+		active := p.fwdActive.Load()
+		switch {
+		case !active && win:
+			p.fwdActive.Store(true)
+			p.gateHoldFrom = now
+		case active && !win:
+			if p.gateHoldFrom.IsZero() {
+				p.gateHoldFrom = now // 初始即 active 的成员，保持窗从首次评估起算
+			}
+			if now.Sub(p.gateHoldFrom) >= hold {
+				p.fwdActive.Store(false)
+			}
+		}
 	}
 }

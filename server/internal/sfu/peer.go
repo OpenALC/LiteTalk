@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/webrtc/v4"
@@ -42,6 +43,25 @@ type Peer struct {
 	initialAnswered   bool
 	negotiateAgain    bool
 	closed            bool
+
+	// —— RFC 6464 电平与活跃门控（#33）——
+	// level 最近一包的电平（0=0dB … 127=静音；-1=尚未收到）。forward 写、ticker 读。
+	level atomic.Int32
+	// pktSeq 上行包计数（forward 每包 +1）：ticker 对比发现停流（muted/DTX/断流）
+	// 后按静音处理，避免最后一包的电平把说话态永久卡住。
+	pktSeq atomic.Uint64
+	// fwdActive 活跃转发门（#33 Phase 1 包级门控）：ticker 写、forward 读。
+	// true=该源的包参与扇出 WriteRTP；false=只收不发（track 保持挂载，禁 RemoveTrack）。
+	fwdActive atomic.Bool
+
+	// —— 以下仅判定 ticker goroutine 访问（单写者，免锁）——
+	spkEnterRun  int       // 连续达进入门限的 tick 数
+	spkExitRun   int       // 连续低于退出门限的 tick 数
+	speaking     bool      // 当前说话态（翻转时经 OnSpeakingFn 下发）
+	gateExitRun  int       // 连续低于退出门限的 tick 数（活跃门 500ms 宽限）
+	gateHoldFrom time.Time // 进入 fwdActive 的时刻（ActiveHoldMS 最少保持）
+	seenSeq      uint64    // 上次 tick 时的 pktSeq（停流检测）
+	staleRun     int       // 连续无新包的 tick 数
 }
 
 func newPeer(room *Room, userID, connID string, sig SignalSender) (*Peer, error) {
@@ -58,6 +78,10 @@ func newPeer(room *Room, userID, connID string, sig SignalSender) (*Peer, error)
 		outbound: make(map[string]*outRoute),
 		debounce: newDebouncer(50 * time.Millisecond),
 	}
+	// 电平初值 -1=未收到（说话判定跳过；活跃门不拦，v1 兼容）。
+	// fwdActive 初值 true：首包前不丢包，ticker 下一拍（≤100ms）再收紧。
+	p.level.Store(-1)
+	p.fwdActive.Store(true)
 
 	// SFU 侧 trickle：候选随收随发
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
@@ -82,13 +106,17 @@ func newPeer(room *Room, userID, connID string, sig SignalSender) (*Peer, error)
 		p.inbound = append(p.inbound, remote)
 		p.mu.Unlock()
 
+		// RFC 6464 电平扩展（#33）：从协商到的头扩展里取 ID；未协商（v1 客户端）
+		// 取 0，forward 跳过电平写入，说话判定/活跃门控对该源自动失效。
+		levelExtID := audioLevelExtID(receiver.GetParameters().HeaderExtensions)
+
 		p.room.sfu.log.Printf("sfu: %s 上行轨道就绪 kind=%s ssrc=%d（房间 %s）",
 			p.userID, remote.Kind(), remote.SSRC(), p.room.id)
 
 		// 对端 SR 等 RTCP 仅 drain，防读缓冲淤积
 		go drainRTCPReceiver(receiver)
 		p.room.addRoutesFrom(p.userID, remote)
-		go p.room.forward(p.userID, remote)
+		go p.room.forward(p, remote, levelExtID)
 	})
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
