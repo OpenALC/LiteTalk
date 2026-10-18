@@ -533,11 +533,36 @@ func (m *Mem) CreateMessage(_ context.Context, msg *Message) error {
 	if _, ok := m.channels[msg.ChannelID]; !ok {
 		return ErrNotFound
 	}
+	// nonce 幂等：同用户同 nonce 只留一条（唯一索引语义，空 nonce 不去重）。
+	if msg.Nonce != "" {
+		for _, x := range m.messages {
+			if x.UserID == msg.UserID && x.Nonce == msg.Nonce {
+				return ErrConflict
+			}
+		}
+	}
 	msg.ID = newID(msg.ID)
 	msg.CreatedAt = time.Now()
 	cp := *msg
 	m.messages[msg.ID] = &cp
 	return nil
+}
+
+// messageMatch 收集频道消息并按 id 升序排序（分页共用）。
+func (m *Mem) messageMatch(channelID int64) []Message {
+	all := []Message{}
+	for _, msg := range m.messages {
+		if msg.ChannelID == channelID {
+			all = append(all, *msg)
+		}
+	}
+	// 插入排序（数据量小）。
+	for i := 1; i < len(all); i++ {
+		for j := i; j > 0 && all[j].ID < all[j-1].ID; j-- {
+			all[j], all[j-1] = all[j-1], all[j]
+		}
+	}
+	return all
 }
 
 func (m *Mem) MessagesBefore(_ context.Context, channelID, beforeID int64, limit int) ([]Message, error) {
@@ -546,36 +571,79 @@ func (m *Mem) MessagesBefore(_ context.Context, channelID, beforeID int64, limit
 	if limit <= 0 || limit > 50 {
 		limit = 50
 	}
-	// 收集符合条件的消息后按 id 倒序取 limit 条，再反转为正序返回。
-	all := []Message{}
-	for _, msg := range m.messages {
-		if msg.ChannelID != channelID {
-			continue
+	// 升序全集 → 截取 beforeID 之前最新 limit 条（仍按升序返回，与 SQL 实现一致）。
+	all := m.messageMatch(channelID)
+	if beforeID > 0 {
+		cut := all[:0]
+		for _, msg := range all {
+			if msg.ID < beforeID {
+				cut = append(cut, msg)
+			}
 		}
-		if beforeID > 0 && msg.ID >= beforeID {
-			continue
-		}
-		all = append(all, *msg)
-	}
-	// 插入排序（数据量小，limit≤50）。
-	for i := 1; i < len(all); i++ {
-		for j := i; j > 0 && all[j].ID > all[j-1].ID; j-- {
-			all[j], all[j-1] = all[j-1], all[j]
-		}
+		all = cut
 	}
 	if len(all) > limit {
-		all = all[:limit]
+		all = all[len(all)-limit:]
 	}
-	// 反转为正序（旧→新）。
 	out := make([]Message, len(all))
 	for i := range all {
-		out[i] = all[len(all)-1-i]
+		out[i] = all[i]
 		u, ok := m.users[out[i].UserID]
 		if ok {
 			out[i].SenderNickname, out[i].SenderTag = u.Nickname, u.Tag
 		}
 	}
 	return out, nil
+}
+
+// MessagesAfter 正序分页（向前翻）：id > afterID 的最早 limit 条。
+func (m *Mem) MessagesAfter(_ context.Context, channelID, afterID int64, limit int) ([]Message, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if limit <= 0 || limit > 50 {
+		limit = 50
+	}
+	all := m.messageMatch(channelID)
+	if afterID > 0 {
+		cut := all[:0]
+		for _, msg := range all {
+			if msg.ID > afterID {
+				cut = append(cut, msg)
+			}
+		}
+		all = cut
+	}
+	if len(all) > limit {
+		all = all[:limit]
+	}
+	out := make([]Message, len(all))
+	for i := range all {
+		out[i] = all[i]
+		u, ok := m.users[out[i].UserID]
+		if ok {
+			out[i].SenderNickname, out[i].SenderTag = u.Nickname, u.Tag
+		}
+	}
+	return out, nil
+}
+
+// MessageByNonce 幂等回读原消息。
+func (m *Mem) MessageByNonce(_ context.Context, userID int64, nonce string) (*Message, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if nonce == "" {
+		return nil, ErrNotFound
+	}
+	for _, x := range m.messages {
+		if x.UserID == userID && x.Nonce == nonce {
+			cp := *x
+			if u, ok := m.users[cp.UserID]; ok {
+				cp.SenderNickname, cp.SenderTag = u.Nickname, u.Tag
+			}
+			return &cp, nil
+		}
+	}
+	return nil, ErrNotFound
 }
 
 // ---- invites ----

@@ -231,7 +231,7 @@ describe('分类改名与排序', () => {
     await expect(s.reorderCategory('22', '3', 0)).rejects.toThrow('500')
     expect(s.extraGroups['22'].map((g) => g.name)).toEqual(['甲', '乙', '丙'])
 
-    mockGoApp.UpdateCategory.mockResolvedValue({ id: 3, server_id: 22, name: '丙', position: 0 })
+    mockGoApp.UpdateCategory.mockResolvedValue({ id: '3', server_id: '22', name: '丙', position: 0 })
     await s.reorderCategory('22', '3', 0)
     expect(mockGoApp.UpdateCategory).toHaveBeenCalledWith('3', '', 0)
     expect(s.extraGroups['22'].map((g) => g.name)).toEqual(['丙', '甲', '乙'])

@@ -109,6 +109,10 @@ func messageView(m *store.Message) Message {
 		Content:   m.Content,
 		CreatedAt: m.CreatedAt,
 	}
+	if m.Nonce != "" {
+		n := m.Nonce
+		out.Nonce = &n
+	}
 	if m.SenderNickname != "" {
 		n := m.SenderNickname
 		out.SenderNickname = &n

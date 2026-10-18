@@ -774,9 +774,14 @@ func (m *MySQL) ReorderCategories(ctx context.Context, serverID, id int64, posit
 
 func (m *MySQL) CreateMessage(ctx context.Context, msg *Message) error {
 	msg.ID = newID(msg.ID)
+	// 空 nonce 落 NULL：唯一索引 (user_id, nonce) 上 '' 会互相撞，NULL 不受约束。
+	var nonce any
+	if msg.Nonce != "" {
+		nonce = msg.Nonce
+	}
 	_, err := m.db.ExecContext(ctx,
-		`INSERT INTO messages (id, channel_id, user_id, content) VALUES (?, ?, ?, ?)`,
-		msg.ID, msg.ChannelID, msg.UserID, msg.Content)
+		`INSERT INTO messages (id, channel_id, user_id, content, nonce) VALUES (?, ?, ?, ?, ?)`,
+		msg.ID, msg.ChannelID, msg.UserID, msg.Content, nonce)
 	if err != nil {
 		if isDup(err) {
 			return ErrConflict
@@ -787,6 +792,9 @@ func (m *MySQL) CreateMessage(ctx context.Context, msg *Message) error {
 		Scan(&msg.CreatedAt)
 }
 
+// messageCols 列清单（nonce 经 COALESCE 归一空串，免 sql.NullString）。
+const messageCols = `m.id, m.channel_id, m.user_id, m.content, COALESCE(m.nonce, ''), m.created_at`
+
 func (m *MySQL) MessagesBefore(ctx context.Context, channelID, beforeID int64, limit int) ([]Message, error) {
 	if limit <= 0 || limit > 50 {
 		limit = 50
@@ -795,12 +803,12 @@ func (m *MySQL) MessagesBefore(ctx context.Context, channelID, beforeID int64, l
 	var err error
 	if beforeID > 0 {
 		rows, err = m.db.QueryContext(ctx,
-			`SELECT m.id, m.channel_id, m.user_id, m.content, m.created_at, u.nickname, u.tag
+			`SELECT `+messageCols+`, u.nickname, u.tag
 			 FROM messages m JOIN users u ON u.id = m.user_id
 			 WHERE m.channel_id = ? AND m.id < ? ORDER BY m.id DESC LIMIT ?`, channelID, beforeID, limit)
 	} else {
 		rows, err = m.db.QueryContext(ctx,
-			`SELECT m.id, m.channel_id, m.user_id, m.content, m.created_at, u.nickname, u.tag
+			`SELECT `+messageCols+`, u.nickname, u.tag
 			 FROM messages m JOIN users u ON u.id = m.user_id
 			 WHERE m.channel_id = ? ORDER BY m.id DESC LIMIT ?`, channelID, limit)
 	}
@@ -812,8 +820,8 @@ func (m *MySQL) MessagesBefore(ctx context.Context, channelID, beforeID int64, l
 	rev := []Message{}
 	for rows.Next() {
 		var msg Message
-		if err := rows.Scan(&msg.ID, &msg.ChannelID, &msg.UserID, &msg.Content,
-			&msg.CreatedAt, &msg.SenderNickname, &msg.SenderTag); err != nil {
+		if err := rows.Scan(&msg.ID, &msg.ChannelID, &msg.UserID, &msg.Content, &msg.Nonce, &msg.CreatedAt,
+			&msg.SenderNickname, &msg.SenderTag); err != nil {
 			return nil, err
 		}
 		rev = append(rev, msg)
@@ -826,6 +834,58 @@ func (m *MySQL) MessagesBefore(ctx context.Context, channelID, beforeID int64, l
 		out[i] = rev[len(rev)-1-i]
 	}
 	return out, nil
+}
+
+// MessagesAfter 正序分页（向前翻）：id > afterID 的最早 limit 条，按 id 正序返回。
+func (m *MySQL) MessagesAfter(ctx context.Context, channelID, afterID int64, limit int) ([]Message, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 50
+	}
+	var rows *sql.Rows
+	var err error
+	if afterID > 0 {
+		rows, err = m.db.QueryContext(ctx,
+			`SELECT `+messageCols+`, u.nickname, u.tag
+			 FROM messages m JOIN users u ON u.id = m.user_id
+			 WHERE m.channel_id = ? AND m.id > ? ORDER BY m.id ASC LIMIT ?`, channelID, afterID, limit)
+	} else {
+		rows, err = m.db.QueryContext(ctx,
+			`SELECT `+messageCols+`, u.nickname, u.tag
+			 FROM messages m JOIN users u ON u.id = m.user_id
+			 WHERE m.channel_id = ? ORDER BY m.id ASC LIMIT ?`, channelID, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Message{}
+	for rows.Next() {
+		var msg Message
+		if err := rows.Scan(&msg.ID, &msg.ChannelID, &msg.UserID, &msg.Content, &msg.Nonce, &msg.CreatedAt,
+			&msg.SenderNickname, &msg.SenderTag); err != nil {
+			return nil, err
+		}
+		out = append(out, msg)
+	}
+	return out, rows.Err()
+}
+
+// MessageByNonce 幂等回读原消息（带发送者内联信息，响应直接可用）。
+func (m *MySQL) MessageByNonce(ctx context.Context, userID int64, nonce string) (*Message, error) {
+	row := m.db.QueryRowContext(ctx,
+		`SELECT `+messageCols+`, u.nickname, u.tag
+		 FROM messages m JOIN users u ON u.id = m.user_id
+		 WHERE m.user_id = ? AND m.nonce = ?`, userID, nonce)
+	var msg Message
+	err := row.Scan(&msg.ID, &msg.ChannelID, &msg.UserID, &msg.Content, &msg.Nonce, &msg.CreatedAt,
+		&msg.SenderNickname, &msg.SenderTag)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &msg, nil
 }
 
 // ---- invites ----

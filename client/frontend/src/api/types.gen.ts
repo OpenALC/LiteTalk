@@ -480,14 +480,14 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * 消息分页（倒序，游标 before_id）
-         * @description limit 上限 50，默认 50。before_id 游标为「更旧一页」。 code：bad_request、路径参数不合法；401；403 forbidden； 404 not_found；5xx internal。
+         * 消息分页（游标，倒序取页正序返回）
+         * @description 游标分页（#31）：limit 上限 50，默认 50。before 取更旧一页（ID 小于游标 的最新 limit 条，旧→新正序返回）；after 取更新一页（ID 大于游标最早的 limit 条）。两者互斥，同给时 before 优先。禁用 offset。 before_id 为 before 的旧别名，兼容一个版本后移除。 code：bad_request、bad_cursor、路径参数不合法；401；403 forbidden； 404 not_found；5xx internal。
          */
         get: operations["listMessages"];
         put?: never;
         /**
-         * 发送文字消息（≤2000 字 + 频控 20/分）
-         * @description 仅文字频道。code：bad_channel、bad_content、bad_request、too_large、 路径参数不合法；401；403 forbidden；404 not_found；429 rate_limited； 5xx internal。
+         * 发送文字消息（≤2000 字 + 频控 20/分 + nonce 幂等）
+         * @description 仅文字频道。nonce（#31）：客户端生成的幂等键（≤64 字符），服务端按 (user_id, nonce) 去重；重复提交回读原消息返回 200（原消息体）， 新消息返回 201。不带 nonce 不去重。 code：bad_channel、bad_content、bad_nonce、bad_request、too_large、 路径参数不合法；401；403 forbidden；404 not_found；429 rate_limited； 5xx internal。
          */
         post: operations["createMessage"];
         delete?: never;
@@ -644,6 +644,8 @@ export interface components {
             channel_id: string;
             user_id: string;
             content: string;
+            /** @description 幂等键（#31）；未带 nonce 的消息无此字段 */
+            nonce?: string;
             /** Format: date-time */
             created_at: string;
             sender_nickname?: string;
@@ -828,6 +830,8 @@ export interface components {
         CreateMessageRequest: {
             /** @description 1–2000 字符 */
             content: string;
+            /** @description 幂等键（#31，≤64 字符）；同用户重复提交回读原消息（200）。缺省不去重。 */
+            nonce?: string;
         };
     };
     responses: {
@@ -1734,7 +1738,14 @@ export interface operations {
     listMessages: {
         parameters: {
             query?: {
-                /** @description 游标：只取 ID 小于该值的消息（0/缺省 = 最新一页） */
+                /** @description 游标：只取 ID 小于该值的消息（缺省 = 最新一页） */
+                before?: number;
+                /** @description 游标：只取 ID 大于该值的消息（向前翻更新；缺省 = 最旧一页） */
+                after?: number;
+                /**
+                 * @deprecated
+                 * @description before 的旧别名（兼容一个版本，#31；与 before 同义）
+                 */
                 before_id?: number;
                 /** @description 条数上限（1–50，越界回落 50） */
                 limit?: number;
@@ -1748,7 +1759,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description 消息数组（不含发送者邮箱） */
+            /** @description 消息数组（旧→新正序；不含发送者邮箱） */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -1780,6 +1791,15 @@ export interface operations {
             };
         };
         responses: {
+            /** @description nonce 重放（幂等命中），原消息体（sender_* 为发送者昵称与 tag） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Message"];
+                };
+            };
             /** @description 已发送（sender_* 为发送者昵称与 tag） */
             201: {
                 headers: {
