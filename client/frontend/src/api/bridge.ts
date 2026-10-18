@@ -133,7 +133,11 @@ const mockApp: GoApp = {
   async Login(email: string) {
     return {
       access_token: 'dev-token', refresh_token: 'dev-refresh',
-      user: { id: 1, nickname: email.split('@')[0] || 'dev', tag: '0001', email },
+      user: {
+        id: 1, nickname: email.split('@')[0] || 'dev', tag: '0001', email,
+        email_verified: true, is_guest: false, status: 0, online: true,
+        created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z',
+      },
     }
   },
   async Register(_n: string, email: string) {
@@ -144,11 +148,19 @@ const mockApp: GoApp = {
   async LoginAsGuest() {
     return {
       access_token: 'dev-token', refresh_token: 'dev-refresh',
-      user: { id: 2, nickname: '游客-0000', tag: '0000', email: '', is_guest: true },
+      user: {
+        id: 2, nickname: '游客-0000', tag: '0000', email: '',
+        email_verified: false, is_guest: true, status: 0, online: true,
+        created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z',
+      },
     }
   },
   async GetMe() {
-    return { id: 1, nickname: 'dev', tag: '0001', email: 'dev@example.com' }
+    return {
+      id: 1, nickname: 'dev', tag: '0001', email: 'dev@example.com',
+      email_verified: true, is_guest: false, status: 0, online: true,
+      created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z',
+    }
   },
   async LogFromWeb() {},
   async SetAudioDevices() {},
@@ -189,15 +201,15 @@ const mockApp: GoApp = {
   async ListServers() { return [] },
   async ListChannels(serverID: number) {
     return {
-      categories: [{ id: 1, server_id: serverID, name: '默认分类', position: 0 }],
-      channels: [{ id: 11, server_id: serverID, name: '大厅', type: 'voice' as const, category_id: 1, position: 0 }],
+      categories: [{ id: 1, server_id: serverID, name: '默认分类', position: 0, created_at: '2026-01-01T00:00:00Z' }],
+      channels: [{ id: 11, server_id: serverID, name: '大厅', type: 'voice' as const, category_id: 1, position: 0, created_at: '2026-01-01T00:00:00Z' }],
     }
   },
   async CreateServer(name: string) {
-    return { id: Date.now(), name, owner_id: 1, icon_name: 'messages-square', icon_color: '#4FA4F3' }
+    return { id: Date.now(), name, owner_id: 1, icon_name: 'messages-square', icon_color: '#4FA4F3', created_at: '2026-01-01T00:00:00Z' }
   },
   async JoinServerByCode() {
-    return { id: Date.now(), name: '加入的服务器', owner_id: 2, icon_name: 'messages-square', icon_color: '#4FA4F3' }
+    return { id: Date.now(), name: '加入的服务器', owner_id: 2, icon_name: 'messages-square', icon_color: '#4FA4F3', created_at: '2026-01-01T00:00:00Z' }
   },
   async RenameServer() {},
   async DeleteServer() {},
@@ -205,18 +217,18 @@ const mockApp: GoApp = {
   async CreateChannel(serverID: number, name: string, typ: string, categoryID: number) {
     return {
       id: Date.now(), server_id: serverID, name, type: typ as 'text' | 'voice',
-      category_id: categoryID || null,
+      category_id: categoryID || null, position: 0, created_at: '2026-01-01T00:00:00Z',
     }
   },
   async RenameChannel() {},
   async DeleteChannel() {},
   async CreateCategory(serverID: number, name: string) {
-    return { id: Date.now(), server_id: serverID, name, position: 0 }
+    return { id: Date.now(), server_id: serverID, name, position: 0, created_at: '2026-01-01T00:00:00Z' }
   },
   async DeleteCategory() {},
   async RenameCategory() {},
   async UpdateCategory(id: number, name: string, position: number) {
-    return { id, server_id: 0, name: name || `分类${id}`, position: position < 0 ? 0 : position }
+    return { id, server_id: 0, name: name || `分类${id}`, position: position < 0 ? 0 : position, created_at: '2026-01-01T00:00:00Z' }
   },
   async SendFriendRequest() {},
   // 好友真实 REST 桩：空列表（浏览器开发环境无可联调数据）。

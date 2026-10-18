@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"log"
@@ -14,17 +15,20 @@ import (
 var errSentinel = errors.New("sentinel: db connection lost")
 
 // TestWriteStoreErrLogs500 writeStoreErr default 分支必须记底层错误并返回 500（#21）。
+// strict 迁移后返回 *apiErr 由 ResponseErrorHandlerFunc 写出，映射与日志行为不变。
 func TestWriteStoreErrLogs500(t *testing.T) {
 	var logBuf bytes.Buffer
 	srv, _ := newTestServerMode(t, AuthModeFull)
 	srv.log = log.New(&logBuf, "", 0)
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/users/me", nil)
-	rec := httptest.NewRecorder()
-	srv.writeStoreErr(rec, req, errSentinel)
-
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("期望 500，实际 %d", rec.Code)
+	ctx := context.WithValue(context.Background(), reqPathKey, "/api/v1/users/me")
+	err := srv.writeStoreErr(ctx, errSentinel)
+	var e *apiErr
+	if !errors.As(err, &e) {
+		t.Fatalf("应返回 *apiErr，实际 %T", err)
+	}
+	if e.status != http.StatusInternalServerError {
+		t.Fatalf("期望 500，实际 %d", e.status)
 	}
 	if !strings.Contains(logBuf.String(), "sentinel") {
 		t.Fatalf("日志应包含底层错误，实际: %q", logBuf.String())
@@ -135,5 +139,21 @@ func TestRateLimitCodesUnified(t *testing.T) {
 				t.Fatalf("code 应为 rate_limited，实际 %s", rec.Body.String())
 			}
 		}
+	}
+}
+
+// TestContentTypeCharset 响应头与旧 writeJSON 同口径：application/json 必带 charset
+// （strict 迁移后生成 Visit 写裸 application/json，由 contentTypeFixer 改写）。
+func TestContentTypeCharset(t *testing.T) {
+	srv, _ := newTestServerMode(t, AuthModeFull)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d", rec.Code)
+	}
+	const want = "application/json; charset=utf-8"
+	if got := rec.Header().Get("Content-Type"); got != want {
+		t.Fatalf("Content-Type 期望 %q，实际 %q", want, got)
 	}
 }

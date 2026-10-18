@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"time"
@@ -8,91 +9,73 @@ import (
 	"github.com/OpenALC/LiteTalk/server/internal/store"
 )
 
-// handleListMessages GET /api/v1/channels/{id}/messages?before_id=&limit=（分页 50 条）
-func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
-	c := currentUser(r)
-	id, ok := pathID(w, r, "id")
-	if !ok {
-		return
+// ListMessages GET /api/v1/channels/{id}/messages?before_id=&limit=（分页 50 条）
+func (s *Server) ListMessages(ctx context.Context, request ListMessagesRequestObject) (ListMessagesResponseObject, error) {
+	if e := checkID(request.Id); e != nil {
+		return nil, e
 	}
-	ch, err := s.store.ChannelByID(r.Context(), id)
+	c := currentUser(ctx)
+	ch, err := s.store.ChannelByID(ctx, request.Id)
 	if err != nil {
-		s.writeStoreErr(w, r, err)
-		return
+		return nil, s.writeStoreErr(ctx, err)
 	}
 	// 成员才能读频道消息。
-	if _, err := s.store.Member(r.Context(), ch.ServerID, c.UserID); err != nil {
-		writeErr(w, http.StatusForbidden, "forbidden", "不是服务器成员")
-		return
+	if _, err := s.store.Member(ctx, ch.ServerID, c.UserID); err != nil {
+		return nil, errf(http.StatusForbidden, "forbidden", "不是服务器成员")
 	}
 	var beforeID int64
-	if v := r.URL.Query().Get("before_id"); v != "" {
-		beforeID, _ = strconv.ParseInt(v, 10, 64)
+	if v := request.Params.BeforeId; v != nil {
+		beforeID = *v
 	}
 	limit := 50
-	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 50 {
-			limit = n
-		}
+	if v := request.Params.Limit; v != nil && *v > 0 && *v <= 50 {
+		limit = *v
 	}
-	msgs, err := s.store.MessagesBefore(r.Context(), id, beforeID, limit)
+	msgs, err := s.store.MessagesBefore(ctx, ch.ID, beforeID, limit)
 	if err != nil {
-		s.writeStoreErr(w, r, err)
-		return
+		return nil, s.writeStoreErr(ctx, err)
 	}
-	writeJSON(w, http.StatusOK, msgs)
-}
-
-type createMessageReq struct {
-	Content string `json:"content"`
+	return ListMessages200JSONResponse(msgs), nil
 }
 
 // 消息发送频控：20 条/分钟/用户。
 const msgRateLimit = 20
 
-// handleCreateMessage POST /api/v1/channels/{id}/messages（≤2000 字 + 频控）
-func (s *Server) handleCreateMessage(w http.ResponseWriter, r *http.Request) {
-	c := currentUser(r)
-	id, ok := pathID(w, r, "id")
-	if !ok {
-		return
+// CreateMessage POST /api/v1/channels/{id}/messages（≤2000 字 + 频控）
+func (s *Server) CreateMessage(ctx context.Context, request CreateMessageRequestObject) (CreateMessageResponseObject, error) {
+	if e := checkID(request.Id); e != nil {
+		return nil, e
 	}
-	ch, err := s.store.ChannelByID(r.Context(), id)
+	if request.Body == nil {
+		return nil, bodyMissing()
+	}
+	c := currentUser(ctx)
+	ch, err := s.store.ChannelByID(ctx, request.Id)
 	if err != nil {
-		s.writeStoreErr(w, r, err)
-		return
+		return nil, s.writeStoreErr(ctx, err)
 	}
 	if ch.Type != store.ChannelText {
-		writeErr(w, http.StatusBadRequest, "bad_channel", "只能向文字频道发消息")
-		return
+		return nil, errf(http.StatusBadRequest, "bad_channel", "只能向文字频道发消息")
 	}
-	if _, err := s.store.Member(r.Context(), ch.ServerID, c.UserID); err != nil {
-		writeErr(w, http.StatusForbidden, "forbidden", "不是服务器成员")
-		return
+	if _, err := s.store.Member(ctx, ch.ServerID, c.UserID); err != nil {
+		return nil, errf(http.StatusForbidden, "forbidden", "不是服务器成员")
 	}
-	var req createMessageReq
-	if !decodeJSON(w, r, &req) {
-		return
+	content := request.Body.Content
+	if n := len([]rune(content)); n == 0 || n > 2000 {
+		return nil, errf(http.StatusBadRequest, "bad_content", "消息长度需为 1–2000 字符")
 	}
-	n := len([]rune(req.Content))
-	if n == 0 || n > 2000 {
-		writeErr(w, http.StatusBadRequest, "bad_content", "消息长度需为 1–2000 字符")
-		return
-	}
-	allowed, err := s.limits.Allow(r.Context(), "msg:"+strconv.FormatInt(c.UserID, 10), msgRateLimit, time.Minute)
+	allowed, err := s.limits.Allow(ctx, "msg:"+strconv.FormatInt(c.UserID, 10), msgRateLimit, time.Minute)
 	if err != nil || !allowed {
-		writeErr(w, http.StatusTooManyRequests, "rate_limited", "发送过于频繁")
-		return
+		return nil, errf(http.StatusTooManyRequests, "rate_limited", "发送过于频繁")
 	}
 	msg := &store.Message{
-		ChannelID: id,
+		ChannelID: ch.ID,
 		UserID:    c.UserID,
-		Content:   req.Content,
+		Content:   content,
 	}
-	if err := s.store.CreateMessage(r.Context(), msg); err != nil {
-		s.writeStoreErr(w, r, err)
-		return
+	if err := s.store.CreateMessage(ctx, msg); err != nil {
+		return nil, s.writeStoreErr(ctx, err)
 	}
 	msg.SenderNickname, msg.SenderTag = c.Nickname, c.Tag
-	writeJSON(w, http.StatusCreated, msg)
+	return CreateMessage201JSONResponse(*msg), nil
 }

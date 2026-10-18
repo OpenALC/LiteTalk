@@ -73,6 +73,13 @@ jobs:
         run: go test -race -count=1 ./...
       - name: go build
         run: go build ./...
+      # 生成物新鲜度：契约（api/openapi.yaml + api/signal/）改了必须重新生成并提交。
+      # -skip-ts：TS 半边（types.gen.ts）在 check-frontend 校验（那侧才有 node_modules）。
+      - name: 生成代码新鲜度（signalgen + openapigen）
+        run: |
+          go run ./api/tools/signalgen
+          go run ./api/tools/openapigen -skip-ts
+          git diff --exit-code
 
   # 前端只在这里构建一次，dist 以 artifact 分发给客户端检查与各打包 job
   check-frontend:
@@ -95,6 +102,11 @@ jobs:
           cache-dependency-path: client/frontend/pnpm-lock.yaml
       - name: 安装依赖
         run: pnpm install --frozen-lockfile
+      # 生成物新鲜度（TS 半边）：openapi.yaml 改了必须重新生成 types.gen.ts 并提交。
+      - name: 生成代码新鲜度（types.gen.ts）
+        run: |
+          pnpm run gen:types
+          git diff --exit-code -- src/api/types.gen.ts
       - name: 类型检查（vue-tsc）
         run: pnpm run type-check
       - name: 单元测试（vitest）
