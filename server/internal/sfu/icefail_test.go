@@ -70,6 +70,14 @@ func TestICEFailCleansPeerOnClientVanish(t *testing.T) {
 	if peerOutbound(s, "c1", "bob", "alice") {
 		t.Fatal("ICE 失败后 B 指向 A 的下行路由未摘除（#23 同因）")
 	}
+	// 摘除先于 SendFailed（peer.go onConnFailed）：轮询到 peer 消失时通知可能还在
+	// 路上，直接断言会把在途通知当成缺失（跑全包 -race 时稳定复现）。等通知落地
+	// 再断言，并留一小段窗口确认没有第二次。
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && len(a.failedCalls()) == 0 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
 	calls := a.failedCalls()
 	if len(calls) != 1 || calls[0] != "c1|alice|ice_failed" {
 		t.Fatalf("应只通知本端一次 rtc.failed，实际 %v（#19）", calls)
