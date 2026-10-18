@@ -988,64 +988,79 @@ components:
     BadRequest:
       description: 请求不合法（body.code：bad_request / too_large / 各操作专属校验码）
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/ApiError'
+            $ref: '#/components/schemas/Problem'
     Unauthorized:
       description: >
         未登录或令牌失效（body.code：unauthorized / session_replaced /
         session_replayed / bad_credentials）。session_* 另带响应头 X-LiteTalk-Auth。
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/ApiError'
+            $ref: '#/components/schemas/Problem'
     Forbidden:
       description: 无权操作（body.code：forbidden / guest_disabled / reset_unavailable 等）
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/ApiError'
+            $ref: '#/components/schemas/Problem'
     NotFound:
       description: 资源不存在（body.code：not_found / bad_code 等）
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/ApiError'
+            $ref: '#/components/schemas/Problem'
     Conflict:
       description: 资源冲突（body.code：conflict / email_taken / already_friends / request_exists / bad_state / code_exhausted / category_not_empty 等）
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/ApiError'
+            $ref: '#/components/schemas/Problem'
     Gone:
       description: 已过期（body.code：code_expired）
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/ApiError'
+            $ref: '#/components/schemas/Problem'
     RateLimited:
       description: 触发限流（body.code：rate_limited）
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/ApiError'
+            $ref: '#/components/schemas/Problem'
     Internal:
       description: 服务端错误（body.code：internal / conflict / not_found / code_expired，store 错误映射）
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/ApiError'
+            $ref: '#/components/schemas/Problem'
   schemas:
-    ApiError:
+    Problem:
       type: object
-      title: ApiError
-      description: 统一错误体。code 为机器可读错误码，message 为中文提示。
-      required: [code, message]
+      title: Problem
+      description: >
+        RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段
+        （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错
+        的中文提示（旧 message 字段改名为 detail）。
+      required: [type, title, status, code, detail]
       properties:
+        type:
+          type: string
+          description: 问题类型 URI（urn:litetalk:error:<code>）
+        title:
+          type: string
+          description: 问题类型摘要（随 status 定，不随实例变）
+        status:
+          type: integer
+          format: int32
+          description: HTTP 状态码（与响应行一致）
         code:
           type: string
-        message:
+          description: 机器可读错误码（扩展字段）
+        detail:
           type: string
+          description: 本次出错的中文提示
     StatusOk:
       type: object
       title: StatusOk
