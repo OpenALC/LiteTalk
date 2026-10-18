@@ -97,6 +97,7 @@ func main() {
 		UDPPort:    envInt("LITETALK_SFU_UDP", 7845),
 		NAT1To1IP:  sfuIP,
 		MaxMembers: envInt("LITETALK_SFU_MAX", 10),
+		MaxRooms:   envInt("LITETALK_MAX_ROOMS", 50),
 		Logger:     log.Default(),
 	})
 	if err != nil {
@@ -133,10 +134,13 @@ func main() {
 		log.Println("WS 鉴权: JWT")
 	}
 	hub := signal.NewHub(sfuInst, authenticator, sessIndex, log.Default(), 0, signal.ChatDeps{
-		Store:    st,
-		Limits:   limits,
-		Presence: presenceDeps{kv: kv, st: st},
-		Dev:      dev,
+		Store:     st,
+		Limits:    limits,
+		Presence:  presenceDeps{kv: kv, st: st},
+		Dev:       dev,
+		MaxConns:  envInt("LITETALK_MAX_CONNS", 8),
+		JoinRate:  envInt("LITETALK_JOIN_RATE", 30),
+		OfferRate: envInt("LITETALK_OFFER_RATE", 60),
 	})
 
 	// TURN 短期凭证签发（coturn use-auth-secret，§5.4）

@@ -53,6 +53,11 @@ type Hub struct {
 	rooms      map[string]*roomState
 	conns      map[connKey]*client // uid+"\x00"+dev → 当前连接（§0.8）
 	nextConnID uint64              // 连接标识自增（SFU peer 归属核对用）
+
+	// 配额与频控（#20）：maxConns 单 uid 连接数；joinRate/offerRate 每分钟每连接。
+	maxConns  int
+	joinRate  int
+	offerRate int
 }
 
 // connKey 连接索引键：uid + "\x00" + dev（§0.8；NUL 分隔避免与 ID 内容歧义）。
@@ -86,6 +91,13 @@ type client struct {
 	mu     sync.Mutex
 	roomID string // 当前所在频道（空 = 未加入）
 	state  VoiceStateData
+	rate   map[string]*rateWin // 单连接消息频控窗口（#20，随连接销毁丢弃）
+}
+
+// rateWin 固定窗计数（1 分钟窗，#20）。
+type rateWin struct {
+	start time.Time
+	n     int
 }
 
 // closeNow 立即断连（心跳超时/写失败/队列满）：幂等；取消读循环 ctx 并跳过关闭握手。
@@ -108,6 +120,11 @@ type ChatDeps struct {
 	// Dev 开发模式：放行非数字的内置房间 ID（M2 遗留场景，无 store 频道实体）。
 	// 生产构建（注入了版本号）必须为 false，否则任意字符串房间都可进入。
 	Dev bool
+	// MaxConns 单 uid 的 WS 连接数上限（多设备，#20）；0 = 不限。
+	MaxConns int
+	// JoinRate / OfferRate 单连接 channel.join、rtc.offer 的每分钟次数上限（#20）；0 = 不限。
+	JoinRate  int
+	OfferRate int
 }
 
 // NewHub 构造信令 hub。maxMembers <= 0 时取 SFU 的上限。
@@ -129,6 +146,9 @@ func NewHub(s *sfu.SFU, authn Authenticator, sess *auth.SessionIndex, logger *lo
 		limits:         chat.Limits,
 		presence:       chat.Presence,
 		dev:            chat.Dev,
+		maxConns:       chat.MaxConns,
+		joinRate:       chat.JoinRate,
+		offerRate:      chat.OfferRate,
 		heartbeatEvery: defaultHeartbeatEvery,
 		pongWait:       defaultPongWait,
 		readIdle:       defaultReadIdle,
@@ -152,6 +172,16 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"code":    "session_replaced",
 			"message": "账号已在其他设备登录",
+		})
+		return
+	}
+	// 连接数配额（#20）：单 uid 超上限拒握手（同 uid+dev 的重连是顶替，不占新名额）。
+	// 必须在 Accept 之前拒绝——升级后再写状态码已无效。
+	if !h.connQuotaOK(id.UserID, id.Dev) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"code": ErrCodeQuotaExceeded, "message": "连接数已达上限",
 		})
 		return
 	}
@@ -453,6 +483,11 @@ func (h *Hub) handleMessage(c *client, data []byte) {
 			h.sendError(c, ErrCodeBadMessage, "channel.join 需要 channel_id")
 			return
 		}
+		// join 频控（#20）：单连接每分钟上限，超限 rate_limited。
+		if !h.allowRate(c, TypeChannelJoin, h.joinRate) {
+			h.sendError(c, ErrCodeRateLimited, "入房过于频繁")
+			return
+		}
 		if code, msg := h.authorizeChannelJoin(c, d.ChannelID); code != "" {
 			h.sendError(c, code, msg)
 			return
@@ -464,6 +499,11 @@ func (h *Hub) handleMessage(c *client, data []byte) {
 		var d SDPData
 		if err := env.Decode(&d); err != nil || d.SDP == "" {
 			h.sendError(c, ErrCodeBadMessage, "rtc.offer 需要 sdp")
+			return
+		}
+		// offer 频控（#20）：单连接每分钟上限，超限 rate_limited。
+		if !h.allowRate(c, TypeRTCOffer, h.offerRate) {
+			h.sendError(c, ErrCodeRateLimited, "协商过于频繁")
 			return
 		}
 		h.handleRTCOffer(c, d.SDP)
@@ -578,7 +618,8 @@ func (h *Hub) joinRoom(c *client, channelID string) {
 		for _, w := range pending {
 			h.finishLeave(w)
 		}
-		h.sendError(c, ErrCodeRoomFull, "语音房间已满")
+		// 容量超限统一 quota_exceeded（§0.1.3）。
+		h.sendError(c, ErrCodeQuotaExceeded, "语音房间已满")
 		return
 	}
 	// 语音单处：摘同 uid 其他会话（锁内），通知与 SFU 清理走 pending（锁外）。
@@ -695,8 +736,9 @@ func (h *Hub) handleRTCOffer(c *client, sdp string) {
 	answer, err := h.sfu.HandleOffer(roomID, c.userID, strconv.FormatUint(c.connID, 10), sdp, &clientSignal{hub: h, c: c})
 	if err != nil {
 		code := ErrCodeRTC
-		if errors.Is(err, sfu.ErrRoomFull) {
-			code = ErrCodeRoomFull
+		// 容量超限统一 quota_exceeded（§0.1.3）：每房人数 / 房间数。
+		if errors.Is(err, sfu.ErrRoomFull) || errors.Is(err, sfu.ErrTooManyRooms) {
+			code = ErrCodeQuotaExceeded
 		}
 		h.sendError(c, code, "RTC 协商失败: "+err.Error())
 		return
@@ -876,6 +918,52 @@ func (h *Hub) connsOfUID(uid string) []*client {
 		}
 	}
 	return out
+}
+
+// connQuotaOK 单 uid 连接数配额（#20）：同 uid+dev 的重连是顶替（净增 0），
+// 不占新名额；maxConns<=0 不限。持 h.mu。
+func (h *Hub) connQuotaOK(uid, dev string) bool {
+	if h.maxConns <= 0 {
+		return true
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	key := makeConnKey(uid, dev)
+	prefix := uid + "\x00"
+	n := 0
+	for k := range h.conns {
+		if k != key && strings.HasPrefix(string(k), prefix) {
+			n++
+		}
+	}
+	return n < h.maxConns
+}
+
+// rateWindow 单连接消息频控窗长（固定窗 1 分钟，#20）。
+const rateWindow = time.Minute
+
+// allowRate 单连接消息频控（键 = 消息类型，计数在连接上、随 cleanup 销毁）。
+// limit<=0 不限流；超限返回 false（调用方回 rate_limited）。
+func (h *Hub) allowRate(c *client, msgType string, limit int) bool {
+	if limit <= 0 {
+		return true
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	w := c.rate[msgType]
+	if w == nil || now.Sub(w.start) >= rateWindow {
+		if c.rate == nil {
+			c.rate = make(map[string]*rateWin, 2)
+		}
+		c.rate[msgType] = &rateWin{start: now, n: 1}
+		return true
+	}
+	if w.n >= limit {
+		return false
+	}
+	w.n++
+	return true
 }
 
 // ---- client / roomState 辅助 ----

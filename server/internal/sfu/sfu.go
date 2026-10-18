@@ -30,6 +30,8 @@ type Config struct {
 	NAT1To1IP string
 	// MaxMembers 房间人数上限（§5.2 默认 10）
 	MaxMembers int
+	// MaxRooms 房间数上限（env LITETALK_MAX_ROOMS，默认 50；#20）。0 = 不限。
+	MaxRooms int
 	// Logger 日志；nil 则丢弃
 	Logger *log.Logger
 }
@@ -112,15 +114,19 @@ func (s *SFU) MaxMembers() int { return s.cfg.MaxMembers }
 // Close 关闭 UDP mux，所有 PeerConnection 随之中断。
 func (s *SFU) Close() error { return s.conn.Close() }
 
-func (s *SFU) getOrCreateRoom(id string) *Room {
+func (s *SFU) getOrCreateRoom(id string) (*Room, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if r, ok := s.rooms[id]; ok {
-		return r
+		return r, nil
+	}
+	// 房间数配额（#20）：满额拒建新房，已有房间不受影响。
+	if s.cfg.MaxRooms > 0 && len(s.rooms) >= s.cfg.MaxRooms {
+		return nil, ErrTooManyRooms
 	}
 	r := newRoom(s, id)
 	s.rooms[id] = r
-	return r
+	return r, nil
 }
 
 func (s *SFU) findRoom(id string) *Room {
@@ -141,12 +147,18 @@ func (s *SFU) removeRoomIfEmpty(id string) {
 // ErrRoomFull 房间人数达到上限。
 var ErrRoomFull = fmt.Errorf("房间已满")
 
+// ErrTooManyRooms 房间数达到上限（#20，LITETALK_MAX_ROOMS）。
+var ErrTooManyRooms = fmt.Errorf("房间数已达上限")
+
 // HandleOffer 处理客户端初始 rtc.offer：创建/复用 PeerConnection、应答、
 // 并把房间既有成员的轨道补发给新成员（触发 SFU 侧重协商 offer）。
 // connID 为归属 WS 连接标识（§0.9）：LeaveIf 按此核对，避免误清新连接的 peer。
 // 返回 rtc.answer 的 SDP。
 func (s *SFU) HandleOffer(roomID, userID, connID, sdp string, sig SignalSender) (string, error) {
-	room := s.getOrCreateRoom(roomID)
+	room, err := s.getOrCreateRoom(roomID)
+	if err != nil {
+		return "", err
+	}
 	peer, err := room.addPeer(userID, connID, sig)
 	if err != nil {
 		return "", err
