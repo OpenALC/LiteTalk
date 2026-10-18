@@ -31,8 +31,6 @@ const (
 	TypeChatSend          = "chat.send"       // C→S
 	TypeChatMessage       = "chat.message"    // S→C
 	TypePresenceUpdate    = "presence.update" // S→C
-	TypeFriendRequest     = "friend.request"  // S→C
-	TypeFriendAccept      = "friend.accept"   // S→C
 	TypeError             = "error"           // S→C
 	// 批次 2 多设备会话（契约 §0.5，只增不改；与 server/internal/signal/protocol.go 同步）。
 	TypeSessionKicked     = "session.kicked"      // S→C 同类设备新登录踢线，随后 close 4001
