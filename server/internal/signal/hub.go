@@ -579,6 +579,13 @@ func (h *Hub) handleMessage(c *client, data []byte) {
 			return
 		}
 		h.handleChatSend(c, d)
+	case TypeGatewayResume:
+		var d GatewayResumeData
+		if err := env.Decode(&d); err != nil {
+			h.sendError(c, ErrCodeBadMessage, "gateway.resume 数据格式错误")
+			return
+		}
+		h.handleGatewayResume(c, d)
 	default:
 		h.sendError(c, ErrCodeBadMessage, "未知消息类型: "+env.Type)
 	}

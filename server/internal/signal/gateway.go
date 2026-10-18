@@ -274,3 +274,33 @@ func (h *Hub) broadcastEvent(uids map[string]bool, msgType string, data any) {
 		h.deliverEvent(c, msgType, payload, ts, seqs[c.sid])
 	}
 }
+
+// handleGatewayResume 处理 C→S gateway.resume{session_id, last_seq}（#32）。
+//
+// 补发窗口 = 环容量（LITETALK_GATEWAY_BACKLOG）∩ 空闲 TTL（30min）∩ 进程存活——
+// 环滚过、会话空闲淘汰、服务端重启都会导致补不上，回 gateway.invalid_session
+// 让客户端走 REST 全量补拉。
+//
+// 目标会话必须是当前连接自己的会话（token 里的 sid）：不允许借 resume 读别的
+// 会话的事件流；旧连接的事件也不会写进别的 sid 的环（Append 按 c.sid 寻址）。
+// 补发用环内留存的 payload 与原 seq 直投，不重新分配序号。
+func (h *Hub) handleGatewayResume(c *client, d GatewayResumeData) {
+	if d.SessionID == "" || d.LastSeq < 0 {
+		h.sendError(c, ErrCodeBadMessage, "gateway.resume 需要 session_id 与 last_seq>=0")
+		return
+	}
+	if c.sid == "" || d.SessionID != c.sid {
+		h.sendJSON(c, TypeGatewayInvalidSession, GatewayInvalidSessionData{Reason: "unknown_session"})
+		return
+	}
+	events, reason := h.evlog.Replay(d.SessionID, d.LastSeq+1)
+	if reason != "" {
+		h.log.Printf("ws: %s resume %s 失败（%s），last_seq=%d", c.userID, d.SessionID, reason, d.LastSeq)
+		h.sendJSON(c, TypeGatewayInvalidSession, GatewayInvalidSessionData{Reason: reason})
+		return
+	}
+	for _, ev := range events {
+		h.deliverEvent(c, ev.Type, ev.Payload, ev.TS, ev.Seq)
+	}
+	h.log.Printf("ws: %s resume %s 补发 %d 条（last_seq=%d）", c.userID, d.SessionID, len(events), d.LastSeq)
+}

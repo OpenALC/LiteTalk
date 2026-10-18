@@ -14,8 +14,8 @@ func ev(seq int64) Event {
 	return Event{Type: TypeChatMessage, Payload: p, TS: seq}
 }
 
-// TestEventLogAppendReplay 追加与补发：seq 从 1 起单调，Replay 从 fromSeq 起升序。
-func TestEventLogAppendReplay(t *testing.T) {
+// TestGatewayRingAppendReplay 追加与补发：seq 从 1 起单调，Replay 从 fromSeq 起升序。
+func TestGatewayRingAppendReplay(t *testing.T) {
 	l := newMemEventLog(8)
 	l.Bind("s1", "u1")
 	for i := 1; i <= 5; i++ {
@@ -42,8 +42,8 @@ func TestEventLogAppendReplay(t *testing.T) {
 	}
 }
 
-// TestEventLogOverflow 环滚过容量：补发起点落到被淘汰区间 → seq_expired。
-func TestEventLogOverflow(t *testing.T) {
+// TestGatewayRingOverflow 环滚过容量：补发起点落到被淘汰区间 → seq_expired。
+func TestGatewayRingOverflow(t *testing.T) {
 	l := newMemEventLog(3)
 	l.Bind("s1", "u1")
 	for i := 1; i <= 5; i++ {
@@ -58,8 +58,8 @@ func TestEventLogOverflow(t *testing.T) {
 	}
 }
 
-// TestEventLogUnknownSession 无环（未连接过/已淘汰/服务端重启后）→ unknown_session。
-func TestEventLogUnknownSession(t *testing.T) {
+// TestGatewayRingUnknownSession 无环（未连接过/已淘汰/服务端重启后）→ unknown_session。
+func TestGatewayRingUnknownSession(t *testing.T) {
 	l := newMemEventLog(8)
 	if _, reason := l.Replay("nope", 1); reason != "unknown_session" {
 		t.Fatalf("reason = %q, want unknown_session", reason)
@@ -78,8 +78,8 @@ func TestEventLogUnknownSession(t *testing.T) {
 	}
 }
 
-// TestEventLogSidsOf 会话归属：同 uid 多会话都能被广播定向；重绑刷新不重复。
-func TestEventLogSidsOf(t *testing.T) {
+// TestGatewayRingSidsOf 会话归属：同 uid 多会话都能被广播定向；重绑刷新不重复。
+func TestGatewayRingSidsOf(t *testing.T) {
 	l := newMemEventLog(8)
 	l.Bind("s1", "u1")
 	l.Bind("s2", "u1")
@@ -98,8 +98,8 @@ func TestEventLogSidsOf(t *testing.T) {
 	}
 }
 
-// TestEventLogIdleSweep 空闲淘汰后 unknown_session（续传窗口 = TTL ∩ 环容量）。
-func TestEventLogIdleSweep(t *testing.T) {
+// TestGatewayRingIdleSweep 空闲淘汰后 unknown_session（续传窗口 = TTL ∩ 环容量）。
+func TestGatewayRingIdleSweep(t *testing.T) {
 	l := newMemEventLog(8)
 	l.Bind("s1", "u1")
 	l.Append("s1", ev(1))
@@ -140,9 +140,9 @@ func TestChatMessageCarriesSeq(t *testing.T) {
 	}
 }
 
-// TestEventRingAccumulatesOffline 事件面订阅不依赖在线：断线会话的环继续留存
+// TestGatewayRingAccumulatesOffline 事件面订阅不依赖在线：断线会话的环继续留存
 // （这是「断线重连后事件不丢」的前提），同 sid 重连后可补发。
-func TestEventRingAccumulatesOffline(t *testing.T) {
+func TestGatewayRingAccumulatesOffline(t *testing.T) {
 	f := newChatFixture(t)
 	a := f.dial("1:desktop:sa", "alice")
 	b := f.dial("2:desktop:sb", "bob")
@@ -192,8 +192,8 @@ func TestEventRingAccumulatesOffline(t *testing.T) {
 	}
 }
 
-// TestEventRingPerSession 各会话 seq 独立：多设备两条环互不影响。
-func TestEventRingPerSession(t *testing.T) {
+// TestGatewayRingPerSession 各会话 seq 独立：多设备两条环互不影响。
+func TestGatewayRingPerSession(t *testing.T) {
 	f := newChatFixture(t)
 	a1 := f.dial("1:desktop:s1", "alice-d1")
 	a2 := f.dial("1:mobile:s2", "alice-d2")
