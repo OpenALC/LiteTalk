@@ -930,7 +930,7 @@ func (s *Session) fullResync() {
 	} else if s.ev.OnPresenceUpdate != nil {
 		for _, f := range friends {
 			if f.Status == "accepted" {
-				s.ev.OnPresenceUpdate(strconv.FormatInt(f.User.ID, 10), f.User.Online)
+				s.ev.OnPresenceUpdate(f.User.ID.String(), f.User.Online)
 			}
 		}
 	}
