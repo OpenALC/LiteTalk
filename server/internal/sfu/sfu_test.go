@@ -64,6 +64,12 @@ func newTestSFU(t *testing.T, maxMembers int) *SFU {
 
 // newTestClient 建一个客户端桩并完成与 SFU 的初始 offer/answer。
 func newTestClient(t *testing.T, s *SFU, roomID, userID string) *testClient {
+	return newTestClientNet(t, s, roomID, userID, false)
+}
+
+// newTestClientNet 建客户端桩；tcpOnly=true 时只启用 TCP 网络类型（模拟禁 UDP 网络，
+// 客户端只能用 ICE-TCP 候选与 SFU 建连）。
+func newTestClientNet(t *testing.T, s *SFU, roomID, userID string, tcpOnly bool) *testClient {
 	t.Helper()
 	me := &webrtc.MediaEngine{}
 	if err := me.RegisterDefaultCodecs(); err != nil {
@@ -73,6 +79,9 @@ func newTestClient(t *testing.T, s *SFU, roomID, userID string) *testClient {
 	//（pion 默认排除 loopback；真实部署时客户端在远端，无需此项）
 	se := webrtc.SettingEngine{}
 	se.SetIncludeLoopbackCandidate(true)
+	if tcpOnly {
+		se.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeTCP4, webrtc.NetworkTypeTCP6})
+	}
 	pc, err := webrtc.NewAPI(webrtc.WithMediaEngine(me), webrtc.WithSettingEngine(se)).NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		t.Fatal(err)
