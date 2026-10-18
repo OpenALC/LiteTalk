@@ -38,7 +38,7 @@ func TestFriendsOnlineField(t *testing.T) {
 	if err := mem.Set(t.Context(), presenceKeyOf(au.ID), "1", 0); err != nil {
 		t.Fatalf("Set presence A: %v", err)
 	}
-	fid := int(fr["id"].(float64))
+	fid := int(asID(fr["id"]))
 	acc := postJSON(t, h, fmt.Sprintf("/api/v1/friends/requests/%d/accept", fid), bTok, nil, 200)
 	if u := acc["user"].(map[string]any); u["online"] != true {
 		t.Fatalf("presence 键存在应 online=true，实际 %v", u["online"])
@@ -84,7 +84,7 @@ func TestFriendsOnlineNoKV(t *testing.T) {
 	}
 	fr := postJSON(t, h, "/api/v1/friends/requests", aTok,
 		map[string]string{"nickname": fmt.Sprintf("无KVB#%s", bu.Tag)}, 201)
-	fid := int(fr["id"].(float64))
+	fid := int(asID(fr["id"]))
 	acc := postJSON(t, h, fmt.Sprintf("/api/v1/friends/requests/%d/accept", fid), bTok, nil, 200)
 	if u := acc["user"].(map[string]any); u["online"] != false {
 		t.Fatalf("无 KV 时应恒 false，实际 %v", u["online"])

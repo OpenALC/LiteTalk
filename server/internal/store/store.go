@@ -7,6 +7,8 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"github.com/OpenALC/LiteTalk/server/internal/snowflake"
 )
 
 // 领域错误（API 层据此映射 HTTP 状态码）。
@@ -16,6 +18,15 @@ var (
 	ErrForbidden = errors.New("forbidden")
 	ErrExpired   = errors.New("expired")
 )
+
+// newID 新行主键（#31）：调用方未预置时取 Snowflake，显式赋值优先（测试夹具用）。
+// 各 Create 显式带 id 列插入，不再依赖 AUTO_INCREMENT；列上的 AUTO_INCREMENT 保留不动。
+func newID(id int64) int64 {
+	if id != 0 {
+		return id
+	}
+	return snowflake.Next()
+}
 
 // User 用户（§6.1 users 表）。无头像字段。
 type User struct {
@@ -111,11 +122,13 @@ type Category struct {
 }
 
 // Message 文字频道消息。
+// Nonce 客户端幂等键（#31）：空 = 不去重；(user_id, nonce) 唯一索引在 0005 迁移。
 type Message struct {
 	ID        int64     `json:"id" db:"id"`
 	ChannelID int64     `json:"channel_id" db:"channel_id"`
 	UserID    int64     `json:"user_id" db:"user_id"`
 	Content   string    `json:"content" db:"content"`
+	Nonce     string    `json:"nonce,omitempty" db:"nonce"`
 	CreatedAt time.Time `json:"created_at" db:"created_at"`
 	// Sender 内联发送者信息（列表响应用）。
 	SenderNickname string `json:"sender_nickname,omitempty" db:"-"`
@@ -151,6 +164,8 @@ type Store interface {
 	UserByEmail(ctx context.Context, email string) (*User, error)
 	UserByNicknameTag(ctx context.Context, nickname, tag string) (*User, error)
 	UpdateUser(ctx context.Context, u *User) error
+	// HasUsers 库内是否已有用户（首启探测用；UserByID(1) 随 Snowflake 失效）。
+	HasUsers(ctx context.Context) (bool, error)
 
 	// friendships
 	CreateFriendship(ctx context.Context, f *Friendship) error
@@ -193,9 +208,15 @@ type Store interface {
 	ReorderCategories(ctx context.Context, serverID, id int64, position int) error
 
 	// messages
+	// CreateMessage 带 nonce 且撞唯一索引时返回 ErrConflict（调用方回读原消息）。
 	CreateMessage(ctx context.Context, m *Message) error
-	// MessagesBefore 倒序分页：beforeID=0 取最新 limit 条（仍按 id 倒序返回）。
+	// MessagesBefore 倒序分页：beforeID=0 取最新 limit 条（按 id 正序返回，旧→新）。
 	MessagesBefore(ctx context.Context, channelID, beforeID int64, limit int) ([]Message, error)
+	// MessagesAfter 正序分页（向前翻更新）：afterID=0 取最旧 limit 条；取 id 大于
+	// afterID 的最早 limit 条，按 id 正序返回。limit 越界回落 50（与 Before 同口径）。
+	MessagesAfter(ctx context.Context, channelID, afterID int64, limit int) ([]Message, error)
+	// MessageByNonce 幂等回读：按 (user_id, nonce) 找原消息；无命中 ErrNotFound。
+	MessageByNonce(ctx context.Context, userID int64, nonce string) (*Message, error)
 
 	// invites
 	CreateInvite(ctx context.Context, inv *Invite) error

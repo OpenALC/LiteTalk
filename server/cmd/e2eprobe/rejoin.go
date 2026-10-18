@@ -46,7 +46,7 @@ func setupVoicePair(ctx context.Context, cfg *config) (room string, uA, uB *prob
 		return "", nil, nil, fmt.Errorf("建服务器: code=%d err=%v body=%s", code, err, body)
 	}
 	srv := struct {
-		ID int64 `json:"id"`
+		ID jsonID `json:"id"`
 	}{}
 	if err = json.Unmarshal(body, &srv); err != nil || srv.ID == 0 {
 		return "", nil, nil, fmt.Errorf("server id 解析: %s", body)
@@ -57,12 +57,12 @@ func setupVoicePair(ctx context.Context, cfg *config) (room string, uA, uB *prob
 		return "", nil, nil, fmt.Errorf("建语音频道: code=%d err=%v body=%s", code, err, body)
 	}
 	ch := struct {
-		ID int64 `json:"id"`
+		ID jsonID `json:"id"`
 	}{}
 	if err = json.Unmarshal(body, &ch); err != nil || ch.ID == 0 {
 		return "", nil, nil, fmt.Errorf("channel id 解析: %s", body)
 	}
-	room = strconv.FormatInt(ch.ID, 10)
+	room = ch.ID.String()
 
 	// A 发邀请 → B 凭码入服（进房权限要求服务器成员）。
 	code, body, err = restPost(cfg.addr, fmt.Sprintf("/servers/%d/invites", srv.ID), a.token,

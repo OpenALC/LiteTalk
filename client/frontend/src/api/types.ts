@@ -5,7 +5,9 @@
 import type { components } from './types.gen'
 
 // ---- REST 契约类型（openapi.yaml → types.gen.ts）----
-export type ApiError = components['schemas']['ApiError']
+// Problem：RFC 9457 问题详情（#31）；ApiError 为旧名兼容别名。
+export type Problem = components['schemas']['Problem']
+export type ApiError = Problem
 export type ServerConfig = components['schemas']['ServerConfig']
 export type User = components['schemas']['User']
 export type PublicUser = components['schemas']['PublicUser']

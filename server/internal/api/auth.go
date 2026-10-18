@@ -76,9 +76,8 @@ func normalizeEmail(s string) string {
 
 // Register POST /api/v1/auth/register（限流 10 次/h/IP：防批量注册与 bcrypt CPU 放大）
 func (s *Server) Register(ctx context.Context, request RegisterRequestObject) (RegisterResponseObject, error) {
-	ok, err := s.limits.Allow(ctx, "register:"+reqIP(ctx), 10, time.Hour)
-	if err != nil || !ok {
-		return nil, errf(http.StatusTooManyRequests, "rate_limited", "操作过于频繁，请稍后再试")
+	if e := s.allowRate(ctx, "register:"+reqIP(ctx), 10, time.Hour, "操作过于频繁，请稍后再试"); e != nil {
+		return nil, e
 	}
 	if request.Body == nil {
 		return nil, bodyMissing()
@@ -160,9 +159,8 @@ func (s *Server) GuestLogin(ctx context.Context, request GuestLoginRequestObject
 	if !s.simpleMode() {
 		return nil, errf(http.StatusForbidden, "guest_disabled", "游客登录仅在 simple 模式开放")
 	}
-	ok, err := s.limits.Allow(ctx, "guest:"+reqIP(ctx), 5, time.Minute)
-	if err != nil || !ok {
-		return nil, errf(http.StatusTooManyRequests, "rate_limited", "操作过于频繁，请稍后再试")
+	if e := s.allowRate(ctx, "guest:"+reqIP(ctx), 5, time.Minute, "操作过于频繁，请稍后再试"); e != nil {
+		return nil, e
 	}
 	// 请求体可为空（兼容老客户端）；非空时校验。
 	dev, okDev := deviceType("")
@@ -175,6 +173,7 @@ func (s *Server) GuestLogin(ctx context.Context, request GuestLoginRequestObject
 
 	// 昵称/邮箱/标签全部随机，冲突重试（同 Register 模式）
 	var user *store.User
+	var err error
 	for i := 0; i < 5; i++ {
 		user = &store.User{
 			Email:         fmt.Sprintf("guest-%s@guest.local", randHex(8)),
@@ -222,9 +221,8 @@ func randHex(n int) string {
 
 // Login POST /api/v1/auth/login（限流 5 次/min/IP）
 func (s *Server) Login(ctx context.Context, request LoginRequestObject) (LoginResponseObject, error) {
-	ok, err := s.limits.Allow(ctx, "login:"+reqIP(ctx), 5, time.Minute)
-	if err != nil || !ok {
-		return nil, errf(http.StatusTooManyRequests, "rate_limited", "登录过于频繁，请稍后再试")
+	if e := s.allowRate(ctx, "login:"+reqIP(ctx), 5, time.Minute, "登录过于频繁，请稍后再试"); e != nil {
+		return nil, e
 	}
 	if request.Body == nil {
 		return nil, bodyMissing()
@@ -297,7 +295,7 @@ func (s *Server) Refresh(ctx context.Context, request RefreshRequestObject) (Ref
 		AccessToken:  access,
 		RefreshToken: plain,
 		ExpiresIn:    int64(auth.AccessTokenTTL / time.Second),
-		User:         *user,
+		User:         userSelf(user),
 	}), nil
 }
 
@@ -335,9 +333,8 @@ func (s *Server) SendEmailCode(ctx context.Context, request SendEmailCodeRequest
 	if s.simpleMode() {
 		return nil, errf(http.StatusBadRequest, "verification_not_required", "当前服务未启用邮箱验证，无需验证码")
 	}
-	ok, err := s.limits.Allow(ctx, "emailcode:"+reqIP(ctx), 10, time.Hour)
-	if err != nil || !ok {
-		return nil, errf(http.StatusTooManyRequests, "rate_limited", "操作过于频繁，请稍后再试")
+	if e := s.allowRate(ctx, "emailcode:"+reqIP(ctx), 10, time.Hour, "操作过于频繁，请稍后再试"); e != nil {
+		return nil, e
 	}
 	if request.Body == nil {
 		return nil, bodyMissing()
@@ -382,9 +379,8 @@ func (s *Server) ResetPassword(ctx context.Context, request ResetPasswordRequest
 		return nil, errf(http.StatusForbidden, "reset_unavailable", "当前服务端未开启邮件功能，无法找回密码")
 	}
 	// 限流 10 次/h/IP：防对批量邮箱尝试爆破验证码。
-	ok, err := s.limits.Allow(ctx, "reset:"+reqIP(ctx), 10, time.Hour)
-	if err != nil || !ok {
-		return nil, errf(http.StatusTooManyRequests, "rate_limited", "操作过于频繁，请稍后再试")
+	if e := s.allowRate(ctx, "reset:"+reqIP(ctx), 10, time.Hour, "操作过于频繁，请稍后再试"); e != nil {
+		return nil, e
 	}
 	if request.Body == nil {
 		return nil, bodyMissing()
@@ -449,6 +445,6 @@ func (s *Server) issueTokens(ctx context.Context, user *store.User, dev string) 
 		AccessToken:  access,
 		RefreshToken: refresh,
 		ExpiresIn:    int64(auth.AccessTokenTTL / time.Second),
-		User:         *user,
+		User:         userSelf(user),
 	}, nil
 }

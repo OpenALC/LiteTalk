@@ -13,11 +13,28 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"time"
+	"strings"
 
-	"github.com/OpenALC/LiteTalk/server/internal/store"
 	"github.com/oapi-codegen/runtime"
 )
+
+// Defines values for ChannelInfoType.
+const (
+	ChannelInfoTypeText  ChannelInfoType = "text"
+	ChannelInfoTypeVoice ChannelInfoType = "voice"
+)
+
+// Valid indicates whether the value is a known member of the ChannelInfoType enum.
+func (e ChannelInfoType) Valid() bool {
+	switch e {
+	case ChannelInfoTypeText:
+		return true
+	case ChannelInfoTypeVoice:
+		return true
+	default:
+		return false
+	}
+}
 
 // Defines values for CreateChannelRequestType.
 const (
@@ -76,18 +93,21 @@ func (e FriendEntryStatus) Valid() bool {
 	}
 }
 
-// Defines values for PatchChannelRequestType.
+// Defines values for MemberInfoRole.
 const (
-	PatchChannelRequestTypeText  PatchChannelRequestType = "text"
-	PatchChannelRequestTypeVoice PatchChannelRequestType = "voice"
+	Admin  MemberInfoRole = "admin"
+	Member MemberInfoRole = "member"
+	Owner  MemberInfoRole = "owner"
 )
 
-// Valid indicates whether the value is a known member of the PatchChannelRequestType enum.
-func (e PatchChannelRequestType) Valid() bool {
+// Valid indicates whether the value is a known member of the MemberInfoRole enum.
+func (e MemberInfoRole) Valid() bool {
 	switch e {
-	case PatchChannelRequestTypeText:
+	case Admin:
 		return true
-	case PatchChannelRequestTypeVoice:
+	case Member:
+		return true
+	case Owner:
 		return true
 	default:
 		return false
@@ -133,17 +153,29 @@ type AddFriendRequest struct {
 	Tag      *string `json:"tag,omitempty"`
 }
 
-// ApiError 统一错误体。code 为机器可读错误码，message 为中文提示。
-type ApiError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+// CategoryInfo 频道分类。ID 为十进制字符串（#31）。
+type CategoryInfo struct {
+	CreatedAt Time   `json:"created_at"`
+	Id        ID     `json:"id"`
+	Name      string `json:"name"`
+	Position  int    `json:"position"`
+	ServerId  ID     `json:"server_id"`
 }
 
-// CategoryInfo defines model for CategoryInfo.
-type CategoryInfo = store.Category
+// ChannelInfo 频道。ID 为十进制字符串（#31）。
+type ChannelInfo struct {
+	// CategoryId 分类归属；null = 未分类（请求侧 0 也表示未分类）
+	CategoryId *ID             `json:"category_id"`
+	CreatedAt  Time            `json:"created_at"`
+	Id         ID              `json:"id"`
+	Name       string          `json:"name"`
+	Position   int             `json:"position"`
+	ServerId   ID              `json:"server_id"`
+	Type       ChannelInfoType `json:"type"`
+}
 
-// ChannelInfo defines model for ChannelInfo.
-type ChannelInfo = store.Channel
+// ChannelInfoType defines model for ChannelInfo.Type.
+type ChannelInfoType string
 
 // CreateCategoryRequest defines model for CreateCategoryRequest.
 type CreateCategoryRequest struct {
@@ -153,8 +185,8 @@ type CreateCategoryRequest struct {
 
 // CreateChannelRequest defines model for CreateChannelRequest.
 type CreateChannelRequest struct {
-	// CategoryId 0 或缺省 = 未分类
-	CategoryId *int64 `json:"category_id,omitempty"`
+	// CategoryId 0/缺省 = 未分类；请求侧数字与字符串双接受（#31）
+	CategoryId *ID `json:"category_id,omitempty"`
 
 	// Name 1–64 字符
 	Name     string                   `json:"name"`
@@ -178,6 +210,9 @@ type CreateInviteRequest struct {
 type CreateMessageRequest struct {
 	// Content 1–2000 字符
 	Content string `json:"content"`
+
+	// Nonce 幂等键（#31，≤64 字符）；同用户重复提交回读原消息（200）。缺省不去重。
+	Nonce *string `json:"nonce,omitempty"`
 }
 
 // CreateServerRequest defines model for CreateServerRequest.
@@ -206,7 +241,7 @@ type FriendEntry struct {
 	Group string `json:"group"`
 
 	// Id 关系行 ID（请求数）
-	Id int64 `json:"id"`
+	Id ID `json:"id"`
 
 	// Incoming true = 对端发起（我是被请求方）
 	Incoming bool              `json:"incoming"`
@@ -225,8 +260,17 @@ type GuestRequest struct {
 	Device *string `json:"device,omitempty"`
 }
 
-// Invite defines model for Invite.
-type Invite = store.Invite
+// Invite 邀请码。ID 为十进制字符串（#31）。
+type Invite struct {
+	Code      string `json:"code"`
+	CreatorId ID     `json:"creator_id"`
+	ExpiresAt *Time  `json:"expires_at,omitempty"`
+
+	// MaxUses 0 = 不限
+	MaxUses  int `json:"max_uses"`
+	ServerId ID  `json:"server_id"`
+	Uses     int `json:"uses"`
+}
 
 // JoinServerRequest defines model for JoinServerRequest.
 type JoinServerRequest struct {
@@ -245,11 +289,32 @@ type LogoutRequest struct {
 	RefreshToken string `json:"refresh_token"`
 }
 
-// MemberInfo 服务器成员（内存实现直接内联昵称/tag）。
-type MemberInfo = store.ServerMember
+// MemberInfo 服务器成员（内联昵称/tag）。ID 为十进制字符串（#31）。
+type MemberInfo struct {
+	JoinedAt Time           `json:"joined_at"`
+	Nickname *string        `json:"nickname,omitempty"`
+	Role     MemberInfoRole `json:"role"`
+	ServerId ID             `json:"server_id"`
+	Tag      *string        `json:"tag,omitempty"`
+	UserId   ID             `json:"user_id"`
+}
 
-// Message 文字频道消息（发送者昵称/tag 内联，不含邮箱）。
-type Message = store.Message
+// MemberInfoRole defines model for MemberInfo.Role.
+type MemberInfoRole string
+
+// Message 文字频道消息（发送者昵称/tag 内联，不含邮箱）。ID 为十进制字符串（#31）。
+type Message struct {
+	ChannelId ID     `json:"channel_id"`
+	Content   string `json:"content"`
+	CreatedAt Time   `json:"created_at"`
+	Id        ID     `json:"id"`
+
+	// Nonce 幂等键（#31）；未带 nonce 的消息无此字段
+	Nonce          *string `json:"nonce,omitempty"`
+	SenderNickname *string `json:"sender_nickname,omitempty"`
+	SenderTag      *string `json:"sender_tag,omitempty"`
+	UserId         ID      `json:"user_id"`
+}
 
 // PasswordResetRequest defines model for PasswordResetRequest.
 type PasswordResetRequest struct {
@@ -258,60 +323,52 @@ type PasswordResetRequest struct {
 	Password string `json:"password"`
 }
 
-// PatchCategoryRequest name 与 position 至少给一个。
-type PatchCategoryRequest struct {
-	Name *string `json:"name,omitempty"`
+// PatchCategoryRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name 不可清， 空值被校验拒 400；position 的 null 拒 400），值 = 设置。 name 与 position 至少给一个。
+type PatchCategoryRequest = PatchCategoryBody
 
-	// Position 目标序（0-based）；服务端重排同服务器其它分类
-	Position *int `json:"position,omitempty"`
+// PatchChannelRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name/type 不可清，空值被校验拒 400；category_id 的 null = 移出分类；position 的 null 拒 400——「删除位置」无语义），值 = 设置。
+type PatchChannelRequest = PatchChannelBody
+
+// PatchFriendRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null/空串 = 清除备注/ 移出分组，值 = 设置。仅发起方向可写。
+type PatchFriendRequest = PatchFriendBody
+
+// PatchMeRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（昵称不可清， 空值被校验拒 400），值 = 设置。部分更新（当前仅 nickname）。
+type PatchMeRequest = PatchMeBody
+
+// PatchServerRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（名称/图标 不可清，空值被校验拒 400），值 = 设置。
+type PatchServerRequest = PatchServerBody
+
+// Problem RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示（旧 message 字段改名为 detail）。
+type Problem struct {
+	// Code 机器可读错误码（扩展字段）
+	Code string `json:"code"`
+
+	// Detail 本次出错的中文提示
+	Detail string `json:"detail"`
+
+	// Status HTTP 状态码（与响应行一致）
+	Status int32 `json:"status"`
+
+	// Title 问题类型摘要（随 status 定，不随实例变）
+	Title string `json:"title"`
+
+	// Type 问题类型 URI（urn:litetalk:error:<code>）
+	Type string `json:"type"`
 }
 
-// PatchChannelRequest defines model for PatchChannelRequest.
-type PatchChannelRequest struct {
-	// CategoryId 0 = 显式移出分类
-	CategoryId *int64                   `json:"category_id,omitempty"`
-	Name       *string                  `json:"name,omitempty"`
-	Position   *int                     `json:"position,omitempty"`
-	Type       *PatchChannelRequestType `json:"type,omitempty"`
-}
-
-// PatchChannelRequestType defines model for PatchChannelRequest.Type.
-type PatchChannelRequestType string
-
-// PatchFriendRequest 部分更新；空串清除备注/移出分组。
-type PatchFriendRequest struct {
-	// Group 0–32 字符
-	Group *string `json:"group,omitempty"`
-
-	// Remark 0–64 字符
-	Remark *string `json:"remark,omitempty"`
-}
-
-// PatchMeRequest 部分更新（当前仅 nickname）。
-type PatchMeRequest struct {
-	Nickname *string `json:"nickname,omitempty"`
-}
-
-// PatchServerRequest defines model for PatchServerRequest.
-type PatchServerRequest struct {
-	IconColor *string `json:"icon_color,omitempty"`
-	IconName  *string `json:"icon_name,omitempty"`
-	Name      *string `json:"name,omitempty"`
-}
-
-// PublicUser 对外用户视图（好友/成员等他人信息），不含 email。
+// PublicUser 对外用户视图（好友/成员等他人信息），不含 email。ID 为十进制字符串（#31）。
 type PublicUser struct {
-	CreatedAt     time.Time `json:"created_at"`
-	EmailVerified bool      `json:"email_verified"`
-	Id            int64     `json:"id"`
-	IsGuest       bool      `json:"is_guest"`
-	Nickname      string    `json:"nickname"`
+	CreatedAt     Time   `json:"created_at"`
+	EmailVerified bool   `json:"email_verified"`
+	Id            ID     `json:"id"`
+	IsGuest       bool   `json:"is_guest"`
+	Nickname      string `json:"nickname"`
 
 	// Online 在线态（presence）；仅 friends 相关响应填真实值，其余恒 false
-	Online    bool      `json:"online"`
-	Status    int32     `json:"status"`
-	Tag       string    `json:"tag"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Online    bool   `json:"online"`
+	Status    int32  `json:"status"`
+	Tag       string `json:"tag"`
+	UpdatedAt Time   `json:"updated_at"`
 }
 
 // RefreshRequest defines model for RefreshRequest.
@@ -361,8 +418,17 @@ type ServerConfig struct {
 // ServerConfigAuthMode defines model for ServerConfig.AuthMode.
 type ServerConfigAuthMode string
 
-// ServerInfo 服务器（群组）。图标为预设 Lucide 图标名 + 颜色，无图片。
-type ServerInfo = store.Server
+// ServerInfo 服务器（群组）。图标为预设 Lucide 图标名 + 颜色，无图片。ID 为十进制字符串（#31）。
+type ServerInfo struct {
+	CreatedAt Time `json:"created_at"`
+
+	// IconColor #RRGGBB
+	IconColor string `json:"icon_color"`
+	IconName  string `json:"icon_name"`
+	Id        ID     `json:"id"`
+	Name      string `json:"name"`
+	OwnerId   ID     `json:"owner_id"`
+}
 
 // StatusOk 删除/吊销类操作的固定成功体。
 type StatusOk struct {
@@ -380,39 +446,53 @@ type TokenPair struct {
 	ExpiresIn    int64  `json:"expires_in"`
 	RefreshToken string `json:"refresh_token"`
 
-	// User 自响应用户（/users/me、登录/注册/游客/刷新），含 email。
+	// User 自响应用户（/users/me、登录/注册/游客/刷新），含 email。ID 为十进制字符串（#31）。
 	User User `json:"user"`
 }
 
-// User 自响应用户（/users/me、登录/注册/游客/刷新），含 email。
-type User = store.User
+// User 自响应用户（/users/me、登录/注册/游客/刷新），含 email。ID 为十进制字符串（#31）。
+type User struct {
+	CreatedAt     Time   `json:"created_at"`
+	Email         string `json:"email"`
+	EmailVerified bool   `json:"email_verified"`
+	Id            ID     `json:"id"`
+	IsGuest       bool   `json:"is_guest"`
+	Nickname      string `json:"nickname"`
+
+	// Status 账号状态枚举
+	Status int32 `json:"status"`
+
+	// Tag 四位定宽数字串
+	Tag       string `json:"tag"`
+	UpdatedAt Time   `json:"updated_at"`
+}
 
 // IDPath defines model for IDPath.
 type IDPath = int64
 
-// BadRequest 统一错误体。code 为机器可读错误码，message 为中文提示。
-type BadRequest = ApiError
+// BadRequest RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示（旧 message 字段改名为 detail）。
+type BadRequest = Problem
 
-// Conflict 统一错误体。code 为机器可读错误码，message 为中文提示。
-type Conflict = ApiError
+// Conflict RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示（旧 message 字段改名为 detail）。
+type Conflict = Problem
 
-// Forbidden 统一错误体。code 为机器可读错误码，message 为中文提示。
-type Forbidden = ApiError
+// Forbidden RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示（旧 message 字段改名为 detail）。
+type Forbidden = Problem
 
-// Gone 统一错误体。code 为机器可读错误码，message 为中文提示。
-type Gone = ApiError
+// Gone RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示（旧 message 字段改名为 detail）。
+type Gone = Problem
 
-// Internal 统一错误体。code 为机器可读错误码，message 为中文提示。
-type Internal = ApiError
+// Internal RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示（旧 message 字段改名为 detail）。
+type Internal = Problem
 
-// NotFound 统一错误体。code 为机器可读错误码，message 为中文提示。
-type NotFound = ApiError
+// NotFound RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示（旧 message 字段改名为 detail）。
+type NotFound = Problem
 
-// RateLimited 统一错误体。code 为机器可读错误码，message 为中文提示。
-type RateLimited = ApiError
+// RateLimited RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示（旧 message 字段改名为 detail）。
+type RateLimited = Problem
 
-// Unauthorized 统一错误体。code 为机器可读错误码，message 为中文提示。
-type Unauthorized = ApiError
+// Unauthorized RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示（旧 message 字段改名为 detail）。
+type Unauthorized = Problem
 
 // DeleteCategoryParams defines parameters for DeleteCategory.
 type DeleteCategoryParams struct {
@@ -422,11 +502,30 @@ type DeleteCategoryParams struct {
 
 // ListMessagesParams defines parameters for ListMessages.
 type ListMessagesParams struct {
-	// BeforeId 游标：只取 ID 小于该值的消息（0/缺省 = 最新一页）
+	// Before 游标：只取 ID 小于该值的消息（缺省 = 最新一页）
+	Before *int64 `form:"before,omitempty" json:"before,omitempty"`
+
+	// After 游标：只取 ID 大于该值的消息（向前翻更新；缺省 = 最旧一页）
+	After *int64 `form:"after,omitempty" json:"after,omitempty"`
+
+	// BeforeId before 的旧别名（兼容一个版本，#31；与 before 同义）
+	// Deprecated: this property has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 	BeforeId *int64 `form:"before_id,omitempty" json:"before_id,omitempty"`
 
 	// Limit 条数上限（1–50，越界回落 50）
 	Limit *int `form:"limit,omitempty" json:"limit,omitempty"`
+}
+
+// ListChannelsParams defines parameters for ListChannels.
+type ListChannelsParams struct {
+	// IfNoneMatch 上次响应的 ETag；命中回 304（#31 协商缓存）
+	IfNoneMatch *string `json:"If-None-Match,omitempty"`
+}
+
+// ListServerMembersParams defines parameters for ListServerMembers.
+type ListServerMembersParams struct {
+	// IfNoneMatch 上次响应的 ETag；命中回 304
+	IfNoneMatch *string `json:"If-None-Match,omitempty"`
 }
 
 // SendEmailCodeJSONRequestBody defines body for SendEmailCode for application/json ContentType.
@@ -453,8 +552,14 @@ type RegisterJSONRequestBody = RegisterRequest
 // PatchCategoryJSONRequestBody defines body for PatchCategory for application/json ContentType.
 type PatchCategoryJSONRequestBody = PatchCategoryRequest
 
+// PatchCategoryApplicationMergePatchPlusJSONRequestBody defines body for PatchCategory for application/merge-patch+json ContentType.
+type PatchCategoryApplicationMergePatchPlusJSONRequestBody = PatchCategoryRequest
+
 // PatchChannelJSONRequestBody defines body for PatchChannel for application/json ContentType.
 type PatchChannelJSONRequestBody = PatchChannelRequest
+
+// PatchChannelApplicationMergePatchPlusJSONRequestBody defines body for PatchChannel for application/merge-patch+json ContentType.
+type PatchChannelApplicationMergePatchPlusJSONRequestBody = PatchChannelRequest
 
 // CreateMessageJSONRequestBody defines body for CreateMessage for application/json ContentType.
 type CreateMessageJSONRequestBody = CreateMessageRequest
@@ -465,6 +570,9 @@ type CreateFriendRequestJSONRequestBody = AddFriendRequest
 // PatchFriendJSONRequestBody defines body for PatchFriend for application/json ContentType.
 type PatchFriendJSONRequestBody = PatchFriendRequest
 
+// PatchFriendApplicationMergePatchPlusJSONRequestBody defines body for PatchFriend for application/merge-patch+json ContentType.
+type PatchFriendApplicationMergePatchPlusJSONRequestBody = PatchFriendRequest
+
 // CreateServerJSONRequestBody defines body for CreateServer for application/json ContentType.
 type CreateServerJSONRequestBody = CreateServerRequest
 
@@ -473,6 +581,9 @@ type JoinServerJSONRequestBody = JoinServerRequest
 
 // PatchServerJSONRequestBody defines body for PatchServer for application/json ContentType.
 type PatchServerJSONRequestBody = PatchServerRequest
+
+// PatchServerApplicationMergePatchPlusJSONRequestBody defines body for PatchServer for application/merge-patch+json ContentType.
+type PatchServerApplicationMergePatchPlusJSONRequestBody = PatchServerRequest
 
 // CreateCategoryJSONRequestBody defines body for CreateCategory for application/json ContentType.
 type CreateCategoryJSONRequestBody = CreateCategoryRequest
@@ -485,6 +596,9 @@ type CreateInviteJSONRequestBody = CreateInviteRequest
 
 // PatchMeJSONRequestBody defines body for PatchMe for application/json ContentType.
 type PatchMeJSONRequestBody = PatchMeRequest
+
+// PatchMeApplicationMergePatchPlusJSONRequestBody defines body for PatchMe for application/merge-patch+json ContentType.
+type PatchMeApplicationMergePatchPlusJSONRequestBody = PatchMeRequest
 
 // ServerInterface represents all server handlers.
 type ServerInterface interface {
@@ -521,10 +635,10 @@ type ServerInterface interface {
 	// PatchChannel 改频道（owner/admin）
 	// (PATCH /api/v1/channels/{id})
 	PatchChannel(w http.ResponseWriter, r *http.Request, id IDPath)
-	// ListMessages 消息分页（倒序，游标 before_id）
+	// ListMessages 消息分页（游标，倒序取页正序返回）
 	// (GET /api/v1/channels/{id}/messages)
 	ListMessages(w http.ResponseWriter, r *http.Request, id IDPath, params ListMessagesParams)
-	// CreateMessage 发送文字消息（≤2000 字 + 频控 20/分）
+	// CreateMessage 发送文字消息（≤2000 字 + 频控 20/分 + nonce 幂等）
 	// (POST /api/v1/channels/{id}/messages)
 	CreateMessage(w http.ResponseWriter, r *http.Request, id IDPath)
 	// GetConfig 服务端能力开关
@@ -565,7 +679,7 @@ type ServerInterface interface {
 	CreateCategory(w http.ResponseWriter, r *http.Request, id IDPath)
 	// ListChannels 服务器的分类与频道（成员可读）
 	// (GET /api/v1/servers/{id}/channels)
-	ListChannels(w http.ResponseWriter, r *http.Request, id IDPath)
+	ListChannels(w http.ResponseWriter, r *http.Request, id IDPath, params ListChannelsParams)
 	// CreateChannel 创建频道（owner/admin）
 	// (POST /api/v1/servers/{id}/channels)
 	CreateChannel(w http.ResponseWriter, r *http.Request, id IDPath)
@@ -574,7 +688,7 @@ type ServerInterface interface {
 	CreateInvite(w http.ResponseWriter, r *http.Request, id IDPath)
 	// ListServerMembers 服务器成员列表（成员可读）
 	// (GET /api/v1/servers/{id}/members)
-	ListServerMembers(w http.ResponseWriter, r *http.Request, id IDPath)
+	ListServerMembers(w http.ResponseWriter, r *http.Request, id IDPath, params ListServerMembersParams)
 	// GetMe 当前用户（自响应，含 email）
 	// (GET /api/v1/users/me)
 	GetMe(w http.ResponseWriter, r *http.Request)
@@ -827,6 +941,32 @@ func (siw *ServerInterfaceWrapper) ListMessages(w http.ResponseWriter, r *http.R
 
 	// Parameter object where we will unmarshal all parameters from the context
 	var params ListMessagesParams
+
+	// ------------- Optional query parameter "before" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "before", r.URL.Query(), &params.Before, runtime.BindQueryParameterOptions{Type: "integer", Format: "int64"})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "before"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "before", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "after" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "after", r.URL.Query(), &params.After, runtime.BindQueryParameterOptions{Type: "integer", Format: "int64"})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "after"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "after", Err: err})
+		}
+		return
+	}
 
 	// ------------- Optional query parameter "before_id" -------------
 
@@ -1146,8 +1286,32 @@ func (siw *ServerInterfaceWrapper) ListChannels(w http.ResponseWriter, r *http.R
 		return
 	}
 
+	// Parameter object where we will unmarshal all parameters from the context
+	var params ListChannelsParams
+
+	headers := r.Header
+
+	// ------------- Optional header parameter "If-None-Match" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("If-None-Match")]; found {
+		var IfNoneMatch string
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "If-None-Match", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "If-None-Match", valueList[0], &IfNoneMatch, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "If-None-Match", Err: err})
+			return
+		}
+
+		params.IfNoneMatch = &IfNoneMatch
+
+	}
+
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		siw.Handler.ListChannels(w, r, id)
+		siw.Handler.ListChannels(w, r, id, params)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -1224,8 +1388,32 @@ func (siw *ServerInterfaceWrapper) ListServerMembers(w http.ResponseWriter, r *h
 		return
 	}
 
+	// Parameter object where we will unmarshal all parameters from the context
+	var params ListServerMembersParams
+
+	headers := r.Header
+
+	// ------------- Optional header parameter "If-None-Match" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("If-None-Match")]; found {
+		var IfNoneMatch string
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "If-None-Match", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "If-None-Match", valueList[0], &IfNoneMatch, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "If-None-Match", Err: err})
+			return
+		}
+
+		params.IfNoneMatch = &IfNoneMatch
+
+	}
+
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		siw.Handler.ListServerMembers(w, r, id)
+		siw.Handler.ListServerMembers(w, r, id, params)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -1418,21 +1606,21 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	return m
 }
 
-type BadRequestJSONResponse ApiError
+type BadRequestApplicationProblemPlusJSONResponse Problem
 
-type ConflictJSONResponse ApiError
+type ConflictApplicationProblemPlusJSONResponse Problem
 
-type ForbiddenJSONResponse ApiError
+type ForbiddenApplicationProblemPlusJSONResponse Problem
 
-type GoneJSONResponse ApiError
+type GoneApplicationProblemPlusJSONResponse Problem
 
-type InternalJSONResponse ApiError
+type InternalApplicationProblemPlusJSONResponse Problem
 
-type NotFoundJSONResponse ApiError
+type NotFoundApplicationProblemPlusJSONResponse Problem
 
-type RateLimitedJSONResponse ApiError
+type RateLimitedApplicationProblemPlusJSONResponse Problem
 
-type UnauthorizedJSONResponse ApiError
+type UnauthorizedApplicationProblemPlusJSONResponse Problem
 
 type SendEmailCodeRequestObject struct {
 	Body *SendEmailCodeJSONRequestBody
@@ -1456,74 +1644,82 @@ func (response SendEmailCode200JSONResponse) VisitSendEmailCodeResponse(w http.R
 	return err
 }
 
-type SendEmailCode400JSONResponse struct{ BadRequestJSONResponse }
+type SendEmailCode400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
 
-func (response SendEmailCode400JSONResponse) VisitSendEmailCodeResponse(w http.ResponseWriter) error {
+func (response SendEmailCode400ApplicationProblemPlusJSONResponse) VisitSendEmailCodeResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type SendEmailCode404JSONResponse struct{ NotFoundJSONResponse }
+type SendEmailCode404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
 
-func (response SendEmailCode404JSONResponse) VisitSendEmailCodeResponse(w http.ResponseWriter) error {
+func (response SendEmailCode404ApplicationProblemPlusJSONResponse) VisitSendEmailCodeResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(404)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type SendEmailCode409JSONResponse struct{ ConflictJSONResponse }
+type SendEmailCode409ApplicationProblemPlusJSONResponse struct {
+	ConflictApplicationProblemPlusJSONResponse
+}
 
-func (response SendEmailCode409JSONResponse) VisitSendEmailCodeResponse(w http.ResponseWriter) error {
+func (response SendEmailCode409ApplicationProblemPlusJSONResponse) VisitSendEmailCodeResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(409)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type SendEmailCode429JSONResponse struct{ RateLimitedJSONResponse }
+type SendEmailCode429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
 
-func (response SendEmailCode429JSONResponse) VisitSendEmailCodeResponse(w http.ResponseWriter) error {
+func (response SendEmailCode429ApplicationProblemPlusJSONResponse) VisitSendEmailCodeResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(429)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type SendEmailCodedefaultJSONResponse struct {
-	Body       ApiError
+type SendEmailCodedefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response SendEmailCodedefaultJSONResponse) VisitSendEmailCodeResponse(w http.ResponseWriter) error {
+func (response SendEmailCodedefaultApplicationProblemPlusJSONResponse) VisitSendEmailCodeResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
@@ -1551,60 +1747,66 @@ func (response GuestLogin201JSONResponse) VisitGuestLoginResponse(w http.Respons
 	return err
 }
 
-type GuestLogin400JSONResponse struct{ BadRequestJSONResponse }
+type GuestLogin400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
 
-func (response GuestLogin400JSONResponse) VisitGuestLoginResponse(w http.ResponseWriter) error {
+func (response GuestLogin400ApplicationProblemPlusJSONResponse) VisitGuestLoginResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type GuestLogin403JSONResponse struct{ ForbiddenJSONResponse }
+type GuestLogin403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
 
-func (response GuestLogin403JSONResponse) VisitGuestLoginResponse(w http.ResponseWriter) error {
+func (response GuestLogin403ApplicationProblemPlusJSONResponse) VisitGuestLoginResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(403)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type GuestLogin429JSONResponse struct{ RateLimitedJSONResponse }
+type GuestLogin429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
 
-func (response GuestLogin429JSONResponse) VisitGuestLoginResponse(w http.ResponseWriter) error {
+func (response GuestLogin429ApplicationProblemPlusJSONResponse) VisitGuestLoginResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(429)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type GuestLogindefaultJSONResponse struct {
-	Body       ApiError
+type GuestLogindefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response GuestLogindefaultJSONResponse) VisitGuestLoginResponse(w http.ResponseWriter) error {
+func (response GuestLogindefaultApplicationProblemPlusJSONResponse) VisitGuestLoginResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
@@ -1632,60 +1834,66 @@ func (response Login200JSONResponse) VisitLoginResponse(w http.ResponseWriter) e
 	return err
 }
 
-type Login400JSONResponse struct{ BadRequestJSONResponse }
+type Login400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
 
-func (response Login400JSONResponse) VisitLoginResponse(w http.ResponseWriter) error {
+func (response Login400ApplicationProblemPlusJSONResponse) VisitLoginResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type Login401JSONResponse struct{ UnauthorizedJSONResponse }
+type Login401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response Login401JSONResponse) VisitLoginResponse(w http.ResponseWriter) error {
+func (response Login401ApplicationProblemPlusJSONResponse) VisitLoginResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type Login429JSONResponse struct{ RateLimitedJSONResponse }
+type Login429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
 
-func (response Login429JSONResponse) VisitLoginResponse(w http.ResponseWriter) error {
+func (response Login429ApplicationProblemPlusJSONResponse) VisitLoginResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(429)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type LogindefaultJSONResponse struct {
-	Body       ApiError
+type LogindefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response LogindefaultJSONResponse) VisitLoginResponse(w http.ResponseWriter) error {
+func (response LogindefaultApplicationProblemPlusJSONResponse) VisitLoginResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
@@ -1713,46 +1921,50 @@ func (response Logout200JSONResponse) VisitLogoutResponse(w http.ResponseWriter)
 	return err
 }
 
-type Logout400JSONResponse struct{ BadRequestJSONResponse }
+type Logout400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
 
-func (response Logout400JSONResponse) VisitLogoutResponse(w http.ResponseWriter) error {
+func (response Logout400ApplicationProblemPlusJSONResponse) VisitLogoutResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type Logout401JSONResponse struct{ UnauthorizedJSONResponse }
+type Logout401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response Logout401JSONResponse) VisitLogoutResponse(w http.ResponseWriter) error {
+func (response Logout401ApplicationProblemPlusJSONResponse) VisitLogoutResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type LogoutdefaultJSONResponse struct {
-	Body       ApiError
+type LogoutdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response LogoutdefaultJSONResponse) VisitLogoutResponse(w http.ResponseWriter) error {
+func (response LogoutdefaultApplicationProblemPlusJSONResponse) VisitLogoutResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
@@ -1780,74 +1992,82 @@ func (response ResetPassword200JSONResponse) VisitResetPasswordResponse(w http.R
 	return err
 }
 
-type ResetPassword400JSONResponse struct{ BadRequestJSONResponse }
+type ResetPassword400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
 
-func (response ResetPassword400JSONResponse) VisitResetPasswordResponse(w http.ResponseWriter) error {
+func (response ResetPassword400ApplicationProblemPlusJSONResponse) VisitResetPasswordResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type ResetPassword403JSONResponse struct{ ForbiddenJSONResponse }
+type ResetPassword403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
 
-func (response ResetPassword403JSONResponse) VisitResetPasswordResponse(w http.ResponseWriter) error {
+func (response ResetPassword403ApplicationProblemPlusJSONResponse) VisitResetPasswordResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(403)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type ResetPassword404JSONResponse struct{ NotFoundJSONResponse }
+type ResetPassword404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
 
-func (response ResetPassword404JSONResponse) VisitResetPasswordResponse(w http.ResponseWriter) error {
+func (response ResetPassword404ApplicationProblemPlusJSONResponse) VisitResetPasswordResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(404)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type ResetPassword429JSONResponse struct{ RateLimitedJSONResponse }
+type ResetPassword429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
 
-func (response ResetPassword429JSONResponse) VisitResetPasswordResponse(w http.ResponseWriter) error {
+func (response ResetPassword429ApplicationProblemPlusJSONResponse) VisitResetPasswordResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(429)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type ResetPassworddefaultJSONResponse struct {
-	Body       ApiError
+type ResetPassworddefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response ResetPassworddefaultJSONResponse) VisitResetPasswordResponse(w http.ResponseWriter) error {
+func (response ResetPassworddefaultApplicationProblemPlusJSONResponse) VisitResetPasswordResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
@@ -1875,46 +2095,50 @@ func (response Refresh200JSONResponse) VisitRefreshResponse(w http.ResponseWrite
 	return err
 }
 
-type Refresh400JSONResponse struct{ BadRequestJSONResponse }
+type Refresh400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
 
-func (response Refresh400JSONResponse) VisitRefreshResponse(w http.ResponseWriter) error {
+func (response Refresh400ApplicationProblemPlusJSONResponse) VisitRefreshResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type Refresh401JSONResponse struct{ UnauthorizedJSONResponse }
+type Refresh401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response Refresh401JSONResponse) VisitRefreshResponse(w http.ResponseWriter) error {
+func (response Refresh401ApplicationProblemPlusJSONResponse) VisitRefreshResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type RefreshdefaultJSONResponse struct {
-	Body       ApiError
+type RefreshdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response RefreshdefaultJSONResponse) VisitRefreshResponse(w http.ResponseWriter) error {
+func (response RefreshdefaultApplicationProblemPlusJSONResponse) VisitRefreshResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
@@ -1942,60 +2166,66 @@ func (response Register201JSONResponse) VisitRegisterResponse(w http.ResponseWri
 	return err
 }
 
-type Register400JSONResponse struct{ BadRequestJSONResponse }
+type Register400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
 
-func (response Register400JSONResponse) VisitRegisterResponse(w http.ResponseWriter) error {
+func (response Register400ApplicationProblemPlusJSONResponse) VisitRegisterResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type Register409JSONResponse struct{ ConflictJSONResponse }
+type Register409ApplicationProblemPlusJSONResponse struct {
+	ConflictApplicationProblemPlusJSONResponse
+}
 
-func (response Register409JSONResponse) VisitRegisterResponse(w http.ResponseWriter) error {
+func (response Register409ApplicationProblemPlusJSONResponse) VisitRegisterResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(409)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type Register429JSONResponse struct{ RateLimitedJSONResponse }
+type Register429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
 
-func (response Register429JSONResponse) VisitRegisterResponse(w http.ResponseWriter) error {
+func (response Register429ApplicationProblemPlusJSONResponse) VisitRegisterResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(429)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type RegisterdefaultJSONResponse struct {
-	Body       ApiError
+type RegisterdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response RegisterdefaultJSONResponse) VisitRegisterResponse(w http.ResponseWriter) error {
+func (response RegisterdefaultApplicationProblemPlusJSONResponse) VisitRegisterResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
@@ -2024,96 +2254,107 @@ func (response DeleteCategory200JSONResponse) VisitDeleteCategoryResponse(w http
 	return err
 }
 
-type DeleteCategory400JSONResponse struct{ BadRequestJSONResponse }
+type DeleteCategory400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
 
-func (response DeleteCategory400JSONResponse) VisitDeleteCategoryResponse(w http.ResponseWriter) error {
+func (response DeleteCategory400ApplicationProblemPlusJSONResponse) VisitDeleteCategoryResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type DeleteCategory401JSONResponse struct{ UnauthorizedJSONResponse }
+type DeleteCategory401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response DeleteCategory401JSONResponse) VisitDeleteCategoryResponse(w http.ResponseWriter) error {
+func (response DeleteCategory401ApplicationProblemPlusJSONResponse) VisitDeleteCategoryResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type DeleteCategory403JSONResponse struct{ ForbiddenJSONResponse }
+type DeleteCategory403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
 
-func (response DeleteCategory403JSONResponse) VisitDeleteCategoryResponse(w http.ResponseWriter) error {
+func (response DeleteCategory403ApplicationProblemPlusJSONResponse) VisitDeleteCategoryResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(403)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type DeleteCategory404JSONResponse struct{ NotFoundJSONResponse }
+type DeleteCategory404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
 
-func (response DeleteCategory404JSONResponse) VisitDeleteCategoryResponse(w http.ResponseWriter) error {
+func (response DeleteCategory404ApplicationProblemPlusJSONResponse) VisitDeleteCategoryResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(404)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type DeleteCategory409JSONResponse struct{ ConflictJSONResponse }
+type DeleteCategory409ApplicationProblemPlusJSONResponse struct {
+	ConflictApplicationProblemPlusJSONResponse
+}
 
-func (response DeleteCategory409JSONResponse) VisitDeleteCategoryResponse(w http.ResponseWriter) error {
+func (response DeleteCategory409ApplicationProblemPlusJSONResponse) VisitDeleteCategoryResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(409)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type DeleteCategorydefaultJSONResponse struct {
-	Body       ApiError
+type DeleteCategorydefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response DeleteCategorydefaultJSONResponse) VisitDeleteCategoryResponse(w http.ResponseWriter) error {
+func (response DeleteCategorydefaultApplicationProblemPlusJSONResponse) VisitDeleteCategoryResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
 type PatchCategoryRequestObject struct {
-	Id   IDPath `json:"id"`
-	Body *PatchCategoryJSONRequestBody
+	Id                                IDPath `json:"id"`
+	JSONBody                          *PatchCategoryJSONRequestBody
+	ApplicationMergePatchPlusJSONBody *PatchCategoryApplicationMergePatchPlusJSONRequestBody
 }
 
 type PatchCategoryResponseObject interface {
@@ -2134,74 +2375,82 @@ func (response PatchCategory200JSONResponse) VisitPatchCategoryResponse(w http.R
 	return err
 }
 
-type PatchCategory400JSONResponse struct{ BadRequestJSONResponse }
+type PatchCategory400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
 
-func (response PatchCategory400JSONResponse) VisitPatchCategoryResponse(w http.ResponseWriter) error {
+func (response PatchCategory400ApplicationProblemPlusJSONResponse) VisitPatchCategoryResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type PatchCategory401JSONResponse struct{ UnauthorizedJSONResponse }
+type PatchCategory401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response PatchCategory401JSONResponse) VisitPatchCategoryResponse(w http.ResponseWriter) error {
+func (response PatchCategory401ApplicationProblemPlusJSONResponse) VisitPatchCategoryResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type PatchCategory403JSONResponse struct{ ForbiddenJSONResponse }
+type PatchCategory403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
 
-func (response PatchCategory403JSONResponse) VisitPatchCategoryResponse(w http.ResponseWriter) error {
+func (response PatchCategory403ApplicationProblemPlusJSONResponse) VisitPatchCategoryResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(403)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type PatchCategory404JSONResponse struct{ NotFoundJSONResponse }
+type PatchCategory404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
 
-func (response PatchCategory404JSONResponse) VisitPatchCategoryResponse(w http.ResponseWriter) error {
+func (response PatchCategory404ApplicationProblemPlusJSONResponse) VisitPatchCategoryResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(404)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type PatchCategorydefaultJSONResponse struct {
-	Body       ApiError
+type PatchCategorydefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response PatchCategorydefaultJSONResponse) VisitPatchCategoryResponse(w http.ResponseWriter) error {
+func (response PatchCategorydefaultApplicationProblemPlusJSONResponse) VisitPatchCategoryResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
@@ -2229,82 +2478,91 @@ func (response DeleteChannel200JSONResponse) VisitDeleteChannelResponse(w http.R
 	return err
 }
 
-type DeleteChannel400JSONResponse struct{ BadRequestJSONResponse }
+type DeleteChannel400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
 
-func (response DeleteChannel400JSONResponse) VisitDeleteChannelResponse(w http.ResponseWriter) error {
+func (response DeleteChannel400ApplicationProblemPlusJSONResponse) VisitDeleteChannelResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type DeleteChannel401JSONResponse struct{ UnauthorizedJSONResponse }
+type DeleteChannel401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response DeleteChannel401JSONResponse) VisitDeleteChannelResponse(w http.ResponseWriter) error {
+func (response DeleteChannel401ApplicationProblemPlusJSONResponse) VisitDeleteChannelResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type DeleteChannel403JSONResponse struct{ ForbiddenJSONResponse }
+type DeleteChannel403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
 
-func (response DeleteChannel403JSONResponse) VisitDeleteChannelResponse(w http.ResponseWriter) error {
+func (response DeleteChannel403ApplicationProblemPlusJSONResponse) VisitDeleteChannelResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(403)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type DeleteChannel404JSONResponse struct{ NotFoundJSONResponse }
+type DeleteChannel404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
 
-func (response DeleteChannel404JSONResponse) VisitDeleteChannelResponse(w http.ResponseWriter) error {
+func (response DeleteChannel404ApplicationProblemPlusJSONResponse) VisitDeleteChannelResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(404)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type DeleteChanneldefaultJSONResponse struct {
-	Body       ApiError
+type DeleteChanneldefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response DeleteChanneldefaultJSONResponse) VisitDeleteChannelResponse(w http.ResponseWriter) error {
+func (response DeleteChanneldefaultApplicationProblemPlusJSONResponse) VisitDeleteChannelResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
 type PatchChannelRequestObject struct {
-	Id   IDPath `json:"id"`
-	Body *PatchChannelJSONRequestBody
+	Id                                IDPath `json:"id"`
+	JSONBody                          *PatchChannelJSONRequestBody
+	ApplicationMergePatchPlusJSONBody *PatchChannelApplicationMergePatchPlusJSONRequestBody
 }
 
 type PatchChannelResponseObject interface {
@@ -2325,74 +2583,82 @@ func (response PatchChannel200JSONResponse) VisitPatchChannelResponse(w http.Res
 	return err
 }
 
-type PatchChannel400JSONResponse struct{ BadRequestJSONResponse }
+type PatchChannel400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
 
-func (response PatchChannel400JSONResponse) VisitPatchChannelResponse(w http.ResponseWriter) error {
+func (response PatchChannel400ApplicationProblemPlusJSONResponse) VisitPatchChannelResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type PatchChannel401JSONResponse struct{ UnauthorizedJSONResponse }
+type PatchChannel401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response PatchChannel401JSONResponse) VisitPatchChannelResponse(w http.ResponseWriter) error {
+func (response PatchChannel401ApplicationProblemPlusJSONResponse) VisitPatchChannelResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type PatchChannel403JSONResponse struct{ ForbiddenJSONResponse }
+type PatchChannel403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
 
-func (response PatchChannel403JSONResponse) VisitPatchChannelResponse(w http.ResponseWriter) error {
+func (response PatchChannel403ApplicationProblemPlusJSONResponse) VisitPatchChannelResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(403)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type PatchChannel404JSONResponse struct{ NotFoundJSONResponse }
+type PatchChannel404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
 
-func (response PatchChannel404JSONResponse) VisitPatchChannelResponse(w http.ResponseWriter) error {
+func (response PatchChannel404ApplicationProblemPlusJSONResponse) VisitPatchChannelResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(404)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type PatchChanneldefaultJSONResponse struct {
-	Body       ApiError
+type PatchChanneldefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response PatchChanneldefaultJSONResponse) VisitPatchChannelResponse(w http.ResponseWriter) error {
+func (response PatchChanneldefaultApplicationProblemPlusJSONResponse) VisitPatchChannelResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
@@ -2421,74 +2687,82 @@ func (response ListMessages200JSONResponse) VisitListMessagesResponse(w http.Res
 	return err
 }
 
-type ListMessages400JSONResponse struct{ BadRequestJSONResponse }
+type ListMessages400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
 
-func (response ListMessages400JSONResponse) VisitListMessagesResponse(w http.ResponseWriter) error {
+func (response ListMessages400ApplicationProblemPlusJSONResponse) VisitListMessagesResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type ListMessages401JSONResponse struct{ UnauthorizedJSONResponse }
+type ListMessages401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response ListMessages401JSONResponse) VisitListMessagesResponse(w http.ResponseWriter) error {
+func (response ListMessages401ApplicationProblemPlusJSONResponse) VisitListMessagesResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type ListMessages403JSONResponse struct{ ForbiddenJSONResponse }
+type ListMessages403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
 
-func (response ListMessages403JSONResponse) VisitListMessagesResponse(w http.ResponseWriter) error {
+func (response ListMessages403ApplicationProblemPlusJSONResponse) VisitListMessagesResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(403)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type ListMessages404JSONResponse struct{ NotFoundJSONResponse }
+type ListMessages404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
 
-func (response ListMessages404JSONResponse) VisitListMessagesResponse(w http.ResponseWriter) error {
+func (response ListMessages404ApplicationProblemPlusJSONResponse) VisitListMessagesResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(404)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type ListMessagesdefaultJSONResponse struct {
-	Body       ApiError
+type ListMessagesdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response ListMessagesdefaultJSONResponse) VisitListMessagesResponse(w http.ResponseWriter) error {
+func (response ListMessagesdefaultApplicationProblemPlusJSONResponse) VisitListMessagesResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
@@ -2501,6 +2775,20 @@ type CreateMessageRequestObject struct {
 
 type CreateMessageResponseObject interface {
 	VisitCreateMessageResponse(w http.ResponseWriter) error
+}
+
+type CreateMessage200JSONResponse Message
+
+func (response CreateMessage200JSONResponse) VisitCreateMessageResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
 }
 
 type CreateMessage201JSONResponse Message
@@ -2517,88 +2805,98 @@ func (response CreateMessage201JSONResponse) VisitCreateMessageResponse(w http.R
 	return err
 }
 
-type CreateMessage400JSONResponse struct{ BadRequestJSONResponse }
+type CreateMessage400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
 
-func (response CreateMessage400JSONResponse) VisitCreateMessageResponse(w http.ResponseWriter) error {
+func (response CreateMessage400ApplicationProblemPlusJSONResponse) VisitCreateMessageResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type CreateMessage401JSONResponse struct{ UnauthorizedJSONResponse }
+type CreateMessage401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response CreateMessage401JSONResponse) VisitCreateMessageResponse(w http.ResponseWriter) error {
+func (response CreateMessage401ApplicationProblemPlusJSONResponse) VisitCreateMessageResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type CreateMessage403JSONResponse struct{ ForbiddenJSONResponse }
+type CreateMessage403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
 
-func (response CreateMessage403JSONResponse) VisitCreateMessageResponse(w http.ResponseWriter) error {
+func (response CreateMessage403ApplicationProblemPlusJSONResponse) VisitCreateMessageResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(403)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type CreateMessage404JSONResponse struct{ NotFoundJSONResponse }
+type CreateMessage404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
 
-func (response CreateMessage404JSONResponse) VisitCreateMessageResponse(w http.ResponseWriter) error {
+func (response CreateMessage404ApplicationProblemPlusJSONResponse) VisitCreateMessageResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(404)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type CreateMessage429JSONResponse struct{ RateLimitedJSONResponse }
+type CreateMessage429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
 
-func (response CreateMessage429JSONResponse) VisitCreateMessageResponse(w http.ResponseWriter) error {
+func (response CreateMessage429ApplicationProblemPlusJSONResponse) VisitCreateMessageResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(429)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type CreateMessagedefaultJSONResponse struct {
-	Body       ApiError
+type CreateMessagedefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response CreateMessagedefaultJSONResponse) VisitCreateMessageResponse(w http.ResponseWriter) error {
+func (response CreateMessagedefaultApplicationProblemPlusJSONResponse) VisitCreateMessageResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
@@ -2646,32 +2944,34 @@ func (response ListFriends200JSONResponse) VisitListFriendsResponse(w http.Respo
 	return err
 }
 
-type ListFriends401JSONResponse struct{ UnauthorizedJSONResponse }
+type ListFriends401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response ListFriends401JSONResponse) VisitListFriendsResponse(w http.ResponseWriter) error {
+func (response ListFriends401ApplicationProblemPlusJSONResponse) VisitListFriendsResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type ListFriendsdefaultJSONResponse struct {
-	Body       ApiError
+type ListFriendsdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response ListFriendsdefaultJSONResponse) VisitListFriendsResponse(w http.ResponseWriter) error {
+func (response ListFriendsdefaultApplicationProblemPlusJSONResponse) VisitListFriendsResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
@@ -2699,74 +2999,82 @@ func (response CreateFriendRequest201JSONResponse) VisitCreateFriendRequestRespo
 	return err
 }
 
-type CreateFriendRequest400JSONResponse struct{ BadRequestJSONResponse }
+type CreateFriendRequest400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
 
-func (response CreateFriendRequest400JSONResponse) VisitCreateFriendRequestResponse(w http.ResponseWriter) error {
+func (response CreateFriendRequest400ApplicationProblemPlusJSONResponse) VisitCreateFriendRequestResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type CreateFriendRequest401JSONResponse struct{ UnauthorizedJSONResponse }
+type CreateFriendRequest401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response CreateFriendRequest401JSONResponse) VisitCreateFriendRequestResponse(w http.ResponseWriter) error {
+func (response CreateFriendRequest401ApplicationProblemPlusJSONResponse) VisitCreateFriendRequestResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type CreateFriendRequest404JSONResponse struct{ NotFoundJSONResponse }
+type CreateFriendRequest404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
 
-func (response CreateFriendRequest404JSONResponse) VisitCreateFriendRequestResponse(w http.ResponseWriter) error {
+func (response CreateFriendRequest404ApplicationProblemPlusJSONResponse) VisitCreateFriendRequestResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(404)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type CreateFriendRequest409JSONResponse struct{ ConflictJSONResponse }
+type CreateFriendRequest409ApplicationProblemPlusJSONResponse struct {
+	ConflictApplicationProblemPlusJSONResponse
+}
 
-func (response CreateFriendRequest409JSONResponse) VisitCreateFriendRequestResponse(w http.ResponseWriter) error {
+func (response CreateFriendRequest409ApplicationProblemPlusJSONResponse) VisitCreateFriendRequestResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(409)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type CreateFriendRequestdefaultJSONResponse struct {
-	Body       ApiError
+type CreateFriendRequestdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response CreateFriendRequestdefaultJSONResponse) VisitCreateFriendRequestResponse(w http.ResponseWriter) error {
+func (response CreateFriendRequestdefaultApplicationProblemPlusJSONResponse) VisitCreateFriendRequestResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
@@ -2794,88 +3102,98 @@ func (response AcceptFriendRequest200JSONResponse) VisitAcceptFriendRequestRespo
 	return err
 }
 
-type AcceptFriendRequest400JSONResponse struct{ BadRequestJSONResponse }
+type AcceptFriendRequest400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
 
-func (response AcceptFriendRequest400JSONResponse) VisitAcceptFriendRequestResponse(w http.ResponseWriter) error {
+func (response AcceptFriendRequest400ApplicationProblemPlusJSONResponse) VisitAcceptFriendRequestResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type AcceptFriendRequest401JSONResponse struct{ UnauthorizedJSONResponse }
+type AcceptFriendRequest401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response AcceptFriendRequest401JSONResponse) VisitAcceptFriendRequestResponse(w http.ResponseWriter) error {
+func (response AcceptFriendRequest401ApplicationProblemPlusJSONResponse) VisitAcceptFriendRequestResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type AcceptFriendRequest403JSONResponse struct{ ForbiddenJSONResponse }
+type AcceptFriendRequest403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
 
-func (response AcceptFriendRequest403JSONResponse) VisitAcceptFriendRequestResponse(w http.ResponseWriter) error {
+func (response AcceptFriendRequest403ApplicationProblemPlusJSONResponse) VisitAcceptFriendRequestResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(403)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type AcceptFriendRequest404JSONResponse struct{ NotFoundJSONResponse }
+type AcceptFriendRequest404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
 
-func (response AcceptFriendRequest404JSONResponse) VisitAcceptFriendRequestResponse(w http.ResponseWriter) error {
+func (response AcceptFriendRequest404ApplicationProblemPlusJSONResponse) VisitAcceptFriendRequestResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(404)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type AcceptFriendRequest409JSONResponse struct{ ConflictJSONResponse }
+type AcceptFriendRequest409ApplicationProblemPlusJSONResponse struct {
+	ConflictApplicationProblemPlusJSONResponse
+}
 
-func (response AcceptFriendRequest409JSONResponse) VisitAcceptFriendRequestResponse(w http.ResponseWriter) error {
+func (response AcceptFriendRequest409ApplicationProblemPlusJSONResponse) VisitAcceptFriendRequestResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(409)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type AcceptFriendRequestdefaultJSONResponse struct {
-	Body       ApiError
+type AcceptFriendRequestdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response AcceptFriendRequestdefaultJSONResponse) VisitAcceptFriendRequestResponse(w http.ResponseWriter) error {
+func (response AcceptFriendRequestdefaultApplicationProblemPlusJSONResponse) VisitAcceptFriendRequestResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
@@ -2903,82 +3221,91 @@ func (response DeleteFriend200JSONResponse) VisitDeleteFriendResponse(w http.Res
 	return err
 }
 
-type DeleteFriend400JSONResponse struct{ BadRequestJSONResponse }
+type DeleteFriend400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
 
-func (response DeleteFriend400JSONResponse) VisitDeleteFriendResponse(w http.ResponseWriter) error {
+func (response DeleteFriend400ApplicationProblemPlusJSONResponse) VisitDeleteFriendResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type DeleteFriend401JSONResponse struct{ UnauthorizedJSONResponse }
+type DeleteFriend401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response DeleteFriend401JSONResponse) VisitDeleteFriendResponse(w http.ResponseWriter) error {
+func (response DeleteFriend401ApplicationProblemPlusJSONResponse) VisitDeleteFriendResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type DeleteFriend403JSONResponse struct{ ForbiddenJSONResponse }
+type DeleteFriend403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
 
-func (response DeleteFriend403JSONResponse) VisitDeleteFriendResponse(w http.ResponseWriter) error {
+func (response DeleteFriend403ApplicationProblemPlusJSONResponse) VisitDeleteFriendResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(403)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type DeleteFriend404JSONResponse struct{ NotFoundJSONResponse }
+type DeleteFriend404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
 
-func (response DeleteFriend404JSONResponse) VisitDeleteFriendResponse(w http.ResponseWriter) error {
+func (response DeleteFriend404ApplicationProblemPlusJSONResponse) VisitDeleteFriendResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(404)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type DeleteFrienddefaultJSONResponse struct {
-	Body       ApiError
+type DeleteFrienddefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response DeleteFrienddefaultJSONResponse) VisitDeleteFriendResponse(w http.ResponseWriter) error {
+func (response DeleteFrienddefaultApplicationProblemPlusJSONResponse) VisitDeleteFriendResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
 type PatchFriendRequestObject struct {
-	Id   IDPath `json:"id"`
-	Body *PatchFriendJSONRequestBody
+	Id                                IDPath `json:"id"`
+	JSONBody                          *PatchFriendJSONRequestBody
+	ApplicationMergePatchPlusJSONBody *PatchFriendApplicationMergePatchPlusJSONRequestBody
 }
 
 type PatchFriendResponseObject interface {
@@ -2999,74 +3326,82 @@ func (response PatchFriend200JSONResponse) VisitPatchFriendResponse(w http.Respo
 	return err
 }
 
-type PatchFriend400JSONResponse struct{ BadRequestJSONResponse }
+type PatchFriend400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
 
-func (response PatchFriend400JSONResponse) VisitPatchFriendResponse(w http.ResponseWriter) error {
+func (response PatchFriend400ApplicationProblemPlusJSONResponse) VisitPatchFriendResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type PatchFriend401JSONResponse struct{ UnauthorizedJSONResponse }
+type PatchFriend401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response PatchFriend401JSONResponse) VisitPatchFriendResponse(w http.ResponseWriter) error {
+func (response PatchFriend401ApplicationProblemPlusJSONResponse) VisitPatchFriendResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type PatchFriend403JSONResponse struct{ ForbiddenJSONResponse }
+type PatchFriend403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
 
-func (response PatchFriend403JSONResponse) VisitPatchFriendResponse(w http.ResponseWriter) error {
+func (response PatchFriend403ApplicationProblemPlusJSONResponse) VisitPatchFriendResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(403)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type PatchFriend404JSONResponse struct{ NotFoundJSONResponse }
+type PatchFriend404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
 
-func (response PatchFriend404JSONResponse) VisitPatchFriendResponse(w http.ResponseWriter) error {
+func (response PatchFriend404ApplicationProblemPlusJSONResponse) VisitPatchFriendResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(404)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type PatchFrienddefaultJSONResponse struct {
-	Body       ApiError
+type PatchFrienddefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response PatchFrienddefaultJSONResponse) VisitPatchFriendResponse(w http.ResponseWriter) error {
+func (response PatchFrienddefaultApplicationProblemPlusJSONResponse) VisitPatchFriendResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
@@ -3093,32 +3428,34 @@ func (response ListServers200JSONResponse) VisitListServersResponse(w http.Respo
 	return err
 }
 
-type ListServers401JSONResponse struct{ UnauthorizedJSONResponse }
+type ListServers401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response ListServers401JSONResponse) VisitListServersResponse(w http.ResponseWriter) error {
+func (response ListServers401ApplicationProblemPlusJSONResponse) VisitListServersResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type ListServersdefaultJSONResponse struct {
-	Body       ApiError
+type ListServersdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response ListServersdefaultJSONResponse) VisitListServersResponse(w http.ResponseWriter) error {
+func (response ListServersdefaultApplicationProblemPlusJSONResponse) VisitListServersResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
@@ -3146,46 +3483,50 @@ func (response CreateServer201JSONResponse) VisitCreateServerResponse(w http.Res
 	return err
 }
 
-type CreateServer400JSONResponse struct{ BadRequestJSONResponse }
+type CreateServer400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
 
-func (response CreateServer400JSONResponse) VisitCreateServerResponse(w http.ResponseWriter) error {
+func (response CreateServer400ApplicationProblemPlusJSONResponse) VisitCreateServerResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type CreateServer401JSONResponse struct{ UnauthorizedJSONResponse }
+type CreateServer401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response CreateServer401JSONResponse) VisitCreateServerResponse(w http.ResponseWriter) error {
+func (response CreateServer401ApplicationProblemPlusJSONResponse) VisitCreateServerResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type CreateServerdefaultJSONResponse struct {
-	Body       ApiError
+type CreateServerdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response CreateServerdefaultJSONResponse) VisitCreateServerResponse(w http.ResponseWriter) error {
+func (response CreateServerdefaultApplicationProblemPlusJSONResponse) VisitCreateServerResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
@@ -3213,88 +3554,98 @@ func (response JoinServer200JSONResponse) VisitJoinServerResponse(w http.Respons
 	return err
 }
 
-type JoinServer400JSONResponse struct{ BadRequestJSONResponse }
+type JoinServer400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
 
-func (response JoinServer400JSONResponse) VisitJoinServerResponse(w http.ResponseWriter) error {
+func (response JoinServer400ApplicationProblemPlusJSONResponse) VisitJoinServerResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type JoinServer401JSONResponse struct{ UnauthorizedJSONResponse }
+type JoinServer401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response JoinServer401JSONResponse) VisitJoinServerResponse(w http.ResponseWriter) error {
+func (response JoinServer401ApplicationProblemPlusJSONResponse) VisitJoinServerResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type JoinServer404JSONResponse struct{ NotFoundJSONResponse }
+type JoinServer404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
 
-func (response JoinServer404JSONResponse) VisitJoinServerResponse(w http.ResponseWriter) error {
+func (response JoinServer404ApplicationProblemPlusJSONResponse) VisitJoinServerResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(404)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type JoinServer409JSONResponse struct{ ConflictJSONResponse }
+type JoinServer409ApplicationProblemPlusJSONResponse struct {
+	ConflictApplicationProblemPlusJSONResponse
+}
 
-func (response JoinServer409JSONResponse) VisitJoinServerResponse(w http.ResponseWriter) error {
+func (response JoinServer409ApplicationProblemPlusJSONResponse) VisitJoinServerResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(409)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type JoinServer410JSONResponse struct{ GoneJSONResponse }
+type JoinServer410ApplicationProblemPlusJSONResponse struct {
+	GoneApplicationProblemPlusJSONResponse
+}
 
-func (response JoinServer410JSONResponse) VisitJoinServerResponse(w http.ResponseWriter) error {
+func (response JoinServer410ApplicationProblemPlusJSONResponse) VisitJoinServerResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(410)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type JoinServerdefaultJSONResponse struct {
-	Body       ApiError
+type JoinServerdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response JoinServerdefaultJSONResponse) VisitJoinServerResponse(w http.ResponseWriter) error {
+func (response JoinServerdefaultApplicationProblemPlusJSONResponse) VisitJoinServerResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
@@ -3322,82 +3673,91 @@ func (response DeleteServer200JSONResponse) VisitDeleteServerResponse(w http.Res
 	return err
 }
 
-type DeleteServer400JSONResponse struct{ BadRequestJSONResponse }
+type DeleteServer400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
 
-func (response DeleteServer400JSONResponse) VisitDeleteServerResponse(w http.ResponseWriter) error {
+func (response DeleteServer400ApplicationProblemPlusJSONResponse) VisitDeleteServerResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type DeleteServer401JSONResponse struct{ UnauthorizedJSONResponse }
+type DeleteServer401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response DeleteServer401JSONResponse) VisitDeleteServerResponse(w http.ResponseWriter) error {
+func (response DeleteServer401ApplicationProblemPlusJSONResponse) VisitDeleteServerResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type DeleteServer403JSONResponse struct{ ForbiddenJSONResponse }
+type DeleteServer403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
 
-func (response DeleteServer403JSONResponse) VisitDeleteServerResponse(w http.ResponseWriter) error {
+func (response DeleteServer403ApplicationProblemPlusJSONResponse) VisitDeleteServerResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(403)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type DeleteServer404JSONResponse struct{ NotFoundJSONResponse }
+type DeleteServer404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
 
-func (response DeleteServer404JSONResponse) VisitDeleteServerResponse(w http.ResponseWriter) error {
+func (response DeleteServer404ApplicationProblemPlusJSONResponse) VisitDeleteServerResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(404)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type DeleteServerdefaultJSONResponse struct {
-	Body       ApiError
+type DeleteServerdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response DeleteServerdefaultJSONResponse) VisitDeleteServerResponse(w http.ResponseWriter) error {
+func (response DeleteServerdefaultApplicationProblemPlusJSONResponse) VisitDeleteServerResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
 type PatchServerRequestObject struct {
-	Id   IDPath `json:"id"`
-	Body *PatchServerJSONRequestBody
+	Id                                IDPath `json:"id"`
+	JSONBody                          *PatchServerJSONRequestBody
+	ApplicationMergePatchPlusJSONBody *PatchServerApplicationMergePatchPlusJSONRequestBody
 }
 
 type PatchServerResponseObject interface {
@@ -3418,74 +3778,82 @@ func (response PatchServer200JSONResponse) VisitPatchServerResponse(w http.Respo
 	return err
 }
 
-type PatchServer400JSONResponse struct{ BadRequestJSONResponse }
+type PatchServer400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
 
-func (response PatchServer400JSONResponse) VisitPatchServerResponse(w http.ResponseWriter) error {
+func (response PatchServer400ApplicationProblemPlusJSONResponse) VisitPatchServerResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type PatchServer401JSONResponse struct{ UnauthorizedJSONResponse }
+type PatchServer401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response PatchServer401JSONResponse) VisitPatchServerResponse(w http.ResponseWriter) error {
+func (response PatchServer401ApplicationProblemPlusJSONResponse) VisitPatchServerResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type PatchServer403JSONResponse struct{ ForbiddenJSONResponse }
+type PatchServer403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
 
-func (response PatchServer403JSONResponse) VisitPatchServerResponse(w http.ResponseWriter) error {
+func (response PatchServer403ApplicationProblemPlusJSONResponse) VisitPatchServerResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(403)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type PatchServer404JSONResponse struct{ NotFoundJSONResponse }
+type PatchServer404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
 
-func (response PatchServer404JSONResponse) VisitPatchServerResponse(w http.ResponseWriter) error {
+func (response PatchServer404ApplicationProblemPlusJSONResponse) VisitPatchServerResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(404)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type PatchServerdefaultJSONResponse struct {
-	Body       ApiError
+type PatchServerdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response PatchServerdefaultJSONResponse) VisitPatchServerResponse(w http.ResponseWriter) error {
+func (response PatchServerdefaultApplicationProblemPlusJSONResponse) VisitPatchServerResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
@@ -3514,67 +3882,74 @@ func (response CreateCategory201JSONResponse) VisitCreateCategoryResponse(w http
 	return err
 }
 
-type CreateCategory400JSONResponse struct{ BadRequestJSONResponse }
+type CreateCategory400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
 
-func (response CreateCategory400JSONResponse) VisitCreateCategoryResponse(w http.ResponseWriter) error {
+func (response CreateCategory400ApplicationProblemPlusJSONResponse) VisitCreateCategoryResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type CreateCategory401JSONResponse struct{ UnauthorizedJSONResponse }
+type CreateCategory401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response CreateCategory401JSONResponse) VisitCreateCategoryResponse(w http.ResponseWriter) error {
+func (response CreateCategory401ApplicationProblemPlusJSONResponse) VisitCreateCategoryResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type CreateCategory403JSONResponse struct{ ForbiddenJSONResponse }
+type CreateCategory403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
 
-func (response CreateCategory403JSONResponse) VisitCreateCategoryResponse(w http.ResponseWriter) error {
+func (response CreateCategory403ApplicationProblemPlusJSONResponse) VisitCreateCategoryResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(403)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type CreateCategorydefaultJSONResponse struct {
-	Body       ApiError
+type CreateCategorydefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response CreateCategorydefaultJSONResponse) VisitCreateCategoryResponse(w http.ResponseWriter) error {
+func (response CreateCategorydefaultApplicationProblemPlusJSONResponse) VisitCreateCategoryResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
 type ListChannelsRequestObject struct {
-	Id IDPath `json:"id"`
+	Id     IDPath `json:"id"`
+	Params ListChannelsParams
 }
 
 type ListChannelsResponseObject interface {
@@ -3595,60 +3970,74 @@ func (response ListChannels200JSONResponse) VisitListChannelsResponse(w http.Res
 	return err
 }
 
-type ListChannels400JSONResponse struct{ BadRequestJSONResponse }
+type ListChannels304Response struct {
+}
 
-func (response ListChannels400JSONResponse) VisitListChannelsResponse(w http.ResponseWriter) error {
+func (response ListChannels304Response) VisitListChannelsResponse(w http.ResponseWriter) error {
+	w.WriteHeader(304)
+	return nil
+}
+
+type ListChannels400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response ListChannels400ApplicationProblemPlusJSONResponse) VisitListChannelsResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type ListChannels401JSONResponse struct{ UnauthorizedJSONResponse }
+type ListChannels401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response ListChannels401JSONResponse) VisitListChannelsResponse(w http.ResponseWriter) error {
+func (response ListChannels401ApplicationProblemPlusJSONResponse) VisitListChannelsResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type ListChannels403JSONResponse struct{ ForbiddenJSONResponse }
+type ListChannels403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
 
-func (response ListChannels403JSONResponse) VisitListChannelsResponse(w http.ResponseWriter) error {
+func (response ListChannels403ApplicationProblemPlusJSONResponse) VisitListChannelsResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(403)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type ListChannelsdefaultJSONResponse struct {
-	Body       ApiError
+type ListChannelsdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response ListChannelsdefaultJSONResponse) VisitListChannelsResponse(w http.ResponseWriter) error {
+func (response ListChannelsdefaultApplicationProblemPlusJSONResponse) VisitListChannelsResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
@@ -3677,60 +4066,66 @@ func (response CreateChannel201JSONResponse) VisitCreateChannelResponse(w http.R
 	return err
 }
 
-type CreateChannel400JSONResponse struct{ BadRequestJSONResponse }
+type CreateChannel400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
 
-func (response CreateChannel400JSONResponse) VisitCreateChannelResponse(w http.ResponseWriter) error {
+func (response CreateChannel400ApplicationProblemPlusJSONResponse) VisitCreateChannelResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type CreateChannel401JSONResponse struct{ UnauthorizedJSONResponse }
+type CreateChannel401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response CreateChannel401JSONResponse) VisitCreateChannelResponse(w http.ResponseWriter) error {
+func (response CreateChannel401ApplicationProblemPlusJSONResponse) VisitCreateChannelResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type CreateChannel403JSONResponse struct{ ForbiddenJSONResponse }
+type CreateChannel403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
 
-func (response CreateChannel403JSONResponse) VisitCreateChannelResponse(w http.ResponseWriter) error {
+func (response CreateChannel403ApplicationProblemPlusJSONResponse) VisitCreateChannelResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(403)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type CreateChanneldefaultJSONResponse struct {
-	Body       ApiError
+type CreateChanneldefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response CreateChanneldefaultJSONResponse) VisitCreateChannelResponse(w http.ResponseWriter) error {
+func (response CreateChanneldefaultApplicationProblemPlusJSONResponse) VisitCreateChannelResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
@@ -3759,67 +4154,74 @@ func (response CreateInvite201JSONResponse) VisitCreateInviteResponse(w http.Res
 	return err
 }
 
-type CreateInvite400JSONResponse struct{ BadRequestJSONResponse }
+type CreateInvite400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
 
-func (response CreateInvite400JSONResponse) VisitCreateInviteResponse(w http.ResponseWriter) error {
+func (response CreateInvite400ApplicationProblemPlusJSONResponse) VisitCreateInviteResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type CreateInvite401JSONResponse struct{ UnauthorizedJSONResponse }
+type CreateInvite401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response CreateInvite401JSONResponse) VisitCreateInviteResponse(w http.ResponseWriter) error {
+func (response CreateInvite401ApplicationProblemPlusJSONResponse) VisitCreateInviteResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type CreateInvite403JSONResponse struct{ ForbiddenJSONResponse }
+type CreateInvite403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
 
-func (response CreateInvite403JSONResponse) VisitCreateInviteResponse(w http.ResponseWriter) error {
+func (response CreateInvite403ApplicationProblemPlusJSONResponse) VisitCreateInviteResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(403)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type CreateInvitedefaultJSONResponse struct {
-	Body       ApiError
+type CreateInvitedefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response CreateInvitedefaultJSONResponse) VisitCreateInviteResponse(w http.ResponseWriter) error {
+func (response CreateInvitedefaultApplicationProblemPlusJSONResponse) VisitCreateInviteResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
 type ListServerMembersRequestObject struct {
-	Id IDPath `json:"id"`
+	Id     IDPath `json:"id"`
+	Params ListServerMembersParams
 }
 
 type ListServerMembersResponseObject interface {
@@ -3840,60 +4242,74 @@ func (response ListServerMembers200JSONResponse) VisitListServerMembersResponse(
 	return err
 }
 
-type ListServerMembers400JSONResponse struct{ BadRequestJSONResponse }
+type ListServerMembers304Response struct {
+}
 
-func (response ListServerMembers400JSONResponse) VisitListServerMembersResponse(w http.ResponseWriter) error {
+func (response ListServerMembers304Response) VisitListServerMembersResponse(w http.ResponseWriter) error {
+	w.WriteHeader(304)
+	return nil
+}
+
+type ListServerMembers400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response ListServerMembers400ApplicationProblemPlusJSONResponse) VisitListServerMembersResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type ListServerMembers401JSONResponse struct{ UnauthorizedJSONResponse }
+type ListServerMembers401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response ListServerMembers401JSONResponse) VisitListServerMembersResponse(w http.ResponseWriter) error {
+func (response ListServerMembers401ApplicationProblemPlusJSONResponse) VisitListServerMembersResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type ListServerMembers403JSONResponse struct{ ForbiddenJSONResponse }
+type ListServerMembers403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
 
-func (response ListServerMembers403JSONResponse) VisitListServerMembersResponse(w http.ResponseWriter) error {
+func (response ListServerMembers403ApplicationProblemPlusJSONResponse) VisitListServerMembersResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(403)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type ListServerMembersdefaultJSONResponse struct {
-	Body       ApiError
+type ListServerMembersdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response ListServerMembersdefaultJSONResponse) VisitListServerMembersResponse(w http.ResponseWriter) error {
+func (response ListServerMembersdefaultApplicationProblemPlusJSONResponse) VisitListServerMembersResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
@@ -3920,53 +4336,58 @@ func (response GetMe200JSONResponse) VisitGetMeResponse(w http.ResponseWriter) e
 	return err
 }
 
-type GetMe401JSONResponse struct{ UnauthorizedJSONResponse }
+type GetMe401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response GetMe401JSONResponse) VisitGetMeResponse(w http.ResponseWriter) error {
+func (response GetMe401ApplicationProblemPlusJSONResponse) VisitGetMeResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type GetMe404JSONResponse struct{ NotFoundJSONResponse }
+type GetMe404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
 
-func (response GetMe404JSONResponse) VisitGetMeResponse(w http.ResponseWriter) error {
+func (response GetMe404ApplicationProblemPlusJSONResponse) VisitGetMeResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(404)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type GetMedefaultJSONResponse struct {
-	Body       ApiError
+type GetMedefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response GetMedefaultJSONResponse) VisitGetMeResponse(w http.ResponseWriter) error {
+func (response GetMedefaultApplicationProblemPlusJSONResponse) VisitGetMeResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
 type PatchMeRequestObject struct {
-	Body *PatchMeJSONRequestBody
+	JSONBody                          *PatchMeJSONRequestBody
+	ApplicationMergePatchPlusJSONBody *PatchMeApplicationMergePatchPlusJSONRequestBody
 }
 
 type PatchMeResponseObject interface {
@@ -3987,60 +4408,66 @@ func (response PatchMe200JSONResponse) VisitPatchMeResponse(w http.ResponseWrite
 	return err
 }
 
-type PatchMe400JSONResponse struct{ BadRequestJSONResponse }
+type PatchMe400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
 
-func (response PatchMe400JSONResponse) VisitPatchMeResponse(w http.ResponseWriter) error {
+func (response PatchMe400ApplicationProblemPlusJSONResponse) VisitPatchMeResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(400)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type PatchMe401JSONResponse struct{ UnauthorizedJSONResponse }
+type PatchMe401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
 
-func (response PatchMe401JSONResponse) VisitPatchMeResponse(w http.ResponseWriter) error {
+func (response PatchMe401ApplicationProblemPlusJSONResponse) VisitPatchMeResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type PatchMe409JSONResponse struct{ ConflictJSONResponse }
+type PatchMe409ApplicationProblemPlusJSONResponse struct {
+	ConflictApplicationProblemPlusJSONResponse
+}
 
-func (response PatchMe409JSONResponse) VisitPatchMeResponse(w http.ResponseWriter) error {
+func (response PatchMe409ApplicationProblemPlusJSONResponse) VisitPatchMeResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(409)
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-type PatchMedefaultJSONResponse struct {
-	Body       ApiError
+type PatchMedefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
 	StatusCode int
 }
 
-func (response PatchMedefaultJSONResponse) VisitPatchMeResponse(w http.ResponseWriter) error {
+func (response PatchMedefaultApplicationProblemPlusJSONResponse) VisitPatchMeResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
@@ -4081,10 +4508,10 @@ type StrictServerInterface interface {
 	// PatchChannel 改频道（owner/admin）
 	// (PATCH /api/v1/channels/{id})
 	PatchChannel(ctx context.Context, request PatchChannelRequestObject) (PatchChannelResponseObject, error)
-	// ListMessages 消息分页（倒序，游标 before_id）
+	// ListMessages 消息分页（游标，倒序取页正序返回）
 	// (GET /api/v1/channels/{id}/messages)
 	ListMessages(ctx context.Context, request ListMessagesRequestObject) (ListMessagesResponseObject, error)
-	// CreateMessage 发送文字消息（≤2000 字 + 频控 20/分）
+	// CreateMessage 发送文字消息（≤2000 字 + 频控 20/分 + nonce 幂等）
 	// (POST /api/v1/channels/{id}/messages)
 	CreateMessage(ctx context.Context, request CreateMessageRequestObject) (CreateMessageResponseObject, error)
 	// GetConfig 服务端能力开关
@@ -4434,13 +4861,26 @@ func (sh *strictHandler) PatchCategory(w http.ResponseWriter, r *http.Request, i
 	var request PatchCategoryRequestObject
 
 	request.Id = id
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 
-	var body PatchCategoryJSONRequestBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
-		return
+		var body PatchCategoryJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.JSONBody = &body
+
 	}
-	request.Body = &body
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/merge-patch+json") {
+
+		var body PatchCategoryApplicationMergePatchPlusJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.ApplicationMergePatchPlusJSONBody = &body
+
+	}
 
 	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
 		return sh.ssi.PatchCategory(ctx, request.(PatchCategoryRequestObject))
@@ -4493,13 +4933,26 @@ func (sh *strictHandler) PatchChannel(w http.ResponseWriter, r *http.Request, id
 	var request PatchChannelRequestObject
 
 	request.Id = id
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 
-	var body PatchChannelJSONRequestBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
-		return
+		var body PatchChannelJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.JSONBody = &body
+
 	}
-	request.Body = &body
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/merge-patch+json") {
+
+		var body PatchChannelApplicationMergePatchPlusJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.ApplicationMergePatchPlusJSONBody = &body
+
+	}
 
 	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
 		return sh.ssi.PatchChannel(ctx, request.(PatchChannelRequestObject))
@@ -4717,13 +5170,26 @@ func (sh *strictHandler) PatchFriend(w http.ResponseWriter, r *http.Request, id 
 	var request PatchFriendRequestObject
 
 	request.Id = id
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 
-	var body PatchFriendJSONRequestBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
-		return
+		var body PatchFriendJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.JSONBody = &body
+
 	}
-	request.Body = &body
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/merge-patch+json") {
+
+		var body PatchFriendApplicationMergePatchPlusJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.ApplicationMergePatchPlusJSONBody = &body
+
+	}
 
 	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
 		return sh.ssi.PatchFriend(ctx, request.(PatchFriendRequestObject))
@@ -4862,13 +5328,26 @@ func (sh *strictHandler) PatchServer(w http.ResponseWriter, r *http.Request, id 
 	var request PatchServerRequestObject
 
 	request.Id = id
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 
-	var body PatchServerJSONRequestBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
-		return
+		var body PatchServerJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.JSONBody = &body
+
 	}
-	request.Body = &body
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/merge-patch+json") {
+
+		var body PatchServerApplicationMergePatchPlusJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.ApplicationMergePatchPlusJSONBody = &body
+
+	}
 
 	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
 		return sh.ssi.PatchServer(ctx, request.(PatchServerRequestObject))
@@ -4924,10 +5403,11 @@ func (sh *strictHandler) CreateCategory(w http.ResponseWriter, r *http.Request, 
 }
 
 // ListChannels operation middleware
-func (sh *strictHandler) ListChannels(w http.ResponseWriter, r *http.Request, id IDPath) {
+func (sh *strictHandler) ListChannels(w http.ResponseWriter, r *http.Request, id IDPath, params ListChannelsParams) {
 	var request ListChannelsRequestObject
 
 	request.Id = id
+	request.Params = params
 
 	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
 		return sh.ssi.ListChannels(ctx, request.(ListChannelsRequestObject))
@@ -5016,10 +5496,11 @@ func (sh *strictHandler) CreateInvite(w http.ResponseWriter, r *http.Request, id
 }
 
 // ListServerMembers operation middleware
-func (sh *strictHandler) ListServerMembers(w http.ResponseWriter, r *http.Request, id IDPath) {
+func (sh *strictHandler) ListServerMembers(w http.ResponseWriter, r *http.Request, id IDPath, params ListServerMembersParams) {
 	var request ListServerMembersRequestObject
 
 	request.Id = id
+	request.Params = params
 
 	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
 		return sh.ssi.ListServerMembers(ctx, request.(ListServerMembersRequestObject))
@@ -5069,12 +5550,26 @@ func (sh *strictHandler) GetMe(w http.ResponseWriter, r *http.Request) {
 func (sh *strictHandler) PatchMe(w http.ResponseWriter, r *http.Request) {
 	var request PatchMeRequestObject
 
-	var body PatchMeJSONRequestBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
-		return
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+
+		var body PatchMeJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.JSONBody = &body
+
 	}
-	request.Body = &body
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/merge-patch+json") {
+
+		var body PatchMeApplicationMergePatchPlusJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.ApplicationMergePatchPlusJSONBody = &body
+
+	}
 
 	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
 		return sh.ssi.PatchMe(ctx, request.(PatchMeRequestObject))

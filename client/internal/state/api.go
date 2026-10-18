@@ -35,13 +35,13 @@ type AuthTokens struct {
 }
 
 // UserProfile 用户档案（无头像——硬性约束）。
-// id 与服务端 store.User 一致为数字（曾误声明 string，导致登录/注册/游客
-// 响应解码全部失败——服务端 wire 是 int64）。
+// id 为 wire 字符串 ID（#31）：Snowflake 超出 JS Number 精度，JSON 一律字符串；
+// 解码双接受数字（老服务端）。
 // 字段与 api/openapi.yaml 的 User/PublicUser 对齐（#28）；Online 为桥接层
 // 补充字段（REST User 无，PublicUser 有）。
 // Status：服务端 users.status（在线状态），好友列表按它归组 online/offline 用。
 type UserProfile struct {
-	ID            int64  `json:"id"`
+	ID            ID     `json:"id"`
 	Nickname      string `json:"nickname"`
 	Tag           string `json:"tag"`
 	Email         string `json:"email"`
@@ -331,15 +331,35 @@ func (c *APIClient) del(path string) (int, []byte, error) {
 	return status, data, nil
 }
 
-// APIError 服务端错误响应 {code,message}。Status 为对应 HTTP 状态码，
-// 不入 JSON——调用方据它区分「明确 401（清令牌）」与「网络错误（保留重试）」。
+// APIError 服务端错误响应（#31 RFC 9457 problem+json）：{type,title,status,code,detail}。
+// code 为机器码（扩展字段，与旧版一致）；Message 取 detail（旧 message 字段兼容读）。
+// Status 为对应 HTTP 状态码，不入 JSON——调用方据它区分「明确 401（清令牌）」与
+// 「网络错误（保留重试）」。
 type APIError struct {
 	Code    string `json:"code"`
-	Message string `json:"message"`
+	Message string `json:"detail"`
 	Status  int    `json:"-"`
 }
 
 func (e *APIError) Error() string { return fmt.Sprintf("%s: %s", e.Code, e.Message) }
+
+// UnmarshalJSON 兼容 problem+json 的 detail 与旧版 message 两种提示字段。
+func (e *APIError) UnmarshalJSON(b []byte) error {
+	var raw struct {
+		Code   string `json:"code"`
+		Detail string `json:"detail"`
+		Legacy string `json:"message"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	e.Code = raw.Code
+	e.Message = raw.Detail
+	if e.Message == "" {
+		e.Message = raw.Legacy
+	}
+	return nil
+}
 
 // decodeError 从响应体解析错误。
 func decodeError(status int, data []byte) error {
@@ -556,23 +576,24 @@ func (c *APIClient) RTCCredentials() (*ICEServersResponse, error) {
 // ---------- 服务器 / 频道 / 好友（REST CRUD，服务端已有端点） ----------
 
 // ServerDTO 服务器（与 store.Server / 契约 ServerInfo wire 对齐；图标为 Lucide 预设名）。
+// ID 为字符串 wire（#31）。
 type ServerDTO struct {
-	ID        int64     `json:"id"`
+	ID        ID        `json:"id"`
 	Name      string    `json:"name"`
-	OwnerID   int64     `json:"owner_id"`
+	OwnerID   ID        `json:"owner_id"`
 	IconName  string    `json:"icon_name"`
 	IconColor string    `json:"icon_color"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// ChannelDTO 频道（与 store.Channel / 契约 ChannelInfo wire 对齐）。
+// ChannelDTO 频道（与 store.Channel / 契约 ChannelInfo wire 对齐）。ID 为字符串 wire（#31）。
 type ChannelDTO struct {
-	ID       int64  `json:"id"`
-	ServerID int64  `json:"server_id"`
+	ID       ID     `json:"id"`
+	ServerID ID     `json:"server_id"`
 	Name     string `json:"name"`
 	Type     string `json:"type"` // text | voice
-	// CategoryID 分类归属（0 = 无分类/未分类，映射自服务端 NULL）；Position 同服务器序。
-	CategoryID *int64    `json:"category_id"`
+	// CategoryID 分类归属（0/空 = 无分类/未分类，映射自服务端 NULL）；Position 同服务器序。
+	CategoryID *ID       `json:"category_id"`
 	Position   int       `json:"position"`
 	CreatedAt  time.Time `json:"created_at"`
 }
@@ -584,8 +605,8 @@ type ServerChannels struct {
 }
 
 // ListChannels 列出服务器的分类与频道（成员可读）。重启后频道列表恢复用。
-func (c *APIClient) ListChannels(serverID int64) (*ServerChannels, error) {
-	status, data, err := c.get(fmt.Sprintf("/servers/%d/channels", serverID))
+func (c *APIClient) ListChannels(serverID string) (*ServerChannels, error) {
+	status, data, err := c.get(fmt.Sprintf("/servers/%s/channels", serverID))
 	if err != nil {
 		return nil, err
 	}
@@ -647,9 +668,9 @@ func (c *APIClient) JoinServer(code string) (*ServerDTO, error) {
 	return &s, nil
 }
 
-// RenameServer 重命名服务器（owner/admin）。
-func (c *APIClient) RenameServer(id int64, name string) error {
-	status, data, err := c.patch(fmt.Sprintf("/servers/%d", id), map[string]string{"name": name})
+// RenameServer 重命名服务器（owner/admin）。id 为十进制 ID 串（#31）。
+func (c *APIClient) RenameServer(id string, name string) error {
+	status, data, err := c.patch(fmt.Sprintf("/servers/%s", id), map[string]string{"name": name})
 	if err != nil {
 		return err
 	}
@@ -660,8 +681,8 @@ func (c *APIClient) RenameServer(id int64, name string) error {
 }
 
 // DeleteServer 删除服务器（仅 owner）。
-func (c *APIClient) DeleteServer(id int64) error {
-	status, data, err := c.del(fmt.Sprintf("/servers/%d", id))
+func (c *APIClient) DeleteServer(id string) error {
+	status, data, err := c.del(fmt.Sprintf("/servers/%s", id))
 	if err != nil {
 		return err
 	}
@@ -672,8 +693,8 @@ func (c *APIClient) DeleteServer(id int64) error {
 }
 
 // CreateInvite 为服务器生成邀请码（admin 及以上）。返回 code 字符串。
-func (c *APIClient) CreateInvite(serverID int64) (string, error) {
-	status, data, err := c.post(fmt.Sprintf("/servers/%d/invites", serverID),
+func (c *APIClient) CreateInvite(serverID string) (string, error) {
+	status, data, err := c.post(fmt.Sprintf("/servers/%s/invites", serverID),
 		map[string]int{}, true)
 	if err != nil {
 		return "", err
@@ -691,11 +712,15 @@ func (c *APIClient) CreateInvite(serverID int64) (string, error) {
 }
 
 // CreateChannel 在服务器下新建频道（owner/admin）。typ 为 text / voice。
-// categoryID 为目标分类（0 = 不归类，服务端落 NULL）——带上它频道才在会话内
+// categoryID 为目标分类（空/「0」= 不归类，服务端落 NULL）——带上它频道才在会话内
 // 就归位，不用等重启后 ListChannels 对账（#72）。成功返回 201。
-func (c *APIClient) CreateChannel(serverID int64, name, typ string, categoryID int64) (*ChannelDTO, error) {
-	status, data, err := c.post(fmt.Sprintf("/servers/%d/channels", serverID),
-		map[string]any{"name": name, "type": typ, "category_id": categoryID}, true)
+func (c *APIClient) CreateChannel(serverID string, name, typ string, categoryID string) (*ChannelDTO, error) {
+	body := map[string]any{"name": name, "type": typ}
+	if categoryID != "" {
+		body["category_id"] = categoryID
+	}
+	status, data, err := c.post(fmt.Sprintf("/servers/%s/channels", serverID),
+		body, true)
 	if err != nil {
 		return nil, err
 	}
@@ -710,8 +735,8 @@ func (c *APIClient) CreateChannel(serverID int64, name, typ string, categoryID i
 }
 
 // RenameChannel 重命名频道（owner/admin）。
-func (c *APIClient) RenameChannel(id int64, name string) error {
-	status, data, err := c.patch(fmt.Sprintf("/channels/%d", id), map[string]string{"name": name})
+func (c *APIClient) RenameChannel(id string, name string) error {
+	status, data, err := c.patch(fmt.Sprintf("/channels/%s", id), map[string]string{"name": name})
 	if err != nil {
 		return err
 	}
@@ -722,8 +747,8 @@ func (c *APIClient) RenameChannel(id int64, name string) error {
 }
 
 // DeleteChannel 删除频道（owner/admin）。
-func (c *APIClient) DeleteChannel(id int64) error {
-	status, data, err := c.del(fmt.Sprintf("/channels/%d", id))
+func (c *APIClient) DeleteChannel(id string) error {
+	status, data, err := c.del(fmt.Sprintf("/channels/%s", id))
 	if err != nil {
 		return err
 	}
@@ -733,18 +758,18 @@ func (c *APIClient) DeleteChannel(id int64) error {
 	return nil
 }
 
-// CategoryDTO 频道分类（与 store.Category / 契约 CategoryInfo 对齐）。
+// CategoryDTO 频道分类（与 store.Category / 契约 CategoryInfo 对齐）。ID 为字符串 wire（#31）。
 type CategoryDTO struct {
-	ID        int64     `json:"id"`
-	ServerID  int64     `json:"server_id"`
+	ID        ID        `json:"id"`
+	ServerID  ID        `json:"server_id"`
 	Name      string    `json:"name"`
 	Position  int       `json:"position"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
 // CreateCategory 创建频道分类（owner/admin；1–32 字）。
-func (c *APIClient) CreateCategory(serverID int64, name string) (*CategoryDTO, error) {
-	status, data, err := c.post(fmt.Sprintf("/servers/%d/categories", serverID),
+func (c *APIClient) CreateCategory(serverID string, name string) (*CategoryDTO, error) {
+	status, data, err := c.post(fmt.Sprintf("/servers/%s/categories", serverID),
 		map[string]string{"name": name}, true)
 	if err != nil {
 		return nil, err
@@ -761,8 +786,8 @@ func (c *APIClient) CreateCategory(serverID int64, name string) (*CategoryDTO, e
 
 // DeleteCategory 删除分类；withChannels=true 时级联删除其下全部频道
 // （服务端单事务；分类非空且未带参会 409 category_not_empty，由 UI 二次确认后传 true）。
-func (c *APIClient) DeleteCategory(id int64, withChannels bool) error {
-	path := fmt.Sprintf("/categories/%d", id)
+func (c *APIClient) DeleteCategory(id string, withChannels bool) error {
+	path := fmt.Sprintf("/categories/%s", id)
 	if withChannels {
 		path += "?with_channels=1"
 	}
@@ -777,14 +802,14 @@ func (c *APIClient) DeleteCategory(id int64, withChannels bool) error {
 }
 
 // RenameCategory 重命名分类（owner/admin；1–32 字）。
-func (c *APIClient) RenameCategory(id int64, name string) error {
+func (c *APIClient) RenameCategory(id string, name string) error {
 	_, err := c.UpdateCategory(id, &name, nil)
 	return err
 }
 
 // UpdateCategory 改分类名/位置（owner/admin；至少给一个字段）。position 为目标序
 // （0-based），服务端把该分类移到此位置并重排同服务器其它分类为 0..n-1。
-func (c *APIClient) UpdateCategory(id int64, name *string, position *int) (*CategoryDTO, error) {
+func (c *APIClient) UpdateCategory(id string, name *string, position *int) (*CategoryDTO, error) {
 	body := map[string]any{}
 	if name != nil {
 		body["name"] = *name
@@ -792,7 +817,7 @@ func (c *APIClient) UpdateCategory(id int64, name *string, position *int) (*Cate
 	if position != nil {
 		body["position"] = *position
 	}
-	status, data, err := c.patch(fmt.Sprintf("/categories/%d", id), body)
+	status, data, err := c.patch(fmt.Sprintf("/categories/%s", id), body)
 	if err != nil {
 		return nil, err
 	}
@@ -819,8 +844,9 @@ func (c *APIClient) SendFriendRequest(target string) error {
 }
 
 // FriendDTO 好友条目（与服务端 friendView 对齐；Remark/Group 仅发起方视角非空）。
+// ID 为字符串 wire（#31）。
 type FriendDTO struct {
-	ID       int64       `json:"id"`
+	ID       ID          `json:"id"`
 	Status   string      `json:"status"` // pending | accepted | blocked
 	Incoming bool        `json:"incoming"`
 	Remark   string      `json:"remark"`
@@ -845,8 +871,8 @@ func (c *APIClient) ListFriends() ([]FriendDTO, error) {
 }
 
 // AcceptFriend 接受好友请求（仅被请求方可调）。
-func (c *APIClient) AcceptFriend(id int64) error {
-	status, data, err := c.post(fmt.Sprintf("/friends/requests/%d/accept", id), nil, true)
+func (c *APIClient) AcceptFriend(id string) error {
+	status, data, err := c.post(fmt.Sprintf("/friends/requests/%s/accept", id), nil, true)
 	if err != nil {
 		return err
 	}
@@ -857,8 +883,8 @@ func (c *APIClient) AcceptFriend(id int64) error {
 }
 
 // RemoveFriend 删除好友关系（双向皆可）。
-func (c *APIClient) RemoveFriend(id int64) error {
-	status, data, err := c.del(fmt.Sprintf("/friends/%d", id))
+func (c *APIClient) RemoveFriend(id string) error {
+	status, data, err := c.del(fmt.Sprintf("/friends/%s", id))
 	if err != nil {
 		return err
 	}
@@ -870,9 +896,9 @@ func (c *APIClient) RemoveFriend(id int64) error {
 
 // UpdateFriend 设置备注/分组（仅发起方；空串=清除备注/移出分组）。
 // 调用方持有全量状态，两个字段总是整体提交。
-func (c *APIClient) UpdateFriend(id int64, remark, group string) error {
+func (c *APIClient) UpdateFriend(id string, remark, group string) error {
 	body := map[string]string{"remark": remark, "group": group}
-	status, data, err := c.patch(fmt.Sprintf("/friends/%d", id), body)
+	status, data, err := c.patch(fmt.Sprintf("/friends/%s", id), body)
 	if err != nil {
 		return err
 	}

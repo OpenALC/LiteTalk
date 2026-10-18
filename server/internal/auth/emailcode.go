@@ -110,9 +110,21 @@ func NewRateLimit(kv kvStore) *RateLimit { return &RateLimit{kv: kv} }
 
 // Allow 窗口内第 n 次请求；超过 limit 返回 false。计数走 IncrCap 原子限幅（#22）。
 func (r *RateLimit) Allow(ctx context.Context, key string, limit int, window time.Duration) (bool, error) {
+	ok, _, _, err := r.AllowInfo(ctx, key, limit, window)
+	return ok, err
+}
+
+// AllowInfo 与 Allow 同判定，另返回剩余配额与窗口重置上限（#31 限流头）。
+// reset 是「此刻 + 窗口长」的上界（固定窗口起点不可回查，重置只会更早不会更晚），
+// 调用方可直接写 X-RateLimit-Reset 与 Retry-After，客户端按它退避只会多等不会少等。
+func (r *RateLimit) AllowInfo(ctx context.Context, key string, limit int, window time.Duration) (bool, int, time.Time, error) {
 	n, err := r.kv.IncrCap(ctx, "rl:"+key, window, int64(limit))
 	if err != nil {
-		return false, err
+		return false, 0, time.Time{}, err
 	}
-	return n <= int64(limit), nil
+	remaining := int(int64(limit) - n)
+	if remaining < 0 {
+		remaining = 0
+	}
+	return n <= int64(limit), remaining, time.Now().Add(window), nil
 }

@@ -147,7 +147,7 @@ async function onPromptConfirm(value: string) {
 }
 
 // acceptPending 接受好友请求。
-async function acceptPending(id: number) {
+async function acceptPending(id: string) {
   try {
     await friends.acceptRequest(id)
     notify.show('已接受好友请求')

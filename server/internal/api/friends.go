@@ -28,7 +28,7 @@ func (s *Server) ListFriends(ctx context.Context, request ListFriendsRequestObje
 			continue
 		}
 		// 备注/分组是发起方视角的字段：被请求方看到空串。
-		entry := FriendEntry{Id: f.ID, Status: FriendEntryStatus(f.Status), Incoming: incoming, User: s.userView(ctx, u)}
+		entry := FriendEntry{Id: idOf(f.ID), Status: FriendEntryStatus(f.Status), Incoming: incoming, User: s.userView(ctx, u)}
 		if !incoming {
 			entry.Remark, entry.Group = f.Remark, f.GroupName
 		}
@@ -77,7 +77,7 @@ func (s *Server) CreateFriendRequest(ctx context.Context, request CreateFriendRe
 		return nil, s.writeStoreErr(ctx, err)
 	}
 	return CreateFriendRequest201JSONResponse{
-		Id: f.ID, Status: FriendEntryStatus(f.Status), Incoming: false,
+		Id: idOf(f.ID), Status: FriendEntryStatus(f.Status), Incoming: false,
 		User: s.userView(ctx, target),
 	}, nil
 }
@@ -105,7 +105,7 @@ func (s *Server) AcceptFriendRequest(ctx context.Context, request AcceptFriendRe
 	}
 	other, _ := s.store.UserByID(ctx, f.UserID)
 	return AcceptFriendRequest200JSONResponse{
-		Id: f.ID, Status: FriendEntryStatus(f.Status), Incoming: true,
+		Id: idOf(f.ID), Status: FriendEntryStatus(f.Status), Incoming: true,
 		User: s.userView(ctx, other),
 	}, nil
 }
@@ -136,7 +136,8 @@ func (s *Server) PatchFriend(ctx context.Context, request PatchFriendRequestObje
 	if e := checkID(request.Id); e != nil {
 		return nil, e
 	}
-	if request.Body == nil {
+	req := patchBody(request.JSONBody, request.ApplicationMergePatchPlusJSONBody)
+	if req == nil {
 		return nil, bodyMissing()
 	}
 	c := currentUser(ctx)
@@ -148,24 +149,27 @@ func (s *Server) PatchFriend(ctx context.Context, request PatchFriendRequestObje
 	if f.UserID != c.UserID {
 		return nil, errf(http.StatusForbidden, "forbidden", "仅发起方可设置备注与分组")
 	}
-	if req := request.Body; req.Remark != nil {
-		if n := len([]rune(*req.Remark)); n > 64 {
+	// Merge Patch（#31）：缺省不改，null/空串清除，值设置。
+	if req.Remark.Set {
+		v := req.Remark.Val
+		if n := len([]rune(v)); n > 64 {
 			return nil, errf(http.StatusBadRequest, "bad_remark", "备注需为 0–64 个字符")
 		}
-		f.Remark = *req.Remark
+		f.Remark = v
 	}
-	if req := request.Body; req.Group != nil {
-		if n := len([]rune(*req.Group)); n > 32 {
+	if req.Group.Set {
+		v := req.Group.Val
+		if n := len([]rune(v)); n > 32 {
 			return nil, errf(http.StatusBadRequest, "bad_group", "分组名需为 0–32 个字符")
 		}
-		f.GroupName = *req.Group
+		f.GroupName = v
 	}
 	if err := s.store.UpdateFriendship(ctx, f); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
 	other, _ := s.store.UserByID(ctx, f.FriendID)
 	return PatchFriend200JSONResponse{
-		Id: f.ID, Status: FriendEntryStatus(f.Status),
+		Id: idOf(f.ID), Status: FriendEntryStatus(f.Status),
 		Remark: f.Remark, Group: f.GroupName,
 		User: s.userView(ctx, other),
 	}, nil

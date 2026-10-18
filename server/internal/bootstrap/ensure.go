@@ -10,8 +10,9 @@ import (
 // Ensure 首启打印管理员邀请码；幂等，满足任一条件即跳过：
 //   - 码已消费（KV）；
 //   - 本次部署已打印过（KV）；
-//   - 库内已有用户（UserByID(1) 命中）——实例已在用，不再自动打印，
+//   - 库内已有用户（HasUsers）——实例已在用，不再自动打印，
 //     防止 MemKV 重启丢标记后把已作废的码又打到日志里。
+//     （旧探测 UserByID(1) 依赖自增 ID=1，Snowflake 后永不命中，#31 换掉。）
 //
 // 丢失可执行 -print-admin-invite 重打（PrintAdminInvite）。
 func Ensure(ctx context.Context, kv store.KV, st store.Store, jwtSecret string, lg *log.Logger) {
@@ -24,7 +25,7 @@ func Ensure(ctx context.Context, kv store.KV, st store.Store, jwtSecret string, 
 		}
 	}
 	if st != nil {
-		if _, err := st.UserByID(ctx, 1); err == nil {
+		if ok, err := st.HasUsers(ctx); err == nil && ok {
 			return
 		}
 	}

@@ -349,7 +349,7 @@ export interface paths {
         };
         /**
          * 服务器成员列表（成员可读）
-         * @description code：bad_request、路径参数不合法；401；403 forbidden； 5xx internal。user_id 为数字 ID（#31 前现状）。
+         * @description 支持 ETag 协商缓存（#31）：响应带 ETag，带 If-None-Match 命中回 304 无 body。 code：bad_request、路径参数不合法；401；403 forbidden； 5xx internal。user_id 为十进制 ID 字符串（#31）。
          */
         get: operations["listServerMembers"];
         put?: never;
@@ -480,14 +480,14 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * 消息分页（倒序，游标 before_id）
-         * @description limit 上限 50，默认 50。before_id 游标为「更旧一页」。 code：bad_request、路径参数不合法；401；403 forbidden； 404 not_found；5xx internal。
+         * 消息分页（游标，倒序取页正序返回）
+         * @description 游标分页（#31）：limit 上限 50，默认 50。before 取更旧一页（ID 小于游标 的最新 limit 条，旧→新正序返回）；after 取更新一页（ID 大于游标最早的 limit 条）。两者互斥，同给时 before 优先。禁用 offset。 before_id 为 before 的旧别名，兼容一个版本后移除。 code：bad_request、bad_cursor、路径参数不合法；401；403 forbidden； 404 not_found；5xx internal。
          */
         get: operations["listMessages"];
         put?: never;
         /**
-         * 发送文字消息（≤2000 字 + 频控 20/分）
-         * @description 仅文字频道。code：bad_channel、bad_content、bad_request、too_large、 路径参数不合法；401；403 forbidden；404 not_found；429 rate_limited； 5xx internal。
+         * 发送文字消息（≤2000 字 + 频控 20/分 + nonce 幂等）
+         * @description 仅文字频道。nonce（#31）：客户端生成的幂等键（≤64 字符），服务端按 (user_id, nonce) 去重；重复提交回读原消息返回 200（原消息体）， 新消息返回 201。不带 nonce 不去重。 code：bad_channel、bad_content、bad_nonce、bad_request、too_large、 路径参数不合法；401；403 forbidden；404 not_found；429 rate_limited； 5xx internal。
          */
         post: operations["createMessage"];
         delete?: never;
@@ -501,12 +501,38 @@ export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
         /**
-         * ApiError
-         * @description 统一错误体。code 为机器可读错误码，message 为中文提示。
+         * Attachment
+         * @description 附件元数据（#31 预留 schema 占位，实现移出本批另单跟踪）。 计划端点：POST /api/v1/attachments（multipart，登录可传）返回本结构， 消息体以 attachment_ids 引用；存储后端可插拔（本地磁盘 / S3 兼容）。 本批不实现端点，字段形状以实现落地时为准。
          */
-        ApiError: {
+        Attachment: {
+            /** @description 附件 ID（十进制字符串） */
+            id: string;
+            filename: string;
+            /**
+             * Format: int64
+             * @description 字节数
+             */
+            size: number;
+            content_type: string;
+        };
+        /**
+         * Problem
+         * @description RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示（旧 message 字段改名为 detail）。
+         */
+        Problem: {
+            /** @description 问题类型 URI（urn:litetalk:error:<code>） */
+            type: string;
+            /** @description 问题类型摘要（随 status 定，不随实例变） */
+            title: string;
+            /**
+             * Format: int32
+             * @description HTTP 状态码（与响应行一致）
+             */
+            status: number;
+            /** @description 机器可读错误码（扩展字段） */
             code: string;
-            message: string;
+            /** @description 本次出错的中文提示 */
+            detail: string;
         };
         /**
          * StatusOk
@@ -529,11 +555,10 @@ export interface components {
         };
         /**
          * User
-         * @description 自响应用户（/users/me、登录/注册/游客/刷新），含 email。
+         * @description 自响应用户（/users/me、登录/注册/游客/刷新），含 email。ID 为十进制字符串（#31）。
          */
         User: {
-            /** Format: int64 */
-            id: number;
+            id: string;
             email: string;
             nickname: string;
             /** @description 四位定宽数字串 */
@@ -552,11 +577,10 @@ export interface components {
         };
         /**
          * PublicUser
-         * @description 对外用户视图（好友/成员等他人信息），不含 email。
+         * @description 对外用户视图（好友/成员等他人信息），不含 email。ID 为十进制字符串（#31）。
          */
         PublicUser: {
-            /** Format: int64 */
-            id: number;
+            id: string;
             nickname: string;
             tag: string;
             email_verified: boolean;
@@ -583,44 +607,41 @@ export interface components {
         };
         /**
          * ServerInfo
-         * @description 服务器（群组）。图标为预设 Lucide 图标名 + 颜色，无图片。
+         * @description 服务器（群组）。图标为预设 Lucide 图标名 + 颜色，无图片。ID 为十进制字符串（#31）。
          */
         ServerInfo: {
-            /** Format: int64 */
-            id: number;
+            id: string;
             name: string;
-            /** Format: int64 */
-            owner_id: number;
+            owner_id: string;
             icon_name: string;
             /** @description #RRGGBB */
             icon_color: string;
             /** Format: date-time */
             created_at: string;
         };
-        /** ChannelInfo */
+        /**
+         * ChannelInfo
+         * @description 频道。ID 为十进制字符串（#31）。
+         */
         ChannelInfo: {
-            /** Format: int64 */
-            id: number;
-            /** Format: int64 */
-            server_id: number;
+            id: string;
+            server_id: string;
             name: string;
             /** @enum {string} */
             type: "text" | "voice";
-            /**
-             * Format: int64
-             * @description 分类归属；null = 未分类（请求侧 0 也表示未分类）
-             */
-            category_id?: number | null;
+            /** @description 分类归属；null = 未分类（请求侧 0 也表示未分类） */
+            category_id: string | null;
             position: number;
             /** Format: date-time */
             created_at: string;
         };
-        /** CategoryInfo */
+        /**
+         * CategoryInfo
+         * @description 频道分类。ID 为十进制字符串（#31）。
+         */
         CategoryInfo: {
-            /** Format: int64 */
-            id: number;
-            /** Format: int64 */
-            server_id: number;
+            id: string;
+            server_id: string;
             name: string;
             position: number;
             /** Format: date-time */
@@ -628,13 +649,11 @@ export interface components {
         };
         /**
          * MemberInfo
-         * @description 服务器成员（内存实现直接内联昵称/tag）。
+         * @description 服务器成员（内联昵称/tag）。ID 为十进制字符串（#31）。
          */
         MemberInfo: {
-            /** Format: int64 */
-            server_id: number;
-            /** Format: int64 */
-            user_id: number;
+            server_id: string;
+            user_id: string;
             /** @enum {string} */
             role: "owner" | "admin" | "member";
             /** Format: date-time */
@@ -644,28 +663,28 @@ export interface components {
         };
         /**
          * Message
-         * @description 文字频道消息（发送者昵称/tag 内联，不含邮箱）。
+         * @description 文字频道消息（发送者昵称/tag 内联，不含邮箱）。ID 为十进制字符串（#31）。
          */
         Message: {
-            /** Format: int64 */
-            id: number;
-            /** Format: int64 */
-            channel_id: number;
-            /** Format: int64 */
-            user_id: number;
+            id: string;
+            channel_id: string;
+            user_id: string;
             content: string;
+            /** @description 幂等键（#31）；未带 nonce 的消息无此字段 */
+            nonce?: string;
             /** Format: date-time */
             created_at: string;
             sender_nickname?: string;
             sender_tag?: string;
         };
-        /** Invite */
+        /**
+         * Invite
+         * @description 邀请码。ID 为十进制字符串（#31）。
+         */
         Invite: {
             code: string;
-            /** Format: int64 */
-            server_id: number;
-            /** Format: int64 */
-            creator_id: number;
+            server_id: string;
+            creator_id: string;
             /** @description 0 = 不限 */
             max_uses: number;
             uses: number;
@@ -677,11 +696,8 @@ export interface components {
          * @description 好友条目。remark/group 仅发起方视角非空（被请求方恒空串）。 user 为 PublicUser（无 email）。
          */
         FriendEntry: {
-            /**
-             * Format: int64
-             * @description 关系行 ID（请求数）
-             */
-            id: number;
+            /** @description 关系行 ID（请求数） */
+            id: string;
             /** @enum {string} */
             status: "pending" | "accepted" | "blocked";
             /** @description true = 对端发起（我是被请求方） */
@@ -748,7 +764,7 @@ export interface components {
         };
         /**
          * PatchMeRequest
-         * @description 部分更新（当前仅 nickname）。
+         * @description JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（昵称不可清， 空值被校验拒 400），值 = 设置。部分更新（当前仅 nickname）。
          */
         PatchMeRequest: {
             nickname?: string | null;
@@ -763,7 +779,7 @@ export interface components {
         };
         /**
          * PatchFriendRequest
-         * @description 部分更新；空串清除备注/移出分组。
+         * @description JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null/空串 = 清除备注/ 移出分组，值 = 设置。仅发起方向可写。
          */
         PatchFriendRequest: {
             /** @description 0–64 字符 */
@@ -780,7 +796,10 @@ export interface components {
             /** @description #RRGGBB；空 = #4FA4F3 */
             icon_color?: string;
         };
-        /** PatchServerRequest */
+        /**
+         * PatchServerRequest
+         * @description JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（名称/图标 不可清，空值被校验拒 400），值 = 设置。
+         */
         PatchServerRequest: {
             name?: string | null;
             icon_name?: string | null;
@@ -809,23 +828,20 @@ export interface components {
             name: string;
             /** @enum {string} */
             type: "text" | "voice";
-            /**
-             * Format: int64
-             * @description 0 或缺省 = 未分类
-             */
-            category_id?: number | null;
+            /** @description 0/缺省 = 未分类；请求侧数字与字符串双接受（#31） */
+            category_id?: string | null;
             position?: number;
         };
-        /** PatchChannelRequest */
+        /**
+         * PatchChannelRequest
+         * @description JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name/type 不可清，空值被校验拒 400；category_id 的 null = 移出分类；position 的 null 拒 400——「删除位置」无语义），值 = 设置。
+         */
         PatchChannelRequest: {
             name?: string | null;
             /** @enum {string|null} */
             type?: "text" | "voice" | null;
-            /**
-             * Format: int64
-             * @description 0 = 显式移出分类
-             */
-            category_id?: number | null;
+            /** @description 0 = 显式移出分类；请求侧数字与字符串双接受（#31） */
+            category_id?: string | null;
             position?: number | null;
         };
         /** CreateCategoryRequest */
@@ -835,7 +851,7 @@ export interface components {
         };
         /**
          * PatchCategoryRequest
-         * @description name 与 position 至少给一个。
+         * @description JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name 不可清， 空值被校验拒 400；position 的 null 拒 400），值 = 设置。 name 与 position 至少给一个。
          */
         PatchCategoryRequest: {
             name?: string | null;
@@ -846,6 +862,8 @@ export interface components {
         CreateMessageRequest: {
             /** @description 1–2000 字符 */
             content: string;
+            /** @description 幂等键（#31，≤64 字符）；同用户重复提交回读原消息（200）。缺省不去重。 */
+            nonce?: string;
         };
     };
     responses: {
@@ -855,7 +873,7 @@ export interface components {
                 [name: string]: unknown;
             };
             content: {
-                "application/json": components["schemas"]["ApiError"];
+                "application/problem+json": components["schemas"]["Problem"];
             };
         };
         /** @description 未登录或令牌失效（body.code：unauthorized / session_replaced / session_replayed / bad_credentials）。session_* 另带响应头 X-LiteTalk-Auth。 */
@@ -864,7 +882,7 @@ export interface components {
                 [name: string]: unknown;
             };
             content: {
-                "application/json": components["schemas"]["ApiError"];
+                "application/problem+json": components["schemas"]["Problem"];
             };
         };
         /** @description 无权操作（body.code：forbidden / guest_disabled / reset_unavailable 等） */
@@ -873,7 +891,7 @@ export interface components {
                 [name: string]: unknown;
             };
             content: {
-                "application/json": components["schemas"]["ApiError"];
+                "application/problem+json": components["schemas"]["Problem"];
             };
         };
         /** @description 资源不存在（body.code：not_found / bad_code 等） */
@@ -882,7 +900,7 @@ export interface components {
                 [name: string]: unknown;
             };
             content: {
-                "application/json": components["schemas"]["ApiError"];
+                "application/problem+json": components["schemas"]["Problem"];
             };
         };
         /** @description 资源冲突（body.code：conflict / email_taken / already_friends / request_exists / bad_state / code_exhausted / category_not_empty 等） */
@@ -891,7 +909,7 @@ export interface components {
                 [name: string]: unknown;
             };
             content: {
-                "application/json": components["schemas"]["ApiError"];
+                "application/problem+json": components["schemas"]["Problem"];
             };
         };
         /** @description 已过期（body.code：code_expired） */
@@ -900,7 +918,7 @@ export interface components {
                 [name: string]: unknown;
             };
             content: {
-                "application/json": components["schemas"]["ApiError"];
+                "application/problem+json": components["schemas"]["Problem"];
             };
         };
         /** @description 触发限流（body.code：rate_limited） */
@@ -909,7 +927,7 @@ export interface components {
                 [name: string]: unknown;
             };
             content: {
-                "application/json": components["schemas"]["ApiError"];
+                "application/problem+json": components["schemas"]["Problem"];
             };
         };
         /** @description 服务端错误（body.code：internal / conflict / not_found / code_expired，store 错误映射） */
@@ -918,12 +936,12 @@ export interface components {
                 [name: string]: unknown;
             };
             content: {
-                "application/json": components["schemas"]["ApiError"];
+                "application/problem+json": components["schemas"]["Problem"];
             };
         };
     };
     parameters: {
-        /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+        /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
         IDPath: number;
     };
     requestBodies: never;
@@ -1180,6 +1198,7 @@ export interface operations {
         };
         requestBody: {
             content: {
+                "application/merge-patch+json": components["schemas"]["PatchMeRequest"];
                 "application/json": components["schemas"]["PatchMeRequest"];
             };
         };
@@ -1255,7 +1274,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1283,13 +1302,14 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
         };
         requestBody: {
             content: {
+                "application/merge-patch+json": components["schemas"]["PatchFriendRequest"];
                 "application/json": components["schemas"]["PatchFriendRequest"];
             };
         };
@@ -1364,7 +1384,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1393,7 +1413,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1421,13 +1441,14 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
         };
         requestBody: {
             content: {
+                "application/merge-patch+json": components["schemas"]["PatchServerRequest"];
                 "application/json": components["schemas"]["PatchServerRequest"];
             };
         };
@@ -1481,9 +1502,12 @@ export interface operations {
     listServerMembers: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description 上次响应的 ETag；命中回 304 */
+                "If-None-Match"?: string;
+            };
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1499,6 +1523,13 @@ export interface operations {
                     "application/json": components["schemas"]["MemberInfo"][];
                 };
             };
+            /** @description ETag 命中（If-None-Match），无 body（#31） */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
@@ -1510,7 +1541,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1539,9 +1570,12 @@ export interface operations {
     listChannels: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description 上次响应的 ETag；命中回 304（#31 协商缓存） */
+                "If-None-Match"?: string;
+            };
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1557,6 +1591,13 @@ export interface operations {
                     "application/json": components["schemas"]["ServerChannels"];
                 };
             };
+            /** @description ETag 命中（If-None-Match），无 body（#31） */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
@@ -1568,7 +1609,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1599,7 +1640,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1627,13 +1668,14 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
         };
         requestBody: {
             content: {
+                "application/merge-patch+json": components["schemas"]["PatchChannelRequest"];
                 "application/json": components["schemas"]["PatchChannelRequest"];
             };
         };
@@ -1659,7 +1701,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1693,7 +1735,7 @@ export interface operations {
             };
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1722,13 +1764,14 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
         };
         requestBody: {
             content: {
+                "application/merge-patch+json": components["schemas"]["PatchCategoryRequest"];
                 "application/json": components["schemas"]["PatchCategoryRequest"];
             };
         };
@@ -1752,21 +1795,28 @@ export interface operations {
     listMessages: {
         parameters: {
             query?: {
-                /** @description 游标：只取 ID 小于该值的消息（0/缺省 = 最新一页） */
+                /** @description 游标：只取 ID 小于该值的消息（缺省 = 最新一页） */
+                before?: number;
+                /** @description 游标：只取 ID 大于该值的消息（向前翻更新；缺省 = 最旧一页） */
+                after?: number;
+                /**
+                 * @deprecated
+                 * @description before 的旧别名（兼容一个版本，#31；与 before 同义）
+                 */
                 before_id?: number;
                 /** @description 条数上限（1–50，越界回落 50） */
                 limit?: number;
             };
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description 消息数组（不含发送者邮箱） */
+            /** @description 消息数组（旧→新正序；不含发送者邮箱） */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -1787,7 +1837,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 资源数字 ID（>0；#31 起改为字符串 ID） */
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
                 id: components["parameters"]["IDPath"];
             };
             cookie?: never;
@@ -1798,6 +1848,15 @@ export interface operations {
             };
         };
         responses: {
+            /** @description nonce 重放（幂等命中），原消息体（sender_* 为发送者昵称与 tag） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Message"];
+                };
+            };
             /** @description 已发送（sender_* 为发送者昵称与 tag） */
             201: {
                 headers: {

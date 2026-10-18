@@ -15,12 +15,14 @@ func (s *Server) GetMe(ctx context.Context, request GetMeRequestObject) (GetMeRe
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	return GetMe200JSONResponse(*user), nil
+	return GetMe200JSONResponse(userSelf(user)), nil
 }
 
 // PatchMe PATCH /api/v1/users/me（昵称可改；无头像字段）
+// Merge Patch（#31）：缺省不改，null 清空（昵称不可清 → 校验拒 400）。
 func (s *Server) PatchMe(ctx context.Context, request PatchMeRequestObject) (PatchMeResponseObject, error) {
-	if request.Body == nil {
+	req := patchBody(request.JSONBody, request.ApplicationMergePatchPlusJSONBody)
+	if req == nil {
 		return nil, bodyMissing()
 	}
 	c := currentUser(ctx)
@@ -28,13 +30,14 @@ func (s *Server) PatchMe(ctx context.Context, request PatchMeRequestObject) (Pat
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	if req := request.Body; req.Nickname != nil {
-		if !validNickname(*req.Nickname) {
+	if req.Nickname.Set {
+		name := req.Nickname.Val
+		if !validNickname(name) {
 			return nil, errf(http.StatusBadRequest, "bad_nickname", "昵称需为 2–16 个字符")
 		}
-		if *req.Nickname != user.Nickname {
+		if name != user.Nickname {
 			// 昵称变更后 tag 需重新分配保证 (nickname,tag) 不冲突。
-			user.Nickname = *req.Nickname
+			user.Nickname = name
 			for i := 0; i < 5; i++ {
 				user.Tag = fmtTag(int(user.ID*7919+int64(i*104729)) % 10000)
 				err = s.store.UpdateUser(ctx, user)
@@ -51,5 +54,5 @@ func (s *Server) PatchMe(ctx context.Context, request PatchMeRequestObject) (Pat
 			}
 		}
 	}
-	return PatchMe200JSONResponse(*user), nil
+	return PatchMe200JSONResponse(userSelf(user)), nil
 }

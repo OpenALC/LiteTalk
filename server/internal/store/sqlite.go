@@ -162,22 +162,18 @@ func (s *SQLite) RollbackLast(ctx context.Context, fsys fs.FS) error {
 // ---- users ----
 
 func (s *SQLite) CreateUser(ctx context.Context, u *User) error {
-	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO users (email, nickname, tag, password_hash, email_verified, is_guest, status)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		u.Email, u.Nickname, u.Tag, u.PasswordHash, u.EmailVerified, u.IsGuest, u.Status)
+	u.ID = newID(u.ID)
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO users (id, email, nickname, tag, password_hash, email_verified, is_guest, status)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		u.ID, u.Email, u.Nickname, u.Tag, u.PasswordHash, u.EmailVerified, u.IsGuest, u.Status)
 	if err != nil {
 		if isDupSQLite(err) {
 			return ErrConflict
 		}
 		return err
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return err
-	}
-	u.ID = id
-	return s.db.QueryRowContext(ctx, `SELECT created_at, updated_at FROM users WHERE id = ?`, id).
+	return s.db.QueryRowContext(ctx, `SELECT created_at, updated_at FROM users WHERE id = ?`, u.ID).
 		Scan(&u.CreatedAt, &u.UpdatedAt)
 }
 
@@ -226,24 +222,30 @@ func (s *SQLite) UpdateUser(ctx context.Context, u *User) error {
 	return checkAffected(res)
 }
 
+// HasUsers 库内是否已有用户（首启探测；UserByID(1) 随 Snowflake 失效）。
+func (s *SQLite) HasUsers(ctx context.Context) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users LIMIT 1`).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // ---- friendships ----
 
 func (s *SQLite) CreateFriendship(ctx context.Context, f *Friendship) error {
-	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO friendships (user_id, friend_id, status) VALUES (?, ?, ?)`,
-		f.UserID, f.FriendID, f.Status)
+	f.ID = newID(f.ID)
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO friendships (id, user_id, friend_id, status) VALUES (?, ?, ?, ?)`,
+		f.ID, f.UserID, f.FriendID, f.Status)
 	if err != nil {
 		if isDupSQLite(err) {
 			return ErrConflict
 		}
 		return err
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return err
-	}
-	f.ID = id
-	return s.db.QueryRowContext(ctx, `SELECT created_at FROM friendships WHERE id = ?`, id).
+	return s.db.QueryRowContext(ctx, `SELECT created_at FROM friendships WHERE id = ?`, f.ID).
 		Scan(&f.CreatedAt)
 }
 
@@ -317,18 +319,14 @@ func (s *SQLite) DeleteFriendship(ctx context.Context, id int64) error {
 // ---- servers ----
 
 func (s *SQLite) CreateServer(ctx context.Context, sv *Server) error {
-	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO servers (name, owner_id, icon_name, icon_color) VALUES (?, ?, ?, ?)`,
-		sv.Name, sv.OwnerID, sv.IconName, sv.IconColor)
+	sv.ID = newID(sv.ID)
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO servers (id, name, owner_id, icon_name, icon_color) VALUES (?, ?, ?, ?, ?)`,
+		sv.ID, sv.Name, sv.OwnerID, sv.IconName, sv.IconColor)
 	if err != nil {
 		return err
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return err
-	}
-	sv.ID = id
-	return s.db.QueryRowContext(ctx, `SELECT created_at FROM servers WHERE id = ?`, id).
+	return s.db.QueryRowContext(ctx, `SELECT created_at FROM servers WHERE id = ?`, sv.ID).
 		Scan(&sv.CreatedAt)
 }
 
@@ -473,18 +471,14 @@ func (s *SQLite) MembersOfServer(ctx context.Context, serverID int64) ([]ServerM
 // ---- channels ----
 
 func (s *SQLite) CreateChannel(ctx context.Context, c *Channel) error {
-	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO channels (server_id, name, type, category_id, position) VALUES (?, ?, ?, ?, ?)`,
-		c.ServerID, c.Name, c.Type, c.CategoryID, c.Position)
+	c.ID = newID(c.ID)
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO channels (id, server_id, name, type, category_id, position) VALUES (?, ?, ?, ?, ?, ?)`,
+		c.ID, c.ServerID, c.Name, c.Type, c.CategoryID, c.Position)
 	if err != nil {
 		return err
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return err
-	}
-	c.ID = id
-	return s.db.QueryRowContext(ctx, `SELECT created_at FROM channels WHERE id = ?`, id).
+	return s.db.QueryRowContext(ctx, `SELECT created_at FROM channels WHERE id = ?`, c.ID).
 		Scan(&c.CreatedAt)
 }
 
@@ -563,18 +557,14 @@ func (s *SQLite) DeleteChannel(ctx context.Context, id int64) error {
 // ---- categories（v0.1.2 迁移 0003） ----
 
 func (s *SQLite) CreateCategory(ctx context.Context, c *Category) error {
-	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO categories (server_id, name, position) VALUES (?, ?, ?)`,
-		c.ServerID, c.Name, c.Position)
+	c.ID = newID(c.ID)
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO categories (id, server_id, name, position) VALUES (?, ?, ?, ?)`,
+		c.ID, c.ServerID, c.Name, c.Position)
 	if err != nil {
 		return err
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return err
-	}
-	c.ID = id
-	return s.db.QueryRowContext(ctx, `SELECT created_at FROM categories WHERE id = ?`, id).
+	return s.db.QueryRowContext(ctx, `SELECT created_at FROM categories WHERE id = ?`, c.ID).
 		Scan(&c.CreatedAt)
 }
 
@@ -726,20 +716,27 @@ func (s *SQLite) ReorderCategories(ctx context.Context, serverID, id int64, posi
 // ---- messages ----
 
 func (s *SQLite) CreateMessage(ctx context.Context, msg *Message) error {
-	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO messages (channel_id, user_id, content) VALUES (?, ?, ?)`,
-		msg.ChannelID, msg.UserID, msg.Content)
+	msg.ID = newID(msg.ID)
+	// 空 nonce 落 NULL：唯一索引 (user_id, nonce) 上 '' 会互相撞，NULL 不受约束。
+	var nonce any
+	if msg.Nonce != "" {
+		nonce = msg.Nonce
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO messages (id, channel_id, user_id, content, nonce) VALUES (?, ?, ?, ?, ?)`,
+		msg.ID, msg.ChannelID, msg.UserID, msg.Content, nonce)
 	if err != nil {
+		if isDupSQLite(err) {
+			return ErrConflict
+		}
 		return err
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return err
-	}
-	msg.ID = id
-	return s.db.QueryRowContext(ctx, `SELECT created_at FROM messages WHERE id = ?`, id).
+	return s.db.QueryRowContext(ctx, `SELECT created_at FROM messages WHERE id = ?`, msg.ID).
 		Scan(&msg.CreatedAt)
 }
+
+// sqMessageCols 列清单（nonce 经 COALESCE 归一空串）。
+const sqMessageCols = `m.id, m.channel_id, m.user_id, m.content, COALESCE(m.nonce, ''), m.created_at`
 
 func (s *SQLite) MessagesBefore(ctx context.Context, channelID, beforeID int64, limit int) ([]Message, error) {
 	if limit <= 0 || limit > 50 {
@@ -749,12 +746,12 @@ func (s *SQLite) MessagesBefore(ctx context.Context, channelID, beforeID int64, 
 	var err error
 	if beforeID > 0 {
 		rows, err = s.db.QueryContext(ctx,
-			`SELECT m.id, m.channel_id, m.user_id, m.content, m.created_at, u.nickname, u.tag
+			`SELECT `+sqMessageCols+`, u.nickname, u.tag
 			 FROM messages m JOIN users u ON u.id = m.user_id
 			 WHERE m.channel_id = ? AND m.id < ? ORDER BY m.id DESC LIMIT ?`, channelID, beforeID, limit)
 	} else {
 		rows, err = s.db.QueryContext(ctx,
-			`SELECT m.id, m.channel_id, m.user_id, m.content, m.created_at, u.nickname, u.tag
+			`SELECT `+sqMessageCols+`, u.nickname, u.tag
 			 FROM messages m JOIN users u ON u.id = m.user_id
 			 WHERE m.channel_id = ? ORDER BY m.id DESC LIMIT ?`, channelID, limit)
 	}
@@ -766,8 +763,8 @@ func (s *SQLite) MessagesBefore(ctx context.Context, channelID, beforeID int64, 
 	rev := []Message{}
 	for rows.Next() {
 		var msg Message
-		if err := rows.Scan(&msg.ID, &msg.ChannelID, &msg.UserID, &msg.Content,
-			&msg.CreatedAt, &msg.SenderNickname, &msg.SenderTag); err != nil {
+		if err := rows.Scan(&msg.ID, &msg.ChannelID, &msg.UserID, &msg.Content, &msg.Nonce, &msg.CreatedAt,
+			&msg.SenderNickname, &msg.SenderTag); err != nil {
 			return nil, err
 		}
 		rev = append(rev, msg)
@@ -780,6 +777,58 @@ func (s *SQLite) MessagesBefore(ctx context.Context, channelID, beforeID int64, 
 		out[i] = rev[len(rev)-1-i]
 	}
 	return out, nil
+}
+
+// MessagesAfter 正序分页（向前翻）：id > afterID 的最早 limit 条，按 id 正序返回。
+func (s *SQLite) MessagesAfter(ctx context.Context, channelID, afterID int64, limit int) ([]Message, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 50
+	}
+	var rows *sql.Rows
+	var err error
+	if afterID > 0 {
+		rows, err = s.db.QueryContext(ctx,
+			`SELECT `+sqMessageCols+`, u.nickname, u.tag
+			 FROM messages m JOIN users u ON u.id = m.user_id
+			 WHERE m.channel_id = ? AND m.id > ? ORDER BY m.id ASC LIMIT ?`, channelID, afterID, limit)
+	} else {
+		rows, err = s.db.QueryContext(ctx,
+			`SELECT `+sqMessageCols+`, u.nickname, u.tag
+			 FROM messages m JOIN users u ON u.id = m.user_id
+			 WHERE m.channel_id = ? ORDER BY m.id ASC LIMIT ?`, channelID, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Message{}
+	for rows.Next() {
+		var msg Message
+		if err := rows.Scan(&msg.ID, &msg.ChannelID, &msg.UserID, &msg.Content, &msg.Nonce, &msg.CreatedAt,
+			&msg.SenderNickname, &msg.SenderTag); err != nil {
+			return nil, err
+		}
+		out = append(out, msg)
+	}
+	return out, rows.Err()
+}
+
+// MessageByNonce 幂等回读原消息（带发送者内联信息，响应直接可用）。
+func (s *SQLite) MessageByNonce(ctx context.Context, userID int64, nonce string) (*Message, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT `+sqMessageCols+`, u.nickname, u.tag
+		 FROM messages m JOIN users u ON u.id = m.user_id
+		 WHERE m.user_id = ? AND m.nonce = ?`, userID, nonce)
+	var msg Message
+	err := row.Scan(&msg.ID, &msg.ChannelID, &msg.UserID, &msg.Content, &msg.Nonce, &msg.CreatedAt,
+		&msg.SenderNickname, &msg.SenderTag)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &msg, nil
 }
 
 // ---- invites ----
