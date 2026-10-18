@@ -39,6 +39,7 @@ require (
 	go.uber.org/atomic v1.12.0 // indirect
 	golang.org/x/net v0.50.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/text v0.34.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 	modernc.org/libc v1.77.1 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
