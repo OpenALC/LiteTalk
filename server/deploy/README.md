@@ -3,6 +3,30 @@
 单机部署：Nginx（TLS）+ Go 服务端 + MySQL + Redis + coturn。
 按顺序执行即可；配置文件都在本目录，复制上服务器后改占位符。
 
+## TLS 三种模式（#26）
+
+| 模式 | 启动方式 | TLS 谁终结 | 适用 |
+|---|---|---|---|
+| 1 内置 ACME 自动签发 | `litetalk-server --domain voice.example.com`（或 `LITETALK_DOMAIN`） | **Go 进程自己**：443 TLS-ALPN-01 + 80 HTTP-01/301，证书自动申请与续期 | 一键自托管，不装 nginx |
+| 2 前置反代 | `litetalk-server --behind-proxy` | nginx / Caddy（本目录 `nginx/litetalk.conf`） | 与既有站点共存、复用已有证书体系 |
+| 3 纯 HTTP | 都不设 | 无 TLS | 仅开发/内网，启动日志会提示 |
+
+**模式 1 要点**：
+
+- 证书缓存默认 `$LITETALK_DATA_DIR/autocert`（权限 0700，私钥不全局可读），autocert 自动续期，无需 cron。
+- 443 是特权端口：root 运行，或非 root 时在 systemd 单元启用
+  `AmbientCapabilities=CAP_NET_BIND_SERVICE`（`systemd/litetalk.service` 里有示例）。
+- `LITETALK_ADDR` 未显式配置时 HTTPS 自动改监听 `:443`；显式配置过就不再自动改端口。
+- 签发域名必须是 `--domain` 单域名（HostPolicy 白名单）；其他 SNI 一律拒绝，防止被 CA 限流。
+- 需要公网 80/443 可达（Let's Encrypt 验证）；安全组/防火墙放行这两个端口。
+
+**模式 2 要点**：
+
+- 服务端**不**占 80/443，只监听 `LITETALK_ADDR`（默认 `:8077` 纯 HTTP）。
+- 必须配置 `LITETALK_TRUSTED_PROXIES`（反代的 IP/CIDR）：只有 RemoteAddr 命中才采信
+  `X-Real-IP`，否则限流/审计记的是反代 IP。伪造的 X-Real-IP 永远不会被采信。
+- 反代配置见 `nginx/litetalk.conf`（含 `X-Real-IP` 与 WebSocket 升级头）。
+
 ## 1. 放行端口
 
 | 端口 | 协议 | 用途 |
