@@ -291,8 +291,12 @@ func TestSQLiteKVMigrationRoundTrip(t *testing.T) {
 	}
 	assertKVTable(t, sq, true)
 
-	if err := sq.RollbackLast(ctx, migFS); err != nil {
-		t.Fatalf("回滚 0006 失败: %v", err)
+	// 0006_kv 之上可能已有更新迁移（当前 0007_message_nonce_channel）；
+	// 逐个回滚到 kv 表消失，避免测试绑定“kv 永远是最后一版”。
+	for i := 0; i < 10 && kvTableExists(t, sq); i++ {
+		if err := sq.RollbackLast(ctx, migFS); err != nil {
+			t.Fatalf("回滚到 0006_kv 失败: %v", err)
+		}
 	}
 	assertKVTable(t, sq, false)
 
@@ -342,14 +346,19 @@ func readKVExpiry(t *testing.T, sq *SQLite, key string) sql.NullTime {
 	return exp
 }
 
-func assertKVTable(t *testing.T, sq *SQLite, want bool) {
+func kvTableExists(t *testing.T, sq *SQLite) bool {
 	t.Helper()
 	var n int
 	if err := sq.DB().QueryRow(
 		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='kv'`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	if got := n > 0; got != want {
+	return n > 0
+}
+
+func assertKVTable(t *testing.T, sq *SQLite, want bool) {
+	t.Helper()
+	if got := kvTableExists(t, sq); got != want {
 		t.Fatalf("kv 表存在 = %v，want %v", got, want)
 	}
 }
