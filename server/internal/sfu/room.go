@@ -375,14 +375,38 @@ func (r *Room) tickSpeak(onSpeak OnSpeakingFn) {
 
 // tickActive 一次活跃门 top-N（#33 Phase 1，activeTick 周期）。仅 speakingLoop
 // goroutine 调用。有效电平取 tickSpeak 存下的 p.effLvl。
+//
+// 门控只在竞争真实存在时启用（#33 复审）：
+//   - ActiveN<=0：配置显式关闭；
+//   - 房间成员数 ≤ ActiveN，或「有电平源」的成员数 ≤ ActiveN：没有可淘汰对象，
+//     直接全放行。否则轻声说话人（如 -42dBov）会永久进不了候选，两人房间也会
+//     被吞音——旧实现的门控在几乎每场日常通话里都生效。
+//
+// 其余房间只放行最响的 N 路；无电平源（v1 客户端/未协商扩展）不受门控，恒转发。
 func (r *Room) tickActive() {
 	peers := r.snapPeers()
 	if len(peers) == 0 {
 		return
 	}
+	n := r.sfu.cfg.ActiveN
+	if n <= 0 || len(peers) <= n {
+		allowAll(peers)
+		return
+	}
+	levelPeers := 0
+	for _, p := range peers {
+		if p.effLvl >= 0 {
+			levelPeers++
+		}
+	}
+	if levelPeers <= n {
+		allowAll(peers)
+		return
+	}
 	now := time.Now()
-	// 活跃候选（达门限或低电平宽限内），按电平升序取 top-N。
-	var cands []activeCand
+	// 活跃候选（达门限或低电平宽限内），按电平升序取 top-N。候选不足 N 时
+	// rankActive 全部放行——空位立即给达标的候选，不等凑满。
+	cands := make([]activeCand, 0, levelPeers)
 	for _, p := range peers {
 		lvl := p.effLvl
 		if lvl < 0 {
@@ -402,13 +426,23 @@ func (r *Room) tickActive() {
 	r.rankActive(cands, peers, now)
 }
 
+// allowAll 门控旁路：全部成员直接参与转发（含低于门限者）。无电平源本就
+// 不受门控，这里一并置位，保持「无电平源恒转发」语义一致。
+func allowAll(peers []*Peer) {
+	for _, p := range peers {
+		p.fwdActive.Store(true)
+	}
+}
+
 // rankActive 活跃门 top-N 选取（#33 Phase 1 包级门控）：
-//   - 候选按电平升序（响者优先）取前 N 为 winner；
+//   - 候选按电平升序（响者优先）取前 N 为 winner；候选不足 N 时全部为
+//     winner——有空位立即放行，不等凑满；
 //   - 未 active 且 winner → 置位并记保持起点；
 //   - active 且非 winner：ActiveHoldMS 内保留（防 top-N 抖动），期满清位——
 //     只清 fwdActive（forward 停发包），track 全程挂载，绝不 RemoveTrack。
 //
-// 仅 speakingLoop goroutine 调用。ActiveN<=0（门控关闭）时不动任何状态。
+// 仅 speakingLoop goroutine 调用；旁路（房间/候选不足 N）由 tickActive 负责。
+// ActiveN<=0 时保留防御性早退，不改变任何状态。
 func (r *Room) rankActive(cands []activeCand, peers []*Peer, now time.Time) {
 	if r.sfu.cfg.ActiveN <= 0 {
 		return
