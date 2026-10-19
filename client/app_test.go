@@ -14,6 +14,7 @@ import (
 	"github.com/OpenALC/LiteTalk/client/core/config"
 	"github.com/OpenALC/LiteTalk/client/core/hotkey"
 	"github.com/OpenALC/LiteTalk/client/core/voice"
+	"github.com/OpenALC/LiteTalk/client/desktop"
 )
 
 // 验证休眠模式三态（off/hibernate/destroy）的读写、持久化与非法值校验。
@@ -274,30 +275,30 @@ func TestOnKickedKeepsGuestTokenForAccountUser(t *testing.T) {
 // 与用户对快捷键的预期完全相反，且只有真机连按才能发现。
 func TestHotkeyEffectTriggerEdges(t *testing.T) {
 	// PTT：两个沿都要响应。少任何一个都会变成开关或卡在说话。
-	if e := effectOf(hotkey.Event{Action: hotkey.ActionPTT, Pressed: true}); !e.pttPress || e.pttRelease {
-		t.Errorf("PTT 按下应只产生 pttPress，实际 %+v", e)
+	if e := desktop.EffectOf(hotkey.Event{Action: hotkey.ActionPTT, Pressed: true}); !e.PTTPress || e.PTTRelease {
+		t.Errorf("PTT 按下应只产生 PTTPress，实际 %+v", e)
 	}
-	if e := effectOf(hotkey.Event{Action: hotkey.ActionPTT, Pressed: false}); !e.pttRelease || e.pttPress {
-		t.Errorf("PTT 抬起应只产生 pttRelease，实际 %+v", e)
+	if e := desktop.EffectOf(hotkey.Event{Action: hotkey.ActionPTT, Pressed: false}); !e.PTTRelease || e.PTTPress {
+		t.Errorf("PTT 抬起应只产生 PTTRelease，实际 %+v", e)
 	}
 
 	// 锁存开关：只有按下沿触发，抬起沿必须是空操作。
 	// 完整一次「按下+抬起」只能产生一次切换。
 	for _, a := range []hotkey.Action{hotkey.ActionMute, hotkey.ActionDeafen, hotkey.ActionDual} {
-		press := effectOf(hotkey.Event{Action: a, Pressed: true})
-		release := effectOf(hotkey.Event{Action: a, Pressed: false})
-		n := boolToInt(press.mute) + boolToInt(press.deafen) + boolToInt(press.dual)
+		press := desktop.EffectOf(hotkey.Event{Action: a, Pressed: true})
+		release := desktop.EffectOf(hotkey.Event{Action: a, Pressed: false})
+		n := boolToInt(press.Mute) + boolToInt(press.Deafen) + boolToInt(press.Dual)
 		if n != 1 {
 			t.Errorf("%s 按下应恰好触发一个动作，实际 %+v", a, press)
 		}
-		if release != (hotkeyEffect{}) {
+		if release != (desktop.HotkeyEffect{}) {
 			t.Errorf("%s 抬起不应触发任何动作，实际 %+v", a, release)
 		}
 	}
 
 	// 未知动作两个沿都必须是空操作，不能误触。
 	for _, pressed := range []bool{true, false} {
-		if e := effectOf(hotkey.Event{Action: hotkey.Action("nope"), Pressed: pressed}); e != (hotkeyEffect{}) {
+		if e := desktop.EffectOf(hotkey.Event{Action: hotkey.Action("nope"), Pressed: pressed}); e != (desktop.HotkeyEffect{}) {
 			t.Errorf("未知动作(pressed=%v) 不应有效果，实际 %+v", pressed, e)
 		}
 	}
@@ -470,8 +471,8 @@ func TestIsWaylandEnv(t *testing.T) {
 		{"darwin", "", "", false},
 	}
 	for _, c := range cases {
-		if got := isWaylandEnv(c.goos, c.wayland, c.x11); got != c.want {
-			t.Errorf("isWaylandEnv(%q,%q,%q) = %v，期望 %v", c.goos, c.wayland, c.x11, got, c.want)
+		if got := desktop.IsWaylandEnv(c.goos, c.wayland, c.x11); got != c.want {
+			t.Errorf("IsWaylandEnv(%q,%q,%q) = %v，期望 %v", c.goos, c.wayland, c.x11, got, c.want)
 		}
 	}
 }
