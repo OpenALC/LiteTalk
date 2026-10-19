@@ -18,7 +18,7 @@ import (
 var banned = []string{
 	"github.com/wailsapp/wails",
 	"github.com/wailsio/",
-	"LiteTalk/client/desktop",
+	"github.com/OpenALC/LiteTalk/client/desktop",
 }
 
 func TestCoreForbidsDesktopImports(t *testing.T) {
