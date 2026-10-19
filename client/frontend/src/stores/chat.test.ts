@@ -61,6 +61,17 @@ describe('chat store 复位', () => {
     chat.unbindEvents()
   })
 
+  it('消息按 id 去重：nonce 幂等回显不重复展示', () => {
+    const chat = useChatStore()
+    chat.bindEvents()
+
+    mockEventsOn.fire('chat:message', { ...msg('m1'), nonce: 'n-1' })
+    mockEventsOn.fire('chat:message', { ...msg('m1'), nonce: 'n-1' })
+
+    expect(chat.messagesFor('c1')).toHaveLength(1)
+    chat.unbindEvents()
+  })
+
   it('bindEvents 幂等，unbindEvents 只注销本 store 的监听器', () => {
     const chat = useChatStore()
     const other: ChatMessage[] = []

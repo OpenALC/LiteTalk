@@ -63,6 +63,8 @@ export interface ChatMessage {
   nickname: string
   content: string
   ts: string
+  // nonce 发送方幂等键（#31，协议 v2；老服务端/REST 补拉不带）
+  nonce?: string
 }
 
 // ConnConfigView 当前生效的服务器地址与来源（设置页「连接」）。

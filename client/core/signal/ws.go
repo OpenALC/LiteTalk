@@ -163,6 +163,9 @@ func (c *Client) Send(msgType string, data any) error {
 // Connected 报告当前是否有活跃连接。
 func (c *Client) Connected() bool { return c.currentConn() != nil }
 
+// Closed 报告客户端是否已被 Close（与「暂时断线、等待重连」区分）。
+func (c *Client) Closed() bool { return c.closed.Load() }
+
 // Close 停止客户端（幂等）。Run 将返回 nil。
 func (c *Client) Close() {
 	if c.closed.CompareAndSwap(false, true) {

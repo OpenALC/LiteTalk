@@ -60,7 +60,8 @@ func (s *Server) ListMessages(ctx context.Context, request ListMessagesRequestOb
 const msgRateLimit = 20
 
 // CreateMessage POST /api/v1/channels/{id}/messages（≤2000 字 + 频控 + nonce 幂等，#31）
-// nonce 幂等：同用户同 nonce 只落一条，重复提交回读原消息 200（弱网重试对账）。
+// nonce 幂等：同频道同用户同 nonce 只落一条，重复提交回读原消息 200（弱网重试对账）。
+// 幂等判断先于频控：重试撞上配额时也必须拿回原消息，而不是 429（审查 P2）。
 func (s *Server) CreateMessage(ctx context.Context, request CreateMessageRequestObject) (CreateMessageResponseObject, error) {
 	if e := checkID(request.Id); e != nil {
 		return nil, e
@@ -90,6 +91,16 @@ func (s *Server) CreateMessage(ctx context.Context, request CreateMessageRequest
 			return nil, errf(http.StatusBadRequest, "bad_nonce", "nonce 需为 0–64 字符")
 		}
 	}
+	// 幂等命中直接回原消息，不消耗频控配额（弱网重试先于配额判断）。
+	if nonce != "" {
+		orig, err := s.store.MessageByNonce(ctx, ch.ID, c.UserID, nonce)
+		if err == nil {
+			return CreateMessage200JSONResponse(messageView(orig)), nil
+		}
+		if !errors.Is(err, store.ErrNotFound) {
+			return nil, s.writeStoreErr(ctx, err)
+		}
+	}
 	if e := s.allowRate(ctx, "msg:"+strconv.FormatInt(c.UserID, 10), msgRateLimit, time.Minute, "发送过于频繁"); e != nil {
 		return nil, e
 	}
@@ -100,9 +111,9 @@ func (s *Server) CreateMessage(ctx context.Context, request CreateMessageRequest
 		Nonce:     nonce,
 	}
 	if err := s.store.CreateMessage(ctx, msg); err != nil {
-		// 撞 (user_id, nonce) 唯一索引 = 幂等重放：回读原消息返回 200。
+		// 撞 (channel_id, user_id, nonce) 唯一索引 = 幂等重放：回读原消息返回 200。
 		if nonce != "" && errors.Is(err, store.ErrConflict) {
-			orig, rerr := s.store.MessageByNonce(ctx, c.UserID, nonce)
+			orig, rerr := s.store.MessageByNonce(ctx, ch.ID, c.UserID, nonce)
 			if rerr != nil {
 				return nil, s.writeStoreErr(ctx, rerr)
 			}
