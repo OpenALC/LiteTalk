@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
@@ -133,4 +134,50 @@ func (s *Server) responseErrorHandler(w http.ResponseWriter, r *http.Request, er
 	}
 	s.log.Printf("[500] %s: %v", r.URL.Path, err)
 	writeErr(w, http.StatusInternalServerError, "internal", "服务器内部错误")
+}
+
+// methodNotAllowedWriter 把 ServeMux 内建的纯文本 405 改写成 problem+json（#77）。
+// Go 1.22 ServeMux 在路径存在但方法不匹配时直接 http.Error 405，没有可插拔的
+// 错误处理点：这里在 WriteHeader 时换掉 Content-Type（保留 ServeMux 设置的
+// Allow 头），并在首次 Write 时写出统一错误体、吞掉 http.Error 的原始文本。
+// 其它状态码原样透传。
+type methodNotAllowedWriter struct {
+	http.ResponseWriter
+	rewriting bool // 已收到 405 WriteHeader
+	wrote     bool // 已写出 problem 体
+}
+
+func (w *methodNotAllowedWriter) WriteHeader(code int) {
+	if code == http.StatusMethodNotAllowed {
+		w.rewriting = true
+		w.ResponseWriter.Header().Set("Content-Type", "application/problem+json")
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *methodNotAllowedWriter) Write(p []byte) (int, error) {
+	if !w.rewriting {
+		return w.ResponseWriter.Write(p)
+	}
+	if w.wrote {
+		// 原始 http.Error 文本丢弃；向调用方报告整段已写入。
+		return len(p), nil
+	}
+	w.wrote = true
+	body, err := json.Marshal(problemBody{
+		Type:    "urn:litetalk:error:method_not_allowed",
+		Title:   http.StatusText(http.StatusMethodNotAllowed),
+		Status:  http.StatusMethodNotAllowed,
+		Code:    "method_not_allowed",
+		Detail:  "请求方法不允许",
+		Message: "请求方法不允许",
+	})
+	if err != nil {
+		return 0, err
+	}
+	body = append(body, '\n')
+	if _, err := w.ResponseWriter.Write(body); err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }

@@ -7,8 +7,8 @@
 # 口径说明：
 # - 本文件描述 /api/v1 的现状（行为保持，#28 不改语义）；ID 字符串化、分页、
 #   RFC 9457 等语义演进在 #31 落地时同步更新本文件。
-# - main.go 挂载的 GET /api/v1/healthz、POST /api/v1/rtc/credentials 暂不在
-#   internal/api 路由树内，未纳入本契约（后续收编另行更新）。
+# - /api/v1 下的全部对外端点都已纳入契约（含 GET /api/v1/healthz 与
+#   POST /api/v1/rtc/credentials，#77 收编）。路径与方法是对外承诺，不得随意变更。
 # - 错误体统一 application/problem+json（RFC 9457）；各操作 description 列出实际会出现的 code。
 openapi: 3.0.3
 info:
@@ -20,10 +20,14 @@ servers:
 security:
   - bearerAuth: []
 tags:
+  - name: system
+    description: 部署探活（免鉴权）
   - name: config
     description: 服务端能力开关（免鉴权）
   - name: auth
     description: 注册 / 登录 / 令牌 / 找回密码（免鉴权；除 logout 外要求 X-LiteTalk-Client ≥ 1.5）
+  - name: rtc
+    description: RTC 基础设施凭证（TURN/STUN 短期凭证）
   - name: users
     description: 当前用户
   - name: friends
@@ -37,6 +41,50 @@ tags:
   - name: sync
     description: 事件续传失败后的聚合快照
 paths:
+  /api/v1/healthz:
+    get:
+      operationId: getHealthz
+      summary: 健康检查（部署探活）
+      description: >
+        免鉴权。部署脚本与探针依赖该路径与方法（GET /api/v1/healthz），
+        路径与方法不得变更。version 为构建期注入的服务端版本号。
+      tags: [system]
+      security: []
+      responses:
+        '200':
+          description: 服务存活
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Healthz'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+  /api/v1/rtc/credentials:
+    post:
+      operationId: postRtcCredentials
+      summary: 签发 TURN 短期凭证
+      description: >
+        鉴权方式与信令一致：Authorization: Bearer <access_token>，或查询参数
+        ?token=<access_token>（两者皆可，不要求 X-LiteTalk-Client）。
+        未登录或令牌无效返回 401 unauthorized（不区分原因，避免泄露内部细节）；
+        服务端未配置 TURN（LITETALK_TURN_SECRET 为空且内置 TURN 关闭）返回
+        503 turn_unavailable，客户端按直连降级。响应 iceServers 可直接填入
+        WebRTC 的 RTCConfiguration.iceServers。
+      tags: [rtc]
+      security: []
+      responses:
+        '200':
+          description: ICE server 列表（STUN 条目无凭证；TURN 条目带 username/credential）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RtcCredentials'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '503':
+          $ref: '#/components/responses/TurnUnavailable'
   /api/v1/config:
     get:
       operationId: getConfig
@@ -1110,6 +1158,18 @@ components:
         application/problem+json:
           schema:
             $ref: '#/components/schemas/Problem'
+    MethodNotAllowed:
+      description: 方法不允许（body.code：method_not_allowed）；响应头 Allow 列出该路径的可用方法。
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    TurnUnavailable:
+      description: TURN 未配置或暂不可用（body.code：turn_unavailable）；客户端按直连降级。
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
     Internal:
       description: 服务端错误（body.code：internal / conflict / not_found / code_expired，store 错误映射）
       content:
@@ -1176,6 +1236,49 @@ components:
         status:
           type: string
           enum: [ok]
+    Healthz:
+      type: object
+      title: Healthz
+      description: 部署探活响应。路径与方法被部署脚本依赖，不得变更。
+      required: [status, version]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        version:
+          type: string
+          description: 服务端构建版本（未注入版本号的本地构建为 dev）
+    ICEServer:
+      type: object
+      title: ICEServer
+      description: 单条 ICE server（字段与 WebRTC RTCIceServer 对齐）。
+      required: [urls]
+      properties:
+        urls:
+          type: array
+          items:
+            type: string
+          description: 'stun:/stuns:/turn:/turns: URL 列表'
+        username:
+          type: string
+          description: TURN 短期用户名（<expiry_unix>:<uid>）；STUN 条目无此字段
+        credential:
+          type: string
+          description: TURN 短期凭证（HMAC-SHA1 base64）；STUN 条目无此字段
+    RtcCredentials:
+      type: object
+      title: RtcCredentials
+      description: TURN/STUN 短期凭证；iceServers 可直接填入 WebRTC 配置。
+      required: [iceServers, expiresAt]
+      properties:
+        iceServers:
+          type: array
+          items:
+            $ref: '#/components/schemas/ICEServer'
+        expiresAt:
+          type: integer
+          format: int64
+          description: 凭证过期时刻（unix 秒）
     ServerConfig:
       type: object
       title: ServerConfig
