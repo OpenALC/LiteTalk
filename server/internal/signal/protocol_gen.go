@@ -80,6 +80,7 @@ type MemberInfo struct {
 	Mute     bool   `json:"mute"`
 	Deafen   bool   `json:"deafen"`
 	Speaking bool   `json:"speaking"`
+	Online   bool   `json:"online"` // 在线态（presence:{uid} 存在即在线），与 REST 成员视图同源
 }
 
 // SDPData rtc.offer / rtc.answer 的载荷。

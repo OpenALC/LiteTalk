@@ -214,7 +214,8 @@ func (s *Server) ListServerMembers(ctx context.Context, request ListServerMember
 		return nil, s.writeStoreErr(ctx, err)
 	}
 	// ETag 协商（#31）：内容哈希弱标签，命中 If-None-Match 回 304。
-	view := memberViews(members)
+	// 在线态是视图的一部分：presence 变化会让 ETag 变化（#11）。
+	view := s.serverMemberViews(ctx, members)
 	etag := contentETag(view)
 	setETag(ctx, etag)
 	if etagMatch(ifNoneMatch(ctx), etag) {

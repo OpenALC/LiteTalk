@@ -83,12 +83,14 @@ func categoryView(c *store.Category) CategoryInfo {
 	}
 }
 
-func memberView(m *store.ServerMember) MemberInfo {
+// memberView 成员行视图；online 由调用方从 presence:{uid} 读取后传入（#11）。
+func memberView(m *store.ServerMember, online bool) MemberInfo {
 	out := MemberInfo{
 		ServerId: idOf(m.ServerID),
 		UserId:   idOf(m.UserID),
 		Role:     MemberInfoRole(m.Role),
 		JoinedAt: timeOf(m.JoinedAt),
+		Online:   online,
 	}
 	if m.Nickname != "" {
 		n := m.Nickname
@@ -172,10 +174,12 @@ func categoryViews(list []store.Category) []CategoryInfo {
 	return out
 }
 
-func memberViews(list []store.ServerMember) []MemberInfo {
+// serverMemberViews 成员列表视图（#11）：逐成员查 presence:{uid} 填 online。
+// 成员数量通常不大，且该端点只在打开成员列表时拉取，先接受逐个 GET。
+func (s *Server) serverMemberViews(ctx context.Context, list []store.ServerMember) []MemberInfo {
 	out := make([]MemberInfo, 0, len(list))
 	for i := range list {
-		out = append(out, memberView(&list[i]))
+		out = append(out, memberView(&list[i], s.online(ctx, list[i].UserID)))
 	}
 	return out
 }
@@ -189,6 +193,15 @@ func (s *Server) userView(ctx context.Context, u *store.User) *PublicUser {
 	}
 	pub.Online = s.online(ctx, u.ID)
 	return pub
+}
+
+// friendUserView 好友条目对端视图：只有已接受关系才填在线态（#11 P2 隐私）。
+// pending/blocked 关系不返回在线与否，避免单方面发出请求即可探测对方在线。
+func (s *Server) friendUserView(ctx context.Context, u *store.User, status store.FriendshipStatus) *PublicUser {
+	if status != store.FriendAccepted {
+		return publicUser(u)
+	}
+	return s.userView(ctx, u)
 }
 
 // online presence:{uid} 存在 = 在线；无 KV 依赖时恒离线。

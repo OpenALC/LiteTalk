@@ -149,7 +149,7 @@ func TestWireKeyMessagesJSON(t *testing.T) {
 		{"VoiceStateData 上行", VoiceStateData{Speaking: boolPtr(true)}, []string{`"speaking":true`}},
 		{"VoiceStateData 下行", VoiceStateData{UserID: "7", Mute: boolPtr(false)}, []string{`"user_id":"7"`, `"mute":false`}},
 		{"MemberInfo", MemberInfo{UserID: "1", Nickname: "n", Mute: true},
-			[]string{`"user_id":"1"`, `"mute":true`, `"deafen":false`, `"speaking":false`}},
+			[]string{`"user_id":"1"`, `"mute":true`, `"deafen":false`, `"speaking":false`, `"online":false`}},
 		{"ICEData", ICEData{Candidate: "c", SDPMid: "0"}, []string{`"candidate":"c"`, `"sdpMid":"0"`}},
 		{"ChatMessageData", ChatMessageData{ID: "9", ChannelID: "3", Content: "hi", TS: 5, User: UserBrief{ID: "1"}},
 			[]string{`"id":"9"`, `"channel_id":"3"`, `"content":"hi"`, `"ts":5`}},
