@@ -290,6 +290,16 @@ func (m *MySQL) HasUsers(ctx context.Context) (bool, error) {
 	return n > 0, nil
 }
 
+// HasServers 库内是否已有服务器（#27：实例是否已被认领的持久判据）。
+func (m *MySQL) HasServers(ctx context.Context) (bool, error) {
+	var n int
+	err := m.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM servers LIMIT 1`).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // ---- friendships ----
 
 func (m *MySQL) CreateFriendship(ctx context.Context, f *Friendship) error {

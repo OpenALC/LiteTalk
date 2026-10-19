@@ -232,6 +232,16 @@ func (s *SQLite) HasUsers(ctx context.Context) (bool, error) {
 	return n > 0, nil
 }
 
+// HasServers 库内是否已有服务器（#27：实例是否已被认领的持久判据）。
+func (s *SQLite) HasServers(ctx context.Context) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM servers LIMIT 1`).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // ---- friendships ----
 
 func (s *SQLite) CreateFriendship(ctx context.Context, f *Friendship) error {

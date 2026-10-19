@@ -16,19 +16,24 @@ import (
 func newBootstrapTestServer(t *testing.T) (*Server, *store.Mem) {
 	t.Helper()
 	mem := store.NewMem()
-	srv := New(Config{
-		Store:             mem,
+	return newBootstrapServer(t, mem, mem), mem
+}
+
+// newBootstrapServer 允许注入独立 Store/KV：模拟「重启后 KV 丢失、库仍在」。
+func newBootstrapServer(t *testing.T, st store.Store, kv store.KV) *Server {
+	t.Helper()
+	return New(Config{
+		Store:             st,
 		JWT:               auth.NewJWT("test-secret"),
-		Refresh:           auth.NewRefreshStore(mem),
-		Codes:             auth.NewEmailCodes(mem),
-		Limits:            auth.NewRateLimit(mem),
+		Refresh:           auth.NewRefreshStore(kv),
+		Codes:             auth.NewEmailCodes(kv),
+		Limits:            auth.NewRateLimit(kv),
 		AuthMode:          AuthModeSimple,
-		Session:           auth.NewSessionIndex(mem, mem),
-		Presence:          mem,
+		Session:           auth.NewSessionIndex(st, kv),
+		Presence:          kv,
 		SelfHost:          true,
-		BootstrapRequired: func() bool { return bootstrap.Required(context.Background(), mem) },
+		BootstrapRequired: func() bool { return bootstrap.Required(context.Background(), kv, st) },
 	})
-	return srv, mem
 }
 
 // TestRegisterBootstrapCode 带码注册 → 认领默认服务器；码一次性（#27）。
@@ -106,6 +111,54 @@ func TestRegisterBootstrapInvalid(t *testing.T) {
 	cfg, _ := getJSON(t, h, "/api/v1/config", "", http.StatusOK).(map[string]any)
 	if cfg["bootstrap_required"] != true {
 		t.Fatalf("码未消费 bootstrap_required 应为 true，实际 %v", cfg["bootstrap_required"])
+	}
+}
+
+// TestRegisterBootstrapRejectedAfterRestart #27 P1：消费标记只在进程内 KV，
+// 重启（新 KV、同一数据库）后同一个码必须仍被拒绝，且不产生第二个默认服务器。
+func TestRegisterBootstrapRejectedAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMem() // 持久层：跨「重启」保留
+	code := bootstrap.Code("test-secret")
+
+	// 第一次启动：KV 与库同进程，带码注册成功并建默认服务器。
+	h1 := newBootstrapServer(t, st, st).Handler()
+	postJSON(t, h1, "/api/v1/auth/register", "", map[string]string{
+		"nickname": "机主", "email": "root@ex.com", "password": "password123", "bootstrap": code,
+	}, http.StatusCreated)
+	owner, err := st.UserByEmail(ctx, "root@ex.com")
+	if err != nil {
+		t.Fatalf("首次注册应建用户: %v", err)
+	}
+
+	// 模拟重启：MemKV 全丢（新实例），SQLite/库文件还在。
+	kv2 := store.NewMemKV()
+	h2 := newBootstrapServer(t, st, kv2).Handler()
+
+	// 持久判据：库内已有服务器 → bootstrap_required 必须为 false。
+	cfg, _ := getJSON(t, h2, "/api/v1/config", "", http.StatusOK).(map[string]any)
+	if cfg["bootstrap_required"] != false {
+		t.Fatalf("重启后 bootstrap_required 应反映持久状态为 false，实际 %v", cfg["bootstrap_required"])
+	}
+
+	// 同一个码再注册 → 400 bad_bootstrap，不建用户。
+	bad := postJSON(t, h2, "/api/v1/auth/register", "", map[string]string{
+		"nickname": "路人", "email": "second@ex.com", "password": "password123", "bootstrap": code,
+	}, http.StatusBadRequest)
+	if bad["code"] != "bad_bootstrap" {
+		t.Fatalf("重启后复用邀请码 code = %v，want bad_bootstrap", bad["code"])
+	}
+	if _, err := st.UserByEmail(ctx, "second@ex.com"); err != store.ErrNotFound {
+		t.Fatalf("被拒注册不应建用户，实际 err=%v", err)
+	}
+
+	// 仍只有一个默认服务器。
+	servers, err := st.ServersOfUser(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(servers) != 1 {
+		t.Fatalf("重启后不应产生第二个默认服务器，实际 %d", len(servers))
 	}
 }
 
