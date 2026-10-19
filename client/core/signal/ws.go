@@ -54,6 +54,12 @@ type Config struct {
 	// reason 约定值见 KickReasonLoginElsewhere。在 Run 的 goroutine 上同步调用，
 	// 实现侧不得同步 Close 本客户端（Close 会等 Run 退出，自成死锁）。
 	OnKicked func(reason string)
+	// OnAuthFailed 握手 401（被顶替类除外）时回调，供上层刷新 access 令牌。
+	// 返回 nil = 已刷新，Run 立即重拨一次（不叠加退避）；返回非 nil = 刷新
+	// 失败，Run 以 ErrAuthFatal 返回，不再重连——宁可回登录态，也不拿旧令牌
+	// 无限撞墙。每次连接生命周期只有一次重试预算：刷新后仍被拒即停。
+	// 被顶替类 401 走 OnKicked，不经过本回调。nil = 不刷新（旧行为）。
+	OnAuthFailed func(ctx context.Context) error
 	// Gate 事件面排序/去重门（#32）：对每条下行信封返回应投递给订阅者的信封
 	//（按返回序投递；通常 0 或 1 条，补发窗口的乱序回填可能一次多条）。
 	// nil = 全部直通（老路径）。gateway.Tracker.Gate 是标准实现。
@@ -174,6 +180,9 @@ func (c *Client) Close() {
 // 其余错误只会触发重连，不会返回。
 func (c *Client) Run(ctx context.Context) error {
 	backoff := c.cfg.ReconnectMin
+	// authRetried 一条连接的 401 刷新重试预算：拨号成功即复位（下一条连接
+	// 又有一次预算），刷新后仍 401 则保持 true 直接致命，杜绝握手 401 风暴。
+	authRetried := false
 	for {
 		if c.closed.Load() {
 			return nil
@@ -201,6 +210,21 @@ func (c *Client) Run(ctx context.Context) error {
 					c.fireKicked(reason)
 					return ErrAuthFatal
 				}
+				// 普通 401 = 令牌过期/被吊销：刷新一次后立即重拨。刷新失败
+				// 或重拨仍被拒都按致命收场，只打日志不重连会让常驻托盘的用户
+				// 在 access 到期后再也连不上（#84）。
+				if resp.StatusCode == http.StatusUnauthorized && !authRetried && c.cfg.OnAuthFailed != nil {
+					authRetried = true
+					c.logf("auth failed (HTTP %d), refreshing access token", resp.StatusCode)
+					if rerr := c.cfg.OnAuthFailed(ctx); rerr == nil {
+						continue
+					} else if ctx.Err() != nil || c.closed.Load() {
+						return nil
+					} else {
+						c.logf("token refresh failed: %v, giving up", rerr)
+						return ErrAuthFatal
+					}
+				}
 				c.logf("auth failed (HTTP %d), giving up", resp.StatusCode)
 				return ErrAuthFatal
 			}
@@ -211,6 +235,7 @@ func (c *Client) Run(ctx context.Context) error {
 			backoff = nextBackoff(backoff, c.cfg.ReconnectMax)
 			continue
 		}
+		authRetried = false
 
 		if c.Stats.Connects.Add(1) > 1 {
 			c.Stats.Reconnects.Add(1)

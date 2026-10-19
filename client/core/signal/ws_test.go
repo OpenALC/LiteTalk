@@ -31,6 +31,11 @@ type stubServer struct {
 	// rejectWith 非空时握手直接 401，并带 X-LiteTalk-Auth: <值> 响应头
 	// （测被踢类鉴权失败与 token_expired 的区分）。
 	rejectWith atomic.Value // string
+	// requireToken 非空时只接受该令牌（其余 401、不带被踢头）：模拟 access
+	// 过期后服务端拒绝旧令牌，刷新后新令牌才放行（#84）。
+	requireToken atomic.Value // string
+	// denied 握手 401 次数（含刷新后的重试），用于断言「重试一次即止」。
+	denied atomic.Int32
 
 	received chan Envelope
 }
@@ -41,6 +46,12 @@ func newStubServer(t *testing.T) *stubServer {
 	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tok := r.URL.Query().Get("token")
 		if !strings.HasPrefix(tok, "dev-") {
+			s.denied.Add(1)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if want, _ := s.requireToken.Load().(string); want != "" && tok != want {
+			s.denied.Add(1)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -219,16 +230,18 @@ func TestWSAuthFailure(t *testing.T) {
 
 // TestWSHandshake401KickedHeader 握手 401 的 X-LiteTalk-Auth 头区分两类失败：
 // session_replaced/session_replayed = 本端已被踢，必须走被踢链路（此前只打日志，
-// 用户看到的是静默的登录失败）；token_expired = REST 侧刷新已处理，不惊动用户。
+// 用户看到的是静默的登录失败）；token_expired = 普通令牌失败，走刷新重试一次，
+// 不能当被踢处理（#84）。
 func TestWSHandshake401KickedHeader(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		header   string
-		wantKick bool
+		name        string
+		header      string
+		wantKick    bool
+		wantRefresh int32
 	}{
-		{"session_replaced 走被踢", "session_replaced", true},
-		{"session_replayed 走被踢", "session_replayed", true},
-		{"token_expired 不惊动用户", "token_expired", false},
+		{"session_replaced 走被踢", "session_replaced", true, 0},
+		{"session_replayed 走被踢", "session_replayed", true, 0},
+		{"token_expired 刷新一次后停", "token_expired", false, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stub := newStubServer(t)
@@ -238,6 +251,12 @@ func TestWSHandshake401KickedHeader(t *testing.T) {
 
 			kicked := make(chan string, 1)
 			c.cfg.OnKicked = func(reason string) { kicked <- reason }
+			var refreshCalls atomic.Int32
+			// 刷新「成功」但服务端恒拒：只允许重试一次，第二次 401 必须致命。
+			c.cfg.OnAuthFailed = func(context.Context) error {
+				refreshCalls.Add(1)
+				return nil
+			}
 			done := make(chan error, 1)
 			go func() { done <- c.Run(context.Background()) }()
 
@@ -262,7 +281,126 @@ func TestWSHandshake401KickedHeader(t *testing.T) {
 					t.Fatalf("header %q 应触发被踢，OnKicked 未调用", tc.header)
 				}
 			}
+			if got := refreshCalls.Load(); got != tc.wantRefresh {
+				t.Fatalf("刷新次数 = %d, want %d（被顶替类不得刷新）", got, tc.wantRefresh)
+			}
 		})
+	}
+}
+
+// TestWSHandshake401RefreshRetry 普通 401（access 过期）：OnAuthFailed 刷新成功
+// 后立即重拨一次并连上，Run 不退出——此前 401 直接 ErrAuthFatal，常驻托盘的
+// 用户 access 到期后只要断线就永久离线（#84）。
+func TestWSHandshake401RefreshRetry(t *testing.T) {
+	stub := newStubServer(t)
+	stub.requireToken.Store("dev-new")
+
+	var tok atomic.Value
+	tok.Store("dev-old")
+	var refreshCalls atomic.Int32
+	c := NewClient(Config{
+		URL: stub.wsURL(),
+		TokenFunc: func(context.Context) (string, error) {
+			return tok.Load().(string), nil
+		},
+		OnAuthFailed: func(context.Context) error {
+			refreshCalls.Add(1)
+			tok.Store("dev-new")
+			return nil
+		},
+		PingInterval: 50 * time.Millisecond,
+		ReconnectMin: 20 * time.Millisecond,
+		ReconnectMax: 100 * time.Millisecond,
+	})
+	defer c.Close()
+
+	done := make(chan error, 1)
+	go func() { done <- c.Run(context.Background()) }()
+	waitFor(t, "connect after refresh", 5*time.Second, c.Connected)
+
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("刷新次数 = %d, want 1", got)
+	}
+	if got := stub.lastToken(); got != "dev-new" {
+		t.Fatalf("重拨应携带刷新后的令牌, 实际 %q", got)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("刷新重连成功后 Run 不应退出: %v", err)
+	default:
+	}
+}
+
+// TestWSHandshake401RefreshFailsFatal 刷新失败：Run 立即以 ErrAuthFatal 返回，
+// 只拨号一次（不进入无限重连；上层据此回登录态）。
+func TestWSHandshake401RefreshFailsFatal(t *testing.T) {
+	stub := newStubServer(t)
+	stub.requireToken.Store("dev-new")
+
+	var refreshCalls atomic.Int32
+	c := NewClient(testConfig(stub.wsURL(), "dev-old"))
+	defer c.Close()
+	c.cfg.OnAuthFailed = func(context.Context) error {
+		refreshCalls.Add(1)
+		return errors.New("refresh rejected")
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- c.Run(context.Background()) }()
+	select {
+	case err := <-done:
+		if err != ErrAuthFatal {
+			t.Fatalf("Run err = %v, want ErrAuthFatal", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("刷新失败后 Run 未返回")
+	}
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("刷新次数 = %d, want 1", got)
+	}
+	if got := stub.denied.Load(); got != 1 {
+		t.Fatalf("握手 401 次数 = %d, want 1（刷新失败不得重试）", got)
+	}
+	// 再等一个退避窗口：不得出现后台重连。
+	time.Sleep(200 * time.Millisecond)
+	if got := stub.denied.Load(); got != 1 {
+		t.Fatalf("刷新失败后仍在重连: 401 次数 %d", got)
+	}
+}
+
+// TestWSHandshake401RefreshRetryOnce 刷新成功但新令牌仍被拒：只重试一次即停，
+// 不发生握手 401 风暴。
+func TestWSHandshake401RefreshRetryOnce(t *testing.T) {
+	stub := newStubServer(t)
+	stub.requireToken.Store("dev-never")
+
+	var refreshCalls atomic.Int32
+	c := NewClient(testConfig(stub.wsURL(), "dev-old"))
+	defer c.Close()
+	c.cfg.OnAuthFailed = func(context.Context) error {
+		refreshCalls.Add(1)
+		return nil // 「刷新成功」，但服务端仍然拒绝新令牌
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- c.Run(context.Background()) }()
+	select {
+	case err := <-done:
+		if err != ErrAuthFatal {
+			t.Fatalf("Run err = %v, want ErrAuthFatal", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("刷新重试仍 401 后 Run 未返回")
+	}
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("刷新次数 = %d, want 1", got)
+	}
+	if got := stub.denied.Load(); got != 2 {
+		t.Fatalf("握手 401 次数 = %d, want 2（首拨 + 一次重试）", got)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := stub.denied.Load(); got != 2 {
+		t.Fatalf("重试预算用尽后仍在拨号: 401 次数 %d", got)
 	}
 }
 

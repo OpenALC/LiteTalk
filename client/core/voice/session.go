@@ -92,10 +92,13 @@ type PeerView struct {
 
 // Session 一次登录后的通话会话：信令连接 + 媒体管线。
 type Session struct {
-	api   *api.APIClient
-	log   *log.Logger
-	ev    Events
-	token string // 信令令牌（access token 或 dev-<name>）
+	api *api.APIClient
+	log *log.Logger
+	ev  Events
+	// token 构造时的信令令牌，仅在 APIClient 无 access 时回落（dev- 令牌/
+	// 直连测试）。正常路径每次拨号都取 APIClient 当前令牌，REST/WS 侧刷新
+	// 后自动生效。atomic 保并发：TokenFunc 在 ws 重连 goroutine 读。
+	token atomic.Value // string
 	name  string
 
 	ws        *signal.Client
@@ -155,13 +158,13 @@ func NewSession(api *api.APIClient, token, nickname string, ev Events, logger *l
 		api:       api,
 		log:       logger,
 		ev:        ev,
-		token:     token,
 		name:      nickname,
 		members:   make(map[string]PeerView),
 		seenChans: make(map[string]bool),
 		voiceSend: make(chan signal.VoiceStateData, 1),
 		gw:        gateway.New(),
 	}
+	s.token.Store(token)
 	s.roomID.Store("")
 	return s
 }
@@ -173,8 +176,31 @@ func (s *Session) Connect(serverURL string) {
 	wsCfg := signal.Config{
 		URL:    serverURL,
 		Logger: s.log,
-		// 闭包取令牌：REST 侧刷新 access token 后，WS 重连自动携带新令牌。
-		TokenFunc: func(context.Context) (string, error) { return s.token, nil },
+		// 每次拨号取 APIClient 当前令牌：REST 刷新后重连自动携带新值。
+		// 已知过期时先单飞续期；失败不阻断本次拨号——旧令牌交给下面的握手
+		// 401 路径强制刷新一次，仍然失败才停（不会无限重连）。
+		TokenFunc: func(ctx context.Context) (string, error) {
+			if tok := s.api.Token(); tok != "" {
+				if err := s.api.EnsureAccess(ctx); err != nil {
+					s.log.Printf("signal: access 预续期失败: %v", err)
+				}
+				if tok = s.api.Token(); tok != "" {
+					return tok, nil
+				}
+			}
+			// APIClient 无令牌（dev 令牌/直连测试）：回落构造时的令牌。
+			return s.token.Load().(string), nil
+		},
+		// 握手 401（被顶替类已由 OnKicked 收口）：刷新一次 access 再重拨。
+		// 刷新窗口里发现会话被顶替（refresh 自身 401 + session_replaced），
+		// 转成被踢事件，让 app 层清令牌回登录页。
+		OnAuthFailed: func(ctx context.Context) error {
+			err := s.api.RefreshAccess(ctx)
+			if errors.Is(err, api.ErrSessionReplaced) {
+				s.handleKicked(signal.KickReasonLoginElsewhere)
+			}
+			return err
+		},
 	}
 	wsCfg.OnConnect = func(c *signal.Client) {
 		if s.ev.OnConnection != nil {
