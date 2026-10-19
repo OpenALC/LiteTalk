@@ -338,8 +338,8 @@ func main() {
 		// 自托管形态自描述（GET /api/v1/config，#26）：SQLite/进程内单机部署 = true，
 		// MySQL 全栈部署 = false。客户端据此显示自托管引导（邀请码等）。
 		SelfHost: pickStoreKind() != "mysql",
-		// 管理员邀请码是否未消费（#27 T4 填 bootstrap.Required 实现）。
-		BootstrapRequired: func() bool { return bootstrap.Required(context.Background(), kv) },
+		// 管理员邀请码是否未认领（#27：KV 消费标记 + 库内是否已有服务器）。
+		BootstrapRequired: func() bool { return bootstrap.Required(context.Background(), kv, st) },
 	})
 
 	mux := http.NewServeMux()

@@ -166,6 +166,9 @@ type Store interface {
 	UpdateUser(ctx context.Context, u *User) error
 	// HasUsers 库内是否已有用户（首启探测用；UserByID(1) 随 Snowflake 失效）。
 	HasUsers(ctx context.Context) (bool, error)
+	// HasServers 库内是否已有服务器（#27：实例是否已被认领的持久判据，
+	// 默认进程内 KV 重启丢标记，不能只看消费标记）。
+	HasServers(ctx context.Context) (bool, error)
 
 	// friendships
 	CreateFriendship(ctx context.Context, f *Friendship) error
