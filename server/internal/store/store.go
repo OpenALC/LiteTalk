@@ -241,7 +241,7 @@ type Store interface {
 	DeleteAllUserSessions(ctx context.Context, userID int64) error
 }
 
-// KV 键值抽象（Redis 与内存实现共同契约；auth 的验证码/刷新令牌/限流使用）。
+// KV 键值抽象（Redis、SQLite 与内存实现共同契约；auth 的验证码/刷新令牌/限流使用）。
 type KV interface {
 	Get(ctx context.Context, key string) (string, error)
 	Set(ctx context.Context, key, value string, ttl time.Duration) error
