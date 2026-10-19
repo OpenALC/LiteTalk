@@ -125,6 +125,13 @@ func (m *Mem) HasUsers(_ context.Context) (bool, error) {
 	return len(m.users) > 0, nil
 }
 
+// HasServers 库内是否已有服务器（#27：实例是否已被认领的持久判据）。
+func (m *Mem) HasServers(_ context.Context) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.servers) > 0, nil
+}
+
 // ---- friendships ----
 
 func (m *Mem) CreateFriendship(_ context.Context, f *Friendship) error {

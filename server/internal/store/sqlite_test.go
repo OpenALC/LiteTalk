@@ -380,3 +380,27 @@ func TestSQLiteTimeRoundTrip(t *testing.T) {
 		t.Fatalf("UpdatedAt 早于 CreatedAt: up=%v cre=%v", s2.UpdatedAt, s2.CreatedAt)
 	}
 }
+
+// TestSQLiteHasServers #27：引导邀请码的持久判据（空库 false，建服务器后 true）。
+func TestSQLiteHasServers(t *testing.T) {
+	ctx := context.Background()
+	m := openTestSQLite(t)
+	if err := m.Migrate(ctx, findMigrationsSQLite(t)); err != nil {
+		t.Fatalf("迁移失败: %v", err)
+	}
+	ok, err := m.HasServers(ctx)
+	if err != nil || ok {
+		t.Fatalf("空库 HasServers = %v/%v，want false/nil", ok, err)
+	}
+	u := &User{Email: "owner@ex.com", Nickname: "owner", Tag: "0001"}
+	if err := m.CreateUser(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.CreateServer(ctx, &Server{Name: "默认服务器", OwnerID: u.ID}); err != nil {
+		t.Fatal(err)
+	}
+	ok, err = m.HasServers(ctx)
+	if err != nil || !ok {
+		t.Fatalf("建服务器后 HasServers = %v/%v，want true/nil", ok, err)
+	}
+}

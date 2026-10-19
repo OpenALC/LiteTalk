@@ -3,8 +3,8 @@
 // 注册时带码者成为默认服务器 owner 并作废该码；不做 users.is_admin（免 0005 迁移）。
 //
 // 码不落库——HMAC 派生保证跨重启稳定；KV 只存「已消费」「已打印」标记。
-// 注意：默认 KV 是进程内 MemKV，不跨重启——重启后消费标记丢失，派生码可再次
-// 使用（影响仅限自托管 UX：任何注册用户本来就能建服务器）。Redis 部署下标记跨重启。
+// 「实例是否已被认领」以库内是否存在服务器为准（HasServers）：默认 KV 是进程内
+// MemKV，重启丢标记，只看 KV 会让同一个码再注册出一个默认服务器。
 package bootstrap
 
 import (
@@ -50,15 +50,24 @@ func Verify(jwtSecret, code string) bool {
 	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 
-// Required 管理员邀请码是否尚未被消费（实例未被认领）。
-// GET /api/v1/config 的 bootstrap_required 据此返回。
-// 读失败按未消费处理——提示性字段 fail-open，Redis 闪断不应把注册页锁死。
-func Required(ctx context.Context, kv store.KV) bool {
+// Required 实例是否仍等待管理员邀请码认领。
+// 判据：KV 已消费 → false；库内已有服务器（实例已被认领）→ false；其余 → true。
+// GET /api/v1/config 的 bootstrap_required 与注册侧校验都据此返回（#27）。
+// kv == nil 视为流程未启用（无法写消费标记，注册侧同样 fail-closed）。
+// 存储读失败按「未认领」处理——提示性字段 fail-open，Redis 闪断不应把注册页锁死。
+func Required(ctx context.Context, kv store.KV, st store.Store) bool {
 	if kv == nil {
 		return false
 	}
-	_, err := kv.Get(ctx, keyConsumed)
-	return err != nil
+	if _, err := kv.Get(ctx, keyConsumed); err == nil {
+		return false
+	}
+	if st != nil {
+		if ok, err := st.HasServers(ctx); err == nil && ok {
+			return false
+		}
+	}
+	return true
 }
 
 // Consume 标记邀请码已消费（value 记使用方 uid 便于排查）。ttl 0 = 不过期。

@@ -20,34 +20,33 @@ func (s *Server) bootstrapKV() store.KV {
 	return kv
 }
 
-// checkBootstrap 邀请码前置校验（建用户之前）：码合法且未消费。
-// 不合法/已用 → errBadBootstrap，调用方回 400 bad_bootstrap。
+// checkBootstrap 邀请码前置校验（建用户之前）：码合法且实例未认领。
+// 「已认领」以 KV 消费标记与库内服务器双重判定（#27），MemKV 重启丢标记后
+// 仍然拒绝复用。不合法/已用 → errBadBootstrap，调用方回 400 bad_bootstrap。
 func (s *Server) checkBootstrap(ctx context.Context, code string) error {
 	if !bootstrap.Verify(string(s.jwt.Secret()), code) {
 		return errBadBootstrap
 	}
 	kv := s.bootstrapKV()
-	if kv == nil || !bootstrap.Required(ctx, kv) {
+	if kv == nil || !bootstrap.Required(ctx, kv, s.store) {
 		return errBadBootstrap
 	}
 	return nil
 }
 
-// claimBootstrap 注册成功后认领：建默认服务器并标记码已消费。
-// 消费标记写失败只记日志——用户与服务器都已建好，重发 500 反而让客户端
-// 误以为注册失败；代价是该码在标记落上之前仍可再用（自托管一次性 UX，可接受）。
+// claimBootstrap 注册成功后认领：原子复查（防并发建出两个默认服务器）→
+// 建默认服务器 → 标记码已消费。失败只记日志——用户已建好，重发 500 反而让
+// 客户端误以为注册失败；持久化判据保证码不会因此被再次使用。
 func (s *Server) claimBootstrap(ctx context.Context, code string, user *store.User) {
 	if !bootstrap.Verify(string(s.jwt.Secret()), code) {
 		return // 前置 checkBootstrap 已拒；防御不重复执行
 	}
-	if _, err := bootstrap.Adopt(ctx, s.store, user.ID); err != nil {
-		s.log.Printf("[bootstrap] 建默认服务器失败 uid=%d: %v", user.ID, err)
-		return
-	}
-	if kv := s.bootstrapKV(); kv != nil {
-		if err := bootstrap.Consume(ctx, kv, user.ID); err != nil {
-			s.log.Printf("[bootstrap] 消费标记写入失败 uid=%d: %v", user.ID, err)
+	if _, err := bootstrap.Claim(ctx, s.bootstrapKV(), s.store, user.ID); err != nil {
+		if errors.Is(err, bootstrap.ErrClaimed) {
+			s.log.Printf("[bootstrap] 实例已被认领（并发注册抢先），跳过建默认服务器 uid=%d", user.ID)
+			return
 		}
+		s.log.Printf("[bootstrap] 建默认服务器失败 uid=%d: %v", user.ID, err)
 	}
 }
 
