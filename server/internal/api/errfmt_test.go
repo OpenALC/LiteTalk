@@ -9,7 +9,8 @@ import (
 )
 
 // TestProblemJSON 错误体 RFC 9457（#31）：application/problem+json，
-// {type,title,status,code,detail}，type 形如 urn:litetalk:error:<code>。
+// {type,title,status,code,detail,message}，type 形如 urn:litetalk:error:<code>。
+// message 与 detail 同值：旧客户端只认 message，缺了它读不到任何提示。
 func TestProblemJSON(t *testing.T) {
 	srv, _ := newTestServer(t)
 	h := srv.Handler()
@@ -24,11 +25,12 @@ func TestProblemJSON(t *testing.T) {
 		t.Fatalf("Content-Type 应为 problem+json，实际 %q", ct)
 	}
 	var body struct {
-		Type   string `json:"type"`
-		Title  string `json:"title"`
-		Status int    `json:"status"`
-		Code   string `json:"code"`
-		Detail string `json:"detail"`
+		Type    string `json:"type"`
+		Title   string `json:"title"`
+		Status  int    `json:"status"`
+		Code    string `json:"code"`
+		Detail  string `json:"detail"`
+		Message string `json:"message"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("problem 解析: %v (%s)", err, rec.Body.String())
@@ -39,9 +41,9 @@ func TestProblemJSON(t *testing.T) {
 	if body.Status != 401 || body.Title == "" || body.Detail == "" {
 		t.Fatalf("status/title/detail 不符：%+v", body)
 	}
-	// 旧字段 message 不再输出（形状由 #31 明文变更）。
-	if strings.Contains(rec.Body.String(), `"message"`) {
-		t.Fatalf("不应再有 message 字段：%s", rec.Body.String())
+	// 旧客户端 decodeError 只认 message（#31 兼容）；两者必须同时存在且同值。
+	if body.Message == "" || body.Message != body.Detail {
+		t.Fatalf("message 应与 detail 同值且非空：detail=%q message=%q", body.Detail, body.Message)
 	}
 }
 
@@ -54,6 +56,7 @@ func TestRateLimitHeaders(t *testing.T) {
 	do := func() *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{}`))
 		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(clientVersionHeader, testClientVersion)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		return rec
@@ -89,10 +92,14 @@ func TestRateLimitHeaders(t *testing.T) {
 		t.Fatal("429 应带 Retry-After")
 	}
 	var body struct {
-		Code   string `json:"code"`
-		Detail string `json:"detail"`
+		Code    string `json:"code"`
+		Detail  string `json:"detail"`
+		Message string `json:"message"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.Code != "rate_limited" {
 		t.Fatalf("429 problem：%v %s", err, rec.Body.String())
+	}
+	if body.Message == "" || body.Message != body.Detail {
+		t.Fatalf("429 message 应与 detail 同值：detail=%q message=%q", body.Detail, body.Message)
 	}
 }

@@ -9,7 +9,7 @@
 #   RFC 9457 等语义演进在 #31 落地时同步更新本文件。
 # - main.go 挂载的 GET /api/v1/healthz、POST /api/v1/rtc/credentials 暂不在
 #   internal/api 路由树内，未纳入本契约（后续收编另行更新）。
-# - 错误体统一 {code, message}；各操作 description 列出实际会出现的 code。
+# - 错误体统一 application/problem+json（RFC 9457）；各操作 description 列出实际会出现的 code。
 openapi: 3.0.3
 info:
   title: LiteTalk API
@@ -23,7 +23,7 @@ tags:
   - name: config
     description: 服务端能力开关（免鉴权）
   - name: auth
-    description: 注册 / 登录 / 令牌 / 找回密码（免鉴权）
+    description: 注册 / 登录 / 令牌 / 找回密码（免鉴权；除 logout 外要求 X-LiteTalk-Client ≥ 1.5）
   - name: users
     description: 当前用户
   - name: friends
@@ -55,8 +55,8 @@ paths:
       summary: 邮箱注册（simple 模式免验证码）
       description: >
         code：bad_device、bad_nickname、bad_email、bad_password、bad_bootstrap、
-        bad_code、bad_request、too_large；409 email_taken；429 rate_limited；
-        5xx internal / conflict / internal（writeStoreErr 映射）。
+        bad_code、bad_request、too_large；409 email_taken；426 client_too_old；
+        429 rate_limited；5xx internal / conflict / internal（writeStoreErr 映射）。
       tags: [auth]
       security: []
       requestBody:
@@ -76,6 +76,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '409':
           $ref: '#/components/responses/Conflict'
+        '426':
+          $ref: '#/components/responses/ClientUpgradeRequired'
         '429':
           $ref: '#/components/responses/RateLimited'
         default:
@@ -86,7 +88,7 @@ paths:
       summary: 邮箱密码登录
       description: >
         code：bad_device、bad_request、too_large；401 bad_credentials；
-        429 rate_limited；5xx internal。
+        426 client_too_old；429 rate_limited；5xx internal。
       tags: [auth]
       security: []
       requestBody:
@@ -106,6 +108,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '426':
+          $ref: '#/components/responses/ClientUpgradeRequired'
         '429':
           $ref: '#/components/responses/RateLimited'
         default:
@@ -116,7 +120,8 @@ paths:
       summary: 刷新令牌（旋转 refresh_token）
       description: >
         code：bad_request、too_large；401 unauthorized、session_replaced、
-        session_replayed（另带响应头 X-LiteTalk-Auth）；5xx internal。
+        session_replayed（另带响应头 X-LiteTalk-Auth）；426 client_too_old；
+        5xx internal。
       tags: [auth]
       security: []
       requestBody:
@@ -136,6 +141,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '426':
+          $ref: '#/components/responses/ClientUpgradeRequired'
         default:
           $ref: '#/components/responses/Internal'
   /api/v1/auth/logout:
@@ -172,7 +179,8 @@ paths:
       summary: 发送邮箱验证码
       description: >
         code：bad_email、bad_purpose、verification_not_required、bad_request、
-        too_large；404 not_found；409 email_taken；429 rate_limited；5xx internal。
+        too_large；404 not_found；409 email_taken；426 client_too_old；
+        429 rate_limited；5xx internal。
       tags: [auth]
       security: []
       requestBody:
@@ -194,6 +202,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '426':
+          $ref: '#/components/responses/ClientUpgradeRequired'
         '429':
           $ref: '#/components/responses/RateLimited'
         default:
@@ -204,7 +214,7 @@ paths:
       summary: 游客一键进入（simple 模式专属）
       description: >
         请求体可为空。code：bad_device、bad_request、too_large；
-        403 guest_disabled；429 rate_limited；5xx internal。
+        403 guest_disabled；426 client_too_old；429 rate_limited；5xx internal。
       tags: [auth]
       security: []
       requestBody:
@@ -224,6 +234,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '426':
+          $ref: '#/components/responses/ClientUpgradeRequired'
         '429':
           $ref: '#/components/responses/RateLimited'
         default:
@@ -235,7 +247,8 @@ paths:
       description: >
         full 模式才可用；成功后吊销全部 refresh 并踢线。
         code：bad_password、bad_code、bad_request、too_large；
-        403 reset_unavailable；404 not_found；429 rate_limited；5xx internal。
+        403 reset_unavailable；404 not_found；426 client_too_old；
+        429 rate_limited；5xx internal。
       tags: [auth]
       security: []
       requestBody:
@@ -257,6 +270,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '426':
+          $ref: '#/components/responses/ClientUpgradeRequired'
         '429':
           $ref: '#/components/responses/RateLimited'
         default:
@@ -1061,6 +1076,15 @@ components:
         application/problem+json:
           schema:
             $ref: '#/components/schemas/Problem'
+    ClientUpgradeRequired:
+      description: >
+        客户端版本过旧（body.code：client_too_old）。服务端要求请求头
+        X-LiteTalk-Client 不低于 1.5；缺失或更低版本的 /auth/* 请求被拒绝。
+        message 与 detail 同值，旧客户端可直接显示升级提示。
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
     Internal:
       description: 服务端错误（body.code：internal / conflict / not_found / code_expired，store 错误映射）
       content:
@@ -1095,7 +1119,8 @@ components:
       description: >
         RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段
         （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错
-        的中文提示（旧 message 字段改名为 detail）。
+        的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段
+        （RFC 9457 允许的扩展字段，至少保留一个版本）。
       required: [type, title, status, code, detail]
       properties:
         type:
@@ -1114,6 +1139,9 @@ components:
         detail:
           type: string
           description: 本次出错的中文提示
+        message:
+          type: string
+          description: 兼容旧客户端的提示字段（与 detail 同值，至少保留一个版本）
     StatusOk:
       type: object
       title: StatusOk
