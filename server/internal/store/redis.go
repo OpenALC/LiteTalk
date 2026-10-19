@@ -47,18 +47,20 @@ func (r *RedisKV) Del(ctx context.Context, keys ...string) error {
 	return r.rdb.Del(ctx, keys...).Err()
 }
 
+// incrScript 原子自增 + 首次设置 TTL（#22）：INCR 与 EXPIRE 分两条命令时，
+// 进程若在两者之间退出会留下永不过期的计数键（验证码每日/错误计数）。
+// Redis 单线程执行 EVAL，计数与过期要么一起生效、要么都不生效。
+const incrScript = `
+local n = redis.call('INCR', KEYS[1])
+if n == 1 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return n
+`
+
 // Incr 自增计数：首次创建时设置 ttl，之后沿用原 TTL（与内存实现一致）。
 func (r *RedisKV) Incr(ctx context.Context, key string, ttl time.Duration) (int64, error) {
-	n, err := r.rdb.Incr(ctx, key).Result()
-	if err != nil {
-		return 0, err
-	}
-	if n == 1 {
-		if err := r.rdb.Expire(ctx, key, ttl).Err(); err != nil {
-			return 0, err
-		}
-	}
-	return n, nil
+	return r.rdb.Eval(ctx, incrScript, []string{key}, int(ttl.Seconds())).Int64()
 }
 
 // Eval 执行 Lua 脚本（go-redis EVAL）。CAS 的原子性由 Redis 单线程执行模型保证。
