@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/OpenALC/LiteTalk/client/core/codec"
-	"github.com/OpenALC/LiteTalk/client/internal/rtc"
+	"github.com/OpenALC/LiteTalk/client/core/rtc"
 	"github.com/pion/interceptor"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"

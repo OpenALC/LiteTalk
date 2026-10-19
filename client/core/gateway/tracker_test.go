@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OpenALC/LiteTalk/client/internal/signal"
+	"github.com/OpenALC/LiteTalk/client/core/signal"
 )
 
 func env(seq int64) signal.Envelope {

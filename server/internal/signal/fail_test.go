@@ -10,7 +10,7 @@ import (
 )
 
 // TestWireRTCFailedJSON 协议逐字同步（#19）：rtc.failed 常量与载荷字段名与
-// client/internal/signal/protocol.go 必须一致，改一边必须改另一边。
+// client/core/signal/protocol.go 必须一致，改一边必须改另一边。
 func TestWireRTCFailedJSON(t *testing.T) {
 	if TypeRTCFailed != "rtc.failed" {
 		t.Fatalf("常量值漂移: %q", TypeRTCFailed)
