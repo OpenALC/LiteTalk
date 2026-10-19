@@ -441,6 +441,26 @@ type StatusOk struct {
 // StatusOkStatus defines model for StatusOk.Status.
 type StatusOkStatus string
 
+// SyncServer 聚合快照中的服务器：ServerInfo 字段平铺 + 分类与频道（空为 []，非 null）。
+type SyncServer struct {
+	Categories []CategoryInfo `json:"categories"`
+	Channels   []ChannelInfo  `json:"channels"`
+	CreatedAt  Time           `json:"created_at"`
+
+	// IconColor #RRGGBB
+	IconColor string `json:"icon_color"`
+	IconName  string `json:"icon_name"`
+	Id        ID     `json:"id"`
+	Name      string `json:"name"`
+	OwnerId   ID     `json:"owner_id"`
+}
+
+// SyncSnapshot 续传失败后的聚合快照（#78）。servers 只含调用者为成员的服务器与其频道； friends 的 user 为 PublicUser（不含 email），online 为真实在线态。
+type SyncSnapshot struct {
+	Friends []FriendEntry `json:"friends"`
+	Servers []SyncServer  `json:"servers"`
+}
+
 // TokenPair defines model for TokenPair.
 type TokenPair struct {
 	AccessToken string `json:"access_token"`
@@ -695,6 +715,9 @@ type ServerInterface interface {
 	// ListServerMembers 服务器成员列表（成员可读）
 	// (GET /api/v1/servers/{id}/members)
 	ListServerMembers(w http.ResponseWriter, r *http.Request, id IDPath, params ListServerMembersParams)
+	// GetSync 事件续传失败后的聚合快照
+	// (GET /api/v1/sync)
+	GetSync(w http.ResponseWriter, r *http.Request)
 	// GetMe 当前用户（自响应，含 email）
 	// (GET /api/v1/users/me)
 	GetMe(w http.ResponseWriter, r *http.Request)
@@ -1429,6 +1452,20 @@ func (siw *ServerInterfaceWrapper) ListServerMembers(w http.ResponseWriter, r *h
 	handler.ServeHTTP(w, r)
 }
 
+// GetSync operation middleware
+func (siw *ServerInterfaceWrapper) GetSync(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetSync(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 // GetMe operation middleware
 func (siw *ServerInterfaceWrapper) GetMe(w http.ResponseWriter, r *http.Request) {
 
@@ -1591,6 +1628,7 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/friends/requests", wrapper.CreateFriendRequest)
 	m.HandleFunc(http.MethodDelete+" "+options.BaseURL+"/api/v1/friends/{id}", wrapper.DeleteFriend)
 	m.HandleFunc(http.MethodPatch+" "+options.BaseURL+"/api/v1/friends/{id}", wrapper.PatchFriend)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/sync", wrapper.GetSync)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/servers", wrapper.ListServers)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/servers", wrapper.CreateServer)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/friends/requests/{id}/accept", wrapper.AcceptFriendRequest)
@@ -4419,6 +4457,60 @@ func (response ListServerMembersdefaultApplicationProblemPlusJSONResponse) Visit
 	return err
 }
 
+type GetSyncRequestObject struct {
+}
+
+type GetSyncResponseObject interface {
+	VisitGetSyncResponse(w http.ResponseWriter) error
+}
+
+type GetSync200JSONResponse SyncSnapshot
+
+func (response GetSync200JSONResponse) VisitGetSyncResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetSync401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response GetSync401ApplicationProblemPlusJSONResponse) VisitGetSyncResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetSyncdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response GetSyncdefaultApplicationProblemPlusJSONResponse) VisitGetSyncResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
 type GetMeRequestObject struct {
 }
 
@@ -4666,6 +4758,9 @@ type StrictServerInterface interface {
 	// ListServerMembers 服务器成员列表（成员可读）
 	// (GET /api/v1/servers/{id}/members)
 	ListServerMembers(ctx context.Context, request ListServerMembersRequestObject) (ListServerMembersResponseObject, error)
+	// GetSync 事件续传失败后的聚合快照
+	// (GET /api/v1/sync)
+	GetSync(ctx context.Context, request GetSyncRequestObject) (GetSyncResponseObject, error)
 	// GetMe 当前用户（自响应，含 email）
 	// (GET /api/v1/users/me)
 	GetMe(ctx context.Context, request GetMeRequestObject) (GetMeResponseObject, error)
@@ -5619,6 +5714,30 @@ func (sh *strictHandler) ListServerMembers(w http.ResponseWriter, r *http.Reques
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
 	} else if validResponse, ok := response.(ListServerMembersResponseObject); ok {
 		if err := validResponse.VisitListServerMembersResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// GetSync operation middleware
+func (sh *strictHandler) GetSync(w http.ResponseWriter, r *http.Request) {
+	var request GetSyncRequestObject
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.GetSync(ctx, request.(GetSyncRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "GetSync")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(GetSyncResponseObject); ok {
+		if err := validResponse.VisitGetSyncResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {
