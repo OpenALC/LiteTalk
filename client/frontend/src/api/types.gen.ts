@@ -507,7 +507,7 @@ export interface paths {
         put?: never;
         /**
          * 发送文字消息（≤2000 字 + 频控 20/分 + nonce 幂等）
-         * @description 仅文字频道。nonce（#31）：客户端生成的幂等键（≤64 字符），服务端按 (user_id, nonce) 去重；重复提交回读原消息返回 200（原消息体）， 新消息返回 201。不带 nonce 不去重。 code：bad_channel、bad_content、bad_nonce、bad_request、too_large、 路径参数不合法；401；403 forbidden；404 not_found；429 rate_limited； 5xx internal。
+         * @description 仅文字频道。nonce（#31）：客户端生成的幂等键（≤64 字符），服务端按 (channel_id, user_id, nonce) 去重；重复提交回读原消息返回 200（原消息体）， 新消息返回 201。幂等命中先于频控判断，不消耗配额。不带 nonce 不去重。 code：bad_channel、bad_content、bad_nonce、bad_request、too_large、 路径参数不合法；401；403 forbidden；404 not_found；429 rate_limited； 5xx internal。
          */
         post: operations["createMessage"];
         delete?: never;
@@ -902,7 +902,7 @@ export interface components {
         CreateMessageRequest: {
             /** @description 1–2000 字符 */
             content: string;
-            /** @description 幂等键（#31，≤64 字符）；同用户重复提交回读原消息（200）。缺省不去重。 */
+            /** @description 幂等键（#31，≤64 字符）；同频道同用户重复提交回读原消息（200）。缺省不去重。 */
             nonce?: string;
         };
     };

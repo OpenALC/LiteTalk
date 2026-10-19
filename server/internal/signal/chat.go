@@ -1,9 +1,10 @@
-// chat 文字聊天：chat.send（C→S）→ 校验/频控/权限 → 落库 → chat.message 广播（S→C）。
-// wire 契约与客户端 client/core/signal/protocol.go 对齐（ChatSendData / ChatMessageData）。
+// chat 文字聊天：chat.send（C→S）→ 校验/幂等/频控/权限 → 落库 → chat.message 广播（S→C）。
+// wire 契约与客户端 client/core/signal/protocol_gen.go 对齐（ChatSendData / ChatMessageData）。
 package signal
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"time"
 
@@ -13,6 +14,8 @@ import (
 // ChatStore chat 持久化最小接口（store.Store 满足；nil 时仅广播不落库）。
 type ChatStore interface {
 	CreateMessage(ctx context.Context, msg *store.Message) error
+	// MessageByNonce 幂等回读：按 (channel_id, user_id, nonce) 找原消息（#31）。
+	MessageByNonce(ctx context.Context, channelID, userID int64, nonce string) (*store.Message, error)
 	ChannelByID(ctx context.Context, id int64) (*store.Channel, error)
 	Member(ctx context.Context, serverID, userID int64) (*store.ServerMember, error)
 	// MembersOfServer 全量成员（#32 事件面广播定向：成员的全部会话进环，
@@ -28,13 +31,17 @@ type RateLimiter interface {
 // 聊天发送限制：2000 字、20 条/分（key 与 REST messages 共用 msg: 前缀，用户级统一配额）。
 const (
 	chatMaxRunes   = 2000
+	chatMaxNonce   = 64
 	chatRateLimit  = 20
 	chatRateWindow = time.Minute
 )
 
-// handleChatSend 文字消息发送：内容/类型校验 → 频控 → 权限（在房间 或 频道成员）→ 落库 → 广播。
+// handleChatSend 文字消息发送：内容/类型/长度校验 → 权限 → 幂等 → 频控 → 落库 → 广播。
 // 广播范围（#32 事件面）：该频道所属服务器**全部成员的会话**——在线实时投递，
 // 断线续传窗口内的进事件环补发，不再依赖是否在语音房；dev 内置房间回退为房内广播。
+//
+// nonce 幂等（#31）：同频道同用户同 nonce 只落一条、只广播一次；重复请求把原消息
+// 定向回显给发起者（不进事件环、不再打扰其他成员），弱网重试据此对账。
 func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 	if d.ChannelID == "" {
 		h.sendError(c, ErrCodeBadMessage, "chat.send 需要 channel_id")
@@ -53,7 +60,49 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 		h.sendError(c, ErrCodeBadMessage, "消息长度需为 1–2000 字符")
 		return
 	}
+	if len(d.Nonce) > chatMaxNonce {
+		h.sendError(c, ErrCodeBadMessage, "nonce 需为 0–64 字符")
+		return
+	}
 	ctx := context.Background()
+
+	// 权限二选一：当前在该房间（M2 dev 房间场景）；
+	// 或 channel_id 为数字频道且本人是该频道所属服务器成员（文字频道场景）。
+	inRoom := c.roomIDLocked() == d.ChannelID
+	var (
+		chID, uid int64
+		serverID  int64
+		persist   bool // 有 store 频道实体：落库 + 幂等 + 事件面广播
+	)
+	if id, err := strconv.ParseInt(d.ChannelID, 10, 64); err == nil && h.chatStore != nil {
+		if ch, err := h.chatStore.ChannelByID(ctx, id); err == nil {
+			serverID = ch.ServerID
+			if u, err := strconv.ParseInt(c.userID, 10, 64); err == nil {
+				if _, err := h.chatStore.Member(ctx, ch.ServerID, u); err == nil {
+					chID, uid, persist = id, u, true
+				}
+			}
+		}
+	}
+	if !inRoom && !persist {
+		h.sendError(c, ErrCodeForbidden, "无权向该频道发送消息")
+		return
+	}
+
+	// 幂等判断先于频控：弱网重试撞上配额时也必须拿回原消息，而不是 rate_limited。
+	if persist && d.Nonce != "" {
+		orig, err := h.chatStore.MessageByNonce(ctx, chID, uid, d.Nonce)
+		switch {
+		case err == nil:
+			h.sendJSON(c, TypeChatMessage, chatMessageFromStore(orig, c))
+			return
+		case !errors.Is(err, store.ErrNotFound):
+			h.log.Printf("chat: nonce 幂等回读失败: %v", err)
+			h.sendError(c, ErrCodeInternal, "消息保存失败")
+			return
+		}
+	}
+
 	if h.limits != nil {
 		ok, err := h.limits.Allow(ctx, "msg:"+c.userID, chatRateLimit, chatRateWindow)
 		if err != nil || !ok {
@@ -62,34 +111,23 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 		}
 	}
 
-	// 权限二选一：当前在该房间（M2 dev 房间场景）；
-	// 或 channel_id 为数字频道且本人是该频道所属服务器成员（文字频道场景）。
-	inRoom := c.roomIDLocked() == d.ChannelID
-	var msg *store.Message
-	var serverID int64
-	if chID, err := strconv.ParseInt(d.ChannelID, 10, 64); err == nil && h.chatStore != nil {
-		if ch, err := h.chatStore.ChannelByID(ctx, chID); err == nil {
-			serverID = ch.ServerID
-			if uid, err := strconv.ParseInt(c.userID, 10, 64); err == nil {
-				if _, err := h.chatStore.Member(ctx, ch.ServerID, uid); err == nil {
-					msg = &store.Message{ChannelID: chID, UserID: uid, Content: d.Content}
-				}
-			}
-		}
-	}
-	if !inRoom && msg == nil {
-		h.sendError(c, ErrCodeForbidden, "无权向该频道发送消息")
-		return
-	}
-
 	out := ChatMessageData{
 		ChannelID: d.ChannelID,
 		Content:   d.Content,
 		TS:        time.Now().UnixMilli(),
 		User:      UserBrief{ID: c.userID, Nickname: c.username},
+		Nonce:     d.Nonce, // 仅发送方带 nonce 时回显（omitempty）
 	}
-	if msg != nil {
+	if persist {
+		msg := &store.Message{ChannelID: chID, UserID: uid, Content: d.Content, Nonce: d.Nonce}
 		if err := h.chatStore.CreateMessage(ctx, msg); err != nil {
+			// 并发同 nonce：前一条已落库，回读原消息定向回显，不再广播。
+			if d.Nonce != "" && errors.Is(err, store.ErrConflict) {
+				if orig, rerr := h.chatStore.MessageByNonce(ctx, chID, uid, d.Nonce); rerr == nil {
+					h.sendJSON(c, TypeChatMessage, chatMessageFromStore(orig, c))
+					return
+				}
+			}
 			h.sendError(c, ErrCodeInternal, "消息保存失败")
 			return
 		}
@@ -104,7 +142,7 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 	// 断线续传窗口内的会话进事件环供 gateway.resume 补发）；dev 房间 → 房内成员。
 	// 发送者恒在目标内（前端以广播替换本地回显，不另做回执）。
 	uids := map[string]bool{c.userID: true}
-	if msg != nil {
+	if persist {
 		members, err := h.chatStore.MembersOfServer(ctx, serverID)
 		if err != nil {
 			h.log.Printf("chat: 查服务器 %d 成员失败: %v", serverID, err)
@@ -122,4 +160,17 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 		h.mu.Unlock()
 	}
 	h.broadcastEvent(uids, TypeChatMessage, out)
+}
+
+// chatMessageFromStore 把落库消息还原成 chat.message 载荷（幂等重放定向回显用）。
+// 身份取当前连接：回读按 (channel_id, user_id, nonce) 限定，原消息必属该用户。
+func chatMessageFromStore(m *store.Message, c *client) ChatMessageData {
+	return ChatMessageData{
+		ID:        strconv.FormatInt(m.ID, 10),
+		ChannelID: strconv.FormatInt(m.ChannelID, 10),
+		Content:   m.Content,
+		TS:        m.CreatedAt.UnixMilli(),
+		User:      UserBrief{ID: c.userID, Nickname: c.username},
+		Nonce:     m.Nonce,
+	}
 }

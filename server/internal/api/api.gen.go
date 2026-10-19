@@ -211,7 +211,7 @@ type CreateMessageRequest struct {
 	// Content 1–2000 字符
 	Content string `json:"content"`
 
-	// Nonce 幂等键（#31，≤64 字符）；同用户重复提交回读原消息（200）。缺省不去重。
+	// Nonce 幂等键（#31，≤64 字符）；同频道同用户重复提交回读原消息（200）。缺省不去重。
 	Nonce *string `json:"nonce,omitempty"`
 }
 

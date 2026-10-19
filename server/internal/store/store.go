@@ -122,7 +122,7 @@ type Category struct {
 }
 
 // Message 文字频道消息。
-// Nonce 客户端幂等键（#31）：空 = 不去重；(user_id, nonce) 唯一索引在 0005 迁移。
+// Nonce 客户端幂等键（#31）：空 = 不去重；(channel_id, user_id, nonce) 唯一索引见迁移 0006。
 type Message struct {
 	ID        int64     `json:"id" db:"id"`
 	ChannelID int64     `json:"channel_id" db:"channel_id"`
@@ -218,8 +218,8 @@ type Store interface {
 	// MessagesAfter 正序分页（向前翻更新）：afterID=0 取最旧 limit 条；取 id 大于
 	// afterID 的最早 limit 条，按 id 正序返回。limit 越界回落 50（与 Before 同口径）。
 	MessagesAfter(ctx context.Context, channelID, afterID int64, limit int) ([]Message, error)
-	// MessageByNonce 幂等回读：按 (user_id, nonce) 找原消息；无命中 ErrNotFound。
-	MessageByNonce(ctx context.Context, userID int64, nonce string) (*Message, error)
+	// MessageByNonce 幂等回读：按 (channel_id, user_id, nonce) 找原消息；无命中 ErrNotFound。
+	MessageByNonce(ctx context.Context, channelID, userID int64, nonce string) (*Message, error)
 
 	// invites
 	CreateInvite(ctx context.Context, inv *Invite) error

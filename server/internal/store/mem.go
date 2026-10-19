@@ -540,10 +540,10 @@ func (m *Mem) CreateMessage(_ context.Context, msg *Message) error {
 	if _, ok := m.channels[msg.ChannelID]; !ok {
 		return ErrNotFound
 	}
-	// nonce 幂等：同用户同 nonce 只留一条（唯一索引语义，空 nonce 不去重）。
+	// nonce 幂等：同频道同用户同 nonce 只留一条（唯一索引语义，空 nonce 不去重）。
 	if msg.Nonce != "" {
 		for _, x := range m.messages {
-			if x.UserID == msg.UserID && x.Nonce == msg.Nonce {
+			if x.ChannelID == msg.ChannelID && x.UserID == msg.UserID && x.Nonce == msg.Nonce {
 				return ErrConflict
 			}
 		}
@@ -634,15 +634,15 @@ func (m *Mem) MessagesAfter(_ context.Context, channelID, afterID int64, limit i
 	return out, nil
 }
 
-// MessageByNonce 幂等回读原消息。
-func (m *Mem) MessageByNonce(_ context.Context, userID int64, nonce string) (*Message, error) {
+// MessageByNonce 幂等回读原消息（频道维度隔离：同 nonce 在不同频道各自独立）。
+func (m *Mem) MessageByNonce(_ context.Context, channelID, userID int64, nonce string) (*Message, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if nonce == "" {
 		return nil, ErrNotFound
 	}
 	for _, x := range m.messages {
-		if x.UserID == userID && x.Nonce == nonce {
+		if x.ChannelID == channelID && x.UserID == userID && x.Nonce == nonce {
 			cp := *x
 			if u, ok := m.users[cp.UserID]; ok {
 				cp.SenderNickname, cp.SenderTag = u.Nickname, u.Tag
