@@ -50,7 +50,7 @@ func openRoom(addrFlag string) (*room, error) {
 	// ChatHandler/ErrorHandler 依赖 ws 实例（ws 为 nil 时静默丢弃），
 	// 必须在 Connect 之后挂——app.go 同序。
 	sess.Connect(wsURL)
-	sess.ChatHandler(func(channelID, msgID, userID, nickname, content, ts string) {
+	sess.ChatHandler(func(channelID, msgID, userID, nickname, content, ts, _ string) {
 		m := chatMsg{channelID, msgID, userID, nickname, content, ts}
 		fmt.Printf("event chat channel=%s id=%s from=%s nick=%s content=%s\n",
 			channelID, msgID, userID, nickname, content)

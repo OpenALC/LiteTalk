@@ -5,6 +5,8 @@ package voice
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -139,8 +141,13 @@ type Session struct {
 	mu        sync.Mutex
 	members   map[string]PeerView
 	selfID    string
-	chatFn    func(channelID, msgID, userID, nickname, content, ts string) // ChatHandler 注入
-	seenChans map[string]bool                                              // 本会话收过 chat.message 的频道（补拉范围）
+	chatFn    func(channelID, msgID, userID, nickname, content, ts, nonce string) // ChatHandler 注入
+	seenChans map[string]bool                                                     // 本会话收过 chat.message 的频道（补拉范围）
+
+	// chatMu/pendingChats 聊天发送 outbox（#31）：断线/写失败时保留 nonce 与内容，
+	// 重连 OnConnect 用同一个 nonce 重发；服务端按 (channel_id, user_id, nonce) 去重。
+	chatMu       sync.Mutex
+	pendingChats []pendingChat
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -176,15 +183,7 @@ func (s *Session) Connect(serverURL string) {
 		// 闭包取令牌：REST 侧刷新 access token 后，WS 重连自动携带新令牌。
 		TokenFunc: func(context.Context) (string, error) { return s.token, nil },
 	}
-	wsCfg.OnConnect = func(c *signal.Client) {
-		if s.ev.OnConnection != nil {
-			s.ev.OnConnection("connected")
-		}
-		// 重连后若仍在房间，重发 join（channel.joined 会重建媒体链路）。
-		if room, _ := s.roomID.Load().(string); room != "" {
-			_ = c.Send(signal.TypeChannelJoin, signal.ChannelJoinData{ChannelID: room})
-		}
-	}
+	wsCfg.OnConnect = s.handleSignalConnect
 	wsCfg.OnDisconnect = func(err error) {
 		if s.ev.OnConnection != nil {
 			s.ev.OnConnection("disconnected")
@@ -286,6 +285,20 @@ func (s *Session) Connect(serverURL string) {
 			s.log.Printf("signal run: %v", err)
 		}
 	}()
+}
+
+// handleSignalConnect 每条（重）连成功后的订阅状态恢复：广播连接状态、重发
+// channel.join、重发断线期间积压的聊天消息（同一 nonce，服务端幂等）。
+// 由 signal.Client 在首次收到下行消息后调用（server.hello 已处理完，protoVer 就绪）。
+func (s *Session) handleSignalConnect(c *signal.Client) {
+	if s.ev.OnConnection != nil {
+		s.ev.OnConnection("connected")
+	}
+	// 重连后若仍在房间，重发 join（channel.joined 会重建媒体链路）。
+	if room, _ := s.roomID.Load().(string); room != "" {
+		_ = c.Send(signal.TypeChannelJoin, signal.ChannelJoinData{ChannelID: room})
+	}
+	s.flushPendingChats()
 }
 
 // startMedia 启动采集/播放（幂等）。未入房不启动——空闲时也跑
@@ -849,15 +862,72 @@ func (s *Session) Stats() string {
 
 // SendChat 发送文字消息（chat.send，chat.message 由 WS 回落）。
 // type 字段是服务端 chat.send 的必填校验（v1.1.0 §0.12：本期仅 text）。
+//
+// nonce（#31）：每次用户发送生成一次；断线/写失败时消息连同 nonce 入队，
+// 重连后由 OnConnect 用同一个 nonce 重发，服务端据此去重（只落一条、只广播一次）。
 func (s *Session) SendChat(channelID, content string) error {
-	if s.ws == nil {
+	if s.ws == nil || s.ws.Closed() {
 		return fmt.Errorf("session not connected")
 	}
-	return s.ws.Send(signal.TypeChatSend, signal.ChatSendData{
-		ChannelID: channelID,
-		Type:      "text",
-		Content:   content,
-	})
+	nonce, err := newChatNonce()
+	if err != nil {
+		return err
+	}
+	s.chatMu.Lock()
+	defer s.chatMu.Unlock()
+	if len(s.pendingChats) >= maxPendingChats {
+		return fmt.Errorf("离线消息队列已满（%d 条），请等连接恢复后重试", maxPendingChats)
+	}
+	s.pendingChats = append(s.pendingChats, pendingChat{channelID: channelID, content: content, nonce: nonce})
+	s.flushPendingChatsLocked()
+	return nil
+}
+
+// maxPendingChats 断线期间积压的聊天消息上限：超出直接拒绝，不无限占内存。
+const maxPendingChats = 64
+
+// pendingChat 一条待发消息。nonce 在用户发送时生成一次，重试不换。
+type pendingChat struct {
+	channelID string
+	content   string
+	nonce     string
+}
+
+// flushPendingChats 重连后重发积压消息（OnConnect 在 ws 读循环上调用）。
+func (s *Session) flushPendingChats() {
+	s.chatMu.Lock()
+	defer s.chatMu.Unlock()
+	s.flushPendingChatsLocked()
+}
+
+// flushPendingChatsLocked 按入队顺序发送；首个失败即停，保留剩余项等下次重连。
+// 调用方持 chatMu（与 SendChat 串行，保证重发与新消息的相对顺序）。
+func (s *Session) flushPendingChatsLocked() {
+	for len(s.pendingChats) > 0 {
+		if err := s.sendChatFrame(s.pendingChats[0]); err != nil {
+			return
+		}
+		s.pendingChats = s.pendingChats[1:]
+	}
+}
+
+// sendChatFrame 发送一条 chat.send。nonce 的 x-since 是 2：老服务端不协商协议
+// （protoVer=0），不带该字段，wire 与 v1 完全一致；v2 服务端才携带。
+func (s *Session) sendChatFrame(item pendingChat) error {
+	d := signal.ChatSendData{ChannelID: item.channelID, Type: "text", Content: item.content}
+	if s.ProtocolVersion() >= 2 {
+		d.Nonce = item.nonce
+	}
+	return s.ws.Send(signal.TypeChatSend, d)
+}
+
+// newChatNonce 16 字节 crypto/rand 的 hex（32 字符，满足 REST/WS 的 ≤64 上限）。
+func newChatNonce() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("生成消息 nonce 失败: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 // RequestVoiceState 请求目标成员闭麦/静音（v0.1.2 voice.request_state；
@@ -896,8 +966,9 @@ func (s *Session) VoiceState() VoiceStateView {
 // ChatHandler 注入 chat.message 处理（app 层补挂）。
 // msgID 为服务端消息 ID（文字消息按频道隔离与去重需要真实 ID，
 // 此前回调丢弃了 ID，前端只能拿时间戳当 key，无法可靠去重）。
+// nonce 为发送方 chat.send 携带的幂等键（#31，协议 v2；REST 补拉与老服务端为空串）。
 // 同时记录收过消息的频道（#32 全量补拉的范围），fn 回灌路径复用同一回调。
-func (s *Session) ChatHandler(fn func(channelID, msgID, userID, nickname, content, ts string)) {
+func (s *Session) ChatHandler(fn func(channelID, msgID, userID, nickname, content, ts, nonce string)) {
 	if s.ws == nil {
 		return
 	}
@@ -910,6 +981,7 @@ func (s *Session) ChatHandler(fn func(channelID, msgID, userID, nickname, conten
 			ChannelID string `json:"channel_id"`
 			Content   string `json:"content"`
 			TS        int64  `json:"ts"`
+			Nonce     string `json:"nonce"`
 			User      struct {
 				ID       string `json:"id"`
 				Nickname string `json:"nickname"`
@@ -921,7 +993,7 @@ func (s *Session) ChatHandler(fn func(channelID, msgID, userID, nickname, conten
 		s.mu.Lock()
 		s.seenChans[d.ChannelID] = true
 		s.mu.Unlock()
-		fn(d.ChannelID, d.ID, d.User.ID, d.User.Nickname, d.Content, fmt.Sprintf("%d", d.TS))
+		fn(d.ChannelID, d.ID, d.User.ID, d.User.Nickname, d.Content, fmt.Sprintf("%d", d.TS), d.Nonce)
 	})
 }
 
@@ -985,7 +1057,7 @@ func (s *Session) fullResync() {
 		}
 		for _, m := range msgs {
 			chatFn(ch, m.ID.String(), m.UserID.String(), m.SenderNickname, m.Content,
-				strconv.FormatInt(m.CreatedAt.UnixMilli(), 10))
+				strconv.FormatInt(m.CreatedAt.UnixMilli(), 10), "")
 		}
 	}
 

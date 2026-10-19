@@ -1149,10 +1149,10 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 			log.Printf("apply audio devices: %v", err)
 		}
 	}
-	sess.ChatHandler(func(channelID, msgID, userID, nick, content, ts string) {
+	sess.ChatHandler(func(channelID, msgID, userID, nick, content, ts, nonce string) {
 		a.emit("chat:message", map[string]string{
 			"id": msgID, "channel_id": channelID, "user_id": userID,
-			"nickname": nick, "content": content, "ts": ts,
+			"nickname": nick, "content": content, "ts": ts, "nonce": nonce,
 		})
 	})
 	// 服务端 error 帧转发前端（B1：此前未订阅，服务端拒收时消息凭空消失）。
