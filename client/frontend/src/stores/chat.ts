@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import { eventsOff, eventsOn, goApp } from '../api/bridge'
+import { eventsOn, goApp } from '../api/bridge'
 import type { ChatMessage } from '../api/types'
 
 // chat 文字聊天状态。消息按 channel_id 分桶存储——此前是单一扁平数组，
@@ -23,8 +23,13 @@ export const useChatStore = defineStore('chat', () => {
     await goApp().SendChat(channelId, content)
   }
 
+  // 事件订阅。eventsOn 返回按监听器的取消函数，卸载时逐个注销——不按事件名
+  // 整体 Off（会清掉别人注册的同名监听）。
+  const offs: Array<() => void> = []
+
   function bindEvents() {
-    eventsOn('chat:message', (m) => {
+    if (offs.length) return // 幂等：重复绑定会叠监听
+    offs.push(eventsOn('chat:message', (m) => {
       const msg = m as ChatMessage
       if (!msg.channel_id) return
       const arr = messagesByChannel.value[msg.channel_id] ?? []
@@ -34,19 +39,21 @@ export const useChatStore = defineStore('chat', () => {
         ...messagesByChannel.value,
         [msg.channel_id]: [...arr, msg],
       }
-    })
+    }))
   }
 
-  // clear 清空全部频道的本地缓存（登出时调用）。
-  // 单频道缓存保留：切频道来回不产生重复拉取，语义为「本地会话缓存」。
-  function clear() {
+  // resetAll 登出/被踢/换服时清空全部频道的本地缓存（#85）。当前频道本身
+  // 记在 servers store（随其 resetAll 清空）。单频道缓存保留：切频道来回
+  // 不产生重复拉取，语义为「本地会话缓存」。幂等；不动事件订阅
+  //（MainView 卸载时另由 unbindEvents 注销）。
+  function resetAll() {
     messagesByChannel.value = {}
   }
 
-  // unbindEvents 休眠态清理：解除事件订阅。
+  // unbindEvents 逐个注销本 store 注册的监听器。
   function unbindEvents() {
-    eventsOff('chat:message')
+    while (offs.length) offs.pop()!()
   }
 
-  return { messagesByChannel, messagesFor, send, bindEvents, unbindEvents, clear }
+  return { messagesByChannel, messagesFor, send, bindEvents, unbindEvents, resetAll }
 })

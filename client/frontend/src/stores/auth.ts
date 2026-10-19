@@ -2,7 +2,30 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { eventsOn, goApp } from '../api/bridge'
 import type { ServerConfig, UserProfile } from '../api/types'
+import { useChatStore } from './chat'
+import { useFriendsStore, useServersStore } from './data'
 import { useNotifyStore } from './notify'
+import { useVoiceStore } from './voice'
+
+// resetSessionStores 业务 store 统一复位（#85）：主动登出、被踢、跨域换服与
+// 登录新账号前都走这里。逐个 try——单个 store 复位失败不能阻断后续，否则
+// 残留数据会跨账号带过去。各 store 的订阅不在复位范围（MainView 卸载时
+// unbindEvents 按监听器逐个注销，登录后重新 bind）。
+function resetSessionStores() {
+  const resets: Array<() => void> = [
+    () => useServersStore().resetAll(),
+    () => useFriendsStore().resetAll(),
+    () => useVoiceStore().resetAll(),
+    () => useChatStore().resetAll(),
+  ]
+  for (const reset of resets) {
+    try {
+      reset()
+    } catch {
+      // 单个失败不阻断后续；下一个入口（登录）会再复位一次。
+    }
+  }
+}
 
 export const useAuthStore = defineStore('auth', () => {
   const user = ref<UserProfile | null>(null)
@@ -38,6 +61,9 @@ export const useAuthStore = defineStore('auth', () => {
 
   async function login(email: string, password: string) {
     const r = await goApp().Login(email, password)
+    // 新会话从干净态开始（#85）：不依赖上一个账号一定走过 logout——会话过期
+    // 被引导回登录页时，业务 store 里可能仍留着旧账号的服务器/好友。
+    resetSessionStores()
     user.value = r.user
     loggedIn.value = true
     signalOk.value = r.session_ok !== false
@@ -47,6 +73,7 @@ export const useAuthStore = defineStore('auth', () => {
 
   async function register(nickname: string, email: string, password: string, code: string, bootstrap = '') {
     const r = await goApp().Register(nickname, email, password, code, bootstrap)
+    resetSessionStores()
     user.value = r.user
     loggedIn.value = true
     signalOk.value = r.session_ok !== false
@@ -57,6 +84,7 @@ export const useAuthStore = defineStore('auth', () => {
   // 游客一键进入（simple 模式）。Go 侧负责复用已记住的游客身份（refresh 轮换）。
   async function guest() {
     const r = await goApp().LoginAsGuest()
+    resetSessionStores()
     user.value = r.user
     loggedIn.value = true
     signalOk.value = r.session_ok !== false
@@ -94,19 +122,19 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   async function logout() {
-    await goApp().Logout()
+    try {
+      await goApp().Logout()
+    } catch {
+      // 离线登出（#14）：Go 侧已清空本地会话，只有令牌吊销请求失败。不能因此
+      // 跳过前端复位，否则界面停在已登录态，下一个账号会继承上一账号的数据。
+    }
     user.value = null
     loggedIn.value = false
     signalOk.value = true
     clearKickedReason()
     clearShutdown()
-    // 清理各业务 store 的本地缓存（B2：chat.clear 此前是死代码，
-    // 登出后换账号登录会继承上一账号的聊天记录）。
-    // setup 风格 store 无 $reset，用显式 resetAll。
-    const { useChatStore } = await import('./chat')
-    const { useVoiceStore } = await import('./voice')
-    useChatStore().clear()
-    useVoiceStore().resetAll()
+    // 各业务 store 显式复位（#85；setup 风格 store 无 $reset）。
+    resetSessionStores()
   }
 
   // handleKicked 被踢全链路（auth:kicked）：复用 logout 清本地会话缓存与登出态，

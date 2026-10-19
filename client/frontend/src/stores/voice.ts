@@ -31,11 +31,20 @@ export const useVoiceStore = defineStore('voice', () => {
     _selfId = id
   }
 
+  // generation 会话代次：resetAll（登出/被踢/换服）递增；在飞的 join/restoreFromGo
+  // 返回后比对，代次变了就丢弃结果——否则登出后房间态会被旧响应重新写回，
+  // 前端又显示「在房内」（#85）。
+  let generation = 0
+
   async function join(id: string) {
+    const gen = generation
     // 先不写 channelId——JoinChannel 失败时不置位，守卫不会拦死重试（B1）
     await goApp().JoinChannel(id)
+    if (gen !== generation) return
     channelId.value = id
-    members.value = await goApp().GetVoiceMembers()
+    const list = await goApp().GetVoiceMembers()
+    if (gen !== generation) return
+    members.value = list
   }
 
   async function leave() {
@@ -53,9 +62,11 @@ export const useVoiceStore = defineStore('voice', () => {
     connected.value = false
   }
 
-  // resetAll 登出时全量清理（含 resetRoom 不覆盖的 muted/deafened/peerVolumes）。
-  // setup 风格 store 无 $reset（Pinia 只给 option store 注入），必须显式清理。
+  // resetAll 登出/被踢/换服时全量清理（含 resetRoom 不覆盖的 muted/deafened/
+  // peerVolumes）。setup 风格 store 无 $reset（Pinia 只给 option store 注入），
+  // 必须显式清理；幂等。事件订阅保留到 MainView 卸载时 unbindEvents。
   function resetAll() {
+    generation++
     resetRoom()
     muted.value = false
     deafened.value = false
@@ -96,13 +107,16 @@ export const useVoiceStore = defineStore('voice', () => {
 
   // restoreFromGo UI 销毁重载后回填语音态（Go 侧会话未断；未连接时为空态）。
   async function restoreFromGo() {
+    const gen = generation
     try {
       const st = await goApp().GetVoiceState()
-      if (!st.channel_id) return
+      if (gen !== generation || !st.channel_id) return
       channelId.value = st.channel_id
       muted.value = st.muted
       deafened.value = st.deafened
-      members.value = await goApp().GetVoiceMembers()
+      const list = await goApp().GetVoiceMembers()
+      if (gen !== generation) return
+      members.value = list
       applySelf()
     } catch {
       // 未连接或方法未就绪：保持空态。
@@ -114,6 +128,7 @@ export const useVoiceStore = defineStore('voice', () => {
   const offs: Array<() => void> = []
 
   function bindEvents() {
+    if (offs.length) return // 幂等：重复绑定会叠监听（登录后 MainView 可能重建）
     const notify = useNotifyStore()
     offs.push(eventsOn('voice:self', (id) => {
       _selfId = id as string
