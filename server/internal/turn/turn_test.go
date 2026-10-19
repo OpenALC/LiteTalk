@@ -163,10 +163,10 @@ func TestPeerIPPolicy(t *testing.T) {
 		"::1", "fe80::1", "ff02::1", "fc00::1", "fdff:ffff::1",
 	}
 	for _, s := range blocked {
-		if !isBlockedPeerIP(net.ParseIP(s)) {
+		if !isBlockedPeerIP(net.ParseIP(s), false) {
 			t.Errorf("%s 应被拒绝", s)
 		}
-		if permitPeer(nil, net.ParseIP(s)) {
+		if permitPeer(false)(nil, net.ParseIP(s)) {
 			t.Errorf("%s 不应通过 PermissionHandler", s)
 		}
 	}
@@ -175,15 +175,26 @@ func TestPeerIPPolicy(t *testing.T) {
 		"::ffff:8.8.8.8", "2001:4860:4860::8888", "2606:4700::1111",
 	}
 	for _, s := range allowed {
-		if isBlockedPeerIP(net.ParseIP(s)) {
+		if isBlockedPeerIP(net.ParseIP(s), false) {
 			t.Errorf("%s 应放行", s)
 		}
-		if !permitPeer(nil, net.ParseIP(s)) {
+		if !permitPeer(false)(nil, net.ParseIP(s)) {
 			t.Errorf("%s 应通过 PermissionHandler", s)
 		}
 	}
-	if !isBlockedPeerIP(nil) || !isBlockedPeerIP(net.IP{}) {
+	if !isBlockedPeerIP(nil, false) || !isBlockedPeerIP(net.IP{}, false) {
 		t.Error("空 peer IP 应拒绝")
+	}
+	// AllowLoopbackPeers 只放开环回；私网/元数据/组播仍拒绝（仅本机集成测试用）。
+	for _, s := range []string{"127.0.0.1", "::1", "::ffff:127.0.0.1"} {
+		if isBlockedPeerIP(net.ParseIP(s), true) || !permitPeer(true)(nil, net.ParseIP(s)) {
+			t.Errorf("allowLoopback=true 时环回 %s 应放行", s)
+		}
+	}
+	for _, s := range []string{"10.0.0.1", "192.168.1.1", "169.254.169.254", "224.0.0.1", "fe80::1"} {
+		if !isBlockedPeerIP(net.ParseIP(s), true) {
+			t.Errorf("allowLoopback=true 时非环回 %s 仍应拒绝", s)
+		}
 	}
 }
 

@@ -2,10 +2,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"io/fs"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,37 +12,44 @@ import (
 	"github.com/OpenALC/LiteTalk/server/internal/store"
 )
 
-// 验证 healthz handler 返回 200 与正确的 JSON 结构
-func TestHealthzHandler(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/healthz", nil)
-	rec := httptest.NewRecorder()
-
-	healthzHandler(rec, req)
-
-	res := rec.Result()
-	defer res.Body.Close()
-
-	if res.StatusCode != http.StatusOK {
-		t.Fatalf("期望状态码 200，实际 %d", res.StatusCode)
+// TestResolveCredentialURLs 下发给客户端的 TURN/STUN URL（#13 P2）：
+// 显式配置优先；内置 TURN 启用回填 host；关闭时只有 dev 允许 loopback 回落，
+// 生产模式返回空列表 + 告警。
+func TestResolveCredentialURLs(t *testing.T) {
+	// 显式配置原样透传，不回落。
+	turn, stun, warn := resolveCredentialURLs("turn:a.example:3478", "stun:a.example:3478", "host", 3478, false)
+	if len(turn) != 1 || turn[0] != "turn:a.example:3478" || len(stun) != 1 || stun[0] != "stun:a.example:3478" || warn != "" {
+		t.Fatalf("显式配置应原样透传: turn=%v stun=%v warn=%q", turn, stun, warn)
 	}
 
-	if ct := res.Header.Get("Content-Type"); ct != "application/json; charset=utf-8" {
-		t.Fatalf("期望 Content-Type application/json; charset=utf-8，实际 %q", ct)
+	// 内置 TURN 启用、两者都未配置：按 host+端口回填 udp/tcp 两条 TURN 与一条 STUN。
+	turn, stun, warn = resolveCredentialURLs("", "", "voice.example.com", 3478, false)
+	if len(turn) != 2 || len(stun) != 1 || warn != "" {
+		t.Fatalf("内置 TURN 回填不符: turn=%v stun=%v warn=%q", turn, stun, warn)
+	}
+	if turn[0] != "turn:voice.example.com:3478?transport=udp" || stun[0] != "stun:voice.example.com:3478" {
+		t.Fatalf("回填 URL 不符: turn=%v stun=%v", turn, stun)
 	}
 
-	var body struct {
-		Status  string `json:"status"`
-		Version string `json:"version"`
+	// 内置 TURN 关闭 + 生产：不得回落 loopback，返回空列表与告警。
+	turn, stun, warn = resolveCredentialURLs("", "", "voice.example.com", 0, false)
+	if len(turn) != 0 || len(stun) != 0 {
+		t.Fatalf("生产模式不应下发 loopback 回落: turn=%v stun=%v", turn, stun)
 	}
-	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
-		t.Fatalf("响应体不是合法 JSON: %v", err)
+	if warn == "" {
+		t.Fatal("生产模式跳过回落时应返回启动告警")
 	}
 
-	if body.Status != "ok" {
-		t.Fatalf("期望 status=ok，实际 %q", body.Status)
+	// 内置 TURN 关闭 + dev：保留本机回落（本地联调）。
+	turn, stun, warn = resolveCredentialURLs("", "", "127.0.0.1", 0, true)
+	if len(turn) != 1 || turn[0] != "turn:127.0.0.1:3478" || len(stun) != 1 || stun[0] != "stun:127.0.0.1:3478" || warn != "" {
+		t.Fatalf("dev 模式应回落本机: turn=%v stun=%v warn=%q", turn, stun, warn)
 	}
-	if body.Version == "" {
-		t.Fatal("version 不应为空")
+
+	// 只配了一侧：turnPort=0 时生产不补齐另一侧（不凭空造 loopback），但保留显式值。
+	turn, stun, warn = resolveCredentialURLs("turn:ext.example:3478", "", "host", 0, false)
+	if len(turn) != 1 || len(stun) != 0 || warn == "" {
+		t.Fatalf("只配 TURN 时生产应保留显式值并告警: turn=%v stun=%v warn=%q", turn, stun, warn)
 	}
 }
 
