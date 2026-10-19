@@ -7,6 +7,47 @@ import (
 	"testing"
 )
 
+// TestResolveCredentialURLs 下发给客户端的 TURN/STUN URL（#13 P2）：
+// 显式配置优先；内置 TURN 启用回填 host；关闭时只有 dev 允许 loopback 回落，
+// 生产模式返回空列表 + 告警。
+func TestResolveCredentialURLs(t *testing.T) {
+	// 显式配置原样透传，不回落。
+	turn, stun, warn := resolveCredentialURLs("turn:a.example:3478", "stun:a.example:3478", "host", 3478, false)
+	if len(turn) != 1 || turn[0] != "turn:a.example:3478" || len(stun) != 1 || stun[0] != "stun:a.example:3478" || warn != "" {
+		t.Fatalf("显式配置应原样透传: turn=%v stun=%v warn=%q", turn, stun, warn)
+	}
+
+	// 内置 TURN 启用、两者都未配置：按 host+端口回填 udp/tcp 两条 TURN 与一条 STUN。
+	turn, stun, warn = resolveCredentialURLs("", "", "voice.example.com", 3478, false)
+	if len(turn) != 2 || len(stun) != 1 || warn != "" {
+		t.Fatalf("内置 TURN 回填不符: turn=%v stun=%v warn=%q", turn, stun, warn)
+	}
+	if turn[0] != "turn:voice.example.com:3478?transport=udp" || stun[0] != "stun:voice.example.com:3478" {
+		t.Fatalf("回填 URL 不符: turn=%v stun=%v", turn, stun)
+	}
+
+	// 内置 TURN 关闭 + 生产：不得回落 loopback，返回空列表与告警。
+	turn, stun, warn = resolveCredentialURLs("", "", "voice.example.com", 0, false)
+	if len(turn) != 0 || len(stun) != 0 {
+		t.Fatalf("生产模式不应下发 loopback 回落: turn=%v stun=%v", turn, stun)
+	}
+	if warn == "" {
+		t.Fatal("生产模式跳过回落时应返回启动告警")
+	}
+
+	// 内置 TURN 关闭 + dev：保留本机回落（本地联调）。
+	turn, stun, warn = resolveCredentialURLs("", "", "127.0.0.1", 0, true)
+	if len(turn) != 1 || turn[0] != "turn:127.0.0.1:3478" || len(stun) != 1 || stun[0] != "stun:127.0.0.1:3478" || warn != "" {
+		t.Fatalf("dev 模式应回落本机: turn=%v stun=%v warn=%q", turn, stun, warn)
+	}
+
+	// 只配了一侧：turnPort=0 时生产不补齐另一侧（不凭空造 loopback），但保留显式值。
+	turn, stun, warn = resolveCredentialURLs("turn:ext.example:3478", "", "host", 0, false)
+	if len(turn) != 1 || len(stun) != 0 || warn == "" {
+		t.Fatalf("只配 TURN 时生产应保留显式值并告警: turn=%v stun=%v warn=%q", turn, stun, warn)
+	}
+}
+
 // TestValidateJWTSecret 生产模式密钥准入：空/示例值/短密钥拒绝，dev 模式全放行。
 func TestValidateJWTSecret(t *testing.T) {
 	// dev 模式不做限制（本地开发允许回落开发密钥）。

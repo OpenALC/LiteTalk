@@ -79,6 +79,18 @@ func newTestClient(t *testing.T, s *SFU, roomID, userID string) *testClient {
 // 客户端只能用 ICE-TCP 候选与 SFU 建连）。
 func newTestClientNet(t *testing.T, s *SFU, roomID, userID string, tcpOnly bool) *testClient {
 	t.Helper()
+	var networks []webrtc.NetworkType
+	if tcpOnly {
+		networks = []webrtc.NetworkType{webrtc.NetworkTypeTCP4, webrtc.NetworkTypeTCP6}
+	}
+	return newTestClientConfig(t, s, roomID, userID, networks, webrtc.Configuration{})
+}
+
+// newTestClientConfig 同 newTestClientNet，但允许注入网络类型与 PeerConnection 配置
+// （TURN 中继集成测试用：ICEServers + ICETransportPolicy=relay）。
+// networks 为空 = pion 默认（UDP4/UDP6）。
+func newTestClientConfig(t *testing.T, s *SFU, roomID, userID string, networks []webrtc.NetworkType, pcCfg webrtc.Configuration) *testClient {
+	t.Helper()
 	me := &webrtc.MediaEngine{}
 	if err := me.RegisterDefaultCodecs(); err != nil {
 		t.Fatal(err)
@@ -93,10 +105,10 @@ func newTestClientNet(t *testing.T, s *SFU, roomID, userID string, tcpOnly bool)
 	//（pion 默认排除 loopback；真实部署时客户端在远端，无需此项）
 	se := webrtc.SettingEngine{}
 	se.SetIncludeLoopbackCandidate(true)
-	if tcpOnly {
-		se.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeTCP4, webrtc.NetworkTypeTCP6})
+	if len(networks) > 0 {
+		se.SetNetworkTypes(networks)
 	}
-	pc, err := webrtc.NewAPI(webrtc.WithMediaEngine(me), webrtc.WithSettingEngine(se)).NewPeerConnection(webrtc.Configuration{})
+	pc, err := webrtc.NewAPI(webrtc.WithMediaEngine(me), webrtc.WithSettingEngine(se)).NewPeerConnection(pcCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
