@@ -20,6 +20,8 @@ export type Message = components['schemas']['Message']
 export type Invite = components['schemas']['Invite']
 export type FriendEntry = components['schemas']['FriendEntry']
 export type ServerChannels = components['schemas']['ServerChannels']
+export type SyncServer = components['schemas']['SyncServer']
+export type SyncSnapshot = components['schemas']['SyncSnapshot']
 
 // ---- 桥接层兼容名（组件/stores 既有命名）----
 // Wails 绑定经 Go state 包中转：字段与契约同源，个别桥接补充字段见注释。

@@ -252,6 +252,26 @@ export interface paths {
         patch: operations["patchFriend"];
         trace?: never;
     };
+    "/api/v1/sync": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 事件续传失败后的聚合快照
+         * @description 当前用户的全量视图快照：所在服务器（含分类与频道）与好友列表。 只返回调用者为成员的服务器与频道；user 为 PublicUser（不含 email）， online 为真实在线态。续传失败（gateway.invalid_session）后客户端用 一次请求恢复服务器/频道/好友视图；消息仍按会话内已见频道单独补拉。 code：401；5xx internal。
+         */
+        get: operations["getSync"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/servers": {
         parameters: {
             query?: never;
@@ -716,6 +736,22 @@ export interface components {
         ServerChannels: {
             categories: components["schemas"]["CategoryInfo"][];
             channels: components["schemas"]["ChannelInfo"][];
+        };
+        /**
+         * SyncServer
+         * @description 聚合快照中的服务器：ServerInfo 字段平铺 + 分类与频道（空为 []，非 null）。
+         */
+        SyncServer: components["schemas"]["ServerInfo"] & {
+            categories: components["schemas"]["CategoryInfo"][];
+            channels: components["schemas"]["ChannelInfo"][];
+        };
+        /**
+         * SyncSnapshot
+         * @description 续传失败后的聚合快照（#78）。servers 只含调用者为成员的服务器与其频道； friends 的 user 为 PublicUser（不含 email），online 为真实在线态。
+         */
+        SyncSnapshot: {
+            servers: components["schemas"]["SyncServer"][];
+            friends: components["schemas"]["FriendEntry"][];
         };
         /** RegisterRequest */
         RegisterRequest: {
@@ -1344,6 +1380,28 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    getSync: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 聚合快照 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SyncSnapshot"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
             default: components["responses"]["Internal"];
         };
     };

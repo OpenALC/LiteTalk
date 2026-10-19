@@ -11,15 +11,25 @@ import (
 // ListFriends GET /api/v1/friends
 func (s *Server) ListFriends(ctx context.Context, request ListFriendsRequestObject) (ListFriendsResponseObject, error) {
 	c := currentUser(ctx)
-	fs, err := s.store.FriendshipsOfUser(ctx, c.UserID)
+	out, err := s.friendEntries(ctx, c.UserID)
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	out := ListFriends200JSONResponse{}
+	return ListFriends200JSONResponse(out), nil
+}
+
+// friendEntries 好友条目投影（ListFriends 与 GetSync 共用）。
+// 返回空切片而非 nil：wire 上必须是 []，不能是 null。
+func (s *Server) friendEntries(ctx context.Context, uid int64) ([]FriendEntry, error) {
+	fs, err := s.store.FriendshipsOfUser(ctx, uid)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]FriendEntry, 0, len(fs))
 	for _, f := range fs {
 		other := f.FriendID
 		incoming := false
-		if f.FriendID == c.UserID {
+		if f.FriendID == uid {
 			other = f.UserID
 			incoming = true
 		}

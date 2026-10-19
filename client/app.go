@@ -1125,6 +1125,13 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 		OnRTCFailed: func(channelID string) {
 			a.emit("rtc:failed", map[string]any{"channel_id": channelID})
 		},
+		// 续传补拉完成（#32/#78）：消息与好友在线态已由 Session 内部回灌，
+		// 服务器/频道等 REST 视图可能已过期。事件名固定 data:resync，只做提示，
+		// 前端收到后自行经绑定刷新（data/friends store 各自订阅）。
+		// Session 跑在独立 goroutine，emit 与其它语音事件同用法。
+		OnResync: func() {
+			a.emit("data:resync", nil)
+		},
 	}
 	server := a.cfg.Resolve().WSURL
 	sess := voice.NewSession(a.api, token, nickname, ev, log.Default())
