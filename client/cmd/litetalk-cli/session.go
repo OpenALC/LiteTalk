@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/OpenALC/LiteTalk/client/core/api"
+	"github.com/OpenALC/LiteTalk/client/core/audio"
 	"github.com/OpenALC/LiteTalk/client/core/config"
 	"github.com/OpenALC/LiteTalk/client/core/voice"
 )
@@ -32,6 +33,19 @@ type room struct {
 	base string
 }
 
+// newVoiceSession 构造 CLI 会话。CLI 跑在无界面、容器、CI 等场合，固定选择
+// BackendNull：不打开真实声卡，由 10ms 节拍器驱动合成信号走完
+// DSP→Opus→RTP→混音全链路（上行是 440Hz 测试音，不做真实采集）。
+// 桌面端不经过这里，仍由 app.go 走默认的 BackendDevice。
+// SetAudioBackend 必须在 Connect 之前——openRoom 在 Connect 前调用本函数。
+func newVoiceSession(c *api.APIClient, st *State, ev *console) (*voice.Session, error) {
+	sess := voice.NewSession(c, st.AccessToken, st.Nickname, ev.events(), ev.logger())
+	if err := sess.SetAudioBackend(audio.BackendNull); err != nil {
+		return nil, err
+	}
+	return sess, nil
+}
+
 // openRoom 建信令会话并等到连上。音频管线随 Connect 装配：构造失败降级
 // （voiceUnavailable，信令照常），启动失败（无声卡）由 mediaSpy 标记——
 // 与 Session 语义一致：语音不可用不阻断登录/入房/聊天。
@@ -46,7 +60,10 @@ func openRoom(addrFlag string) (*room, error) {
 		return nil, err
 	}
 	ev := newConsole()
-	sess := voice.NewSession(c, st.AccessToken, st.Nickname, ev.events(), ev.logger())
+	sess, err := newVoiceSession(c, st, ev)
+	if err != nil {
+		return nil, err
+	}
 	// ChatHandler/ErrorHandler 依赖 ws 实例（ws 为 nil 时静默丢弃），
 	// 必须在 Connect 之后挂——app.go 同序。
 	sess.Connect(wsURL)

@@ -37,6 +37,62 @@ func TestJoinChannelRollback(t *testing.T) {
 	}
 }
 
+// TestConnectUsesConfiguredAudioBackend Session.Connect 必须使用 SetAudioBackend
+// 在 Connect 前选定的后端（#79）：CLI 等无界面消费方靠 BackendNull 无声卡运行。
+// Connect 后改后端必须报错——管线已按旧选择装配，运行期换后端不支持。
+func TestConnectUsesConfiguredAudioBackend(t *testing.T) {
+	stub := newDownlinkStub(t, signal.TypeHello)
+	s := NewSession(api.NewAPIClient(stub.wsURL()), "tok", "n", Events{}, nil)
+	if err := s.SetAudioBackend(audio.BackendNull); err != nil {
+		t.Fatalf("SetAudioBackend: %v", err)
+	}
+	s.Connect(stub.wsURL())
+	defer s.Close()
+
+	if s.pipe == nil {
+		t.Fatal("BackendNull 下管线应构造成功")
+	}
+	if got := s.pipe.Backend(); got != audio.BackendNull {
+		t.Fatalf("管线后端 = %v, want BackendNull", got)
+	}
+	if err := s.SetAudioBackend(audio.BackendDevice); err == nil {
+		t.Fatal("Connect 之后 SetAudioBackend 应返回错误")
+	}
+	if got := s.AudioBackend(); got != audio.BackendNull {
+		t.Fatalf("Connect 后后端不得改变, 得到 %v", got)
+	}
+}
+
+// TestConnectDefaultsToDeviceBackend 桌面端默认行为不变：未显式选择时
+// Connect 仍按 BackendDevice 装配。
+func TestConnectDefaultsToDeviceBackend(t *testing.T) {
+	stub := newDownlinkStub(t, signal.TypeHello)
+	s := NewSession(api.NewAPIClient(stub.wsURL()), "tok", "n", Events{}, nil)
+	if got := s.AudioBackend(); got != audio.BackendDevice {
+		t.Fatalf("默认后端 = %v, want BackendDevice", got)
+	}
+	s.Connect(stub.wsURL())
+	defer s.Close()
+
+	if s.pipe == nil {
+		t.Fatal("BackendDevice 下管线应构造成功")
+	}
+	if got := s.pipe.Backend(); got != audio.BackendDevice {
+		t.Fatalf("管线后端 = %v, want BackendDevice", got)
+	}
+}
+
+// TestSetAudioBackendRejectsUnknown 非法后端值直接拒绝，不能悄悄落到设备后端。
+func TestSetAudioBackendRejectsUnknown(t *testing.T) {
+	s := NewSession(api.NewAPIClient("http://127.0.0.1:1"), "tok", "n", Events{}, nil)
+	if err := s.SetAudioBackend(audio.Backend(9)); err == nil {
+		t.Fatal("非法后端值应返回错误")
+	}
+	if got := s.AudioBackend(); got != audio.BackendDevice {
+		t.Fatalf("非法值不得改变后端, 得到 %v", got)
+	}
+}
+
 // TestJoinChannelVoiceUnavailable 媒体管线初始化失败（如无 Opus 的平台）时
 // JoinChannel 必须给出明确错误供前端 toast，而不是静默成功或 panic。
 func TestJoinChannelVoiceUnavailable(t *testing.T) {

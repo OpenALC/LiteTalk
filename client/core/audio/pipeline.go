@@ -492,6 +492,9 @@ func (p *Pipeline) Close() error {
 // Stats 返回运行统计快照。
 func (p *Pipeline) Stats() StatsSnapshot { return p.stats.Snapshot() }
 
+// Backend 返回构造时选定的音频后端（只读，诊断/测试用）。
+func (p *Pipeline) Backend() Backend { return p.cfg.Backend }
+
 // SetGain 运行时调整增益。
 func (p *Pipeline) SetGain(g float64) { p.dsp.SetGain(g) }
 
