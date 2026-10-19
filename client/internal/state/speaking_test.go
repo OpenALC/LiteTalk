@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OpenALC/LiteTalk/client/core/api"
 	"github.com/OpenALC/LiteTalk/client/internal/audio"
 	"github.com/OpenALC/LiteTalk/client/internal/signal"
 	"github.com/coder/websocket"
@@ -68,7 +69,7 @@ func TestVoiceSpeakingForwards(t *testing.T) {
 		signal.Envelope{Type: signal.TypeVoiceSpeaking, TS: 3,
 			Data: json.RawMessage(`{"channel_id":"7","user_id":"42","speaking":true}`)},
 	)
-	s := NewSession(NewAPIClient(stub.wsURL()), "tok", "n", Events{
+	s := NewSession(api.NewAPIClient(stub.wsURL()), "tok", "n", Events{
 		OnPeerSpeaking: func(userID string, speaking, mute, deafen bool) {
 			got <- ev{userID, speaking, mute}
 		},
@@ -113,7 +114,7 @@ func TestVoiceSpeakingSelfKeepsLocalState(t *testing.T) {
 		signal.Envelope{Type: signal.TypeVoiceSpeaking, TS: 2,
 			Data: json.RawMessage(`{"channel_id":"7","user_id":"42","speaking":false}`)},
 	)
-	s := NewSession(NewAPIClient(stub.wsURL()), "tok", "n", Events{
+	s := NewSession(api.NewAPIClient(stub.wsURL()), "tok", "n", Events{
 		OnPeerSpeaking: func(userID string, speaking, mute, deafen bool) {
 			got <- speaking
 		},

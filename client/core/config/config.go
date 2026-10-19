@@ -14,7 +14,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/OpenALC/LiteTalk/client/internal/hotkey"
+	"github.com/OpenALC/LiteTalk/client/core/hotkey"
 )
 
 // Defaults 默认服务器地址（本机开发）。

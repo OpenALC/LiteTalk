@@ -15,9 +15,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/OpenALC/LiteTalk/client/core/api"
+	"github.com/OpenALC/LiteTalk/client/core/config"
+	"github.com/OpenALC/LiteTalk/client/core/hotkey"
 	"github.com/OpenALC/LiteTalk/client/internal/audio"
-	"github.com/OpenALC/LiteTalk/client/internal/config"
-	"github.com/OpenALC/LiteTalk/client/internal/hotkey"
 	"github.com/OpenALC/LiteTalk/client/internal/state"
 	"github.com/OpenALC/LiteTalk/client/internal/tray"
 	"github.com/gen2brain/malgo"
@@ -58,7 +59,7 @@ type App struct {
 	// 托盘不可用时关窗必须放行真正关闭，绝不能隐藏窗口把用户锁死（问题 4a）。
 	trayReady atomic.Bool
 
-	api  *state.APIClient
+	api  *api.APIClient
 	sess *state.Session // 登录并连接信令后创建
 
 	// connMu 串行化 connectSession/disconnectSession：双击登录或登录与游客并发
@@ -82,7 +83,7 @@ type App struct {
 
 	mu         sync.Mutex
 	refreshTok string
-	user       state.UserProfile
+	user       api.UserProfile
 
 	audioCtx *audio.Context // 设备枚举用，惰性创建
 
@@ -182,7 +183,7 @@ func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) 
 	initLogging()
 	log.Printf("=== LiteTalk %s 启动 (pid=%d) ===", version, os.Getpid())
 	r := a.cfg.Resolve()
-	a.api = state.NewAPIClient(r.BaseURL)
+	a.api = api.NewAPIClient(r.BaseURL)
 	// 401 自动刷新重试的令牌来源与回写：refresh_token 存 app 层（区分持久化
 	// 策略——游客落盘 config.json），旋转后的新令牌对经回调回传。
 	a.api.SetRefreshSource(func(ctx context.Context) (string, error) {
@@ -190,7 +191,7 @@ func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) 
 		defer a.mu.Unlock()
 		return a.refreshTok, nil
 	})
-	a.api.SetOnRefreshed(func(t state.AuthTokens) {
+	a.api.SetOnRefreshed(func(t api.AuthTokens) {
 		a.mu.Lock()
 		a.refreshTok = t.RefreshToken
 		isGuest := a.user.IsGuest
@@ -613,13 +614,13 @@ func (a *App) retarget(baseURL string) {
 	}
 	// 令牌兼容性预检：Me() 能通就重连信令；401（含刷新失败）才清会话回登录态。
 	if _, err := a.api.Me(); err != nil {
-		var ae *state.APIError
+		var ae *api.APIError
 		if errors.As(err, &ae) && ae.Status == http.StatusUnauthorized {
 			log.Printf("server switch: token rejected by new server: %v", err)
 			a.mu.Lock()
 			a.refreshTok = ""
 			isGuest := a.user.IsGuest
-			a.user = state.UserProfile{}
+			a.user = api.UserProfile{}
 			a.mu.Unlock()
 			// 清 access token：换服后旧令牌不被接受，残留会让 GetMe 把用户
 			// 「登回」到一个无信令连接的僵尸会话。
@@ -675,7 +676,7 @@ func (a *App) TestServerConnection(baseURL string) *ConnTestResult {
 // ---------- 认证（转发 REST，§5.4） ----------
 
 // GetAuthConfig 获取服务端 Auth 模式与发信配置（前端适配 UI 用）。
-func (a *App) GetAuthConfig() (*state.ServerConfig, error) {
+func (a *App) GetAuthConfig() (*api.ServerConfig, error) {
 	return a.api.GetServerConfig()
 }
 
@@ -686,7 +687,7 @@ func (a *App) SendEmailCode(email, purpose string) error {
 
 // Login 邮箱密码登录。成功后连接信令（SessionOK 报告信令是否连上，
 // false 时后台带退避重试，期间前端显示「信令连接中」提示条）。
-func (a *App) Login(email, password string) (*state.AuthResult, error) {
+func (a *App) Login(email, password string) (*api.AuthResult, error) {
 	r, err := a.api.Login(email, password)
 	if err != nil {
 		return nil, err
@@ -700,7 +701,7 @@ func (a *App) Login(email, password string) (*state.AuthResult, error) {
 }
 
 // Register 注册并自动登录。bootstrap 为可选管理员邀请码（#27，空=不使用）。
-func (a *App) Register(nickname, email, password, code, bootstrap string) (*state.AuthResult, error) {
+func (a *App) Register(nickname, email, password, code, bootstrap string) (*api.AuthResult, error) {
 	r, err := a.api.Register(nickname, email, password, code, bootstrap)
 	if err != nil {
 		return nil, err
@@ -718,7 +719,7 @@ func (a *App) Register(nickname, email, password, code, bootstrap string) (*stat
 // 旧实现 refresh 成功但 Me() 失败会清令牌新建游客——旧身份/好友全丢（S6）；
 // 现在：refresh 响应自带 user 直接用（不带才 Me），令牌先落盘，
 // 只有明确 401 才清令牌，网络错误保留已存令牌下次启动续试。
-func (a *App) LoginAsGuest() (*state.AuthResult, error) {
+func (a *App) LoginAsGuest() (*api.AuthResult, error) {
 	if saved := a.cfg.GetGuestRefresh(); saved != "" {
 		t, err := a.api.Refresh(saved)
 		if err == nil {
@@ -740,12 +741,12 @@ func (a *App) LoginAsGuest() (*state.AuthResult, error) {
 			a.user = *u
 			a.mu.Unlock()
 			ok := a.startSession(t.AccessToken, u.Nickname)
-			return &state.AuthResult{
+			return &api.AuthResult{
 				AccessToken: t.AccessToken, RefreshToken: t.RefreshToken,
 				User: *u, SessionOK: ok,
 			}, nil
 		}
-		var ae *state.APIError
+		var ae *api.APIError
 		if errors.As(err, &ae) && ae.Status == http.StatusUnauthorized {
 			_ = a.cfg.SetGuestRefresh("") // 明确失效（过期/被吊销/服务端迁移）才清
 		} else {
@@ -777,7 +778,7 @@ func (a *App) Logout() error {
 	a.mu.Lock()
 	rt := a.refreshTok
 	a.refreshTok = ""
-	a.user = state.UserProfile{} // 清档案，否则 GetMe 仍返回旧用户
+	a.user = api.UserProfile{} // 清档案，否则 GetMe 仍返回旧用户
 	a.mu.Unlock()
 	a.disconnectSession()
 	var err error
@@ -813,7 +814,7 @@ func (a *App) onKicked(reason string) {
 }
 
 // GetMe 当前用户档案。
-func (a *App) GetMe() (*state.UserProfile, error) {
+func (a *App) GetMe() (*api.UserProfile, error) {
 	a.mu.Lock()
 	u := a.user
 	a.mu.Unlock()
@@ -1189,26 +1190,26 @@ func (a *App) SetDeafen(deafened bool) {
 }
 
 // ---------- 服务器 / 频道 / 好友（REST CRUD） ----------
-// 以下方法直接代理 state.APIClient；令牌已由登录/注册/游客/刷新路径注入。
+// 以下方法直接代理 api.APIClient；令牌已由登录/注册/游客/刷新路径注入。
 
 // ListServers 列出当前用户加入的服务器。
-func (a *App) ListServers() ([]state.ServerDTO, error) {
+func (a *App) ListServers() ([]api.ServerDTO, error) {
 	return a.api.ListServers()
 }
 
 // ListChannels 列出服务器的分类与频道（成员可读）；重启后频道列表恢复用。
 // ID 参数一律十进制字符串（#31：Snowflake 超出 JS Number 精度，桥上不用数字）。
-func (a *App) ListChannels(serverID string) (*state.ServerChannels, error) {
+func (a *App) ListChannels(serverID string) (*api.ServerChannels, error) {
 	return a.api.ListChannels(serverID)
 }
 
 // CreateServer 创建服务器（名称为唯一必填项）。
-func (a *App) CreateServer(name string) (*state.ServerDTO, error) {
+func (a *App) CreateServer(name string) (*api.ServerDTO, error) {
 	return a.api.CreateServer(name)
 }
 
 // JoinServerByCode 凭邀请码加入服务器。
-func (a *App) JoinServerByCode(code string) (*state.ServerDTO, error) {
+func (a *App) JoinServerByCode(code string) (*api.ServerDTO, error) {
 	return a.api.JoinServer(code)
 }
 
@@ -1228,7 +1229,7 @@ func (a *App) CreateInviteCode(serverID string) (string, error) {
 }
 
 // CreateChannel 新建频道（typ: text / voice；categoryID 空串/「0」= 不归类）。
-func (a *App) CreateChannel(serverID string, name, typ string, categoryID string) (*state.ChannelDTO, error) {
+func (a *App) CreateChannel(serverID string, name, typ string, categoryID string) (*api.ChannelDTO, error) {
 	return a.api.CreateChannel(serverID, name, typ, categoryID)
 }
 
@@ -1243,7 +1244,7 @@ func (a *App) DeleteChannel(id string) error {
 }
 
 // CreateCategory 创建频道分类（owner/admin；1–32 字）。
-func (a *App) CreateCategory(serverID string, name string) (*state.CategoryDTO, error) {
+func (a *App) CreateCategory(serverID string, name string) (*api.CategoryDTO, error) {
 	return a.api.CreateCategory(serverID, name)
 }
 
@@ -1260,7 +1261,7 @@ func (a *App) RenameCategory(id string, name string) error {
 // UpdateCategory 改分类名/位置（owner/admin）。Wails 绑定不用指针参数：
 // name 为空串表示不改名，position < 0 表示不改位置；position 为目标序（0-based），
 // 服务端移到此位置并重排同服务器其它分类为 0..n-1。
-func (a *App) UpdateCategory(id string, name string, position int) (*state.CategoryDTO, error) {
+func (a *App) UpdateCategory(id string, name string, position int) (*api.CategoryDTO, error) {
 	var n *string
 	if name != "" {
 		n = &name
@@ -1280,7 +1281,7 @@ func (a *App) SendFriendRequest(target string) error {
 // ---------- 好友管理（v0.1.2：接真实 REST，替换前端 mock） ----------
 
 // ListFriends 好友关系全量（accepted 分在线/离线由前端按 user.status 归组）。
-func (a *App) ListFriends() ([]state.FriendDTO, error) { return a.api.ListFriends() }
+func (a *App) ListFriends() ([]api.FriendDTO, error) { return a.api.ListFriends() }
 
 // AcceptFriend 接受好友请求（仅被请求方）。
 func (a *App) AcceptFriend(id string) error { return a.api.AcceptFriend(id) }

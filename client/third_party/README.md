@@ -32,4 +32,4 @@
 
 - `gopkg.in/hraban/opus.v2` 的 `#cgo pkg-config: opus opusfile` 需要构建机提供
   `pkg-config`（winlibs 自带 `pkgconf.exe`）并设置 `PKG_CONFIG_PATH` 指向上述 pkgconfig 目录；
-  项目内的 Opus 封装（`internal/codec`）使用 `${SRCDIR}` 相对路径的 #cgo 指令，不依赖 pkg-config。
+  项目内的 Opus 封装（`core/codec`）使用 `${SRCDIR}` 相对路径的 #cgo 指令，不依赖 pkg-config。

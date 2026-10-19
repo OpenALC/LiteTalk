@@ -8,8 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/OpenALC/LiteTalk/client/internal/codec"
-	"github.com/OpenALC/LiteTalk/client/internal/hotkey"
+	"github.com/OpenALC/LiteTalk/client/core/codec"
+	"github.com/OpenALC/LiteTalk/client/core/hotkey"
 )
 
 // Backend 选择管线的音频来源/去向。

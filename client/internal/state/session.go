@@ -1,3 +1,6 @@
+// Package state 是客户端业务状态桥：把 M1/M2 的 audio / rtc / signal 管线
+// 装配成面向 UI 的会话（登录 → 连信令 → 入房 → 通话），并经 Wails Events
+// 推送给前端（落地方案 §4.6 事件表）。
 package state
 
 import (
@@ -13,9 +16,10 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/OpenALC/LiteTalk/client/core/api"
+	"github.com/OpenALC/LiteTalk/client/core/hotkey"
 	"github.com/OpenALC/LiteTalk/client/internal/audio"
 	"github.com/OpenALC/LiteTalk/client/internal/gateway"
-	"github.com/OpenALC/LiteTalk/client/internal/hotkey"
 	"github.com/OpenALC/LiteTalk/client/internal/rtc"
 	"github.com/OpenALC/LiteTalk/client/internal/signal"
 	"github.com/pion/webrtc/v4"
@@ -87,7 +91,7 @@ type PeerView struct {
 
 // Session 一次登录后的通话会话：信令连接 + 媒体管线。
 type Session struct {
-	api   *APIClient
+	api   *api.APIClient
 	log   *log.Logger
 	ev    Events
 	token string // 信令令牌（access token 或 dev-<name>）
@@ -142,7 +146,7 @@ type Session struct {
 }
 
 // NewSession 创建会话。token 为信令鉴权令牌；nickname 仅 dev 模式用作 user_id。
-func NewSession(api *APIClient, token, nickname string, ev Events, logger *log.Logger) *Session {
+func NewSession(api *api.APIClient, token, nickname string, ev Events, logger *log.Logger) *Session {
 	if logger == nil {
 		logger = log.Default()
 	}

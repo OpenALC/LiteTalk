@@ -10,8 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OpenALC/LiteTalk/client/internal/config"
-	"github.com/OpenALC/LiteTalk/client/internal/hotkey"
+	"github.com/OpenALC/LiteTalk/client/core/api"
+	"github.com/OpenALC/LiteTalk/client/core/config"
+	"github.com/OpenALC/LiteTalk/client/core/hotkey"
 	"github.com/OpenALC/LiteTalk/client/internal/state"
 )
 
@@ -132,7 +133,7 @@ func TestLoginAsGuestNetworkErrorKeepsToken(t *testing.T) {
 		_, _ = w.Write([]byte(`{"code":"internal","message":"boom"}`))
 	}))
 	defer srv.Close()
-	app.api = state.NewAPIClient(srv.URL)
+	app.api = api.NewAPIClient(srv.URL)
 
 	if _, err := app.LoginAsGuest(); err == nil {
 		t.Fatal("服务端 500 时登录应失败")
@@ -162,7 +163,7 @@ func TestLoginAsGuest401ClearsToken(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
-	app.api = state.NewAPIClient(srv.URL)
+	app.api = api.NewAPIClient(srv.URL)
 
 	if _, err := app.LoginAsGuest(); err == nil {
 		t.Fatal("refresh 401 + guest 500 时登录应失败")
@@ -180,10 +181,10 @@ func TestOnKickedClearsSessionAndTokens(t *testing.T) {
 	if err := m.SetGuestRefresh("guest-rt"); err != nil {
 		t.Fatal(err)
 	}
-	app.api = state.NewAPIClient("http://127.0.0.1:1")
+	app.api = api.NewAPIClient("http://127.0.0.1:1")
 	app.mu.Lock()
 	app.refreshTok = "rt"
-	app.user = state.UserProfile{ID: 1, Nickname: "游客-0001", IsGuest: true}
+	app.user = api.UserProfile{ID: 1, Nickname: "游客-0001", IsGuest: true}
 	app.sess = state.NewSession(app.api, "tok", "n", state.Events{}, nil)
 	app.mu.Unlock()
 
@@ -213,12 +214,12 @@ func TestOnKickedClearsSessionAndTokens(t *testing.T) {
 func TestLogoutClearsAccessToken(t *testing.T) {
 	m := config.NewWithPath(filepath.Join(t.TempDir(), "config.json"))
 	app := newAppWithConfig(m)
-	app.api = state.NewAPIClient("http://127.0.0.1:1")
+	app.api = api.NewAPIClient("http://127.0.0.1:1")
 
 	// rt == "" 路径（被踢后前端 logout）：即使不发吊销请求也要清 token。
 	app.api.SetToken("stale-access")
 	app.mu.Lock()
-	app.user = state.UserProfile{ID: 1, Nickname: "a"}
+	app.user = api.UserProfile{ID: 1, Nickname: "a"}
 	app.mu.Unlock()
 	if err := app.Logout(); err != nil {
 		t.Fatalf("Logout: %v", err)
@@ -231,7 +232,7 @@ func TestLogoutClearsAccessToken(t *testing.T) {
 	app.api.SetToken("stale-access-2")
 	app.mu.Lock()
 	app.refreshTok = "rt"
-	app.user = state.UserProfile{ID: 1, Nickname: "a"}
+	app.user = api.UserProfile{ID: 1, Nickname: "a"}
 	app.mu.Unlock()
 	if err := app.Logout(); err == nil {
 		t.Fatal("吊销端点不可达时 Logout 应返回错误")
@@ -249,10 +250,10 @@ func TestOnKickedKeepsGuestTokenForAccountUser(t *testing.T) {
 	if err := m.SetGuestRefresh("other-guest-rt"); err != nil {
 		t.Fatal(err)
 	}
-	app.api = state.NewAPIClient("http://127.0.0.1:1")
+	app.api = api.NewAPIClient("http://127.0.0.1:1")
 	app.mu.Lock()
 	app.refreshTok = "rt"
-	app.user = state.UserProfile{ID: 7, Nickname: "alice"}
+	app.user = api.UserProfile{ID: 7, Nickname: "alice"}
 	app.mu.Unlock()
 
 	app.onKicked("login_elsewhere")
@@ -325,7 +326,7 @@ func TestSetServerConfigHotSwitch(t *testing.T) {
 
 	m := config.NewWithPath(filepath.Join(t.TempDir(), "config.json"))
 	app := newAppWithConfig(m)
-	app.api = state.NewAPIClient("http://127.0.0.1:1") // 初始地址
+	app.api = api.NewAPIClient("http://127.0.0.1:1") // 初始地址
 
 	// 成功切换。
 	if err := app.SetServerConfig(ok.URL); err != nil {
@@ -385,10 +386,10 @@ func TestSetServerConfigSerializesRetarget(t *testing.T) {
 
 	m := config.NewWithPath(filepath.Join(t.TempDir(), "config.json"))
 	app := newAppWithConfig(m)
-	app.api = state.NewAPIClient(slow.URL)
+	app.api = api.NewAPIClient(slow.URL)
 	app.api.SetToken("tok")
 	app.mu.Lock()
-	app.user = state.UserProfile{ID: 1, Nickname: "a"}
+	app.user = api.UserProfile{ID: 1, Nickname: "a"}
 	app.mu.Unlock()
 
 	first := make(chan error, 1)
@@ -439,7 +440,7 @@ func TestSetServerConfigEnvOverride(t *testing.T) {
 	t.Setenv("LITETALK_API", envSrv.URL)
 	m := config.NewWithPath(filepath.Join(t.TempDir(), "config.json"))
 	app := newAppWithConfig(m)
-	app.api = state.NewAPIClient(envSrv.URL)
+	app.api = api.NewAPIClient(envSrv.URL)
 
 	// SetServerConfig 写 fileSrv 地址到盘；Resolve 仍返回 envSrv。
 	if err := app.SetServerConfig(fileSrv.URL); err != nil {
