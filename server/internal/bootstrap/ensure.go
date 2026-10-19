@@ -10,7 +10,7 @@ import (
 // Ensure 首启打印管理员邀请码；幂等，满足任一条件即跳过：
 //   - 码已消费（KV）；
 //   - 本次部署已打印过（KV）；
-//   - 库内已有用户（HasUsers）——实例已在用，不再自动打印，
+//   - 库内已有用户或服务器（HasUsers / HasServers）——实例已在用，不再自动打印，
 //     防止 MemKV 重启丢标记后把已作废的码又打到日志里。
 //     （旧探测 UserByID(1) 依赖自增 ID=1，Snowflake 后永不命中，#31 换掉。）
 //
@@ -28,6 +28,9 @@ func Ensure(ctx context.Context, kv store.KV, st store.Store, jwtSecret string, 
 		if ok, err := st.HasUsers(ctx); err == nil && ok {
 			return
 		}
+		if ok, err := st.HasServers(ctx); err == nil && ok {
+			return
+		}
 	}
 	printInvite(lg, Code(jwtSecret))
 	if kv != nil {
@@ -36,12 +39,18 @@ func Ensure(ctx context.Context, kv store.KV, st store.Store, jwtSecret string, 
 }
 
 // PrintAdminInvite 重新打印管理员邀请码（-print-admin-invite）。
-// 已消费则只报状态不再亮码——码是一次性的，重打已作废的码只会误导操作员。
+// 已消费（KV 或库内已有服务器）则只报状态不再亮码——码是一次性的，
+// 重打已作废的码只会误导操作员。
 func PrintAdminInvite(ctx context.Context, kv store.KV, st store.Store, jwtSecret string, lg *log.Logger) {
-	_ = st // 与 Ensure 同签名（T3 预留）；消费状态只看 KV
 	if kv != nil {
 		if uid, err := kv.Get(ctx, keyConsumed); err == nil {
 			lg.Printf("管理员邀请码已消费（uid=%s），实例已被认领，无需再发。", uid)
+			return
+		}
+	}
+	if st != nil {
+		if ok, err := st.HasServers(ctx); err == nil && ok {
+			lg.Println("实例已被认领（库内已有服务器），管理员邀请码已作废，无需再发。")
 			return
 		}
 	}

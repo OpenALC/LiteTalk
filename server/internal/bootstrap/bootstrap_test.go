@@ -3,8 +3,11 @@ package bootstrap
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/OpenALC/LiteTalk/server/internal/store"
@@ -46,18 +49,40 @@ func TestVerify(t *testing.T) {
 func TestRequiredConsumeRoundtrip(t *testing.T) {
 	ctx := context.Background()
 	kv := store.NewMemKV()
-	if !Required(ctx, kv) {
+	st := store.NewMem()
+	if !Required(ctx, kv, st) {
 		t.Fatal("未消费时 Required 应为 true")
 	}
 	if err := Consume(ctx, kv, 42); err != nil {
 		t.Fatalf("Consume: %v", err)
 	}
-	if Required(ctx, kv) {
+	if Required(ctx, kv, st) {
 		t.Fatal("消费后 Required 应为 false")
 	}
 	// 值记 uid 便于排查。
 	if v, err := kv.Get(ctx, keyConsumed); err != nil || v != "42" {
 		t.Fatalf("消费标记应存 uid，实际 %q/%v", v, err)
+	}
+}
+
+// TestRequiredReflectsPersistedServers #27 P1：消费标记只在进程内 KV，
+// 重启（新 MemKV）后判据必须回落到库内服务器，管理员码不能复活。
+func TestRequiredReflectsPersistedServers(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMem()
+	u := &store.User{Email: "o@ex.com", Nickname: "owner", Tag: "0001"}
+	if err := st.CreateUser(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+	if !Required(ctx, store.NewMemKV(), st) {
+		t.Fatal("空库时应要求管理员邀请码")
+	}
+	if _, err := Adopt(ctx, st, u.ID); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	// 模拟重启：KV 全丢，库还在。
+	if Required(ctx, store.NewMemKV(), st) {
+		t.Fatal("库内已有服务器（已认领），重启后 Required 应为 false")
 	}
 }
 
@@ -110,6 +135,26 @@ func TestEnsureSkipsWhenConsumed(t *testing.T) {
 	}
 }
 
+// TestEnsureSkipsWhenServersExist #27：MemKV 重启丢标记后，库内服务器仍能阻止
+// 把已作废的码重新打到日志里。
+func TestEnsureSkipsWhenServersExist(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMem()
+	u := &store.User{Email: "o@ex.com", Nickname: "owner", Tag: "0001"}
+	if err := st.CreateUser(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Adopt(ctx, st, u.ID); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	lg := log.New(&buf, "", 0)
+	Ensure(ctx, store.NewMemKV(), st, "secret-a", lg)
+	if buf.Len() != 0 {
+		t.Fatalf("库内已有服务器不应再打印，日志：%q", buf.String())
+	}
+}
+
 func TestPrintAdminInvite(t *testing.T) {
 	ctx := context.Background()
 	kv := store.NewMemKV()
@@ -131,6 +176,61 @@ func TestPrintAdminInvite(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "已消费") {
 		t.Fatalf("已消费应报状态，日志：%q", buf.String())
+	}
+
+	// KV 丢失但库内已有服务器：同样只报状态（#27 持久判据）。
+	st := store.NewMem()
+	u := &store.User{Email: "o@ex.com", Nickname: "owner", Tag: "0001"}
+	if err := st.CreateUser(context.Background(), u); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Adopt(context.Background(), st, u.ID); err != nil {
+		t.Fatal(err)
+	}
+	buf.Reset()
+	PrintAdminInvite(ctx, store.NewMemKV(), st, "secret-a", lg)
+	if strings.Contains(buf.String(), Code("secret-a")) {
+		t.Fatalf("库内已有服务器不应再亮码，日志：%q", buf.String())
+	}
+	if !strings.Contains(buf.String(), "已被认领") {
+		t.Fatalf("库内已有服务器应报已认领，日志：%q", buf.String())
+	}
+}
+
+// TestClaimConcurrentSingleServer #27 P2：并发带码注册只能建出一个默认服务器，
+// 其余请求得到 ErrClaimed。
+func TestClaimConcurrentSingleServer(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMem()
+	kv := store.NewMemKV()
+	const n = 8
+	var wg sync.WaitGroup
+	var claimed atomic.Int32
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(uid int64) {
+			defer wg.Done()
+			if _, err := Claim(ctx, kv, st, uid); err == nil {
+				claimed.Add(1)
+			} else if !errors.Is(err, ErrClaimed) {
+				t.Errorf("Claim uid=%d: %v", uid, err)
+			}
+		}(int64(i + 1))
+	}
+	wg.Wait()
+	if got := claimed.Load(); got != 1 {
+		t.Fatalf("并发认领应恰好成功一次，实际 %d", got)
+	}
+	total := 0
+	for uid := int64(1); uid <= n; uid++ {
+		servers, err := st.ServersOfUser(ctx, uid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		total += len(servers)
+	}
+	if total != 1 {
+		t.Fatalf("应只产生一个默认服务器，实际 %d", total)
 	}
 }
 

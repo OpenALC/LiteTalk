@@ -62,6 +62,19 @@ func main() {
 	// 生产模式下内存降级、默认密钥、dev 令牌开关等开发便利项全部拒绝启动。
 	dev := version == "dev"
 
+	// ---- JWT 密钥（#27）：env 显式 > $DATA_DIR/jwt.secret（缺失则生成并持久化）----
+	// 先于 validate：生产构建不再要求运维手动设置 LITETALK_JWT_SECRET，
+	// `--domain` 一条命令即可首启。dev 构建空串行为不变（回落开发密钥）。
+	jwtSecret, generated, err := resolveJWTSecret(cfg.jwtSecret, cfg.dataDir, dev)
+	if err != nil {
+		log.Fatalf("JWT 密钥不可用: %v", err)
+	}
+	if generated {
+		log.Printf("JWT: 未设置 LITETALK_JWT_SECRET，已生成随机密钥并保存到 %s（0600，后续启动自动复用）",
+			filepath.Join(cfg.dataDir, jwtSecretFile))
+	}
+	cfg.jwtSecret = jwtSecret
+
 	// ---- 配置校验（§0.6 步骤 2）：JWT secret、SFU IP 拒环回、auth mode、域名形态 ----
 	if err := cfg.validate(dev); err != nil {
 		log.Fatalf("启动配置校验失败: %v", err)
@@ -136,8 +149,7 @@ func main() {
 	}
 
 	// ---- 账号安全 ----
-	// JWT secret 与 SFU IP 校验已并入 cfg.validate（§0.6 步骤 2，持久化之前）。
-	jwtSecret := cfg.jwtSecret
+	// JWT 密钥已在上方解析并校验（env 或 $DATA_DIR/jwt.secret）。
 	sfuIP := cfg.sfuIP
 	jwtSigner := auth.NewJWT(jwtSecret)
 	refreshStore := auth.NewRefreshStore(kv)
@@ -326,8 +338,8 @@ func main() {
 		// 自托管形态自描述（GET /api/v1/config，#26）：SQLite/进程内单机部署 = true，
 		// MySQL 全栈部署 = false。客户端据此显示自托管引导（邀请码等）。
 		SelfHost: pickStoreKind() != "mysql",
-		// 管理员邀请码是否未消费（#27 T4 填 bootstrap.Required 实现）。
-		BootstrapRequired: func() bool { return bootstrap.Required(context.Background(), kv) },
+		// 管理员邀请码是否未认领（#27：KV 消费标记 + 库内是否已有服务器）。
+		BootstrapRequired: func() bool { return bootstrap.Required(context.Background(), kv, st) },
 	})
 
 	mux := http.NewServeMux()
