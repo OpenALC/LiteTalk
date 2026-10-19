@@ -89,8 +89,11 @@ function iconFromServer(name: string): string {
   return map[name] ?? 'MessagesSquare'
 }
 
-export const useServersStore = defineStore('servers', () => {
-  const servers = ref<Server[]>([
+// initialServers 登录前的内置示例服务器快照（每次返回全新对象）。
+// 内置示例允许本地改名/删频道（服务端无实体），复位时必须回到出厂内容——
+// 复用同一个数组会把上一个会话的本地改动带到下一个账号。
+function initialServers(): Server[] {
+  return [
     {
       id: 'hq', name: '语音总部', icon: 'MessagesSquare', builtin: true,
       channels: [
@@ -112,7 +115,11 @@ export const useServersStore = defineStore('servers', () => {
     ] },
     { id: 'design', name: '设计工坊', icon: 'Palette', builtin: true, channels: [] },
     { id: 'book', name: '读书会', icon: 'BookOpen', builtin: true, channels: [] },
-  ])
+  ]
+}
+
+export const useServersStore = defineStore('servers', () => {
+  const servers = ref<Server[]>(initialServers())
   const currentServerId = ref('')
   const currentChannelId = ref('')
 
@@ -176,14 +183,23 @@ export const useServersStore = defineStore('servers', () => {
   // ids 集合误删另一次刚拉到的服务器。
   let loadChain: Promise<void> = Promise.resolve()
 
+  // generation 会话代次：resetAll（登出/被踢/换服）递增，在飞请求的每个 await
+  // 之后比对，代次变了就放弃写回——否则旧账号的响应返回时会把刚清空的列表
+  // 重新填上，B 登录后仍看到 A 的服务器（#85）。
+  let generation = 0
+
   function loadRemoteServers(): Promise<void> {
-    const run = loadChain.then(doLoadRemoteServers)
+    // 代次在入队时捕获：resetAll 之前排队的请求即使延后执行，也属于旧会话。
+    const gen = generation
+    const run = loadChain.then(() => doLoadRemoteServers(gen))
     loadChain = run.catch(() => {})
     return run
   }
 
-  async function doLoadRemoteServers() {
+  async function doLoadRemoteServers(gen: number) {
+    if (gen !== generation) return
     const list = await goApp().ListServers()
+    if (gen !== generation) return
     const ids = new Set<string>()
     for (const s of list) {
       const id = String(s.id)
@@ -195,7 +211,8 @@ export const useServersStore = defineStore('servers', () => {
       } else {
         servers.value.push({ id, name: s.name, icon: iconFromServer(s.icon_name), channels: [] })
       }
-      await loadChannels(id)
+      await loadChannels(gen, id)
+      if (gen !== generation) return
     }
     servers.value = servers.value.filter((x) => x.builtin || ids.has(x.id))
     // 当前服务器已被移出/解散：回退到第一个可用服务器（介绍页不是服务器实体，
@@ -209,13 +226,15 @@ export const useServersStore = defineStore('servers', () => {
   // loadChannels 拉服务器的分类与频道：channel.group 取分类名（无分类归「未分类」），
   // 空分类也进 extraGroups（空分类重启后不丢）。失败不再静默（#12）：标记
   // unavailable 并 toast——被踢出（403）与网络错误都给解释，频道区不能恒空。
-  async function loadChannels(serverId: string) {
+  async function loadChannels(gen: number, serverId: string) {
     const s = findServer(serverId)
     if (!s || s.builtin) return
     let out: ServerChannels
     try {
       out = await goApp().ListChannels(serverId)
     } catch (e) {
+      // 会话已复位：旧账号的失败提示也不该出现在新会话里。
+      if (gen !== generation) return
       s.unavailable = true
       // 403 判定走服务端错误码前缀（bridge 只传 message 字符串，与 RegisterView 同法）。
       const msg = String((e as Error)?.message ?? e)
@@ -227,6 +246,7 @@ export const useServersStore = defineStore('servers', () => {
       }
       return
     }
+    if (gen !== generation) return
     s.unavailable = false
     const nameOf = new Map<string, string>()
     for (const c of out.categories ?? []) nameOf.set(c.id, c.name)
@@ -345,6 +365,22 @@ export const useServersStore = defineStore('servers', () => {
   // extraGroups：服务器 ID → 分类列表（含空分类；内置服务器 id 为 'local-<name>'）。
   // position 为显示序（真实分类 = 服务端 position，重排后 0..n-1）。
   const extraGroups = ref<Record<string, { id: string; name: string; position: number }[]>>({})
+
+  // resetAll 恢复登录前状态（#85）：主动登出、被踢、跨域换服与登录新账号前
+  // 都由 auth store 调用。服务器列表回到内置示例，选中的服务器/频道与分类缓存
+  // 全清；事件订阅不在清理范围——data:resync 监听在 MainView 卸载时另由
+  // unbindEvents 按监听器注销，登录后重新 bind。幂等。
+  // homeId / introHidden 属于 config.json 里的客户端级偏好，不是账号会话态，
+  // 保留；若 homeId 指向新账号不可见的服务器，下一次 loadRemoteServers 会经
+  // 「当前服务器不在列表」分支回退到可用项。
+  function resetAll() {
+    generation++
+    loadChain = Promise.resolve()
+    servers.value = initialServers()
+    currentServerId.value = ''
+    currentChannelId.value = ''
+    extraGroups.value = {}
+  }
 
   // groupsOf 某服务器的全部分类。Channel.group 是分类名——按名归组（同名分类会
   // 合并显示，过渡方案）。排序：显式分类按 position；无分类条目的分组里「未分类」
@@ -490,7 +526,7 @@ export const useServersStore = defineStore('servers', () => {
     loadRemoteServers, createServer, joinServer, renameServer, removeServer,
     createChannel, renameChannel, deleteChannel,
     extraGroups, groupsOf, createCategory, deleteCategory, renameCategory, reorderCategory,
-    bindEvents, unbindEvents,
+    resetAll, bindEvents, unbindEvents,
   }
 })
 
@@ -506,10 +542,15 @@ export const useFriendsStore = defineStore('friends', () => {
   // 在线态只有两态（#11）：数据源是 presence:{uid}，不再造 idle/busy。
   const STATUS_TEXT = { online: '在线', offline: '离线' } as const
 
+  // generation 同 servers：resetAll 后旧账号在飞的 loadFriends 不得写回（#85）。
+  let generation = 0
+
   // loadFriends 拉取并归组。服务端 friendships.remark/group 仅「发起方向」可写，
   // 对方视角恒为空——显示名回落 nickname 属预期，不补双侧字段（服务端规格如此）。
   async function loadFriends() {
+    const gen = generation
     const list = await goApp().ListFriends()
+    if (gen !== generation) return
     const on: Friend[] = []
     const off: Friend[] = []
     const pend: { id: string; name: string; outgoing: boolean }[] = []
@@ -585,6 +626,16 @@ export const useFriendsStore = defineStore('friends', () => {
     return [...online.value, ...offline.value].find((f) => f.id === id)
   }
 
+  // resetAll 清空好友列表与待处理请求（#85，登出/被踢/换服/登录新账号前）。
+  // 只清会话数据，不动 presence:update / data:resync 订阅（MainView 卸载时
+  // 另由 unbindEvents 注销）；幂等。
+  function resetAll() {
+    generation++
+    online.value = []
+    offline.value = []
+    pending.value = []
+  }
+
   // 事件订阅（presence:update，#11；data:resync，#78）。eventsOn 返回按监听器
   // 的取消函数，卸载时逐个注销——不按事件名整体 Off（会清掉别人注册的同名监听）。
   const offs: Array<() => void> = []
@@ -611,7 +662,7 @@ export const useFriendsStore = defineStore('friends', () => {
 
   return {
     online, offline, pending, loadFriends, sendRequest, acceptRequest, removeFriend, setMeta, findById,
-    setPresence, bindEvents, unbindEvents,
+    setPresence, resetAll, bindEvents, unbindEvents,
   }
 })
 
