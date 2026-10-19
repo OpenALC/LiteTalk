@@ -197,7 +197,7 @@ export interface paths {
         };
         /**
          * 好友与好友请求列表
-         * @description remark/group 仅发起方视角非空。user 为 PublicUser（不含 email， online 为真实在线态）。401；5xx internal。
+         * @description remark/group 仅发起方视角非空。user 为 PublicUser（不含 email， online 对已接受关系为真实在线态，pending/blocked 恒 false）。401；5xx internal。
          */
         get: operations["listFriends"];
         put?: never;
@@ -261,7 +261,7 @@ export interface paths {
         };
         /**
          * 事件续传失败后的聚合快照
-         * @description 当前用户的全量视图快照：所在服务器（含分类与频道）与好友列表。 只返回调用者为成员的服务器与频道；user 为 PublicUser（不含 email）， online 为真实在线态。续传失败（gateway.invalid_session）后客户端用 一次请求恢复服务器/频道/好友视图；消息仍按会话内已见频道单独补拉。 code：401；5xx internal。
+         * @description 当前用户的全量视图快照：所在服务器（含分类与频道）与好友列表。 只返回调用者为成员的服务器与频道；user 为 PublicUser（不含 email）， online 对已接受好友关系为真实在线态（pending/blocked 恒 false）。续传失败 （gateway.invalid_session）后客户端用 一次请求恢复服务器/频道/好友视图；消息仍按会话内已见频道单独补拉。 code：401；5xx internal。
          */
         get: operations["getSync"];
         put?: never;
@@ -609,7 +609,7 @@ export interface components {
             is_guest: boolean;
             /** Format: int32 */
             status: number;
-            /** @description 在线态（presence）；仅 friends 相关响应填真实值，其余恒 false */
+            /** @description 在线态（presence）；仅已接受好友关系填真实值（成员视图用 MemberInfo.online），其余恒 false */
             online: boolean;
             /** Format: date-time */
             created_at: string;
@@ -671,7 +671,7 @@ export interface components {
         };
         /**
          * MemberInfo
-         * @description 服务器成员（内联昵称/tag）。ID 为十进制字符串（#31）。
+         * @description 服务器成员（内联昵称/tag，含在线态）。ID 为十进制字符串（#31）。
          */
         MemberInfo: {
             server_id: string;
@@ -682,6 +682,8 @@ export interface components {
             joined_at: string;
             nickname?: string;
             tag?: string;
+            /** @description 在线态（presence:{uid} 存在即在线）；不依赖好友关系 */
+            online: boolean;
         };
         /**
          * Message
@@ -747,7 +749,7 @@ export interface components {
         };
         /**
          * SyncSnapshot
-         * @description 续传失败后的聚合快照（#78）。servers 只含调用者为成员的服务器与其频道； friends 的 user 为 PublicUser（不含 email），online 为真实在线态。
+         * @description 续传失败后的聚合快照（#78）。servers 只含调用者为成员的服务器与其频道； friends 的 user 为 PublicUser（不含 email），online 对已接受关系为真实在线态。
          */
         SyncSnapshot: {
             servers: components["schemas"]["SyncServer"][];

@@ -28,9 +28,13 @@
         },
         "mute": { "type": "boolean" },
         "deafen": { "type": "boolean" },
-        "speaking": { "type": "boolean" }
+        "speaking": { "type": "boolean" },
+        "online": {
+          "type": "boolean",
+          "description": "在线态（presence:{uid} 存在即在线），与 REST 成员视图同源"
+        }
       },
-      "required": ["user_id", "nickname", "mute", "deafen", "speaking"],
+      "required": ["user_id", "nickname", "mute", "deafen", "speaking", "online"],
       "additionalProperties": false
     },
     "SDPData": {

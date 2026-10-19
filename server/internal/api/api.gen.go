@@ -289,10 +289,13 @@ type LogoutRequest struct {
 	RefreshToken string `json:"refresh_token"`
 }
 
-// MemberInfo 服务器成员（内联昵称/tag）。ID 为十进制字符串（#31）。
+// MemberInfo 服务器成员（内联昵称/tag，含在线态）。ID 为十进制字符串（#31）。
 type MemberInfo struct {
-	JoinedAt Time           `json:"joined_at"`
-	Nickname *string        `json:"nickname,omitempty"`
+	JoinedAt Time    `json:"joined_at"`
+	Nickname *string `json:"nickname,omitempty"`
+
+	// Online 在线态（presence:{uid} 存在即在线）；不依赖好友关系
+	Online   bool           `json:"online"`
 	Role     MemberInfoRole `json:"role"`
 	ServerId ID             `json:"server_id"`
 	Tag      *string        `json:"tag,omitempty"`
@@ -367,7 +370,7 @@ type PublicUser struct {
 	IsGuest       bool   `json:"is_guest"`
 	Nickname      string `json:"nickname"`
 
-	// Online 在线态（presence）；仅 friends 相关响应填真实值，其余恒 false
+	// Online 在线态（presence）；仅已接受好友关系填真实值（成员视图用 MemberInfo.online），其余恒 false
 	Online    bool   `json:"online"`
 	Status    int32  `json:"status"`
 	Tag       string `json:"tag"`
@@ -455,7 +458,7 @@ type SyncServer struct {
 	OwnerId   ID     `json:"owner_id"`
 }
 
-// SyncSnapshot 续传失败后的聚合快照（#78）。servers 只含调用者为成员的服务器与其频道； friends 的 user 为 PublicUser（不含 email），online 为真实在线态。
+// SyncSnapshot 续传失败后的聚合快照（#78）。servers 只含调用者为成员的服务器与其频道； friends 的 user 为 PublicUser（不含 email），online 对已接受关系为真实在线态。
 type SyncSnapshot struct {
 	Friends []FriendEntry `json:"friends"`
 	Servers []SyncServer  `json:"servers"`
