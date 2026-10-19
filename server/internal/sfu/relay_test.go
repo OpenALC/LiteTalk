@@ -65,8 +65,23 @@ func relayICEConfig(t *testing.T, uid, transport string, port int) webrtc.Config
 }
 
 // waitSelectedPair 等 ICE 选出候选对（未选出返回 nil）。
+// 先等 PeerConnection 进入 Connected/Completed 再读 ICETransport：pion 的
+// GetSelectedCandidatePair 与 StartContext 并发访问同一字段，连接建立前轮询
+// 会被 -race 判为数据竞争（CI 偶发，见 #13 relay run）。连接失败/关闭直接 nil。
 func waitSelectedPair(pc *webrtc.PeerConnection, timeout time.Duration) *webrtc.ICECandidatePair {
 	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		switch pc.ConnectionState() {
+		case webrtc.PeerConnectionStateConnected:
+			goto connected
+		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return nil
+
+connected:
 	for time.Now().Before(deadline) {
 		pair, err := pc.SCTP().Transport().ICETransport().GetSelectedCandidatePair()
 		if err == nil && pair != nil {
