@@ -498,3 +498,53 @@ func TestClientVersionHeader(t *testing.T) {
 		}
 	}
 }
+
+// TestSyncDecode GET /sync 聚合快照解码（#78）：服务器字段平铺（嵌入 ServerDTO）
+// 与分类/频道/好友数组都按契约解出，好友 online 为服务端 presence 值。
+func TestSyncDecode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/sync" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"servers":[{
+				"id":"10","name":"服十","owner_id":"1","icon_name":"music","icon_color":"#4FA4F3",
+				"created_at":"2026-01-01T00:00:00Z",
+				"categories":[{"id":"100","server_id":"10","name":"甲组","position":2,"created_at":"2026-01-01T00:00:00Z"}],
+				"channels":[{"id":"101","server_id":"10","name":"大厅","type":"voice","category_id":"100","position":0,"created_at":"2026-01-01T00:00:00Z"}]
+			}],
+			"friends":[{"id":"5","status":"accepted","incoming":false,"remark":"","group":"","user":{
+				"id":"2","nickname":"乙","tag":"0002","email_verified":true,"is_guest":false,
+				"status":1,"online":true,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"
+			}}]
+		}`))
+	}))
+	defer srv.Close()
+
+	c := NewAPIClient(srv.URL)
+	snap, err := c.Sync()
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if len(snap.Servers) != 1 {
+		t.Fatalf("servers 应 1 条，实际 %d", len(snap.Servers))
+	}
+	sv := snap.Servers[0]
+	if sv.ID != 10 || sv.Name != "服十" || sv.IconName != "music" || sv.OwnerID != 1 {
+		t.Fatalf("服务器字段解码异常（ServerDTO 未平铺？）: %+v", sv)
+	}
+	if len(sv.Categories) != 1 || sv.Categories[0].Name != "甲组" || sv.Categories[0].Position != 2 {
+		t.Fatalf("分类解码异常: %+v", sv.Categories)
+	}
+	if len(sv.Channels) != 1 || sv.Channels[0].ID != 101 || sv.Channels[0].Type != "voice" {
+		t.Fatalf("频道解码异常: %+v", sv.Channels)
+	}
+	if sv.Channels[0].CategoryID == nil || *sv.Channels[0].CategoryID != 100 {
+		t.Fatalf("频道分类归属解码异常: %+v", sv.Channels[0].CategoryID)
+	}
+	if len(snap.Friends) != 1 || snap.Friends[0].User.ID != 2 || !snap.Friends[0].User.Online {
+		t.Fatalf("好友快照解码异常: %+v", snap.Friends)
+	}
+}
