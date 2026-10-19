@@ -147,6 +147,15 @@ func NewPeer(cfg PeerConfig) (*Peer, error) {
 	}
 
 	se := webrtc.SettingEngine{}
+	// #25：显式启用 ICE-TCP 候选。pion 默认只收 UDP 候选，UDP 被封的网络里
+	// 直连永远走不到 SFU 的 ICE-TCP mux（LITETALK_SFU_TCP）——这是「禁 UDP
+	// 网络可通话」的客户端侧前提。TCP4/TCP6 与 UDP4/UDP6 并存，不改变正常网络。
+	se.SetNetworkTypes([]webrtc.NetworkType{
+		webrtc.NetworkTypeUDP4,
+		webrtc.NetworkTypeUDP6,
+		webrtc.NetworkTypeTCP4,
+		webrtc.NetworkTypeTCP6,
+	})
 	if cfg.IncludeLoopback {
 		se.SetIncludeLoopbackCandidate(true)
 	}
