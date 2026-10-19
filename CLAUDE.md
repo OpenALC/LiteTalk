@@ -204,9 +204,16 @@ git checkout -- .
 - 错误统一用 `writeErr(status, code, msg)`；500 必须在服务端记录底层错误。
 
 ### 协议变更
-- 信令消息类型目前有**两份手工同步的定义**：`server/internal/signal/protocol.go` 和 `client/internal/signal/protocol.go`。改一边必须同时改另一边，并补上两侧的测试。
-- REST 改动需要同步 `client/internal/state/api.go` 和 `client/frontend/src/api/types.ts`。
+- 信令消息类型的**单一事实源是 `api/signal/*.json`**（JSON Schema），由 `server/api/tools/signalgen` 生成两侧 `protocol_gen.go`（`server/internal/signal/` 与 `client/core/signal/`，除 package 行外**字节相同**）。**不要手改生成物**——要改消息就改 Schema 再跑生成器；CI 的 `check-server` 会因生成物不新鲜而红，`check-contract` 会因生成物与 Schema 脱钩而红。
+- 手写层只留 `Envelope`/`Identity`/`Bool` 等运行时辅助，且两边仍需逐字对齐。
+- REST 改动需要同步 `client/core/api` 与 `client/frontend/src/api/types.ts`（后者从 `types.gen.ts` re-export，REST 类型由 `api/openapi.yaml` 生成，改契约要重跑 `pnpm run gen:types`）。
 - 只做向后兼容的改动：新增字段可以；删字段或改语义需要升协议版本，并征得用户同意。
+
+### 客户端分层（#34）
+- `client/core/` 是与 UI 无关的业务层：`{api,audio,codec,config,gateway,hotkey,rtc,signal,voice}`。**`core/` 禁止 import `desktop/`、`wails`、`application`、`@wailsio`**——由 `client/core_boundary_test.go` 用 `go/ast` 机制性强制，改 `core/` 后必须 `go test -count=1 -run TestCoreForbidsDesktopImports .`（该测试运行时扫目录，**不加 `-count=1` 会命中测试缓存拿到旧结果**）。
+- `client/internal/` 现在只剩平台壳件；桌面适配层在 `app.go`（Wails 绑定、窗口、托盘、事件转发），只做适配，业务逻辑在 `core/`。
+- 音频热路径文件（`core/audio/{dsp,pipeline,mixer,ringbuffer,remote}.go`）**只做机械搬迁，不改逻辑**；搬迁前后基准必须一致（参考值：`BenchmarkSendOpus` 0 allocs、`SendOpusWrite/noext` 0、`SendOpusWrite/ext` 1——那 1 个是 pion stats 拦截器的 `header.Clone()`，非本项目代码）。
+- 报音频基准一律 `-benchtime=200x -count=3` 或默认 benchtime，**禁用 `-benchtime=1x`**（单次迭代会把懒初始化算进 alloc 计数，数字不可信）。
 
 ### 前端
 - 所有 Go 调用都经过 `src/api/bridge.ts`（`Call.ByName("main.App.<方法>")`），组件里不准直接 import `@wailsio/runtime`。
