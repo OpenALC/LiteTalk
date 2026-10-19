@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -402,5 +403,282 @@ func TestSQLiteHasServers(t *testing.T) {
 	ok, err = m.HasServers(ctx)
 	if err != nil || !ok {
 		t.Fatalf("建服务器后 HasServers = %v/%v，want true/nil", ok, err)
+	}
+}
+
+// TestSQLiteUserTagLargeSnowflakeID 大 Snowflake ID + 4 位 tag 可正常写入，
+// 且按 昵称#tag 能查回（#22：溢出产生的 "-7952" 能存进 SQLite，但用户
+// 从此无法被加好友）。
+func TestSQLiteUserTagLargeSnowflakeID(t *testing.T) {
+	m := openTestSQLite(t)
+	ctx := context.Background()
+	if err := m.Migrate(ctx, findMigrationsSQLite(t)); err != nil {
+		t.Fatalf("迁移失败: %v", err)
+	}
+	cases := []struct {
+		id  int64
+		tag string
+	}{
+		{int64(1)<<62 + 123456789, "0000"}, // 旧算法的溢出面量级，且带前导零
+		{int64(1767225600000) << 22, "0420"},
+		{math.MaxInt64 - 7919, "9999"},
+	}
+	for _, tc := range cases {
+		u := &User{
+			ID: tc.id, Email: tc.tag + "@big.test", Nickname: "big-" + tc.tag,
+			Tag: tc.tag, PasswordHash: "h",
+		}
+		if err := m.CreateUser(ctx, u); err != nil {
+			t.Fatalf("id=%d tag=%s CreateUser: %v", tc.id, tc.tag, err)
+		}
+		got, err := m.UserByNicknameTag(ctx, u.Nickname, tc.tag)
+		if err != nil {
+			t.Fatalf("id=%d tag=%s UserByNicknameTag: %v", tc.id, tc.tag, err)
+		}
+		if got.ID != tc.id || got.Tag != tc.tag {
+			t.Fatalf("往返失真: got id=%d tag=%q，期望 id=%d tag=%q", got.ID, got.Tag, tc.id, tc.tag)
+		}
+	}
+}
+
+// seedTxFixture 建一条完整的 服务器 → 分类 → 频道 → 消息 数据链，
+// 供事务回滚用例断言「中途失败后先前删除全部撤销」。
+func seedTxFixture(t *testing.T, m *SQLite) (u *User, sv *Server, cat *Category, ch *Channel, msg *Message) {
+	t.Helper()
+	ctx := context.Background()
+	u = &User{Email: "tx@ex.com", Nickname: "tx-user", Tag: "0001", PasswordHash: "h"}
+	if err := m.CreateUser(ctx, u); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	sv = &Server{Name: "tx-srv", OwnerID: u.ID, IconName: "music", IconColor: "#4FA4F3"}
+	if err := m.CreateServer(ctx, sv); err != nil {
+		t.Fatalf("CreateServer: %v", err)
+	}
+	if err := m.AddMember(ctx, &ServerMember{ServerID: sv.ID, UserID: u.ID, Role: RoleOwner}); err != nil {
+		t.Fatalf("AddMember: %v", err)
+	}
+	cat = &Category{ServerID: sv.ID, Name: "cat", Position: 0}
+	if err := m.CreateCategory(ctx, cat); err != nil {
+		t.Fatalf("CreateCategory: %v", err)
+	}
+	ch = &Channel{ServerID: sv.ID, Name: "voice", Type: ChannelVoice, CategoryID: &cat.ID}
+	if err := m.CreateChannel(ctx, ch); err != nil {
+		t.Fatalf("CreateChannel: %v", err)
+	}
+	msg = &Message{ChannelID: ch.ID, UserID: u.ID, Content: "hello"}
+	if err := m.CreateMessage(ctx, msg); err != nil {
+		t.Fatalf("CreateMessage: %v", err)
+	}
+	return u, sv, cat, ch, msg
+}
+
+// assertChannelsMessagesIntact 断言频道与消息仍在（事务回滚后的读回检查）。
+func assertChannelsMessagesIntact(t *testing.T, m *SQLite, chID, msgID int64) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := m.ChannelByID(ctx, chID); err != nil {
+		t.Fatalf("频道应在回滚后保留: %v", err)
+	}
+	msgs, err := m.MessagesBefore(ctx, chID, 0, 10)
+	if err != nil {
+		t.Fatalf("MessagesBefore: %v", err)
+	}
+	if len(msgs) != 1 || msgs[0].ID != msgID {
+		t.Fatalf("消息应在回滚后保留: %+v", msgs)
+	}
+}
+
+// TestSQLiteDeleteServerRollbackOnMidFailure DeleteServer 事务回滚（#22）：
+// 在第三步（删 categories）注入 ABORT，此前已执行的 messages/channels 删除
+// 必须整体撤销；移除触发器后删除应成功。
+func TestSQLiteDeleteServerRollbackOnMidFailure(t *testing.T) {
+	m := openTestSQLite(t)
+	ctx := context.Background()
+	if err := m.Migrate(ctx, findMigrationsSQLite(t)); err != nil {
+		t.Fatalf("迁移失败: %v", err)
+	}
+	u, sv, _, ch, msg := seedTxFixture(t, m)
+
+	// 触发器只在删 categories 时爆炸，位于 messages/channels 删除之后。
+	if _, err := m.DB().ExecContext(ctx,
+		`CREATE TRIGGER tx_abort_category_delete BEFORE DELETE ON categories
+		 BEGIN SELECT RAISE(ABORT, 'injected mid-transaction failure'); END`); err != nil {
+		t.Fatalf("建注入触发器: %v", err)
+	}
+	if err := m.DeleteServer(ctx, sv.ID); err == nil {
+		t.Fatal("注入失败后 DeleteServer 应返回错误")
+	}
+	// 先前已执行的删除全部回滚。
+	if _, err := m.ServerByID(ctx, sv.ID); err != nil {
+		t.Fatalf("服务器应在回滚后保留: %v", err)
+	}
+	assertChannelsMessagesIntact(t, m, ch.ID, msg.ID)
+	if cats, err := m.CategoriesOfServer(ctx, sv.ID); err != nil || len(cats) != 1 {
+		t.Fatalf("分类应在回滚后保留: %+v %v", cats, err)
+	}
+	if _, err := m.Member(ctx, sv.ID, u.ID); err != nil {
+		t.Fatalf("成员应在回滚后保留: %v", err)
+	}
+
+	// 障碍移除后，同一事务路径应成功并清空全部子资源。
+	if _, err := m.DB().ExecContext(ctx, `DROP TRIGGER tx_abort_category_delete`); err != nil {
+		t.Fatalf("删触发器: %v", err)
+	}
+	if err := m.DeleteServer(ctx, sv.ID); err != nil {
+		t.Fatalf("移除障碍后 DeleteServer 应成功: %v", err)
+	}
+	if _, err := m.ServerByID(ctx, sv.ID); err != ErrNotFound {
+		t.Fatalf("服务器应已删除: %v", err)
+	}
+	if _, err := m.ChannelByID(ctx, ch.ID); err != ErrNotFound {
+		t.Fatalf("频道应已删除: %v", err)
+	}
+	if msgs, _ := m.MessagesBefore(ctx, ch.ID, 0, 10); len(msgs) != 0 {
+		t.Fatalf("消息应已删除: %+v", msgs)
+	}
+}
+
+// TestSQLiteDeleteCategoryWithChannelsRollbackOnMidFailure 分类连带删除事务
+// 在删分类时注入 ABORT（#22）：此前删掉的 messages/channels 必须回滚。
+func TestSQLiteDeleteCategoryWithChannelsRollbackOnMidFailure(t *testing.T) {
+	m := openTestSQLite(t)
+	ctx := context.Background()
+	if err := m.Migrate(ctx, findMigrationsSQLite(t)); err != nil {
+		t.Fatalf("迁移失败: %v", err)
+	}
+	_, sv, cat, ch, msg := seedTxFixture(t, m)
+
+	if _, err := m.DB().ExecContext(ctx,
+		`CREATE TRIGGER tx_abort_category_delete BEFORE DELETE ON categories
+		 BEGIN SELECT RAISE(ABORT, 'injected mid-transaction failure'); END`); err != nil {
+		t.Fatalf("建注入触发器: %v", err)
+	}
+	if err := m.DeleteCategoryWithChannels(ctx, cat.ID); err == nil {
+		t.Fatal("注入失败后 DeleteCategoryWithChannels 应返回错误")
+	}
+	assertChannelsMessagesIntact(t, m, ch.ID, msg.ID)
+	if list, err := m.CategoriesOfServer(ctx, sv.ID); err != nil || len(list) != 1 {
+		t.Fatalf("分类应在回滚后保留: %+v %v", list, err)
+	}
+
+	if _, err := m.DB().ExecContext(ctx, `DROP TRIGGER tx_abort_category_delete`); err != nil {
+		t.Fatalf("删触发器: %v", err)
+	}
+	if err := m.DeleteCategoryWithChannels(ctx, cat.ID); err != nil {
+		t.Fatalf("移除障碍后应成功: %v", err)
+	}
+	if _, err := m.ChannelByID(ctx, ch.ID); err != ErrNotFound {
+		t.Fatalf("频道应已删除: %v", err)
+	}
+	if _, err := m.CategoryByID(ctx, cat.ID); err != ErrNotFound {
+		t.Fatalf("分类应已删除: %v", err)
+	}
+}
+
+// TestSQLiteDeleteChannelRollbackOnMidFailure DeleteChannel 先删消息再删频道，
+// 在删频道处注入 ABORT（#22）：已删的消息必须回滚。
+func TestSQLiteDeleteChannelRollbackOnMidFailure(t *testing.T) {
+	m := openTestSQLite(t)
+	ctx := context.Background()
+	if err := m.Migrate(ctx, findMigrationsSQLite(t)); err != nil {
+		t.Fatalf("迁移失败: %v", err)
+	}
+	_, _, _, ch, msg := seedTxFixture(t, m)
+
+	if _, err := m.DB().ExecContext(ctx,
+		`CREATE TRIGGER tx_abort_channel_delete BEFORE DELETE ON channels
+		 BEGIN SELECT RAISE(ABORT, 'injected mid-transaction failure'); END`); err != nil {
+		t.Fatalf("建注入触发器: %v", err)
+	}
+	if err := m.DeleteChannel(ctx, ch.ID); err == nil {
+		t.Fatal("注入失败后 DeleteChannel 应返回错误")
+	}
+	assertChannelsMessagesIntact(t, m, ch.ID, msg.ID)
+
+	if _, err := m.DB().ExecContext(ctx, `DROP TRIGGER tx_abort_channel_delete`); err != nil {
+		t.Fatalf("删触发器: %v", err)
+	}
+	if err := m.DeleteChannel(ctx, ch.ID); err != nil {
+		t.Fatalf("移除障碍后应成功: %v", err)
+	}
+	if msgs, _ := m.MessagesBefore(ctx, ch.ID, 0, 10); len(msgs) != 0 {
+		t.Fatalf("消息应已删除: %+v", msgs)
+	}
+	if _, err := m.ChannelByID(ctx, ch.ID); err != ErrNotFound {
+		t.Fatalf("频道应已删除: %v", err)
+	}
+}
+
+// TestSQLiteUseInviteAndAddMember 邀请码消费与加入成员同一事务（#22）：
+// 成功、成员冲突不消耗、次数用尽、过期与不存在路径。
+func TestSQLiteUseInviteAndAddMember(t *testing.T) {
+	m := openTestSQLite(t)
+	ctx := context.Background()
+	if err := m.Migrate(ctx, findMigrationsSQLite(t)); err != nil {
+		t.Fatalf("迁移失败: %v", err)
+	}
+	newUser := func(email, nickname, tag string) *User {
+		u := &User{Email: email, Nickname: nickname, Tag: tag, PasswordHash: "h"}
+		if err := m.CreateUser(ctx, u); err != nil {
+			t.Fatalf("CreateUser(%s): %v", email, err)
+		}
+		return u
+	}
+	u1 := newUser("j1@ex.com", "joiner1", "0001")
+	u2 := newUser("j2@ex.com", "joiner2", "0002")
+	u3 := newUser("j3@ex.com", "joiner3", "0003")
+	sv := &Server{Name: "join-srv", OwnerID: u1.ID, IconName: "music", IconColor: "#4FA4F3"}
+	if err := m.CreateServer(ctx, sv); err != nil {
+		t.Fatalf("CreateServer: %v", err)
+	}
+	if err := m.CreateInvite(ctx, &Invite{Code: "join1", ServerID: sv.ID, CreatorID: u1.ID, MaxUses: 2}); err != nil {
+		t.Fatalf("CreateInvite: %v", err)
+	}
+
+	// 成功：返回的成员带邀请码所属服务器与加入时间。
+	mem, err := m.UseInviteAndAddMember(ctx, "join1", u1.ID, RoleMember)
+	if err != nil {
+		t.Fatalf("首次加入: %v", err)
+	}
+	if mem.ServerID != sv.ID || mem.UserID != u1.ID || mem.Role != RoleMember || mem.JoinedAt.IsZero() {
+		t.Fatalf("返回成员不符: %+v", mem)
+	}
+	if got, err := m.Member(ctx, sv.ID, u1.ID); err != nil || got.Role != RoleMember {
+		t.Fatalf("成员应已写入: %+v %v", got, err)
+	}
+
+	// 同一用户重复加入：ErrConflict 且不消耗邀请码。
+	if _, err := m.UseInviteAndAddMember(ctx, "join1", u1.ID, RoleMember); err != ErrConflict {
+		t.Fatalf("重复加入应 ErrConflict，实际 %v", err)
+	}
+	if inv, _ := m.InviteByCode(ctx, "join1"); inv.Uses != 1 {
+		t.Fatalf("成员冲突不应消耗邀请码，uses = %d", inv.Uses)
+	}
+
+	// 第二个用户成功用掉最后一次。
+	if _, err := m.UseInviteAndAddMember(ctx, "join1", u2.ID, RoleMember); err != nil {
+		t.Fatalf("第二次加入: %v", err)
+	}
+	// 第三个用户：次数用尽，不写入成员。
+	if _, err := m.UseInviteAndAddMember(ctx, "join1", u3.ID, RoleMember); err != ErrConflict {
+		t.Fatalf("次数用尽应 ErrConflict，实际 %v", err)
+	}
+	if _, err := m.Member(ctx, sv.ID, u3.ID); err != ErrNotFound {
+		t.Fatalf("次数用尽后不应加入: %v", err)
+	}
+	if inv, _ := m.InviteByCode(ctx, "join1"); inv.Uses != 2 {
+		t.Fatalf("uses 应停在 2，实际 %d", inv.Uses)
+	}
+
+	// 过期与不存在。
+	past := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
+	if err := m.CreateInvite(ctx, &Invite{Code: "expired", ServerID: sv.ID, CreatorID: u1.ID, ExpiresAt: &past}); err != nil {
+		t.Fatalf("CreateInvite(expired): %v", err)
+	}
+	if _, err := m.UseInviteAndAddMember(ctx, "expired", u3.ID, RoleMember); err != ErrExpired {
+		t.Fatalf("过期应 ErrExpired，实际 %v", err)
+	}
+	if _, err := m.UseInviteAndAddMember(ctx, "missing", u3.ID, RoleMember); err != ErrNotFound {
+		t.Fatalf("不存在应 ErrNotFound，实际 %v", err)
 	}
 }

@@ -540,7 +540,8 @@ func resolveTURNSecret(explicit string, turnEnabled, dev bool) (secret string, g
 	return hex.EncodeToString(buf), true, nil
 }
 
-// validateSFUIP 生产模式拒环回地址（#22）：SFU 对外通告 IP 为环回时客户端 ICE 候选不可达。
+// validateSFUIP 生产模式拒环回与未指定地址（#22）：SFU 对外通告的 IP 为
+// 127.0.0.1/::1 或 0.0.0.0/:: 时，客户端拿到的 ICE 候选不可达。
 // dev 模式允许（本机联调）。
 func validateSFUIP(ip string, dev bool) error {
 	if dev {
@@ -552,6 +553,9 @@ func validateSFUIP(ip string, dev bool) error {
 	}
 	if parsed.IsLoopback() {
 		return fmt.Errorf("生产模式禁止环回地址（127.0.0.0/8、::1），实际 %q", ip)
+	}
+	if parsed.IsUnspecified() {
+		return fmt.Errorf("生产模式禁止未指定地址（0.0.0.0、::），实际 %q", ip)
 	}
 	return nil
 }
