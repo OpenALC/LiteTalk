@@ -53,6 +53,10 @@ func TestClientHelloNegotiation(t *testing.T) {
 	if d.Version != ProtocolVersionMax {
 		t.Fatalf("version = %d, want %d", d.Version, ProtocolVersionMax)
 	}
+	// 会话 ID 必须回传（#32 P0）：客户端据此决定是否发 gateway.resume。
+	if d.SessionID != defaultTestSid("1") {
+		t.Fatalf("session_id = %q, want %q", d.SessionID, defaultTestSid("1"))
+	}
 	// 定窄区间：协商结果应是客户端上限。
 	c.send(TypeClientHello, ClientHelloData{Min: 1, Max: 1})
 	env = c.recvUntil(TypeServerHello)
@@ -62,6 +66,30 @@ func TestClientHelloNegotiation(t *testing.T) {
 	// 首次协商已定 v2，重复 client.hello 只回当前结果、不重开区间。
 	if d.Version != ProtocolVersionMax {
 		t.Fatalf("重复协商后的 version = %d, want %d（首次结果不变）", d.Version, ProtocolVersionMax)
+	}
+	// 重复协商路径同样带 session_id。
+	if d.SessionID != defaultTestSid("1") {
+		t.Fatalf("重复协商 session_id = %q, want %q", d.SessionID, defaultTestSid("1"))
+	}
+}
+
+// TestServerHelloSessionIDEmpty 旧令牌（无会话）协商：server.hello 不带 session_id
+// （omitempty），客户端保持不续传。
+func TestServerHelloSessionIDEmpty(t *testing.T) {
+	f := newChatFixture(t)
+	c := f.dial("1:desktop:", "alice") // 显式空 sid
+
+	c.send(TypeClientHello, ClientHelloData{Min: 1, Max: 2})
+	env := c.recvUntil(TypeServerHello)
+	var d ServerHelloData
+	if err := env.Decode(&d); err != nil {
+		t.Fatalf("decode server.hello: %v", err)
+	}
+	if d.SessionID != "" {
+		t.Fatalf("旧令牌 session_id = %q, want 空", d.SessionID)
+	}
+	if strings.Contains(string(env.Data), "session_id") {
+		t.Fatalf("空会话不应下发 session_id: %s", env.Data)
 	}
 }
 

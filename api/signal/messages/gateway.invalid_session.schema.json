@@ -14,6 +14,12 @@
       "type": "string",
       "enum": ["unknown_session", "seq_expired"],
       "description": "失败原因"
+    },
+    "latest_seq": {
+      "type": "integer",
+      "minimum": 0,
+      "x-go-omitempty": true,
+      "description": "服务端环当前最大 seq（0=无环/空环），客户端据此重置序号基准"
     }
   },
   "required": ["reason"],
