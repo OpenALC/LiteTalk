@@ -1,6 +1,33 @@
 package audio
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/gen2brain/malgo"
+)
+
+// TestNewContext 真正调用 malgo.InitContext，挡住 cgo 指针传参回归。
+// 原 bug 把 Go 指针塞进 C 结构体（PApplicationName = &slice[0]），cgocheck 在
+// InitContext 调用边界直接 panic 崩进程；panic 与有无音频设备无关，所以无声卡的
+// CI 环境同样能挡住回归。后端不可用时记日志早退而不是 t.Skip。
+func TestNewContext(t *testing.T) {
+	ctx, err := NewContext(nil)
+	if err != nil {
+		// 后端不可用（无声卡/无音频服务）。cgo 指针检查已在调用边界完成，
+		// 走到这里就说明传参合法；设备缺失不构成本测试的失败。
+		t.Logf("audio backend unavailable: %v", err)
+		return
+	}
+	defer ctx.Close()
+
+	// 初始化成功时枚举必须可用：无设备返回空列表，而不是错误。
+	if _, err := ctx.Devices(malgo.Capture); err != nil {
+		t.Errorf("enumerate capture devices: %v", err)
+	}
+	if _, err := ctx.Devices(malgo.Playback); err != nil {
+		t.Errorf("enumerate playback devices: %v", err)
+	}
+}
 
 // TestPickDevice 设备 selector 解析：空 = 默认、精确 ID、名称子串（忽略大小写）、无匹配。
 func TestPickDevice(t *testing.T) {
