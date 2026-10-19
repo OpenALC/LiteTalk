@@ -54,6 +54,12 @@ type Hub struct {
 	conns      map[connKey]*client // uid+"\x00"+dev → 当前连接（§0.8）
 	nextConnID uint64              // 连接标识自增（SFU peer 归属核对用）
 
+	// presence 写入串行化（#11）：KV SET/DEL 与好友推送都在 h.mu 之外执行，
+	// 但必须按「当前连接事实」依次应用，否则旧连接的 DEL 可能落到新连接的
+	// SET 之后。锁序固定 presenceMu → h.mu，禁止反向获取。
+	presenceMu        sync.Mutex
+	presencePublished map[string]bool // uid → 本进程已发布/已推送的在线态
+
 	// evlog 事件面每会话事件环（#32）：seq 分配与断线续传补发。
 	// 实现为进程内环形队列（单实例假设，见 gateway.go 头注释）。
 	evlog EventLog
@@ -152,24 +158,25 @@ func NewHub(s *sfu.SFU, authn Authenticator, sess *auth.SessionIndex, logger *lo
 		logger = log.Default()
 	}
 	h := &Hub{
-		sfu:            s,
-		auth:           authn,
-		sess:           sess,
-		log:            logger,
-		maxPer:         maxMembers,
-		chatStore:      chat.Store,
-		limits:         chat.Limits,
-		presence:       chat.Presence,
-		dev:            chat.Dev,
-		maxConns:       chat.MaxConns,
-		joinRate:       chat.JoinRate,
-		offerRate:      chat.OfferRate,
-		heartbeatEvery: defaultHeartbeatEvery,
-		pongWait:       defaultPongWait,
-		readIdle:       defaultReadIdle,
-		rooms:          make(map[string]*roomState),
-		conns:          make(map[connKey]*client),
-		evlog:          newMemEventLog(chat.Backlog),
+		sfu:               s,
+		auth:              authn,
+		sess:              sess,
+		log:               logger,
+		maxPer:            maxMembers,
+		chatStore:         chat.Store,
+		limits:            chat.Limits,
+		presence:          chat.Presence,
+		dev:               chat.Dev,
+		maxConns:          chat.MaxConns,
+		joinRate:          chat.JoinRate,
+		offerRate:         chat.OfferRate,
+		heartbeatEvery:    defaultHeartbeatEvery,
+		pongWait:          defaultPongWait,
+		readIdle:          defaultReadIdle,
+		rooms:             make(map[string]*roomState),
+		conns:             make(map[connKey]*client),
+		evlog:             newMemEventLog(chat.Backlog),
+		presencePublished: make(map[string]bool),
 	}
 	// SFU 说话翻转 → 网关事件面（#33）：判定在 SFU ticker，下发在 WS 层。
 	s.SetOnSpeaking(h.broadcastVoiceSpeaking)
@@ -232,7 +239,9 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 	c.lastAct.Store(time.Now().UnixNano())
 
 	// 注册（§0.6 踢人序）：先登记新连接，再处理被顶替的旧连接。
-	old := h.register(c)
+	// becameOnline 是 register 在 h.mu 内判定的 0→1 边沿（#11）：只有真正
+	// 从零到一的那次连接触发 presence 写入与上线推送。
+	old, becameOnline := h.register(c)
 	// 事件环登记（#32）：会话（sid）订阅随首次连接建立，断线后环保留供 resume 补发。
 	h.evlog.Bind(c.sid, c.userID)
 	go c.writeLoop(ctx)
@@ -240,7 +249,9 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 	if old != nil {
 		h.replace(old, c)
 	}
-	h.markOnline(c)
+	if becameOnline {
+		h.syncPresence(c.userID)
+	}
 
 	h.sendJSON(c, TypeHello, HelloData{
 		User:     UserBrief{ID: id.UserID, Nickname: id.Username},
@@ -288,26 +299,48 @@ func (h *Hub) sessionOK(ctx context.Context, id Identity) bool {
 	return true
 }
 
-// register 登记连接并分配 connID；返回同 uid+dev 的旧连接（nil=无）。
-func (h *Hub) register(c *client) *client {
+// register 登记连接并分配 connID；返回同 uid+dev 的旧连接（nil=无），以及
+// 该 uid 是否由 0 条连接变为 1 条（becameOnline，#11 的上线边沿）。
+// 边沿判定必须与 conns 变更处于同一临界区：放到锁外数连接数时，多设备
+// 同时首连会各自看到「已有连接」而无人推送上线。
+func (h *Hub) register(c *client) (old *client, becameOnline bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.nextConnID++
 	c.connID = h.nextConnID
 	key := makeConnKey(c.userID, c.dev)
-	old := h.conns[key]
+	old = h.conns[key]
+	// 边沿看插入前是否有任何设备连接：同设备顶替时槽位仍被旧连接占着，
+	// 插入后数连接数会得到 1，误判成 0→1（P2 重复推送 online）。
+	hadAny := h.connCountLocked(c.userID) > 0
 	h.conns[key] = c
-	return old
+	return old, !hadAny
 }
 
 // unregister 仅当 conns[key] 仍是本连接时摘除（被顶替的旧连接不得误删新连接，§0.8）。
-func (h *Hub) unregister(c *client) {
+// 返回该 uid 是否由 1 条连接变为 0 条（becameOffline，#11 的下线边沿）；
+// 与删除在同一临界区判定，避免「先查后删」race。
+func (h *Hub) unregister(c *client) (becameOffline bool) {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	key := makeConnKey(c.userID, c.dev)
-	if h.conns[key] == c {
-		delete(h.conns, key)
+	if h.conns[key] != c {
+		return false // 已被顶替：新连接仍在同一 uid 下，状态未变
 	}
-	h.mu.Unlock()
+	delete(h.conns, key)
+	return h.connCountLocked(c.userID) == 0
+}
+
+// connCountLocked 调用方须持 h.mu。
+func (h *Hub) connCountLocked(uid string) int {
+	prefix := uid + "\x00"
+	n := 0
+	for k := range h.conns {
+		if strings.HasPrefix(string(k), prefix) {
+			n++
+		}
+	}
+	return n
 }
 
 // replace 处理同 uid+dev 的旧连接（§0.6）：同 sid = 会话半开被替换 → 静默 close 4000；
@@ -470,12 +503,15 @@ func (h *Hub) heartbeatLoop(ctx context.Context, c *client) {
 }
 
 // cleanup 断连收尾：摘连接索引、离房（触发 SFU 归属清理 + peer_left 广播）、
-// 该 uid 无其它连接时下线 presence。均做身份核对（conns[key]==c、members[uid]==c），
-// 被顶替的旧连接不会误删新连接（§0.8）。多处调用（defer/心跳超时/写失败），全程幂等。
+// unregister 判定出 1→0 边沿时下线 presence。均做身份核对（conns[key]==c、
+// members[uid]==c），被顶替的旧连接不会误删新连接（§0.8）。多处调用
+// （defer/心跳超时/写失败），全程幂等。
 func (h *Hub) cleanup(c *client) {
-	h.unregister(c)
+	becameOffline := h.unregister(c)
 	h.leaveRoom(c)
-	h.markOffline(c.userID)
+	if becameOffline {
+		h.syncPresence(c.userID)
+	}
 	h.log.Printf("ws: %s 已断开", c.userID)
 }
 
@@ -780,11 +816,17 @@ func (h *Hub) joinRoom(c *client, channelID string) {
 
 	h.log.Printf("ws: %s 加入频道 %s（%d 人）", c.userID, channelID, len(members))
 	all := memberInfos(members)
+	// 在线态从 presence KV 读取（不持 h.mu，逐成员一次 GET）；Self 取同一份快照。
+	byUID := make(map[string]MemberInfo, len(all))
+	for i := range all {
+		all[i].Online = h.presenceOnline(all[i].UserID)
+		byUID[all[i].UserID] = all[i]
+	}
 	for _, m := range members {
 		h.sendJSON(m, TypeChannelJoined, ChannelJoinedData{
 			ChannelID: channelID,
 			Members:   all,
-			Self:      memberInfoOf(m),
+			Self:      byUID[m.userID],
 		})
 	}
 }
@@ -1023,14 +1065,7 @@ func (h *Hub) connByDevice(uid, dev string) *client {
 func (h *Hub) connCount(uid string) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	prefix := uid + "\x00"
-	n := 0
-	for k := range h.conns {
-		if strings.HasPrefix(string(k), prefix) {
-			n++
-		}
-	}
-	return n
+	return h.connCountLocked(uid)
 }
 
 // connQuotaOK 单 uid 连接数配额（#20）：同 uid+dev 的重连是顶替（净增 0），
@@ -1119,16 +1154,7 @@ func memberInfoOf(m *client) MemberInfo {
 func memberInfos(members []*client) []MemberInfo {
 	infos := make([]MemberInfo, 0, len(members))
 	for _, m := range members {
-		m.mu.Lock()
-		infos = append(infos, MemberInfo{
-			UserID:   m.userID,
-			Nickname: m.username,
-			Tag:      m.tag,
-			Mute:     m.state.Mute != nil && *m.state.Mute,
-			Deafen:   m.state.Deafen != nil && *m.state.Deafen,
-			Speaking: m.state.Speaking != nil && *m.state.Speaking,
-		})
-		m.mu.Unlock()
+		infos = append(infos, memberInfoOf(m))
 	}
 	return infos
 }

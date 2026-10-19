@@ -1,7 +1,7 @@
 // presence 在线状态（#11）：presence:{uid} 键由 hub 写、REST 侧读。
-// 写入点：连接 register 后 SET（TTL 90s）、心跳成功续期、cleanup 且该 uid 无
-// 其它连接时 DEL。DEL 必须幂等且带连接实例核对（unregister 已保证被顶替的旧
-// 连接不会误清新连接的在线态）。
+// 写入由 register/unregister 在 h.mu 内判定的 0→1 / 1→0 边沿触发；KV SET/DEL
+// 与好友推送在锁外执行，但统一经 presenceMu 串行化并重新读取连接索引的最新
+// 事实，避免旧连接的 DEL 落到新连接的 SET 之后把在线用户误删成离线。
 package signal
 
 import (
@@ -29,46 +29,71 @@ const defaultPresenceTTL = 90 * time.Second
 // 改格式必须两边一起改。
 func presenceKey(uid string) string { return "presence:" + uid }
 
-// markOnline 连接建立：SET presence:{uid} 并在 0→1 变化时推在线。
-// 调用方不得持有 h.mu（内含 KV I/O 与好友查询）。
-func (h *Hub) markOnline(c *client) {
+// syncPresence 把该 uid 的 presence 键与好友推送对齐到连接索引的当前事实。
+// 由 register/unregister 锁内判定的 0→1 / 1→0 边沿触发；调用方不得持有 h.mu。
+//
+// 不能把边沿上算出的 online 直接落 KV：边沿判定与 KV 应用之间还有窗口，
+// 断线清理与重连可能交错，按各自捕获的状态落盘会让后执行的旧状态覆盖新状态。
+// 这里在 presenceMu 下重新数连接数，后到的写入总是取最新事实；presencePublished
+// 记录本进程已发布的态，兜住重复推送（同设备顶替、并发首连都只推一次）。
+func (h *Hub) syncPresence(uid string) {
 	if h.presence == nil {
 		return
 	}
-	ctx := context.Background()
-	if err := h.presence.Set(ctx, presenceKey(c.userID), "1", h.ttl()); err != nil {
-		h.log.Printf("presence: SET %s 失败: %v", c.userID, err)
+	h.presenceMu.Lock()
+	defer h.presenceMu.Unlock()
+	if h.presencePublished == nil {
+		h.presencePublished = make(map[string]bool)
 	}
-	// 去抖：该 uid 已有其它连接（多设备）时状态未变，不推。
-	if h.connCount(c.userID) <= 1 {
-		h.pushPresence(c.userID, true)
-	}
-}
-
-// markOffline 连接清理：该 uid 已无任何连接时 DEL 并推离线。
-// 由 cleanup 调用（unregister 之后），调用方不得持有 h.mu。
-func (h *Hub) markOffline(uid string) {
-	if h.presence == nil {
-		return
-	}
-	if h.connCount(uid) > 0 {
-		return // 其它设备仍在线：状态未变
+	online := h.connCount(uid) > 0
+	if h.presencePublished[uid] == online {
+		return // 状态未变：不重写、不重推
 	}
 	ctx := context.Background()
-	if err := h.presence.Del(ctx, presenceKey(uid)); err != nil {
-		h.log.Printf("presence: DEL %s 失败: %v", uid, err)
+	if online {
+		if err := h.presence.Set(ctx, presenceKey(uid), "1", h.ttl()); err != nil {
+			h.log.Printf("presence: SET %s 失败: %v", uid, err)
+			return
+		}
+	} else {
+		if err := h.presence.Del(ctx, presenceKey(uid)); err != nil {
+			h.log.Printf("presence: DEL %s 失败: %v", uid, err)
+			return
+		}
 	}
-	h.pushPresence(uid, false)
+	if online {
+		h.presencePublished[uid] = true
+	} else {
+		delete(h.presencePublished, uid) // 缺省即离线，避免 map 随历史用户无限增长
+	}
+	h.pushPresence(uid, online)
 }
 
 // renewPresence 心跳成功续期（25s 一拍，TTL 90s）。仅续期，不推送。
+// 与 syncPresence 共用 presenceMu：若连接已被顶替/摘除，取消续期，避免在
+// 离线 DEL 之后又把键写回来。
 func (h *Hub) renewPresence(c *client) {
 	if h.presence == nil {
+		return
+	}
+	h.presenceMu.Lock()
+	defer h.presenceMu.Unlock()
+	if h.connByDevice(c.userID, c.dev) != c {
 		return
 	}
 	if err := h.presence.Set(context.Background(), presenceKey(c.userID), "1", h.ttl()); err != nil {
 		h.log.Printf("presence: 续期 %s 失败: %v", c.userID, err)
 	}
+}
+
+// presenceOnline 读在线态：presence:{uid} 存在 = 在线；无 KV 依赖时恒离线。
+// 供 room 成员快照填充（#11）；不持 h.mu。
+func (h *Hub) presenceOnline(uid string) bool {
+	if h.presence == nil {
+		return false
+	}
+	_, err := h.presence.Get(context.Background(), presenceKey(uid))
+	return err == nil
 }
 
 // pushPresence 把 uid 的在线状态推给其互为已接受好友的会话（#32 事件面）。
