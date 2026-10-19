@@ -1,8 +1,14 @@
 package audio
 
+/*
+#include <stdlib.h>
+*/
+import "C"
+
 import (
 	"fmt"
 	"strings"
+	"unsafe"
 
 	"github.com/gen2brain/malgo"
 )
@@ -15,8 +21,10 @@ type DeviceInfo struct {
 }
 
 // Context 包装 malgo 上下文；进程内建议只创建一个。
+// pulseName 是交给 Pulse 后端的应用名（C 内存），随上下文一起释放。
 type Context struct {
-	ctx *malgo.AllocatedContext
+	ctx       *malgo.AllocatedContext
+	pulseName *C.char
 }
 
 // NewContext 初始化音频后端上下文（Windows 上为 WASAPI）。
@@ -28,15 +36,22 @@ func NewContext(logf func(string)) (*Context, error) {
 	// PulseAudio 后端在 connect 时读 pApplicationName（pavucontrol 等音量面板按它
 	// 显示应用名）。malgo 的 DeviceConfig.Pulse 只暴露 StreamName*，应用名在
 	// ContextConfig.Pulse.PApplicationName——只能在 init context 时设置一次。
-	// 指针需活到 InitContext 返回：局部字节串栈/堆分配期间被 C 只读取，够用。
+	// 该字段只被 Pulse 后端读取，其它后端忽略。
+	//
+	// 必须用 C 内存：cfg 是 Go 侧的 C 结构体值，字段是 *byte；若指向 Go 内存
+	// （例如 &slice[0]），就构成"传给 C 的 Go 指针所指内存里含 Go 指针"，
+	// cgocheck 在调用边界直接 panic——与 C 是否留存、指针是否 KeepAlive 无关。
+	// C.CString 分配在 C 堆、GC 不碰，可安全让 C 留存。miniaudio 在 ma_context_init
+	// 里 ma_copy_string 复制一份，本份由 Context 持有、Close 时释放。
+	pulseName := C.CString("LiteTalk")
 	cfg := malgo.ContextConfig{}
-	pulseName := append([]byte("LiteTalk"), 0)
-	cfg.Pulse.PApplicationName = &pulseName[0]
+	cfg.Pulse.PApplicationName = (*byte)(unsafe.Pointer(pulseName))
 	ctx, err := malgo.InitContext(nil, cfg, logf)
 	if err != nil {
+		C.free(unsafe.Pointer(pulseName))
 		return nil, fmt.Errorf("init audio context: %w", err)
 	}
-	return &Context{ctx: ctx}, nil
+	return &Context{ctx: ctx, pulseName: pulseName}, nil
 }
 
 // Close 释放上下文。调用前必须先停掉所有由它创建的设备。
@@ -47,6 +62,10 @@ func (c *Context) Close() error {
 	err := c.ctx.Uninit()
 	c.ctx.Free()
 	c.ctx = nil
+	if c.pulseName != nil {
+		C.free(unsafe.Pointer(c.pulseName))
+		c.pulseName = nil
+	}
 	return err
 }
 
