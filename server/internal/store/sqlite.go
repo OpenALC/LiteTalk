@@ -37,6 +37,8 @@ func sqliteDSN(path string) string {
 }
 
 // OpenSQLite 打开（必要时创建）path 处的库；path 为空时取 LITETALK_SQLITE_PATH。
+// 权限（#88）：数据目录 0700、库文件与 -wal/-shm 0600——库里有密码哈希、会话
+// 和邀请数据，同机其他用户不能读。旧部署已有的宽松权限在打开时就地收紧。
 // MaxOpenConns(1)：SQLite 单写者，连接池 >1 只会在 busy_timeout 边缘打转
 // （常见坑：SQLITE_BUSY 风暴），并发写让单连接排队反而更稳。
 func OpenSQLite(path string) (*SQLite, error) {
@@ -46,10 +48,16 @@ func OpenSQLite(path string) (*SQLite, error) {
 	if path == "" {
 		return nil, errors.New("sqlite: 库路径为空")
 	}
-	if dir := filepath.Dir(path); dir != "" && dir != "." && dir != path {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if dir != "" && dir != "." && dir != path {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("sqlite: 建数据目录: %w", err)
 		}
+	}
+	// 先以 0600 预创建库文件与 -wal/-shm：SQLite 首次连接建库会按进程 umask
+	// 落成 0644，WAL 文件更是要到首次写入才创建，这里把可读窗口和时序问题一起消掉。
+	if err := precreateSQLiteFiles(path); err != nil {
+		return nil, fmt.Errorf("sqlite: 创建库文件: %w", err)
 	}
 	db, err := sql.Open("sqlite", sqliteDSN(path))
 	if err != nil {
@@ -61,6 +69,12 @@ func OpenSQLite(path string) (*SQLite, error) {
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite ping: %w", err)
+	}
+	// Ping 会按 DSN 打开 WAL，-wal/-shm 可能在这之后才存在；统一在打开完成后收紧。
+	// Windows 无 POSIX 权限位，该函数是 no-op（见 sqlite_perms_windows.go）。
+	if err := tightenSQLitePerms(dir, path); err != nil {
+		_ = db.Close()
+		return nil, err
 	}
 	return &SQLite{db: db}, nil
 }
