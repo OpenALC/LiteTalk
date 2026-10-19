@@ -532,10 +532,8 @@ func (m *Manager) GetSavedCredentials() SavedCredentials {
 // Linux Secret Service）。Linux keyring 不可用时密码不保存（绝不回落 base64
 // 文件——base64 等同明文），只记邮箱。
 func (m *Manager) SetSavedCredentials(email, password string) error {
-	enc := ""
-	if password != "" {
-		enc, _ = savedPasswordPut(password)
-	}
+	// 空密码等同清除：Linux 下必须同时删 keyring 项，否则旧密码会在下次启动复活。
+	enc, _ := savedPasswordPut(password)
 	return m.Update(func(c *Config) error {
 		c.SavedEmail = email
 		c.EncPassword = enc
