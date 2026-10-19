@@ -1,5 +1,5 @@
 // hotkeySpec 全局热键绑定语法。纯函数集中在本文件，与 Go 侧
-// client/internal/hotkey.ParseBinding 的语义逐条对齐（任务书 §0.2）：
+// client/core/hotkey.ParseBinding 的语义逐条对齐（任务书 §0.2）：
 //   · 修饰键 ctrl/alt/shift/win，顺序不敏感，重复即非法
 //   · 主键：a-z、0-9、f1-f24、space/tab/esc/enter/up/down/left/right/home/end/
 //     pgup/pgdn/ins/del，标点 ` - = [ ] \ ; ' , . /，以及 mouse1-mouse5

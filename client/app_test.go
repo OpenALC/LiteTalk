@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OpenALC/LiteTalk/client/internal/config"
-	"github.com/OpenALC/LiteTalk/client/internal/hotkey"
+	"github.com/OpenALC/LiteTalk/client/core/config"
+	"github.com/OpenALC/LiteTalk/client/core/hotkey"
 	"github.com/OpenALC/LiteTalk/client/internal/state"
 )
 

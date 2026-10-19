@@ -171,7 +171,7 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@v4
-      # libx11-dev / libxi-dev 供 client/internal/hotkey/hotkey_linux.go 的 cgo 用
+      # libx11-dev / libxi-dev 供 client/core/hotkey/hotkey_linux.go 的 cgo 用
       # （X11 + XInput2 raw 事件）。只是构建期开发库：libX11.so.6 / libXi.so.6 运行
       # 时已由 libgtk-3-0 传递依赖，nfpm 的 depends 不用动。
       # desktop-file-utils 供 litetalk.desktop 静态校验（issue #6），前移到检查

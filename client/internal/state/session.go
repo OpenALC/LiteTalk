@@ -13,9 +13,9 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/OpenALC/LiteTalk/client/core/hotkey"
 	"github.com/OpenALC/LiteTalk/client/internal/audio"
 	"github.com/OpenALC/LiteTalk/client/internal/gateway"
-	"github.com/OpenALC/LiteTalk/client/internal/hotkey"
 	"github.com/OpenALC/LiteTalk/client/internal/rtc"
 	"github.com/OpenALC/LiteTalk/client/internal/signal"
 	"github.com/pion/webrtc/v4"

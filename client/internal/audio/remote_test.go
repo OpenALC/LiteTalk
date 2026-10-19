@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OpenALC/LiteTalk/client/internal/codec"
+	"github.com/OpenALC/LiteTalk/client/core/codec"
 	"github.com/OpenALC/LiteTalk/client/internal/rtc"
 	"github.com/pion/interceptor"
 	"github.com/pion/rtp"
