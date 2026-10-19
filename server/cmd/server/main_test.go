@@ -124,10 +124,10 @@ func TestResolveTURNSecret(t *testing.T) {
 	}
 }
 
-// TestValidateSFUIP 生产模式拒环回地址（#22）。
+// TestValidateSFUIP 生产模式拒环回与未指定地址（#22）。
 func TestValidateSFUIP(t *testing.T) {
 	// dev 模式全放行。
-	for _, ip := range []string{"127.0.0.1", "::1", "10.0.0.1", "bad-ip"} {
+	for _, ip := range []string{"127.0.0.1", "::1", "0.0.0.0", "::", "10.0.0.1", "bad-ip"} {
 		if err := validateSFUIP(ip, true); err != nil {
 			t.Fatalf("dev 模式 %q 应放行，实际 %v", ip, err)
 		}
@@ -136,6 +136,12 @@ func TestValidateSFUIP(t *testing.T) {
 	for _, ip := range []string{"127.0.0.1", "127.0.0.53", "::1"} {
 		if err := validateSFUIP(ip, false); err == nil {
 			t.Fatalf("生产模式环回 %q 应拒绝", ip)
+		}
+	}
+	// 生产：未指定地址拒绝（通告 0.0.0.0/:: 会让客户端候选不可达）。
+	for _, ip := range []string{"0.0.0.0", "::", "0:0:0:0:0:0:0:0"} {
+		if err := validateSFUIP(ip, false); err == nil {
+			t.Fatalf("生产模式未指定地址 %q 应拒绝", ip)
 		}
 	}
 	// 生产：非法 IP 拒绝。
