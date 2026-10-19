@@ -28,6 +28,10 @@ export LITETALK_JWT_SECRET="fuzz-$(head -c 24 /dev/urandom | base64 | tr -d '\n'
 export LITETALK_DEV_AUTH=1 # 仅 dev 构建允许（go build 不注入版本号即 dev）
 export LITETALK_AUTH_MODE=simple
 export LITETALK_TURN_PORT=0 # 关内置 TURN
+# #77：rtc/credentials 已收编契约并会被 fuzz；给临时服务端一个 TURN 密钥，
+# 让端点返回 200 而不是声明过的 503——schemathesis 的 not_a_server_error
+# 不豁免 5xx，关掉 TURN 会让契约检查因合法的 503 失败。
+export LITETALK_TURN_SECRET="fuzz-turn-$(head -c 24 /dev/urandom | base64 | tr -d '\n')"
 export LITETALK_SFU_UDP=0  # 随机端口，不占 7845
 export LITETALK_SFU_TCP=0  # 不启 ICE-TCP
 export LITETALK_SFU_IP=127.0.0.1
