@@ -17,11 +17,11 @@ import (
 	"sync/atomic"
 
 	"github.com/OpenALC/LiteTalk/client/core/api"
+	"github.com/OpenALC/LiteTalk/client/core/audio"
 	"github.com/OpenALC/LiteTalk/client/core/gateway"
 	"github.com/OpenALC/LiteTalk/client/core/hotkey"
-	"github.com/OpenALC/LiteTalk/client/internal/audio"
-	"github.com/OpenALC/LiteTalk/client/internal/rtc"
-	"github.com/OpenALC/LiteTalk/client/internal/signal"
+	"github.com/OpenALC/LiteTalk/client/core/rtc"
+	"github.com/OpenALC/LiteTalk/client/core/signal"
 	"github.com/pion/webrtc/v4"
 )
 

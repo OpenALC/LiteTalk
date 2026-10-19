@@ -50,7 +50,7 @@ func run(root string) error {
 	}
 	for _, rel := range []string{
 		filepath.Join("server", "internal", "signal", "protocol_gen.go"),
-		filepath.Join("client", "internal", "signal", "protocol_gen.go"),
+		filepath.Join("client", "core", "signal", "protocol_gen.go"),
 	} {
 		if err := os.WriteFile(filepath.Join(root, rel), body, 0o644); err != nil {
 			return fmt.Errorf("写 %s: %w", rel, err)

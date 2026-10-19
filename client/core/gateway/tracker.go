@@ -1,6 +1,6 @@
 // Package gateway 客户端事件面（#32）：seq 追踪、断线续传、invalid_session 全量补拉。
 //
-// 与 voice.Session 解耦（只依赖 internal/signal 的信封类型）；**禁止 import Wails**
+// 与 voice.Session 解耦（只依赖 core/signal 的信封类型）；**禁止 import Wails**
 // （#34 已整包移入 core/gateway，纯移动）。
 //
 // 时序（同会话重连）：client.hello → server.hello{version,session_id} 确认同会话 →
@@ -13,7 +13,7 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/OpenALC/LiteTalk/client/internal/signal"
+	"github.com/OpenALC/LiteTalk/client/core/signal"
 )
 
 // maxPending 乱序缓冲上限：正常路径 FIFO 顺序（缓冲瞬时即清），积压到上限说明

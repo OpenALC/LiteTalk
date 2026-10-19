@@ -16,10 +16,10 @@ import (
 	"time"
 
 	"github.com/OpenALC/LiteTalk/client/core/api"
+	"github.com/OpenALC/LiteTalk/client/core/audio"
 	"github.com/OpenALC/LiteTalk/client/core/config"
 	"github.com/OpenALC/LiteTalk/client/core/hotkey"
 	"github.com/OpenALC/LiteTalk/client/core/voice"
-	"github.com/OpenALC/LiteTalk/client/internal/audio"
 	"github.com/OpenALC/LiteTalk/client/internal/tray"
 	"github.com/gen2brain/malgo"
 	"github.com/wailsapp/wails/v3/pkg/application"
