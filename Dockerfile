@@ -1,7 +1,8 @@
 # LiteTalk 服务端镜像（#27）：多阶段构建，最终 CGO_ENABLED=0 静态二进制
 #（SQLite 走纯 Go 的 modernc 驱动，无 cgo 依赖）。保持单二进制卖点：不塞 MySQL/Redis/coturn。
-# 发版镜像请传版本号：docker build --build-arg VERSION=vX.Y.Z -t litetalk-server:vX.Y.Z .
-# VERSION=dev 时生产守卫（JWT/SFU IP）不生效，仅限本地自测。
+# 发版镜像请显式传版本号：docker build --build-arg VERSION=vX.Y.Z -t litetalk-server:vX.Y.Z .
+# VERSION 默认 local（非 dev）：生产守卫（JWT/SFU IP/存储降级）全部生效；
+# 只有显式传 VERSION=dev 才回到开发模式，仅限本地自测。
 FROM golang:1.27 AS build
 WORKDIR /src
 # 先只拷依赖清单：server/ 源码变更不使 go mod download 层失效。
@@ -12,9 +13,10 @@ COPY client/go.mod client/go.sum ./client/
 WORKDIR /src/server
 RUN go mod download
 COPY server/ ./
-ARG VERSION=dev
+ARG VERSION=local
 ARG TARGETARCH=amd64
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -trimpath \
+# /out/data 供最终镜像创建 /data：命名卷首次创建时继承镜像内目录属主（65532）。
+RUN mkdir -p /out/data && CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -trimpath \
     -ldflags "-s -w -X main.version=${VERSION}" \
     -o /out/litetalk-server ./cmd/server
 
@@ -22,6 +24,10 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -trimpath \
 # net.ipv4.ip_unprivileged_port_start=0（或自行 --cap-add / 反代终结 TLS）。
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/litetalk-server /litetalk-server
+# /data 属主设为 65532：compose 的命名卷首次创建会继承它，非 root 进程可直接写入
+# （SQLite / 自动生成的 jwt.secret）。bind mount 不受镜像属主影响，宿主机目录
+# 需要先 chown 65532:65532。
+COPY --from=build --chown=65532:65532 /out/data /data
 ENV LITETALK_DATA_DIR=/data \
     LITETALK_STORE=sqlite
 VOLUME /data
