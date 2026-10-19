@@ -1,8 +1,8 @@
 //go:build ignore
 
-// 一次性生成器：产出 client/internal/tray/icon.ico（32x32 品牌蓝声波条，单帧 32bpp BMP+AND）
+// 一次性生成器：产出 client/desktop/tray/icon.ico（32x32 品牌蓝声波条，单帧 32bpp BMP+AND）
 // 与 icon.png（256x256 同图案，Linux/macOS 托盘用——StatusNotifierItem 只认 PNG）。
-// 必须在本目录执行（输出为相对路径）：cd client/internal/tray && go run gen_icon.go
+// 必须在本目录执行（输出为相对路径）：cd client/desktop/tray && go run gen_icon.go
 package main
 
 import (
@@ -45,7 +45,7 @@ func drawIcon(size int) *image.NRGBA {
 func main() {
 	// 输出是相对路径：在 client/ 下 go run 会把图标写到错误位置且 embed 不更新。
 	if _, err := os.Stat("icon.go"); err != nil {
-		log.Fatal("请在 client/internal/tray 目录执行：cd client/internal/tray && go run gen_icon.go")
+		log.Fatal("请在 client/desktop/tray 目录执行：cd client/desktop/tray && go run gen_icon.go")
 	}
 	ico := encodeICO(drawIcon(32))
 	if err := os.WriteFile("icon.ico", ico, 0o644); err != nil {
