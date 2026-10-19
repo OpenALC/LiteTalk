@@ -34,6 +34,8 @@ tags:
     description: 频道与分类
   - name: messages
     description: 文字频道消息
+  - name: sync
+    description: 事件续传失败后的聚合快照
 paths:
   /api/v1/config:
     get:
@@ -439,6 +441,28 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/sync:
+    get:
+      operationId: getSync
+      summary: 事件续传失败后的聚合快照
+      description: >
+        当前用户的全量视图快照：所在服务器（含分类与频道）与好友列表。
+        只返回调用者为成员的服务器与频道；user 为 PublicUser（不含 email），
+        online 为真实在线态。续传失败（gateway.invalid_session）后客户端用
+        一次请求恢复服务器/频道/好友视图；消息仍按会话内已见频道单独补拉。
+        code：401；5xx internal。
+      tags: [sync]
+      responses:
+        '200':
+          description: 聚合快照
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncSnapshot'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         default:
           $ref: '#/components/responses/Internal'
   /api/v1/servers:
@@ -1433,6 +1457,39 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ChannelInfo'
+    SyncServer:
+      type: object
+      title: SyncServer
+      description: 聚合快照中的服务器：ServerInfo 字段平铺 + 分类与频道（空为 []，非 null）。
+      allOf:
+        - $ref: '#/components/schemas/ServerInfo'
+        - type: object
+          required: [categories, channels]
+          properties:
+            categories:
+              type: array
+              items:
+                $ref: '#/components/schemas/CategoryInfo'
+            channels:
+              type: array
+              items:
+                $ref: '#/components/schemas/ChannelInfo'
+    SyncSnapshot:
+      type: object
+      title: SyncSnapshot
+      description: >
+        续传失败后的聚合快照（#78）。servers 只含调用者为成员的服务器与其频道；
+        friends 的 user 为 PublicUser（不含 email），online 为真实在线态。
+      required: [servers, friends]
+      properties:
+        servers:
+          type: array
+          items:
+            $ref: '#/components/schemas/SyncServer'
+        friends:
+          type: array
+          items:
+            $ref: '#/components/schemas/FriendEntry'
     RegisterRequest:
       type: object
       title: RegisterRequest
