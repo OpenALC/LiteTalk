@@ -32,6 +32,7 @@ env:
   GO_VERSION: '1.27'
   NODE_VERSION: '22'
   NFPM_VERSION: 'v2.48.0'
+  SCHEMATHESIS_VERSION: '4.32.0'
 
 jobs:
   # ======================= 检查组（每次 push / PR，全部阻塞） =======================
@@ -80,6 +81,47 @@ jobs:
           go run ./api/tools/signalgen
           go run ./api/tools/openapigen -skip-ts
           git diff --exit-code
+
+  # 契约测试（#30）：契约 ↔ 实现双向比对 + 生成新鲜度 + schemathesis 模糊测试。
+  # 阻塞发版（release 的 needs/if 都含本 job）。types.gen.ts 的新鲜度在 check-frontend
+  # 校验（那侧有 pnpm），这里只管 Go 生成物。
+  check-contract:
+    name: 契约检查
+    needs: check-server
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: server/go.sum
+      - name: 生成代码新鲜度（signalgen + openapigen）
+        run: |
+          go run ./api/tools/signalgen
+          go run ./api/tools/openapigen -skip-ts
+          git diff --exit-code
+      # REST 路由双向比对 + 信令 catalog 与两侧生成物一致（server/api/tests）
+      - name: 契约比对测试
+        run: go test ./api/tests/... -count=1 -v
+      - name: 安装 schemathesis（锁版本）
+        run: |
+          python3 -m venv "$RUNNER_TEMP/sth-venv"
+          "$RUNNER_TEMP/sth-venv/bin/pip" install --quiet "schemathesis==$SCHEMATHESIS_VERSION"
+          echo "$RUNNER_TEMP/sth-venv/bin" >> "$GITHUB_PATH"
+      - name: schemathesis 模糊测试（固定 seed，无 5xx + 形状符合契约）
+        env:
+          LITETALK_FUZZ_DIR: ${{ runner.temp }}/fuzz-data
+        run: bash api/tests/run_schemathesis.sh
+      - name: 上传 fuzz 报告与服务端日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-fuzz
+          path: ${{ runner.temp }}/fuzz-data/
+          retention-days: 7
 
   # 前端只在这里构建一次，dist 以 artifact 分发给客户端检查与各打包 job
   check-frontend:
@@ -389,13 +431,15 @@ jobs:
   release:
     name: 发布 GitHub Release
     needs:
+      - check-contract
       - package-server
       - package-client-windows
       - package-client-linux
       - package-client-macos
-    # always() 让 macOS 失败不阻断；显式要求所有阻塞打包 job 为 success
+    # always() 让 macOS 失败不阻断；显式要求所有阻塞 job（含 check-contract）为 success
     if: >-
       always() && startsWith(github.ref, 'refs/tags/v') &&
+      needs.check-contract.result == 'success' &&
       needs.package-server.result == 'success' &&
       needs.package-client-windows.result == 'success' &&
       needs.package-client-linux.result == 'success'
