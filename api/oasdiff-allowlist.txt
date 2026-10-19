@@ -1,0 +1,201 @@
+# 已批准的破坏性变更允许清单（oasdiff，见 .github/workflows/ci.yml「契约破坏性变更」）。
+#
+# 目的：让 CI 只对「新增且未批准」的破坏性变更失败。每条目精确匹配 oasdiff
+# breaking 输出的四元组（check id + HTTP 方法 + 路径 + 描述），不支持通配/前缀，
+# 因此不会吞掉后续改动：同一路径上描述不同的新破坏性变更仍然会失败。
+#
+# 格式：<check id>	<HTTP 方法>	<路径>	<oasdiff 描述>
+# 四列必须用制表符分隔；# 开头为注释，空行忽略；重复条目会被 gate 拒绝。
+#
+# 新增条目必须先在 issue 中批准并在提交信息里引用单号；禁止批量粘贴未审阅条目。
+#
+# 当前全部条目依据 #31（REST 破坏性改造：ID 由 int64 字符串化、错误体改 RFC 9457
+# detail、游标分页等）。基线是 api/oasdiff-baseline.yaml（#31 之前的最后契约状态）。
+# 最近 release tag 一旦包含 api/openapi.yaml，CI 会改用 tag 作为基线；届时这些条目
+# 会显示为「允许清单未再用到」，可按提示清理。
+
+# ---- response-property-type-changed（#31：ID 字段 integer/int64 → string）（47 条）----
+response-property-type-changed	POST	/api/v1/auth/guest	the `user/id` response's property `type/format` changed from `integer/int64` to `string` for status `201`
+response-property-type-changed	POST	/api/v1/auth/login	the `user/id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	POST	/api/v1/auth/refresh	the `user/id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	POST	/api/v1/auth/register	the `user/id` response's property `type/format` changed from `integer/int64` to `string` for status `201`
+response-property-type-changed	PATCH	/api/v1/categories/{id}	the `id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	PATCH	/api/v1/categories/{id}	the `server_id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	PATCH	/api/v1/channels/{id}	the `category_id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	PATCH	/api/v1/channels/{id}	the `id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	PATCH	/api/v1/channels/{id}	the `server_id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	GET	/api/v1/channels/{id}/messages	the `items/channel_id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	GET	/api/v1/channels/{id}/messages	the `items/id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	GET	/api/v1/channels/{id}/messages	the `items/user_id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	POST	/api/v1/channels/{id}/messages	the `channel_id` response's property `type/format` changed from `integer/int64` to `string` for status `201`
+response-property-type-changed	POST	/api/v1/channels/{id}/messages	the `id` response's property `type/format` changed from `integer/int64` to `string` for status `201`
+response-property-type-changed	POST	/api/v1/channels/{id}/messages	the `user_id` response's property `type/format` changed from `integer/int64` to `string` for status `201`
+response-property-type-changed	GET	/api/v1/friends	the `items/id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	GET	/api/v1/friends	the `items/user/id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	PATCH	/api/v1/friends/{id}	the `id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	PATCH	/api/v1/friends/{id}	the `user/id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	POST	/api/v1/friends/requests	the `id` response's property `type/format` changed from `integer/int64` to `string` for status `201`
+response-property-type-changed	POST	/api/v1/friends/requests	the `user/id` response's property `type/format` changed from `integer/int64` to `string` for status `201`
+response-property-type-changed	POST	/api/v1/friends/requests/{id}/accept	the `id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	POST	/api/v1/friends/requests/{id}/accept	the `user/id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	GET	/api/v1/servers	the `items/id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	GET	/api/v1/servers	the `items/owner_id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	POST	/api/v1/servers	the `id` response's property `type/format` changed from `integer/int64` to `string` for status `201`
+response-property-type-changed	POST	/api/v1/servers	the `owner_id` response's property `type/format` changed from `integer/int64` to `string` for status `201`
+response-property-type-changed	PATCH	/api/v1/servers/{id}	the `id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	PATCH	/api/v1/servers/{id}	the `owner_id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	POST	/api/v1/servers/{id}/categories	the `id` response's property `type/format` changed from `integer/int64` to `string` for status `201`
+response-property-type-changed	POST	/api/v1/servers/{id}/categories	the `server_id` response's property `type/format` changed from `integer/int64` to `string` for status `201`
+response-property-type-changed	GET	/api/v1/servers/{id}/channels	the `categories/items/id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	GET	/api/v1/servers/{id}/channels	the `categories/items/server_id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	GET	/api/v1/servers/{id}/channels	the `channels/items/category_id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	GET	/api/v1/servers/{id}/channels	the `channels/items/id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	GET	/api/v1/servers/{id}/channels	the `channels/items/server_id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	POST	/api/v1/servers/{id}/channels	the `category_id` response's property `type/format` changed from `integer/int64` to `string` for status `201`
+response-property-type-changed	POST	/api/v1/servers/{id}/channels	the `id` response's property `type/format` changed from `integer/int64` to `string` for status `201`
+response-property-type-changed	POST	/api/v1/servers/{id}/channels	the `server_id` response's property `type/format` changed from `integer/int64` to `string` for status `201`
+response-property-type-changed	POST	/api/v1/servers/{id}/invites	the `creator_id` response's property `type/format` changed from `integer/int64` to `string` for status `201`
+response-property-type-changed	POST	/api/v1/servers/{id}/invites	the `server_id` response's property `type/format` changed from `integer/int64` to `string` for status `201`
+response-property-type-changed	GET	/api/v1/servers/{id}/members	the `items/server_id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	GET	/api/v1/servers/{id}/members	the `items/user_id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	POST	/api/v1/servers/join	the `id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	POST	/api/v1/servers/join	the `owner_id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	GET	/api/v1/users/me	the `id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+response-property-type-changed	PATCH	/api/v1/users/me	the `id` response's property `type/format` changed from `integer/int64` to `string` for status `200`
+
+# ---- request-property-type-changed（#31：请求字段 integer/int64 → string）（2 条）----
+request-property-type-changed	PATCH	/api/v1/channels/{id}	the `category_id` request property `type/format` changed from `integer/int64` to `string`
+request-property-type-changed	POST	/api/v1/servers/{id}/channels	the `category_id` request property `type/format` changed from `integer/int64` to `string`
+
+# ---- response-property-became-optional（#31：错误体 message → RFC 9457 detail）（131 条）----
+response-property-became-optional	POST	/api/v1/auth/email-code	the response property `message` became optional for the status `400`
+response-property-became-optional	POST	/api/v1/auth/email-code	the response property `message` became optional for the status `404`
+response-property-became-optional	POST	/api/v1/auth/email-code	the response property `message` became optional for the status `409`
+response-property-became-optional	POST	/api/v1/auth/email-code	the response property `message` became optional for the status `429`
+response-property-became-optional	POST	/api/v1/auth/email-code	the response property `message` became optional for the status `default`
+response-property-became-optional	POST	/api/v1/auth/guest	the response property `message` became optional for the status `400`
+response-property-became-optional	POST	/api/v1/auth/guest	the response property `message` became optional for the status `403`
+response-property-became-optional	POST	/api/v1/auth/guest	the response property `message` became optional for the status `429`
+response-property-became-optional	POST	/api/v1/auth/guest	the response property `message` became optional for the status `default`
+response-property-became-optional	POST	/api/v1/auth/login	the response property `message` became optional for the status `400`
+response-property-became-optional	POST	/api/v1/auth/login	the response property `message` became optional for the status `401`
+response-property-became-optional	POST	/api/v1/auth/login	the response property `message` became optional for the status `429`
+response-property-became-optional	POST	/api/v1/auth/login	the response property `message` became optional for the status `default`
+response-property-became-optional	POST	/api/v1/auth/logout	the response property `message` became optional for the status `400`
+response-property-became-optional	POST	/api/v1/auth/logout	the response property `message` became optional for the status `401`
+response-property-became-optional	POST	/api/v1/auth/logout	the response property `message` became optional for the status `default`
+response-property-became-optional	POST	/api/v1/auth/password/reset	the response property `message` became optional for the status `400`
+response-property-became-optional	POST	/api/v1/auth/password/reset	the response property `message` became optional for the status `403`
+response-property-became-optional	POST	/api/v1/auth/password/reset	the response property `message` became optional for the status `404`
+response-property-became-optional	POST	/api/v1/auth/password/reset	the response property `message` became optional for the status `429`
+response-property-became-optional	POST	/api/v1/auth/password/reset	the response property `message` became optional for the status `default`
+response-property-became-optional	POST	/api/v1/auth/refresh	the response property `message` became optional for the status `400`
+response-property-became-optional	POST	/api/v1/auth/refresh	the response property `message` became optional for the status `401`
+response-property-became-optional	POST	/api/v1/auth/refresh	the response property `message` became optional for the status `default`
+response-property-became-optional	POST	/api/v1/auth/register	the response property `message` became optional for the status `400`
+response-property-became-optional	POST	/api/v1/auth/register	the response property `message` became optional for the status `409`
+response-property-became-optional	POST	/api/v1/auth/register	the response property `message` became optional for the status `429`
+response-property-became-optional	POST	/api/v1/auth/register	the response property `message` became optional for the status `default`
+response-property-became-optional	DELETE	/api/v1/categories/{id}	the response property `message` became optional for the status `400`
+response-property-became-optional	DELETE	/api/v1/categories/{id}	the response property `message` became optional for the status `401`
+response-property-became-optional	DELETE	/api/v1/categories/{id}	the response property `message` became optional for the status `403`
+response-property-became-optional	DELETE	/api/v1/categories/{id}	the response property `message` became optional for the status `404`
+response-property-became-optional	DELETE	/api/v1/categories/{id}	the response property `message` became optional for the status `409`
+response-property-became-optional	DELETE	/api/v1/categories/{id}	the response property `message` became optional for the status `default`
+response-property-became-optional	PATCH	/api/v1/categories/{id}	the response property `message` became optional for the status `400`
+response-property-became-optional	PATCH	/api/v1/categories/{id}	the response property `message` became optional for the status `401`
+response-property-became-optional	PATCH	/api/v1/categories/{id}	the response property `message` became optional for the status `403`
+response-property-became-optional	PATCH	/api/v1/categories/{id}	the response property `message` became optional for the status `404`
+response-property-became-optional	PATCH	/api/v1/categories/{id}	the response property `message` became optional for the status `default`
+response-property-became-optional	DELETE	/api/v1/channels/{id}	the response property `message` became optional for the status `400`
+response-property-became-optional	DELETE	/api/v1/channels/{id}	the response property `message` became optional for the status `401`
+response-property-became-optional	DELETE	/api/v1/channels/{id}	the response property `message` became optional for the status `403`
+response-property-became-optional	DELETE	/api/v1/channels/{id}	the response property `message` became optional for the status `404`
+response-property-became-optional	DELETE	/api/v1/channels/{id}	the response property `message` became optional for the status `default`
+response-property-became-optional	PATCH	/api/v1/channels/{id}	the response property `message` became optional for the status `400`
+response-property-became-optional	PATCH	/api/v1/channels/{id}	the response property `message` became optional for the status `401`
+response-property-became-optional	PATCH	/api/v1/channels/{id}	the response property `message` became optional for the status `403`
+response-property-became-optional	PATCH	/api/v1/channels/{id}	the response property `message` became optional for the status `404`
+response-property-became-optional	PATCH	/api/v1/channels/{id}	the response property `message` became optional for the status `default`
+response-property-became-optional	GET	/api/v1/channels/{id}/messages	the response property `message` became optional for the status `400`
+response-property-became-optional	GET	/api/v1/channels/{id}/messages	the response property `message` became optional for the status `401`
+response-property-became-optional	GET	/api/v1/channels/{id}/messages	the response property `message` became optional for the status `403`
+response-property-became-optional	GET	/api/v1/channels/{id}/messages	the response property `message` became optional for the status `404`
+response-property-became-optional	GET	/api/v1/channels/{id}/messages	the response property `message` became optional for the status `default`
+response-property-became-optional	POST	/api/v1/channels/{id}/messages	the response property `message` became optional for the status `400`
+response-property-became-optional	POST	/api/v1/channels/{id}/messages	the response property `message` became optional for the status `401`
+response-property-became-optional	POST	/api/v1/channels/{id}/messages	the response property `message` became optional for the status `403`
+response-property-became-optional	POST	/api/v1/channels/{id}/messages	the response property `message` became optional for the status `404`
+response-property-became-optional	POST	/api/v1/channels/{id}/messages	the response property `message` became optional for the status `429`
+response-property-became-optional	POST	/api/v1/channels/{id}/messages	the response property `message` became optional for the status `default`
+response-property-became-optional	GET	/api/v1/friends	the response property `message` became optional for the status `401`
+response-property-became-optional	GET	/api/v1/friends	the response property `message` became optional for the status `default`
+response-property-became-optional	DELETE	/api/v1/friends/{id}	the response property `message` became optional for the status `400`
+response-property-became-optional	DELETE	/api/v1/friends/{id}	the response property `message` became optional for the status `401`
+response-property-became-optional	DELETE	/api/v1/friends/{id}	the response property `message` became optional for the status `403`
+response-property-became-optional	DELETE	/api/v1/friends/{id}	the response property `message` became optional for the status `404`
+response-property-became-optional	DELETE	/api/v1/friends/{id}	the response property `message` became optional for the status `default`
+response-property-became-optional	PATCH	/api/v1/friends/{id}	the response property `message` became optional for the status `400`
+response-property-became-optional	PATCH	/api/v1/friends/{id}	the response property `message` became optional for the status `401`
+response-property-became-optional	PATCH	/api/v1/friends/{id}	the response property `message` became optional for the status `403`
+response-property-became-optional	PATCH	/api/v1/friends/{id}	the response property `message` became optional for the status `404`
+response-property-became-optional	PATCH	/api/v1/friends/{id}	the response property `message` became optional for the status `default`
+response-property-became-optional	POST	/api/v1/friends/requests	the response property `message` became optional for the status `400`
+response-property-became-optional	POST	/api/v1/friends/requests	the response property `message` became optional for the status `401`
+response-property-became-optional	POST	/api/v1/friends/requests	the response property `message` became optional for the status `404`
+response-property-became-optional	POST	/api/v1/friends/requests	the response property `message` became optional for the status `409`
+response-property-became-optional	POST	/api/v1/friends/requests	the response property `message` became optional for the status `default`
+response-property-became-optional	POST	/api/v1/friends/requests/{id}/accept	the response property `message` became optional for the status `400`
+response-property-became-optional	POST	/api/v1/friends/requests/{id}/accept	the response property `message` became optional for the status `401`
+response-property-became-optional	POST	/api/v1/friends/requests/{id}/accept	the response property `message` became optional for the status `403`
+response-property-became-optional	POST	/api/v1/friends/requests/{id}/accept	the response property `message` became optional for the status `404`
+response-property-became-optional	POST	/api/v1/friends/requests/{id}/accept	the response property `message` became optional for the status `409`
+response-property-became-optional	POST	/api/v1/friends/requests/{id}/accept	the response property `message` became optional for the status `default`
+response-property-became-optional	GET	/api/v1/servers	the response property `message` became optional for the status `401`
+response-property-became-optional	GET	/api/v1/servers	the response property `message` became optional for the status `default`
+response-property-became-optional	POST	/api/v1/servers	the response property `message` became optional for the status `400`
+response-property-became-optional	POST	/api/v1/servers	the response property `message` became optional for the status `401`
+response-property-became-optional	POST	/api/v1/servers	the response property `message` became optional for the status `default`
+response-property-became-optional	DELETE	/api/v1/servers/{id}	the response property `message` became optional for the status `400`
+response-property-became-optional	DELETE	/api/v1/servers/{id}	the response property `message` became optional for the status `401`
+response-property-became-optional	DELETE	/api/v1/servers/{id}	the response property `message` became optional for the status `403`
+response-property-became-optional	DELETE	/api/v1/servers/{id}	the response property `message` became optional for the status `404`
+response-property-became-optional	DELETE	/api/v1/servers/{id}	the response property `message` became optional for the status `default`
+response-property-became-optional	PATCH	/api/v1/servers/{id}	the response property `message` became optional for the status `400`
+response-property-became-optional	PATCH	/api/v1/servers/{id}	the response property `message` became optional for the status `401`
+response-property-became-optional	PATCH	/api/v1/servers/{id}	the response property `message` became optional for the status `403`
+response-property-became-optional	PATCH	/api/v1/servers/{id}	the response property `message` became optional for the status `404`
+response-property-became-optional	PATCH	/api/v1/servers/{id}	the response property `message` became optional for the status `default`
+response-property-became-optional	POST	/api/v1/servers/{id}/categories	the response property `message` became optional for the status `400`
+response-property-became-optional	POST	/api/v1/servers/{id}/categories	the response property `message` became optional for the status `401`
+response-property-became-optional	POST	/api/v1/servers/{id}/categories	the response property `message` became optional for the status `403`
+response-property-became-optional	POST	/api/v1/servers/{id}/categories	the response property `message` became optional for the status `default`
+response-property-became-optional	GET	/api/v1/servers/{id}/channels	the response property `message` became optional for the status `400`
+response-property-became-optional	GET	/api/v1/servers/{id}/channels	the response property `message` became optional for the status `401`
+response-property-became-optional	GET	/api/v1/servers/{id}/channels	the response property `message` became optional for the status `403`
+response-property-became-optional	GET	/api/v1/servers/{id}/channels	the response property `message` became optional for the status `default`
+response-property-became-optional	POST	/api/v1/servers/{id}/channels	the response property `message` became optional for the status `400`
+response-property-became-optional	POST	/api/v1/servers/{id}/channels	the response property `message` became optional for the status `401`
+response-property-became-optional	POST	/api/v1/servers/{id}/channels	the response property `message` became optional for the status `403`
+response-property-became-optional	POST	/api/v1/servers/{id}/channels	the response property `message` became optional for the status `default`
+response-property-became-optional	POST	/api/v1/servers/{id}/invites	the response property `message` became optional for the status `400`
+response-property-became-optional	POST	/api/v1/servers/{id}/invites	the response property `message` became optional for the status `401`
+response-property-became-optional	POST	/api/v1/servers/{id}/invites	the response property `message` became optional for the status `403`
+response-property-became-optional	POST	/api/v1/servers/{id}/invites	the response property `message` became optional for the status `default`
+response-property-became-optional	GET	/api/v1/servers/{id}/members	the response property `message` became optional for the status `400`
+response-property-became-optional	GET	/api/v1/servers/{id}/members	the response property `message` became optional for the status `401`
+response-property-became-optional	GET	/api/v1/servers/{id}/members	the response property `message` became optional for the status `403`
+response-property-became-optional	GET	/api/v1/servers/{id}/members	the response property `message` became optional for the status `default`
+response-property-became-optional	POST	/api/v1/servers/join	the response property `message` became optional for the status `400`
+response-property-became-optional	POST	/api/v1/servers/join	the response property `message` became optional for the status `401`
+response-property-became-optional	POST	/api/v1/servers/join	the response property `message` became optional for the status `404`
+response-property-became-optional	POST	/api/v1/servers/join	the response property `message` became optional for the status `409`
+response-property-became-optional	POST	/api/v1/servers/join	the response property `message` became optional for the status `410`
+response-property-became-optional	POST	/api/v1/servers/join	the response property `message` became optional for the status `default`
+response-property-became-optional	GET	/api/v1/users/me	the response property `message` became optional for the status `401`
+response-property-became-optional	GET	/api/v1/users/me	the response property `message` became optional for the status `404`
+response-property-became-optional	GET	/api/v1/users/me	the response property `message` became optional for the status `default`
+response-property-became-optional	PATCH	/api/v1/users/me	the response property `message` became optional for the status `400`
+response-property-became-optional	PATCH	/api/v1/users/me	the response property `message` became optional for the status `401`
+response-property-became-optional	PATCH	/api/v1/users/me	the response property `message` became optional for the status `409`
+response-property-became-optional	PATCH	/api/v1/users/me	the response property `message` became optional for the status `default`

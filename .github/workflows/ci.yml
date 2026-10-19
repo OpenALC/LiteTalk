@@ -33,6 +33,8 @@ env:
   NODE_VERSION: '22'
   NFPM_VERSION: 'v2.48.0'
   SCHEMATHESIS_VERSION: '4.32.0'
+  # #86：契约破坏性变更检测工具，锁版本（禁止 @latest）
+  OASDIFF_VERSION: 'v1.34.0'
 
 jobs:
   # ======================= 检查组（每次 push / PR，全部阻塞） =======================
@@ -94,6 +96,9 @@ jobs:
         working-directory: server
     steps:
       - uses: actions/checkout@v4
+        with:
+          # #86：git describe 找上一个 release tag 需要完整历史与 tag
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
@@ -106,6 +111,13 @@ jobs:
       # REST 路由双向比对 + 信令 catalog 与两侧生成物一致（server/api/tests）
       - name: 契约比对测试
         run: go test ./api/tests/... -count=1 -v
+      # #86：与上一个 release tag 的契约对比，出现未批准的破坏性变更即失败。
+      # tag 不含 api/openapi.yaml 时回落到 api/oasdiff-baseline.yaml（脚本内选择）；
+      # 完整 breaking 列表与允许清单命中情况都打印在日志里。
+      - name: 契约破坏性变更检测（oasdiff，锁版本）
+        env:
+          LITETALK_OASDIFF_DIR: ${{ runner.temp }}/oasdiff
+        run: bash api/tests/run_breaking_check.sh
       - name: 安装 schemathesis（锁版本）
         run: |
           python3 -m venv "$RUNNER_TEMP/sth-venv"
