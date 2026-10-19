@@ -19,7 +19,6 @@ import (
 type routeInfo struct {
 	Pattern  string
 	Position string // 文件:行，失败信息用
-	FromGen  bool   // 由生成器的运行时注册表确认过
 }
 
 // recordingMux 实现 api.ServeMux，只登记 HandleFunc 的 pattern，不真正路由。
@@ -30,7 +29,7 @@ type recordingMux struct {
 }
 
 func (r *recordingMux) HandleFunc(pattern string, _ func(http.ResponseWriter, *http.Request)) {
-	r.seen = append(r.seen, routeInfo{Pattern: pattern, FromGen: true})
+	r.seen = append(r.seen, routeInfo{Pattern: pattern, Position: "运行时注册表"})
 }
 
 func (r *recordingMux) ServeHTTP(http.ResponseWriter, *http.Request) {}
