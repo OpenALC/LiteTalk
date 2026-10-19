@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -304,6 +305,132 @@ func TestAPITokenConcurrent(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+// testJWT 构造只有 payload 有意义的 JWT：客户端只解 exp 判提前续期，不验签。
+func testJWT(t *testing.T, exp time.Time) string {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{"exp": exp.Unix()})
+	if err != nil {
+		t.Fatalf("marshal jwt payload: %v", err)
+	}
+	return "eyJhbGciOiJIUzI1NiJ9." + base64.RawURLEncoding.EncodeToString(payload) + ".sig"
+}
+
+// TestEnsureAccessRefreshesExpiredJWT access 已过期 → EnsureAccess 单飞刷新一次，
+// 安装新令牌（WS 重连前主动续期的核心路径，#84）。
+func TestEnsureAccessRefreshesExpiredJWT(t *testing.T) {
+	srv, refreshCalls := newRefreshStub(t, 0)
+	c := NewAPIClient(srv.URL)
+	c.SetToken(testJWT(t, time.Now().Add(-time.Minute)))
+	c.SetRefreshSource(func(context.Context) (string, error) { return "rt1", nil })
+
+	if err := c.EnsureAccess(context.Background()); err != nil {
+		t.Fatalf("EnsureAccess: %v", err)
+	}
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("refresh 调用次数 = %d, want 1", got)
+	}
+	if c.Token() != "tok2" {
+		t.Fatalf("access 未更新为刷新结果: %q", c.Token())
+	}
+}
+
+// TestEnsureAccessSkipsFreshToken 未过期 / 无法判定 exp 的令牌都不触发刷新——
+// 否则每次 WS 重连都会旋转一次 refresh_token（dev- 令牌、测试桩尤其明显）。
+func TestEnsureAccessSkipsFreshToken(t *testing.T) {
+	srv, refreshCalls := newRefreshStub(t, 0)
+	c := NewAPIClient(srv.URL)
+	c.SetRefreshSource(func(context.Context) (string, error) { return "rt1", nil })
+
+	cases := []struct {
+		name  string
+		token string
+	}{
+		{"JWT 有效期内", testJWT(t, time.Now().Add(time.Hour))},
+		{"非 JWT（opaque/dev）", "dev-alice"},
+		{"三段式但 payload 非法", "a.!!!.c"},
+		{"payload 无 exp", "a." + base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"x"}`)) + ".c"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c.SetToken(tc.token)
+			if err := c.EnsureAccess(context.Background()); err != nil {
+				t.Fatalf("EnsureAccess: %v", err)
+			}
+			if c.Token() != tc.token {
+				t.Fatalf("不应改令牌: %q", c.Token())
+			}
+		})
+	}
+	if got := refreshCalls.Load(); got != 0 {
+		t.Fatalf("不应触发刷新, 实际 %d 次", got)
+	}
+
+	// 进入提前续期窗口（1 分钟内到期）必须刷新。
+	c.SetToken(testJWT(t, time.Now().Add(30*time.Second)))
+	if err := c.EnsureAccess(context.Background()); err != nil {
+		t.Fatalf("EnsureAccess(即将过期): %v", err)
+	}
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("即将过期应刷新一次, 实际 %d 次", got)
+	}
+}
+
+// TestEnsureAccessSingleflight 并发调用 EnsureAccess 只刷新一次，其余等待共享结果。
+func TestEnsureAccessSingleflight(t *testing.T) {
+	srv, refreshCalls := newRefreshStub(t, 150*time.Millisecond)
+	c := NewAPIClient(srv.URL)
+	c.SetToken(testJWT(t, time.Now().Add(-time.Hour)))
+	c.SetRefreshSource(func(context.Context) (string, error) { return "rt1", nil })
+
+	const n = 8
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = c.EnsureAccess(context.Background())
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("EnsureAccess[%d]: %v", i, err)
+		}
+	}
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("refresh 调用次数 = %d, want 1（单飞合并失效）", got)
+	}
+}
+
+// TestRefreshAccessForcesRefresh 握手 401 后用的强制刷新：即便本地判断令牌
+// 未过期，也要换新值（服务端拒绝 = 权威判定）。
+func TestRefreshAccessForcesRefresh(t *testing.T) {
+	srv, refreshCalls := newRefreshStub(t, 0)
+	c := NewAPIClient(srv.URL)
+	c.SetToken(testJWT(t, time.Now().Add(time.Hour)))
+	c.SetRefreshSource(func(context.Context) (string, error) { return "rt1", nil })
+
+	if err := c.RefreshAccess(context.Background()); err != nil {
+		t.Fatalf("RefreshAccess: %v", err)
+	}
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("refresh 调用次数 = %d, want 1", got)
+	}
+	if c.Token() != "tok2" {
+		t.Fatalf("access 未更新: %q", c.Token())
+	}
+
+	// 无 refresh 来源时不得静默成功：调用方要据此停止重连。
+	c2 := NewAPIClient(srv.URL)
+	if err := c2.RefreshAccess(context.Background()); !errors.Is(err, ErrNoRefreshSource) {
+		t.Fatalf("无刷新来源应返回 ErrNoRefreshSource, 得到 %v", err)
+	}
+	if err := c2.EnsureAccess(context.Background()); !errors.Is(err, ErrNoRefreshSource) {
+		t.Fatalf("空令牌 + 无刷新来源应返回 ErrNoRefreshSource, 得到 %v", err)
+	}
 }
 
 // TestAPI401SessionReplacedFatal 会话顶替三分支之「致命」：401 + session_replaced/
