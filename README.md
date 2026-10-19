@@ -50,15 +50,18 @@ Linux 产物以 **Ubuntu 24.04**（glibc 2.39）为构建基线，CI 校验产�
 
 1. **取得程序**：Releases 下载 `litetalk-server-linux-amd64.tar.gz` 解压；或克隆仓库后 `docker compose up -d`（compose 自行构建，见 [docker-compose.yml](docker-compose.yml)）。
 2. **一条命令起服**：`./litetalk-server --domain voice.example.com`；compose 场景等价于
-   `LITETALK_JWT_SECRET=$(openssl rand -hex 32) LITETALK_DOMAIN=voice.example.com docker compose up -d`。
+   `LITETALK_DOMAIN=voice.example.com docker compose up -d`。
 3. **认领实例**：把终端打印的管理员邀请码（compose 看 `docker logs litetalk`）填进客户端「注册」页，即可创建你的服务器并成为其所有者。
 
 `--domain` 一条命令完成证书签发、建库、生成邀请码，并解析域名推导 SFU 宣告地址——**不用再设 `LITETALK_SFU_IP`**。
 只有不用 `--domain` 或域名解析失败时才要手填（解析失败会直接报错并提示设置），生产构建对环回地址始终拒绝。
+首次启动会自动生成 JWT 密钥并持久化到 `$LITETALK_DATA_DIR/jwt.secret`（权限 0600，后续启动复用）；
+需要自行管理密钥时用 `LITETALK_JWT_SECRET` 显式覆盖（优先级更高，生产要求 ≥32 字节随机串）。
 邀请码可随时 `./litetalk-server --print-admin-invite` 重打。
 
 前提：域名 A 记录指向服务器、80/443 可达；绑定 80/443 需 root 或 `CAP_NET_BIND_SERVICE`
-（compose 已配 `net.ipv4.ip_unprivileged_port_start=0`）。数据落在 `$LITETALK_DATA_DIR`（默认 `./data`，compose 为 `/data`）。
+（compose 已配 `net.ipv4.ip_unprivileged_port_start=0`）。数据落在 `$LITETALK_DATA_DIR`（默认 `./data`，
+compose 为命名卷 `litetalk-data`）。改用 bind mount 时宿主机目录需先 `chown 65532:65532`（镜像以 nonroot 运行）。
 
 自建数据库/反代/Nginx/systemd 全套配置见 **[server/deploy/README.md](server/deploy/README.md)**：
 端口、MySQL/Redis/coturn 可选扩展与验证清单，RockyLinux 9.5 按步骤照抄即可。

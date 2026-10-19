@@ -1,20 +1,23 @@
 # LiteTalk 服务端一键起服（#27）：单二进制 + SQLite + 进程内 KV，无外部依赖。
 # 用法：
-#   LITETALK_JWT_SECRET=$(openssl rand -hex 32) \
 #   LITETALK_DOMAIN=voice.example.com docker compose up -d
+# JWT 密钥无需手动设置：首启自动生成并保存到命名卷里的 /data/jwt.secret（0600），
+# 后续启动复用；也可以用 LITETALK_JWT_SECRET 显式覆盖（必须 ≥32 字节随机串）。
 # 起服后管理员邀请码打印在容器日志：docker logs litetalk
 services:
   litetalk:
     build:
       context: .
       args:
-        VERSION: "${VERSION:-dev}"
-    image: litetalk-server:${VERSION:-dev}
+        # 默认 local 而非 dev：dev 会关闭生产守卫（内存存储/dev 令牌/环回 SFU）。
+        # 发版时显式传 VERSION=vX.Y.Z。
+        VERSION: "${VERSION:-local}"
+    image: litetalk-server:${VERSION:-local}
     container_name: litetalk
     restart: unless-stopped
     environment:
-      # 必填：至少 32 字节随机串。生产守卫拒绝 CHANGE_ME 等公开示例值。
-      LITETALK_JWT_SECRET: "${LITETALK_JWT_SECRET:?请设置 LITETALK_JWT_SECRET}"
+      # 可选：显式指定 JWT 密钥（≥32 字节随机串）；留空则首启自动生成并持久化。
+      LITETALK_JWT_SECRET: "${LITETALK_JWT_SECRET:-}"
       # 域名非空即启用 ACME 自动签发（80/443 双监听），并自动推导 SFU 宣告地址
       #——无需手填 LITETALK_SFU_IP（#27）。留空 = 纯 HTTP，仅限开发。
       LITETALK_DOMAIN: "${LITETALK_DOMAIN:-}"
@@ -26,7 +29,10 @@ services:
       # LITETALK_BEHIND_PROXY: "1"
       # LITETALK_TRUSTED_PROXIES: 172.16.0.0/12
     volumes:
-      - ./data:/data
+      # 命名卷：首次创建继承镜像内 /data 的属主（65532），非 root 进程可直接写。
+      # 改用 bind mount（./data:/data）时必须先：
+      #   sudo mkdir -p ./data && sudo chown -R 65532:65532 ./data
+      - litetalk-data:/data
     ports:
       - "80:80"            # ACME HTTP-01 挑战与 301（无 TLS 时也可用）
       - "443:443"          # TLS（ACME 自动签发）
@@ -60,6 +66,7 @@ services:
   #   restart: unless-stopped
   #   volumes:
   #     - redis-data:/data
-# volumes:
-#   mysql-data:
-#   redis-data:
+volumes:
+  litetalk-data:
+  # mysql-data:
+  # redis-data:
