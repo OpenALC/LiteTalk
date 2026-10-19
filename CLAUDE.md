@@ -16,7 +16,11 @@ LiteTalk 是 OpenALC 组织的开源桌面语音开黑软件，SFU 架构，服�
 ## 1. 硬性约束（违反即返工）
 
 ### 仓库与工具链
-- 远程仓库根目录**只允许**：`client/`、`server/`、`.github/`、`.gitignore`、`README.md`、`LICENSE`、`CLAUDE.md`。新增根目录文件或目录**不再需要逐次征得用户同意**（2026-10-18 一次性授权），但必须与某个 issue 对应，且不得违反其它硬约束——`docs/`、`prototype/` 等本地材料仍然禁止推送。
+- 远程仓库根目录**当前实际内容**：`client/`、`server/`、`api/`、`.github/` 四个目录，加 `.gitignore`、`.gitattributes`、`.dockerignore`、`Dockerfile`、`docker-compose.yml`、`README.md`、`LICENSE`、`CLAUDE.md` 八个文件。
+  - `api/`（#28/#29）：REST 与信令契约的单一事实源——`openapi.yaml` + `signal/*.schema.json`，由 `server/api/tools/` 下的生成器消费。
+  - `Dockerfile`/`docker-compose.yml`/`.dockerignore`（#27）：一键自托管。
+  - `.gitattributes`：统一行尾为 LF。
+  新增根目录文件或目录**不再需要逐次征得用户同意**（2026-10-18 一次性授权），但必须与某个 issue 对应，且不得违反其它硬约束——`docs/`、`prototype/` 等本地材料仍然禁止推送。
 - `docs/`、`prototype/`、`.playwright-mcp/` 等本地材料**禁止推送**（已写入 .gitignore，不要 `git add -f`）。
 - 前端包管理**只用 pnpm**，禁止 npm 和 yarn。项目级 `.npmrc` 指向 npmmirror。
 - 本机 Go 走 `GOPROXY=https://goproxy.cn,direct`；CI 在境外，使用默认源，不要把镜像写进 CI。
