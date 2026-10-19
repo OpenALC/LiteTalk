@@ -15,7 +15,8 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
-// ICEServer 与 rtcapi.ICEServer 字段对齐（本地复刻，避免跨 internal 依赖）。
+// ICEServer 与契约 ICEServer（api/openapi.yaml）字段对齐；本地复刻避免依赖
+// 服务端 API 包（探针只做黑盒调用）。
 type ICEServer struct {
 	URLs           any    `json:"urls"`
 	Username       string `json:"username,omitempty"`
