@@ -88,6 +88,8 @@ func resolveBase(flagVal string, st *State) string {
 }
 
 // newAPI 构造 REST 客户端并接上令牌刷新回写（401 自动 refresh 一次）。
+// X-LiteTalk-Client 保持 NewAPIClient 的默认 dev（服务端对探测值放行，#31）；
+// CLI 没有构建注入的版本号。
 func newAPI(base string, st *State) *api.APIClient {
 	c := api.NewAPIClient(base)
 	if st == nil {

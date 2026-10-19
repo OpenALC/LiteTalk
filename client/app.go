@@ -123,6 +123,14 @@ func newAppWithConfig(m *config.Manager) *App {
 	return &App{cfg: m}
 }
 
+// newAppAPI 构造 REST 客户端并注入构建版本（#31 升级门，未注入时是 dev）。
+// 抽成函数让测试能验证版本头，不必拉起完整 ServiceStartup。
+func newAppAPI(base string) *api.APIClient {
+	c := api.NewAPIClient(base)
+	c.SetClientVersion(version)
+	return c
+}
+
 // Bind 注入 v3 应用与主窗口引用（main() 在创建窗口后调用，晚于 RegisterService——
 // 绑定持有的是 App 指针，后续字段变更对绑定透明）。
 func (a *App) Bind(wails *application.App, window *application.WebviewWindow) {
@@ -194,7 +202,7 @@ func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) 
 	initLogging()
 	log.Printf("=== LiteTalk %s 启动 (pid=%d) ===", version, os.Getpid())
 	r := a.cfg.Resolve()
-	a.api = api.NewAPIClient(r.BaseURL)
+	a.api = newAppAPI(r.BaseURL)
 	// 401 自动刷新重试的令牌来源与回写：refresh_token 存 app 层（区分持久化
 	// 策略——游客落盘 config.json），旋转后的新令牌对经回调回传。
 	a.api.SetRefreshSource(func(ctx context.Context) (string, error) {

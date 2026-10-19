@@ -35,7 +35,7 @@ export interface paths {
         put?: never;
         /**
          * 邮箱注册（simple 模式免验证码）
-         * @description code：bad_device、bad_nickname、bad_email、bad_password、bad_bootstrap、 bad_code、bad_request、too_large；409 email_taken；429 rate_limited； 5xx internal / conflict / internal（writeStoreErr 映射）。
+         * @description code：bad_device、bad_nickname、bad_email、bad_password、bad_bootstrap、 bad_code、bad_request、too_large；409 email_taken；426 client_too_old； 429 rate_limited；5xx internal / conflict / internal（writeStoreErr 映射）。
          */
         post: operations["register"];
         delete?: never;
@@ -55,7 +55,7 @@ export interface paths {
         put?: never;
         /**
          * 邮箱密码登录
-         * @description code：bad_device、bad_request、too_large；401 bad_credentials； 429 rate_limited；5xx internal。
+         * @description code：bad_device、bad_request、too_large；401 bad_credentials； 426 client_too_old；429 rate_limited；5xx internal。
          */
         post: operations["login"];
         delete?: never;
@@ -75,7 +75,7 @@ export interface paths {
         put?: never;
         /**
          * 刷新令牌（旋转 refresh_token）
-         * @description code：bad_request、too_large；401 unauthorized、session_replaced、 session_replayed（另带响应头 X-LiteTalk-Auth）；5xx internal。
+         * @description code：bad_request、too_large；401 unauthorized、session_replaced、 session_replayed（另带响应头 X-LiteTalk-Auth）；426 client_too_old； 5xx internal。
          */
         post: operations["refresh"];
         delete?: never;
@@ -115,7 +115,7 @@ export interface paths {
         put?: never;
         /**
          * 发送邮箱验证码
-         * @description code：bad_email、bad_purpose、verification_not_required、bad_request、 too_large；404 not_found；409 email_taken；429 rate_limited；5xx internal。
+         * @description code：bad_email、bad_purpose、verification_not_required、bad_request、 too_large；404 not_found；409 email_taken；426 client_too_old； 429 rate_limited；5xx internal。
          */
         post: operations["sendEmailCode"];
         delete?: never;
@@ -135,7 +135,7 @@ export interface paths {
         put?: never;
         /**
          * 游客一键进入（simple 模式专属）
-         * @description 请求体可为空。code：bad_device、bad_request、too_large； 403 guest_disabled；429 rate_limited；5xx internal。
+         * @description 请求体可为空。code：bad_device、bad_request、too_large； 403 guest_disabled；426 client_too_old；429 rate_limited；5xx internal。
          */
         post: operations["guestLogin"];
         delete?: never;
@@ -155,7 +155,7 @@ export interface paths {
         put?: never;
         /**
          * 邮箱验证码重置密码
-         * @description full 模式才可用；成功后吊销全部 refresh 并踢线。 code：bad_password、bad_code、bad_request、too_large； 403 reset_unavailable；404 not_found；429 rate_limited；5xx internal。
+         * @description full 模式才可用；成功后吊销全部 refresh 并踢线。 code：bad_password、bad_code、bad_request、too_large； 403 reset_unavailable；404 not_found；426 client_too_old； 429 rate_limited；5xx internal。
          */
         post: operations["resetPassword"];
         delete?: never;
@@ -517,7 +517,7 @@ export interface components {
         };
         /**
          * Problem
-         * @description RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示（旧 message 字段改名为 detail）。
+         * @description RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段 （RFC 9457 允许的扩展字段，至少保留一个版本）。
          */
         Problem: {
             /** @description 问题类型 URI（urn:litetalk:error:<code>） */
@@ -533,6 +533,8 @@ export interface components {
             code: string;
             /** @description 本次出错的中文提示 */
             detail: string;
+            /** @description 兼容旧客户端的提示字段（与 detail 同值，至少保留一个版本） */
+            message?: string;
         };
         /**
          * StatusOk
@@ -930,6 +932,15 @@ export interface components {
                 "application/problem+json": components["schemas"]["Problem"];
             };
         };
+        /** @description 客户端版本过旧（body.code：client_too_old）。服务端要求请求头 X-LiteTalk-Client 不低于 1.5；缺失或更低版本的 /auth/* 请求被拒绝。 message 与 detail 同值，旧客户端可直接显示升级提示。 */
+        ClientUpgradeRequired: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/problem+json": components["schemas"]["Problem"];
+            };
+        };
         /** @description 服务端错误（body.code：internal / conflict / not_found / code_expired，store 错误映射） */
         Internal: {
             headers: {
@@ -994,6 +1005,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             409: components["responses"]["Conflict"];
+            426: components["responses"]["ClientUpgradeRequired"];
             429: components["responses"]["RateLimited"];
             default: components["responses"]["Internal"];
         };
@@ -1022,6 +1034,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            426: components["responses"]["ClientUpgradeRequired"];
             429: components["responses"]["RateLimited"];
             default: components["responses"]["Internal"];
         };
@@ -1050,6 +1063,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            426: components["responses"]["ClientUpgradeRequired"];
             default: components["responses"]["Internal"];
         };
     };
@@ -1105,6 +1119,7 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            426: components["responses"]["ClientUpgradeRequired"];
             429: components["responses"]["RateLimited"];
             default: components["responses"]["Internal"];
         };
@@ -1133,6 +1148,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             403: components["responses"]["Forbidden"];
+            426: components["responses"]["ClientUpgradeRequired"];
             429: components["responses"]["RateLimited"];
             default: components["responses"]["Internal"];
         };
@@ -1162,6 +1178,7 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            426: components["responses"]["ClientUpgradeRequired"];
             429: components["responses"]["RateLimited"];
             default: components["responses"]["Internal"];
         };

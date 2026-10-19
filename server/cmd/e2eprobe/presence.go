@@ -35,7 +35,13 @@ func registerTagged(addr, nickname string) (*probePair, error) {
 	raw, _ := json.Marshal(map[string]string{
 		"nickname": nickname, "email": email, "password": "probe1234",
 	})
-	resp, err := http.Post("http://"+addr+"/api/v1/auth/register", "application/json", bytes.NewReader(raw))
+	req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/api/v1/auth/register", bytes.NewReader(raw))
+	if err != nil {
+		return nil, fmt.Errorf("register 请求: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(clientVersionHeader, probeClientVersion)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("register 请求: %w", err)
 	}
@@ -71,6 +77,7 @@ func restJSON(method, addr, path, token string, body any) (int, []byte, error) {
 	if err != nil {
 		return 0, nil, err
 	}
+	req.Header.Set(clientVersionHeader, probeClientVersion)
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}

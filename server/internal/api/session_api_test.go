@@ -24,6 +24,7 @@ func doJSON(t *testing.T, h http.Handler, method, path, token string, body any, 
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	req.Header.Set(clientVersionHeader, testClientVersion)
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -164,6 +165,7 @@ func TestSessionRefreshRotateAndReplay(t *testing.T) {
 	// 旧刷新令牌重放 → session_replayed。
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/refresh", bytesReader([]byte(`{"refresh_token":"`+oldRefresh+`"}`)))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(clientVersionHeader, testClientVersion)
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
