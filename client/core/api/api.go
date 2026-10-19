@@ -5,6 +5,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +21,13 @@ import (
 // 致命：refresh 令牌同族已失效，刷新也救不回——不触发刷新重试，直接返回；
 // 上层应断会话、清令牌、回登录页。
 var ErrSessionReplaced = errors.New("会话已被其他设备替换")
+
+// ErrNoRefreshSource 未注入 refresh_token 来源，无法续期 access 令牌。
+var ErrNoRefreshSource = errors.New("api: 无 refresh_token 来源")
+
+// accessExpiryLeeway 提前续期的余量：JWT 的 exp 距现在不足该值即视为过期。
+// 拨号/请求前发现快过期就先换新，避免正好卡在过期边界上被 401。
+const accessExpiryLeeway = time.Minute
 
 // errBaseChanged 请求在飞期间 REST 基址被热切换：刷新结果属于旧基址，
 // 必须丢弃——绝不能把旧服务器的新令牌装回客户端、落盘或重放到新地址（#17）。
@@ -164,6 +172,68 @@ func (c *APIClient) Token() string {
 	c.tokenMu.RLock()
 	defer c.tokenMu.RUnlock()
 	return c.access
+}
+
+// EnsureAccess 确保 access 令牌可用：为空、或 JWT 的 exp 已进入提前续期窗口时，
+// 经 refreshOnce 单飞刷新一次；否则原样返回。
+// 不是 JWT 的令牌（dev- 令牌、测试桩、旧格式）无法判断 exp，按有效处理——
+// 不能因为解析不了就在每次重连时旋转 refresh_token。
+// 刷新失败返回错误，但已安装的旧令牌保持不动，由调用方决定是否继续用。
+func (c *APIClient) EnsureAccess(ctx context.Context) error {
+	tok := c.Token()
+	if tok != "" && !accessExpiring(tok, accessExpiryLeeway) {
+		return nil
+	}
+	if c.refreshSource == nil {
+		return ErrNoRefreshSource
+	}
+	_, err := c.refreshOnce(ctx, c.Base())
+	return err
+}
+
+// RefreshAccess 强制单飞刷新一次 access 令牌。WS 握手 401 后调用：服务端已经
+// 拒绝当前令牌，即便本地判断未过期也要换新值再试。
+// refresh 自身撞上 session_replaced/session_replayed 时返回 ErrSessionReplaced，
+// 供上层走被踢链路；其余错误原样上抛（上层据此停止重连，回登录态）。
+func (c *APIClient) RefreshAccess(ctx context.Context) error {
+	if c.refreshSource == nil {
+		return ErrNoRefreshSource
+	}
+	_, err := c.refreshOnce(ctx, c.Base())
+	return err
+}
+
+// accessExpiring 判断 access 令牌是否已过期或将在 leeway 内过期。
+// 解析不出 exp 时返回 false（无法判断 → 按有效处理）。
+func accessExpiring(token string, leeway time.Duration) bool {
+	exp, ok := jwtExpiry(token)
+	if !ok {
+		return false
+	}
+	return !time.Now().Add(leeway).Before(exp)
+}
+
+// jwtExpiry 只解 JWT payload 的 exp（秒级 Unix），不校验签名——仅用于客户端
+// 本地提前续期，服务端仍会独立验签。兼容带/不带 padding 的 base64url。
+func jwtExpiry(token string) (time.Time, bool) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return time.Time{}, false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		payload, err = base64.URLEncoding.DecodeString(parts[1])
+		if err != nil {
+			return time.Time{}, false
+		}
+	}
+	var claims struct {
+		Exp int64 `json:"exp"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil || claims.Exp <= 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(claims.Exp, 0), true
 }
 
 // Base 返回 REST 基址（会话侧据此判环回候选，见 IsLoopbackURL）。
