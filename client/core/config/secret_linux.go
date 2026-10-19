@@ -2,9 +2,13 @@
 
 // Package config 的 Linux 机密存储（issue #8）：优先 Secret Service
 // （zalando/go-keyring，D-Bus org.freedesktop.secrets），不可用（无桌面密钥环 /
-// 无 D-Bus）时回落「base64 编码 + 0600 文件」的弱保护——与 SSH 私钥同级的文件
-// 权限模型，防随手翻看，不防拿到文件的攻击者。游客 refresh_token 因此能跨启动
-// 保持，避免每次新建游客账号堆积。回落必须让 UI 可感知（secretMode），不静默降级。
+// 无 D-Bus）时，游客 refresh_token 回落「base64 编码 + 0600 文件」的弱保护——
+// 与 SSH 私钥同级的文件权限模型，防随手翻看，不防拿到文件的攻击者。游客令牌
+// 因此能跨启动保持，避免每次新建游客账号堆积。回落必须让 UI 可感知（secretMode），
+// 不静默降级。
+//
+// 登录密码不适用这条回落：base64 等同明文，keyring 不可用时宁可不记住密码
+// （见 savedPasswordPut/Get/Clear）。
 package config
 
 import (
@@ -15,11 +19,12 @@ import (
 	"github.com/zalando/go-keyring"
 )
 
-// keyringService / keyringGuestKey Secret Service 的定位键（固定值，勿改——
-// 改了老用户密钥环里的令牌就找不回来）。
+// keyringService / keyringGuestKey / keyringPasswordKey Secret Service 的定位键
+// （固定值，勿改——改了老用户密钥环里的凭据就找不回来）。
 const (
-	keyringService  = "LiteTalk"
-	keyringGuestKey = "guest_refresh"
+	keyringService     = "LiteTalk"
+	keyringGuestKey    = "guest_refresh"
+	keyringPasswordKey = "saved_password"
 )
 
 // protectString base64 编码落盘（可逆，非加密；文件权限见 config.go 的 0600）。
@@ -69,6 +74,42 @@ func guestTokenPut(plain string) string {
 		return ""
 	}
 	return enc
+}
+
+// savedPasswordPut 保存登录密码：写入 Secret Service 成功时返回空串
+// （EncPassword 不残留）。keyring 不可用返回 ok=false，密码宁可不记住，
+// 绝不回落 base64 文件。空串为清除语义。
+func savedPasswordPut(plain string) (enc string, ok bool) {
+	if plain == "" {
+		savedPasswordClear()
+		return "", true
+	}
+	if err := keyring.Set(keyringService, keyringPasswordKey, plain); err == nil {
+		return "", true
+	}
+	return "", false
+}
+
+// savedPasswordGet 读取登录密码：优先 Secret Service；miss（含 keyring 不可用）
+// 时回落旧版 EncPassword 的 base64 值，保证升级后首次启动仍能自动填充。
+// 旧值在下一次 savedPasswordPut 成功写 keyring 时被清空（见 SetSavedCredentials）。
+func savedPasswordGet(fileEnc string) (plain string, ok bool) {
+	if pw, err := keyring.Get(keyringService, keyringPasswordKey); err == nil && pw != "" {
+		return pw, true
+	}
+	if fileEnc == "" {
+		return "", false
+	}
+	pw, err := unprotectString(fileEnc)
+	if err != nil {
+		return "", false
+	}
+	return pw, true
+}
+
+// savedPasswordClear 删除 Secret Service 里的登录密码（不存在也算清干净）。
+func savedPasswordClear() {
+	_ = keyring.Delete(keyringService, keyringPasswordKey)
 }
 
 // secretProbe Secret Service 可用性：启动时探测一次供 UI 提示（数据路径每次都
