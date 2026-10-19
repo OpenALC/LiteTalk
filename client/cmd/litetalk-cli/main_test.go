@@ -1,14 +1,30 @@
 package main
 
 import (
-	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/OpenALC/LiteTalk/client/core/api"
+	"github.com/OpenALC/LiteTalk/client/core/audio"
 )
+
+// TestNewVoiceSessionUsesNullBackend CLI 构造路径固定走 BackendNull（#79）：
+// 无界面/容器/CI 环境没有可用的声卡，必须能在装配阶段就把后端定下来。
+func TestNewVoiceSessionUsesNullBackend(t *testing.T) {
+	st := &State{AccessToken: "tok", Nickname: "甲"}
+	sess, err := newVoiceSession(api.NewAPIClient("http://127.0.0.1:1"), st, newConsole())
+	if err != nil {
+		t.Fatalf("newVoiceSession: %v", err)
+	}
+	defer sess.Close()
+	if got := sess.AudioBackend(); got != audio.BackendNull {
+		t.Fatalf("CLI 音频后端 = %v, want BackendNull", got)
+	}
+}
 
 // TestResolveBasePriority flag 显式 > LITETALK_API > 状态文件 > 默认。
 func TestResolveBasePriority(t *testing.T) {
@@ -70,30 +86,13 @@ func TestStateRoundTrip(t *testing.T) {
 	}
 }
 
-// TestMediaSpyDetectsPipelineFailure 识别 Session 日志里的媒体启动失败行。
-func TestMediaSpyDetectsPipelineFailure(t *testing.T) {
+// TestConsoleVoiceUnavailableRecords OnVoiceUnavailable 是 CLI 观测媒体不可用的
+// 正规通道（#80）：初始化失败与入房后启动失败都走这里，printVoiceState 据此明示。
+func TestConsoleVoiceUnavailableRecords(t *testing.T) {
 	c := newConsole()
-	spy := &mediaSpy{c: c, w: io.Discard}
-	for _, line := range []string{
-		"voice: pipeline start: no suitable device",
-		"voice: mixer start: device busy",
-		"voice: pipeline unavailable: init dsp: boom",
-	} {
-		if _, err := spy.Write([]byte(line + "\n")); err != nil {
-			t.Fatal(err)
-		}
-		if c.mediaDegraded() == "" {
-			t.Fatalf("应识别降级行: %q", line)
-		}
-	}
-	// 普通日志行不得误标。
-	c2 := newConsole()
-	spy2 := &mediaSpy{c: c2, w: io.Discard}
-	if _, err := spy2.Write([]byte("voice: signal: 协商协议版本 v2\n")); err != nil {
-		t.Fatal(err)
-	}
-	if got := c2.mediaDegraded(); got != "" {
-		t.Fatalf("普通行不应标记降级, 得到 %q", got)
+	c.events().OnVoiceUnavailable("音频设备启动失败，请检查麦克风和扬声器")
+	if got := c.mediaDegraded(); got != "音频设备启动失败，请检查麦克风和扬声器" {
+		t.Fatalf("mediaDegraded = %q", got)
 	}
 }
 
