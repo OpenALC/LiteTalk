@@ -98,6 +98,12 @@ type Session struct {
 	token string // 信令令牌（access token 或 dev-<name>）
 	name  string
 
+	// audioMu 保护 audioBackend/connectBegin：后端选择只允许在 Connect 之前，
+	// 两者必须成对判定，否则并发调用会出现「选完之后又被 Connect 读走」的窗口。
+	audioMu      sync.Mutex
+	audioBackend audio.Backend // 零值 = BackendDevice（桌面端默认）
+	connectBegin bool          // Connect 已开始装配，后端不再可改
+
 	ws        *signal.Client
 	pipe      *audio.Pipeline
 	mixer     *audio.Mixer
@@ -166,10 +172,40 @@ func NewSession(api *api.APIClient, token, nickname string, ev Events, logger *l
 	return s
 }
 
+// SetAudioBackend 选择音频后端（audio.BackendDevice / audio.BackendNull）。
+// 必须在 Connect 之前调用：管线在 Connect 中按当时的选择装配，运行期换后端
+// 需要重建整条媒体链路，当前不支持——Connect 之后调用返回错误。并发调用
+// 与 Connect 之间由 audioMu 串行化，要么生效、要么明确报错。
+func (s *Session) SetAudioBackend(b audio.Backend) error {
+	if b != audio.BackendDevice && b != audio.BackendNull {
+		return fmt.Errorf("unknown audio backend: %d", int(b))
+	}
+	s.audioMu.Lock()
+	defer s.audioMu.Unlock()
+	if s.connectBegin {
+		return errors.New("audio backend must be set before Connect")
+	}
+	s.audioBackend = b
+	return nil
+}
+
+// AudioBackend 返回当前选择的音频后端；Connect 之后即为管线实际生效值。
+func (s *Session) AudioBackend() audio.Backend {
+	s.audioMu.Lock()
+	defer s.audioMu.Unlock()
+	return s.audioBackend
+}
+
 // Connect 建立信令连接并装配媒体管线（采集/播放入房才启动，见 startMedia）。
 // 媒体管线初始化失败不再让登录整体失败：置 voiceUnavailable、发
 // OnVoiceUnavailable 事件，信令照常连接（纯文字/好友功能仍可用）。
 func (s *Session) Connect(serverURL string) {
+	// 后端选择在装配开始时定格：之后 SetAudioBackend 一律报错（见其注释）。
+	s.audioMu.Lock()
+	s.connectBegin = true
+	backend := s.audioBackend
+	s.audioMu.Unlock()
+
 	wsCfg := signal.Config{
 		URL:    serverURL,
 		Logger: s.log,
@@ -216,7 +252,10 @@ func (s *Session) Connect(serverURL string) {
 
 	// 媒体管线：采集→降噪→Opus→(OnPacket→RTP)；下行混音→播放环。
 	// 构造失败（如无 Opus 的平台）降级：跳过音频初始化，信令不受影响。
+	// 后端默认 BackendDevice；无界面/容器/CI 消费方可在 Connect 前经
+	// SetAudioBackend(audio.BackendNull) 改用无声卡自检后端。
 	pcfg := audio.DefaultPipelineConfig()
+	pcfg.Backend = backend
 	pcfg.Loopback = false
 	pcfg.DSP.OnSpeakingChange = func(speaking bool) {
 		// DSP 回调跑在音频 goroutine 上，必须非阻塞：投递到容量 1 的

@@ -8,7 +8,24 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/OpenALC/LiteTalk/client/core/api"
+	"github.com/OpenALC/LiteTalk/client/core/audio"
 )
+
+// TestNewVoiceSessionUsesNullBackend CLI 构造路径固定走 BackendNull（#79）：
+// 无界面/容器/CI 环境没有可用的声卡，必须能在装配阶段就把后端定下来。
+func TestNewVoiceSessionUsesNullBackend(t *testing.T) {
+	st := &State{AccessToken: "tok", Nickname: "甲"}
+	sess, err := newVoiceSession(api.NewAPIClient("http://127.0.0.1:1"), st, newConsole())
+	if err != nil {
+		t.Fatalf("newVoiceSession: %v", err)
+	}
+	defer sess.Close()
+	if got := sess.AudioBackend(); got != audio.BackendNull {
+		t.Fatalf("CLI 音频后端 = %v, want BackendNull", got)
+	}
+}
 
 // TestResolveBasePriority flag 显式 > LITETALK_API > 状态文件 > 默认。
 func TestResolveBasePriority(t *testing.T) {
