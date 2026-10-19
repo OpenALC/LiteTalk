@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/OpenALC/LiteTalk/client/core/codec"
-	"github.com/OpenALC/LiteTalk/client/internal/rtc"
+	"github.com/OpenALC/LiteTalk/client/core/rtc"
 	"github.com/pion/webrtc/v4"
 )
 

@@ -13,7 +13,7 @@ import (
 	"github.com/OpenALC/LiteTalk/client/core/api"
 	"github.com/OpenALC/LiteTalk/client/core/config"
 	"github.com/OpenALC/LiteTalk/client/core/hotkey"
-	"github.com/OpenALC/LiteTalk/client/internal/state"
+	"github.com/OpenALC/LiteTalk/client/core/voice"
 )
 
 // 验证休眠模式三态（off/hibernate/destroy）的读写、持久化与非法值校验。
@@ -185,7 +185,7 @@ func TestOnKickedClearsSessionAndTokens(t *testing.T) {
 	app.mu.Lock()
 	app.refreshTok = "rt"
 	app.user = api.UserProfile{ID: 1, Nickname: "游客-0001", IsGuest: true}
-	app.sess = state.NewSession(app.api, "tok", "n", state.Events{}, nil)
+	app.sess = voice.NewSession(app.api, "tok", "n", voice.Events{}, nil)
 	app.mu.Unlock()
 
 	genBefore := app.loginGen.Load()
