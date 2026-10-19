@@ -63,9 +63,10 @@ type Events struct {
 	// 会话已完成本地重建（销毁 PC、清远端链路、重发 channel.join），此处只报 UI。
 	// 与 OnKicked 同线程约定（ws 读循环 goroutine，实现侧不得同步 Close 会话）。
 	OnRTCFailed func(channelID string)
-	// OnResync 事件面续传失败后的全量补拉提示（#32，gateway.invalid_session）：
+	// OnResync 事件面续传失败后的全量补拉提示（#32/#78，gateway.invalid_session）：
 	// 消息与好友在线态已由会话内部补拉完毕，服务器/频道等 REST 视图可能已过期，
 	// UI 层应重新拉取（绑定方法 ListServers/ListChannels/ListFriends 都在）。
+	// app 层固定以 data:resync 事件转发，前端收到后经绑定自取。
 	// 跑在独立 goroutine，可安全触发网络请求；nil = 不通知。
 	OnResync func()
 }
@@ -927,14 +928,28 @@ func (s *Session) ChatHandler(fn func(channelID, msgID, userID, nickname, conten
 // resyncRecentMessages 单频道补拉的消息条数（最新 N 条，覆盖断线窗口）。
 const resyncRecentMessages = 50
 
-// fullResync 事件面续传失败后的全量补拉（#32）。跑在独立 goroutine
+// applyFriendPresence 好友在线态回灌（状态型更新，幂等）。
+func (s *Session) applyFriendPresence(friends []api.FriendDTO) {
+	if s.ev.OnPresenceUpdate == nil {
+		return
+	}
+	for _, f := range friends {
+		if f.Status == "accepted" {
+			s.ev.OnPresenceUpdate(f.User.ID.String(), f.User.Online)
+		}
+	}
+}
+
+// fullResync 事件面续传失败后的全量补拉（#32/#78）。跑在独立 goroutine
 // （gateway.Tracker 异步触发），可安全做 REST I/O——WS 读循环禁止阻塞。
 // 范围：
-//  1. 本会话收过消息的频道各拉最近消息，回灌 ChatHandler（前端按消息 id 幂等，
-//     与在途增量重叠也不重复）；
-//  2. 好友在线态回灌 OnPresenceUpdate（状态型更新，幂等）；
-//  3. Events.OnResync 通知 UI 层刷新服务器/频道等 REST 视图（列表由前端经
-//     绑定方法自取，会话内不维护，只发提示不代拉）。
+//  1. 聚合快照 GET /api/v1/sync 一次取回服务器/频道/好友；好友在线态回灌
+//     OnPresenceUpdate。快照本身不落会话状态（服务器/频道视图由 UI 收到
+//     Events.OnResync 后经绑定自取）；失败只降级好友单拉，不影响后续消息补拉。
+//  2. 本会话收过消息的频道各拉最近消息，回灌 ChatHandler（前端按消息 id 幂等，
+//     与在途增量重叠也不重复）。聚合端点不含消息——按用户全部频道返消息的
+//     响应体积不可控，消息仍按 seenChans 范围补拉。
+//  3. Events.OnResync 通知 UI 层刷新服务器/频道等 REST 视图（只发提示不代拉）。
 func (s *Session) fullResync() {
 	s.mu.Lock()
 	chans := make([]string, 0, len(s.seenChans))
@@ -943,6 +958,17 @@ func (s *Session) fullResync() {
 	}
 	chatFn := s.chatFn
 	s.mu.Unlock()
+
+	if snap, err := s.api.Sync(); err != nil {
+		s.log.Printf("gateway: 聚合快照拉取失败，好友回落到单拉: %v", err)
+		if friends, ferr := s.api.ListFriends(); ferr != nil {
+			s.log.Printf("gateway: 补拉好友在线态失败: %v", ferr)
+		} else {
+			s.applyFriendPresence(friends)
+		}
+	} else {
+		s.applyFriendPresence(snap.Friends)
+	}
 
 	for _, ch := range chans {
 		cid, err := strconv.ParseInt(ch, 10, 64)
@@ -960,16 +986,6 @@ func (s *Session) fullResync() {
 		for _, m := range msgs {
 			chatFn(ch, m.ID.String(), m.UserID.String(), m.SenderNickname, m.Content,
 				strconv.FormatInt(m.CreatedAt.UnixMilli(), 10))
-		}
-	}
-
-	if friends, err := s.api.ListFriends(); err != nil {
-		s.log.Printf("gateway: 补拉好友在线态失败: %v", err)
-	} else if s.ev.OnPresenceUpdate != nil {
-		for _, f := range friends {
-			if f.Status == "accepted" {
-				s.ev.OnPresenceUpdate(f.User.ID.String(), f.User.Online)
-			}
 		}
 	}
 

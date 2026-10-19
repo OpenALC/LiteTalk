@@ -1056,3 +1056,38 @@ func (c *APIClient) ListMessages(channelID int64, limit int) ([]MessageDTO, erro
 	}
 	return list, nil
 }
+
+// ---------- 聚合快照（#78 续传收尾） ----------
+
+// SyncServerDTO 聚合快照中的服务器：ServerDTO 字段平铺 + 分类/频道（#78）。
+// 与契约 SyncServer（ServerInfo + ServerChannels）对齐。
+type SyncServerDTO struct {
+	ServerDTO
+	Categories []CategoryDTO `json:"categories"`
+	Channels   []ChannelDTO  `json:"channels"`
+}
+
+// SyncSnapshot GET /sync 的聚合快照（#78）：续传失败（gateway.invalid_session）
+// 后一次请求取回所在服务器（含分类/频道）与好友列表。只含调用者为成员的
+// 服务器；好友 user 为 PublicUser（无 email），online 为服务端 presence 值。
+type SyncSnapshot struct {
+	Servers []SyncServerDTO `json:"servers"`
+	Friends []FriendDTO     `json:"friends"`
+}
+
+// Sync 拉取聚合快照。调用方（voice.fullResync）失败时回落
+// ListFriends + 逐频道 ListMessages，不能让续传补拉因单一端点故障整体失效。
+func (c *APIClient) Sync() (*SyncSnapshot, error) {
+	status, data, err := c.get("/sync")
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, decodeError(status, data)
+	}
+	var out SyncSnapshot
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("decode sync: %w", err)
+	}
+	return &out, nil
+}

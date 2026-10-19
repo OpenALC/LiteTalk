@@ -306,6 +306,81 @@ describe('好友在线态', () => {
   })
 })
 
+// data:resync（#78）：续传失败后 Go 侧提示 UI 重新拉取服务器/频道与好友视图。
+describe('data:resync 刷新', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    resetMock()
+  })
+
+  const serverDTO = (id: number, name: string) => ({
+    id: String(id), name, owner_id: '1', icon_name: 'music', icon_color: '#4FA4F3',
+  })
+
+  it('servers store 收到 data:resync 后重拉服务器/频道，更新名称并剔除已失去的服务器', async () => {
+    mockGoApp.ListServers.mockResolvedValueOnce([serverDTO(7, '旧名'), serverDTO(8, '将被移出')])
+    mockGoApp.ListChannels.mockResolvedValue({ categories: [], channels: [] })
+    const s = useServersStore()
+    await s.loadRemoteServers()
+    s.selectServer('8')
+    expect(s.findServer('8')).toBeTruthy()
+
+    s.bindEvents()
+    mockGoApp.ListServers.mockResolvedValueOnce([serverDTO(7, '新名')])
+    mockEventsOn.fire('data:resync', null)
+
+    await vi.waitFor(() => expect(mockGoApp.ListServers).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect(s.findServer('7')?.name).toBe('新名'))
+    await vi.waitFor(() => expect(s.findServer('8')).toBeUndefined())
+    expect(mockGoApp.ListChannels).toHaveBeenLastCalledWith('7')
+    // 当前选中的服务器被移出：回退到第一个可用服务器（内置示例在前）。
+    expect(s.currentServerId).not.toBe('8')
+    expect(s.findServer(s.currentServerId)).toBeTruthy()
+    s.unbindEvents()
+  })
+
+  it('servers store unbindEvents 后不再响应 data:resync', async () => {
+    mockGoApp.ListServers.mockResolvedValue([serverDTO(7, '服七')])
+    mockGoApp.ListChannels.mockResolvedValue({ categories: [], channels: [] })
+    const s = useServersStore()
+    await s.loadRemoteServers()
+    expect(mockGoApp.ListServers).toHaveBeenCalledTimes(1)
+
+    s.bindEvents()
+    s.unbindEvents()
+    mockEventsOn.fire('data:resync', null)
+    await Promise.resolve()
+    expect(mockGoApp.ListServers).toHaveBeenCalledTimes(1)
+  })
+
+  it('friends store 收到 data:resync 后重拉好友列表', async () => {
+    const friendDTO = (id: number, uid: number, online: boolean) => ({
+      id: String(id), status: 'accepted', incoming: false, remark: '', group: '',
+      user: { id: String(uid), nickname: `用户${uid}`, tag: '0001', status: 1, online },
+    })
+    mockGoApp.ListFriends.mockResolvedValue([friendDTO(1, 10, true)])
+    const s = useFriendsStore()
+    await s.loadFriends()
+    s.bindEvents()
+
+    mockGoApp.ListFriends.mockResolvedValue([friendDTO(2, 20, false)])
+    mockEventsOn.fire('data:resync', null)
+    await vi.waitFor(() => expect(mockGoApp.ListFriends).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect(s.offline.map((f) => f.userId)).toEqual(['20']))
+    s.unbindEvents()
+  })
+
+  it('friends store unbindEvents 同时注销 presence:update 与 data:resync', async () => {
+    const s = useFriendsStore()
+    s.bindEvents()
+    s.unbindEvents()
+    mockGoApp.ListFriends.mockResolvedValue([])
+    mockEventsOn.fire('data:resync', null)
+    await Promise.resolve()
+    expect(mockGoApp.ListFriends).not.toHaveBeenCalled()
+  })
+})
+
 // 新建频道归入分类（#72）：显式 category_id 必须带给服务端，本地 group 同时取
 // 分类名——#16 的按名归组靠 group 名落位，只带 id 不改名仍会掉进类型默认组。
 describe('新建频道归入分类', () => {
