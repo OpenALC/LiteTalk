@@ -182,6 +182,13 @@ export const useVoiceStore = defineStore('voice', () => {
       resetRoom()
       notify.show('已在其他设备加入语音')
     }))
+    // 音频不可用（管线初始化失败，或入房后采集/播放启动失败，#80）：Go 侧对
+    // 同一故障周期只上报一次，这里直接提示。toast 是瞬时的（notify 自动隐藏），
+    // 重入房重试成功后无需清除状态；若再次失败，Go 侧会在新故障周期重新上报。
+    offs.push(eventsOn('voice:unavailable', (d) => {
+      const msg = (d as { error?: string } | null)?.error
+      notify.show(msg?.trim() || '语音不可用', true)
+    }))
   }
 
   // unbindEvents 休眠态清理：逐个注销本 store 注册的监听器。

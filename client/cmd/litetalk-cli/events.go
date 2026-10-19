@@ -2,10 +2,8 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"log"
 	"os"
-	"strings"
 	"sync"
 
 	"github.com/OpenALC/LiteTalk/client/core/voice"
@@ -17,11 +15,11 @@ type chatMsg struct {
 }
 
 // console 把 voice.Events 落到标准输出，兼作房间命令的等待原语
-// （join 等 OnSelf、send 等 chat 回显）。媒体降级经 noteMedia 标记——
-// core 未暴露媒体启动结果，见 mediaSpy 注释。
+// （join 等 OnSelf、send 等 chat 回显）。媒体不可用（初始化失败或入房后
+// 启动失败）统一经 OnVoiceUnavailable 记录，printVoiceState 据此明示。
 type console struct {
 	mu           sync.Mutex
-	mediaErr     string // 非空 = 媒体管线降级（voiceUnavailable 或启动失败）
+	mediaErr     string // 非空 = 媒体不可用（初始化失败或启动失败）
 	joinedCh     chan string
 	chatCh       chan chatMsg
 	speakingFlip int
@@ -34,7 +32,7 @@ func newConsole() *console {
 	}
 }
 
-// noteMedia 记录媒体降级原因（log spy 与 OnVoiceUnavailable 共用）。
+// noteMedia 记录媒体不可用原因（OnVoiceUnavailable 的统一入口）。
 func (c *console) noteMedia(msg string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -79,7 +77,7 @@ func (c *console) events() voice.Events {
 				userID, speaking, mute, deafen, n)
 		},
 		OnVoiceUnavailable: func(errMsg string) {
-			c.noteMedia("voiceUnavailable: " + errMsg)
+			c.noteMedia(errMsg)
 			fmt.Printf("event voice-unavailable err=%s\n", errMsg)
 		},
 		OnKicked: func(reason string) {
@@ -106,26 +104,8 @@ func (c *console) events() voice.Events {
 	}
 }
 
-// mediaSpy 会话日志旁路：识别「媒体管线启动失败」这一降级路径。
-// voiceUnavailable 只覆盖管线构造失败（如缺 Opus）；无声卡/无设备时构造成功、
-// startMedia 启动失败，Session 仅打日志不给事件——消费方拿不到结果（core 缺口，
-// 见 #34 汇报）。这里拦截已知日志行做明示，属权宜之计。
-type mediaSpy struct {
-	c *console
-	w io.Writer
-}
-
-func (s *mediaSpy) Write(p []byte) (int, error) {
-	line := string(p)
-	if strings.Contains(line, "pipeline start:") ||
-		strings.Contains(line, "mixer start:") ||
-		strings.Contains(line, "pipeline unavailable:") {
-		s.c.noteMedia(strings.TrimSpace(line))
-	}
-	return s.w.Write(p)
-}
-
-// logger 会话日志器：转发 stderr 的同时喂 mediaSpy。
+// logger 会话日志器：转发 stderr（媒体不可用的用户提示走 OnVoiceUnavailable，
+// 底层错误仍在日志里，供排查）。
 func (c *console) logger() *log.Logger {
-	return log.New(&mediaSpy{c: c, w: os.Stderr}, "voice: ", log.Ltime)
+	return log.New(os.Stderr, "voice: ", log.Ltime)
 }

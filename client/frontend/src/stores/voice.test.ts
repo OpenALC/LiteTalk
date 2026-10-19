@@ -24,6 +24,7 @@ const mockEventsOn = vi.hoisted(() => {
 vi.mock('../api/bridge', () => ({ goApp: () => ({}), eventsOn: mockEventsOn.on }))
 
 import { useVoiceStore } from './voice'
+import { useNotifyStore } from './notify'
 import type { PeerView } from '../api/types'
 
 // 语音被抢占（session.voice_taken）后本地必须清空房间态：Go 侧已退房，
@@ -136,5 +137,39 @@ describe('voice store 房间态清理', () => {
 
     voice.unbindEvents()
     expect(mockEventsOn.handlers.get('voice:peer-join')).toHaveLength(0)
+  })
+
+  // 语音没起来（#80）：Go 侧把用户可读的原因放在 payload.error，前端必须弹
+  // toast——否则用户看着自己在房里，说话没人听得见且毫无提示。
+  it('voice:unavailable 经 notify 显示错误提示', () => {
+    const voice = useVoiceStore()
+    const notify = useNotifyStore()
+    voice.bindEvents()
+
+    mockEventsOn.fire('voice:unavailable', { error: '音频设备启动失败，请检查麦克风和扬声器' })
+
+    expect(notify.visible).toBe(true)
+    expect(notify.isError).toBe(true)
+    expect(notify.text).toBe('音频设备启动失败，请检查麦克风和扬声器')
+  })
+
+  it('voice:unavailable 缺原因时回落到通用文案', () => {
+    const voice = useVoiceStore()
+    const notify = useNotifyStore()
+    voice.bindEvents()
+
+    mockEventsOn.fire('voice:unavailable', null)
+    expect(notify.text).toBe('语音不可用')
+  })
+
+  it('unbindEvents 逐个注销 voice:unavailable，注销后不再提示', () => {
+    const voice = useVoiceStore()
+    const notify = useNotifyStore()
+    voice.bindEvents()
+    voice.unbindEvents()
+
+    expect(mockEventsOn.handlers.get('voice:unavailable')).toHaveLength(0)
+    mockEventsOn.fire('voice:unavailable', { error: '音频设备启动失败' })
+    expect(notify.visible).toBe(false)
   })
 })

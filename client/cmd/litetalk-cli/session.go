@@ -47,7 +47,7 @@ func newVoiceSession(c *api.APIClient, st *State, ev *console) (*voice.Session, 
 }
 
 // openRoom 建信令会话并等到连上。音频管线随 Connect 装配：构造失败降级
-// （voiceUnavailable，信令照常），启动失败（无声卡）由 mediaSpy 标记——
+// （voiceUnavailable，信令照常），入房后启动失败经 OnVoiceUnavailable 上报——
 // 与 Session 语义一致：语音不可用不阻断登录/入房/聊天。
 func openRoom(addrFlag string) (*room, error) {
 	c, st, err := authedClient(addrFlag)

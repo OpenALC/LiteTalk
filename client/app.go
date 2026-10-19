@@ -1095,8 +1095,8 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 				"mute": mute != nil && *mute, "deafen": deafen != nil && *deafen,
 			})
 		},
-		// 媒体管线初始化失败（如 Linux 缺 Opus）：音频不可用但信令已连，
-		// 前端 toast 明确提示，JoinChannel 会返回同因错误。
+		// 媒体不可用（管线初始化失败，或入房后采集/播放启动失败，#80）：
+		// 音频不可用但信令已连，前端 toast 明确提示，JoinChannel 会返回同因错误。
 		OnVoiceUnavailable: func(errMsg string) {
 			a.emit("voice:unavailable", map[string]string{"error": errMsg})
 		},
