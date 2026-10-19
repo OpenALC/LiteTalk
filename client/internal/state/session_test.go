@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OpenALC/LiteTalk/client/core/api"
 	"github.com/OpenALC/LiteTalk/client/internal/audio"
 	"github.com/OpenALC/LiteTalk/client/internal/rtc"
 	"github.com/OpenALC/LiteTalk/client/internal/signal"
@@ -23,7 +24,7 @@ import (
 // TestJoinChannelRollback 发送失败必须回滚 roomID——roomID 先存是为断线重连
 // 恢复，失败路径不复位会让 OnConnect 重发 join 造成「幽灵入房」。
 func TestJoinChannelRollback(t *testing.T) {
-	s := NewSession(NewAPIClient("http://127.0.0.1:1"), "tok", "n", Events{}, nil)
+	s := NewSession(api.NewAPIClient("http://127.0.0.1:1"), "tok", "n", Events{}, nil)
 	s.ws = signal.NewClient(signal.Config{URL: "ws://127.0.0.1:1/ws"})
 	defer s.ws.Close()
 
@@ -39,7 +40,7 @@ func TestJoinChannelRollback(t *testing.T) {
 // TestJoinChannelVoiceUnavailable 媒体管线初始化失败（如无 Opus 的平台）时
 // JoinChannel 必须给出明确错误供前端 toast，而不是静默成功或 panic。
 func TestJoinChannelVoiceUnavailable(t *testing.T) {
-	s := NewSession(NewAPIClient("http://127.0.0.1:1"), "tok", "n", Events{}, nil)
+	s := NewSession(api.NewAPIClient("http://127.0.0.1:1"), "tok", "n", Events{}, nil)
 	s.ws = signal.NewClient(signal.Config{URL: "ws://127.0.0.1:1/ws"})
 	defer s.ws.Close()
 	s.voiceUnavailable = true
@@ -61,7 +62,7 @@ func TestJoinChannelVoiceUnavailable(t *testing.T) {
 // 未注册回调时静默（Events 零值可安全构造）。
 func TestHandleKickedForwardsReason(t *testing.T) {
 	got := ""
-	s := NewSession(NewAPIClient("http://127.0.0.1:1"), "tok", "n",
+	s := NewSession(api.NewAPIClient("http://127.0.0.1:1"), "tok", "n",
 		Events{OnKicked: func(reason string) { got = reason }}, nil)
 	s.handleKicked("login_elsewhere")
 	if got != "login_elsewhere" {
@@ -69,7 +70,7 @@ func TestHandleKickedForwardsReason(t *testing.T) {
 	}
 
 	// 零值 Events：无回调不得 panic。
-	quiet := NewSession(NewAPIClient("http://127.0.0.1:1"), "tok", "n", Events{}, nil)
+	quiet := NewSession(api.NewAPIClient("http://127.0.0.1:1"), "tok", "n", Events{}, nil)
 	quiet.handleKicked("login_elsewhere")
 }
 
@@ -138,7 +139,7 @@ func TestVoiceTakenLeavesRoomLocally(t *testing.T) {
 	stub := newDownlinkStub(t, signal.TypeSessionVoiceTaken)
 
 	taken := make(chan struct{}, 1)
-	s := NewSession(NewAPIClient(stub.wsURL()), "tok", "n",
+	s := NewSession(api.NewAPIClient(stub.wsURL()), "tok", "n",
 		Events{OnVoiceTaken: func() { taken <- struct{}{} }}, nil)
 	s.ws = signal.NewClient(signal.Config{
 		URL:          stub.wsURL(),
@@ -203,7 +204,7 @@ func TestPrefetchICEDecouplesReadLoop(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"iceServers":[{"urls":["stun:s:3478"]}],"expiresAt":1}`))
 	}))
-	s := NewSession(NewAPIClient(srv.URL), "tok", "n", Events{}, nil)
+	s := NewSession(api.NewAPIClient(srv.URL), "tok", "n", Events{}, nil)
 
 	// JoinChannel 预取：未连接的 ws 让 Send 报错回滚 roomID，但预取已经完成。
 	s.ws = signal.NewClient(signal.Config{URL: "ws://127.0.0.1:1/ws"})
@@ -224,7 +225,7 @@ func TestPrefetchICEDecouplesReadLoop(t *testing.T) {
 	}
 
 	// 从未预取 → 空列表（降级），不 panic。
-	s2 := NewSession(NewAPIClient("http://127.0.0.1:1"), "tok", "n", Events{}, nil)
+	s2 := NewSession(api.NewAPIClient("http://127.0.0.1:1"), "tok", "n", Events{}, nil)
 	if got2 := s2.cachedICE(); got2 != nil {
 		t.Fatalf("未预取时 cachedICE 应为 nil，实际 %v", got2)
 	}
@@ -240,11 +241,11 @@ func TestRTCCredentialsShortTimeout(t *testing.T) {
 	defer srv.Close()
 	defer close(block) // 先放行 handler 再关 server，避免 Close 等待悬挂请求
 
-	old := rtCredentialsTimeout
-	rtCredentialsTimeout = 100 * time.Millisecond
-	defer func() { rtCredentialsTimeout = old }()
+	old := api.RTCredentialsTimeout
+	api.RTCredentialsTimeout = 100 * time.Millisecond
+	defer func() { api.RTCredentialsTimeout = old }()
 
-	s := NewSession(NewAPIClient(srv.URL), "tok", "n", Events{}, nil)
+	s := NewSession(api.NewAPIClient(srv.URL), "tok", "n", Events{}, nil)
 	start := time.Now()
 	if _, err := s.api.RTCCredentials(); err == nil {
 		t.Fatal("黑洞端点应返回超时错误")
@@ -297,7 +298,7 @@ func TestFetchICEServers(t *testing.T) {
 		],"expiresAt":1}`))
 	}))
 	defer srv.Close()
-	s := NewSession(NewAPIClient(srv.URL), "tok", "n", Events{}, nil)
+	s := NewSession(api.NewAPIClient(srv.URL), "tok", "n", Events{}, nil)
 	got := s.fetchICEServers()
 	if len(got) != 2 {
 		t.Fatalf("期望 2 条 ICE server，实际 %d", len(got))
@@ -314,7 +315,7 @@ func TestFetchICEServers(t *testing.T) {
 		http.Error(w, "turn not configured", http.StatusServiceUnavailable)
 	}))
 	defer fail.Close()
-	s2 := NewSession(NewAPIClient(fail.URL), "tok", "n", Events{}, nil)
+	s2 := NewSession(api.NewAPIClient(fail.URL), "tok", "n", Events{}, nil)
 	if got2 := s2.fetchICEServers(); got2 != nil {
 		t.Fatalf("失败时应降级为空 ICE 列表，实际 %v", got2)
 	}
@@ -325,7 +326,7 @@ func TestFetchICEServers(t *testing.T) {
 		_, _ = w.Write([]byte(`{"iceServers":[],"expiresAt":0}`))
 	}))
 	defer empty.Close()
-	s3 := NewSession(NewAPIClient(empty.URL), "tok", "n", Events{}, nil)
+	s3 := NewSession(api.NewAPIClient(empty.URL), "tok", "n", Events{}, nil)
 	if got3 := s3.fetchICEServers(); got3 != nil {
 		t.Fatalf("空 iceServers 应返回 nil，实际 %v", got3)
 	}
@@ -380,7 +381,7 @@ func TestPresenceUpdateForwards(t *testing.T) {
 		Type: signal.TypePresenceUpdate, TS: 1,
 		Data: json.RawMessage(`{"user_id":"42","online":true,"ts":1}`),
 	})
-	s := NewSession(NewAPIClient(stub.wsURL()), "tok", "n", Events{
+	s := NewSession(api.NewAPIClient(stub.wsURL()), "tok", "n", Events{
 		OnPresenceUpdate: func(userID string, online bool) {
 			got <- struct {
 				uid    string
@@ -413,7 +414,7 @@ func TestServerShutdownStopsReconnect(t *testing.T) {
 		Type: signal.TypeServerShutdown, TS: 1,
 		Data: json.RawMessage(`{"reason":"shutdown","ts":1}`),
 	})
-	s := NewSession(NewAPIClient(stub.wsURL()), "tok", "n", Events{
+	s := NewSession(api.NewAPIClient(stub.wsURL()), "tok", "n", Events{
 		OnServerShutdown: func(reason string) { got <- reason },
 	}, nil)
 	s.ws = signal.NewClient(signal.Config{
@@ -459,7 +460,7 @@ func TestRTCFailedRebuildsPeer(t *testing.T) {
 		Type: signal.TypeRTCFailed, TS: 1,
 		Data: json.RawMessage(`{"channel_id":"room1","reason":"ice_failed"}`),
 	})
-	s := NewSession(NewAPIClient(stub.wsURL()), "tok", "n", Events{
+	s := NewSession(api.NewAPIClient(stub.wsURL()), "tok", "n", Events{
 		OnRTCFailed: func(channelID string) { got <- channelID },
 	}, nil)
 	s.ws = signal.NewClient(signal.Config{URL: stub.wsURL(), ReconnectMin: 20 * time.Millisecond})
@@ -517,7 +518,7 @@ func TestRTCFailedStaleIgnored(t *testing.T) {
 		Type: signal.TypeRTCFailed, TS: 1,
 		Data: json.RawMessage(`{"channel_id":"other-room","reason":"ice_failed"}`),
 	})
-	s := NewSession(NewAPIClient(stub.wsURL()), "tok", "n", Events{
+	s := NewSession(api.NewAPIClient(stub.wsURL()), "tok", "n", Events{
 		OnRTCFailed: func(channelID string) { got <- channelID },
 	}, nil)
 	s.ws = signal.NewClient(signal.Config{URL: stub.wsURL(), ReconnectMin: 20 * time.Millisecond})
@@ -554,7 +555,7 @@ func TestServerHelloRecordsVersion(t *testing.T) {
 		Type: signal.TypeServerHello, TS: 1,
 		Data: json.RawMessage(`{"version":2}`),
 	})
-	s := NewSession(NewAPIClient(stub.wsURL()), "tok", "n", Events{}, nil)
+	s := NewSession(api.NewAPIClient(stub.wsURL()), "tok", "n", Events{}, nil)
 	s.ws = signal.NewClient(signal.Config{URL: stub.wsURL(), ReconnectMin: 20 * time.Millisecond})
 	defer s.ws.Close()
 	s.registerHandlers()
@@ -673,7 +674,7 @@ func TestGatewayResumeAfterReconnect(t *testing.T) {
 	stub := newGatewayStub(t)
 	var mu sync.Mutex
 	got := map[string]int{}
-	s := NewSession(NewAPIClient(stub.wsURL()), "tok", "n", Events{}, nil)
+	s := NewSession(api.NewAPIClient(stub.wsURL()), "tok", "n", Events{}, nil)
 	s.ws = signal.NewClient(signal.Config{
 		URL:          stub.wsURL(),
 		ReconnectMin: 20 * time.Millisecond,
