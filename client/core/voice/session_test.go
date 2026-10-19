@@ -652,10 +652,13 @@ func (s *gatewayStub) closeConn() {
 	}
 }
 
+// resumeSeq 最近一次 gateway.resume 的 last_seq（跨越所有连接，取最新一条）。
+// 首连会发 resume{0}（#81），所以判定重连不能只看「有没有值」，必须看具体 seq。
 func (s *gatewayStub) resumeSeq() (int64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, e := range s.up {
+	for i := len(s.up) - 1; i >= 0; i-- {
+		e := s.up[i]
 		if e.Type != signal.TypeGatewayResume {
 			continue
 		}
@@ -667,9 +670,10 @@ func (s *gatewayStub) resumeSeq() (int64, bool) {
 	return 0, false
 }
 
-// TestGatewayResumeAfterReconnect 断线重连后事件不丢不重（#32 验收）：
-// 断线前收到 seq 1..2，重连经 server.hello 确认同会话后发 gateway.resume{S1,2}，
-// 补发的 seq 3 与实时流续接，ChatHandler 逐条各收到一次。
+// TestGatewayResumeAfterReconnect 断线重连后事件不丢不重（#32/#81 验收）：
+// 首连发 resume{S1,0}（服务端环可能已有事件），收到 seq 1..2 后断线；
+// 重连经 server.hello 确认同会话后发 gateway.resume{S1,2}，补发的 seq 3 与
+// 实时流续接，ChatHandler 逐条各收到一次。
 func TestGatewayResumeAfterReconnect(t *testing.T) {
 	stub := newGatewayStub(t)
 	var mu sync.Mutex
@@ -702,7 +706,22 @@ func TestGatewayResumeAfterReconnect(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	// 首连：server.hello 只记录会话，不发 resume；随后收 seq 1..2。
+	// 首连也必须发 resume{last_seq:0}（#81）：复用旧 sid 时服务端环里可能已有
+	// seq>1 的事件，不补发就会永久卡住。resumeSeq 取最新一条，首连 0 与重连 2
+	// 不会串——下面的重连断言会等具体的 2。
+	firstDeadline := time.Now().Add(5 * time.Second)
+	var firstSeq int64
+	var firstOK bool
+	for time.Now().Before(firstDeadline) {
+		if firstSeq, firstOK = stub.resumeSeq(); firstOK && firstSeq == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !firstOK || firstSeq != 0 {
+		t.Fatalf("首连 resume.last_seq = %d (ok=%v), want 0", firstSeq, firstOK)
+	}
+	// 随后收 seq 1..2。
 	stub.push(t, 1, "m1")
 	stub.push(t, 2, "m2")
 	waitForMsg := func(id string, n int) {
@@ -728,28 +747,27 @@ func TestGatewayResumeAfterReconnect(t *testing.T) {
 	if s.gw.LastSeq() != 2 {
 		t.Fatalf("LastSeq = %d, want 2", s.gw.LastSeq())
 	}
-	if _, ok := stub.resumeSeq(); ok {
-		t.Fatal("首连不应发 gateway.resume")
+	if seq, ok := stub.resumeSeq(); !ok || seq != 0 {
+		t.Fatalf("首连 resume = (%d,%v), want (0,true)", seq, ok)
 	}
 
 	// 断线重连：新连接的 server.hello 确认同会话 → 必须发 resume{last_seq=2}。
+	// 首连的 0 已存在，不能以「resumeSeq 有值」为条件，必须等具体 seq=2。
 	stub.closeConn()
 	reconnectDeadline := time.Now().Add(5 * time.Second)
+	var last int64
+	var ok bool
 	for time.Now().Before(reconnectDeadline) {
-		if _, ok := stub.resumeSeq(); ok {
+		if last, ok = stub.resumeSeq(); ok && last == 2 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	last, ok := stub.resumeSeq()
-	if !ok {
+	if !ok || last != 2 {
 		stub.mu.Lock()
 		diag := fmt.Sprintf("conns=%d up=%d cur=%v", stub.conns, len(stub.up), stub.cur != nil)
 		stub.mu.Unlock()
-		t.Fatalf("重连后未发 gateway.resume（%s）", diag)
-	}
-	if last != 2 {
-		t.Fatalf("resume.last_seq = %d, want 2", last)
+		t.Fatalf("重连后 resume.last_seq = %d (ok=%v), want 2（%s）", last, ok, diag)
 	}
 	// 补发 seq 3 + 重复 seq 2（补发与实时重叠）：只各投一次。
 	stub.push(t, 2, "m2")
