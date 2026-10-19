@@ -53,7 +53,7 @@ func TestGenerateIdempotent(t *testing.T) {
 	// 与仓库里已提交的生成物一致（忘记重新生成会在本地就暴露）。
 	for _, rel := range []string{
 		filepath.Join("server", "internal", "signal", "protocol_gen.go"),
-		filepath.Join("client", "internal", "signal", "protocol_gen.go"),
+		filepath.Join("client", "core", "signal", "protocol_gen.go"),
 	} {
 		onDisk, err := os.ReadFile(filepath.Join(root, rel))
 		if err != nil {

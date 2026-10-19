@@ -1,4 +1,4 @@
-package state
+package voice
 
 import (
 	"context"
@@ -14,9 +14,9 @@ import (
 	"time"
 
 	"github.com/OpenALC/LiteTalk/client/core/api"
-	"github.com/OpenALC/LiteTalk/client/internal/audio"
-	"github.com/OpenALC/LiteTalk/client/internal/rtc"
-	"github.com/OpenALC/LiteTalk/client/internal/signal"
+	"github.com/OpenALC/LiteTalk/client/core/audio"
+	"github.com/OpenALC/LiteTalk/client/core/rtc"
+	"github.com/OpenALC/LiteTalk/client/core/signal"
 	"github.com/coder/websocket"
 	"github.com/pion/webrtc/v4"
 )

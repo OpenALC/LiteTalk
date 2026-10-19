@@ -1,5 +1,5 @@
 // chat 文字聊天：chat.send（C→S）→ 校验/频控/权限 → 落库 → chat.message 广播（S→C）。
-// wire 契约与客户端 client/internal/signal/protocol.go 对齐（ChatSendData / ChatMessageData）。
+// wire 契约与客户端 client/core/signal/protocol.go 对齐（ChatSendData / ChatMessageData）。
 package signal
 
 import (

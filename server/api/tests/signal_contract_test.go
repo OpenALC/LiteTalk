@@ -244,7 +244,7 @@ func TestSignalGenMatchesContract(t *testing.T) {
 		path string
 	}{
 		{"server", filepath.Join(root, "server", "internal", "signal", "protocol_gen.go")},
-		{"client", filepath.Join(root, "client", "internal", "signal", "protocol_gen.go")},
+		{"client", filepath.Join(root, "client", "core", "signal", "protocol_gen.go")},
 	}
 	for _, side := range sides {
 		t.Run(side.name, func(t *testing.T) {
@@ -280,10 +280,10 @@ func TestSignalGenMatchesContract(t *testing.T) {
 func TestSignalGenSidesIdentical(t *testing.T) {
 	root := findRoot(t)
 	serverSide := normGenFile(t, filepath.Join(root, "server", "internal", "signal", "protocol_gen.go"))
-	clientSide := normGenFile(t, filepath.Join(root, "client", "internal", "signal", "protocol_gen.go"))
+	clientSide := normGenFile(t, filepath.Join(root, "client", "core", "signal", "protocol_gen.go"))
 	if serverSide != clientSide {
 		// 只报差异存在，不把两份 200 行文件灌进日志；定位用 diff 命令。
-		t.Errorf("两侧 protocol_gen.go 正文不一致（除 package 行）：\n  diff server/internal/signal/protocol_gen.go client/internal/signal/protocol_gen.go\n  server %d 行，client %d 行",
+		t.Errorf("两侧 protocol_gen.go 正文不一致（除 package 行）：\n  diff server/internal/signal/protocol_gen.go client/core/signal/protocol_gen.go\n  server %d 行，client %d 行",
 			strings.Count(serverSide, "\n"), strings.Count(clientSide, "\n"))
 	}
 }
