@@ -8,9 +8,11 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -105,6 +107,10 @@ type App struct {
 	// 托盘自己的点击会更新，另两条路径改了静音托盘不跟着变）。
 	// setupTray 在 ServiceStartup 里赋值，早于热键 goroutine 启动。
 	trayMute *application.MenuItem
+
+	// emitHook 测试专用的事件观察口（emit 广播前同步回调，生产恒为 nil）。
+	// 事件是跨层唯一可观测输出；没有它，测试只能断言状态副作用、断不到 reason。
+	emitHook func(name string, data any)
 }
 
 // NewApp 创建应用实例
@@ -139,7 +145,11 @@ func (a *App) setWindow(w *application.WebviewWindow) {
 }
 
 // emit 向前端广播事件的统一出口：测试环境（wails==nil）空转。
+// emitHook 仅在测试里赋值，同步回调——测试据此断言事件与载荷。
 func (a *App) emit(name string, data any) {
+	if a.emitHook != nil {
+		a.emitHook(name, data)
+	}
 	if a.wails != nil {
 		a.wails.Event.Emit(name, data)
 	}
@@ -542,9 +552,42 @@ func (a *App) GetServerConfig() *ServerConfigView {
 	return &ServerConfigView{BaseURL: r.BaseURL, WSURL: r.WSURL, Source: string(r.Source)}
 }
 
+// sameOrigin 判断两个基址是否同源（scheme + host + port 全同）。
+// scheme/host 大小写不敏感；缺省端口按 scheme 归一化（http/ws→80、https/wss→443），
+// 因此 http://a 与 http://a:80/ 同源。基址里的 path 不参与比较。
+func sameOrigin(a, b string) bool {
+	ua, err := url.Parse(strings.TrimSpace(a))
+	if err != nil || ua.Host == "" {
+		return false
+	}
+	ub, err := url.Parse(strings.TrimSpace(b))
+	if err != nil || ub.Host == "" {
+		return false
+	}
+	if !strings.EqualFold(ua.Scheme, ub.Scheme) || !strings.EqualFold(ua.Hostname(), ub.Hostname()) {
+		return false
+	}
+	return effectivePort(ua) == effectivePort(ub)
+}
+
+// effectivePort 返回 URL 的有效端口：显式端口优先，否则按 scheme 的默认端口。
+func effectivePort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "ws":
+		return "80"
+	case "https", "wss":
+		return "443"
+	}
+	return ""
+}
+
 // SetServerConfig 保存服务器地址并热切换（WS 自动推导：https→wss、http→ws，末尾补 /ws）。
 // 流程：校验 → healthz 探活 → 落盘 → 重定向 REST/信令到新地址 →
-// 用当前令牌重建信令会话。探活失败保持原地址不动，返回错误给前端提示。
+// 同 origin 时用当前令牌重建信令会话；跨 origin 时清空会话回登录页（见 retarget）。
+// 探活失败保持原地址不动，返回错误给前端提示。
 func (a *App) SetServerConfig(baseURL string) error {
 	if err := config.ValidateBase(baseURL); err != nil {
 		return err
@@ -576,11 +619,41 @@ func (a *App) SetServerConfig(baseURL string) error {
 }
 
 // retarget 把 REST 基址切到新地址并重建信令会话（热切换核心）。
-// 已登录则携带当前令牌重连；令牌不被新服务端接受时清会话回登录态。
-// 调用方须持 retargetMu——与落盘合成一个原子切换，防并发保存交错。
+// 同 origin（仅 path 变化）令牌仍属同一服务端，可做 Me() 预检后重连；
+// 跨 origin 时旧服务器的 access/refresh 一律不发给新地址——预检本身就是泄露面
+// （#17），改为清会话直接回登录页。调用方须持 retargetMu——与落盘合成一个
+// 原子切换，防并发保存交错。
 func (a *App) retarget(baseURL string) {
 	if a.api == nil {
 		return // 测试环境未初始化 API 客户端，跳过
+	}
+	if !sameOrigin(a.api.Base(), baseURL) {
+		// 跨 origin：先停重试与旧会话，原子切换基址并清 access token，再清 app 层
+		// 登录态。
+		//   - loginGen+1 放最前：配置已落盘，旧 startSession 的重试循环下一跳会按
+		//     新地址解析 WS，必须尽快停掉。
+		//   - refresh_token 切换前后各清一次：切换前那次保证新基址上的 401 拿不到
+		//     旧 refresh_token；SetBaseAndClearToken 的写锁会等在飞刷新「复查+安装+
+		//     onRefreshed」读锁段结束，切换后那次抹掉它可能刚回写的令牌。
+		//   - 落盘游客令牌属于旧服务器，无条件作废——否则下次 LoginAsGuest 会把
+		//     它发给新服务器，绕开这里的所有清理。
+		// 在飞请求无法撤销（api.SetBase 的语义是自然结束于旧地址）；刷新请求本身
+		// 钉在请求创建时的 base 快照上，基址已变时结果被丢弃（见 doRefresh）。
+		a.loginGen.Add(1)
+		a.disconnectSession()
+		a.mu.Lock()
+		a.refreshTok = ""
+		a.mu.Unlock()
+		a.api.SetBaseAndClearToken(baseURL)
+		a.mu.Lock()
+		a.refreshTok = ""
+		a.user = api.UserProfile{}
+		a.mu.Unlock()
+		_ = a.cfg.SetGuestRefresh("")
+		// 复用 auth:kicked 让前端走 logout → 登录页（现有唯一回登录页机制）。
+		// 前端随后的 Logout() 因令牌已空，不会向新服务器发 /auth/logout。
+		a.emit("auth:kicked", map[string]any{"reason": "server_changed"})
+		return
 	}
 	a.api.SetBase(baseURL)
 	a.mu.Lock()
@@ -595,7 +668,8 @@ func (a *App) retarget(baseURL string) {
 		a.emit("auth:session", map[string]any{"ok": false})
 		return
 	}
-	// 令牌兼容性预检：Me() 能通就重连信令；401（含刷新失败）才清会话回登录态。
+	// 令牌兼容性预检：同 origin 下令牌本就属于该服务端，401 自动刷新不会跨服泄露；
+	// Me() 能通就重连信令，401（含刷新失败）才清会话回登录态。
 	if _, err := a.api.Me(); err != nil {
 		var ae *api.APIError
 		if errors.As(err, &ae) && ae.Status == http.StatusUnauthorized {

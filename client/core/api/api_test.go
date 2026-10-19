@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -130,6 +132,100 @@ func TestAPI401RefreshRetry(t *testing.T) {
 	}
 	if !onRefreshed.Load() {
 		t.Fatal("onRefreshed 未回调（旋转令牌未回传 app 层）")
+	}
+}
+
+// TestAPI401RefreshDiscardsOnBaseChange 401 刷新期间 REST 基址被热切换（#17）：
+// 换服发生在 401 返回之后、刷新 POST 构造之前。刷新 POST 必须钉在请求创建时的
+// base（旧服务器 A），响应回来时基址已变则丢弃结果——绝不把 A 的 refresh_token
+// 发给新服务器 B，也不安装/回调/重放 A 的新令牌。旧实现用 c.Base() 构造刷新
+// 请求，会把 B 的地址和 A 的长期凭据凑到一起。
+func TestAPI401RefreshDiscardsOnBaseChange(t *testing.T) {
+	refreshSrcEntered := make(chan struct{})
+	releaseRefreshSrc := make(chan struct{})
+	var enteredOnce, releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseRefreshSrc) }) }
+	var aMu sync.Mutex
+	var aRefreshBody string
+
+	oldSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/users/me":
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"code":"token_expired","message":"expired"}`))
+		case "/api/v1/auth/refresh":
+			body, _ := io.ReadAll(r.Body)
+			aMu.Lock()
+			aRefreshBody = string(body)
+			aMu.Unlock()
+			_, _ = w.Write([]byte(`{"access_token":"tok-new-A","refresh_token":"rt-new-A","expires_in":7200}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer oldSrv.Close()
+
+	var bMu sync.Mutex
+	var bReqs []string
+	newSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bMu.Lock()
+		bReqs = append(bReqs, r.URL.Path+"|"+string(body))
+		bMu.Unlock()
+		http.NotFound(w, r)
+	}))
+	defer newSrv.Close()
+
+	c := NewAPIClient(oldSrv.URL)
+	c.SetToken("tok1")
+	// 卡在 401 之后、刷新 POST 之前：测试在这里完成 SetBase（等价于用户此刻
+	// 保存了新服务器地址），再放行刷新。
+	defer release() // 断言中途失败也放行，避免 goroutine 悬挂
+	c.SetRefreshSource(func(context.Context) (string, error) {
+		enteredOnce.Do(func() { close(refreshSrcEntered) })
+		<-releaseRefreshSrc
+		return "rt-A", nil
+	})
+	var refreshed atomic.Int32
+	c.SetOnRefreshed(func(AuthTokens) { refreshed.Add(1) })
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := c.Me()
+		errCh <- err
+	}()
+
+	select {
+	case <-refreshSrcEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("401 后未进入刷新流程")
+	}
+	c.SetBase(newSrv.URL)
+	release()
+
+	err := <-errCh
+	if !errors.Is(err, errBaseChanged) {
+		t.Fatalf("换基址后的刷新应返回 errBaseChanged，得到 %v", err)
+	}
+	if got := c.Token(); got != "tok1" {
+		t.Fatalf("旧服务器的新令牌不得安装，token = %q", got)
+	}
+	if got := refreshed.Load(); got != 0 {
+		t.Fatalf("onRefreshed 不应回调，实际 %d 次", got)
+	}
+
+	aMu.Lock()
+	body := aRefreshBody
+	aMu.Unlock()
+	if !strings.Contains(body, "rt-A") {
+		t.Fatalf("刷新应发往旧服务器且带旧 refresh_token，body = %q", body)
+	}
+	bMu.Lock()
+	gotB := append([]string(nil), bReqs...)
+	bMu.Unlock()
+	if len(gotB) != 0 {
+		t.Fatalf("新服务器不应收到任何请求（尤其 refresh_token），实际: %v", gotB)
 	}
 }
 
