@@ -684,7 +684,7 @@ func TestGatewayResumeAfterReconnect(t *testing.T) {
 		ReconnectMin: 20 * time.Millisecond,
 		Gate:         s.gw.Gate,
 	})
-	s.ChatHandler(func(channelID, msgID, userID, nickname, content, ts string) {
+	s.ChatHandler(func(channelID, msgID, userID, nickname, content, ts, _ string) {
 		mu.Lock()
 		got[msgID]++
 		mu.Unlock()
