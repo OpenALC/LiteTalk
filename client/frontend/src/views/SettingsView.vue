@@ -385,9 +385,10 @@ function bindRecording(spec: string) {
             <LogOut :size="14" class="btn-icon" />退出登录
           </button>
         </div>
-        <!-- Linux 无密钥环时游客令牌回落明文文件（issue #8）：明示降级，不静默 -->
+        <!-- Linux 无密钥环时的降级（issue #8）：密码不保存、游客令牌回落明文文件，
+             两者都必须明示，不静默降级 -->
         <p v-if="secretMode === 'file'" class="s-note s-warn">
-          <CircleAlert :size="13" />令牌以明文文件存储，建议在有密钥环的桌面使用
+          <CircleAlert :size="13" />密钥环不可用：登录密码不会被记住；游客令牌以明文文件存储
         </p>
       </section>
 
