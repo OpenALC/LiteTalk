@@ -51,6 +51,11 @@ func main() {
 		Linux: application.LinuxOptions{
 			// 与 Windows 同理：destroy 休眠模式销毁唯一窗口后须由托盘唤醒重建。
 			DisableQuitOnLastWindowClosed: true,
+			// 不设时 Wails 会推导出 org.wails.litetalk，与 .desktop 的
+			// StartupWMClass 对不上（任务栏通用图标/重复条目）。GTK 同时把
+			// 它作为 Wayland 的 app_id 与 g_set_prgname，须与 .desktop 文件名
+			// io.github.openalc.LiteTalk.desktop 完全一致。
+			ApplicationID: "io.github.openalc.LiteTalk",
 		},
 		Mac: application.MacOptions{
 			// macOS 语义相反：该字段为 true 时最后一窗关闭才终止进程，

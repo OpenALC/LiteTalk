@@ -174,14 +174,20 @@ jobs:
       # libx11-dev / libxi-dev 供 client/core/hotkey/hotkey_linux.go 的 cgo 用
       # （X11 + XInput2 raw 事件）。只是构建期开发库：libX11.so.6 / libXi.so.6 运行
       # 时已由 libgtk-3-0 传递依赖，nfpm 的 depends 不用动。
-      # desktop-file-utils 供 litetalk.desktop 静态校验（issue #6），前移到检查
+      # desktop-file-utils 供 .desktop 静态校验（issue #6），前移到检查
       # job：不依赖构建产物，dev 期间每次 push 都能发现打包期才暴露的问题。
-      - name: 安装 GTK/WebKitGTK/libopus/X11/desktop-file 开发库
+      # xvfb / xauth / dbus-daemon 供同 job 的安装后启动冒烟（issue #6）：
+      # v3 单实例锁走会话总线，没有 dbus-run-session 会在 application.New 里
+      # fatal 退出（noble 上 dbus-run-session 属于 dbus-daemon 包，不是 dbus）；
+      # libasound2t64 / libpulse0 与 nfpm 的 Depends 对齐，保证 dpkg -i 能
+      # 独立验证依赖闭包。
+      - name: 安装 GTK/WebKitGTK/libopus/X11/desktop-file/冒烟依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev libopus-dev libx11-dev libxi-dev desktop-file-utils
+          sudo apt-get install -y pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev libopus-dev libx11-dev libxi-dev desktop-file-utils \
+            xvfb xauth dbus-daemon libasound2t64 libpulse0
       - name: desktop-file-validate（.desktop 静态校验）
-        run: desktop-file-validate build/linux/litetalk.desktop
+        run: desktop-file-validate build/linux/io.github.openalc.LiteTalk.desktop
       - uses: actions/download-artifact@v4
         with:
           name: frontend-dist
@@ -202,6 +208,59 @@ jobs:
         run: go test -tags gtk3 -race -count=1 ./...
       - name: go build
         run: go build -tags gtk3 ./...
+      # ---- issue #6：安装后启动冒烟（非 tag 也跑） ----
+      # nfpm 打包此前只在 tag 时执行，PR 上从未验证过「装得上、起得来」。
+      # 前端产物复用 check-frontend 的 artifact，这里不再构建前端。
+      - name: 构建 production 二进制（供 nfpm 安装包）
+        run: go build -tags gtk3,production -trimpath -ldflags "-s -w -X main.version=smoke" -o build/bin/LiteTalk .
+      - name: 安装 nfpm（锁版本）
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@${NFPM_VERSION}
+      - name: 打 deb 并安装
+        run: |
+          export VERSION=0.0.0
+          export ARCH=amd64
+          mkdir -p dist
+          nfpm package --config build/nfpm.yaml --packager deb --target dist/
+          deb="$(ls dist/litetalk_${VERSION}_${ARCH}.deb)"
+          sudo dpkg -i "$deb"
+          # 安装物一致性：.desktop 文件名 = ApplicationID（Wayland 按文件名
+          # 匹配 app_id），StartupWMClass / Icon 同值，与 main.go 的
+          # LinuxOptions.ApplicationID 对齐。
+          desktop=/usr/share/applications/io.github.openalc.LiteTalk.desktop
+          test -f "$desktop"
+          test -x /usr/bin/litetalk
+          test -f /usr/share/icons/hicolor/256x256/apps/io.github.openalc.LiteTalk.png
+          grep -qx 'StartupWMClass=io.github.openalc.LiteTalk' "$desktop"
+          grep -qx 'Icon=io.github.openalc.LiteTalk' "$desktop"
+          desktop-file-validate "$desktop"
+      - name: 启动冒烟（Xvfb，10 秒）
+        env:
+          # 无 GPU 的 Xvfb 下关闭 WebKit 合成/DMABUF，避免软件渲染初始化失败
+          WEBKIT_DISABLE_COMPOSITING_MODE: '1'
+          WEBKIT_DISABLE_DMABUF_RENDERER: '1'
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: |
+          set +e
+          # dbus-run-session 必需：v3 单实例锁走会话总线，无总线时
+          # application.New 直接 fatal（exit 1），与真实桌面环境不符。
+          dbus-run-session -- xvfb-run -a timeout 10 litetalk > smoke.log 2>&1
+          code=$?
+          set -e
+          cat smoke.log
+          # exit 124 = timeout 到点杀进程，说明这 10 秒内 litetalk 一直存活：
+          # 启动成功且没有自行退出。0（提前退出）、1（启动失败）、139（崩溃）
+          # 等一律失败。依据是本应用启动后进入事件循环并驻留，不会自行结束。
+          if [ "$code" -ne 124 ]; then
+            echo "::error::启动冒烟失败：litetalk 退出码 $code（期望 124：限时内持续运行）"
+            exit 1
+          fi
+          # 124 只证明进程没退出，再确认进入了 ServiceStartup 的启动日志，
+          # 排除卡在 GTK/WebKit 初始化之前的假阳性。
+          if ! grep -q "启动 (pid=" smoke.log; then
+            echo "::error::启动冒烟日志缺少启动标记，进程未进入服务启动"
+            exit 1
+          fi
+          echo "启动冒烟通过：litetalk 在 10 秒时限内持续运行且输出了启动日志"
 
   # Windows：主力平台。真实 cgo Opus / DPAPI / WASAPI 路径只在这里被编译与测试
   check-client-windows:
