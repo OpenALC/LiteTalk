@@ -117,13 +117,13 @@ func (s *Server) Register(ctx context.Context, request RegisterRequestObject) (R
 		return nil, s.writeStoreErr(ctx, err)
 	}
 
-	// 分配 tag：4 位随机，冲突重试（UNIQUE(nickname,tag)）。
+	// 分配 tag：4 位随机（crypto/rand，避免平台 int 宽度差异），冲突重试（UNIQUE(nickname,tag)）。
 	var user *store.User
 	for i := 0; i < 5; i++ {
 		user = &store.User{
 			Email:        email,
 			Nickname:     req.Nickname,
-			Tag:          fmtTag(int(time.Now().UnixNano()+int64(i*7919)) % 10000),
+			Tag:          randDigits(4),
 			PasswordHash: hash,
 			// full 模式邮箱已过验证码验证；simple 模式未验证（从简取舍）。
 			EmailVerified: !s.simpleMode(),

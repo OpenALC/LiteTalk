@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -378,5 +379,40 @@ func TestSQLiteTimeRoundTrip(t *testing.T) {
 	}
 	if s2.UpdatedAt.Before(s2.CreatedAt) {
 		t.Fatalf("UpdatedAt 早于 CreatedAt: up=%v cre=%v", s2.UpdatedAt, s2.CreatedAt)
+	}
+}
+
+// TestSQLiteUserTagLargeSnowflakeID 大 Snowflake ID + 4 位 tag 可正常写入，
+// 且按 昵称#tag 能查回（#22：溢出产生的 "-7952" 能存进 SQLite，但用户
+// 从此无法被加好友）。
+func TestSQLiteUserTagLargeSnowflakeID(t *testing.T) {
+	m := openTestSQLite(t)
+	ctx := context.Background()
+	if err := m.Migrate(ctx, findMigrationsSQLite(t)); err != nil {
+		t.Fatalf("迁移失败: %v", err)
+	}
+	cases := []struct {
+		id  int64
+		tag string
+	}{
+		{int64(1)<<62 + 123456789, "0000"}, // 旧算法的溢出面量级，且带前导零
+		{int64(1767225600000) << 22, "0420"},
+		{math.MaxInt64 - 7919, "9999"},
+	}
+	for _, tc := range cases {
+		u := &User{
+			ID: tc.id, Email: tc.tag + "@big.test", Nickname: "big-" + tc.tag,
+			Tag: tc.tag, PasswordHash: "h",
+		}
+		if err := m.CreateUser(ctx, u); err != nil {
+			t.Fatalf("id=%d tag=%s CreateUser: %v", tc.id, tc.tag, err)
+		}
+		got, err := m.UserByNicknameTag(ctx, u.Nickname, tc.tag)
+		if err != nil {
+			t.Fatalf("id=%d tag=%s UserByNicknameTag: %v", tc.id, tc.tag, err)
+		}
+		if got.ID != tc.id || got.Tag != tc.tag {
+			t.Fatalf("往返失真: got id=%d tag=%q，期望 id=%d tag=%q", got.ID, got.Tag, tc.id, tc.tag)
+		}
 	}
 }
