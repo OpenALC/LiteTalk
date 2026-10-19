@@ -448,3 +448,107 @@ describe('新建频道归入分类', () => {
     expect(s.findServer('31')!.channels[0].group).toBe(UNCATEGORIZED)
   })
 })
+
+// 业务 store 统一复位（#85）：登出/被踢/换服后不能再残留上一账号的服务器、
+// 好友与分类缓存；在飞的旧请求返回时也不得把刚清空的数据写回。
+describe('store 统一复位', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    resetMock()
+  })
+
+  const serverDTO = (id: number, name: string) => ({
+    id: String(id), name, owner_id: '1', icon_name: 'music', icon_color: '#4FA4F3',
+  })
+
+  it('servers.resetAll 回到内置示例并清空会话选中/分类缓存，保留客户端偏好', async () => {
+    mockGoApp.ListServers.mockResolvedValue([serverDTO(7, '服七')])
+    mockGoApp.ListChannels.mockResolvedValue({
+      categories: [{ id: 71, server_id: 7, name: '甲组', position: 0 }],
+      channels: [{ id: 72, server_id: 7, name: '大厅', type: 'voice', category_id: 71, position: 0 }],
+    })
+    const s = useServersStore()
+    await s.loadRemoteServers()
+    s.selectServer('7')
+    // 内置示例的本地改动（改名）必须在复位后消失，否则会跨账号带过去。
+    s.findServer('hq')!.name = '改过的总部'
+    s.homeId = '7'
+    s.introHidden = true
+
+    s.resetAll()
+
+    expect(s.servers.map((x) => x.id)).toEqual(['hq', 'game', 'music', 'design', 'book'])
+    expect(s.findServer('hq')?.name).toBe('语音总部')
+    expect(s.findServer('7')).toBeUndefined()
+    expect(s.currentServerId).toBe('')
+    expect(s.currentChannelId).toBe('')
+    expect(s.extraGroups).toEqual({})
+    // homeId / introHidden 是 config.json 的客户端级偏好，不属于账号会话。
+    expect(s.homeId).toBe('7')
+    expect(s.introHidden).toBe(true)
+  })
+
+  it('servers.resetAll 幂等：重复调用不报错且仍为出厂态', () => {
+    const s = useServersStore()
+    s.selectServer('hq')
+
+    s.resetAll()
+    s.resetAll()
+
+    expect(s.servers).toHaveLength(5)
+    expect(s.currentServerId).toBe('')
+    expect(s.currentChannelId).toBe('')
+  })
+
+  it('servers.resetAll 后旧账号在飞的 loadRemoteServers 不写回', async () => {
+    let resolveList!: (v: unknown[]) => void
+    mockGoApp.ListServers.mockReturnValue(new Promise((res) => { resolveList = res }))
+    const s = useServersStore()
+
+    const p = s.loadRemoteServers()
+    s.resetAll()
+    resolveList([serverDTO(9, '旧账号服务器')])
+    await p
+
+    expect(s.findServer('9')).toBeUndefined()
+    expect(mockGoApp.ListChannels).not.toHaveBeenCalled()
+  })
+
+  it('friends.resetAll 清空在线/离线/待处理，幂等', async () => {
+    const friendDTO = (id: number, uid: number, online: boolean) => ({
+      id: String(id), status: 'accepted', incoming: false, remark: '', group: '',
+      user: { id: String(uid), nickname: `用户${uid}`, tag: '0001', status: 1, online },
+    })
+    mockGoApp.ListFriends.mockResolvedValue([friendDTO(1, 10, true), friendDTO(2, 20, false)])
+    const s = useFriendsStore()
+    await s.loadFriends()
+    s.pending = [{ id: '3', name: '待处理', outgoing: true }]
+
+    s.resetAll()
+
+    expect(s.online).toEqual([])
+    expect(s.offline).toEqual([])
+    expect(s.pending).toEqual([])
+
+    s.resetAll() // 幂等
+    expect(s.online).toEqual([])
+  })
+
+  it('friends.resetAll 后旧账号在飞的 loadFriends 不写回', async () => {
+    let resolveList!: (v: unknown[]) => void
+    mockGoApp.ListFriends.mockReturnValue(new Promise((res) => { resolveList = res }))
+    const s = useFriendsStore()
+
+    const p = s.loadFriends()
+    s.resetAll()
+    resolveList([{
+      id: '1', status: 'accepted', incoming: false, remark: '', group: '',
+      user: { id: '10', nickname: '用户10', tag: '0001', status: 1, online: true },
+    }])
+    await p
+
+    expect(s.online).toEqual([])
+    expect(s.offline).toEqual([])
+    expect(s.pending).toEqual([])
+  })
+})
