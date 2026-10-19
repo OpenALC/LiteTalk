@@ -93,6 +93,98 @@ func TestSetAudioBackendRejectsUnknown(t *testing.T) {
 	}
 }
 
+// newNullPipeline 构造无声卡自检管线（不启动），测试用于代替真实设备。
+func newNullPipeline(t *testing.T) *audio.Pipeline {
+	t.Helper()
+	cfg := audio.DefaultPipelineConfig()
+	cfg.Backend = audio.BackendNull
+	p, err := audio.NewPipeline(cfg)
+	if err != nil {
+		t.Fatalf("NewPipeline: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+	return p
+}
+
+// TestStartMediaFailureReportsVoiceUnavailable startMedia 的 mixer/pipeline
+// 启动失败必须经 OnVoiceUnavailable 上报（#80）：此前只打日志，UI 仍显示在
+// 房内、麦克风没起来，用户与消费方都不可观测。
+// 同一故障周期只上报一次；启动成功复位，后续新故障可再次上报。
+func TestStartMediaFailureReportsVoiceUnavailable(t *testing.T) {
+	newSession := func(msgs chan<- string) *Session {
+		s := NewSession(api.NewAPIClient("http://127.0.0.1:1"), "tok", "n",
+			Events{OnVoiceUnavailable: func(msg string) { msgs <- msg }}, nil)
+		s.mixer = audio.NewMixer(func([]int16) int { return 0 })
+		return s
+	}
+	expectMsg := func(t *testing.T, msgs <-chan string, want string) {
+		t.Helper()
+		select {
+		case got := <-msgs:
+			if got != want {
+				t.Fatalf("提示 = %q, want %q", got, want)
+			}
+		default:
+			t.Fatalf("未上报 OnVoiceUnavailable（want %q）", want)
+		}
+	}
+	expectSilent := func(t *testing.T, msgs <-chan string) {
+		t.Helper()
+		select {
+		case got := <-msgs:
+			t.Fatalf("同一故障周期不应重复上报，收到 %q", got)
+		default:
+		}
+	}
+
+	t.Run("mixer", func(t *testing.T) {
+		msgs := make(chan string, 4)
+		s := newSession(msgs)
+		s.pipe = newNullPipeline(t)
+		// 预先启动 mixer，使 startMedia 内的 Start 返回 already started。
+		if err := s.mixer.Start(); err != nil {
+			t.Fatalf("预热 mixer: %v", err)
+		}
+		s.startMedia()
+		expectMsg(t, msgs, "音频播放启动失败，请检查扬声器")
+		if s.mediaStarted.Load() {
+			t.Fatal("启动失败后 mediaStarted 应为 false（允许重试）")
+		}
+		s.startMedia()
+		expectSilent(t, msgs)
+		s.mixer.Stop()
+	})
+
+	t.Run("pipeline", func(t *testing.T) {
+		msgs := make(chan string, 4)
+		s := newSession(msgs)
+		closed := newNullPipeline(t)
+		_ = closed.Close() // Start 必然失败，且错误文本含内部细节
+		s.pipe = closed
+
+		s.startMedia()
+		expectMsg(t, msgs, "音频设备启动失败，请检查麦克风和扬声器")
+		if s.mediaStarted.Load() {
+			t.Fatal("启动失败后 mediaStarted 应为 false（允许重试）")
+		}
+		s.startMedia()
+		expectSilent(t, msgs)
+
+		// 换成可用管线启动成功：去重标记复位，后续新故障应再次提示。
+		s.pipe = newNullPipeline(t)
+		s.startMedia()
+		if !s.mediaStarted.Load() {
+			t.Fatal("可用管线应启动成功")
+		}
+		s.stopMedia()
+		closed2 := newNullPipeline(t)
+		_ = closed2.Close()
+		s.pipe = closed2
+		s.startMedia()
+		expectMsg(t, msgs, "音频设备启动失败，请检查麦克风和扬声器")
+	})
+}
+
 // TestJoinChannelVoiceUnavailable 媒体管线初始化失败（如无 Opus 的平台）时
 // JoinChannel 必须给出明确错误供前端 toast，而不是静默成功或 panic。
 func TestJoinChannelVoiceUnavailable(t *testing.T) {
