@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -290,12 +289,12 @@ func main() {
 			}
 		}
 	}
-	rtcCreds := rtcapi.NewHandler(rtcapi.Config{
+	rtcCfg := rtcapi.Config{
 		Secret:   turnSecret,
 		TurnURLs: turnURLs,
 		StunURLs: stunURLs,
 		TTL:      12 * time.Hour,
-	}, rtcAuth, log.Default())
+	}
 
 	// 发信通道：webhook（自有发码平台）> SMTP > Console 打印，见 README「发信配置」
 	mail, mailName := mailer.New(mailer.Config{
@@ -340,11 +339,14 @@ func main() {
 		SelfHost: pickStoreKind() != "mysql",
 		// 管理员邀请码是否未认领（#27：KV 消费标记 + 库内是否已有服务器）。
 		BootstrapRequired: func() bool { return bootstrap.Required(context.Background(), kv, st) },
+		// healthz 版本号与 rtc/credentials 凭证（#77 收编）：端点统一由 strict server
+		// 路由提供，鉴权函数沿用信令口径（JWT，dev 模式兜底 dev 令牌）。
+		Version: version,
+		RTC:     rtcCfg,
+		RTCAuth: rtcAuth,
 	})
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/v1/healthz", healthzHandler)
-	mux.Handle("POST /api/v1/rtc/credentials", rtcCreds)
 	mux.Handle("/api/v1/", apiSrv.Handler())
 	mux.HandleFunc("GET /ws", hub.ServeWS)
 
@@ -447,15 +449,6 @@ func isPermError(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "permission denied") || strings.Contains(msg, "access is denied")
-}
-
-// healthzHandler 健康检查：GET /api/v1/healthz
-func healthzHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"status":  "ok",
-		"version": version,
-	})
 }
 
 // identityFromClaims 从 JWT Claims 构造信令身份。IssuedAt 透传供握手侧

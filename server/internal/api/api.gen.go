@@ -93,6 +93,21 @@ func (e FriendEntryStatus) Valid() bool {
 	}
 }
 
+// Defines values for HealthzStatus.
+const (
+	HealthzStatusOk HealthzStatus = "ok"
+)
+
+// Valid indicates whether the value is a known member of the HealthzStatus enum.
+func (e HealthzStatus) Valid() bool {
+	switch e {
+	case HealthzStatusOk:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for MemberInfoRole.
 const (
 	Admin  MemberInfoRole = "admin"
@@ -134,13 +149,13 @@ func (e ServerConfigAuthMode) Valid() bool {
 
 // Defines values for StatusOkStatus.
 const (
-	Ok StatusOkStatus = "ok"
+	StatusOkStatusOk StatusOkStatus = "ok"
 )
 
 // Valid indicates whether the value is a known member of the StatusOkStatus enum.
 func (e StatusOkStatus) Valid() bool {
 	switch e {
-	case Ok:
+	case StatusOkStatusOk:
 		return true
 	default:
 		return false
@@ -258,6 +273,29 @@ type FriendEntryStatus string
 // GuestRequest 请求体可为空（老客户端兼容）。
 type GuestRequest struct {
 	Device *string `json:"device,omitempty"`
+}
+
+// Healthz 部署探活响应。路径与方法被部署脚本依赖，不得变更。
+type Healthz struct {
+	Status HealthzStatus `json:"status"`
+
+	// Version 服务端构建版本（未注入版本号的本地构建为 dev）
+	Version string `json:"version"`
+}
+
+// HealthzStatus defines model for Healthz.Status.
+type HealthzStatus string
+
+// ICEServer 单条 ICE server（字段与 WebRTC RTCIceServer 对齐）。
+type ICEServer struct {
+	// Credential TURN 短期凭证（HMAC-SHA1 base64）；STUN 条目无此字段
+	Credential *string `json:"credential,omitempty"`
+
+	// Urls stun:/stuns:/turn:/turns: URL 列表
+	Urls []string `json:"urls"`
+
+	// Username TURN 短期用户名（<expiry_unix>:<uid>）；STUN 条目无此字段
+	Username *string `json:"username,omitempty"`
 }
 
 // Invite 邀请码。ID 为十进制字符串（#31）。
@@ -401,6 +439,13 @@ type RegisterRequest struct {
 	Password string `json:"password"`
 }
 
+// RtcCredentials TURN/STUN 短期凭证；iceServers 可直接填入 WebRTC 配置。
+type RtcCredentials struct {
+	// ExpiresAt 凭证过期时刻（unix 秒）
+	ExpiresAt  int64       `json:"expiresAt"`
+	IceServers []ICEServer `json:"iceServers"`
+}
+
 // ServerChannels 分类与频道两数组（空为 []，非 null）。
 type ServerChannels struct {
 	Categories []CategoryInfo `json:"categories"`
@@ -514,11 +559,17 @@ type Gone = Problem
 // Internal RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段 （RFC 9457 允许的扩展字段，至少保留一个版本）。
 type Internal = Problem
 
+// MethodNotAllowed RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段 （RFC 9457 允许的扩展字段，至少保留一个版本）。
+type MethodNotAllowed = Problem
+
 // NotFound RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段 （RFC 9457 允许的扩展字段，至少保留一个版本）。
 type NotFound = Problem
 
 // RateLimited RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段 （RFC 9457 允许的扩展字段，至少保留一个版本）。
 type RateLimited = Problem
+
+// TurnUnavailable RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段 （RFC 9457 允许的扩展字段，至少保留一个版本）。
+type TurnUnavailable = Problem
 
 // Unauthorized RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段 （RFC 9457 允许的扩展字段，至少保留一个版本）。
 type Unauthorized = Problem
@@ -688,6 +739,12 @@ type ServerInterface interface {
 	// PatchFriend 设置备注/分组（仅发起方）
 	// (PATCH /api/v1/friends/{id})
 	PatchFriend(w http.ResponseWriter, r *http.Request, id IDPath)
+	// GetHealthz 健康检查（部署探活）
+	// (GET /api/v1/healthz)
+	GetHealthz(w http.ResponseWriter, r *http.Request)
+	// PostRtcCredentials 签发 TURN 短期凭证
+	// (POST /api/v1/rtc/credentials)
+	PostRtcCredentials(w http.ResponseWriter, r *http.Request)
 	// ListServers 我所在的服务器列表
 	// (GET /api/v1/servers)
 	ListServers(w http.ResponseWriter, r *http.Request)
@@ -1183,6 +1240,34 @@ func (siw *ServerInterfaceWrapper) PatchFriend(w http.ResponseWriter, r *http.Re
 	handler.ServeHTTP(w, r)
 }
 
+// GetHealthz operation middleware
+func (siw *ServerInterfaceWrapper) GetHealthz(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetHealthz(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// PostRtcCredentials operation middleware
+func (siw *ServerInterfaceWrapper) PostRtcCredentials(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.PostRtcCredentials(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 // ListServers operation middleware
 func (siw *ServerInterfaceWrapper) ListServers(w http.ResponseWriter, r *http.Request) {
 
@@ -1617,6 +1702,8 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 		ErrorHandlerFunc:   options.ErrorHandlerFunc,
 	}
 
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/healthz", wrapper.GetHealthz)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/rtc/credentials", wrapper.PostRtcCredentials)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/config", wrapper.GetConfig)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/auth/register", wrapper.Register)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/auth/login", wrapper.Login)
@@ -1665,9 +1752,13 @@ type GoneApplicationProblemPlusJSONResponse Problem
 
 type InternalApplicationProblemPlusJSONResponse Problem
 
+type MethodNotAllowedApplicationProblemPlusJSONResponse Problem
+
 type NotFoundApplicationProblemPlusJSONResponse Problem
 
 type RateLimitedApplicationProblemPlusJSONResponse Problem
+
+type TurnUnavailableApplicationProblemPlusJSONResponse Problem
 
 type UnauthorizedApplicationProblemPlusJSONResponse Problem
 
@@ -3552,6 +3643,112 @@ func (response PatchFrienddefaultApplicationProblemPlusJSONResponse) VisitPatchF
 	return err
 }
 
+type GetHealthzRequestObject struct {
+}
+
+type GetHealthzResponseObject interface {
+	VisitGetHealthzResponse(w http.ResponseWriter) error
+}
+
+type GetHealthz200JSONResponse Healthz
+
+func (response GetHealthz200JSONResponse) VisitGetHealthzResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetHealthz405ApplicationProblemPlusJSONResponse struct {
+	MethodNotAllowedApplicationProblemPlusJSONResponse
+}
+
+func (response GetHealthz405ApplicationProblemPlusJSONResponse) VisitGetHealthzResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(405)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PostRtcCredentialsRequestObject struct {
+}
+
+type PostRtcCredentialsResponseObject interface {
+	VisitPostRtcCredentialsResponse(w http.ResponseWriter) error
+}
+
+type PostRtcCredentials200JSONResponse RtcCredentials
+
+func (response PostRtcCredentials200JSONResponse) VisitPostRtcCredentialsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PostRtcCredentials401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response PostRtcCredentials401ApplicationProblemPlusJSONResponse) VisitPostRtcCredentialsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PostRtcCredentials405ApplicationProblemPlusJSONResponse struct {
+	MethodNotAllowedApplicationProblemPlusJSONResponse
+}
+
+func (response PostRtcCredentials405ApplicationProblemPlusJSONResponse) VisitPostRtcCredentialsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(405)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PostRtcCredentials503ApplicationProblemPlusJSONResponse struct {
+	TurnUnavailableApplicationProblemPlusJSONResponse
+}
+
+func (response PostRtcCredentials503ApplicationProblemPlusJSONResponse) VisitPostRtcCredentialsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(503)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
 type ListServersRequestObject struct {
 }
 
@@ -4731,6 +4928,12 @@ type StrictServerInterface interface {
 	// PatchFriend 设置备注/分组（仅发起方）
 	// (PATCH /api/v1/friends/{id})
 	PatchFriend(ctx context.Context, request PatchFriendRequestObject) (PatchFriendResponseObject, error)
+	// GetHealthz 健康检查（部署探活）
+	// (GET /api/v1/healthz)
+	GetHealthz(ctx context.Context, request GetHealthzRequestObject) (GetHealthzResponseObject, error)
+	// PostRtcCredentials 签发 TURN 短期凭证
+	// (POST /api/v1/rtc/credentials)
+	PostRtcCredentials(ctx context.Context, request PostRtcCredentialsRequestObject) (PostRtcCredentialsResponseObject, error)
 	// ListServers 我所在的服务器列表
 	// (GET /api/v1/servers)
 	ListServers(ctx context.Context, request ListServersRequestObject) (ListServersResponseObject, error)
@@ -5413,6 +5616,54 @@ func (sh *strictHandler) PatchFriend(w http.ResponseWriter, r *http.Request, id 
 	}
 }
 
+// GetHealthz operation middleware
+func (sh *strictHandler) GetHealthz(w http.ResponseWriter, r *http.Request) {
+	var request GetHealthzRequestObject
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.GetHealthz(ctx, request.(GetHealthzRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "GetHealthz")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(GetHealthzResponseObject); ok {
+		if err := validResponse.VisitGetHealthzResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// PostRtcCredentials operation middleware
+func (sh *strictHandler) PostRtcCredentials(w http.ResponseWriter, r *http.Request) {
+	var request PostRtcCredentialsRequestObject
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.PostRtcCredentials(ctx, request.(PostRtcCredentialsRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "PostRtcCredentials")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(PostRtcCredentialsResponseObject); ok {
+		if err := validResponse.VisitPostRtcCredentialsResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
 // ListServers operation middleware
 func (sh *strictHandler) ListServers(w http.ResponseWriter, r *http.Request) {
 	var request ListServersRequestObject
@@ -5821,6 +6072,7 @@ func (sh *strictHandler) PatchMe(w http.ResponseWriter, r *http.Request) {
 // 由 openapigen 生成；未列出的路由一律要求 Bearer 鉴权。
 var PublicRoutePatterns = map[string]bool{
 	"GET /api/v1/config":               true,
+	"GET /api/v1/healthz":              true,
 	"POST /api/v1/auth/email-code":     true,
 	"POST /api/v1/auth/guest":          true,
 	"POST /api/v1/auth/login":          true,
@@ -5828,4 +6080,5 @@ var PublicRoutePatterns = map[string]bool{
 	"POST /api/v1/auth/password/reset": true,
 	"POST /api/v1/auth/refresh":        true,
 	"POST /api/v1/auth/register":       true,
+	"POST /api/v1/rtc/credentials":     true,
 }

@@ -4,6 +4,46 @@
  */
 
 export interface paths {
+    "/api/v1/healthz": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 健康检查（部署探活）
+         * @description 免鉴权。部署脚本与探针依赖该路径与方法（GET /api/v1/healthz）， 路径与方法不得变更。version 为构建期注入的服务端版本号。
+         */
+        get: operations["getHealthz"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/rtc/credentials": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 签发 TURN 短期凭证
+         * @description 鉴权方式与信令一致：Authorization: Bearer <access_token>，或查询参数 ?token=<access_token>（两者皆可，不要求 X-LiteTalk-Client）。 未登录或令牌无效返回 401 unauthorized（不区分原因，避免泄露内部细节）； 服务端未配置 TURN（LITETALK_TURN_SECRET 为空且内置 TURN 关闭）返回 503 turn_unavailable，客户端按直连降级。响应 iceServers 可直接填入 WebRTC 的 RTCConfiguration.iceServers。
+         */
+        post: operations["postRtcCredentials"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/config": {
         parameters: {
             query?: never;
@@ -564,6 +604,40 @@ export interface components {
             /** @enum {string} */
             status: "ok";
         };
+        /**
+         * Healthz
+         * @description 部署探活响应。路径与方法被部署脚本依赖，不得变更。
+         */
+        Healthz: {
+            /** @enum {string} */
+            status: "ok";
+            /** @description 服务端构建版本（未注入版本号的本地构建为 dev） */
+            version: string;
+        };
+        /**
+         * ICEServer
+         * @description 单条 ICE server（字段与 WebRTC RTCIceServer 对齐）。
+         */
+        ICEServer: {
+            /** @description stun:/stuns:/turn:/turns: URL 列表 */
+            urls: string[];
+            /** @description TURN 短期用户名（<expiry_unix>:<uid>）；STUN 条目无此字段 */
+            username?: string;
+            /** @description TURN 短期凭证（HMAC-SHA1 base64）；STUN 条目无此字段 */
+            credential?: string;
+        };
+        /**
+         * RtcCredentials
+         * @description TURN/STUN 短期凭证；iceServers 可直接填入 WebRTC 配置。
+         */
+        RtcCredentials: {
+            iceServers: components["schemas"]["ICEServer"][];
+            /**
+             * Format: int64
+             * @description 凭证过期时刻（unix 秒）
+             */
+            expiresAt: number;
+        };
         /** ServerConfig */
         ServerConfig: {
             /** @enum {string} */
@@ -979,6 +1053,24 @@ export interface components {
                 "application/problem+json": components["schemas"]["Problem"];
             };
         };
+        /** @description 方法不允许（body.code：method_not_allowed）；响应头 Allow 列出该路径的可用方法。 */
+        MethodNotAllowed: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/problem+json": components["schemas"]["Problem"];
+            };
+        };
+        /** @description TURN 未配置或暂不可用（body.code：turn_unavailable）；客户端按直连降级。 */
+        TurnUnavailable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/problem+json": components["schemas"]["Problem"];
+            };
+        };
         /** @description 服务端错误（body.code：internal / conflict / not_found / code_expired，store 错误映射） */
         Internal: {
             headers: {
@@ -999,6 +1091,50 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    getHealthz: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 服务存活 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Healthz"];
+                };
+            };
+            405: components["responses"]["MethodNotAllowed"];
+        };
+    };
+    postRtcCredentials: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description ICE server 列表（STUN 条目无凭证；TURN 条目带 username/credential） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RtcCredentials"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            405: components["responses"]["MethodNotAllowed"];
+            503: components["responses"]["TurnUnavailable"];
+        };
+    };
     getConfig: {
         parameters: {
             query?: never;
