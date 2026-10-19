@@ -135,6 +135,13 @@ type wsClient struct {
 	t    *testing.T
 	conn *websocket.Conn
 	user string
+
+	// pending 预读缓冲：dial 为等服务端 register 完成会先读到 hello（register
+	// 先于 hello 下发，见 hub.go ServeWS），途中若夹带其它信封则缓存于此，
+	// recvUntil 先排空缓冲再读连接。没有它，"dial 完立刻 send" 会撞上
+	// 服务端尚未 register 的窗口——广播直接跳过该连接，对端永远等不到消息
+	// （CI 上表现为间歇 5s 超时，TestGatewayResumeTrailing 踩过）。
+	pending []Envelope
 }
 
 func (f *chatFixture) dial(token, name string) *wsClient {
@@ -145,7 +152,27 @@ func (f *chatFixture) dial(token, name string) *wsClient {
 		f.t.Fatalf("dial %s: %v", name, err)
 	}
 	f.t.Cleanup(func() { conn.CloseNow() })
-	return &wsClient{t: f.t, conn: conn, user: name}
+	c := &wsClient{t: f.t, conn: conn, user: name}
+	// 等到 hello：服务端 register + 事件环 Bind 都先于它下发（hub.go:235-245），
+	// 收到即保证该连接已被房间广播覆盖。显式 recvUntil(TypeHello) 的测试不受
+	// 影响——hello 进了 pending，recvUntil 会先取到它。
+	c.awaitHello()
+	return c
+}
+
+// awaitHello 读到 hello 为止，途中信封进 pending。超时 5s（与 recvUntil 一致）。
+func (c *wsClient) awaitHello() {
+	c.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		env := c.readOne()
+		if env.Type == TypeHello {
+			c.pending = append(c.pending, env)
+			return
+		}
+		c.pending = append(c.pending, env)
+	}
+	c.t.Fatalf("awaitHello: 5s 内未收到 hello（user=%s）", c.user)
 }
 
 func (c *wsClient) send(msgType string, data any) {
@@ -159,20 +186,33 @@ func (c *wsClient) send(msgType string, data any) {
 	}
 }
 
+// readOne 读一个信封（超时 5s）。awaitHello 与 recvUntil 共用。
+func (c *wsClient) readOne() Envelope {
+	c.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, data, err := c.conn.Read(ctx)
+	if err != nil {
+		c.t.Fatalf("readOne (user=%s): %v", c.user, err)
+	}
+	var env Envelope
+	if err := json.Unmarshal(data, &env); err != nil {
+		c.t.Fatalf("unmarshal envelope: %v", err)
+	}
+	return env
+}
+
 // recvUntil 读到指定类型为止（跳过 hello/joined 等中间消息），超时 5s。
+// 先排空 dial 预读进 pending 的信封，再读连接。
 func (c *wsClient) recvUntil(want string) Envelope {
 	c.t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_, data, err := c.conn.Read(ctx)
-		cancel()
-		if err != nil {
-			c.t.Fatalf("recvUntil %s (user=%s): %v", want, c.user, err)
-		}
 		var env Envelope
-		if err := json.Unmarshal(data, &env); err != nil {
-			c.t.Fatalf("unmarshal envelope: %v", err)
+		if len(c.pending) > 0 {
+			env, c.pending = c.pending[0], c.pending[1:]
+		} else {
+			env = c.readOne()
 		}
 		if env.Type == want {
 			return env

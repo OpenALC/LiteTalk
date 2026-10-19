@@ -53,6 +53,12 @@ type pump struct {
 
 func newPump(t *testing.T, c *wsClient) *pump {
 	p := &pump{t: t, ch: make(chan Envelope, 64)}
+	// dial 为保证服务端已 register 会预读到 hello 并暂存 c.pending；pump 的读循环
+	// 直接走 c.conn，不排空缓冲就会永远等不到那条 hello（until(TypeHello) 超时）。
+	for _, env := range c.pending {
+		p.ch <- env
+	}
+	c.pending = nil
 	go func() {
 		for {
 			_, data, err := c.conn.Read(context.Background())
