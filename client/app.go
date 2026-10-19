@@ -449,13 +449,15 @@ type SavedCredentialsView struct {
 	Saved    bool   `json:"saved"`
 }
 
-// GetSavedCredentials 读取记住的登录凭据（密码经 DPAPI 解密）。
+// GetSavedCredentials 读取记住的登录凭据（密码由平台实现解密：Windows DPAPI /
+// Linux keyring）。
 func (a *App) GetSavedCredentials() SavedCredentialsView {
 	c := a.cfg.GetSavedCredentials()
 	return SavedCredentialsView{Email: c.Email, Password: c.Password, Saved: c.Saved}
 }
 
-// SetSavedCredentials 保存登录凭据（邮箱明文 + 密码 DPAPI 加密）。
+// SetSavedCredentials 保存登录凭据（邮箱明文；密码 Windows DPAPI / Linux keyring，
+// keyring 不可用时不保存密码）。
 func (a *App) SetSavedCredentials(email, password string) {
 	_ = a.cfg.SetSavedCredentials(email, password)
 }
