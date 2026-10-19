@@ -17,6 +17,11 @@ type Room struct {
 
 	mu    sync.RWMutex
 	peers map[string]*Peer // userID → Peer
+	// joining 入房进行中的计数（#19，受 mu 保护）：acquireRoom 返回前 +1，
+	// addPeer 落位后由 releaseJoin -1。removeRoomIfEmpty 只在 peers 为空且
+	// joining==0 时删除，杜绝「拿到房间 → 被回收 → peer 落进孤儿房」。
+	// 锁序固定为 s.mu → r.mu（acquireRoom / removeRoomIfEmpty 都按此顺序）。
+	joining int
 
 	// tickPeers 成员快照缓冲（复用免分配；仅 speakingLoop goroutine 访问）。
 	tickPeers []*Peer
@@ -28,12 +33,6 @@ func newRoom(s *SFU, id string) *Room {
 		sfu:   s,
 		peers: make(map[string]*Peer),
 	}
-}
-
-func (r *Room) isEmpty() bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return len(r.peers) == 0
 }
 
 func (r *Room) getPeer(userID string) *Peer {
@@ -81,6 +80,14 @@ func (r *Room) addPeer(userID, connID string, sig SignalSender) (*Peer, error) {
 	}
 	r.sfu.log.Printf("sfu: 成员 %s 加入房间 %s（connID %s，当前 %d 人）", userID, r.id, connID, n)
 	return p, nil
+}
+
+// releaseJoin 结束一次入房登记（#19）：与 acquireRoom 成对，在 addPeer 调用
+// 之后执行；addPeer 失败也必须释放，否则空房间永远无法回收。
+func (r *Room) releaseJoin() {
+	r.mu.Lock()
+	r.joining--
+	r.mu.Unlock()
 }
 
 // removePeerIf 仅当 peer 归属 connID 时移除并关闭其 PC（§0.9 身份核对：

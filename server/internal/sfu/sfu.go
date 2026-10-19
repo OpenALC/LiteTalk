@@ -375,6 +375,9 @@ func (s *SFU) Close() error {
 	return err
 }
 
+// getOrCreateRoom 只创建/查找房间，不登记入房（#19）：返回后到 addPeer 之间
+// 空房间可能被 removeRoomIfEmpty 回收。生产入房必须走 acquireRoom（带 joining
+// 登记）；这里仅供确实不接 addPeer 的测试与配额检查使用。
 func (s *SFU) getOrCreateRoom(id string) (*Room, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -390,16 +393,48 @@ func (s *SFU) getOrCreateRoom(id string) (*Room, error) {
 	return r, nil
 }
 
+// acquireRoom 取得（或创建）房间并登记一次「入房进行中」（#19）。
+// 与 removeRoomIfEmpty 用同一锁序 s.mu → r.mu：返回后到 addPeer 落位之间，
+// 即使房间此刻还是空的，removeRoomIfEmpty 也会因 joining>0 而保留它，
+// 不会出现「peer 落进已从 rooms 摘掉的孤儿房」。调用方必须在 addPeer
+// 之后（无论成功与否）调用 releaseJoin。
+func (s *SFU) acquireRoom(id string) (*Room, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.rooms[id]
+	if !ok {
+		if s.cfg.MaxRooms > 0 && len(s.rooms) >= s.cfg.MaxRooms {
+			return nil, ErrTooManyRooms
+		}
+		r = newRoom(s, id)
+		s.rooms[id] = r
+	}
+	r.mu.Lock()
+	r.joining++
+	r.mu.Unlock()
+	return r, nil
+}
+
 func (s *SFU) findRoom(id string) *Room {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.rooms[id]
 }
 
+// removeRoomIfEmpty 回收空房间（#19）：只有在没有 peer 且没有入房进行中
+// （joining==0）时删除。锁序与 acquireRoom 一致（s.mu → r.mu），两者串行化，
+// 因此不会误删刚被 acquireRoom 拿到、正在 addPeer 的房间。
 func (s *SFU) removeRoomIfEmpty(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if r, ok := s.rooms[id]; ok && r.isEmpty() {
+	r, ok := s.rooms[id]
+	if !ok {
+		return
+	}
+	r.mu.RLock()
+	empty := len(r.peers) == 0 && r.joining == 0
+	r.mu.RUnlock()
+	if empty {
 		delete(s.rooms, id)
 		s.log.Printf("sfu: 房间 %s 已空，销毁", id)
 	}
@@ -416,12 +451,14 @@ var ErrTooManyRooms = fmt.Errorf("房间数已达上限")
 // connID 为归属 WS 连接标识（§0.9）：LeaveIf 按此核对，避免误清新连接的 peer。
 // 返回 rtc.answer 的 SDP。
 func (s *SFU) HandleOffer(roomID, userID, connID, sdp string, sig SignalSender) (string, error) {
-	room, err := s.getOrCreateRoom(roomID)
+	room, err := s.acquireRoom(roomID)
 	if err != nil {
 		return "", err
 	}
 	peer, err := room.addPeer(userID, connID, sig)
+	room.releaseJoin()
 	if err != nil {
+		s.removeRoomIfEmpty(roomID)
 		return "", err
 	}
 	answerSDP, err := peer.handleInitialOffer(sdp)
