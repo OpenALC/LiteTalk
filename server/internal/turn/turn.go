@@ -9,9 +9,19 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"strings"
+	"sync"
 
 	"github.com/pion/logging"
 	turnpkg "github.com/pion/turn/v5"
+)
+
+const (
+	// 每 uid 的并发 allocation 上限（#25）：正常客户端一条连接只用 1 个中继，
+	// 4 个留给重连/多网卡场景，同时把单凭证刷爆中继端口的成本压到最低。
+	maxAllocationsPerUID = 4
+	// 每客户端 IP 的并发上限：同一 NAT 出口后可能有多个不同 uid 的用户。
+	maxAllocationsPerIP = 8
 )
 
 // Config 内置 TURN 配置。
@@ -79,9 +89,21 @@ func New(cfg Config) (*Server, error) {
 		}
 	}
 
+	// 配额按 uid 与客户端 IP 两层计数（#25）：pion 的 QuotaHandler 只负责
+	// 分配前检查，真实计数由生命周期事件维护。
+	quota := newAllocationQuota()
 	sc := turnpkg.ServerConfig{
-		Realm:       cfg.Realm,
-		AuthHandler: turnpkg.LongTermTURNRESTAuthHandler(cfg.Secret, pionLog),
+		Realm:        cfg.Realm,
+		AuthHandler:  turnpkg.LongTermTURNRESTAuthHandler(cfg.Secret, pionLog),
+		QuotaHandler: quota.allow,
+		EventHandler: turnpkg.EventHandler{
+			OnAllocationCreated: func(srcAddr, _ net.Addr, _, userID, _ string, _ net.Addr, _ int) {
+				quota.add(srcAddr, userID, 1)
+			},
+			OnAllocationDeleted: func(srcAddr, _ net.Addr, _, userID, _ string) {
+				quota.add(srcAddr, userID, -1)
+			},
+		},
 	}
 
 	s := &Server{logger: logger}
@@ -95,6 +117,7 @@ func New(cfg Config) (*Server, error) {
 		sc.PacketConnConfigs = append(sc.PacketConnConfigs, turnpkg.PacketConnConfig{
 			PacketConn:            udpLn,
 			RelayAddressGenerator: newRelayGen(),
+			PermissionHandler:     permitPeer,
 		})
 	}
 	if cfg.TCPPort != 0 {
@@ -107,6 +130,7 @@ func New(cfg Config) (*Server, error) {
 		sc.ListenerConfigs = append(sc.ListenerConfigs, turnpkg.ListenerConfig{
 			Listener:              tcpLn,
 			RelayAddressGenerator: newRelayGen(),
+			PermissionHandler:     permitPeer,
 		})
 	}
 
@@ -157,4 +181,123 @@ func (s *Server) closeListeners() {
 	if s.tcpLn != nil {
 		_ = s.tcpLn.Close()
 	}
+}
+
+// permitPeer 是 pion 的 PermissionHandler：中继只能对公网 peer 建立权限（#25）。
+// 没有它时 pion 默认放行一切，任何拿到合法凭证的人都能以服务器源 IP 访问
+// 内网服务与云元数据（169.254.169.254）。
+func permitPeer(_ net.Addr, peerIP net.IP) bool {
+	return !isBlockedPeerIP(peerIP)
+}
+
+// isBlockedPeerIP 判定不允许中继的 peer 地址。IPv4-mapped IPv6 先经 To4()
+// 归一到 IPv4 再判断，避免用 ::ffff:127.0.0.1 之类的表示绕过。
+func isBlockedPeerIP(ip net.IP) bool {
+	if len(ip) == 0 {
+		return true
+	}
+	if v4 := ip.To4(); v4 != nil {
+		switch {
+		case v4[0] == 0: // 0.0.0.0/8，含未指定地址
+		case v4.IsLoopback(): // 127.0.0.0/8
+		case v4.IsPrivate(): // 10/8、172.16/12、192.168/16
+		case v4[0] == 100 && v4[1]&0xc0 == 64: // 100.64/10 CGNAT
+		case v4[0] == 169 && v4[1] == 254: // 169.254/16 链路本地（云元数据）
+		case v4.IsMulticast(): // 224.0.0.0/4
+		case v4.Equal(net.IPv4bcast): // 255.255.255.255
+		default:
+			return false
+		}
+		return true
+	}
+	// IPv6：::1、未指定地址、fe80::/10、ff00::/8、fc00::/7（ULA）。
+	return ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() ||
+		ip.IsMulticast() || ip[0]&0xfe == 0xfc
+}
+
+// allocationQuota 按 uid 与客户端 IP 双层限制并发 allocation（#25）。
+// QuotaHandler 只在分配前做只读检查，计数由 OnAllocationCreated/Deleted 维护；
+// TCP 多连接并发分配时检查与计数之间不具原子性，可能少量超额，作为软上限足够。
+type allocationQuota struct {
+	mu    sync.Mutex
+	byUID map[string]int
+	byIP  map[string]int
+}
+
+func newAllocationQuota() *allocationQuota {
+	return &allocationQuota{
+		byUID: make(map[string]int),
+		byIP:  make(map[string]int),
+	}
+}
+
+// allow 供 pion QuotaHandler 调用；超限返回 false，pion 回 486（Allocation Quota Reached）。
+func (q *allocationQuota) allow(username, _ string, srcAddr net.Addr) bool {
+	uid := uidFromUsername(username)
+	ip := normalizedIPFromAddr(srcAddr)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if uid != "" && q.byUID[uid] >= maxAllocationsPerUID {
+		return false
+	}
+	if ip != "" && q.byIP[ip] >= maxAllocationsPerIP {
+		return false
+	}
+	return true
+}
+
+// add 在 allocation 创建/删除事件上维护计数；delta 为 -1 时归零即删键，
+// 计数不会为负，map 也不会无限增长。
+func (q *allocationQuota) add(srcAddr net.Addr, userID string, delta int) {
+	uid := uidFromUsername(userID)
+	ip := normalizedIPFromAddr(srcAddr)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	bumpCount(q.byUID, uid, delta)
+	bumpCount(q.byIP, ip, delta)
+}
+
+func bumpCount(m map[string]int, key string, delta int) {
+	if key == "" {
+		return
+	}
+	if next := m[key] + delta; next > 0 {
+		m[key] = next
+	} else {
+		delete(m, key)
+	}
+}
+
+// uidFromUsername 从 REST 凭证用户名 `<expiry>:<uid>` 取最后一个冒号后的 uid。
+// pion 的 LongTermTURNRESTAuthHandler 通常已剥掉过期段，两种形态都要成立。
+func uidFromUsername(username string) string {
+	if i := strings.LastIndexByte(username, ':'); i >= 0 {
+		return username[i+1:]
+	}
+	return username
+}
+
+// normalizedIPFromAddr 取客户端 IP 的归一形式：v4-mapped IPv6 收敛到 IPv4，
+// 避免同一地址用两种表示绕过按 IP 的配额。
+func normalizedIPFromAddr(addr net.Addr) string {
+	var ip net.IP
+	switch a := addr.(type) {
+	case *net.UDPAddr:
+		if a != nil {
+			ip = a.IP
+		}
+	case *net.TCPAddr:
+		if a != nil {
+			ip = a.IP
+		}
+	default:
+		return ""
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return v4.String()
+	}
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
 }
