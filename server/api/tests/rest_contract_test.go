@@ -17,7 +17,7 @@ var contractExemptions = map[string]string{
 }
 
 // specOperations 从 openapi.yaml 提取 (method, path) 全集——契约侧，schema 驱动。
-func specOperations(t *testing.T, path string) map[string]string {
+func specOperations(t *testing.T, path string) map[string]bool {
 	t.Helper()
 	loader := openapi3.NewLoader()
 	doc, err := loader.LoadFromFile(path)
@@ -27,14 +27,13 @@ func specOperations(t *testing.T, path string) map[string]string {
 	if doc.Paths == nil {
 		t.Fatalf("%s 没有 paths", path)
 	}
-	out := map[string]string{}
+	out := map[string]bool{}
 	for p, item := range doc.Paths.Map() {
 		if item == nil {
 			continue
 		}
 		for method := range item.Operations() {
-			key := strings.ToUpper(method) + " " + p
-			out[key] = key
+			out[strings.ToUpper(method)+" "+p] = true
 		}
 	}
 	return out
