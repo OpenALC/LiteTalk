@@ -174,6 +174,14 @@ func TestWireGatewayJSON(t *testing.T) {
 	if !strings.Contains(string(raw), `"reason":"unknown_session"`) {
 		t.Fatalf("GatewayInvalidSessionData JSON 字段不一致: %s", raw)
 	}
+	if strings.Contains(string(raw), "latest_seq") {
+		t.Fatalf("latest_seq=0 应省略（omitempty）: %s", raw)
+	}
+	// latest_seq 可选（omitempty）：非零随 invalid_session 下发（#32）。
+	raw, _ = json.Marshal(GatewayInvalidSessionData{Reason: "seq_expired", LatestSeq: 12})
+	if !strings.Contains(string(raw), `"latest_seq":12`) {
+		t.Fatalf("GatewayInvalidSessionData 缺 latest_seq: %s", raw)
+	}
 	raw, err = json.Marshal(VoiceSpeakingData{ChannelID: "3", UserID: "1", Speaking: true})
 	if err != nil {
 		t.Fatal(err)

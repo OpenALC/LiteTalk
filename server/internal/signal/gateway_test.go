@@ -118,6 +118,66 @@ func TestGatewayRingIdleSweep(t *testing.T) {
 	}
 }
 
+// TestGatewayRingAppendDoesNotTouch 广播 Append 不续期：同 uid 的离线旧 sid
+// 不会被广播刷新 last，30 分钟后能被 sweep 摘除（否则每次登录泄漏一个环）；
+// 活跃会话靠 Touch（心跳/实时下行）保留。
+func TestGatewayRingAppendDoesNotTouch(t *testing.T) {
+	l := newMemEventLog(8)
+	l.Bind("old", "u1")
+	l.Bind("new", "u1")
+
+	past := time.Now().Add(-ringIdleTTL - time.Minute)
+	l.mu.Lock()
+	l.rings["old"].last = past
+	l.mu.Unlock()
+
+	// 广播到该 uid 的全部存活 sid（含离线旧会话）：不应续期。
+	if seq := l.Append("old", ev(1)); seq != 1 {
+		t.Fatalf("Append seq = %d, want 1", seq)
+	}
+	l.mu.Lock()
+	got := l.rings["old"].last
+	l.mu.Unlock()
+	if !got.Equal(past) {
+		t.Fatalf("Append 刷新了旧 sid 的 last（%v → %v）", past, got)
+	}
+
+	// 活跃 sid 通过 Touch 续期。
+	l.Touch("new")
+	l.lastSweep = time.Time{}
+	l.Bind("other", "u2") // 触发 sweep
+	if _, ok := l.rings["old"]; ok {
+		t.Fatal("离线旧 sid 未被 sweep 摘除")
+	}
+	if _, ok := l.rings["new"]; !ok {
+		t.Fatal("Touch 续期的活跃 sid 被误淘汰")
+	}
+	if sids := l.SidsOf("u1"); len(sids) != 1 || sids[0] != "new" {
+		t.Fatalf("SidsOf(u1) = %v, want [new]", sids)
+	}
+}
+
+// TestGatewayRingLatestSeq 环现状：无环/空环为 0，Append 后为最大 seq。
+func TestGatewayRingLatestSeq(t *testing.T) {
+	l := newMemEventLog(8)
+	if got := l.LatestSeq("nope"); got != 0 {
+		t.Fatalf("无环 LatestSeq = %d, want 0", got)
+	}
+	if got := l.LatestSeq(""); got != 0 {
+		t.Fatalf("空 sid LatestSeq = %d, want 0", got)
+	}
+	l.Bind("s1", "u1")
+	if got := l.LatestSeq("s1"); got != 0 {
+		t.Fatalf("空环 LatestSeq = %d, want 0", got)
+	}
+	for i := 1; i <= 3; i++ {
+		l.Append("s1", ev(int64(i)))
+	}
+	if got := l.LatestSeq("s1"); got != 3 {
+		t.Fatalf("LatestSeq = %d, want 3", got)
+	}
+}
+
 // ---- 事件面广播与 seq（#32）----
 
 // TestChatMessageCarriesSeq chat.message 走事件面：信封带 per-sid seq，

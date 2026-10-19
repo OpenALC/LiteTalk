@@ -146,7 +146,8 @@ type ErrorData struct {
 
 // GatewayInvalidSessionData 续传失败（#32）。reason=unknown_session：会话未知或与当前连接不符；seq_expired：缺失事件已滚出环（含序号超前于环现状）。客户端收到后放弃补发，走 REST 全量补拉（服务器/频道/好友/最近消息），更新本地后继续收新事件；本地按消息 id 幂等去重（补拉与在途增量可能重叠）。
 type GatewayInvalidSessionData struct {
-	Reason string `json:"reason"` // 失败原因
+	Reason    string `json:"reason"`               // 失败原因
+	LatestSeq int64  `json:"latest_seq,omitempty"` // 服务端环当前最大 seq（0=无环/空环），客户端据此重置序号基准
 }
 
 // GatewayResumeData 断线续传请求（#32）：同会话重连后发送（在 client.hello 之后、收到 server.hello 确认同会话之后）。session_id 为 server.hello.session_id 的回传，last_seq 为已收到的最后事件序号（0=一条未收）。环内可补则按 seq 升序补发后继续流式；补不上回 gateway.invalid_session，客户端走 REST 全量补拉。只在协商到协议 ≥2 后发送，老服务端不受影响。

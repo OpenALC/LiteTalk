@@ -3,7 +3,8 @@
 // 命名空间边界（api/signal/messages/*.schema.json 的 x-namespace）：
 //   - event 事件面：chat.message / presence.update / session.kicked / server.shutdown
 //     / voice.speaking——登录后常驻，按「订阅」下发给该用户全部服务器的相关事件，
-//     与是否在语音房无关；进环、带 seq，断线后可 gateway.resume 补发。
+//     与是否在语音房无关；带 seq、断线后可 gateway.resume 补发。例外：voice.speaking
+//     高频且瞬时，即时下行但不进补发环（seq=0），避免挤掉聊天消息的补发窗口。
 //   - voice 语音面：channel.* / rtc.* / voice.state* / session.voice_taken——
 //     进房才产生，瞬时语义，不进环、无 seq（replay 过期状态只会污染客户端）。
 //   - session 连接控制：hello 系 / error / gateway.resume / gateway.invalid_session。
@@ -30,23 +31,29 @@ type Event struct {
 
 // EventLog 每会话事件环（#32）。seq 按会话（sid）从 1 起单调递增。
 //
-//	Bind    连接建立时登记会话归属（uid → sid 索引，广播定向用）
-//	Append  分配 seq 并留存；环不存在（无会话/已淘汰）返回 0，不留存
-//	Replay  返回 seq >= fromSeq 的留存事件（升序）；reason 非空即续传失败
-//	        （unknown_session / seq_expired，与 gateway.invalid_session.reason 对应）
-//	SidsOf  该 uid 名下全部存活会话（在线 + 断线续传窗口内）
+//	Bind     连接建立时登记会话归属（uid → sid 索引，广播定向用）
+//	Append   分配 seq 并留存；环不存在（无会话/已淘汰）返回 0，不留存。
+//	         不续期空闲计时——广播会 Append 到该 uid 名下所有存活 sid（含已断线
+//	         的旧会话），续期会让 sweep 永远淘汰不掉旧环
+//	Replay   返回 seq >= fromSeq 的留存事件（升序）；reason 非空即续传失败
+//	          （unknown_session / seq_expired，与 gateway.invalid_session.reason 对应）
+//	SidsOf   该 uid 名下全部存活会话（在线 + 断线续传窗口内）
+//	LatestSeq 环当前最大 seq（无环返回 0）；invalid_session 让客户端重置基准
+//	Touch    活跃连接的续期（心跳/实时下行）；只有真正在线的会话才该续期
 type EventLog interface {
 	Bind(sid, uid string)
 	Append(sid string, ev Event) int64
 	Replay(sid string, fromSeq int64) (events []Event, reason string)
 	SidsOf(uid string) []string
+	LatestSeq(sid string) int64
+	Touch(sid string)
 }
 
 const (
 	// defaultEventBacklog 每会话事件环条数（LITETALK_GATEWAY_BACKLOG，§0.11）。
 	// 零值/缺省一律回落本值；补发窗口 = min(环容量, 空闲 TTL)。
 	defaultEventBacklog = 256
-	// ringIdleTTL 会话环空闲淘汰：Bind/Append/Replay 均续期。断线超过此时长
+	// ringIdleTTL 会话环空闲淘汰：Bind/Replay/Touch 续期。断线且超过此时长
 	//（或环滚过容量）即续传失败 → 客户端走 REST 全量补拉。
 	ringIdleTTL = 30 * time.Minute
 	// sweepEvery 空闲淘汰的触发间隔（amortized 到写入路径，不设独立 goroutine）。
@@ -116,7 +123,8 @@ func (l *memEventLog) Bind(sid, uid string) {
 }
 
 // Append 分配 seq 并留存事件，返回分配的序号（0 = 无环不留存，调用方退化为无 seq 下发）。
-// O(1)：定长覆写，不淘汰扫描、不二次编码。
+// O(1)：定长覆写，不淘汰扫描、不二次编码。**不续期 last**：续期只由 Bind/Replay/Touch
+// 负责，否则广播写旧 sid 的环会让断线会话永不淘汰（每次登录泄漏一个环）。
 func (l *memEventLog) Append(sid string, ev Event) int64 {
 	if sid == "" {
 		return 0
@@ -134,7 +142,6 @@ func (l *memEventLog) Append(sid string, ev Event) int64 {
 	if r.count < len(r.buf) {
 		r.count++
 	}
-	r.last = time.Now()
 	return ev.Seq
 }
 
@@ -189,6 +196,34 @@ func (l *memEventLog) SidsOf(uid string) []string {
 	return out
 }
 
+// LatestSeq 环当前最大 seq（无环返回 0）。invalid_session 携带它，
+// 客户端据此把序号基准对齐到服务端现状，而不是清零后永久卡在空洞上。
+func (l *memEventLog) LatestSeq(sid string) int64 {
+	if sid == "" {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	r := l.rings[sid]
+	if r == nil {
+		return 0
+	}
+	return r.nextSeq - 1
+}
+
+// Touch 活跃连接续期：只有真正在线（心跳存活/收到实时下行）的会话才调。
+// 已淘汰的环不重建——晚到的 Touch 没有可续的对象。
+func (l *memEventLog) Touch(sid string) {
+	if sid == "" {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if r := l.rings[sid]; r != nil {
+		r.last = time.Now()
+	}
+}
+
 // sweepLocked 空闲淘汰（调用方持锁）：超时环连同 uid 索引一起摘除。
 // 之后同一 sid 再 resume 会得到 unknown_session → 客户端全量补拉，语义正确。
 func (l *memEventLog) sweepLocked() {
@@ -228,12 +263,20 @@ func (h *Hub) sendEvent(c *client, msgType string, data any) {
 
 // deliverEvent 把预序列化载荷写入下行队列（seq<=0 不写信封 seq 字段）。
 // 队列满 = 对端消费停滞 → CloseNow，与 sendJSON 同一策略（§0.7）。
+// 能投递说明连接当前活跃：顺带给它的环续期（Append 不再顺带续期，见 EventLog 注释）。
 func (h *Hub) deliverEvent(c *client, msgType string, payload json.RawMessage, ts, seq int64) {
 	raw, err := MarshalEnvelopePayload(msgType, payload, ts, seq)
 	if err != nil {
 		h.log.Printf("ws: 编码 %s 失败: %v", msgType, err)
 		return
 	}
+	h.evlog.Touch(c.sid)
+	h.enqueueRaw(c, raw, msgType)
+}
+
+// enqueueRaw 把已编码信封写入连接下行队列（队列满 → CloseNow，§0.7）。
+// 供一次序列化、多连接下发的路径复用（如 voice.speaking）。
+func (h *Hub) enqueueRaw(c *client, raw []byte, msgType string) {
 	select {
 	case c.send <- raw:
 	default:
@@ -277,7 +320,9 @@ func (h *Hub) broadcastEvent(uids map[string]bool, msgType string, data any) {
 
 // broadcastVoiceSpeaking 说话翻转下发（#33）：SFU 按 RFC 6464 电平统一判定后
 // 经此投递网关事件面。按连接协议版本分流（裁定 #5 兼容过渡，一个版本周期）：
-//   - 协议 ≥2：voice.speaking 走事件面进环带 seq，含本人（自己的声波球同源）；
+//   - 协议 ≥2：voice.speaking 即时下行、**不进补发环**（seq=0），含本人（自己的
+//     声波球同源）。说话翻转是高频瞬时语义，进环会在十人房里一分钟内把聊天
+//     消息挤出 256 条补发窗口；断线期间错过的说话态本就无回放价值。
 //   - 协议 <2（v1/未协商）：退化为 voice.state{speaking}——老客户端只认这条路，
 //     行为与今天一致（不含本人：v1 的自我指示由本地 DSP 驱动）。
 //
@@ -285,11 +330,11 @@ func (h *Hub) broadcastEvent(uids map[string]bool, msgType string, data any) {
 func (h *Hub) broadcastVoiceSpeaking(channelID, userID string, speaking bool) {
 	h.mu.Lock()
 	var legacy []*client
-	v2 := make(map[string]bool)
+	v2uids := make(map[string]bool)
 	if room := h.rooms[channelID]; room != nil {
 		for uid, m := range room.members {
 			if m.protoVer.Load() >= 2 {
-				v2[uid] = true
+				v2uids[uid] = true
 			} else {
 				legacy = append(legacy, m)
 			}
@@ -301,12 +346,32 @@ func (h *Hub) broadcastVoiceSpeaking(channelID, userID string, speaking bool) {
 			m.mu.Unlock()
 		}
 	}
+	// 事件面订阅是 uid 级：同 uid 的其他在线 v2 设备也收说话指示（与旧广播一致）。
+	var v2 []*client
+	if len(v2uids) > 0 {
+		for _, c := range h.conns {
+			if v2uids[c.userID] && c.protoVer.Load() >= 2 {
+				v2 = append(v2, c)
+			}
+		}
+	}
 	h.mu.Unlock()
 
 	if len(v2) > 0 {
-		h.broadcastEvent(v2, TypeVoiceSpeaking, VoiceSpeakingData{
-			ChannelID: channelID, UserID: userID, Speaking: speaking,
-		})
+		// 一次序列化、多连接下发（seq=0：不进环、不需去重排序）。
+		payload, err := json.Marshal(VoiceSpeakingData{ChannelID: channelID, UserID: userID, Speaking: speaking})
+		if err != nil {
+			h.log.Printf("ws: 编码 %s 失败: %v", TypeVoiceSpeaking, err)
+		} else {
+			raw, err := MarshalEnvelopePayload(TypeVoiceSpeaking, payload, time.Now().UnixMilli(), 0)
+			if err != nil {
+				h.log.Printf("ws: 编码 %s 失败: %v", TypeVoiceSpeaking, err)
+			} else {
+				for _, c := range v2 {
+					h.enqueueRaw(c, raw, TypeVoiceSpeaking)
+				}
+			}
+		}
 	}
 	for _, c := range legacy {
 		if c.userID == userID {
@@ -331,14 +396,20 @@ func (h *Hub) handleGatewayResume(c *client, d GatewayResumeData) {
 		h.sendError(c, ErrCodeBadMessage, "gateway.resume 需要 session_id 与 last_seq>=0")
 		return
 	}
+	// invalid_session 一律带上**当前连接** sid 的环现状：客户端据此把基准对齐到
+	// 服务端最新 seq（而不是清零后等一个永远不会再出现的 seq）。取不到环就是 0。
 	if c.sid == "" || d.SessionID != c.sid {
-		h.sendJSON(c, TypeGatewayInvalidSession, GatewayInvalidSessionData{Reason: "unknown_session"})
+		h.sendJSON(c, TypeGatewayInvalidSession, GatewayInvalidSessionData{
+			Reason: "unknown_session", LatestSeq: h.evlog.LatestSeq(c.sid),
+		})
 		return
 	}
 	events, reason := h.evlog.Replay(d.SessionID, d.LastSeq+1)
 	if reason != "" {
 		h.log.Printf("ws: %s resume %s 失败（%s），last_seq=%d", c.userID, d.SessionID, reason, d.LastSeq)
-		h.sendJSON(c, TypeGatewayInvalidSession, GatewayInvalidSessionData{Reason: reason})
+		h.sendJSON(c, TypeGatewayInvalidSession, GatewayInvalidSessionData{
+			Reason: reason, LatestSeq: h.evlog.LatestSeq(c.sid),
+		})
 		return
 	}
 	for _, ev := range events {
