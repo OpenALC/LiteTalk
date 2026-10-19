@@ -22,8 +22,12 @@ func runMessagesNoncePaging(t *testing.T, st Store) {
 	if err := st.CreateChannel(ctx, ch); err != nil {
 		t.Fatal(err)
 	}
+	ch2 := &Channel{ServerID: sv.ID, Name: "c2", Type: ChannelText}
+	if err := st.CreateChannel(ctx, ch2); err != nil {
+		t.Fatal(err)
+	}
 
-	// nonce 幂等：同用户同 nonce 撞唯一约束；空 nonce 不去重。
+	// nonce 幂等：同频道同用户同 nonce 撞唯一约束；空 nonce 不去重。
 	a := &Message{ChannelID: ch.ID, UserID: u.ID, Content: "一", Nonce: "n1"}
 	if err := st.CreateMessage(ctx, a); err != nil {
 		t.Fatal(err)
@@ -32,12 +36,26 @@ func runMessagesNoncePaging(t *testing.T, st Store) {
 	if err := st.CreateMessage(ctx, dup); !errors.Is(err, ErrConflict) {
 		t.Fatalf("同 nonce 应 ErrConflict，实际 %v", err)
 	}
-	got, err := st.MessageByNonce(ctx, u.ID, "n1")
+	got, err := st.MessageByNonce(ctx, ch.ID, u.ID, "n1")
 	if err != nil || got.Content != "一" || got.ID != a.ID {
 		t.Fatalf("幂等回读应为原消息：%+v %v", got, err)
 	}
-	if _, err := st.MessageByNonce(ctx, u.ID, "nope"); !errors.Is(err, ErrNotFound) {
+	if _, err := st.MessageByNonce(ctx, ch.ID, u.ID, "nope"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("未命中应 ErrNotFound，实际 %v", err)
+	}
+	// 去重键含频道：同用户同 nonce 在另一个频道独立成条，回读不串频道。
+	b := &Message{ChannelID: ch2.ID, UserID: u.ID, Content: "另频道", Nonce: "n1"}
+	if err := st.CreateMessage(ctx, b); err != nil {
+		t.Fatalf("跨频道同 nonce 应独立落库: %v", err)
+	}
+	if orig, err := st.MessageByNonce(ctx, ch.ID, u.ID, "n1"); err != nil || orig.ID != a.ID {
+		t.Fatalf("原频道回读串到了别的频道：%+v %v", orig, err)
+	}
+	if other, err := st.MessageByNonce(ctx, ch2.ID, u.ID, "n1"); err != nil || other.ID != b.ID || other.ChannelID != ch2.ID {
+		t.Fatalf("跨频道回读应为第二条：%+v %v", other, err)
+	}
+	if _, err := st.MessageByNonce(ctx, ch2.ID, u.ID, "nope"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("跨频道未命中应 ErrNotFound，实际 %v", err)
 	}
 	for _, c := range []string{"", ""} {
 		if err := st.CreateMessage(ctx, &Message{ChannelID: ch.ID, UserID: u.ID, Content: "空" + c}); err != nil {

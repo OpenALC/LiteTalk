@@ -727,7 +727,7 @@ func (s *SQLite) ReorderCategories(ctx context.Context, serverID, id int64, posi
 
 func (s *SQLite) CreateMessage(ctx context.Context, msg *Message) error {
 	msg.ID = newID(msg.ID)
-	// 空 nonce 落 NULL：唯一索引 (user_id, nonce) 上 '' 会互相撞，NULL 不受约束。
+	// 空 nonce 落 NULL：唯一索引 (channel_id, user_id, nonce) 上 '' 会互相撞，NULL 不受约束。
 	var nonce any
 	if msg.Nonce != "" {
 		nonce = msg.Nonce
@@ -823,12 +823,12 @@ func (s *SQLite) MessagesAfter(ctx context.Context, channelID, afterID int64, li
 	return out, rows.Err()
 }
 
-// MessageByNonce 幂等回读原消息（带发送者内联信息，响应直接可用）。
-func (s *SQLite) MessageByNonce(ctx context.Context, userID int64, nonce string) (*Message, error) {
+// MessageByNonce 幂等回读原消息（带发送者内联信息，响应直接可用；频道维度隔离）。
+func (s *SQLite) MessageByNonce(ctx context.Context, channelID, userID int64, nonce string) (*Message, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT `+sqMessageCols+`, u.nickname, u.tag
 		 FROM messages m JOIN users u ON u.id = m.user_id
-		 WHERE m.user_id = ? AND m.nonce = ?`, userID, nonce)
+		 WHERE m.channel_id = ? AND m.user_id = ? AND m.nonce = ?`, channelID, userID, nonce)
 	var msg Message
 	err := row.Scan(&msg.ID, &msg.ChannelID, &msg.UserID, &msg.Content, &msg.Nonce, &msg.CreatedAt,
 		&msg.SenderNickname, &msg.SenderTag)

@@ -15,7 +15,14 @@
       "type": "string",
       "description": "消息种类，本期仅 text"
     },
-    "content": { "type": "string" }
+    "content": { "type": "string" },
+    "nonce": {
+      "type": "string",
+      "x-since": 2,
+      "x-go-omitempty": true,
+      "maxLength": 64,
+      "description": "客户端幂等键（#31，≤64 字符）：同频道同用户重复提交只落一条，重复请求回显原消息。缺省不去重（老客户端）。"
+    }
   },
   "required": ["channel_id", "type", "content"],
   "additionalProperties": false
