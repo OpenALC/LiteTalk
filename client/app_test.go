@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -354,47 +356,461 @@ func TestSetServerConfigHotSwitch(t *testing.T) {
 	}
 }
 
+// TestSameOrigin 钉住换服判定的边界：scheme/host 大小写与默认端口必须归一化，
+// 只有 path 变化算同源；scheme、host、端口任一不同都是跨 origin（#17）。
+func TestSameOrigin(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"http://Example.com", "http://example.com:80/", true},
+		{"HTTP://example.com", "http://example.com", true},
+		{"https://example.com", "https://example.com:443/x", true},
+		{"http://example.com:8077", "http://example.com:8077/a/b", true},
+		{"http://[::1]", "http://[::1]:80", true},
+		{"http://example.com", "https://example.com", false},
+		{"http://example.com", "http://example.com:8080", false},
+		{"http://example.com:8080", "http://example.com:80", false},
+		{"http://example.com", "http://other.example.com", false},
+		{"", "http://example.com", false},
+		{"not-a-url", "not-a-url", false},
+	}
+	for _, c := range cases {
+		if got := sameOrigin(c.a, c.b); got != c.want {
+			t.Errorf("sameOrigin(%q, %q) = %v，期望 %v", c.a, c.b, got, c.want)
+		}
+	}
+}
+
+// TestSetServerConfigCrossOriginDropsCredentials 跨 origin 换服不得泄露旧凭据
+// （#17 P1 安全）：旧实现先 SetBase 再 Me() 预检，B 返回 401 后 401 自动刷新
+// 还会把 A 的 refresh_token 发给 B。现在跨 origin 不向 B 发任何旧令牌，
+// 只清本地会话并回登录页。
+func TestSetServerConfigCrossOriginDropsCredentials(t *testing.T) {
+	type reqRecord struct {
+		path string
+		auth string
+		body string
+	}
+	record := func(r *http.Request) reqRecord {
+		body, _ := io.ReadAll(r.Body)
+		return reqRecord{path: r.URL.Path, auth: r.Header.Get("Authorization"), body: string(body)}
+	}
+
+	// A：旧服务器。记录请求，切换过程不应再与它交互。
+	var aMu sync.Mutex
+	var aReqs []reqRecord
+	oldSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		aMu.Lock()
+		aReqs = append(aReqs, record(r))
+		aMu.Unlock()
+		http.NotFound(w, r)
+	}))
+	defer oldSrv.Close()
+
+	// B：新服务器。healthz 放行；/users/me 故意 401，旧实现会由此触发刷新泄露。
+	var bMu sync.Mutex
+	var bReqs []reqRecord
+	newSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bMu.Lock()
+		bReqs = append(bReqs, record(r))
+		bMu.Unlock()
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/api/v1/healthz"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok","version":"new"}`))
+		case strings.HasSuffix(r.URL.Path, "/api/v1/users/me"):
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"code":"unauthorized","message":"rejected"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer newSrv.Close()
+
+	m := config.NewWithPath(filepath.Join(t.TempDir(), "config.json"))
+	app := newAppWithConfig(m)
+	app.api = api.NewAPIClient(oldSrv.URL)
+	app.api.SetToken("old-access-A")
+	// 与 ServiceStartup 相同的注入：401 自动刷新时把 app 层 refresh_token 发给
+	// 当前 REST 基址。旧实现会因此把旧服务器的长期凭据交给 B。
+	app.api.SetRefreshSource(func(context.Context) (string, error) {
+		app.mu.Lock()
+		defer app.mu.Unlock()
+		return app.refreshTok, nil
+	})
+	app.mu.Lock()
+	app.refreshTok = "old-refresh-A"
+	app.user = api.UserProfile{ID: 1, Nickname: "alice", IsGuest: true}
+	app.mu.Unlock()
+	if err := m.SetGuestRefresh("old-guest-refresh-A"); err != nil {
+		t.Fatal(err)
+	}
+
+	type appEvent struct {
+		name string
+		data any
+	}
+	events := make(chan appEvent, 8)
+	app.emitHook = func(name string, data any) {
+		select {
+		case events <- appEvent{name: name, data: data}:
+		default:
+		}
+	}
+	genBefore := app.loginGen.Load()
+
+	if err := app.SetServerConfig(newSrv.URL); err != nil {
+		t.Fatalf("SetServerConfig: %v", err)
+	}
+
+	// B 从未收到任何旧凭据：不能有 Authorization、不能走 /auth/refresh，
+	// 也不能调用 Me() 预检（那正是旧实现的泄露入口）。
+	bMu.Lock()
+	gotB := append([]reqRecord(nil), bReqs...)
+	bMu.Unlock()
+	for _, r := range gotB {
+		if r.auth != "" {
+			t.Errorf("新服务器收到 Authorization=%q（path=%s）", r.auth, r.path)
+		}
+		if strings.Contains(r.path, "/auth/refresh") {
+			t.Errorf("新服务器收到 /auth/refresh 请求（body=%q）", r.body)
+		}
+		if strings.HasSuffix(r.path, "/api/v1/users/me") {
+			t.Errorf("跨 origin 不应调用 Me() 预检（path=%s）", r.path)
+		}
+		if strings.Contains(r.body, "old-refresh-A") || strings.Contains(r.body, "old-guest-refresh-A") {
+			t.Errorf("新服务器收到旧 refresh_token（path=%s body=%q）", r.path, r.body)
+		}
+	}
+	// 旧服务器同样不应被切换流程触发（会话在本地关闭，不做跨服吊销）。
+	aMu.Lock()
+	gotA := len(aReqs)
+	aMu.Unlock()
+	if gotA != 0 {
+		t.Errorf("切换过程不应请求旧服务器，收到 %d 个请求", gotA)
+	}
+
+	if got := app.api.Base(); got != newSrv.URL {
+		t.Errorf("REST 基址未切换: %s（期望 %s）", got, newSrv.URL)
+	}
+	if got := app.api.Token(); got != "" {
+		t.Errorf("旧 access token 未清空: %q", got)
+	}
+	app.mu.Lock()
+	rt, user := app.refreshTok, app.user
+	app.mu.Unlock()
+	if rt != "" {
+		t.Errorf("旧 refresh token 未清空: %q", rt)
+	}
+	if user.ID != 0 || user.Nickname != "" || user.IsGuest {
+		t.Errorf("用户档案未清空: %+v", user)
+	}
+	if got := m.GetGuestRefresh(); got != "" {
+		t.Errorf("落盘游客令牌未作废: %q", got)
+	}
+	if got := app.loginGen.Load(); got <= genBefore {
+		t.Errorf("loginGen 应递增以停掉旧重试循环，得到 %d（前置 %d）", got, genBefore)
+	}
+
+	select {
+	case ev := <-events:
+		if ev.name != "auth:kicked" {
+			t.Errorf("事件类型 = %s，期望 auth:kicked", ev.name)
+		}
+		payload, _ := ev.data.(map[string]any)
+		if payload["reason"] != "server_changed" {
+			t.Errorf("auth:kicked reason = %v，期望 server_changed", payload["reason"])
+		}
+	default:
+		t.Error("未收到 auth:kicked 事件（前端不会回到登录页）")
+	}
+}
+
+// TestSetServerConfigCrossOriginWaitsInflightRefresh 换服与在飞刷新交错：
+// 刷新先完成安装并卡在 onRefreshed（api 层的 baseMu 读锁段内），此时跨 origin
+// 换服会阻塞在 SetBaseAndClearToken 的写锁上；放行后 retarget 再清一次 app 层
+// 令牌。终态不得残留任何旧凭据，新服务器只能看到 healthz（#17）。
+func TestSetServerConfigCrossOriginWaitsInflightRefresh(t *testing.T) {
+	type reqRecord struct {
+		path string
+		auth string
+		body string
+	}
+	record := func(r *http.Request) reqRecord {
+		body, _ := io.ReadAll(r.Body)
+		return reqRecord{path: r.URL.Path, auth: r.Header.Get("Authorization"), body: string(body)}
+	}
+
+	// A：401 后刷新返回旧服务器的新令牌对。
+	oldSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/users/me":
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"code":"token_expired","message":"expired"}`))
+		case "/api/v1/auth/refresh":
+			_, _ = w.Write([]byte(`{"access_token":"tok-new-A","refresh_token":"rt-new-A","expires_in":7200}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer oldSrv.Close()
+
+	// B：只应收到 healthz。
+	var bMu sync.Mutex
+	var bReqs []reqRecord
+	newSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec := record(r)
+		bMu.Lock()
+		bReqs = append(bReqs, rec)
+		bMu.Unlock()
+		if strings.HasSuffix(r.URL.Path, "/api/v1/healthz") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok","version":"new"}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer newSrv.Close()
+
+	m := config.NewWithPath(filepath.Join(t.TempDir(), "config.json"))
+	app := newAppWithConfig(m)
+	app.api = api.NewAPIClient(oldSrv.URL)
+	app.api.SetToken("old-access-A")
+	app.mu.Lock()
+	app.refreshTok = "old-refresh-A"
+	app.user = api.UserProfile{ID: 1, Nickname: "alice", IsGuest: true}
+	app.mu.Unlock()
+	if err := m.SetGuestRefresh("old-guest-refresh-A"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 与 ServiceStartup 相同的刷新回调，额外卡在 onRefreshed 里：api 的
+	// doRefresh 持 baseMu 读锁调用它，因此换服的写锁必须等到放行。
+	onRefreshedEntered := make(chan struct{})
+	releaseOnRefreshed := make(chan struct{})
+	var enteredOnce, releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseOnRefreshed) }) }
+	defer release()
+	app.api.SetRefreshSource(func(context.Context) (string, error) {
+		app.mu.Lock()
+		defer app.mu.Unlock()
+		return app.refreshTok, nil
+	})
+	app.api.SetOnRefreshed(func(tk api.AuthTokens) {
+		app.mu.Lock()
+		app.refreshTok = tk.RefreshToken
+		isGuest := app.user.IsGuest
+		app.mu.Unlock()
+		if isGuest && tk.RefreshToken != "" {
+			_ = m.SetGuestRefresh(tk.RefreshToken)
+		}
+		enteredOnce.Do(func() { close(onRefreshedEntered) })
+		<-releaseOnRefreshed
+	})
+
+	type appEvent struct {
+		name string
+		data any
+	}
+	events := make(chan appEvent, 8)
+	app.emitHook = func(name string, data any) {
+		select {
+		case events <- appEvent{name: name, data: data}:
+		default:
+		}
+	}
+
+	meDone := make(chan struct{})
+	go func() {
+		_, _ = app.api.Me()
+		close(meDone)
+	}()
+	select {
+	case <-onRefreshedEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("刷新未进入 onRefreshed（读锁段）")
+	}
+
+	switched := make(chan error, 1)
+	go func() { switched <- app.SetServerConfig(newSrv.URL) }()
+
+	// 等 retarget 走到「切换前清 refreshTok」：此刻它即将（或已经）卡在
+	// SetBaseAndClearToken 的写锁上，而在飞刷新的读锁尚未释放。
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		app.mu.Lock()
+		rt := app.refreshTok
+		app.mu.Unlock()
+		if rt == "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("retarget 未进行到切换前的令牌清理")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	select {
+	case err := <-switched:
+		t.Fatalf("换服未等在飞刷新结束就返回了: %v", err)
+	default:
+	}
+
+	release()
+	if err := <-switched; err != nil {
+		t.Fatalf("SetServerConfig: %v", err)
+	}
+	select {
+	case <-meDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("在飞 Me 未结束")
+	}
+
+	// 终态：无论刷新在切换前一刻回写了什么，都不能残留。
+	if got := app.api.Token(); got != "" {
+		t.Errorf("终态 access token 应为空，得到 %q", got)
+	}
+	app.mu.Lock()
+	rt, user := app.refreshTok, app.user
+	app.mu.Unlock()
+	if rt != "" {
+		t.Errorf("终态 refreshTok 应为空，得到 %q", rt)
+	}
+	if user.ID != 0 || user.IsGuest {
+		t.Errorf("终态用户档案未清空: %+v", user)
+	}
+	if got := m.GetGuestRefresh(); got != "" {
+		t.Errorf("终态落盘游客令牌应为空，得到 %q", got)
+	}
+	if got := app.api.Base(); got != newSrv.URL {
+		t.Errorf("REST 基址 = %s，期望 %s", got, newSrv.URL)
+	}
+
+	bMu.Lock()
+	gotB := append([]reqRecord(nil), bReqs...)
+	bMu.Unlock()
+	if len(gotB) == 0 {
+		t.Fatal("新服务器未收到 healthz 探活")
+	}
+	for _, r := range gotB {
+		if r.auth != "" {
+			t.Errorf("新服务器收到 Authorization=%q（path=%s）", r.auth, r.path)
+		}
+		if !strings.HasSuffix(r.path, "/api/v1/healthz") {
+			t.Errorf("新服务器收到非 healthz 请求: %s", r.path)
+		}
+		if strings.Contains(r.path, "/auth/refresh") ||
+			strings.Contains(r.body, "rt-new-A") || strings.Contains(r.body, "old-refresh-A") {
+			t.Errorf("新服务器收到刷新凭据（path=%s body=%q）", r.path, r.body)
+		}
+	}
+
+	select {
+	case ev := <-events:
+		if ev.name != "auth:kicked" {
+			t.Errorf("事件类型 = %s，期望 auth:kicked", ev.name)
+		}
+		payload, _ := ev.data.(map[string]any)
+		if payload["reason"] != "server_changed" {
+			t.Errorf("auth:kicked reason = %v，期望 server_changed", payload["reason"])
+		}
+	default:
+		t.Error("未收到 auth:kicked 事件")
+	}
+}
+
+// TestSetServerConfigSameOriginKeepsToken 仅 path 变化的切换仍是同一服务端：
+// 保留令牌并走 Me() 预检（#17 的清理只针对跨 origin）。
+func TestSetServerConfigSameOriginKeepsToken(t *testing.T) {
+	var mu sync.Mutex
+	var meAuth []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/api/v1/healthz"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok","version":"test"}`))
+		case strings.HasSuffix(r.URL.Path, "/api/v1/users/me"):
+			mu.Lock()
+			meAuth = append(meAuth, r.Header.Get("Authorization"))
+			mu.Unlock()
+			// 401 只为终止流程（避免 startSession 连 WS）；预检本身已验证。
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"code":"unauthorized","message":"rejected"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	m := config.NewWithPath(filepath.Join(t.TempDir(), "config.json"))
+	app := newAppWithConfig(m)
+	app.api = api.NewAPIClient(srv.URL + "/old")
+	app.api.SetToken("old-access-same-origin")
+	app.mu.Lock()
+	app.user = api.UserProfile{ID: 1, Nickname: "alice"}
+	app.mu.Unlock()
+
+	if err := app.SetServerConfig(srv.URL + "/new"); err != nil {
+		t.Fatalf("SetServerConfig: %v", err)
+	}
+
+	mu.Lock()
+	got := append([]string(nil), meAuth...)
+	mu.Unlock()
+	if len(got) != 1 || got[0] != "Bearer old-access-same-origin" {
+		t.Fatalf("同源切换应携带旧令牌走 Me() 预检，收到 Authorization: %v", got)
+	}
+	if got := app.api.Base(); got != srv.URL+"/new" {
+		t.Fatalf("REST 基址未切换: %s", got)
+	}
+	if got := app.GetServerConfig().BaseURL; got != srv.URL+"/new" {
+		t.Fatalf("配置地址未切换: %s", got)
+	}
+}
+
 // TestSetServerConfigSerializesRetarget 并发保存必须串行：第一个保存卡在
 // retarget 的 Me() 预检期间，第二个不得抢先落盘，否则终态配置与会话错位（#17）。
+// 两个 base 只能是同一 server 的不同 path：跨 origin 不再走进 Me() 预检
+// （见 TestSetServerConfigCrossOriginDropsCredentials），这个用例要测的正是
+// 预检期间的锁占位，所以必须保持同源。
 func TestSetServerConfigSerializesRetarget(t *testing.T) {
 	inMe := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
 	var releaseOnce sync.Once
 	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
-	healthzAnd401 := func(block bool) *httptest.Server {
-		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			switch r.URL.Path {
-			case "/api/v1/healthz":
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"status":"ok","version":"t"}`))
-			case "/api/v1/users/me":
-				if block {
-					once.Do(func() { close(inMe) })
-					<-release
-				}
-				w.WriteHeader(http.StatusUnauthorized)
-				_, _ = w.Write([]byte(`{"code":"unauthorized","message":"rejected"}`))
-			default:
-				http.NotFound(w, r)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/api/v1/healthz"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok","version":"t"}`))
+		case strings.HasSuffix(r.URL.Path, "/api/v1/users/me"):
+			// 第一个保存的 Me 卡住；第二个保存（/fast）立即 401。
+			if strings.HasPrefix(r.URL.Path, "/slow/") {
+				once.Do(func() { close(inMe) })
+				<-release
 			}
-		}))
-	}
-	slow, fast := healthzAnd401(true), healthzAnd401(false)
-	defer slow.Close()
-	defer fast.Close()
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"code":"unauthorized","message":"rejected"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
 	defer releaseAll() // 断言中途失败也放行，避免 goroutine 悬挂
+	slow, fast := srv.URL+"/slow", srv.URL+"/fast"
 
 	m := config.NewWithPath(filepath.Join(t.TempDir(), "config.json"))
 	app := newAppWithConfig(m)
-	app.api = api.NewAPIClient(slow.URL)
+	app.api = api.NewAPIClient(slow)
 	app.api.SetToken("tok")
 	app.mu.Lock()
 	app.user = api.UserProfile{ID: 1, Nickname: "a"}
 	app.mu.Unlock()
 
 	first := make(chan error, 1)
-	go func() { first <- app.SetServerConfig(slow.URL) }()
+	go func() { first <- app.SetServerConfig(slow) }()
 	select {
 	case <-inMe:
 	case <-time.After(5 * time.Second):
@@ -402,9 +818,9 @@ func TestSetServerConfigSerializesRetarget(t *testing.T) {
 	}
 
 	second := make(chan error, 1)
-	go func() { second <- app.SetServerConfig(fast.URL) }()
+	go func() { second <- app.SetServerConfig(fast) }()
 	time.Sleep(300 * time.Millisecond)
-	if got := app.GetServerConfig().BaseURL; got != slow.URL {
+	if got := app.GetServerConfig().BaseURL; got != slow {
 		t.Fatalf("第一个切换未完成时配置已被第二个保存改写: %s", got)
 	}
 
@@ -416,11 +832,11 @@ func TestSetServerConfigSerializesRetarget(t *testing.T) {
 		t.Fatalf("第二个保存: %v", err)
 	}
 	// 终态一致：最后完成的保存同时决定配置与 REST 基址。
-	if got, want := app.GetServerConfig().BaseURL, fast.URL; got != want {
+	if got, want := app.GetServerConfig().BaseURL, fast; got != want {
 		t.Fatalf("终态配置 = %s，期望 %s", got, want)
 	}
-	if got := app.api.Base(); got != fast.URL {
-		t.Fatalf("终态 REST 基址 = %s，期望 %s", got, fast.URL)
+	if got := app.api.Base(); got != fast {
+		t.Fatalf("终态 REST 基址 = %s，期望 %s", got, fast)
 	}
 }
 
