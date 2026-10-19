@@ -3,6 +3,11 @@ package signal
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -256,4 +261,219 @@ func TestPresenceHeartbeatRenew(t *testing.T) {
 	}
 	_ = alice.conn.CloseNow()
 	waitPresence(t, f.st, "1", false)
+}
+
+// ---- 边沿判定与推送（#11）----
+
+// newPresenceHub 构造只含连接索引 / presence / 事件面的最小 Hub（不建 SFU/HTTP），
+// 供并发边沿测试直接驱动 register/unregister。返回的 bob（uid=2）已登记为连接，
+// 与 alice（uid=1）互为已接受好友，会收到 presence.update。
+func newPresenceHub(t *testing.T) (*Hub, *store.Mem, *client) {
+	t.Helper()
+	st := store.NewMem()
+	if err := st.CreateFriendship(context.Background(), &store.Friendship{
+		UserID: 1, FriendID: 2, Status: store.FriendAccepted,
+	}); err != nil {
+		t.Fatalf("CreateFriendship: %v", err)
+	}
+	h := &Hub{
+		log:               log.New(io.Discard, "", 0),
+		conns:             make(map[connKey]*client),
+		presence:          st,
+		evlog:             newMemEventLog(16),
+		presencePublished: make(map[string]bool),
+	}
+	bob := &client{hub: h, userID: "2", send: make(chan []byte, 1024)}
+	h.register(bob)
+	return h, st, bob
+}
+
+// drainUpdates 取走下行队列里已入队的 presence.update（同步路径调用后立即可用）。
+func drainUpdates(t *testing.T, c *client) []PresenceUpdateData {
+	t.Helper()
+	var out []PresenceUpdateData
+	for {
+		select {
+		case raw := <-c.send:
+			var env Envelope
+			if err := json.Unmarshal(raw, &env); err != nil {
+				t.Fatalf("解信封: %v", err)
+			}
+			if env.Type != TypePresenceUpdate {
+				continue
+			}
+			var d PresenceUpdateData
+			if err := env.Decode(&d); err != nil {
+				t.Fatalf("解 presence.update: %v", err)
+			}
+			out = append(out, d)
+		default:
+			return out
+		}
+	}
+}
+
+// TestPresenceEdgeConcurrentPush 多设备并发首连/并发断开（-race 下多轮）：
+// 只有 0→1 的那次推 online，只有 1→0 的那次推 offline；不重复、不遗漏。
+// 旧实现把「数连接数」放在 register 之后、推送在锁外，两台设备同时首连会
+// 各自看到已有连接，可能一条 online 都不推。
+func TestPresenceEdgeConcurrentPush(t *testing.T) {
+	h, st, bob := newPresenceHub(t)
+	ctx := context.Background()
+	const rounds = 50
+	for round := 0; round < rounds; round++ {
+		const devices = 6
+		cs := make([]*client, devices)
+		for i := range cs {
+			cs[i] = &client{hub: h, userID: "1", dev: fmt.Sprintf("d%d", i)}
+		}
+		var wg sync.WaitGroup
+		for _, c := range cs {
+			wg.Add(1)
+			go func(c *client) {
+				defer wg.Done()
+				if _, became := h.register(c); became {
+					h.syncPresence(c.userID)
+				}
+			}(c)
+		}
+		wg.Wait()
+		if ups := drainUpdates(t, bob); len(ups) != 1 || !ups[0].Online {
+			t.Fatalf("第 %d 轮并发首连：期望恰好 1 条 online=true，实际 %+v", round, ups)
+		}
+		if _, err := st.Get(ctx, presenceKey("1")); err != nil {
+			t.Fatalf("第 %d 轮首连后 presence 键应存在: %v", round, err)
+		}
+
+		for _, c := range cs {
+			wg.Add(1)
+			go func(c *client) {
+				defer wg.Done()
+				if h.unregister(c) {
+					h.syncPresence(c.userID)
+				}
+			}(c)
+		}
+		wg.Wait()
+		if ups := drainUpdates(t, bob); len(ups) != 1 || ups[0].Online {
+			t.Fatalf("第 %d 轮并发断开：期望恰好 1 条 online=false，实际 %+v", round, ups)
+		}
+		if _, err := st.Get(ctx, presenceKey("1")); err == nil {
+			t.Fatalf("第 %d 轮全断后 presence 键应删除", round)
+		}
+	}
+}
+
+// TestPresenceReplaceSameDeviceNoDuplicatePush 同 uid+dev 被顶替（P2）：
+// 新连接不产生 0→1 边沿，旧连接 cleanup 不产生 1→0 边沿，好友不应收到重复 online。
+func TestPresenceReplaceSameDeviceNoDuplicatePush(t *testing.T) {
+	h, _, bob := newPresenceHub(t)
+
+	old := &client{hub: h, userID: "1", dev: "desktop"}
+	if _, became := h.register(old); !became {
+		t.Fatal("首连应判定为 0→1 边沿")
+	}
+	h.syncPresence("1")
+	if ups := drainUpdates(t, bob); len(ups) != 1 || !ups[0].Online {
+		t.Fatalf("首连应推 1 条 online=true，实际 %+v", ups)
+	}
+
+	fresh := &client{hub: h, userID: "1", dev: "desktop"}
+	if _, became := h.register(fresh); became {
+		t.Fatal("同设备顶替不应判定为 0→1 边沿")
+	}
+	if h.unregister(old) {
+		t.Fatal("被顶替的旧连接不应判定为 1→0 边沿")
+	}
+	if ups := drainUpdates(t, bob); len(ups) != 0 {
+		t.Fatalf("顶替不应重复推送 presence.update，实际 %+v", ups)
+	}
+
+	if !h.unregister(fresh) {
+		t.Fatal("最后一条连接断开应判定为 1→0 边沿")
+	}
+	h.syncPresence("1")
+	if ups := drainUpdates(t, bob); len(ups) != 1 || ups[0].Online {
+		t.Fatalf("最终断开应推 1 条 online=false，实际 %+v", ups)
+	}
+}
+
+// TestPresenceReconnectRace 断线清理与重连交错（-race 多轮）：旧连接的 DEL
+// 不能覆盖新连接的 SET——最终 presence 键必须存在。这是一开始复现出的
+// 「设备实际在线、好友一直显示离线」的根因路径。
+func TestPresenceReconnectRace(t *testing.T) {
+	h, st, bob := newPresenceHub(t)
+	ctx := context.Background()
+	const rounds = 100
+	for round := 0; round < rounds; round++ {
+		a := &client{hub: h, userID: "1", dev: "desktop"}
+		if _, became := h.register(a); !became {
+			t.Fatalf("第 %d 轮首连应判定为 0→1 边沿", round)
+		}
+		h.syncPresence("1")
+
+		b := &client{hub: h, userID: "1", dev: "mobile"}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if h.unregister(a) {
+				h.syncPresence("1")
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if _, became := h.register(b); became {
+				h.syncPresence("1")
+			}
+		}()
+		wg.Wait()
+		if _, err := st.Get(ctx, presenceKey("1")); err != nil {
+			t.Fatalf("第 %d 轮重连后 presence 键丢失（旧连接 DEL 覆盖了新连接）", round)
+		}
+
+		// 收尾回离线，进入下一轮。
+		if !h.unregister(b) {
+			t.Fatalf("第 %d 轮收尾应判定为 1→0 边沿", round)
+		}
+		h.syncPresence("1")
+		if _, err := st.Get(ctx, presenceKey("1")); err == nil {
+			t.Fatalf("第 %d 轮收尾后 presence 键应删除", round)
+		}
+		drainUpdates(t, bob) // 每轮推 0~2 条（边沿交错时会去重），及时清空队列
+	}
+}
+
+// TestChannelJoinedOnlineField 成员快照带在线态（#11 验收）：channel.joined
+// 的 members 与 self 都从 presence:{uid} 填 online。
+func TestChannelJoinedOnlineField(t *testing.T) {
+	f := newChatFixture(t).withPresence()
+	alice := f.dial("1", "alice")
+	bob := f.dial("2", "bob")
+	chID := strconv.FormatInt(f.vch.ID, 10)
+
+	alice.send(TypeChannelJoin, ChannelJoinData{ChannelID: chID})
+	var joined ChannelJoinedData
+	if err := alice.recvUntil(TypeChannelJoined).Decode(&joined); err != nil {
+		t.Fatalf("decode channel.joined: %v", err)
+	}
+	if len(joined.Members) != 1 || joined.Members[0].UserID != "1" || !joined.Members[0].Online {
+		t.Fatalf("单人入房快照应含本人且 online=true: %+v", joined)
+	}
+	if !joined.Self.Online {
+		t.Fatalf("self 也应带 online=true: %+v", joined.Self)
+	}
+
+	bob.send(TypeChannelJoin, ChannelJoinData{ChannelID: chID})
+	if err := alice.recvUntil(TypeChannelJoined).Decode(&joined); err != nil {
+		t.Fatalf("decode channel.joined: %v", err)
+	}
+	if len(joined.Members) != 2 {
+		t.Fatalf("两人入房快照应为 2 人，实际 %+v", joined.Members)
+	}
+	for _, m := range joined.Members {
+		if !m.Online {
+			t.Fatalf("在线成员 %s 的 online 应为 true: %+v", m.UserID, m)
+		}
+	}
 }
