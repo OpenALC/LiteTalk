@@ -43,7 +43,11 @@ type Events struct {
 	OnSelf func(userID string)
 	// OnStateRequest 收到他人发来的闭麦/静音请求（v0.1.2；接收方自行决定执行）。
 	OnStateRequest func(fromID, fromNickname string, mute, deafen *bool)
-	// OnVoiceUnavailable 媒体管线初始化失败（音频不可用但信令照常连接）。
+	// OnVoiceUnavailable 媒体不可用（管线初始化失败，或入房后采集/播放启动失败）：
+	// 音频不可用但信令照常连接。errMsg 是面向用户的中文提示，不含内部路径。
+	// 线程约定：初始化失败在 Connect 的调用方 goroutine 上报；启动失败在 ws 读
+	// 循环的 channel.joined 处理器内上报——实现侧不得阻塞，也不得同步 Close
+	// 会话（会与读循环互等）。
 	OnVoiceUnavailable func(errMsg string)
 	// OnKicked 被服务端踢下线（session.kicked 消息 / WS 4001：同类设备新登录，
 	// 契约 §0.5）。reason 约定值 login_elsewhere。回调可能跑在 ws 读循环
@@ -101,6 +105,12 @@ type Session struct {
 	token atomic.Value // string
 	name  string
 
+	// audioMu 保护 audioBackend/connectBegin：后端选择只允许在 Connect 之前，
+	// 两者必须成对判定，否则并发调用会出现「选完之后又被 Connect 读走」的窗口。
+	audioMu      sync.Mutex
+	audioBackend audio.Backend // 零值 = BackendDevice（桌面端默认）
+	connectBegin bool          // Connect 已开始装配，后端不再可改
+
 	ws        *signal.Client
 	pipe      *audio.Pipeline
 	mixer     *audio.Mixer
@@ -116,10 +126,13 @@ type Session struct {
 	// 积压旧状态无意义），由专用 goroutine 消费发送（音频回调禁止直发网络）。
 	voiceSend    chan signal.VoiceStateData
 	mediaStarted atomic.Bool // 采集/播放是否已启动（入房才启动，按需点亮麦克风）
-	peerRef      atomic.Pointer[rtc.Peer]
-	roomID       atomic.Value // string
-	muted        atomic.Bool
-	deafened     atomic.Bool
+	// mediaFailReported 媒体启动失败是否已上报（#80）：同一故障周期只提示一次，
+	// 重入房仍会真实重试但不再重复弹 toast；启动成功后复位，下次故障可再报。
+	mediaFailReported atomic.Bool
+	peerRef           atomic.Pointer[rtc.Peer]
+	roomID            atomic.Value // string
+	muted             atomic.Bool
+	deafened          atomic.Bool
 
 	// protoVer 服务端协商到的协议版本（#29）：0=尚未收到 server.hello（按 v1 行为）。
 	// v2 客户端据此停发 voice.state{speaking} 等版本相关行为（#33 接线）。
@@ -169,10 +182,40 @@ func NewSession(api *api.APIClient, token, nickname string, ev Events, logger *l
 	return s
 }
 
+// SetAudioBackend 选择音频后端（audio.BackendDevice / audio.BackendNull）。
+// 必须在 Connect 之前调用：管线在 Connect 中按当时的选择装配，运行期换后端
+// 需要重建整条媒体链路，当前不支持——Connect 之后调用返回错误。并发调用
+// 与 Connect 之间由 audioMu 串行化，要么生效、要么明确报错。
+func (s *Session) SetAudioBackend(b audio.Backend) error {
+	if b != audio.BackendDevice && b != audio.BackendNull {
+		return fmt.Errorf("unknown audio backend: %d", int(b))
+	}
+	s.audioMu.Lock()
+	defer s.audioMu.Unlock()
+	if s.connectBegin {
+		return errors.New("audio backend must be set before Connect")
+	}
+	s.audioBackend = b
+	return nil
+}
+
+// AudioBackend 返回当前选择的音频后端；Connect 之后即为管线实际生效值。
+func (s *Session) AudioBackend() audio.Backend {
+	s.audioMu.Lock()
+	defer s.audioMu.Unlock()
+	return s.audioBackend
+}
+
 // Connect 建立信令连接并装配媒体管线（采集/播放入房才启动，见 startMedia）。
 // 媒体管线初始化失败不再让登录整体失败：置 voiceUnavailable、发
 // OnVoiceUnavailable 事件，信令照常连接（纯文字/好友功能仍可用）。
 func (s *Session) Connect(serverURL string) {
+	// 后端选择在装配开始时定格：之后 SetAudioBackend 一律报错（见其注释）。
+	s.audioMu.Lock()
+	s.connectBegin = true
+	backend := s.audioBackend
+	s.audioMu.Unlock()
+
 	wsCfg := signal.Config{
 		URL:    serverURL,
 		Logger: s.log,
@@ -242,7 +285,10 @@ func (s *Session) Connect(serverURL string) {
 
 	// 媒体管线：采集→降噪→Opus→(OnPacket→RTP)；下行混音→播放环。
 	// 构造失败（如无 Opus 的平台）降级：跳过音频初始化，信令不受影响。
+	// 后端默认 BackendDevice；无界面/容器/CI 消费方可在 Connect 前经
+	// SetAudioBackend(audio.BackendNull) 改用无声卡自检后端。
 	pcfg := audio.DefaultPipelineConfig()
+	pcfg.Backend = backend
 	pcfg.Loopback = false
 	pcfg.DSP.OnSpeakingChange = func(speaking bool) {
 		// DSP 回调跑在音频 goroutine 上，必须非阻塞：投递到容量 1 的
@@ -316,7 +362,9 @@ func (s *Session) Connect(serverURL string) {
 
 // startMedia 启动采集/播放（幂等）。未入房不启动——空闲时也跑
 // 采集+RNNoise+Opus 是白耗 CPU 且 Windows 麦克风指示灯常亮。
-// 启动失败仅记录（重入房可重试），不影响信令与对端下行。
+// 启动失败不置 voiceUnavailable（重入房可重试），但必须经 OnVoiceUnavailable
+// 上报：否则 UI 显示在房内、麦克风实际没起来，用户无从得知（#80）。
+// 本函数跑在 ws 读循环的 channel.joined 处理器里，上报只做转发不得阻塞。
 func (s *Session) startMedia() {
 	if s.voiceUnavailable || s.pipe == nil {
 		return
@@ -326,14 +374,35 @@ func (s *Session) startMedia() {
 	}
 	if err := s.mixer.Start(); err != nil {
 		s.mediaStarted.Store(false)
-		s.log.Printf("mixer start: %v", err)
+		s.reportMediaFailure("mixer", err)
 		return
 	}
 	if err := s.pipe.Start(); err != nil {
 		s.mixer.Stop()
 		s.mediaStarted.Store(false)
-		s.log.Printf("pipeline start: %v", err)
+		s.reportMediaFailure("pipeline", err)
+		return
 	}
+	// 启动成功：复位故障周期，下次失败重新提示。
+	s.mediaFailReported.Store(false)
+}
+
+// reportMediaFailure 上报媒体启动失败（#80）。日志保留底层错误（含设备名等
+// 诊断信息），事件只发面向用户的中文提示，不暴露内部路径/设备枚举细节。
+// 同一故障周期只上报一次：重入房重试仍会真实重试，但不会把提示刷成风暴。
+func (s *Session) reportMediaFailure(stage string, err error) {
+	s.log.Printf("%s start: %v", stage, err)
+	if !s.mediaFailReported.CompareAndSwap(false, true) {
+		return
+	}
+	if s.ev.OnVoiceUnavailable == nil {
+		return
+	}
+	if stage == "mixer" {
+		s.ev.OnVoiceUnavailable("音频播放启动失败，请检查扬声器")
+		return
+	}
+	s.ev.OnVoiceUnavailable("音频设备启动失败，请检查麦克风和扬声器")
 }
 
 // stopMedia 停止采集/播放（幂等）。与 LeaveChannel/断线/Close 的清理路径
