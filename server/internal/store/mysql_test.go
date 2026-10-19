@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"io/fs"
+	"math"
 	"os"
 	"testing"
 
@@ -89,6 +90,14 @@ func TestMySQLMigrateAndCRUD(t *testing.T) {
 	}
 	if err := m.CreateUser(ctx, &User{Email: "t@ex.com", Nickname: "x", Tag: "0002"}); err != ErrConflict {
 		t.Fatalf("邮箱唯一约束未生效: %v", err)
+	}
+	// 大 Snowflake ID + 4 位 tag（含前导零）写入并按 昵称#tag 查回（#22）。
+	uBig := &User{ID: math.MaxInt64 - 7919, Email: "big@ex.com", Nickname: "big-user", Tag: "0042", PasswordHash: "h"}
+	if err := m.CreateUser(ctx, uBig); err != nil {
+		t.Fatalf("大 ID CreateUser: %v", err)
+	}
+	if got, err := m.UserByNicknameTag(ctx, "big-user", "0042"); err != nil || got.ID != uBig.ID || got.Tag != "0042" {
+		t.Fatalf("大 ID UserByNicknameTag: %+v %v", got, err)
 	}
 
 	// 分类改名/重排（0.1.2 PATCH）：MySQL 事务路径与 Mem 同语义。
