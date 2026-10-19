@@ -34,17 +34,21 @@ type OnSpeakingFn func(channelID, userID string, speaking bool)
 // RFC 6464 音频电平（#33）：SDP 协商的头扩展 URI，与客户端 rtc 包一致。
 const audioLevelURI = "urn:ietf:params:rtp-hdrext:ssrc-audio-level"
 
-// 说话判定门限（RFC 6464 电平：0=0dB 满幅 … 127=静音，越小越响）。
-// 数值对齐客户端 DSP 静音环境默认（底噪 -50dBFS + 12/+6dB ⇒ enter≈-38dBFS、
-// exit≈-44dBFS，dBov 与 dBFS 同满幅基准）。服务端看的是 AGC 后的上行电平，
-// 跨客户端刻度已被拉齐，先用固定门限；数值可随实测再调。
+// 说话判定门限（RFC 6464 电平：0=0dB 满幅 … 127=静音，越小越响；头扩展
+// 低 7 位的数值就是负的 dBov，44 即 -44dBov）。数值对齐客户端 DSP 静音环境
+// 默认（底噪 -50dBFS + 12/+6dB ⇒ enter≈-38dBFS、exit≈-44dBFS，dBov 与 dBFS
+// 同满幅基准）。服务端看的是 AGC 后的上行电平，跨客户端刻度已被拉齐。
+//
+// 进入门限取 44（审查要求）：旧的 38 会把 -42dBov 这类轻声说话人永久挡在
+// 候选外，两人房间也不转发。退出门限取 50，保留 6dB 迟滞——45..50 之间
+// 保持原态，避免门限附近来回翻转；enter 必须小于 exit，不能退化成无迟滞。
 //
 // 迟滞拍数按 speakingTick 折算，**时间常数不变**（对齐客户端 DSP：
 // EnterFrames=3=30ms 起判、ExitFrames=15=150ms 挂起）。退出挂起和停流判定
 // 都是防字间停顿/丢包闪断的宽限，压短会闪断——换判定周期只折算拍数，不改时长。
 const (
-	speakEnterLevel = 38 // 电平 ≤38（≥-38dBov）进入说话
-	speakExitLevel  = 44 // 电平 >44 计入退出（39..44 之间保持原态，双门限迟滞）
+	speakEnterLevel = 44 // 电平 ≤44（≥-44dBov）进入说话
+	speakExitLevel  = 50 // 电平 >50（<-50dBov）计入退出（45..50 之间保持原态，双门限迟滞）
 	speakEnterTicks = 1  // 20ms/tick → 20ms 起判（≤客户端现状 30ms）
 	speakExitTicks  = 10 // 20ms/tick → 200ms 挂起（时间常数同旧 2 拍×100ms，对齐客户端 150ms 量级）
 	levelStaleTicks = 10 // 20ms/tick → 200ms 停流按静音（时间常数同旧 2 拍×100ms）
