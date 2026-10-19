@@ -1,7 +1,6 @@
-// Package state 是客户端业务状态桥：把 M1/M2 的 audio / rtc / signal 管线
-// 装配成面向 UI 的会话（登录 → 连信令 → 入房 → 通话），并经 Wails Events
-// 推送给前端（落地方案 §4.6 事件表）。
-package state
+// Package api 是客户端 REST 客户端：鉴权与令牌刷新、各资源端点的请求封装
+// （#31 wire：ID 字符串化）。与 UI 无关，供 core/desktop 两侧复用。
+package api
 
 import (
 	"bytes"
@@ -551,13 +550,14 @@ type ICEServersResponse struct {
 	ExpiresAt  int64       `json:"expiresAt"`
 }
 
-// rtCredentialsTimeout /rtc/credentials 短超时：该请求可能落在进房链路上，
+// RTCredentialsTimeout /rtc/credentials 短超时：该请求可能落在进房链路上，
 // 用全局 15s 会把 WS 读循环停摆到撞心跳预算（#13）。失败由调用方降级空 ICE。
-var rtCredentialsTimeout = 3 * time.Second
+// 导出供会话侧测试临时调小以覆盖超时降级路径。
+var RTCredentialsTimeout = 3 * time.Second
 
 // RTCCredentials 获取 STUN/TURN 凭证。
 func (c *APIClient) RTCCredentials() (*ICEServersResponse, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), rtCredentialsTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), RTCredentialsTimeout)
 	defer cancel()
 	status, data, err := c.postCtx(ctx, "/rtc/credentials", map[string]string{}, true)
 	if err != nil {
