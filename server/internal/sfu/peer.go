@@ -144,13 +144,16 @@ func newPeer(room *Room, userID, connID string, sig SignalSender) (*Peer, error)
 const reasonICEFailed = "ice_failed"
 
 // onConnFailed ICE 失败清理（#19）：按**实例**核对摘除本 peer（含其余成员指向
-// 本端的下行路由，#23），并只通知本端连接 rtc.failed。同 WS 连接重入的新 peer
-// 与本实例共享 connID，只有指针核对不会误杀它。其余成员的 channel.peer_left 由
-// 信令层（signal/fail.go）在收到 SendFailed 后广播。
+// 本端的下行路由，#23），回收空房间，并只通知本端连接 rtc.failed。同 WS 连接
+// 重入的新 peer 与本实例共享 connID，只有指针核对不会误杀它。其余成员的
+// channel.peer_left 由信令层（signal/fail.go）在收到 SendFailed 后广播。
 func (p *Peer) onConnFailed() {
 	if !p.room.removePeerInstance(p) {
 		return
 	}
+	// 摘掉最后一个成员后房间必须回收（#19）：否则空房间留在 rooms map 里
+	// 占满 MaxRooms，之后所有新语音房都会被配额拒绝。
+	p.room.sfu.removeRoomIfEmpty(p.room.id)
 	p.room.sfu.log.Printf("sfu: %s 连接失败清理完成（房间 %s）", p.userID, p.room.id)
 	if p.signal != nil {
 		p.signal.SendFailed(p.room.id, p.userID, reasonICEFailed)
