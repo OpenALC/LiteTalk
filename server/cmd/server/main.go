@@ -82,10 +82,12 @@ func main() {
 
 	// ---- 持久化（Store 选型 + KV；§0.3）----
 	// Store：LITETALK_STORE 显式 > LITETALK_MYSQL_DSN 非空 → mysql（向后兼容）> 默认 sqlite。
-	// KV：显式 LITETALK_REDIS_ADDR 必须连通（拒绝静默降级）；未配置默认进程内 MemKV（#24）。
+	// KV：显式 LITETALK_REDIS_ADDR 必须连通（拒绝静默降级）；未配置时 sqlite 后端落同库
+	// kv 表（#83，重启不丢），mem/mysql 后端退回进程内并明确告警。
+	kind := pickStoreKind()
 	var st store.Store
-	var kv store.KV
-	switch pickStoreKind() {
+	var sqliteStore *store.SQLite
+	switch kind {
 	case "mysql":
 		dsn := os.Getenv("LITETALK_MYSQL_DSN")
 		if dsn == "" {
@@ -116,6 +118,7 @@ func main() {
 			log.Fatalf("数据库迁移失败: %v", err)
 		}
 		st = sq
+		sqliteStore = sq
 		log.Printf("持久化: SQLite（%s）", path)
 	case "mem":
 		// 内存存储重启即失（用户/服务器/消息全丢），生产拒绝，仅 dev 本地开发。
@@ -125,8 +128,9 @@ func main() {
 		st = store.NewMem()
 		log.Println("持久化: 内存（仅 dev）")
 	default:
-		log.Fatalf("LITETALK_STORE=%q 不支持：可选 mysql / sqlite / mem", pickStoreKind())
+		log.Fatalf("LITETALK_STORE=%q 不支持：可选 mysql / sqlite / mem", kind)
 	}
+	var kv store.KV
 	if addr := os.Getenv("LITETALK_REDIS_ADDR"); addr != "" {
 		rdb, err := store.OpenRedis(addr)
 		if err != nil {
@@ -137,8 +141,16 @@ func main() {
 		log.Println("KV: Redis")
 	} else {
 		// #24 放宽生产 KV 守卫：单机自托管不该被 Redis 缺失挡住启动。
-		kv = store.NewMemKV()
-		log.Println("KV: 进程内（会话/验证码/限流不跨重启；多实例部署必须配置 LITETALK_REDIS_ADDR）")
+		// #83：SQLite 后端把 KV 落到同一个库文件，重启后刷新令牌/游客身份/验证码/限流保留。
+		var label string
+		kv, label, err = selectKV(kind, sqliteStore)
+		if err != nil {
+			log.Fatalf("KV 初始化失败: %v", err)
+		}
+		log.Printf("KV: %s", label)
+		if kind == "mysql" {
+			log.Println("警告: MySQL 后端未配置 LITETALK_REDIS_ADDR，KV 仍是进程内——重启后刷新令牌/游客身份/验证码/限流全部丢失；多实例部署必须配置 Redis")
+		}
 	}
 
 	// -print-admin-invite：重新打印管理员邀请码后退出（#27 T4 填实现），不启动 SFU/TURN/HTTP。
@@ -601,6 +613,28 @@ func pickStoreKind() string {
 		return "mysql"
 	}
 	return "sqlite"
+}
+
+// selectKV 未配置 Redis 时按 Store 后端选 KV（#83）：
+//   - sqlite：与 Store 共用同一个库文件/连接池的 kv 表，重启不丢；
+//   - mem：仅 dev 的进程内实现，重启即丢；
+//   - mysql：无 Redis 时退回进程内（不破坏既有部署），由调用方打告警。
+//
+// 返回的字符串是启动日志标签。
+func selectKV(kind string, sqliteStore *store.SQLite) (store.KV, string, error) {
+	switch kind {
+	case "sqlite":
+		if sqliteStore == nil {
+			return nil, "", errors.New("SQLite 后端缺少已初始化的 Store")
+		}
+		return store.NewSQLiteKV(sqliteStore.DB()), "SQLite（与数据同库，重启不丢）", nil
+	case "mem":
+		return store.NewMemKV(), "进程内（仅 dev，重启即丢）", nil
+	case "mysql":
+		return store.NewMemKV(), "进程内（未配 Redis，重启即丢）", nil
+	default:
+		return nil, "", fmt.Errorf("未知存储后端 %q", kind)
+	}
 }
 
 // resolveMigrationsMySQL 返回 MySQL 方言迁移 SQL 的文件系统：
