@@ -92,7 +92,7 @@ func TestFullResyncUsesSyncSnapshot(t *testing.T) {
 	}, nil)
 	s.mu.Lock()
 	s.seenChans["123"] = true
-	s.chatFn = func(channelID, msgID, userID, nickname, content, ts string) {
+	s.chatFn = func(channelID, msgID, userID, nickname, content, ts, _ string) {
 		chats = append(chats, fmt.Sprintf("%s/%s/%s", channelID, msgID, content))
 	}
 	s.mu.Unlock()
@@ -158,7 +158,7 @@ func TestFullResyncFallsBackWhenSyncFails(t *testing.T) {
 	}, nil)
 	s.mu.Lock()
 	s.seenChans["123"] = true
-	s.chatFn = func(channelID, msgID, userID, nickname, content, ts string) {
+	s.chatFn = func(channelID, msgID, userID, nickname, content, ts, _ string) {
 		chats = append(chats, content)
 	}
 	s.mu.Unlock()

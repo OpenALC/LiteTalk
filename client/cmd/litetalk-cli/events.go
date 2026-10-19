@@ -9,7 +9,7 @@ import (
 	"github.com/OpenALC/LiteTalk/client/core/voice"
 )
 
-// chatMsg 聊天回调载荷（ChatHandler 签名是六个裸参数，这里聚合成结构体传递）。
+// chatMsg 聊天回调载荷（ChatHandler 签名是一组裸参数，这里聚合成结构体传递）。
 type chatMsg struct {
 	channelID, msgID, userID, nickname, content, ts string
 }

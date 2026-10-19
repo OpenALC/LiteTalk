@@ -124,6 +124,7 @@ type ChatMessageData struct {
 	Content   string    `json:"content"`
 	TS        int64     `json:"ts"`
 	User      UserBrief `json:"user"`
+	Nonce     string    `json:"nonce,omitempty"` // 发送方 chat.send 携带的幂等键；仅发送方带 nonce 时回显（#31，协议 v2）。
 }
 
 // ChatSendData 向频道发一条文字消息。type 为消息种类，本期仅支持 text，其他值拒收。
@@ -131,6 +132,7 @@ type ChatSendData struct {
 	ChannelID string `json:"channel_id"`
 	Type      string `json:"type"` // 消息种类，本期仅 text
 	Content   string `json:"content"`
+	Nonce     string `json:"nonce,omitempty"` // 客户端幂等键（#31，≤64 字符）：同频道同用户重复提交只落一条，重复请求回显原消息。缺省不去重（老客户端）。
 }
 
 // ClientHelloData 协议版本协商（#29）：WS 连上并鉴权后客户端立刻发送，声明可接受区间 [min,max]。老服务端不认识本消息会回 error{bad_message}，客户端须容忍（记日志、按 v1 继续，不重连风暴）。不发本消息按 v1 处理。

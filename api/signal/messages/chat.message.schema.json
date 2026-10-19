@@ -14,7 +14,14 @@
     "channel_id": { "type": "string" },
     "content": { "type": "string" },
     "ts": { "type": "integer" },
-    "user": { "$ref": "components.schema.json#/$defs/UserBrief" }
+    "user": { "$ref": "components.schema.json#/$defs/UserBrief" },
+    "nonce": {
+      "type": "string",
+      "x-since": 2,
+      "x-go-omitempty": true,
+      "maxLength": 64,
+      "description": "发送方 chat.send 携带的幂等键；仅发送方带 nonce 时回显（#31，协议 v2）。"
+    }
   },
   "required": ["id", "channel_id", "content", "ts", "user"],
   "additionalProperties": false

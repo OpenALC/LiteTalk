@@ -125,3 +125,55 @@ func TestMessageNonceIdempotent(t *testing.T) {
 	postJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/messages", chID), aAccess,
 		map[string]string{"content": "x", "nonce": string(make([]byte, 65))}, http.StatusBadRequest)
 }
+
+// TestMessageNonceChannelScoped 去重键含频道（#31）：同一 nonce 跨频道各自独立；
+// 幂等判断先于频控——配额耗尽后重放仍回原消息（200），而不是 429。
+func TestMessageNonceChannelScoped(t *testing.T) {
+	srv, mem := newTestServer(t)
+	h := srv.Handler()
+	aAccess, _ := registerUser(t, h, mem, "nc-scope@ex.com", "ncScope", "password123")
+
+	serverResp := postJSON(t, h, "/api/v1/servers", aAccess,
+		map[string]string{"name": "跨频道", "icon_name": "music", "icon_color": "#4FA4F3"}, http.StatusCreated)
+	serverID := asID(serverResp["id"])
+	mkChannel := func(name string) int64 {
+		t.Helper()
+		resp := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/channels", serverID), aAccess,
+			map[string]string{"name": name, "type": "text"}, http.StatusCreated)
+		return asID(resp["id"])
+	}
+	ch1, ch2 := mkChannel("一"), mkChannel("二")
+
+	first := postJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/messages", ch1), aAccess,
+		map[string]string{"content": "频道一", "nonce": "same"}, http.StatusCreated)
+	second := postJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/messages", ch2), aAccess,
+		map[string]string{"content": "频道二", "nonce": "same"}, http.StatusCreated)
+	if asID(first["id"]) == asID(second["id"]) {
+		t.Fatal("跨频道同 nonce 不应互相命中")
+	}
+
+	// 各自重放回各自频道的原消息。
+	replay1 := postJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/messages", ch1), aAccess,
+		map[string]string{"content": "重放一", "nonce": "same"}, http.StatusOK)
+	if asID(replay1["id"]) != asID(first["id"]) || replay1["content"] != "频道一" {
+		t.Fatalf("频道一重放应回原消息：%v", replay1)
+	}
+	replay2 := postJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/messages", ch2), aAccess,
+		map[string]string{"content": "重放二", "nonce": "same"}, http.StatusOK)
+	if asID(replay2["id"]) != asID(second["id"]) || replay2["content"] != "频道二" {
+		t.Fatalf("频道二重放应回原消息：%v", replay2)
+	}
+
+	// 打满 20 条/分配额（上面已计 2 条），再断言：新 nonce 429，重放旧 nonce 仍 200。
+	for i := 0; i < 18; i++ {
+		postJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/messages", ch1), aAccess,
+			map[string]string{"content": fmt.Sprintf("填充%d", i), "nonce": fmt.Sprintf("fill-%d", i)}, http.StatusCreated)
+	}
+	postJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/messages", ch1), aAccess,
+		map[string]string{"content": "超限", "nonce": "fill-over"}, http.StatusTooManyRequests)
+	afterLimit := postJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/messages", ch1), aAccess,
+		map[string]string{"content": "重放", "nonce": "same"}, http.StatusOK)
+	if asID(afterLimit["id"]) != asID(first["id"]) {
+		t.Fatalf("配额耗尽后的幂等重放应回原消息：%v", afterLimit)
+	}
+}
