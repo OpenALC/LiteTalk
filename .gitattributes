@@ -14,6 +14,7 @@
 *.yaml  text eol=lf
 *.json  text eol=lf
 *.sql   text eol=lf
+*.txt   text eol=lf
 
 # 容器构建（#27）：CRLF 会打断 Dockerfile 的反斜杠续行
 Dockerfile     text eol=lf
