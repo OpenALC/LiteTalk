@@ -12,6 +12,7 @@ import (
 
 	"github.com/OpenALC/LiteTalk/server/internal/auth"
 	"github.com/OpenALC/LiteTalk/server/internal/mailer"
+	"github.com/OpenALC/LiteTalk/server/internal/rtcapi"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
 )
 
@@ -51,6 +52,12 @@ type Server struct {
 	selfHost bool               // 一键自托管形态（GET /api/v1/config 自描述，#26）
 	// bootstrapRequired 管理员邀请码是否未消费（#27 T4 接线；nil=恒 false）。
 	bootstrapRequired func() bool
+	// version 服务端构建版本（GET /api/v1/healthz 回显，#77）。
+	version string
+	// rtcCfg TURN/STUN 凭证签发配置（POST /api/v1/rtc/credentials，#77）。
+	rtcCfg rtcapi.Config
+	// rtcAuth 从访问令牌提取 uid；nil 时该端点一律 401（fail-closed）。
+	rtcAuth rtcapi.UserFromToken
 }
 
 // Config 构造配置。
@@ -77,6 +84,12 @@ type Config struct {
 	// BootstrapRequired 管理员邀请码是否尚未被消费；注册页提示「等待管理员邀请」。
 	// nil=恒 false（bootstrap 流程未启用，#27 T4 接线）。
 	BootstrapRequired func() bool
+	// Version 服务端构建版本（GET /api/v1/healthz 回显；空视为 dev，#77）。
+	Version string
+	// RTC TURN/STUN 凭证签发配置；Secret 为空时 rtc/credentials 返回 503（#77）。
+	RTC rtcapi.Config
+	// RTCAuth 从访问令牌提取 uid（Bearer 或 ?token=，与信令一致）；nil 一律 401。
+	RTCAuth rtcapi.UserFromToken
 }
 
 // New 构造 API Server。
@@ -93,6 +106,10 @@ func New(cfg Config) *Server {
 	if mode != AuthModeSimple {
 		mode = AuthModeFull
 	}
+	ver := cfg.Version
+	if ver == "" {
+		ver = "dev"
+	}
 	return &Server{
 		store:             cfg.Store,
 		jwt:               cfg.JWT,
@@ -108,6 +125,9 @@ func New(cfg Config) *Server {
 		presence:          cfg.Presence,
 		selfHost:          cfg.SelfHost,
 		bootstrapRequired: cfg.BootstrapRequired,
+		version:           ver,
+		rtcCfg:            cfg.RTC,
+		rtcAuth:           cfg.RTCAuth,
 	}
 }
 
@@ -157,12 +177,17 @@ func (s *Server) Handler() http.Handler {
 		RequestErrorHandlerFunc:  s.requestErrorHandler,
 		ResponseErrorHandlerFunc: s.responseErrorHandler,
 	})
-	return HandlerWithOptions(si, StdHTTPServerOptions{
+	h := HandlerWithOptions(si, StdHTTPServerOptions{
 		BaseRouter:  &authMux{ServeMux: http.NewServeMux(), s: s},
 		Middlewares: []MiddlewareFunc{limitBody},
 		ErrorHandlerFunc: func(w http.ResponseWriter, r *http.Request, err error) {
 			writeErr(w, http.StatusBadRequest, "bad_request", "路径参数不合法")
 		},
+	})
+	// ServeMux 的 405 由 net/http 内部直接 http.Error 写出（纯文本），没有可插拔
+	// 的错误处理点；包一层响应改写，保证 405 也是 RFC 9457 problem+json（#77）。
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.ServeHTTP(&methodNotAllowedWriter{ResponseWriter: w}, r)
 	})
 }
 
