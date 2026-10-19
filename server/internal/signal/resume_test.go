@@ -29,6 +29,9 @@ func TestGatewayResumeReplay(t *testing.T) {
 			t.Fatalf("发送者未收到广播: %s", env.Type)
 		}
 	}
+	// 等最后一条 missed 真正进环再重连：慢调度下 a2 可能先连上，实时事件
+	// 先于补发到达，断言首条补发 seq=2 会偶发拿到 3（CI 踩过）。
+	waitRingSeq(t, f, "sa", 3)
 
 	a2 := f.dial("1:desktop:sa", "alice")
 	a2.recvUntil(TypeHello)
@@ -103,6 +106,8 @@ func TestGatewayResumeSeqExpired(t *testing.T) {
 			t.Fatalf("发送者未收到广播: %s", env.Type)
 		}
 	}
+	// 同 Replay：确保 3 条 missed 都已进环（m1 + 3 = 4）再重连。
+	waitRingSeq(t, f, "sa", 4)
 
 	a2 := f.dial("1:desktop:sa", "alice")
 	a2.recvUntil(TypeHello)
@@ -134,6 +139,20 @@ func TestGatewayResumeTrailing(t *testing.T) {
 	b.send(TypeChatSend, ChatSendData{ChannelID: chID, Type: "text", Content: "m2"})
 	if env := a.recvUntil(TypeChatMessage); env.Seq != 2 {
 		t.Fatalf("m2 seq = %d, want 2", env.Seq)
+	}
+}
+
+// waitRingSeq 等 sid 的事件环分配到的最大 seq 达到 want：重连前用它保证
+// 断线期间的最后一个 broadcastEvent 已完成进环，避免“重连与最后一条消息抢跑”
+// 的偶发（实时事件先于补发到达会让补发首条 seq 断言偏移）。
+func waitRingSeq(t *testing.T, f *chatFixture, sid string, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for f.hub.evlog.LatestSeq(sid) < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("sid %s 事件环未到 seq %d（当前 %d）", sid, want, f.hub.evlog.LatestSeq(sid))
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
