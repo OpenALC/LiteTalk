@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OpenALC/LiteTalk/client/internal/codec"
-	"github.com/OpenALC/LiteTalk/client/internal/hotkey"
+	"github.com/OpenALC/LiteTalk/client/core/codec"
+	"github.com/OpenALC/LiteTalk/client/core/hotkey"
 )
 
 // requireOpus 编解码测试前置：darwin 尚未接入 libopus（stub），是唯一允许
