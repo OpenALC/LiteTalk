@@ -434,3 +434,67 @@ func TestAPI401TokenExpiredRefreshRetry(t *testing.T) {
 		t.Fatalf("access token 未更新为 tok2: %q", c.Token())
 	}
 }
+
+// TestClientVersionHeader 所有 REST 请求（GET/POST/PATCH/DELETE、刷新与
+// rtc/credentials）都带 X-LiteTalk-Client；默认 dev，SetClientVersion 后生效，
+// 空值回落 dev（#31 升级门）。
+func TestClientVersionHeader(t *testing.T) {
+	var mu sync.Mutex
+	var got []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		got = append(got, r.Header.Get(clientVersionHeader))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/users/me":
+			_, _ = w.Write([]byte(mePayload))
+		case "/api/v1/auth/login", "/api/v1/auth/refresh":
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"code":"unauthorized","detail":"no"}`))
+		default:
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := NewAPIClient(srv.URL)
+	if _, err := c.Me(); err != nil { // GET
+		t.Fatalf("Me: %v", err)
+	}
+	if err := c.UpdateFriend("1", "备注", "组"); err != nil { // PATCH
+		t.Fatalf("UpdateFriend: %v", err)
+	}
+	if err := c.RemoveFriend("1"); err != nil { // DELETE
+		t.Fatalf("RemoveFriend: %v", err)
+	}
+	if _, err := c.RTCCredentials(); err != nil { // POST（postCtx）
+		t.Fatalf("RTCCredentials: %v", err)
+	}
+	if _, err := c.Login("a@b.c", "x"); err == nil { // POST 业务失败也算发出
+		t.Fatal("Login 期望报错")
+	}
+	if _, err := c.Refresh("rt"); err == nil { // 刷新自身
+		t.Fatal("Refresh 期望报错")
+	}
+	c.SetClientVersion("v1.5.0-alpha")
+	if _, err := c.Me(); err != nil {
+		t.Fatalf("Me after SetClientVersion: %v", err)
+	}
+	c.SetClientVersion("")
+	if _, err := c.Me(); err != nil {
+		t.Fatalf("Me after empty version: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"dev", "dev", "dev", "dev", "dev", "dev", "v1.5.0-alpha", "dev"}
+	if len(got) != len(want) {
+		t.Fatalf("请求数 %d，期望 %d（%v）", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("第 %d 个请求版本头 = %q，期望 %q（全部：%v）", i, got[i], want[i], got)
+		}
+	}
+}
