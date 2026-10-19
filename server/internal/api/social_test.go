@@ -112,6 +112,32 @@ func TestPatchFriendRemark(t *testing.T) {
 		map[string]string{"remark": string(make([]byte, 65))}, 400)
 }
 
+// TestJoinServerInviteExhausted 邀请码次数用尽返回 409 code_exhausted；
+// 已在服务器内的用户重复请求按幂等成功返回（#22：消费邀请码与加入成员同事务）。
+func TestJoinServerInviteExhausted(t *testing.T) {
+	srv, mem := newTestServer(t)
+	h := srv.Handler()
+
+	aTok, _ := registerUser(t, h, mem, "jca@ex.com", "邀请A", "password123")
+	bTok, _ := registerUser(t, h, mem, "jcb@ex.com", "邀请B", "password123")
+	cTok, _ := registerUser(t, h, mem, "jcc@ex.com", "邀请C", "password123")
+
+	sv := postJSON(t, h, "/api/v1/servers", aTok, map[string]string{"name": "邀请服"}, 201)
+	sid := int(asID(sv["id"]))
+	inv := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/invites", sid), aTok,
+		map[string]any{"max_uses": 1}, 201)
+	code := inv["code"].(string)
+
+	postJSON(t, h, "/api/v1/servers/join", bTok, map[string]string{"code": code}, 200)
+	// 已加入的用户重复请求：幂等成功，不应返回 code_exhausted。
+	postJSON(t, h, "/api/v1/servers/join", bTok, map[string]string{"code": code}, 200)
+	// 次数已用尽：第三个用户 409。
+	out := postJSON(t, h, "/api/v1/servers/join", cTok, map[string]string{"code": code}, 409)
+	if out["code"] != "code_exhausted" {
+		t.Fatalf("期望 code_exhausted，实际 %+v", out)
+	}
+}
+
 // TestCategoriesCRUD 分类创建/列频道/删除：非空未带参 409，with_channels=1 级联。
 func TestCategoriesCRUD(t *testing.T) {
 	srv, mem := newTestServer(t)

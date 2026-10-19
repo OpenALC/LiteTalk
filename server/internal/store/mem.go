@@ -673,22 +673,57 @@ func (m *Mem) InviteByCode(_ context.Context, code string) (*Invite, error) {
 	return &cp, nil
 }
 
-func (m *Mem) UseInvite(_ context.Context, code string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// checkInviteLocked 邀请码有效性校验（调用方持 m.mu）：存在、未过期、次数未用尽。
+func (m *Mem) checkInviteLocked(code string) (*Invite, error) {
 	inv, ok := m.invites[code]
 	if !ok {
-		return ErrNotFound
+		return nil, ErrNotFound
 	}
 	// 原子路径含过期校验（#22）。
 	if inv.ExpiresAt != nil && time.Now().After(*inv.ExpiresAt) {
-		return ErrExpired
+		return nil, ErrExpired
 	}
 	if inv.MaxUses > 0 && inv.Uses >= inv.MaxUses {
-		return ErrConflict
+		return nil, ErrConflict
+	}
+	return inv, nil
+}
+
+func (m *Mem) UseInvite(_ context.Context, code string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	inv, err := m.checkInviteLocked(code)
+	if err != nil {
+		return err
 	}
 	inv.Uses++
 	return nil
+}
+
+// UseInviteAndAddMember 原子消费邀请码并加入服务器（#22）：同一把锁内完成校验、
+// 自增与成员插入，任何一步失败都不消耗邀请码。
+func (m *Mem) UseInviteAndAddMember(_ context.Context, code string, userID int64, role MemberRole) (*ServerMember, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	inv, err := m.checkInviteLocked(code)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := m.servers[inv.ServerID]; !ok {
+		return nil, ErrNotFound
+	}
+	if m.members[inv.ServerID] != nil {
+		if _, ok := m.members[inv.ServerID][userID]; ok {
+			return nil, ErrConflict
+		}
+	} else {
+		m.members[inv.ServerID] = map[int64]*ServerMember{}
+	}
+	inv.Uses++
+	mem := &ServerMember{ServerID: inv.ServerID, UserID: userID, Role: role, JoinedAt: time.Now()}
+	cp := *mem
+	m.members[inv.ServerID][userID] = &cp
+	return mem, nil
 }
 
 // ---- user_sessions（v1.1.0 迁移 0004） ----

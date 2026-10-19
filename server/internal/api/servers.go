@@ -172,17 +172,24 @@ func (s *Server) JoinServer(ctx context.Context, request JoinServerRequestObject
 		srv, _ := s.store.ServerByID(ctx, inv.ServerID)
 		return JoinServer200JSONResponse(serverView(srv)), nil
 	}
-	if err := s.store.UseInvite(ctx, inv.Code); err != nil {
-		if errors.Is(err, store.ErrConflict) {
+	// 消费邀请码与加入成员同一事务（#22）：中途失败时邀请码次数不增长。
+	if _, err := s.store.UseInviteAndAddMember(ctx, inv.Code, c.UserID, store.RoleMember); err != nil {
+		switch {
+		case errors.Is(err, store.ErrConflict):
+			// 邀请码用尽；也可能是同一用户的并发请求已先一步加入，后者按幂等成功返回。
+			if _, e := s.store.Member(ctx, inv.ServerID, c.UserID); e == nil {
+				srv, e := s.store.ServerByID(ctx, inv.ServerID)
+				if e != nil {
+					return nil, s.writeStoreErr(ctx, e)
+				}
+				return JoinServer200JSONResponse(serverView(srv)), nil
+			}
 			return nil, errf(http.StatusConflict, "code_exhausted", "邀请码使用次数已达上限")
-		}
-		if errors.Is(err, store.ErrExpired) {
+		case errors.Is(err, store.ErrExpired):
 			return nil, errf(http.StatusGone, "code_expired", "邀请码已过期")
+		case errors.Is(err, store.ErrNotFound):
+			return nil, errf(http.StatusNotFound, "bad_code", "邀请码无效")
 		}
-		return nil, s.writeStoreErr(ctx, err)
-	}
-	mem := &store.ServerMember{ServerID: inv.ServerID, UserID: c.UserID, Role: store.RoleMember}
-	if err := s.store.AddMember(ctx, mem); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
 	srv, err := s.store.ServerByID(ctx, inv.ServerID)

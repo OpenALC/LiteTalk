@@ -870,34 +870,93 @@ func (s *SQLite) InviteByCode(ctx context.Context, code string) (*Invite, error)
 // UseInvite 原子路径含 max_uses 与过期校验（#22）：SQLite 方言用 CURRENT_TIMESTAMP
 // （与 expires_at 同为 UTC "YYYY-MM-DD HH:MM:SS" 文本，字典序即时间序）。
 func (s *SQLite) UseInvite(ctx context.Context, code string) error {
-	res, err := s.db.ExecContext(ctx,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	ok, err := sqUseInvite(ctx, tx, code)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return sqInviteMiss(ctx, tx, code)
+	}
+	return tx.Commit()
+}
+
+// sqUseInvite 邀请码自增（单条 UPDATE 即原子判定 max_uses/过期）；返回是否命中。
+// 不 Commit——调用方决定事务边界（UseInvite 与 UseInviteAndAddMember 共用）。
+func sqUseInvite(ctx context.Context, tx *sql.Tx, code string) (bool, error) {
+	res, err := tx.ExecContext(ctx,
 		`UPDATE invites SET uses = uses + 1
 		 WHERE code = ? AND (max_uses = 0 OR uses < max_uses)
 		   AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)`, code)
 	if err != nil {
-		return err
+		return false, err
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// sqInviteMiss 区分 UPDATE 0 行的原因：不存在、已过期、次数用尽。
+func sqInviteMiss(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, code string) error {
+	var cnt, expired int
+	if err := q.QueryRowContext(ctx,
+		`SELECT COUNT(*), COALESCE(SUM(expires_at IS NOT NULL AND expires_at <= CURRENT_TIMESTAMP), 0)
+		 FROM invites WHERE code = ?`, code).Scan(&cnt, &expired); err != nil {
 		return err
 	}
-	if n == 0 {
-		// 区分不存在、已用尽与已过期。
-		var cnt, expired int
-		if err := s.db.QueryRowContext(ctx,
-			`SELECT COUNT(*), COALESCE(SUM(expires_at IS NOT NULL AND expires_at <= CURRENT_TIMESTAMP), 0)
-			 FROM invites WHERE code = ?`, code).Scan(&cnt, &expired); err != nil {
-			return err
-		}
-		if cnt == 0 {
-			return ErrNotFound
-		}
-		if expired > 0 {
-			return ErrExpired
-		}
-		return ErrConflict
+	if cnt == 0 {
+		return ErrNotFound
 	}
-	return nil
+	if expired > 0 {
+		return ErrExpired
+	}
+	return ErrConflict
+}
+
+// UseInviteAndAddMember 同一事务内消费邀请码并插入成员（#22）：成员冲突或
+// 插入失败时整体回滚，邀请码次数不增长。
+func (s *SQLite) UseInviteAndAddMember(ctx context.Context, code string, userID int64, role MemberRole) (*ServerMember, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var serverID int64
+	err = tx.QueryRowContext(ctx, `SELECT server_id FROM invites WHERE code = ?`, code).Scan(&serverID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	ok, err := sqUseInvite(ctx, tx, code)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, sqInviteMiss(ctx, tx, code)
+	}
+	mem := &ServerMember{ServerID: serverID, UserID: userID, Role: role, JoinedAt: time.Now()}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO server_members (server_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)`,
+		mem.ServerID, mem.UserID, mem.Role, mem.JoinedAt); err != nil {
+		if isDupSQLite(err) {
+			return nil, ErrConflict
+		}
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return mem, nil
 }
 
 // ---- user_sessions（v1.1.0 迁移 0004） ----

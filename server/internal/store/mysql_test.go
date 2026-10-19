@@ -145,6 +145,31 @@ func TestMySQLMigrateAndCRUD(t *testing.T) {
 		t.Fatalf("改名未生效: %+v", list[1])
 	}
 
+	// 邀请码消费与加入成员同一事务（#22）：重复加入不消耗次数。
+	uJoin := &User{Email: "join@ex.com", Nickname: "joiner", Tag: "0003", PasswordHash: "h"}
+	if err := m.CreateUser(ctx, uJoin); err != nil {
+		t.Fatalf("CreateUser(joiner): %v", err)
+	}
+	if err := m.CreateInvite(ctx, &Invite{Code: "join001", ServerID: sv.ID, CreatorID: u.ID, MaxUses: 1}); err != nil {
+		t.Fatalf("CreateInvite: %v", err)
+	}
+	jm, err := m.UseInviteAndAddMember(ctx, "join001", uJoin.ID, RoleMember)
+	if err != nil {
+		t.Fatalf("UseInviteAndAddMember: %v", err)
+	}
+	if jm.ServerID != sv.ID || jm.Role != RoleMember || jm.JoinedAt.IsZero() {
+		t.Fatalf("返回成员不符: %+v", jm)
+	}
+	if _, err := m.UseInviteAndAddMember(ctx, "join001", uJoin.ID, RoleMember); err != ErrConflict {
+		t.Fatalf("重复加入应 ErrConflict，实际 %v", err)
+	}
+	if inv, _ := m.InviteByCode(ctx, "join001"); inv.Uses != 1 {
+		t.Fatalf("成员冲突不应消耗邀请码，uses = %d", inv.Uses)
+	}
+	if _, err := m.UseInviteAndAddMember(ctx, "join001", u.ID, RoleMember); err != ErrConflict {
+		t.Fatalf("次数用尽应 ErrConflict，实际 %v", err)
+	}
+
 	// 频道分类归属（#72）：与 Mem 共用同一套断言，两边语义漂移会直接测挂。
 	assertChannelCategoryPersist(t, m)
 }
