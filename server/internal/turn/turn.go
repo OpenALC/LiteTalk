@@ -38,6 +38,10 @@ type Config struct {
 	Realm string
 	// Secret REST 短期凭证共享密钥（env LITETALK_TURN_SECRET，与 rtcapi 同源）
 	Secret string
+	// AllowLoopbackPeers 允许中继到环回 peer。仅供本机集成测试/本地联调：
+	// 生产必须保持 false——合法凭证不能借中继访问本机服务（#25 P0）。
+	// 私网、链路本地（云元数据）与组播地址无论该值如何始终拒绝。
+	AllowLoopbackPeers bool
 	// Logger 日志；nil 则丢弃
 	Logger *log.Logger
 }
@@ -92,6 +96,7 @@ func New(cfg Config) (*Server, error) {
 	// 配额按 uid 与客户端 IP 两层计数（#25）：pion 的 QuotaHandler 只负责
 	// 分配前检查，真实计数由生命周期事件维护。
 	quota := newAllocationQuota()
+	permission := permitPeer(cfg.AllowLoopbackPeers)
 	sc := turnpkg.ServerConfig{
 		Realm:        cfg.Realm,
 		AuthHandler:  turnpkg.LongTermTURNRESTAuthHandler(cfg.Secret, pionLog),
@@ -117,7 +122,7 @@ func New(cfg Config) (*Server, error) {
 		sc.PacketConnConfigs = append(sc.PacketConnConfigs, turnpkg.PacketConnConfig{
 			PacketConn:            udpLn,
 			RelayAddressGenerator: newRelayGen(),
-			PermissionHandler:     permitPeer,
+			PermissionHandler:     permission,
 		})
 	}
 	if cfg.TCPPort != 0 {
@@ -130,7 +135,7 @@ func New(cfg Config) (*Server, error) {
 		sc.ListenerConfigs = append(sc.ListenerConfigs, turnpkg.ListenerConfig{
 			Listener:              tcpLn,
 			RelayAddressGenerator: newRelayGen(),
-			PermissionHandler:     permitPeer,
+			PermissionHandler:     permission,
 		})
 	}
 
@@ -183,16 +188,19 @@ func (s *Server) closeListeners() {
 	}
 }
 
-// permitPeer 是 pion 的 PermissionHandler：中继只能对公网 peer 建立权限（#25）。
+// permitPeer 返回 pion 的 PermissionHandler：中继只能对公网 peer 建立权限（#25）。
 // 没有它时 pion 默认放行一切，任何拿到合法凭证的人都能以服务器源 IP 访问
-// 内网服务与云元数据（169.254.169.254）。
-func permitPeer(_ net.Addr, peerIP net.IP) bool {
-	return !isBlockedPeerIP(peerIP)
+// 内网服务与云元数据（169.254.169.254）。allowLoopback 仅供本机集成测试。
+func permitPeer(allowLoopback bool) turnpkg.PermissionHandler {
+	return func(_ net.Addr, peerIP net.IP) bool {
+		return !isBlockedPeerIP(peerIP, allowLoopback)
+	}
 }
 
 // isBlockedPeerIP 判定不允许中继的 peer 地址。IPv4-mapped IPv6 先经 To4()
 // 归一到 IPv4 再判断，避免用 ::ffff:127.0.0.1 之类的表示绕过。
-func isBlockedPeerIP(ip net.IP) bool {
+// allowLoopback 只放开环回（127.0.0.0/8、::1）；私网/元数据/组播始终拒绝。
+func isBlockedPeerIP(ip net.IP, allowLoopback bool) bool {
 	if len(ip) == 0 {
 		return true
 	}
@@ -200,6 +208,7 @@ func isBlockedPeerIP(ip net.IP) bool {
 		switch {
 		case v4[0] == 0: // 0.0.0.0/8，含未指定地址
 		case v4.IsLoopback(): // 127.0.0.0/8
+			return !allowLoopback
 		case v4.IsPrivate(): // 10/8、172.16/12、192.168/16
 		case v4[0] == 100 && v4[1]&0xc0 == 64: // 100.64/10 CGNAT
 		case v4[0] == 169 && v4[1] == 254: // 169.254/16 链路本地（云元数据）
@@ -211,7 +220,10 @@ func isBlockedPeerIP(ip net.IP) bool {
 		return true
 	}
 	// IPv6：::1、未指定地址、fe80::/10、ff00::/8、fc00::/7（ULA）。
-	return ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() ||
+	if ip.IsLoopback() {
+		return !allowLoopback
+	}
+	return ip.IsUnspecified() || ip.IsLinkLocalUnicast() ||
 		ip.IsMulticast() || ip[0]&0xfe == 0xfc
 }
 

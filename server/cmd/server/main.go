@@ -270,24 +270,17 @@ func main() {
 		}
 	}
 	// TURN 短期凭证签发 URLs（§0.4）：显式 env 优先；未设且内置 TURN 启用则按
-	// host（LITETALK_DOMAIN，否则 LITETALK_SFU_IP）回填。host 别一个用 IP 一个用域名。
-	turnURLs := splitList(os.Getenv("LITETALK_TURN_URLS"))
-	stunURLs := splitList(os.Getenv("LITETALK_STUN_URLS"))
-	if len(turnURLs) == 0 || len(stunURLs) == 0 {
-		host := envOr("LITETALK_DOMAIN", sfuIP)
-		if turnPort != 0 {
-			if len(turnURLs) == 0 && len(stunURLs) == 0 {
-				turnURLs, stunURLs = rtcapi.DefaultURLs(host, turnPort)
-			}
-		} else {
-			// 内置 TURN 关闭且未显式配置：保持既有开发默认值（仅本机联调可达）。
-			if len(turnURLs) == 0 {
-				turnURLs = []string{"turn:127.0.0.1:3478"}
-			}
-			if len(stunURLs) == 0 {
-				stunURLs = []string{"stun:127.0.0.1:3478"}
-			}
-		}
+	// host（LITETALK_DOMAIN，否则 LITETALK_SFU_IP）回填。生产模式在内置 TURN
+	// 关闭且未配置外部 TURN 时不再回落 loopback（#13 P2），见 resolveCredentialURLs。
+	turnURLs, stunURLs, urlWarn := resolveCredentialURLs(
+		os.Getenv("LITETALK_TURN_URLS"),
+		os.Getenv("LITETALK_STUN_URLS"),
+		envOr("LITETALK_DOMAIN", sfuIP),
+		turnPort,
+		dev,
+	)
+	if urlWarn != "" {
+		log.Println(urlWarn)
 	}
 	rtcCfg := rtcapi.Config{
 		Secret:   turnSecret,
@@ -558,6 +551,40 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// resolveCredentialURLs 解析下发给客户端的 TURN/STUN URL（#13 P2）：
+//   - 显式配置优先；
+//   - 内置 TURN 启用且两者都未配置：按 host + 端口回填（rtcapi.DefaultURLs）；
+//   - 内置 TURN 关闭（LITETALK_TURN_PORT=0）：dev 模式回落本机 127.0.0.1:3478
+//     便于本地联调；生产模式不做 loopback 回落并返回告警——客户端拿到不可达的
+//     本机中继只会白白等待超时，反而掩盖「未配置外部 TURN」这一部署错误。
+func resolveCredentialURLs(rawTurn, rawStun, host string, turnPort int, dev bool) (turnURLs, stunURLs []string, warn string) {
+	turnURLs = splitList(rawTurn)
+	stunURLs = splitList(rawStun)
+	if len(turnURLs) > 0 && len(stunURLs) > 0 {
+		return turnURLs, stunURLs, ""
+	}
+	if turnPort != 0 {
+		if len(turnURLs) == 0 && len(stunURLs) == 0 {
+			t, s := rtcapi.DefaultURLs(host, turnPort)
+			return t, s, ""
+		}
+		return turnURLs, stunURLs, ""
+	}
+	if dev {
+		if len(turnURLs) == 0 {
+			turnURLs = []string{"turn:127.0.0.1:3478"}
+		}
+		if len(stunURLs) == 0 {
+			stunURLs = []string{"stun:127.0.0.1:3478"}
+		}
+		return turnURLs, stunURLs, ""
+	}
+	if len(turnURLs) == 0 || len(stunURLs) == 0 {
+		warn = "TURN: 内置 TURN 已关闭（LITETALK_TURN_PORT=0）且 TURN/STUN URL 未配齐；生产模式不下发 loopback 回落"
+	}
+	return turnURLs, stunURLs, warn
 }
 
 func envInt(key string, def int) int {
