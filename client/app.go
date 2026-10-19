@@ -20,7 +20,7 @@ import (
 	"github.com/OpenALC/LiteTalk/client/core/config"
 	"github.com/OpenALC/LiteTalk/client/core/hotkey"
 	"github.com/OpenALC/LiteTalk/client/core/voice"
-	"github.com/OpenALC/LiteTalk/client/internal/tray"
+	"github.com/OpenALC/LiteTalk/client/desktop/tray"
 	"github.com/gen2brain/malgo"
 	"github.com/wailsapp/wails/v3/pkg/application"
 	"github.com/wailsapp/wails/v3/pkg/events"
