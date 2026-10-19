@@ -223,6 +223,10 @@ type Store interface {
 	InviteByCode(ctx context.Context, code string) (*Invite, error)
 	// UseInvite 自增使用次数（超过 max_uses 返回 ErrConflict）。
 	UseInvite(ctx context.Context, code string) error
+	// UseInviteAndAddMember 原子地消费邀请码并把 userID 加入邀请码所属服务器（#22）：
+	// 邀请码校验（存在/未过期/次数未用尽）与成员插入在同一事务里完成，成员已存在
+	// 时返回 ErrConflict 且不消耗邀请码。服务器 ID 取自 invitation 行，避免调用方传错。
+	UseInviteAndAddMember(ctx context.Context, code string, userID int64, role MemberRole) (*ServerMember, error)
 
 	// user_sessions（v1.1.0 迁移 0004，多设备会话）
 	UpsertUserSession(ctx context.Context, s *UserSession) error

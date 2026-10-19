@@ -124,3 +124,84 @@ func TestMemUseInviteExpired(t *testing.T) {
 		t.Fatalf("过期邀请应返回 ErrExpired，实际 %v", err)
 	}
 }
+
+// TestMemUseInviteAndAddMemberRace 邀请码消费与加入成员同一临界区（#22）：
+// 20 个不同用户并发抢 max_uses=5 的码，成功恰 5 人，成员数与 uses 都为 5。
+func TestMemUseInviteAndAddMemberRace(t *testing.T) {
+	m := NewMem()
+	ctx := context.Background()
+	sv := &Server{Name: "s", OwnerID: 1}
+	if err := m.CreateServer(ctx, sv); err != nil {
+		t.Fatalf("CreateServer: %v", err)
+	}
+	if err := m.CreateInvite(ctx, &Invite{Code: "join-race", ServerID: sv.ID, CreatorID: 1, MaxUses: 5}); err != nil {
+		t.Fatalf("CreateInvite: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	ok := 0
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(uid int64) {
+			defer wg.Done()
+			mem, err := m.UseInviteAndAddMember(ctx, "join-race", uid, RoleMember)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				if mem == nil || mem.ServerID != sv.ID || mem.Role != RoleMember {
+					t.Errorf("返回成员不符: %+v", mem)
+				}
+				ok++
+			case err != ErrConflict:
+				t.Errorf("失败原因应为 ErrConflict，实际 %v", err)
+			}
+		}(int64(i + 1))
+	}
+	wg.Wait()
+	if ok != 5 {
+		t.Fatalf("成功数应恰为 5，实际 %d", ok)
+	}
+	members, err := m.MembersOfServer(ctx, sv.ID)
+	if err != nil || len(members) != 5 {
+		t.Fatalf("成员数应恰为 5: %d %v", len(members), err)
+	}
+	inv, err := m.InviteByCode(ctx, "join-race")
+	if err != nil || inv.Uses != 5 {
+		t.Fatalf("uses 应恰为 5: %+v %v", inv, err)
+	}
+}
+
+// TestMemUseInviteAndAddMemberConflictDoesNotConsume 同一用户重复加入返回
+// ErrConflict，且不消耗邀请码次数（#22）。
+func TestMemUseInviteAndAddMemberConflictDoesNotConsume(t *testing.T) {
+	m := NewMem()
+	ctx := context.Background()
+	sv := &Server{Name: "s", OwnerID: 1}
+	if err := m.CreateServer(ctx, sv); err != nil {
+		t.Fatalf("CreateServer: %v", err)
+	}
+	if err := m.CreateInvite(ctx, &Invite{Code: "join-once", ServerID: sv.ID, CreatorID: 1, MaxUses: 2}); err != nil {
+		t.Fatalf("CreateInvite: %v", err)
+	}
+	if _, err := m.UseInviteAndAddMember(ctx, "join-once", 7, RoleMember); err != nil {
+		t.Fatalf("首次加入: %v", err)
+	}
+	if _, err := m.UseInviteAndAddMember(ctx, "join-once", 7, RoleMember); err != ErrConflict {
+		t.Fatalf("重复加入应 ErrConflict，实际 %v", err)
+	}
+	inv, _ := m.InviteByCode(ctx, "join-once")
+	if inv.Uses != 1 {
+		t.Fatalf("成员冲突不应消耗邀请码，uses = %d", inv.Uses)
+	}
+	if _, err := m.UseInviteAndAddMember(ctx, "join-once", 8, RoleMember); err != nil {
+		t.Fatalf("第二个用户加入: %v", err)
+	}
+	if _, err := m.UseInviteAndAddMember(ctx, "join-once", 9, RoleMember); err != ErrConflict {
+		t.Fatalf("次数用尽应 ErrConflict，实际 %v", err)
+	}
+	if _, err := m.Member(ctx, sv.ID, 9); err != ErrNotFound {
+		t.Fatalf("次数用尽后不应加入: %v", err)
+	}
+}
