@@ -87,16 +87,16 @@ func restCredential(secret, uid string, ttl time.Duration) (username, credential
 	return username, signREST(secret, username)
 }
 
-// allocateUDP 经 UDP 向内置 TURN 申请中继（凭证走 REST 短期凭证）。
-func allocateUDP(t *testing.T, port int, secret, uid string) {
+// newUDPAlloc 经 UDP 向内置 TURN 申请中继；成功后中继与客户端保持到测试结束，
+// 便于测试对中继端口发起真实读写。失败返回错误（配额测试要观察失败本身）。
+func newUDPAlloc(t *testing.T, port int, secret, uid string) (net.PacketConn, error) {
 	t.Helper()
 	username, credential := restCredential(secret, uid, time.Hour)
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 	conn, err := net.ListenPacket("udp4", "0.0.0.0:0")
 	if err != nil {
-		t.Fatal(err)
+		return nil, fmt.Errorf("监听本地 UDP: %w", err)
 	}
-	defer func() { _ = conn.Close() }()
 	client, err := turnpkg.NewClient(&turnpkg.ClientConfig{
 		STUNServerAddr: addr,
 		TURNServerAddr: addr,
@@ -106,18 +106,37 @@ func allocateUDP(t *testing.T, port int, secret, uid string) {
 		Realm:          "test",
 	})
 	if err != nil {
-		t.Fatalf("创建 TURN 客户端: %v", err)
+		_ = conn.Close()
+		return nil, fmt.Errorf("创建 TURN 客户端: %w", err)
 	}
-	defer client.Close()
 	if err := client.Listen(); err != nil {
-		t.Fatalf("TURN 客户端 Listen: %v", err)
+		client.Close()
+		_ = conn.Close()
+		return nil, fmt.Errorf("TURN 客户端 Listen: %w", err)
 	}
 	relay, err := client.Allocate()
 	if err != nil {
+		client.Close()
+		_ = conn.Close()
+		return nil, err
+	}
+	t.Cleanup(func() {
+		_ = relay.Close()
+		client.Close()
+		_ = conn.Close()
+	})
+	return relay, nil
+}
+
+// allocateUDP 申请中继，失败即 Fatal（凭证互通用例）。
+func allocateUDP(t *testing.T, port int, secret, uid string) net.PacketConn {
+	t.Helper()
+	relay, err := newUDPAlloc(t, port, secret, uid)
+	if err != nil {
 		t.Fatalf("REST 凭证经 UDP Allocate 失败（凭证互通断裂）: %v", err)
 	}
-	defer func() { _ = relay.Close() }()
 	t.Logf("UDP 中继就绪 %s（凭证互通 OK）", relay.LocalAddr())
+	return relay
 }
 
 // TestAllocateUDP REST 短期凭证与内置 TURN 互通：签发端点同款 HMAC 可直接 Allocate。
@@ -129,6 +148,127 @@ func TestAllocateUDP(t *testing.T) {
 	}
 	defer func() { _ = srv.Close() }()
 	allocateUDP(t, port, "test-secret-0123456789", "42")
+}
+
+// TestPeerIPPolicy 直接覆盖 PermissionHandler 的地址判定（#25）：内网/环回/
+// 元数据/组播一律拒绝，公网与 v4-mapped 公网放行。
+func TestPeerIPPolicy(t *testing.T) {
+	blocked := []string{
+		"127.0.0.1", "127.255.255.254", "::ffff:127.0.0.1",
+		"0.0.0.0", "0.1.2.3", "::",
+		"10.0.0.1", "172.16.0.1", "172.31.255.255", "192.168.1.1", "::ffff:192.168.1.1",
+		"100.64.0.1", "100.127.255.254",
+		"169.254.169.254", "::ffff:169.254.169.254",
+		"224.0.0.1", "239.255.255.255", "255.255.255.255",
+		"::1", "fe80::1", "ff02::1", "fc00::1", "fdff:ffff::1",
+	}
+	for _, s := range blocked {
+		if !isBlockedPeerIP(net.ParseIP(s)) {
+			t.Errorf("%s 应被拒绝", s)
+		}
+		if permitPeer(nil, net.ParseIP(s)) {
+			t.Errorf("%s 不应通过 PermissionHandler", s)
+		}
+	}
+	allowed := []string{
+		"8.8.8.8", "1.1.1.1", "203.0.113.10",
+		"::ffff:8.8.8.8", "2001:4860:4860::8888", "2606:4700::1111",
+	}
+	for _, s := range allowed {
+		if isBlockedPeerIP(net.ParseIP(s)) {
+			t.Errorf("%s 应放行", s)
+		}
+		if !permitPeer(nil, net.ParseIP(s)) {
+			t.Errorf("%s 应通过 PermissionHandler", s)
+		}
+	}
+	if !isBlockedPeerIP(nil) || !isBlockedPeerIP(net.IP{}) {
+		t.Error("空 peer IP 应拒绝")
+	}
+}
+
+// TestRelayToLoopbackDenied 合法凭证只应换来中继端口，不能借中继访问 127.0.0.1
+// （#25 P0：实测可打穿本机 Redis/MySQL）。分配本身必须仍成功。
+func TestRelayToLoopbackDenied(t *testing.T) {
+	port := freePort(t)
+	srv, err := New(testConfig(port, port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = srv.Close() }()
+
+	relay := allocateUDP(t, port, "test-secret-0123456789", "46")
+	if _, err := relay.WriteTo([]byte("probe"), &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8080}); err == nil {
+		t.Fatal("中继到 127.0.0.1 应被 CreatePermission 拒绝")
+	} else {
+		t.Logf("环回 peer 被拒: %v", err)
+	}
+}
+
+// TestAllocationQuotaPerUID 同一 uid 第 5 个并发 allocation 必须失败（486），
+// 换一个 uid 仍可分配（#25 P1：单凭证刷爆中继端口 = 对所有人拒绝服务）。
+func TestAllocationQuotaPerUID(t *testing.T) {
+	port := freePort(t)
+	cfg := testConfig(port, port)
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = srv.Close() }()
+
+	for i := 0; i < maxAllocationsPerUID; i++ {
+		if _, err := newUDPAlloc(t, port, cfg.Secret, "quota-uid"); err != nil {
+			t.Fatalf("第 %d 个 allocation 应成功: %v", i+1, err)
+		}
+	}
+	if _, err := newUDPAlloc(t, port, cfg.Secret, "quota-uid"); err == nil {
+		t.Fatalf("同一 uid 第 %d 个 allocation 应被配额拒绝", maxAllocationsPerUID+1)
+	} else {
+		t.Logf("同一 uid 超限被拒: %v", err)
+	}
+	if _, err := newUDPAlloc(t, port, cfg.Secret, "other-uid"); err != nil {
+		t.Fatalf("换 uid 后应可分配: %v", err)
+	}
+}
+
+// TestAllocationQuotaIPPure IP 层配额是纯计数逻辑，直接测 tracker：8 个不同
+// uid 后第 9 个即使 uid 未超限也必须被拒。
+func TestAllocationQuotaIPPure(t *testing.T) {
+	q := newAllocationQuota()
+	src := &net.UDPAddr{IP: net.ParseIP("203.0.113.5"), Port: 12345}
+	for i := 0; i < maxAllocationsPerIP; i++ {
+		uid := fmt.Sprintf("uid-%d", i)
+		if !q.allow(uid, "test", src) {
+			t.Fatalf("第 %d 个 uid 不应被拒", i+1)
+		}
+		q.add(src, uid, 1)
+	}
+	if q.allow("uid-new", "test", src) {
+		t.Fatal("同一 IP 超过上限后应拒绝")
+	}
+	// 计数必须能归零且不为负：全部删除后重新放行。
+	for i := 0; i < maxAllocationsPerIP; i++ {
+		q.add(src, fmt.Sprintf("uid-%d", i), -1)
+	}
+	q.add(src, "uid-new", -1) // 多余的删除不得把计数打成负数
+	if !q.allow("uid-new", "test", src) {
+		t.Fatal("计数归零后应重新放行")
+	}
+}
+
+// TestUIDFromUsername 凭证用户名的两种形态（pion 有时已剥掉过期段）。
+func TestUIDFromUsername(t *testing.T) {
+	cases := map[string]string{
+		"1234567890:42": "42",
+		"42":            "42",
+		"":              "",
+		"1:2:3":         "3",
+	}
+	for in, want := range cases {
+		if got := uidFromUsername(in); got != want {
+			t.Errorf("uidFromUsername(%q) = %q，期望 %q", in, got, want)
+		}
+	}
 }
 
 // allocateTCP 经 TCP 向内置 TURN 申请中继（模拟禁 UDP 网络：客户端零 UDP socket，
@@ -190,6 +330,69 @@ func TestAllocateTCPDual(t *testing.T) {
 	}
 	defer func() { _ = srv.Close() }()
 	allocateTCP(t, port, "test-secret-0123456789", "44")
+}
+
+// newTCPConnector 建立经 TURN TCP 的 allocation，返回发起 RFC6062 Connect 的
+// 闭包；客户端与 allocation 保持到测试结束。
+func newTCPConnector(t *testing.T, port int, secret, uid string) func(peer net.Addr) error {
+	t.Helper()
+	username, credential := restCredential(secret, uid, time.Hour)
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("拨号 TURN TCP: %v", err)
+	}
+	client, err := turnpkg.NewClient(&turnpkg.ClientConfig{
+		STUNServerAddr: addr,
+		TURNServerAddr: addr,
+		Conn:           turnpkg.NewSTUNConn(conn),
+		Username:       username,
+		Password:       credential,
+		Realm:          "test",
+	})
+	if err != nil {
+		_ = conn.Close()
+		t.Fatalf("创建 TURN TCP 客户端: %v", err)
+	}
+	if err := client.Listen(); err != nil {
+		client.Close()
+		_ = conn.Close()
+		t.Fatalf("TURN TCP 客户端 Listen: %v", err)
+	}
+	alloc, err := client.AllocateTCP()
+	if err != nil {
+		client.Close()
+		_ = conn.Close()
+		t.Fatalf("TCP allocation 失败: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = alloc.Close()
+		client.Close()
+		_ = conn.Close()
+	})
+	return func(peer net.Addr) error {
+		_, err := alloc.Connect(peer)
+		return err
+	}
+}
+
+// TestConnectTCPToLoopbackDenied RFC6062 CONNECT 同样受 PermissionHandler 约束
+// （#25 P0）：TCP 中继不能连到 127.0.0.1 上的内部 TCP 服务。
+func TestConnectTCPToLoopbackDenied(t *testing.T) {
+	port := freePort(t)
+	cfg := testConfig(0, port)
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = srv.Close() }()
+
+	connect := newTCPConnector(t, port, cfg.Secret, "47")
+	if err := connect(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 6379}); err == nil {
+		t.Fatal("TCP CONNECT 到 127.0.0.1 应被拒绝")
+	} else {
+		t.Logf("环回 peer 的 TCP CONNECT 被拒: %v", err)
+	}
 }
 
 // TestExpiredCredentialRejected 过期的 REST 凭证必须被拒（LongTermTURNRESTAuthHandler
