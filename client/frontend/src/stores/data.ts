@@ -169,14 +169,40 @@ export const useServersStore = defineStore('servers', () => {
 
   // loadRemoteServers 登录后拉取真实服务器并恢复各自频道列表（数字 ID 与内置示例不冲突）。
   // 逐服调 ListChannels；单服失败标记 unavailable 并提示（#12，不重试），不阻断其它服。
-  async function loadRemoteServers() {
+  // 快照语义（#78）：续传失败后也会再调一次，已存在的服务器更新名称/图标，
+  // 服务端已不存在的真实服务器（被移出/解散）从本地剔除——否则视图永远停在
+  // 断线前的陈旧列表。内置示例不是服务端实体，不参与对账。
+  // 串行化：data:resync 可能在上一次加载仍在飞时到达，并发对账会用过期的
+  // ids 集合误删另一次刚拉到的服务器。
+  let loadChain: Promise<void> = Promise.resolve()
+
+  function loadRemoteServers(): Promise<void> {
+    const run = loadChain.then(doLoadRemoteServers)
+    loadChain = run.catch(() => {})
+    return run
+  }
+
+  async function doLoadRemoteServers() {
     const list = await goApp().ListServers()
+    const ids = new Set<string>()
     for (const s of list) {
       const id = String(s.id)
-      if (!servers.value.some((x) => x.id === id)) {
+      ids.add(id)
+      const existing = servers.value.find((x) => x.id === id)
+      if (existing) {
+        existing.name = s.name
+        existing.icon = iconFromServer(s.icon_name)
+      } else {
         servers.value.push({ id, name: s.name, icon: iconFromServer(s.icon_name), channels: [] })
       }
       await loadChannels(id)
+    }
+    servers.value = servers.value.filter((x) => x.builtin || ids.has(x.id))
+    // 当前服务器已被移出/解散：回退到第一个可用服务器（介绍页不是服务器实体，
+    // 不能因对账把它顶掉）。
+    if (currentServerId.value && currentServerId.value !== INTRO_ID
+        && !servers.value.some((x) => x.id === currentServerId.value)) {
+      selectServer(servers.value[0]?.id ?? '')
     }
   }
 
@@ -438,6 +464,25 @@ export const useServersStore = defineStore('servers', () => {
     }
   }
 
+  // 事件订阅（data:resync，#78）：续传失败后 Go 侧只发提示，服务器/频道视图
+  // 由本 store 经绑定重新拉取。eventsOn 返回按监听器的取消函数，卸载时逐个
+  // 注销；重复 bind 幂等（避免重入叠监听）。
+  const offs: Array<() => void> = []
+
+  function bindEvents() {
+    if (offs.length) return
+    offs.push(
+      eventsOn('data:resync', () => {
+        // 拉取失败静默：与登录后首次加载一致，不打断主界面。
+        loadRemoteServers().catch(() => {})
+      }),
+    )
+  }
+
+  function unbindEvents() {
+    while (offs.length) offs.pop()!()
+  }
+
   return {
     servers, currentServerId, currentChannelId, currentServer, currentChannel,
     homeId, introHidden, initHome, setHome, setIntroHidden,
@@ -445,6 +490,7 @@ export const useServersStore = defineStore('servers', () => {
     loadRemoteServers, createServer, joinServer, renameServer, removeServer,
     createChannel, renameChannel, deleteChannel,
     extraGroups, groupsOf, createCategory, deleteCategory, renameCategory, reorderCategory,
+    bindEvents, unbindEvents,
   }
 })
 
@@ -539,8 +585,8 @@ export const useFriendsStore = defineStore('friends', () => {
     return [...online.value, ...offline.value].find((f) => f.id === id)
   }
 
-  // 事件订阅（presence:update，#11）。eventsOn 返回按监听器的取消函数，
-  // 卸载时逐个注销——不按事件名整体 Off（会清掉别人注册的同名监听）。
+  // 事件订阅（presence:update，#11；data:resync，#78）。eventsOn 返回按监听器
+  // 的取消函数，卸载时逐个注销——不按事件名整体 Off（会清掉别人注册的同名监听）。
   const offs: Array<() => void> = []
 
   function bindEvents() {
@@ -550,6 +596,11 @@ export const useFriendsStore = defineStore('friends', () => {
         const p = d as { user_id?: string; online?: boolean } | null
         if (p?.user_id == null || typeof p.online !== 'boolean') return
         setPresence(p.user_id, p.online)
+      }),
+      // 续传失败（#78）：好友列表整体重拉——presence 增量之外，断线期间
+      // 可能错过好友请求/接受/删除。
+      eventsOn('data:resync', () => {
+        loadFriends().catch(() => {})
       }),
     )
   }
