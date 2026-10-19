@@ -461,6 +461,10 @@ func (h *Hub) heartbeatLoop(ctx context.Context, c *client) {
 			}
 			c.lastAct.Store(time.Now().UnixNano())
 			h.renewPresence(c) // 心跳成功续期 presence:{uid}（25s 一拍，TTL 90s）
+			// 心跳成功说明连接活跃：续期事件环。Append 不再顺带续期（否则广播
+			// 会永久保住断线旧 sid 的环），没有这一拍，30 分钟没消息的在线会话
+			// 会被 sweep 误淘汰、之后 resume 得到 unknown_session。
+			h.evlog.Touch(c.sid)
 		}
 	}
 }
@@ -617,7 +621,7 @@ func (h *Hub) handleClientHello(c *client, env Envelope) {
 			h.sendError(c, ErrCodeProtocolUnsupported, "协议版本无交集")
 			return
 		}
-		h.sendJSON(c, TypeServerHello, ServerHelloData{Version: cur})
+		h.sendJSON(c, TypeServerHello, ServerHelloData{Version: cur, SessionID: c.sid})
 		return
 	}
 	serverMax := h.serverMax()
@@ -631,7 +635,7 @@ func (h *Hub) handleClientHello(c *client, env Envelope) {
 		return
 	}
 	c.protoVer.Store(v)
-	h.sendJSON(c, TypeServerHello, ServerHelloData{Version: v})
+	h.sendJSON(c, TypeServerHello, ServerHelloData{Version: v, SessionID: c.sid})
 	h.log.Printf("ws: %s 协商协议版本 v%d（客户端 %d..%d）", c.userID, v, d.Min, d.Max)
 }
 

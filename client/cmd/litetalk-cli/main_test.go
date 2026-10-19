@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestResolveBasePriority flag 显式 > LITETALK_API > 状态文件 > 默认。
@@ -93,6 +94,24 @@ func TestMediaSpyDetectsPipelineFailure(t *testing.T) {
 	}
 	if got := c2.mediaDegraded(); got != "" {
 		t.Fatalf("普通行不应标记降级, 得到 %q", got)
+	}
+}
+
+// TestWaitChatEcho send 的 WS 回显判定：跳过其它频道/其它内容的事件，
+// 匹配到本人消息才成功；完全没回显时超时报错（无 REST 兜底）。
+func TestWaitChatEcho(t *testing.T) {
+	ch := make(chan chatMsg, 4)
+	ch <- chatMsg{channelID: "9", content: "other", msgID: "m0"} // 别的频道
+	ch <- chatMsg{channelID: "1", content: "别的消息", msgID: "m1"}
+	ch <- chatMsg{channelID: "1", content: "hello", msgID: "m2"}
+	got, err := waitChatEcho(ch, "1", "hello", time.Second)
+	if err != nil || got.msgID != "m2" {
+		t.Fatalf("回显匹配 = (%+v,%v), want m2", got, err)
+	}
+
+	empty := make(chan chatMsg)
+	if _, err := waitChatEcho(empty, "1", "hello", 20*time.Millisecond); err == nil {
+		t.Fatal("无回显应超时报错")
 	}
 }
 

@@ -339,9 +339,9 @@ func (s *Session) registerHandlers() {
 			return
 		}
 		s.protoVer.Store(d.Version)
-		// 同会话重连：server.hello 确认 session_id 未变后才发 gateway.resume（#32）。
-		// 等确认再发是为了避开两类误伤：新登录（新会话，无需补发，登录流程已带全量）
-		// 与老服务端（无 server.hello，也就没有 seq/续传概念）。发送失败按普通断线重连处理。
+		// server.hello 确认会话后发 gateway.resume（#32）：首次协商也发 last_seq=0
+		//（服务端环可能已有事件，见 #81），同会话重连带已投递的 last_seq。
+		// 老服务端（无 server.hello）没有续传概念，不发；发送失败按普通断线重连处理。
 		if resume, ok := s.gw.OnServerHello(d.SessionID, d.Version); ok {
 			if err := s.ws.Send(signal.TypeGatewayResume, resume); err != nil {
 				s.log.Printf("gateway: resume 发送失败: %v", err)
