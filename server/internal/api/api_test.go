@@ -38,6 +38,10 @@ func newTestServerNoSessionMode(t *testing.T) (*Server, *store.Mem) {
 	}), mem
 }
 
+// testClientVersion 业务测试请求声明的客户端版本（#31 升级门放行值）。
+// 守门行为的正反用例单独写在 clientversion_test.go，这里只是不挡业务断言。
+const testClientVersion = "1.5.0"
+
 // postJSON 发请求并解码响应。
 func postJSON(t *testing.T, h http.Handler, path, token string, body any, wantStatus int) map[string]any {
 	t.Helper()
@@ -49,6 +53,7 @@ func postJSON(t *testing.T, h http.Handler, path, token string, body any, wantSt
 	}
 	req := httptest.NewRequest(http.MethodPost, path, &buf)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(clientVersionHeader, testClientVersion)
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -67,6 +72,7 @@ func postJSON(t *testing.T, h http.Handler, path, token string, body any, wantSt
 func getJSON(t *testing.T, h http.Handler, path, token string, wantStatus int) any {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Header.Set(clientVersionHeader, testClientVersion)
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -91,6 +97,7 @@ func patchJSON(t *testing.T, h http.Handler, path, token string, body any, wantS
 	}
 	req := httptest.NewRequest(http.MethodPatch, path, &buf)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(clientVersionHeader, testClientVersion)
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -109,6 +116,7 @@ func patchJSON(t *testing.T, h http.Handler, path, token string, body any, wantS
 func delJSON(t *testing.T, h http.Handler, path, token string, wantStatus int) map[string]any {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodDelete, path, nil)
+	req.Header.Set(clientVersionHeader, testClientVersion)
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}

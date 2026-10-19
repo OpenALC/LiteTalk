@@ -242,6 +242,7 @@ func restPost(addr, path, token string, body any) (int, []byte, error) {
 		return 0, nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(clientVersionHeader, probeClientVersion)
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}

@@ -47,6 +47,7 @@ func TestDecodeJSONTooLarge(t *testing.T) {
 	body := `{"nickname":"` + big + `"}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/register", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(clientVersionHeader, testClientVersion)
 	req.ContentLength = int64(len(body))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -67,6 +68,7 @@ func TestDecodeJSONTooLargeChunked(t *testing.T) {
 	body := `{"nickname":"` + big + `"}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/register", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(clientVersionHeader, testClientVersion)
 	req.ContentLength = -1 // 模拟 chunked：Content-Length 未知
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -129,6 +131,7 @@ func TestRateLimitCodesUnified(t *testing.T) {
 		_ = json.NewEncoder(buf).Encode(body)
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", buf)
 		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(clientVersionHeader, testClientVersion)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		if i == 5 {
