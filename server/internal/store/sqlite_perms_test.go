@@ -47,9 +47,12 @@ func TestOpenSQLiteTightensExistingLoosePermissions(t *testing.T) {
 
 	assertPerm(t, dir, 0o700)
 	assertPerm(t, dbPath, 0o600)
+	// 预创建的 WAL/SHM 在打开后就必须存在且为 0600（SQLite 会沿用同一 inode）。
+	for _, p := range []string{dbPath + "-wal", dbPath + "-shm"} {
+		assertPerm(t, p, 0o600)
+	}
 
-	// 触发 WAL 写入，尽量让 -wal/-shm 落盘；存在即必须是 0600（缺失时由
-	// TestTightenSQLitePermsCoversWALAndSHM 直接覆盖 helper 的该分支）。
+	// 真实写入后再次确认：WAL 是首次写入才写内容的，权限不能在这时回落到 umask。
 	if _, err := sq.DB().Exec("CREATE TABLE perm_probe (x INTEGER)"); err != nil {
 		t.Fatalf("建表: %v", err)
 	}
@@ -57,9 +60,7 @@ func TestOpenSQLiteTightensExistingLoosePermissions(t *testing.T) {
 		t.Fatalf("写入: %v", err)
 	}
 	for _, p := range []string{dbPath + "-wal", dbPath + "-shm"} {
-		if _, err := os.Stat(p); err == nil {
-			assertPerm(t, p, 0o600)
-		}
+		assertPerm(t, p, 0o600)
 	}
 }
 

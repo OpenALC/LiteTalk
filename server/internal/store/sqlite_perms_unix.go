@@ -34,12 +34,20 @@ func tightenSQLitePerms(dir, dbPath string) error {
 	return nil
 }
 
-// precreateSQLiteFile 以 0600 预创建空库文件（0 字节是合法的空 SQLite 库）。
-// 已存在的文件只打开不截断；之后 OpenSQLite 的 tightenSQLitePerms 仍会兜底收紧。
-func precreateSQLiteFile(path string) error {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
+// precreateSQLiteFiles 以 0600 预创建库文件与空的 -wal/-shm 文件。
+// SQLite 要到首次写入才创建 WAL 文件，且按编译期默认权限（通常 0644）落盘——
+// 那时已晚于 OpenSQLite 打开后的收紧步骤。实测（SQLite 3.5x/modernc）提前放好的
+// 空 WAL/SHM 会被识别并沿用同一个 inode，因此 0600 权限能保持到实际写入。
+// 已存在的文件只打开不截断，崩溃后待恢复的 WAL 不受影响。
+func precreateSQLiteFiles(path string) error {
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			return err
+		}
+		if err := f.Close(); err != nil {
+			return err
+		}
 	}
-	return f.Close()
+	return nil
 }

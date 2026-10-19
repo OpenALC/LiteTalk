@@ -54,9 +54,9 @@ func OpenSQLite(path string) (*SQLite, error) {
 			return nil, fmt.Errorf("sqlite: 建数据目录: %w", err)
 		}
 	}
-	// 先以 0600 预创建：sql.Open 的首次连接建库会按进程 umask 落成 0644，
-	// 这里把「创建 → 收紧」之间的可读窗口消掉。
-	if err := precreateSQLiteFile(path); err != nil {
+	// 先以 0600 预创建库文件与 -wal/-shm：SQLite 首次连接建库会按进程 umask
+	// 落成 0644，WAL 文件更是要到首次写入才创建，这里把可读窗口和时序问题一起消掉。
+	if err := precreateSQLiteFiles(path); err != nil {
 		return nil, fmt.Errorf("sqlite: 创建库文件: %w", err)
 	}
 	db, err := sql.Open("sqlite", sqliteDSN(path))
