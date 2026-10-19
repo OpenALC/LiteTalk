@@ -41,7 +41,7 @@ func TestMySQLMigrateAndCRUD(t *testing.T) {
 	// 下一轮 CREATE TABLE 直接 1050）——新增迁移建表要同步这张清单。
 	for _, tbl := range []string{
 		"invites", "messages", "channels", "categories", "server_members",
-		"servers", "friendships", "users", "user_sessions", "schema_migrations",
+		"servers", "friendships", "users", "user_sessions", "kv", "schema_migrations",
 	} {
 		_, _ = m.DB().ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl)
 	}

@@ -1,13 +1,18 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/OpenALC/LiteTalk/server/internal/store"
 )
 
 // 验证 healthz handler 返回 200 与正确的 JSON 结构
@@ -226,5 +231,87 @@ func TestPickStoreKind(t *testing.T) {
 	t.Setenv("LITETALK_STORE", "mem")
 	if got := pickStoreKind(); got != "mem" {
 		t.Fatalf("mem 应透传由 main 拒绝/放行，实际 %q", got)
+	}
+}
+
+// TestSelectKVSQLiteWiring #83：SQLite 后端未配 Redis 时 KV 落同一个库文件，
+// 重启（重新打开库）后仍能读回——接线层不走真实服务启动。
+func TestSelectKVSQLiteWiring(t *testing.T) {
+	t.Setenv("LITETALK_SQLITE_PATH", "")
+	t.Setenv("LITETALK_MIGRATIONS_DIR", "")
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "litetalk.db")
+
+	sq, err := store.OpenSQLite(path)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	if err := sq.Migrate(ctx, resolveMigrationsSQLite()); err != nil {
+		t.Fatalf("迁移: %v", err)
+	}
+	kv, label, err := selectKV("sqlite", sq)
+	if err != nil {
+		t.Fatalf("selectKV(sqlite): %v", err)
+	}
+	if !strings.Contains(label, "SQLite") {
+		t.Fatalf("SQLite 后端标签应说明持久化，实际 %q", label)
+	}
+	if _, ok := kv.(*store.SQLiteKV); !ok {
+		t.Fatalf("SQLite 后端应返回 SQLiteKV，实际 %T", kv)
+	}
+	if err := kv.Set(ctx, "rt:1:desktop", "hash", time.Hour); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	// 直接查 Store 的句柄：KV 与 Store 必须是同一个库。
+	var v string
+	if err := sq.DB().QueryRowContext(ctx,
+		`SELECT kv_value FROM kv WHERE kv_key = ?`, "rt:1:desktop").Scan(&v); err != nil {
+		t.Fatalf("同一 DB 应能读到 KV 行: %v", err)
+	}
+	if v != "hash" {
+		t.Fatalf("同一 DB 读到 %q，want hash", v)
+	}
+	if err := sq.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 模拟重启：重新打开同一文件，新建 SQLiteKV 应读回。
+	sq2, err := store.OpenSQLite(path)
+	if err != nil {
+		t.Fatalf("重开 SQLite: %v", err)
+	}
+	defer sq2.Close()
+	if err := sq2.Migrate(ctx, resolveMigrationsSQLite()); err != nil {
+		t.Fatalf("重开迁移幂等: %v", err)
+	}
+	kv2, _, err := selectKV("sqlite", sq2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := kv2.Get(ctx, "rt:1:desktop"); err != nil || got != "hash" {
+		t.Fatalf("重启后 Get = %q/%v，want hash/nil", got, err)
+	}
+}
+
+// TestSelectKVFallbacks mem（仅 dev）与 mysql（无 Redis）都退回进程内并说明；
+// SQLite 缺少 Store 句柄或后端未知时必须报错而不是静默降级。
+func TestSelectKVFallbacks(t *testing.T) {
+	for _, kind := range []string{"mem", "mysql"} {
+		kv, label, err := selectKV(kind, nil)
+		if err != nil {
+			t.Fatalf("selectKV(%s): %v", kind, err)
+		}
+		if _, ok := kv.(*store.MemKV); !ok {
+			t.Fatalf("%s 后端应返回 MemKV，实际 %T", kind, kv)
+		}
+		if !strings.Contains(label, "进程内") || !strings.Contains(label, "重启即丢") {
+			t.Fatalf("%s 标签应明确不持久，实际 %q", kind, label)
+		}
+	}
+	if _, _, err := selectKV("sqlite", nil); err == nil {
+		t.Fatal("SQLite 后端缺少 Store 应报错")
+	}
+	if _, _, err := selectKV("bogus", nil); err == nil {
+		t.Fatal("未知后端应报错")
 	}
 }
