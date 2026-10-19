@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -66,6 +67,60 @@ func TestValidateJWTSecret(t *testing.T) {
 	}
 	if err := validateJWTSecret("a-much-longer-random-production-secret-value", false); err != nil {
 		t.Fatalf("长随机密钥应放行，实际 %v", err)
+	}
+}
+
+// TestValidateTURNSecret 显式配置的 TURN 密钥准入（#25）：弱值/短值拒绝，
+// 未设置放行（走随机生成），dev 模式全放行。
+func TestValidateTURNSecret(t *testing.T) {
+	weak := []string{"CHANGE_ME", "litetalk-dev-secret-change-me", "short-secret", strings.Repeat("a", 31)}
+	for _, s := range weak {
+		if err := validateTURNSecret(s, true); err != nil {
+			t.Fatalf("dev 模式 %q 应放行，实际 %v", s, err)
+		}
+		if err := validateTURNSecret(s, false); err == nil {
+			t.Fatalf("生产模式弱密钥 %q 应拒绝", s)
+		}
+	}
+	if err := validateTURNSecret("", false); err != nil {
+		t.Fatalf("未设置应放行（走随机生成），实际 %v", err)
+	}
+	if err := validateTURNSecret(strings.Repeat("a", 32), false); err != nil {
+		t.Fatalf("32 字节密钥应放行，实际 %v", err)
+	}
+}
+
+// TestResolveTURNSecret 未设置且内置 TURN 启用时随机生成 64 位 hex；未启用时
+// 保持空串（不额外消耗随机源）；显式强值原样返回。
+func TestResolveTURNSecret(t *testing.T) {
+	secret, generated, err := resolveTURNSecret("", true, false)
+	if err != nil {
+		t.Fatalf("未设置应随机生成: %v", err)
+	}
+	if !generated || len(secret) != 64 {
+		t.Fatalf("应生成 64 位 hex 随机串，实际 generated=%v len=%d", generated, len(secret))
+	}
+	again, _, err := resolveTURNSecret("", true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secret == again {
+		t.Fatal("两次随机生成不应相同")
+	}
+
+	secret, generated, err = resolveTURNSecret("", false, false)
+	if err != nil || generated || secret != "" {
+		t.Fatalf("TURN 关闭且未设置时应保持空串，实际 secret=%q generated=%v err=%v", secret, generated, err)
+	}
+
+	const explicit = "0123456789abcdef0123456789abcdef"
+	secret, generated, err = resolveTURNSecret(explicit, true, false)
+	if err != nil || generated || secret != explicit {
+		t.Fatalf("显式强密钥应原样返回，实际 secret=%q generated=%v err=%v", secret, generated, err)
+	}
+
+	if _, _, err := resolveTURNSecret("CHANGE_ME", true, false); err == nil {
+		t.Fatal("生产模式显式弱密钥应拒绝")
 	}
 }
 

@@ -167,15 +167,12 @@ func main() {
 	// ---- 内置 TURN（#25）：UDP+TCP 双监听，与 rtcapi 短期凭证互通 ----
 	// LITETALK_TURN_PORT=0 关闭（走外部 coturn）；默认 3478。
 	turnPort := envInt("LITETALK_TURN_PORT", 3478)
-	turnSecret := os.Getenv("LITETALK_TURN_SECRET")
-	if turnPort != 0 && turnSecret == "" {
-		// 一键自托管：未设密钥则进程内随机生成（签发与校验同进程，互通无碍）。
-		// 重启后旧凭证失效，客户端会重新取凭证，12h TTL 内可接受。
-		buf := make([]byte, 32)
-		if _, err := rand.Read(buf); err != nil {
-			log.Fatalf("生成 TURN 凭证密钥失败: %v", err)
-		}
-		turnSecret = hex.EncodeToString(buf)
+	// 显式配置的密钥先过弱密钥校验（生产模式）；未配置且内置 TURN 启用时随机生成。
+	turnSecret, generated, err := resolveTURNSecret(os.Getenv("LITETALK_TURN_SECRET"), turnPort != 0, dev)
+	if err != nil {
+		log.Fatalf("TURN 凭证密钥不可用: %v", err)
+	}
+	if generated {
 		log.Println("TURN: 未设 LITETALK_TURN_SECRET，已生成随机凭证密钥（重启后旧凭证失效）")
 	}
 	var turnSrv *turn.Server
@@ -493,6 +490,42 @@ func validateJWTSecret(secret string, dev bool) error {
 		return fmt.Errorf("密钥长度 %d 字节，不足 32 字节", len(secret))
 	}
 	return nil
+}
+
+// validateTURNSecret 显式配置的 TURN 密钥准入（#25）：内置 TURN 的 REST
+// 凭证完全由该密钥派生，弱密钥等于任何人可自算凭证。未设置（空串）不在此
+// 校验——由 resolveTURNSecret 走随机生成；dev 模式不做限制。
+func validateTURNSecret(secret string, dev bool) error {
+	if dev || secret == "" {
+		return nil
+	}
+	if weakSecrets[secret] {
+		return errors.New("LITETALK_TURN_SECRET 仍是公开示例值，必须更换为 ≥32 字节随机串（openssl rand -hex 32）")
+	}
+	if len(secret) < 32 {
+		return fmt.Errorf("LITETALK_TURN_SECRET 长度 %d 字节，不足 32 字节（openssl rand -hex 32）", len(secret))
+	}
+	return nil
+}
+
+// resolveTURNSecret 决定 TURN 凭证密钥：显式值先过弱密钥校验；未显式配置且
+// 内置 TURN 启用时随机生成（签发与校验同进程，互通无碍；重启后旧凭证失效，
+// 客户端会重新取凭证）。generated 仅用于调用方打日志。
+func resolveTURNSecret(explicit string, turnEnabled, dev bool) (secret string, generated bool, err error) {
+	if err := validateTURNSecret(explicit, dev); err != nil {
+		return "", false, err
+	}
+	if explicit != "" {
+		return explicit, false, nil
+	}
+	if !turnEnabled {
+		return "", false, nil
+	}
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", false, fmt.Errorf("生成 TURN 凭证密钥失败: %w", err)
+	}
+	return hex.EncodeToString(buf), true, nil
 }
 
 // validateSFUIP 生产模式拒环回地址（#22）：SFU 对外通告 IP 为环回时客户端 ICE 候选不可达。
