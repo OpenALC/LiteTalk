@@ -24,7 +24,7 @@ const iconID = "io.github.openalc.LiteTalk"
 
 func main() {
 	// 输出是相对路径：在错误目录执行会把图标写飞（同 tray/gen_icon.go 的护栏）。
-	if _, err := os.Stat("litetalk.desktop"); err != nil {
+	if _, err := os.Stat("io.github.openalc.LiteTalk.desktop"); err != nil {
 		log.Fatal("请在 client/build/linux 目录执行：cd client/build/linux && go run gen_icons.go")
 	}
 	src, err := os.Open(filepath.Join("..", "appicon.png"))
