@@ -23,5 +23,14 @@ func guestTokenGet(string) string { return "" }
 // 返回 "" 走清空语义。
 func guestTokenPut(string) string { return "" }
 
+// savedPasswordPut 其余平台不保存登录密码（宁可不记住，也不明文落盘）。
+func savedPasswordPut(string) (string, bool) { return "", false }
+
+// savedPasswordGet 其余平台无密码存储后端，恒读不到。
+func savedPasswordGet(string) (string, bool) { return "", false }
+
+// savedPasswordClear 其余平台无密码存储，无动作。
+func savedPasswordClear() {}
+
 // secretMode 其余平台无加密后端，按文件弱保护口径上报（不存 = 提示无意义但契约取值固定）。
 func secretMode() string { return SecretModeFile }

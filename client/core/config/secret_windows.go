@@ -105,5 +105,34 @@ func guestTokenPut(plain string) string {
 	return enc
 }
 
+// savedPasswordPut 保存登录密码：DPAPI（user scope）加密后返回 base64 密文。
+// 加密失败返回 ok=false，不落任何可还原的明文。
+func savedPasswordPut(plain string) (enc string, ok bool) {
+	if plain == "" {
+		return "", true
+	}
+	s, err := protectString(plain)
+	if err != nil {
+		return "", false
+	}
+	return s, true
+}
+
+// savedPasswordGet 解密 DPAPI 密文；enc 为空表示没有记住密码。
+func savedPasswordGet(enc string) (plain string, ok bool) {
+	if enc == "" {
+		return "", false
+	}
+	pw, err := unprotectString(enc)
+	if err != nil {
+		return "", false
+	}
+	return pw, true
+}
+
+// savedPasswordClear Windows 的密码密文在 config.json 字段里，清空字段即清除，
+// 无进程外存储可清。
+func savedPasswordClear() {}
+
 // secretMode Windows 机密存储恒为 DPAPI（user scope，见 protectString）。
 func secretMode() string { return SecretModeDPAPI }

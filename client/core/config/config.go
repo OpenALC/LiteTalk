@@ -45,7 +45,7 @@ type Config struct {
 	HibernateMode       string           `json:"hibernate_mode,omitempty"`        // 休眠模式：off 不休眠 / hibernate 卸载业务组件 / destroy 整页重载（默认 off）
 	CloseToTray         *bool            `json:"close_to_tray,omitempty"`         // 关闭窗口时最小化到托盘（默认 true；false=退出程序）
 	SavedEmail          string           `json:"saved_email,omitempty"`           // 记住的登录邮箱
-	EncPassword         string           `json:"enc_password,omitempty"`          // 记住的密码（DPAPI 密文 base64；非 Windows 恒空）
+	EncPassword         string           `json:"enc_password,omitempty"`          // 记住的密码密文（Windows DPAPI base64；Linux keyring 命中时恒空，旧版 base64 仅保留读取迁移；其余平台恒空）
 	EncGuestRefresh     string           `json:"enc_guest_refresh,omitempty"`     // 记住的游客 refresh_token（Windows DPAPI 密文 / Linux base64+0600 降级；其余平台恒空）
 	Audio               *AudioSettings   `json:"audio,omitempty"`                 // 语音设置（码率/VBR/DTX/FEC/丢包率/降噪/增益/VAD 灵敏度）
 	AudioCapture        string           `json:"audio_capture,omitempty"`         // 采集设备 ID（空=默认）
@@ -516,30 +516,25 @@ type SavedCredentials struct {
 	Saved    bool
 }
 
-// GetSavedCredentials 读取记住的凭据。密码经 DPAPI 解密；
-// 解密失败/非 Windows 平台返回空密码（只记邮箱）。
+// GetSavedCredentials 读取记住的凭据。密码由平台实现解密/读取
+// （Windows DPAPI / Linux Secret Service，Linux 另兼容旧版 base64 文件值）；
+// 读不到时返回空密码（只记邮箱）。
 func (m *Manager) GetSavedCredentials() SavedCredentials {
 	c := m.Get()
 	if c.SavedEmail == "" {
 		return SavedCredentials{}
 	}
-	pw := ""
-	if c.EncPassword != "" {
-		if plain, err := unprotectString(c.EncPassword); err == nil {
-			pw = plain
-		}
-	}
+	pw, _ := savedPasswordGet(c.EncPassword)
 	return SavedCredentials{Email: c.SavedEmail, Password: pw, Saved: true}
 }
 
-// SetSavedCredentials 保存凭据：邮箱明文、密码 DPAPI 加密（user scope）。
-// 加密失败（非 Windows）只记邮箱不记密码。
+// SetSavedCredentials 保存凭据：邮箱明文；密码交给平台实现（Windows DPAPI，
+// Linux Secret Service）。Linux keyring 不可用时密码不保存（绝不回落 base64
+// 文件——base64 等同明文），只记邮箱。
 func (m *Manager) SetSavedCredentials(email, password string) error {
 	enc := ""
 	if password != "" {
-		if s, err := protectString(password); err == nil {
-			enc = s
-		}
+		enc, _ = savedPasswordPut(password)
 	}
 	return m.Update(func(c *Config) error {
 		c.SavedEmail = email
@@ -550,6 +545,7 @@ func (m *Manager) SetSavedCredentials(email, password string) error {
 
 // ClearSavedCredentials 清除记住的凭据（取消勾选/登出时调用）。
 func (m *Manager) ClearSavedCredentials() error {
+	savedPasswordClear()
 	return m.Update(func(c *Config) error {
 		c.SavedEmail = ""
 		c.EncPassword = ""
