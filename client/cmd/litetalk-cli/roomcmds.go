@@ -3,7 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"strconv"
 	"time"
 )
 
@@ -59,38 +58,31 @@ func cmdSend(args []string) error {
 		return err
 	}
 	fmt.Printf("send channel=%s text=%s\n", *channel, *text)
-	// 首选 WS 回显（chat.message 广播含发送者）。回显未达时回落 REST 落库核对：
-	// 短命会话复用旧登录 sid 时事件面序号会卡在续传缺口（见 #34 汇报），
-	// 消息本身已落库，REST 仍可核对成功。
-	select {
-	case m := <-r.ev.chatCh:
-		if m.channelID == *channel && m.content == *text {
-			fmt.Printf("ok send echoed id=%s ts=%s\n", m.msgID, m.ts)
-			return nil
-		}
-	case <-time.After(3 * time.Second):
+	// 只认 WS 回显（chat.message 广播含发送者）：send 的语义就是信令面发送，
+	// 回显缺席说明事件面没有正常回流，应当暴露而不是用 REST 落库结果掩盖。
+	m, err := waitChatEcho(r.ev.chatCh, *channel, *text, 3*time.Second)
+	if err != nil {
+		return err
 	}
-	return r.verifySendREST(*channel, *text)
+	fmt.Printf("ok send echoed id=%s ts=%s\n", m.msgID, m.ts)
+	return nil
 }
 
-// verifySendREST 用 REST 落库结果核对发送（WS 回显缺席时的兜底）。
-func (r *room) verifySendREST(channelID, text string) error {
-	id, err := strconv.ParseInt(channelID, 10, 64)
-	if err != nil {
-		return fmt.Errorf("频道 ID 无效: %w", err)
-	}
-	list, err := r.api.ListMessages(id, 10)
-	if err != nil {
-		return fmt.Errorf("WS 回显未达且 REST 核对失败: %w", err)
-	}
-	for i := len(list) - 1; i >= 0; i-- {
-		m := list[i]
-		if m.Content == text && m.UserID.String() == r.st.UserID {
-			fmt.Printf("ok send rest-confirmed id=%s（WS 回显缺席，事件面续传缺口）\n", m.ID.String())
-			return nil
+// waitChatEcho 等本人消息的 WS 回显；其他频道的在途消息跳过（同一连接会收
+// 全服务器事件）。超时 = 事件面没有回流，由调用方报错。
+func waitChatEcho(ch <-chan chatMsg, channelID, text string, timeout time.Duration) (chatMsg, error) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case m := <-ch:
+			if m.channelID == channelID && m.content == text {
+				return m, nil
+			}
+		case <-timer.C:
+			return chatMsg{}, fmt.Errorf("send 已发出但 %s 内未收到 chat.message 回显", timeout)
 		}
 	}
-	return fmt.Errorf("消息既无 WS 回显也不在 REST 最近消息里")
 }
 
 // cmdCall 入房通话 N 秒打印统计（信令 + 媒体）。无声卡环境媒体降级明示，

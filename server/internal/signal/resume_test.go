@@ -51,18 +51,28 @@ func TestGatewayResumeReplay(t *testing.T) {
 }
 
 // TestGatewayResumeUnknownSession 会话未知（sid 与当前连接不符/从未建立）→
-// gateway.invalid_session{unknown_session}，不补发。
+// gateway.invalid_session{unknown_session}，不补发；latest_seq 带当前连接环现状。
 func TestGatewayResumeUnknownSession(t *testing.T) {
 	f := newChatFixture(t)
+	chID := strconv.FormatInt(f.ch.ID, 10)
 	a := f.dial("1:desktop:sa", "alice")
+	b := f.dial("2:desktop:sb", "bob")
 	a.recvUntil(TypeHello)
+	// 先制造一条事件，让 sa 的环有 latest_seq=1。
+	b.send(TypeChatSend, ChatSendData{ChannelID: chID, Type: "text", Content: "m1"})
+	if env := a.recvUntil(TypeChatMessage); env.Seq != 1 {
+		t.Fatalf("m1 seq = %d, want 1", env.Seq)
+	}
 
-	// 借别的会话读流：session_id 与连接自己的 sid 不符。
+	// 借别的会话读流：session_id 与连接自己的 sid 不符。latest_seq 仍取本连接的。
 	a.send(TypeGatewayResume, GatewayResumeData{SessionID: "sb", LastSeq: 0})
 	env := a.recvUntil(TypeGatewayInvalidSession)
 	var d GatewayInvalidSessionData
 	if err := env.Decode(&d); err != nil || d.Reason != "unknown_session" {
 		t.Fatalf("invalid_session = %+v (%v), want unknown_session", d, err)
+	}
+	if d.LatestSeq != 1 {
+		t.Fatalf("latest_seq = %d, want 1（当前连接环现状）", d.LatestSeq)
 	}
 
 	// 空 session_id：bad_message（载荷校验），不是 invalid_session。
@@ -101,6 +111,10 @@ func TestGatewayResumeSeqExpired(t *testing.T) {
 	var d GatewayInvalidSessionData
 	if err := env.Decode(&d); err != nil || d.Reason != "seq_expired" {
 		t.Fatalf("invalid_session = %+v (%v), want seq_expired", d, err)
+	}
+	// latest_seq = 环当前最大 seq（m1 + 3 条 missed = 4）；客户端据此对齐基准。
+	if d.LatestSeq != 4 {
+		t.Fatalf("latest_seq = %d, want 4", d.LatestSeq)
 	}
 }
 

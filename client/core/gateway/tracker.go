@@ -26,6 +26,7 @@ type Tracker struct {
 	sessionID string                    // 当前会话（server.hello.session_id）
 	lastSeq   int64                     // 已投递的最大 seq（0=尚未投递任何事件）
 	pending   map[int64]signal.Envelope // 乱序缓冲：seq → 信封（同 seq 覆盖即去重）
+	awaitBase bool                      // 积压溢出后等下一事件定基准（服务端最新 seq 不可知）
 	onResync  func(reason string)       // 续传失败/缓冲溢出 → 全量同步
 }
 
@@ -58,51 +59,60 @@ func (t *Tracker) LastSeq() int64 {
 }
 
 // OnServerHello 处理 server.hello（#29 协商结果）：记录会话并决定是否续传。
-//   - 同会话且协议 >= 2 → 返回 (resume 载荷, true)，调用方发 gateway.resume；
-//   - 首次协商 → 只记录会话，不续传（没有可回放的基准）；
+//   - 协议 >= 2 且服务端下发了非空 session_id → 返回 (resume 载荷, true)；
+//     首次协商也发 resume{last_seq:0}：服务端环里可能已有 seq>1 的事件
+//     （进程重启后复用旧 sid 的首个连接、或本端 Tracker 重建），不补发就会永久卡住。
 //   - 会话被换掉（防御路径：同实例内 sid 本应恒定）→ 序号基准作废并触发全量补拉；
 //   - 协议 < 2 或无会话（旧令牌）→ 不续传。
 func (t *Tracker) OnServerHello(sessionID string, version int64) (signal.GatewayResumeData, bool) {
 	t.mu.Lock()
-	if sessionID != "" && t.sessionID != "" && sessionID != t.sessionID {
+	// 空 session_id（旧令牌/老服务端）：没有可续的会话，保持不续传。
+	if sessionID == "" {
+		t.mu.Unlock()
+		return signal.GatewayResumeData{}, false
+	}
+	if t.sessionID != "" && sessionID != t.sessionID {
 		t.pending = make(map[int64]signal.Envelope)
 		t.lastSeq = 0
+		t.awaitBase = false
 		t.sessionID = sessionID
 		t.mu.Unlock()
 		t.fireResync("session_changed")
 		return signal.GatewayResumeData{}, false
 	}
-	if t.sessionID == "" {
-		// 首次协商：记录会话即可——本连接之前的事件不可能有缺口
-		//（会话自本连接起才存在），从 seq 1 起连续到达，无需续传。
-		t.sessionID = sessionID
-		t.mu.Unlock()
-		return signal.GatewayResumeData{}, false
-	}
-	sid := t.sessionID
+	t.sessionID = sessionID
 	last := t.lastSeq
 	t.mu.Unlock()
-	if sid == "" || version < 2 {
+	if version < 2 {
 		return signal.GatewayResumeData{}, false
 	}
-	return signal.GatewayResumeData{SessionID: sid, LastSeq: last}, true
+	return signal.GatewayResumeData{SessionID: sessionID, LastSeq: last}, true
 }
 
 // Gate 作为 signal.Config.Gate（#32）：对每条下行信封返回应投递给订阅者的信封
 // （按返回序投递；通常 0 或 1 条，补发窗口的乱序回填可能一次多条）。
 //
 //   - seq<=0 的消息（语音面/连接控制）直通；gateway.invalid_session 由本包消化：
-//     重置序号基准、投递在途事件、触发全量补拉，不回投给订阅者。
+//     把基准对齐到服务端下发的 latest_seq、投递在途事件、触发全量补拉，不回投给订阅者。
 //   - seq>0 的事件面消息：同 seq 覆盖即去重；从 lastSeq+1 起连续段立即投递，
 //     有空洞先缓冲（补发/重连交错时乱序到达），空洞补齐后自动释放。
 func (t *Tracker) Gate(env signal.Envelope) []signal.Envelope {
 	if env.Type == signal.TypeGatewayInvalidSession {
-		return t.handleInvalid("invalid_session")
+		var d signal.GatewayInvalidSessionData
+		// 老服务端不带 latest_seq：零值即旧行为（基准清零）。
+		_ = env.Decode(&d)
+		return t.handleInvalid("invalid_session", d.LatestSeq)
 	}
 	if env.Seq <= 0 {
 		return []signal.Envelope{env}
 	}
 	t.mu.Lock()
+	if t.awaitBase {
+		// 积压溢出时服务端最新 seq 不可知：以下一条见到的 seq 为基准并投递它。
+		// 不再清零后死等 seq=1——服务端的环不会跟着客户端重计。
+		t.awaitBase = false
+		t.lastSeq = env.Seq - 1
+	}
 	if env.Seq <= t.lastSeq {
 		t.mu.Unlock()
 		return nil // 已投递过（补发与实时投递可能重叠）
@@ -111,6 +121,7 @@ func (t *Tracker) Gate(env signal.Envelope) []signal.Envelope {
 	over := len(t.pending) > maxPending
 	if over {
 		out := t.resetLocked()
+		t.awaitBase = true
 		t.mu.Unlock()
 		t.fireResync("pending_overflow")
 		return out
@@ -121,21 +132,23 @@ func (t *Tracker) Gate(env signal.Envelope) []signal.Envelope {
 }
 
 // handleInvalid 续传失败/流失序：投递在途事件（消费者按 id 幂等），
-// 重置序号基准让新流（服务端环可能已从 1 重计）能继续，并异步触发全量补拉。
+// 把基准对齐到服务端 latest_seq（没有则清零）让新流能继续，并异步触发全量补拉。
 // 返回值是要回投的在途事件；invalid_session 本身不回投。
-func (t *Tracker) handleInvalid(reason string) []signal.Envelope {
+func (t *Tracker) handleInvalid(reason string, latestSeq int64) []signal.Envelope {
 	t.mu.Lock()
 	out := t.resetLocked()
+	t.lastSeq = latestSeq
+	t.awaitBase = false
 	t.mu.Unlock()
 	t.fireResync(reason)
 	return out
 }
 
-// resetLocked 清空缓冲与序号基准（调用方持锁）。返回清空前按序收拢的在途事件。
+// resetLocked 清空缓冲（调用方持锁）。返回清空前按序收拢的在途事件。
+// 序号基准由调用方决定：invalid_session 用服务端 latest_seq，溢出走 awaitBase。
 func (t *Tracker) resetLocked() []signal.Envelope {
 	out := t.sortedPendingLocked()
 	t.pending = make(map[int64]signal.Envelope)
-	t.lastSeq = 0
 	return out
 }
 

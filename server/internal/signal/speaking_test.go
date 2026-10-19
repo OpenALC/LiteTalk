@@ -6,8 +6,8 @@ import (
 	"testing"
 )
 
-// TestVoiceSpeakingFanout 说话翻转下发（#33 裁定 #5）：v2 连接走事件面
-// voice.speaking（含本人、进环带 seq），v1/未协商连接退化为 voice.state{speaking}。
+// TestVoiceSpeakingFanout 说话翻转下发（#33 裁定 #5）：v2 连接即时收
+// voice.speaking（含本人，seq=0 不进补发环），v1/未协商连接退化为 voice.state{speaking}。
 func TestVoiceSpeakingFanout(t *testing.T) {
 	f := newChatFixture(t)
 	chID := strconv.FormatInt(f.vch.ID, 10)
@@ -24,10 +24,10 @@ func TestVoiceSpeakingFanout(t *testing.T) {
 
 	f.hub.broadcastVoiceSpeaking(chID, "1", true)
 
-	// v2：voice.speaking 走事件面（seq 进环），含本人（自己的声波球同源）。
+	// v2：voice.speaking 即时下行、seq=0（不进补发环），含本人（声波球同源）。
 	env := a.recvUntil(TypeVoiceSpeaking)
-	if env.Seq <= 0 {
-		t.Fatalf("voice.speaking seq = %d, want > 0（事件面）", env.Seq)
+	if env.Seq != 0 {
+		t.Fatalf("voice.speaking seq = %d, want 0（不进补发环）", env.Seq)
 	}
 	var sp VoiceSpeakingData
 	if err := env.Decode(&sp); err != nil {
@@ -45,6 +45,15 @@ func TestVoiceSpeakingFanout(t *testing.T) {
 	}
 	if st.UserID != "1" || st.Speaking == nil || !*st.Speaking {
 		t.Fatalf("v1 退化 voice.state = %+v, want {user:1 speaking:true}", st)
+	}
+
+	// 说话事件不占补发环：随后的聊天事件从 seq=1 开始，不被挤出窗口。
+	b.send(TypeChatSend, ChatSendData{ChannelID: chID, Type: "text", Content: "after-speaking"})
+	if env := a.recvUntil(TypeChatMessage); env.Seq != 1 {
+		t.Fatalf("聊天 seq = %d, want 1（说话事件不应占环）", env.Seq)
+	}
+	if got := f.hub.evlog.LatestSeq("sa"); got != 1 {
+		t.Fatalf("环 latest_seq = %d, want 1（只含聊天事件）", got)
 	}
 }
 
