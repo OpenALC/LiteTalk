@@ -1,7 +1,7 @@
-// Package state 是客户端业务状态桥：把 M1/M2 的 audio / rtc / signal 管线
-// 装配成面向 UI 的会话（登录 → 连信令 → 入房 → 通话），并经 Wails Events
-// 推送给前端（落地方案 §4.6 事件表）。
-package state
+// Package voice 是客户端语音会话编排层：把 audio / rtc / signal 管线
+// 装配成面向 UI 的会话（登录 → 连信令 → 入房 → 通话），并经 Go 回调
+// 推送给上层（落地方案 §4.6 事件表）。
+package voice
 
 import (
 	"context"
@@ -17,9 +17,9 @@ import (
 	"sync/atomic"
 
 	"github.com/OpenALC/LiteTalk/client/core/api"
+	"github.com/OpenALC/LiteTalk/client/core/gateway"
 	"github.com/OpenALC/LiteTalk/client/core/hotkey"
 	"github.com/OpenALC/LiteTalk/client/internal/audio"
-	"github.com/OpenALC/LiteTalk/client/internal/gateway"
 	"github.com/OpenALC/LiteTalk/client/internal/rtc"
 	"github.com/OpenALC/LiteTalk/client/internal/signal"
 	"github.com/pion/webrtc/v4"

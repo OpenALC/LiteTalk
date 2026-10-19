@@ -1,7 +1,7 @@
 // Package gateway 客户端事件面（#32）：seq 追踪、断线续传、invalid_session 全量补拉。
 //
-// 与 state.Session 解耦（只依赖 internal/signal 的信封类型）；**禁止 import Wails**
-// （#34 将整包移入 core/gateway，届时应是纯移动）。
+// 与 voice.Session 解耦（只依赖 internal/signal 的信封类型）；**禁止 import Wails**
+// （#34 已整包移入 core/gateway，纯移动）。
 //
 // 时序（同会话重连）：client.hello → server.hello{version,session_id} 确认同会话 →
 // gateway.resume{session_id,last_seq} → 环内缺失事件按 seq 升序补发 → 续流。

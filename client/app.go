@@ -18,8 +18,8 @@ import (
 	"github.com/OpenALC/LiteTalk/client/core/api"
 	"github.com/OpenALC/LiteTalk/client/core/config"
 	"github.com/OpenALC/LiteTalk/client/core/hotkey"
+	"github.com/OpenALC/LiteTalk/client/core/voice"
 	"github.com/OpenALC/LiteTalk/client/internal/audio"
-	"github.com/OpenALC/LiteTalk/client/internal/state"
 	"github.com/OpenALC/LiteTalk/client/internal/tray"
 	"github.com/gen2brain/malgo"
 	"github.com/wailsapp/wails/v3/pkg/application"
@@ -60,7 +60,7 @@ type App struct {
 	trayReady atomic.Bool
 
 	api  *api.APIClient
-	sess *state.Session // 登录并连接信令后创建
+	sess *voice.Session // 登录并连接信令后创建
 
 	// connMu 串行化 connectSession/disconnectSession：双击登录或登录与游客并发
 	// 时，同一时刻只允许一个活跃会话（旧会话在切换时关闭，不再泄漏双管线）。
@@ -993,7 +993,7 @@ func (a *App) connectSession(token, nickname string, gen uint64) error {
 // connectSessionLocked 前提：已持 connMu。
 func (a *App) connectSessionLocked(token, nickname string) error {
 	a.disconnectSessionLocked()
-	ev := state.Events{
+	ev := voice.Events{
 		OnPeerJoin: func(userID, nickname, tag string, speaking, mute, deafen bool) {
 			a.emit("voice:peer-join", map[string]any{
 				"user_id": userID, "nickname": nickname, "tag": tag,
@@ -1060,7 +1060,7 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 		},
 	}
 	server := a.cfg.Resolve().WSURL
-	sess := state.NewSession(a.api, token, nickname, ev, log.Default())
+	sess := voice.NewSession(a.api, token, nickname, ev, log.Default())
 	// 按键说话发送门：App 级长期存活的同一个 Gate，重连不换（PTT 按住状态不丢）。
 	sess.SetSendGate(a.hkGate)
 	sess.Connect(server) // 音频降级不阻塞：Connect 不再整体失败
@@ -1308,12 +1308,12 @@ func (a *App) RequestVoiceState(channelID, targetID string, mute, deafen bool) e
 }
 
 // GetVoiceState 当前语音态快照（UI 销毁重载后回填用；channel_id 空=未在频道）。
-func (a *App) GetVoiceState() state.VoiceStateView {
+func (a *App) GetVoiceState() voice.VoiceStateView {
 	a.mu.Lock()
 	s := a.sess
 	a.mu.Unlock()
 	if s == nil {
-		return state.VoiceStateView{}
+		return voice.VoiceStateView{}
 	}
 	return s.VoiceState()
 }
@@ -1655,7 +1655,7 @@ func (a *App) SendChat(channelID, content string) error {
 }
 
 // GetVoiceMembers 房间成员快照。
-func (a *App) GetVoiceMembers() []state.PeerView {
+func (a *App) GetVoiceMembers() []voice.PeerView {
 	a.mu.Lock()
 	s := a.sess
 	a.mu.Unlock()
