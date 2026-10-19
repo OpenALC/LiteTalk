@@ -15,7 +15,7 @@ import IntroView from './IntroView.vue'
 import { useVoiceStore } from '../stores/voice'
 import { useChatStore } from '../stores/chat'
 import { useAuthStore } from '../stores/auth'
-import { INTRO_ID, useServersStore } from '../stores/data'
+import { INTRO_ID, useFriendsStore, useServersStore } from '../stores/data'
 import { useHotkeys } from '../composables/useHotkeys'
 import { eventsOn } from '../api/bridge'
 
@@ -24,6 +24,7 @@ const voice = useVoiceStore()
 const chat = useChatStore()
 const auth = useAuthStore()
 const servers = useServersStore()
+const friends = useFriendsStore()
 
 const tab = ref<'voice' | 'chat'>('voice')
 const showFriends = ref(true)
@@ -56,6 +57,10 @@ let offAuthSession: () => void = () => {}
 onMounted(() => {
   voice.bindEvents()
   chat.bindEvents()
+  // 服务器/频道与好友的事件订阅上提到主壳：data:resync（#78）与 presence:update
+  // 必须在登录后立即生效，不能依赖 FriendList 是否展开（它是可隐藏的子组件）。
+  servers.bindEvents()
+  friends.bindEvents()
   offAuthSession = eventsOn('auth:session', (d) => {
     auth.setSignalOk((d as { ok?: boolean }).ok !== false)
   })
@@ -75,6 +80,8 @@ onMounted(() => {
 onUnmounted(() => {
   voice.unbindEvents()
   chat.unbindEvents()
+  servers.unbindEvents()
+  friends.unbindEvents()
   offAuthSession()
 })
 </script>
