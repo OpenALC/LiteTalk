@@ -157,6 +157,25 @@ func TestSavedPasswordNoFileFallback(t *testing.T) {
 	}
 }
 
+// TestSavedPasswordEmptyClears 空密码保存等同清除：keyring 里的旧密码必须一并删除，
+// 否则 config.json 字段清空后旧密码仍会在下次启动复活。
+func TestSavedPasswordEmptyClears(t *testing.T) {
+	useMockKeyring(t)
+	m := tmpManager(t)
+	if err := m.SetSavedCredentials("u@example.com", "old-pw"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SetSavedCredentials("u@example.com", ""); err != nil {
+		t.Fatalf("SetSavedCredentials 空密码: %v", err)
+	}
+	if _, err := keyring.Get(keyringService, keyringPasswordKey); err == nil {
+		t.Fatal("空密码保存后 keyring 里不应再有密码")
+	}
+	if c := m.GetSavedCredentials(); c.Password != "" {
+		t.Fatalf("空密码保存后不应读回旧密码，得到 %q", c.Password)
+	}
+}
+
 // TestSavedPasswordLegacyFileRead 升级兼容：旧版把密码 base64 存在 EncPassword，
 // 新版本先读 keyring、miss 后仍能读到旧值；下一次保存成功后迁入 keyring 并清空文件字段。
 func TestSavedPasswordLegacyFileRead(t *testing.T) {
