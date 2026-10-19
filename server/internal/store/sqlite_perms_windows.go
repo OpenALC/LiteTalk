@@ -8,4 +8,4 @@ package store
 
 func tightenSQLitePerms(dir, dbPath string) error { return nil }
 
-func precreateSQLiteFile(path string) error { return nil }
+func precreateSQLiteFiles(path string) error { return nil }
