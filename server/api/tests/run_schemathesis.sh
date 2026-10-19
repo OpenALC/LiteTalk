@@ -57,8 +57,10 @@ fi
 # REST 鉴权是 JWT：simple 模式游客登录取令牌注入 fuzz（dev-token 只兜底 WS 面）。
 # 令牌注入后 fuzz 会打到业务分支；登出/换会话类操作可能中途废掉令牌，
 # 后续请求退化为 401——401 是契约内响应，不算违约。
+# X-LiteTalk-Client 是 #31 的强制升级门：取令牌与 fuzz 请求都带 dev，
+# 否则 /auth/* 一律 426，业务分支完全测不到（426 仍在契约里声明）。
 resp="$(curl -sf -X POST "http://127.0.0.1:${port}/api/v1/auth/guest" \
-  -H 'Content-Type: application/json' -d '{}' || true)"
+  -H 'Content-Type: application/json' -H 'X-LiteTalk-Client: dev' -d '{}' || true)"
 token="$(printf '%s' "$resp" | sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
 if [ -z "$token" ]; then
   echo "::error::游客登录未取得 access_token：${resp}"
@@ -70,6 +72,7 @@ echo "== schemathesis fuzz（seed=42，确定性生成，断言无 5xx + 形状�
 schemathesis run api/openapi.yaml \
   --url "http://127.0.0.1:${port}" \
   --header "Authorization: Bearer ${token}" \
+  --header "X-LiteTalk-Client: dev" \
   --checks not_a_server_error,response_schema_conformance \
   --phases examples,coverage,fuzzing \
   --mode all \

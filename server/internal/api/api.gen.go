@@ -338,13 +338,16 @@ type PatchMeRequest = PatchMeBody
 // PatchServerRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（名称/图标 不可清，空值被校验拒 400），值 = 设置。
 type PatchServerRequest = PatchServerBody
 
-// Problem RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示（旧 message 字段改名为 detail）。
+// Problem RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段 （RFC 9457 允许的扩展字段，至少保留一个版本）。
 type Problem struct {
 	// Code 机器可读错误码（扩展字段）
 	Code string `json:"code"`
 
 	// Detail 本次出错的中文提示
 	Detail string `json:"detail"`
+
+	// Message 兼容旧客户端的提示字段（与 detail 同值，至少保留一个版本）
+	Message *string `json:"message,omitempty"`
 
 	// Status HTTP 状态码（与响应行一致）
 	Status int32 `json:"status"`
@@ -470,28 +473,31 @@ type User struct {
 // IDPath defines model for IDPath.
 type IDPath = int64
 
-// BadRequest RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示（旧 message 字段改名为 detail）。
+// BadRequest RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段 （RFC 9457 允许的扩展字段，至少保留一个版本）。
 type BadRequest = Problem
 
-// Conflict RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示（旧 message 字段改名为 detail）。
+// ClientUpgradeRequired RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段 （RFC 9457 允许的扩展字段，至少保留一个版本）。
+type ClientUpgradeRequired = Problem
+
+// Conflict RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段 （RFC 9457 允许的扩展字段，至少保留一个版本）。
 type Conflict = Problem
 
-// Forbidden RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示（旧 message 字段改名为 detail）。
+// Forbidden RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段 （RFC 9457 允许的扩展字段，至少保留一个版本）。
 type Forbidden = Problem
 
-// Gone RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示（旧 message 字段改名为 detail）。
+// Gone RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段 （RFC 9457 允许的扩展字段，至少保留一个版本）。
 type Gone = Problem
 
-// Internal RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示（旧 message 字段改名为 detail）。
+// Internal RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段 （RFC 9457 允许的扩展字段，至少保留一个版本）。
 type Internal = Problem
 
-// NotFound RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示（旧 message 字段改名为 detail）。
+// NotFound RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段 （RFC 9457 允许的扩展字段，至少保留一个版本）。
 type NotFound = Problem
 
-// RateLimited RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示（旧 message 字段改名为 detail）。
+// RateLimited RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段 （RFC 9457 允许的扩展字段，至少保留一个版本）。
 type RateLimited = Problem
 
-// Unauthorized RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示（旧 message 字段改名为 detail）。
+// Unauthorized RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段 （RFC 9457 允许的扩展字段，至少保留一个版本）。
 type Unauthorized = Problem
 
 // DeleteCategoryParams defines parameters for DeleteCategory.
@@ -1608,6 +1614,8 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 
 type BadRequestApplicationProblemPlusJSONResponse Problem
 
+type ClientUpgradeRequiredApplicationProblemPlusJSONResponse Problem
+
 type ConflictApplicationProblemPlusJSONResponse Problem
 
 type ForbiddenApplicationProblemPlusJSONResponse Problem
@@ -1688,6 +1696,22 @@ func (response SendEmailCode409ApplicationProblemPlusJSONResponse) VisitSendEmai
 	}
 	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(409)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SendEmailCode426ApplicationProblemPlusJSONResponse struct {
+	ClientUpgradeRequiredApplicationProblemPlusJSONResponse
+}
+
+func (response SendEmailCode426ApplicationProblemPlusJSONResponse) VisitSendEmailCodeResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(426)
 	_, err := buf.WriteTo(w)
 	return err
 }
@@ -1779,6 +1803,22 @@ func (response GuestLogin403ApplicationProblemPlusJSONResponse) VisitGuestLoginR
 	return err
 }
 
+type GuestLogin426ApplicationProblemPlusJSONResponse struct {
+	ClientUpgradeRequiredApplicationProblemPlusJSONResponse
+}
+
+func (response GuestLogin426ApplicationProblemPlusJSONResponse) VisitGuestLoginResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(426)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
 type GuestLogin429ApplicationProblemPlusJSONResponse struct {
 	RateLimitedApplicationProblemPlusJSONResponse
 }
@@ -1862,6 +1902,22 @@ func (response Login401ApplicationProblemPlusJSONResponse) VisitLoginResponse(w 
 	}
 	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type Login426ApplicationProblemPlusJSONResponse struct {
+	ClientUpgradeRequiredApplicationProblemPlusJSONResponse
+}
+
+func (response Login426ApplicationProblemPlusJSONResponse) VisitLoginResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(426)
 	_, err := buf.WriteTo(w)
 	return err
 }
@@ -2040,6 +2096,22 @@ func (response ResetPassword404ApplicationProblemPlusJSONResponse) VisitResetPas
 	return err
 }
 
+type ResetPassword426ApplicationProblemPlusJSONResponse struct {
+	ClientUpgradeRequiredApplicationProblemPlusJSONResponse
+}
+
+func (response ResetPassword426ApplicationProblemPlusJSONResponse) VisitResetPasswordResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(426)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
 type ResetPassword429ApplicationProblemPlusJSONResponse struct {
 	RateLimitedApplicationProblemPlusJSONResponse
 }
@@ -2127,6 +2199,22 @@ func (response Refresh401ApplicationProblemPlusJSONResponse) VisitRefreshRespons
 	return err
 }
 
+type Refresh426ApplicationProblemPlusJSONResponse struct {
+	ClientUpgradeRequiredApplicationProblemPlusJSONResponse
+}
+
+func (response Refresh426ApplicationProblemPlusJSONResponse) VisitRefreshResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(426)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
 type RefreshdefaultApplicationProblemPlusJSONResponse struct {
 	Body       Problem
 	StatusCode int
@@ -2194,6 +2282,22 @@ func (response Register409ApplicationProblemPlusJSONResponse) VisitRegisterRespo
 	}
 	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(409)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type Register426ApplicationProblemPlusJSONResponse struct {
+	ClientUpgradeRequiredApplicationProblemPlusJSONResponse
+}
+
+func (response Register426ApplicationProblemPlusJSONResponse) VisitRegisterResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(426)
 	_, err := buf.WriteTo(w)
 	return err
 }

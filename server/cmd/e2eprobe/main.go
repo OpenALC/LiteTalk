@@ -29,6 +29,13 @@ import (
 	"time"
 )
 
+// 服务端 /auth/* 的强制升级门（#31）：探测客户端统一声明 dev 版本，
+// 服务端对 dev / 含 dev 的探测值放行，避免探针被 426 挡住。
+const (
+	clientVersionHeader = "X-LiteTalk-Client"
+	probeClientVersion  = "e2eprobe-dev"
+)
+
 type config struct {
 	addr        string
 	users       int
@@ -49,7 +56,13 @@ func register(addr, nickname string) (email, token string, id int64, ice []ICESe
 
 	post := func(path string, body any) (int, []byte, error) {
 		raw, _ := json.Marshal(body)
-		resp, err := http.Post("http://"+addr+path, "application/json", bytes.NewReader(raw))
+		req, err := http.NewRequest(http.MethodPost, "http://"+addr+path, bytes.NewReader(raw))
+		if err != nil {
+			return 0, nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(clientVersionHeader, probeClientVersion)
+		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -78,6 +91,7 @@ func register(addr, nickname string) (email, token string, id int64, ice []ICESe
 	}
 
 	req, _ := http.NewRequest("POST", "http://"+addr+"/api/v1/rtc/credentials?token="+pair.AccessToken, nil)
+	req.Header.Set(clientVersionHeader, probeClientVersion)
 	cresp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", "", 0, nil, fmt.Errorf("rtc/credentials: %w", err)

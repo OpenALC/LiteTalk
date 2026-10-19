@@ -222,28 +222,34 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// problemBody RFC 9457 问题详情（#31）：type/title/status/code/detail。
+// problemBody RFC 9457 问题详情（#31）：type/title/status/code/detail/message。
 // code 是扩展字段（客户端 APIError.Code 依赖），字符串码与迁移前逐字一致；
 // title 随 status 定（不随实例变），detail 才是本次出错的中文提示。
+//
+// message 与 detail 同值：RFC 9457 允许扩展字段，v1.1 客户端 decodeError 只认
+// message，缺了它任何错误都解析不出来（过期令牌清不掉）。至少保留一个版本（#31）。
 type problemBody struct {
-	Type   string `json:"type"`
-	Title  string `json:"title"`
-	Status int    `json:"status"`
-	Code   string `json:"code"`
-	Detail string `json:"detail"`
+	Type    string `json:"type"`
+	Title   string `json:"title"`
+	Status  int    `json:"status"`
+	Code    string `json:"code"`
+	Detail  string `json:"detail"`
+	Message string `json:"message"`
 }
 
 // writeErr 统一错误体（RFC 9457，application/problem+json，契约 Problem）。
 // type 形如 urn:litetalk:error:<code>；签名不变，只改写响应形状。
+// detail 与 message 必须同时填：前者是新口径，后者兼容已发布的旧客户端。
 func writeErr(w http.ResponseWriter, status int, code, msg string) {
 	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(problemBody{
-		Type:   "urn:litetalk:error:" + code,
-		Title:  http.StatusText(status),
-		Status: status,
-		Code:   code,
-		Detail: msg,
+		Type:    "urn:litetalk:error:" + code,
+		Title:   http.StatusText(status),
+		Status:  status,
+		Code:    code,
+		Detail:  msg,
+		Message: msg,
 	})
 }
 
