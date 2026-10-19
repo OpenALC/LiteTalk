@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -26,6 +27,14 @@ var errBaseChanged = errors.New("服务器地址已切换，刷新结果已丢�
 
 // authHeaderSession 服务端 401 细分会话类失败的响应头（契约 §0.4）。
 const authHeaderSession = "X-LiteTalk-Auth"
+
+// clientVersionHeader 客户端版本头（#31 强制升级门）。服务端对 /auth/*
+// 要求 >= 1.5；缺失或过旧返回 426 client_too_old。
+const clientVersionHeader = "X-LiteTalk-Client"
+
+// defaultClientVersion 未注入构建版本时的兜底值：服务端识别 dev 并放行，
+// 避免测试 / CLI / 本地运行被升级门挡住。
+const defaultClientVersion = "dev"
 
 // AuthTokens 登录/刷新返回的令牌对（§5.4 auth 契约）。
 // User 仅服务端响应携带时非空（/auth/refresh 会带回 user，可直接用，
@@ -82,6 +91,10 @@ type APIClient struct {
 	tokenMu sync.RWMutex
 	access  string
 
+	// versionMu 保护 clientVersion：SetClientVersion 可能与在飞请求并发。
+	versionMu     sync.RWMutex
+	clientVersion string
+
 	// refreshSource/onRefreshed 由 app 层注入：刷新令牌存 app（需区分
 	// 持久化策略），旋转后的新令牌对回传 app 落盘。
 	refreshSource RefreshSource
@@ -103,11 +116,34 @@ type refreshCall struct {
 }
 
 // NewAPIClient 创建 REST 客户端。base 形如 https://host（不含 /api/v1）。
+// 版本头默认 dev（服务端放行），app 层启动时用构建版本覆盖。
 func NewAPIClient(base string) *APIClient {
 	return &APIClient{
-		base: base,
-		http: &http.Client{Timeout: 15 * time.Second},
+		base:          base,
+		http:          &http.Client{Timeout: 15 * time.Second},
+		clientVersion: defaultClientVersion,
 	}
+}
+
+// SetClientVersion 设置 X-LiteTalk-Client 的版本值（#31 强制升级门）。
+// 空值回落到 dev：宁可让服务端放行本地构建，也不要因漏注入把请求挡在 426 上。
+func (c *APIClient) SetClientVersion(v string) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		v = defaultClientVersion
+	}
+	c.versionMu.Lock()
+	defer c.versionMu.Unlock()
+	c.clientVersion = v
+}
+
+// setVersionHeader 给每个 REST 请求统一带上客户端版本头（含刷新与
+// rtc/credentials 这类直接构造的请求）。重试走 req.Clone，头会保留。
+func (c *APIClient) setVersionHeader(req *http.Request) {
+	c.versionMu.RLock()
+	v := c.clientVersion
+	c.versionMu.RUnlock()
+	req.Header.Set(clientVersionHeader, v)
 }
 
 // SetRefreshSource 注入 refresh_token 来源（401 刷新重试的前置条件）。
@@ -330,6 +366,7 @@ func (c *APIClient) postAt(ctx context.Context, base, path string, body any, aut
 		return 0, nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	c.setVersionHeader(req)
 	status, data, err := c.do(req, auth, base)
 	if err != nil {
 		return 0, nil, fmt.Errorf("post %s: %w", path, err)
@@ -344,6 +381,7 @@ func (c *APIClient) get(path string) (int, []byte, error) {
 	if err != nil {
 		return 0, nil, err
 	}
+	c.setVersionHeader(req)
 	status, data, err := c.do(req, true, base)
 	if err != nil {
 		return 0, nil, fmt.Errorf("get %s: %w", path, err)
@@ -363,6 +401,7 @@ func (c *APIClient) patch(path string, body any) (int, []byte, error) {
 		return 0, nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	c.setVersionHeader(req)
 	status, data, err := c.do(req, true, base)
 	if err != nil {
 		return 0, nil, fmt.Errorf("patch %s: %w", path, err)
@@ -377,6 +416,7 @@ func (c *APIClient) del(path string) (int, []byte, error) {
 	if err != nil {
 		return 0, nil, err
 	}
+	c.setVersionHeader(req)
 	status, data, err := c.do(req, true, base)
 	if err != nil {
 		return 0, nil, fmt.Errorf("delete %s: %w", path, err)

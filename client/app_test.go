@@ -73,6 +73,26 @@ func TestGetVersion(t *testing.T) {
 	}
 }
 
+// TestAppAPIClientVersionHeader app 构造的 REST 客户端必须带构建版本头
+// （#31 强制升级门）；未注入时是 dev，服务端放行。
+func TestAppAPIClientVersionHeader(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("X-LiteTalk-Client")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"auth_mode":"full"}`))
+	}))
+	defer srv.Close()
+
+	c := newAppAPI(srv.URL)
+	if _, err := c.GetServerConfig(); err != nil {
+		t.Fatalf("GetServerConfig: %v", err)
+	}
+	if got != version {
+		t.Fatalf("X-LiteTalk-Client = %q，期望构建版本 %q", got, version)
+	}
+}
+
 // 验证服务器地址配置：保存 / WS 推导 / 来源（热切换需探活通过才落盘）
 func TestServerConfig(t *testing.T) {
 	m := config.NewWithPath(filepath.Join(t.TempDir(), "config.json"))
