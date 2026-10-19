@@ -4,8 +4,11 @@
 # VERSION=dev 时生产守卫（JWT/SFU IP）不生效，仅限本地自测。
 FROM golang:1.27 AS build
 WORKDIR /src
-# 先只拷依赖清单：server/ 源码变更不使 go mod download 层失效
+# 先只拷依赖清单：server/ 源码变更不使 go mod download 层失效。
+# client 仅需 go.mod/go.sum：server 的联调测试通过 replace ../client 引用真实
+# 客户端 Tracker（#32），模块图加载需要它；构建服务端二进制不编译客户端源码。
 COPY server/go.mod server/go.sum ./server/
+COPY client/go.mod client/go.sum ./client/
 WORKDIR /src/server
 RUN go mod download
 COPY server/ ./

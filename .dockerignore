@@ -1,9 +1,13 @@
-# 构建上下文只需 server/（#27）：客户端、文档与本地材料不进镜像
+# 构建上下文只需 server/，外加 client 的 go.mod/go.sum（server 测试通过
+# replace ../client 引用真实客户端 Tracker）；客户端源码、文档与本地材料不进镜像。
 .git
 .github
 .claude
 .playwright-mcp
-client
+# 不能写成 client：父目录被排除后无法再放行其中的文件
+client/**
+!client/go.mod
+!client/go.sum
 docs
 prototype
 **/node_modules
