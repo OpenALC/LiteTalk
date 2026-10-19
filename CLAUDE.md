@@ -106,7 +106,8 @@ git checkout -- .
 | 检查 | `check-frontend` | 每次 push 和 PR | 是 | `pnpm install --frozen-lockfile`、type-check、vitest、build，产出 `frontend-dist` artifact |
 | 检查 | `check-client-linux` | 每次 push 和 PR | 是 | gofmt、tidy、vet、`test -race`、build（`-tags gtk3`） |
 | 检查 | `check-client-windows` | 每次 push 和 PR | 是 | vet、`test -race`、production GUI build。**这是真实 cgo Opus、DPAPI、WASAPI 唯一被测试的地方** |
-| 打包 | `package-server` | 标签 | 是 | linux amd64/arm64，tar.gz 内含二进制和 `migrations/` |
+| 检查 | `check-contract` | 每次 push 和 PR | 是 | 契约 ↔ 实现双向比对（`server/api/tests`，AST + 运行时注册表 + kin-openapi）、Go 生成物新鲜度、schemathesis 模糊测试（锁版本，固定 seed，断言无 5xx 与形状违约）。**阻塞发版** |
+| 打包 | `package-server` | 标签 | 是 | linux amd64/arm64，tar.gz 内含二进制；`migrations/` 已 embed 进二进制（#18），不再随包分发 |
 | 打包 | `package-client-windows` | 标签 | 是 | exe 加 NSIS 安装器（版本号从标签注入）加绿色版 zip |
 | 打包 | `package-client-linux` | 标签 | 是 | 矩阵 amd64/arm64：绿色版、deb、rpm（nfpm 锁版本） |
 | 打包 | `package-client-macos` | 标签 | **否** | 裸二进制 zip，实验性，`continue-on-error` |
