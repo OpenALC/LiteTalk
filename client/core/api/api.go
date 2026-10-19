@@ -20,6 +20,10 @@ import (
 // 上层应断会话、清令牌、回登录页。
 var ErrSessionReplaced = errors.New("会话已被其他设备替换")
 
+// errBaseChanged 请求在飞期间 REST 基址被热切换：刷新结果属于旧基址，
+// 必须丢弃——绝不能把旧服务器的新令牌装回客户端、落盘或重放到新地址（#17）。
+var errBaseChanged = errors.New("服务器地址已切换，刷新结果已丢弃")
+
 // authHeaderSession 服务端 401 细分会话类失败的响应头（契约 §0.4）。
 const authHeaderSession = "X-LiteTalk-Auth"
 
@@ -90,7 +94,9 @@ type APIClient struct {
 }
 
 // refreshCall 一次进行中的刷新及其结果（done 关闭前 tokens/err 已写好）。
+// base 是发起刷新的请求所用的基址快照：不同基址的等待方不得复用其结果。
 type refreshCall struct {
+	base   string
 	done   chan struct{}
 	tokens *AuthTokens
 	err    error
@@ -139,15 +145,29 @@ func (c *APIClient) SetBase(base string) {
 	c.base = base
 }
 
-// do 执行一次请求；401（token_expired/unauthorized）且带鉴权时先合并刷新
-// 再用新令牌原样重放一次（retried 防递归）；仍 401 才返回错误。
-// 401 且会话被顶替/重放（X-LiteTalk-Auth: session_replaced/session_replayed）
-// 则返回 ErrSessionReplaced，不走刷新。
-func (c *APIClient) do(req *http.Request, auth bool) (int, []byte, error) {
-	return c.doOnce(req, auth, false)
+// SetBaseAndClearToken 原子切换 REST 基址并清空 access token（跨 origin 换服专用）。
+// 写锁会等待正在进行的 doRefresh「复查+安装+onRefreshed」读锁段结束：刷新若在
+// 切换前完成，调用返回后 token 已被清掉；若在切换后复查，则直接丢弃。分两次
+// 调用 SetToken/SetBase 会留下「新基址 + 旧 access token」窗口（#17）。
+// 锁序 baseMu → tokenMu，与 doRefresh 的 baseMu.RLock → SetToken 一致。
+func (c *APIClient) SetBaseAndClearToken(base string) {
+	c.baseMu.Lock()
+	defer c.baseMu.Unlock()
+	c.base = base
+	c.SetToken("")
 }
 
-func (c *APIClient) doOnce(req *http.Request, auth, retried bool) (int, []byte, error) {
+// do 执行一次请求；401（token_expired/unauthorized）且带鉴权时先合并刷新
+// 再用新令牌原样重放一次（retried 防递归）；仍 401 才返回错误。
+// base 是请求创建时的基址快照（见 get/post 等）：刷新必须钉在它上面，
+// 不能用可能已被 SetBase 换掉的 c.Base()（#17 换服泄露）。
+// 401 且会话被顶替/重放（X-LiteTalk-Auth: session_replaced/session_replayed）
+// 则返回 ErrSessionReplaced，不走刷新。
+func (c *APIClient) do(req *http.Request, auth bool, base string) (int, []byte, error) {
+	return c.doOnce(req, auth, false, base)
+}
+
+func (c *APIClient) doOnce(req *http.Request, auth, retried bool, base string) (int, []byte, error) {
 	if auth {
 		if tok := c.Token(); tok != "" {
 			req.Header.Set("Authorization", "Bearer "+tok)
@@ -169,7 +189,12 @@ func (c *APIClient) doOnce(req *http.Request, auth, retried bool) (int, []byte, 
 			// 服务端对过期/无效令牌统一返回 unauthorized（router.go），
 			// token_expired 是文档约定码——两者都尝试刷新，刷新失败即原样报错。
 			if json.Unmarshal(data, &e) == nil && (e.Code == "token_expired" || e.Code == "unauthorized") {
-				if _, rerr := c.refreshOnce(req.Context()); rerr == nil {
+				if _, rerr := c.refreshOnce(req.Context(), base); rerr == nil {
+					// 刷新返回时基址可能已被热切换：旧基址的新令牌不能重放到
+					// 新地址（#17），丢弃并上抛。
+					if c.Base() != base {
+						return resp.StatusCode, data, errBaseChanged
+					}
 					retry := req.Clone(req.Context())
 					// GET/DELETE 无 body 时 GetBody 为 nil（http.NewRequest 只为
 					// bytes.Reader/Buffer 填充），Clone 复用原 Body 即可重放。
@@ -180,11 +205,14 @@ func (c *APIClient) doOnce(req *http.Request, auth, retried bool) (int, []byte, 
 						}
 						retry.Body = body
 					}
-					return c.doOnce(retry, auth, true)
+					return c.doOnce(retry, auth, true, base)
 				} else if errors.Is(rerr, ErrSessionReplaced) {
 					// 并发窗口里会话已被顶替（refresh 撞上 session_replaced），
 					// 同样按致命上抛。
 					return resp.StatusCode, data, ErrSessionReplaced
+				} else if errors.Is(rerr, errBaseChanged) {
+					// 刷新期间基址已变：不重放，把明确原因交给上层。
+					return resp.StatusCode, data, errBaseChanged
 				}
 			}
 		}
@@ -205,10 +233,15 @@ func isSessionReplaced(header string, data []byte) bool {
 
 // refreshOnce 并发安全的单次刷新：已有刷新在进行则等待其结果，
 // 否则自己发起。http.Client 自带 15s 超时，等待方以请求 ctx 兜底。
-func (c *APIClient) refreshOnce(ctx context.Context) (*AuthTokens, error) {
+// base 为发起请求的基址快照；不同基址的刷新结果不能互相复用——
+// 否则换服后新地址的请求会拿着旧服务器的令牌去重放（#17）。
+func (c *APIClient) refreshOnce(ctx context.Context, base string) (*AuthTokens, error) {
 	c.refreshMu.Lock()
 	if f := c.refreshFlight; f != nil {
 		c.refreshMu.Unlock()
+		if f.base != base {
+			return nil, errBaseChanged
+		}
 		select {
 		case <-f.done:
 			return f.tokens, f.err
@@ -216,11 +249,11 @@ func (c *APIClient) refreshOnce(ctx context.Context) (*AuthTokens, error) {
 			return nil, ctx.Err()
 		}
 	}
-	f := &refreshCall{done: make(chan struct{})}
+	f := &refreshCall{base: base, done: make(chan struct{})}
 	c.refreshFlight = f
 	c.refreshMu.Unlock()
 
-	f.tokens, f.err = c.doRefresh(ctx)
+	f.tokens, f.err = c.doRefresh(ctx, base)
 	close(f.done) // 先写结果再关通道：close 提供 happens-before，等待方读到完整结果
 	c.refreshMu.Lock()
 	c.refreshFlight = nil
@@ -229,8 +262,10 @@ func (c *APIClient) refreshOnce(ctx context.Context) (*AuthTokens, error) {
 }
 
 // doRefresh 真正发 /auth/refresh（auth=false 走 post，不会触发重试递归）。
-// 成功后先换内存令牌并回调 app 落盘，再返回给等待方重放原请求。
-func (c *APIClient) doRefresh(ctx context.Context) (*AuthTokens, error) {
+// base 是触发刷新的那次请求的基址快照：POST 必须发到它上面，不能跟随
+// c.Base()（SetBase 可能已把客户端切到新服务器，发过去就是凭据泄露， #17）。
+// 刷新成功后先复查基址；已切换则丢弃结果，绝不安装/回调/落盘。
+func (c *APIClient) doRefresh(ctx context.Context, base string) (*AuthTokens, error) {
 	rt, err := c.refreshSource(ctx)
 	if err != nil {
 		return nil, err
@@ -238,7 +273,7 @@ func (c *APIClient) doRefresh(ctx context.Context) (*AuthTokens, error) {
 	if rt == "" {
 		return nil, fmt.Errorf("no refresh token")
 	}
-	status, data, err := c.post("/auth/refresh", map[string]string{
+	status, data, err := c.postAt(ctx, base, "/auth/refresh", map[string]string{
 		"refresh_token": rt,
 	}, false)
 	if err != nil {
@@ -256,10 +291,20 @@ func (c *APIClient) doRefresh(ctx context.Context) (*AuthTokens, error) {
 	if err := json.Unmarshal(data, &t); err != nil {
 		return nil, fmt.Errorf("decode refresh: %w", err)
 	}
+	// 复查基址、安装令牌与回调必须在 baseMu 读锁内完成：SetBase 是写锁，
+	// 两者不会交错。否则「检查通过 → SetBase → 再安装」会把旧服务器的新令牌
+	// 留在新基址上（#17）。注意这里不能调 c.Base()（重复 RLock 会与等待中的
+	// 写锁互相卡住），直接读 c.base。
+	c.baseMu.RLock()
+	if c.base != base {
+		c.baseMu.RUnlock()
+		return nil, errBaseChanged
+	}
 	c.SetToken(t.AccessToken)
 	if c.onRefreshed != nil {
 		c.onRefreshed(t)
 	}
+	c.baseMu.RUnlock()
 	return &t, nil
 }
 
@@ -270,16 +315,22 @@ func (c *APIClient) post(path string, body any, auth bool) (int, []byte, error) 
 
 // postCtx 同 post，但带请求上下文（可设短超时，见 RTCCredentials）。
 func (c *APIClient) postCtx(ctx context.Context, path string, body any, auth bool) (int, []byte, error) {
+	return c.postAt(ctx, c.Base(), path, body, auth)
+}
+
+// postAt 用指定基址构造 POST。基址在构造时取快照并一路传到 do/doRefresh，
+// 刷新才不会被 SetBase 带到新服务器上。
+func (c *APIClient) postAt(ctx context.Context, base, path string, body any, auth bool) (int, []byte, error) {
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return 0, nil, fmt.Errorf("marshal %s: %w", path, err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.Base()+"/api/v1"+path, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/v1"+path, bytes.NewReader(raw))
 	if err != nil {
 		return 0, nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	status, data, err := c.do(req, auth)
+	status, data, err := c.do(req, auth, base)
 	if err != nil {
 		return 0, nil, fmt.Errorf("post %s: %w", path, err)
 	}
@@ -288,11 +339,12 @@ func (c *APIClient) postCtx(ctx context.Context, path string, body any, auth boo
 
 // get JSON GET（带 Bearer）。
 func (c *APIClient) get(path string) (int, []byte, error) {
-	req, err := http.NewRequest(http.MethodGet, c.Base()+"/api/v1"+path, nil)
+	base := c.Base()
+	req, err := http.NewRequest(http.MethodGet, base+"/api/v1"+path, nil)
 	if err != nil {
 		return 0, nil, err
 	}
-	status, data, err := c.do(req, true)
+	status, data, err := c.do(req, true, base)
 	if err != nil {
 		return 0, nil, fmt.Errorf("get %s: %w", path, err)
 	}
@@ -301,16 +353,17 @@ func (c *APIClient) get(path string) (int, []byte, error) {
 
 // patch JSON PATCH（带 Bearer，管理端点：服务器/频道重命名等）。
 func (c *APIClient) patch(path string, body any) (int, []byte, error) {
+	base := c.Base()
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return 0, nil, fmt.Errorf("marshal %s: %w", path, err)
 	}
-	req, err := http.NewRequest(http.MethodPatch, c.Base()+"/api/v1"+path, bytes.NewReader(raw))
+	req, err := http.NewRequest(http.MethodPatch, base+"/api/v1"+path, bytes.NewReader(raw))
 	if err != nil {
 		return 0, nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	status, data, err := c.do(req, true)
+	status, data, err := c.do(req, true, base)
 	if err != nil {
 		return 0, nil, fmt.Errorf("patch %s: %w", path, err)
 	}
@@ -319,11 +372,12 @@ func (c *APIClient) patch(path string, body any) (int, []byte, error) {
 
 // del JSON DELETE（带 Bearer，管理端点：删除服务器/频道等）。
 func (c *APIClient) del(path string) (int, []byte, error) {
-	req, err := http.NewRequest(http.MethodDelete, c.Base()+"/api/v1"+path, nil)
+	base := c.Base()
+	req, err := http.NewRequest(http.MethodDelete, base+"/api/v1"+path, nil)
 	if err != nil {
 		return 0, nil, err
 	}
-	status, data, err := c.do(req, true)
+	status, data, err := c.do(req, true, base)
 	if err != nil {
 		return 0, nil, fmt.Errorf("delete %s: %w", path, err)
 	}
