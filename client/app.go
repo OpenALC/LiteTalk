@@ -20,7 +20,8 @@ import (
 	"github.com/OpenALC/LiteTalk/client/core/config"
 	"github.com/OpenALC/LiteTalk/client/core/hotkey"
 	"github.com/OpenALC/LiteTalk/client/core/voice"
-	"github.com/OpenALC/LiteTalk/client/internal/tray"
+	"github.com/OpenALC/LiteTalk/client/desktop"
+	"github.com/OpenALC/LiteTalk/client/desktop/tray"
 	"github.com/gen2brain/malgo"
 	"github.com/wailsapp/wails/v3/pkg/application"
 	"github.com/wailsapp/wails/v3/pkg/events"
@@ -324,7 +325,7 @@ func (a *App) showFromTray() {
 		if a.savedBounds != nil && a.savedBounds.Width > 0 {
 			// Wayland 协议不允许应用定位窗口（坐标写入被忽略或告警）：只记忆尺寸，
 			// 不写 X/Y，改由 Focus 前置（见下方 show 分支）。X11/Windows 保留完整位置记忆。
-			if !isWaylandSession() {
+			if !desktop.IsWaylandSession() {
 				opts.X, opts.Y = a.savedBounds.X, a.savedBounds.Y
 			}
 			opts.Width, opts.Height = a.savedBounds.Width, a.savedBounds.Height
@@ -348,28 +349,10 @@ func (a *App) showFromTray() {
 		win.Restore()
 	}
 	// Wayland 无坐标可用，靠 Focus 抢输入焦点完成前置（X11/Windows 由坐标记忆保证位置）。
-	if isWaylandSession() {
+	if desktop.IsWaylandSession() {
 		win.Focus()
 	}
 	a.emit("sys:wake", nil)
-}
-
-// isWaylandEnv 按给定环境判定 Wayland 会话（纯函数，便于测试注入）：
-// Linux 下有 WAYLAND_DISPLAY 即 Wayland；无 DISPLAY（纯 Wayland、无 XWayland）也算。
-// 非 Linux 恒 false。
-func isWaylandEnv(goos, waylandDisplay, x11Display string) bool {
-	if goos != "linux" {
-		return false
-	}
-	if waylandDisplay != "" {
-		return true
-	}
-	return x11Display == ""
-}
-
-// isWaylandSession 进程环境的 Wayland 会话判定（Wayland 下禁止坐标定位窗口）。
-func isWaylandSession() bool {
-	return isWaylandEnv(runtime.GOOS, os.Getenv("WAYLAND_DISPLAY"), os.Getenv("DISPLAY"))
 }
 
 // emitHibernate 休眠处理（设置页「休眠模式」三态之一 hibernate）：
@@ -1386,18 +1369,11 @@ func (a *App) runtimeAudio() audio.RuntimeSettings {
 		AGC:             as.AGC != nil && *as.AGC,
 		Gain:            float64(as.MicVolume) / 100,
 		PlaybackGain:    float64(as.PlaybackVolume) / 100,
-		VADSens:         derefInt(as.VADSens, 2),
+		VADSens:         desktop.DerefInt(as.VADSens, 2),
 		Complexity:      complexity,
 		InputMode:       audio.ParseInputMode(as.InputMode),
 		PreGainDB:       as.PreGainDB,
 	}
-}
-
-func derefInt(p *int, def int) int {
-	if p == nil {
-		return def
-	}
-	return *p
 }
 
 // GetAudioSettings 读取持久化语音设置（设置页初始化用；未设置字段回落默认值）。
@@ -1510,66 +1486,25 @@ func (a *App) hotkeyLoop() {
 	}
 }
 
-// hotkeyEffect 是一次热键事件要产生的效果。
-type hotkeyEffect struct {
-	pttPress   bool // 按住说话：打开发送门
-	pttRelease bool // 松开说话：关门并开尾包窗
-	mute       bool // 切换闭麦
-	deafen     bool // 切换静音（耳聋）
-	dual       bool // 全关 / 全开
-}
-
-// effectOf 把一次热键事件翻译成要做的动作。
-//
-// 两类动作的触发沿完全不同，混用会出线上事故：
-//   - PTT 是「按住说话」，按下和抬起都要响应，少一个就变成开关或卡在说话；
-//   - 闭麦 / 静音 / 全关全是锁存开关，用户心理模型是「按一下切一次」，
-//     **只能由按下沿触发**。若抬起也响应，实际行为变成「按住闭麦、松开
-//     恢复说话」——与任何用户对快捷键的预期都相反。
-func effectOf(ev hotkey.Event) hotkeyEffect {
-	var e hotkeyEffect
-	switch ev.Action {
-	case hotkey.ActionPTT:
-		if ev.Pressed {
-			e.pttPress = true
-		} else {
-			e.pttRelease = true
-		}
-	case hotkey.ActionMute, hotkey.ActionDeafen, hotkey.ActionDual:
-		if !ev.Pressed {
-			return e // 锁存开关忽略抬起沿
-		}
-		switch ev.Action {
-		case hotkey.ActionMute:
-			e.mute = true
-		case hotkey.ActionDeafen:
-			e.deafen = true
-		case hotkey.ActionDual:
-			e.dual = true
-		}
-	}
-	return e
-}
-
 // handleHotkeyEvent 热键动作分发，跑在专用 goroutine 上。跨线程约定与 OnKicked
 // 一致：不碰会话内部状态，只走 Session 的公开方法（内部已原子/加锁），
 // emit 非阻塞可直调。
 func (a *App) handleHotkeyEvent(ev hotkey.Event) {
-	e := effectOf(ev)
+	e := desktop.EffectOf(ev)
 	switch {
-	case e.pttPress:
+	case e.PTTPress:
 		a.hkGate.Press()
-	case e.pttRelease:
+	case e.PTTRelease:
 		// 尾包窗：松手后补一小段话音，避免末字被硬切。
 		tail := time.Duration(a.cfg.GetHotkeySettings().TailMS) * time.Millisecond
 		a.hkGate.Release(tail)
-	case e.mute:
+	case e.Mute:
 		mute, _ := a.voiceMuteState()
 		a.SetMute(!mute)
-	case e.deafen:
+	case e.Deafen:
 		_, deafen := a.voiceMuteState()
 		a.SetDeafen(!deafen)
-	case e.dual:
+	case e.Dual:
 		// 全关 / 全开：已全关则全开，否则全关（与前端 dual 语义一致）。
 		mute, deafen := a.voiceMuteState()
 		allOff := !(mute && deafen)
