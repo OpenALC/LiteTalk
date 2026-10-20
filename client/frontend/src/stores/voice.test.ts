@@ -172,4 +172,30 @@ describe('voice store 房间态清理', () => {
     mockEventsOn.fire('voice:unavailable', { error: '音频设备启动失败' })
     expect(notify.visible).toBe(false)
   })
+
+  // rtc:failed（#34）：ICE 失败重建时提示用户语音链路正在恢复；载荷 {channel_id}
+  // 不参与文案。
+  it('rtc:failed 经 notify 提示语音连接失败', () => {
+    const voice = useVoiceStore()
+    const notify = useNotifyStore()
+    voice.bindEvents()
+
+    mockEventsOn.fire('rtc:failed', { channel_id: 'room1' })
+
+    expect(notify.visible).toBe(true)
+    expect(notify.isError).toBe(true)
+    expect(notify.text).toBe('语音连接失败')
+    voice.unbindEvents()
+  })
+
+  it('unbindEvents 注销 rtc:failed，注销后不再提示', () => {
+    const voice = useVoiceStore()
+    const notify = useNotifyStore()
+    voice.bindEvents()
+    voice.unbindEvents()
+
+    expect(mockEventsOn.handlers.get('rtc:failed')).toHaveLength(0)
+    mockEventsOn.fire('rtc:failed', { channel_id: 'room1' })
+    expect(notify.visible).toBe(false)
+  })
 })

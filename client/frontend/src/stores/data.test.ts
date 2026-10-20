@@ -159,6 +159,54 @@ describe('频道列表恢复', () => {
     expect(s.findServer('9')?.unavailable).toBeFalsy()
     expect(s.findServer('9')?.channels).toHaveLength(1)
   })
+
+  // ListServers 失败不再静默（#12）：toast 提示，串行链不断，下一次加载照常。
+  it('ListServers 失败时提示且不阻断后续加载', async () => {
+    mockGoApp.ListServers.mockRejectedValueOnce(
+      new Error('get /servers: dial tcp 127.0.0.1:8077: connectex: No connection could be made'))
+    const s = useServersStore()
+    const notify = useNotifyStore()
+
+    await expect(s.loadRemoteServers()).resolves.toBeUndefined()
+    expect(notify.visible).toBe(true)
+    expect(notify.isError).toBe(true)
+    expect(notify.text).toBe('服务器列表加载失败')
+    // 内置示例保留，界面其余操作照常。
+    expect(s.findServer('hq')).toBeTruthy()
+
+    mockGoApp.ListServers.mockResolvedValueOnce([
+      { id: 7, name: '服七', owner_id: 1, icon_name: 'music', icon_color: '#4FA4F3' },
+    ])
+    mockGoApp.ListChannels.mockResolvedValue({ categories: [], channels: [] })
+    await s.loadRemoteServers()
+    expect(s.findServer('7')?.name).toBe('服七')
+  })
+
+  it('ListServers 成功时不弹提示', async () => {
+    mockGoApp.ListServers.mockResolvedValue([])
+    const s = useServersStore()
+    const notify = useNotifyStore()
+
+    await s.loadRemoteServers()
+
+    expect(notify.visible).toBe(false)
+  })
+
+  it('旧会话在飞的 ListServers 失败不提示', async () => {
+    let rejectList!: (e: Error) => void
+    mockGoApp.ListServers.mockReturnValue(new Promise((_res, rej) => { rejectList = rej }))
+    const s = useServersStore()
+    const notify = useNotifyStore()
+
+    const p = s.loadRemoteServers()
+    // 让串行链启动、ListServers 真正在飞，再复位会话。
+    await Promise.resolve()
+    s.resetAll()
+    rejectList(new Error('RuntimeError: get /servers: dial tcp: connection refused'))
+    await expect(p).resolves.toBeUndefined()
+
+    expect(notify.visible).toBe(false)
+  })
 })
 
 describe('分类改名与排序', () => {
