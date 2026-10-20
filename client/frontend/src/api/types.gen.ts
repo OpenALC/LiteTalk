@@ -614,7 +614,7 @@ export interface paths {
         get?: never;
         /**
          * 全量替换成员角色（需 ManageRoles，#35 B4）
-         * @description @everyone 强制保留；服务器 owner 的 owner 角色强制保留（不能经此降级）； owner builtin 不可分配（owner 身份只由 servers.owner_id 决定）。 层级防提权：目标角色（除 @everyone）的 position 必须严格小于操作者最高 角色 position，且权限位必须是操作者权限的子集。成功后 legacy role 投影同步。 code：bad_request、路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
+         * @description @everyone 强制保留；服务器 owner 的 owner 角色强制保留（不能经此降级）； owner builtin 不可分配（owner 身份只由 servers.owner_id 决定）。 层级防提权：目标角色（除 @everyone）的 position 必须严格小于操作者最高 角色 position，且权限位必须是操作者权限的子集；目标成员的最高角色 position 也不得大于等于操作者（同级/上级不可动，owner 操作者不受限）。 成功后 legacy role 投影同步。 code：bad_request、路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
          */
         put: operations["setMemberRoles"];
         post?: never;
