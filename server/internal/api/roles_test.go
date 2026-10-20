@@ -237,6 +237,50 @@ func (w *permWorld) ownerIDNum(t *testing.T) int64 {
 	return meID(t, w.h, w.owner)
 }
 
+// TestMemberRolesTargetHierarchy 目标层级闸（#35 验收追加）：非 owner 不能改
+// 不低于自己的成员——堵住「admin 对另一个 admin 提交 role_ids:[] 做降级」。
+func TestMemberRolesTargetHierarchy(t *testing.T) {
+	w := newPermWorld(t)
+	h := w.h
+	ctx := context.Background()
+
+	// 第二个 admin（直写 store 挂 builtin；角色管理 API 是 B4 自己测的对象）。
+	admin2 := mustReg(t, h, w.mem, "pw-a2@ex.com", "pwAdmin2")
+	admin2ID := meID(t, h, admin2)
+	if err := w.mem.AddMember(ctx, &store.ServerMember{ServerID: w.serverID, UserID: admin2ID, Role: store.RoleAdmin}); err != nil {
+		t.Fatalf("AddMember(admin2): %v", err)
+	}
+	// 位置 0 的自定义角色（admin 最高位 1，0 < 1 可分配）。
+	roleResp := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/roles", w.serverID), w.owner,
+		map[string]any{"name": "低位", "position": 0, "permissions": "8"}, http.StatusCreated)
+	lowID := asID(roleResp["id"])
+	adminID := meID(t, h, w.admin)
+	memberID := meID(t, h, w.member)
+
+	// admin 改另一个 admin（含空列表降级）→ 403。
+	doJSON(t, h, http.MethodPut, fmt.Sprintf("/api/v1/servers/%d/members/%d/roles", w.serverID, admin2ID), w.admin,
+		map[string]any{"role_ids": []string{}}, http.StatusForbidden)
+	doJSON(t, h, http.MethodPut, fmt.Sprintf("/api/v1/servers/%d/members/%d/roles", w.serverID, admin2ID), w.admin,
+		map[string]any{"role_ids": []string{fmt.Sprint(lowID)}}, http.StatusForbidden)
+	// 自己也不能自降级？——自己是同级（1 >= 1），同规则拒（防误操作也一致）。
+	doJSON(t, h, http.MethodPut, fmt.Sprintf("/api/v1/servers/%d/members/%d/roles", w.serverID, adminID), w.admin,
+		map[string]any{"role_ids": []string{fmt.Sprint(lowID)}}, http.StatusForbidden)
+
+	// admin 改普通成员（0 < 1）→ 成功。
+	doJSON(t, h, http.MethodPut, fmt.Sprintf("/api/v1/servers/%d/members/%d/roles", w.serverID, memberID), w.admin,
+		map[string]any{"role_ids": []string{fmt.Sprint(lowID)}}, http.StatusOK)
+
+	// owner 改 admin → 成功（不受目标层级限制）。
+	doJSON(t, h, http.MethodPut, fmt.Sprintf("/api/v1/servers/%d/members/%d/roles", w.serverID, admin2ID), w.owner,
+		map[string]any{"role_ids": []string{fmt.Sprint(lowID)}}, http.StatusOK)
+
+	// 目标不是成员 → 404（admin 与 owner 同口径）。
+	doJSON(t, h, http.MethodPut, fmt.Sprintf("/api/v1/servers/%d/members/4242424242/roles", w.serverID), w.admin,
+		map[string]any{"role_ids": []string{}}, http.StatusNotFound)
+	doJSON(t, h, http.MethodPut, fmt.Sprintf("/api/v1/servers/%d/members/4242424242/roles", w.serverID), w.owner,
+		map[string]any{"role_ids": []string{}}, http.StatusNotFound)
+}
+
 // TestOverwritesAPI 覆盖 set/get/delete、越界位、跨服目标、变更后可见性立即变化。
 func TestOverwritesAPI(t *testing.T) {
 	w := newPermWorld(t)

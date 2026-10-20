@@ -36,6 +36,29 @@ func (s *Server) roleRankOf(ctx context.Context, serverID, userID int64) (roleRa
 		}
 		return roleRank{}, s.writeStoreErr(ctx, err)
 	}
+	max, e := s.maxPosition(ctx, serverID, userID, roles)
+	if e != nil {
+		return roleRank{}, e
+	}
+	return roleRank{max: max}, nil
+}
+
+// targetMaxRank 目标成员当前角色的最高 position。非成员 404——目标侧的错误口径
+// 与操作者侧（403）不同：跨服/移出成员不出存在性（#35 B4 追加层级闸）。
+func (s *Server) targetMaxRank(ctx context.Context, serverID, userID int64) (int, *apiErr) {
+	roles, err := s.store.RolesOfMember(ctx, serverID, userID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return 0, errf(http.StatusNotFound, "not_found", "资源不存在")
+		}
+		return 0, s.writeStoreErr(ctx, err)
+	}
+	return s.maxPosition(ctx, serverID, userID, roles)
+}
+
+// maxPosition 角色列表的最高 position；空列表按 legacy member=0/admin=1/owner=2 回退
+// （B1 之后正常数据不会走到；0010 未回填的旧库可能）。
+func (s *Server) maxPosition(ctx context.Context, serverID, userID int64, roles []store.Role) (int, *apiErr) {
 	max := -1
 	for _, r := range roles {
 		if r.Position > max {
@@ -43,10 +66,9 @@ func (s *Server) roleRankOf(ctx context.Context, serverID, userID int64) (roleRa
 		}
 	}
 	if len(roles) == 0 {
-		// legacy 回退（B1 之后正常数据不会走到；0010 未回填的旧库可能）。
 		mem, err := s.store.Member(ctx, serverID, userID)
 		if err != nil {
-			return roleRank{}, s.writeStoreErr(ctx, err)
+			return 0, s.writeStoreErr(ctx, err)
 		}
 		switch mem.Role {
 		case store.RoleOwner:
@@ -57,7 +79,7 @@ func (s *Server) roleRankOf(ctx context.Context, serverID, userID int64) (roleRa
 			max = 0
 		}
 	}
-	return roleRank{max: max}, nil
+	return max, nil
 }
 
 // guardRoleBody 防提权（#35 B4）：非 owner 的 position 必须严格小于自己最高位，
@@ -385,6 +407,18 @@ func (s *Server) SetMemberRoles(ctx context.Context, request SetMemberRolesReque
 	rr, e := s.roleRankOf(ctx, request.Id, c.UserID)
 	if e != nil {
 		return nil, e
+	}
+	// 目标层级闸（#35 验收追加）：非 owner 只能动比自己低的成员——否则同级 admin
+	// 提交 role_ids: [] 就能把另一个 admin 降级（Store 只强制 @everyone）。
+	// 目标非成员 404；owner 操作者不受限（Store 对 owner 目标另有强制保留兜底）。
+	if !rr.owner {
+		tRank, e := s.targetMaxRank(ctx, request.Id, request.UserId)
+		if e != nil {
+			return nil, e
+		}
+		if tRank >= rr.max {
+			return nil, errf(http.StatusForbidden, "forbidden", "不能改动不低于自己的成员")
+		}
 	}
 	want := make([]int64, 0, len(request.Body.RoleIds))
 	seen := map[int64]bool{}
