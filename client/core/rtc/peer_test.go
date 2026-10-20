@@ -300,9 +300,9 @@ func TestPeerLoopback(t *testing.T) {
 	<-iceDone
 }
 
-// TestPeerDropDTX 发送端丢弃 DTX 空包：≤2 字节载荷不发出，但 seq/时戳照常
-// 推进（时间线连续，对端按断流做丢包补偿）；恢复说话后 seq/时戳衔接。
-func TestPeerDropDTX(t *testing.T) {
+// TestPeerSendDTXHeartbeat 发送端照常发送 DTX 心跳包：≤2 字节载荷进入 RTP，
+// seq/时戳逐包连续（接收端 jitter 不判空洞）；用户主动静音仍然整包丢弃。
+func TestPeerSendDTXHeartbeat(t *testing.T) {
 	sfu := newFakeSFU(t)
 
 	localSDP := make(chan webrtc.SessionDescription, 4)
@@ -357,12 +357,12 @@ func TestPeerDropDTX(t *testing.T) {
 	waitConnected(t, peer, sfu)
 
 	speech := bytes.Repeat([]byte{0xAB}, 80)
+	dtx := []byte{0x00}
 	if err := peer.SendOpus(speech); err != nil {
 		t.Fatalf("SendOpus speech1: %v", err)
 	}
-	// 静音期 DTX 空包：应被丢弃但 seq/时戳推进。
 	for i := 0; i < 3; i++ {
-		if err := peer.SendOpus([]byte{0x00}); err != nil {
+		if err := peer.SendOpus(dtx); err != nil {
 			t.Fatalf("SendOpus dtx %d: %v", i, err)
 		}
 	}
@@ -370,30 +370,53 @@ func TestPeerDropDTX(t *testing.T) {
 		t.Fatalf("SendOpus speech2: %v", err)
 	}
 
-	var first, second *rtp.Packet
-	select {
-	case first = <-sfu.gotRTP:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting first speech pkt")
+	// 5 个包全部到达：seq/时戳逐包 +1/+960，DTX 载荷原样转发。
+	wantPayloads := [][]byte{speech, dtx, dtx, dtx, speech}
+	var prev *rtp.Packet
+	for i, want := range wantPayloads {
+		var pkt *rtp.Packet
+		select {
+		case pkt = <-sfu.gotRTP:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timeout waiting uplink pkt %d", i)
+		}
+		if !bytes.Equal(pkt.Payload, want) {
+			t.Fatalf("pkt %d payload len=%d, want len=%d", i, len(pkt.Payload), len(want))
+		}
+		if prev != nil {
+			if pkt.SequenceNumber != prev.SequenceNumber+1 {
+				t.Fatalf("pkt %d seq = %d, want %d", i, pkt.SequenceNumber, prev.SequenceNumber+1)
+			}
+			if pkt.Timestamp != prev.Timestamp+rtpTimestampStep {
+				t.Fatalf("pkt %d ts = %d, want %d (+%d)", i, pkt.Timestamp, prev.Timestamp+rtpTimestampStep, rtpTimestampStep)
+			}
+		}
+		prev = pkt
+	}
+	if got := peer.Stats.PacketsSent.Load(); got != 5 {
+		t.Fatalf("PacketsSent = %d, want 5", got)
+	}
+	if got := peer.Stats.SentDTX.Load(); got != 3 {
+		t.Fatalf("SentDTX = %d, want 3", got)
+	}
+
+	// 用户主动静音：连 DTX 心跳也不发，计数为静音丢弃。
+	peer.SetMuted(true)
+	if err := peer.SendOpus(dtx); err != nil {
+		t.Fatalf("SendOpus muted dtx: %v", err)
+	}
+	if got := peer.Stats.MutedDropped.Load(); got != 1 {
+		t.Fatalf("MutedDropped = %d, want 1", got)
+	}
+	if got := peer.Stats.SentDTX.Load(); got != 3 {
+		t.Fatalf("SentDTX after mute = %d, want 3", got)
 	}
 	select {
-	case second = <-sfu.gotRTP:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting second speech pkt")
+	case pkt := <-sfu.gotRTP:
+		t.Fatalf("received pkt while muted: seq %d", pkt.SequenceNumber)
+	case <-time.After(300 * time.Millisecond):
 	}
-	// 中间 3 个空包被吞：序号跳 4、时戳跳 4×960，时间线保持与发送节拍一致。
-	if second.SequenceNumber != first.SequenceNumber+4 {
-		t.Fatalf("seq gap = %d, want 4 (3 DTX dropped + 1)", int(second.SequenceNumber-first.SequenceNumber))
-	}
-	if second.Timestamp != first.Timestamp+4*rtpTimestampStep {
-		t.Fatalf("ts gap = %d, want %d", second.Timestamp-first.Timestamp, 4*rtpTimestampStep)
-	}
-	if got := peer.Stats.DTXDropped.Load(); got != 3 {
-		t.Fatalf("DTXDropped = %d, want 3", got)
-	}
-	if got := peer.Stats.PacketsSent.Load(); got != 2 {
-		t.Fatalf("PacketsSent = %d, want 2", got)
-	}
+	peer.SetMuted(false)
 
 	close(localICE)
 	<-iceDone
