@@ -2,11 +2,11 @@
 // ChannelList 频道栏（v0.1.2）：双击加入语音频道（单击仅选中，对齐 Discord 语义）；
 // 空白处右键创建频道/分类；分类头右键重命名/删除分类（含频道，二次确认），
 // 按住分类头拖拽排序（#16，原生 DnD）；空服务器显示空态（#12）；
-// 分类数据源为 servers.groupsOf（服务端 categories 实体 + 内置示例本地语义）；
+// 分类数据源为 servers.groupsOf（服务端 categories 实体）；
 // 底部齿轮跳转 /settings 独立路由页。
 import { computed, onMounted, ref } from 'vue'
 import {
-  ChevronDown, Eye, Hash, Lock, Mic, Volume2, Headphones, HeadphoneOff,
+  ChevronDown, Hash, Lock, Mic, Volume2, Headphones, HeadphoneOff,
   MicOff, Settings, Pencil, Trash2, FolderPlus, Folder, CircleAlert,
 } from 'lucide-vue-next'
 import { useRouter } from 'vue-router'
@@ -171,7 +171,7 @@ function openBlankCtx(e: MouseEvent) {
 const blankPrompt = ref<{ mode: 'channel' | 'category' } | null>(null)
 
 // catChoices 归入分类候选（#72）：真实分类 + 末位「未分类」。
-// groupsOf 的合成组（chan: 前缀，如内置示例自带组）不是服务端分类，不能当归宿。
+// groupsOf 的合成组（chan: 前缀，无分类频道归组用）不是服务端分类，不能当归宿。
 const catChoices = computed(() => [
   ...groups.value.filter((g) => !g.id.startsWith('chan:')).map((g) => ({ value: g.id, label: g.name })),
   { value: '', label: '未分类' },
@@ -215,12 +215,6 @@ async function onBlankConfirm(value: string, _option: string, option2: string) {
 // createChannelInGroup：新建频道并显式归入分类（#72）。categoryId 是服务端分类
 // id（'' = 不归类）；显式分类优先生效，缺省才由 store 走按名归组的旧路径。
 async function createChannelInGroup(serverId: string, name: string, categoryId: string) {
-  const s = servers.findServer(serverId)
-  if (!s) return
-  if (s.builtin) {
-    // 内置示例不支持新建（与 ServerRail 右键策略一致）。
-    throw new Error('示例服务器不可新建频道')
-  }
   await servers.createChannel(serverId, name, 'voice', categoryId)
 }
 
@@ -352,7 +346,7 @@ async function onCatDrop(e: DragEvent, gi: number) {
                  @click="pick(ch.id)"
                  @dblclick.prevent="joinOnDblClick(ch.id)"
                  @contextmenu.prevent="openCtx($event, ch.id, ch.name)">
-              <component :is="ch.type === 'text' ? Hash : (ch.locked ? Lock : (ch.id === 'ch-audience' ? Eye : Volume2))"
+              <component :is="ch.type === 'text' ? Hash : (ch.locked ? Lock : Volume2)"
                          :size="16" />
               <span class="cname">{{ ch.name }}</span>
               <span v-if="ch.id === voice.channelId" class="count">
