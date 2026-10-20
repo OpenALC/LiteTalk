@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"io/fs"
 	"os"
@@ -336,9 +337,24 @@ func TestFriendshipPairMigrationMySQL(t *testing.T) {
 		t.Fatalf("Store 层反向重复应 ErrConflict，实际 %v", err)
 	}
 
-	// down 只撤索引：回滚后索引消失，再迁移可重建（此时数据已无重复）。
-	if err := m.RollbackLast(ctx, full); err != nil {
-		t.Fatalf("回滚 0008 失败: %v", err)
+	// down 只撤索引：0008 之上可能还有更新的迁移，先逐个回滚到 0008 再撤它
+	// （RollbackLast 只撤最新一个，直接调用撤掉的是更新版本）。
+	for {
+		var latest string
+		err := m.DB().QueryRowContext(ctx,
+			`SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1`).Scan(&latest)
+		if err == sql.ErrNoRows {
+			t.Fatal("0008 未应用")
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if latest < "0008" {
+			break
+		}
+		if err := m.RollbackLast(ctx, full); err != nil {
+			t.Fatalf("回滚 %s 失败: %v", latest, err)
+		}
 	}
 	var n int
 	if err := m.DB().QueryRowContext(ctx,

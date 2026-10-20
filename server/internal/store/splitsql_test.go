@@ -232,7 +232,13 @@ func TestSplitSQLExistingMigrations(t *testing.T) {
 				continue
 			}
 			if len(stmts) == 0 {
-				t.Errorf("%s/%s: 没切出语句", dir, e.Name())
+				// 注释型 no-op 迁移（如 SQLite 侧的 0009_users_nickname_bin）合法：
+				// 整份文件只有 -- 注释，loader 只记录版本号。真正的语句不可能被
+				// 静默吞成 0 条——引号或块注释未闭合时 splitSQL 会报错。
+				if !commentOnly(string(body)) {
+					t.Errorf("%s/%s: 没切出语句", dir, e.Name())
+				}
+				continue
 			}
 			for _, stmt := range stmts {
 				again, err := splitSQL(stmt)
@@ -246,4 +252,16 @@ func TestSplitSQLExistingMigrations(t *testing.T) {
 			}
 		}
 	}
+}
+
+// commentOnly 迁移文件是否只有 -- 行注释与空行（注释型 no-op 迁移）。
+func commentOnly(s string) bool {
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "--") {
+			continue
+		}
+		return false
+	}
+	return true
 }
