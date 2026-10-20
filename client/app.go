@@ -1180,6 +1180,14 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 		OnRTCFailed: func(channelID string) {
 			a.emit("rtc:failed", map[string]any{"channel_id": channelID})
 		},
+		// 进房被服务端拒绝（#91）：Session 已回滚房间态（InRoom=false，重连不
+		// 再重发 join）。前端据 voice:join_failed 清掉 channelId/延迟并提示。
+		// 同一次失败不再走 chat:error（见 ErrorHandlerEx）。
+		OnJoinFailed: func(channelID, code, message string) {
+			a.emit("voice:join_failed", map[string]string{
+				"channel_id": channelID, "code": code, "message": message,
+			})
+		},
 		// 续传补拉完成（#32/#78）：消息与好友在线态已由 Session 内部回灌，
 		// 服务器/频道等 REST 视图可能已过期。事件名固定 data:resync，只做提示，
 		// 前端收到后自行经绑定刷新（data/friends store 各自订阅）。
@@ -1211,7 +1219,12 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 		})
 	})
 	// 服务端 error 帧转发前端（B1：此前未订阅，服务端拒收时消息凭空消失）。
-	sess.ErrorHandler(func(code, message string) {
+	// 已归属进房路径的错误（#91）由 voice:join_failed 承载，这里跳过以免同一次
+	// 失败弹两条提示。
+	sess.ErrorHandlerEx(func(code, message string, joinHandled bool) {
+		if joinHandled {
+			return
+		}
 		a.emit("chat:error", map[string]string{
 			"code": code, "message": message,
 		})
