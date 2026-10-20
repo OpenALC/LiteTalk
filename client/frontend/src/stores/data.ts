@@ -26,9 +26,8 @@ export interface Server {
   name: string
   icon: string // Lucide 图标名（禁头像/上传图——硬性约束）
   channels: Channel[]
-  // builtin 内置示例服务器：WS 频道 ID 为不透明字符串，可直接加入通话，
-  // 是语音联调的演练场；它们不是服务端实体，管理操作（重命名/删除/邀请）
-  // 对其一律提示不可编辑。REST 创建的频道会获得数字 ID，WS 同样可加入。
+  // builtin 仅为类型兼容保留：内置示例服务器已移除，不再产生实例；
+  // ServerRail 仍有针对它的守卫。
   builtin?: boolean
   // unavailable 频道列表加载失败（多为被踢出/成员数据异常的 403）：频道区据此
   // 给出解释而不是恒空（#12）。
@@ -50,7 +49,7 @@ export interface Friend {
   // incoming=true 时备注/分组项必须禁用（review B1：否则 100% 弹 403）。
 }
 
-// isRealID 判断是否为服务端实体 ID（纯数字）；内置示例为字符串 ID。
+// isRealID 判断是否为服务端实体 ID（纯数字）；groupsOf 合成的 chan: 分组不是实体。
 export function isRealID(id: string): boolean {
   return /^\d+$/.test(id)
 }
@@ -89,37 +88,9 @@ function iconFromServer(name: string): string {
   return map[name] ?? 'MessagesSquare'
 }
 
-// initialServers 登录前的内置示例服务器快照（每次返回全新对象）。
-// 内置示例允许本地改名/删频道（服务端无实体），复位时必须回到出厂内容——
-// 复用同一个数组会把上一个会话的本地改动带到下一个账号。
-function initialServers(): Server[] {
-  return [
-    {
-      id: 'hq', name: '语音总部', icon: 'MessagesSquare', builtin: true,
-      channels: [
-        { id: 'notice', name: '通知公告', type: 'text', group: '文字频道' },
-        { id: 'chat', name: '闲聊广场', type: 'text', group: '文字频道' },
-        { id: 'tech', name: '技术讨论', type: 'text', group: '文字频道' },
-        { id: 'ch-hall', name: '休闲大厅', type: 'voice', members: 4, group: '语音频道' },
-        { id: 'ch-game1', name: '竞技室 #1', type: 'voice', members: 2, group: '语音频道' },
-        { id: 'ch-game2', name: '竞技室 #2', type: 'voice', group: '语音频道' },
-        { id: 'ch-private', name: '私密会议室', type: 'voice', locked: true, members: 1, group: '语音频道' },
-        { id: 'ch-audience', name: '观众席', type: 'voice', members: 8, group: '特殊频道' },
-      ],
-    },
-    { id: 'game', name: '竞技开黑', icon: 'Gamepad2', builtin: true, channels: [
-      { id: 'game-hall', name: '开黑大厅', type: 'voice', members: 3, group: '语音频道' },
-    ] },
-    { id: 'music', name: '音乐电台', icon: 'Music', builtin: true, channels: [
-      { id: 'radio', name: '电台直播间', type: 'voice', group: '语音频道' },
-    ] },
-    { id: 'design', name: '设计工坊', icon: 'Palette', builtin: true, channels: [] },
-    { id: 'book', name: '读书会', icon: 'BookOpen', builtin: true, channels: [] },
-  ]
-}
-
 export const useServersStore = defineStore('servers', () => {
-  const servers = ref<Server[]>(initialServers())
+  // 登录前为空列表；登录后由 loadRemoteServers 从服务端填充。
+  const servers = ref<Server[]>([])
   const currentServerId = ref('')
   const currentChannelId = ref('')
 
@@ -149,6 +120,8 @@ export const useServersStore = defineStore('servers', () => {
     introHidden.value = v
   }
 
+  // 列表为空时 currentServer 为 undefined（登录前/无服务器）：消费方必须先
+  // 确认存在当前服务器（MainView 用 isIntro 兜底），不能无条件取字段。
   const currentServer = computed(() =>
     servers.value.find((s) => s.id === currentServerId.value) ?? servers.value[0])
   const currentChannel = computed(() =>
@@ -174,13 +147,13 @@ export const useServersStore = defineStore('servers', () => {
 
   // ---- 真实 REST（批次①接线） ----
 
-  // loadRemoteServers 登录后拉取真实服务器并恢复各自频道列表（数字 ID 与内置示例不冲突）。
+  // loadRemoteServers 登录后拉取真实服务器并恢复各自频道列表。
   // 逐服调 ListChannels；单服失败标记 unavailable 并提示（#12，不重试），不阻断其它服。
-  // ListServers 失败不再静默（#12）：toast 一次后保留内置示例，界面其余操作照常；
+  // ListServers 失败不再静默（#12）：toast 一次后保留当前界面，其余操作照常；
   // 与 loadChannels 一致在内部消化失败，调用方无需再 catch。
   // 快照语义（#78）：续传失败后也会再调一次，已存在的服务器更新名称/图标，
   // 服务端已不存在的真实服务器（被移出/解散）从本地剔除——否则视图永远停在
-  // 断线前的陈旧列表。内置示例不是服务端实体，不参与对账。
+  // 断线前的陈旧列表。
   // 串行化：data:resync 可能在上一次加载仍在飞时到达，并发对账会用过期的
   // ids 集合误删另一次刚拉到的服务器。
   let loadChain: Promise<void> = Promise.resolve()
@@ -224,7 +197,7 @@ export const useServersStore = defineStore('servers', () => {
       await loadChannels(gen, id)
       if (gen !== generation) return
     }
-    servers.value = servers.value.filter((x) => x.builtin || ids.has(x.id))
+    servers.value = servers.value.filter((x) => ids.has(x.id))
     // 当前服务器已被移出/解散：回退到第一个可用服务器（介绍页不是服务器实体，
     // 不能因对账把它顶掉）。
     if (currentServerId.value && currentServerId.value !== INTRO_ID
@@ -238,7 +211,7 @@ export const useServersStore = defineStore('servers', () => {
   // unavailable 并 toast——被踢出（403）与网络错误都给解释，频道区不能恒空。
   async function loadChannels(gen: number, serverId: string) {
     const s = findServer(serverId)
-    if (!s || s.builtin) return
+    if (!s) return
     let out: ServerChannels
     try {
       out = await goApp().ListChannels(serverId)
@@ -277,28 +250,45 @@ export const useServersStore = defineStore('servers', () => {
     }
   }
 
-  // createServer 创建服务器（REST），成功即选中。
+  // createServer 创建服务器（REST），成功即选中并拉取分类/频道。
+  // 拉取失败由 loadChannels 内部提示，不阻断创建结果。
   async function createServer(name: string) {
+    const gen = generation
     const s = await goApp().CreateServer(name)
-    servers.value.push({ id: String(s.id), name: s.name, icon: iconFromServer(s.icon_name), channels: [] })
-    selectServer(String(s.id))
+    if (gen !== generation) return
+    const id = String(s.id)
+    servers.value.push({ id, name: s.name, icon: iconFromServer(s.icon_name), channels: [] })
+    selectServer(id)
+    await loadChannels(gen, id)
+    // 服务端带默认频道时补选第一个；用户已切走则不抢选中。
+    if (gen === generation && currentServerId.value === id && !currentChannelId.value) {
+      selectServer(id)
+    }
   }
 
-  // joinServer 凭邀请码加入（REST），成功即选中；已是成员时服务端原样返回，本地去重。
+  // joinServer 凭邀请码加入（REST），成功即选中并拉取分类/频道；已是成员时
+  // 服务端原样返回，本地去重后同样拉取（此前只在登录时拉，好友加入后永远
+  // 看不到频道/分类，#91）。
   async function joinServer(code: string) {
+    const gen = generation
     const s = await goApp().JoinServerByCode(code)
+    if (gen !== generation) return
     const id = String(s.id)
     if (!servers.value.some((x) => x.id === id)) {
       servers.value.push({ id, name: s.name, icon: iconFromServer(s.icon_name), channels: [] })
     }
     selectServer(id)
+    await loadChannels(gen, id)
+    // 拉取频道前 selectServer 只能选中空频道：回来后补选第一个。
+    if (gen === generation && currentServerId.value === id && !currentChannelId.value) {
+      selectServer(id)
+    }
   }
 
-  // renameServer 重命名（REST；内置示例抛错由 UI 提示）。
+  // renameServer 重命名（REST）。
   async function renameServer(id: string, name: string) {
     const s = findServer(id)
     if (!s) return
-    if (s.builtin) throw new Error('示例服务器不可编辑')
     await goApp().RenameServer(id, name)
     s.name = name
   }
@@ -308,7 +298,6 @@ export const useServersStore = defineStore('servers', () => {
   async function removeServer(id: string) {
     const s = findServer(id)
     if (!s) return
-    if (s.builtin) throw new Error('示例服务器不可删除')
     await goApp().DeleteServer(id)
     servers.value = servers.value.filter((x) => x.id !== id)
     if (homeId.value === id) {
@@ -334,7 +323,6 @@ export const useServersStore = defineStore('servers', () => {
   async function createChannel(serverId: string, name: string, type: 'text' | 'voice', categoryId?: string) {
     const s = findServer(serverId)
     if (!s) return
-    if (s.builtin) throw new Error('示例服务器不可新建频道')
     const catId = categoryId ?? ''
     const c = await goApp().CreateChannel(serverId, name, type, catId)
     const cat = categoryId ? (extraGroups.value[serverId] ?? []).find((g) => g.id === categoryId) : undefined
@@ -347,46 +335,41 @@ export const useServersStore = defineStore('servers', () => {
     })
   }
 
-  // renameChannel 重命名频道：真实频道（数字 ID）同步服务端；
-  // 内置示例频道仅本地生效（服务端无对应实体，重启还原）。
+  // renameChannel 重命名频道（REST）。
   async function renameChannel(serverId: string, chId: string, name: string) {
     const ch = findServer(serverId)?.channels.find((c) => c.id === chId)
     if (!ch) return
-    if (isRealID(chId)) {
-      await goApp().RenameChannel(chId, name)
-    }
+    await goApp().RenameChannel(chId, name)
     ch.name = name
   }
 
-  // deleteChannel 删除频道（语义同 renameChannel）。调用方负责先离开语音频道。
+  // deleteChannel 删除频道（REST）。调用方负责先离开语音频道。
   async function deleteChannel(serverId: string, chId: string) {
     const s = findServer(serverId)
     if (!s) return
-    if (isRealID(chId)) {
-      await goApp().DeleteChannel(chId)
-    }
+    await goApp().DeleteChannel(chId)
     s.channels = s.channels.filter((c) => c.id !== chId)
     if (currentChannelId.value === chId) {
       currentChannelId.value = s.channels[0]?.id ?? ''
     }
   }
 
-  // ---- 频道分类（v0.1.2：服务端 categories 实体 + 内置示例本地语义） ----
-  // extraGroups：服务器 ID → 分类列表（含空分类；内置服务器 id 为 'local-<name>'）。
+  // ---- 频道分类（v0.1.2：服务端 categories 实体） ----
+  // extraGroups：服务器 ID → 分类列表（含空分类）。
   // position 为显示序（真实分类 = 服务端 position，重排后 0..n-1）。
   const extraGroups = ref<Record<string, { id: string; name: string; position: number }[]>>({})
 
   // resetAll 恢复登录前状态（#85）：主动登出、被踢、跨域换服与登录新账号前
-  // 都由 auth store 调用。服务器列表回到内置示例，选中的服务器/频道与分类缓存
-  // 全清；事件订阅不在清理范围——data:resync 监听在 MainView 卸载时另由
-  // unbindEvents 按监听器注销，登录后重新 bind。幂等。
+  // 都由 auth store 调用。服务器列表清空（登录前为空），选中的服务器/频道与
+  // 分类缓存全清；事件订阅不在清理范围——data:resync 监听在 MainView 卸载时
+  // 另由 unbindEvents 按监听器注销，登录后重新 bind。幂等。
   // homeId / introHidden 属于 config.json 里的客户端级偏好，不是账号会话态，
   // 保留；若 homeId 指向新账号不可见的服务器，下一次 loadRemoteServers 会经
   // 「当前服务器不在列表」分支回退到可用项。
   function resetAll() {
     generation++
     loadChain = Promise.resolve()
-    servers.value = initialServers()
+    servers.value = []
     currentServerId.value = ''
     currentChannelId.value = ''
     extraGroups.value = {}
@@ -394,7 +377,7 @@ export const useServersStore = defineStore('servers', () => {
 
   // groupsOf 某服务器的全部分类。Channel.group 是分类名——按名归组（同名分类会
   // 合并显示，过渡方案）。排序：显式分类按 position；无分类条目的分组里「未分类」
-  // 沉底，其余（内置示例自带组）按频道首次出现序排在显式分类之前。sort 稳定。
+  // 沉底，其余（按名归组的过渡分组）按频道首次出现序排在显式分类之前。sort 稳定。
   function groupsOf(serverId: string, channels: Channel[]): { id: string; name: string }[] {
     const cats = extraGroups.value[serverId] ?? []
     const byName = new Map(cats.map((g) => [g.name, g]))
@@ -421,18 +404,10 @@ export const useServersStore = defineStore('servers', () => {
     return out.map(({ id, name }) => ({ id, name }))
   }
 
-  // createCategory 新建分类：真实服务器走 REST；内置示例仅本地（重启还原，注释已注明）。
+  // createCategory 新建分类（REST）。
   async function createCategory(serverId: string, name: string) {
     const s = findServer(serverId)
     if (!s) return
-    if (s.builtin) {
-      const list = extraGroups.value[serverId] ?? []
-      extraGroups.value = {
-        ...extraGroups.value,
-        [serverId]: [...list, { id: `local-${name}`, name, position: list.length }],
-      }
-      return
-    }
     const c = await goApp().CreateCategory(serverId, name)
     const list = extraGroups.value[serverId] ?? []
     extraGroups.value = {
@@ -442,11 +417,11 @@ export const useServersStore = defineStore('servers', () => {
   }
 
   // deleteCategory 删除分类及其下频道（二次确认由 UI 负责）：
-  // 真实服务器走 REST 级联删除；内置示例逐频道本地删 + 移除空分类。
+  // 真实分类走 REST 级联删除；合成组（chan:）逐频道删除。
   async function deleteCategory(serverId: string, catId: string, catName: string) {
     const s = findServer(serverId)
     if (!s) return
-    if (!s.builtin && isRealID(catId)) {
+    if (isRealID(catId)) {
       await goApp().DeleteCategory(catId, true) // with_channels=1 级联
       s.channels = s.channels.filter((c) => c.group !== catName)
     } else {
@@ -461,10 +436,10 @@ export const useServersStore = defineStore('servers', () => {
     }
   }
 
-  // renameCategory 重命名分类：真实服务器走 PATCH；内置示例仅本地（重启还原）。
+  // renameCategory 重命名分类：真实分类走 PATCH；合成组（chan: id）只改本地标签，
+  // 下一次 loadChannels 会按服务端数据重建。
   // 本地同步分类名与其下频道的 group——Channel.group 是分类名，按名归组的过渡方案
   // 必须改名即同步，否则归组失联（同名分类仍会合并显示，见 groupsOf 注释）。
-  // 未分类/内置自带组（chan: id）只改本地标签，重启后还原。
   async function renameCategory(serverId: string, catId: string, name: string) {
     const s = findServer(serverId)
     if (!s) return
@@ -472,7 +447,7 @@ export const useServersStore = defineStore('servers', () => {
     const g = list.find((x) => x.id === catId)
     const old = g ? g.name : catId.startsWith('chan:') ? catId.slice(5) : ''
     if (!old) return
-    if (!s.builtin && isRealID(catId)) {
+    if (isRealID(catId)) {
       await goApp().RenameCategory(catId, name)
     }
     if (g) {
@@ -486,7 +461,7 @@ export const useServersStore = defineStore('servers', () => {
 
   // reorderCategory 把分类移到目标序（0-based，相对 extraGroups 列表）：乐观改本地
   // 顺序与 position，落盘 PATCH（position = 最终序）；失败回滚快照并抛给 UI。
-  // 内置示例/本地分类只改本地状态。
+  // 合成组（chan:）不是服务端实体，只改本地状态。
   async function reorderCategory(serverId: string, catId: string, position: number) {
     const prev = (extraGroups.value[serverId] ?? []).map((g) => ({ ...g }))
     const from = prev.findIndex((g) => g.id === catId)
@@ -501,7 +476,7 @@ export const useServersStore = defineStore('servers', () => {
       [serverId]: list.map((g, i) => ({ ...g, position: i })),
     }
     const s = findServer(serverId)
-    if (!s || s.builtin || !isRealID(catId)) return
+    if (!s || !isRealID(catId)) return
     try {
       await goApp().UpdateCategory(catId, '', to)
     } catch (e) {
