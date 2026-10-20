@@ -223,6 +223,29 @@ func DefaultSettings() Settings {
 	return Settings{Enabled: false, Mode: ModePTT, TailMS: DefaultTailMS}
 }
 
+// EffectiveSendMode 返回发送门实际应采用的门控模式。
+//
+// PTT 只有在「已启用」且「绑定了 PTT 键」时才成立：未启用时 Manager 不安装
+// 全局钩子，按键永远不会到达；绑定为空时也没有按键可等。这两种情况若仍按
+// PTT 收门，所有上行帧都会被拦掉——服务端收不到音频，双方互相听不见
+// （出厂配置正是 Enabled=false + ModePTT + 无绑定）。因此退化为常开。
+//
+// 语音激活与常开不依赖钩子，原样返回；越界模式按 Sanitize 的收敛规则视作 PTT。
+// 平台是否支持全局钩子由调用方另行判断（见 app 层），本函数只描述设置语义。
+func EffectiveSendMode(s Settings) Mode {
+	m := s.Mode
+	if m != ModePTT && m != ModeVoice && m != ModeOpen {
+		m = ModePTT
+	}
+	if m != ModePTT {
+		return m
+	}
+	if !s.Enabled || strings.TrimSpace(s.PTT) == "" {
+		return ModeOpen
+	}
+	return ModePTT
+}
+
 // specFor 取某个动作的原始绑定串（未规范化）。
 func (s Settings) specFor(a Action) string {
 	switch a {
