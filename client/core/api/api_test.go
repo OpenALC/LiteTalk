@@ -676,6 +676,85 @@ func TestSyncDecode(t *testing.T) {
 	}
 }
 
+// TestAPIErrorRetryAfter 429 的 Retry-After 从响应头进 APIError（#31）：
+// GET 与 POST 两条路径都要带上；无头或非法值按 0（不乱给倒计时）。
+func TestAPIErrorRetryAfter(t *testing.T) {
+	cases := []struct {
+		name   string
+		method string
+		header string
+		want   int
+	}{
+		{"GET 有头", http.MethodGet, "3", 3},
+		{"GET 无头", http.MethodGet, "", 0},
+		{"POST 有头", http.MethodPost, "7", 7},
+		{"POST 非法头", http.MethodPost, "soon", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tc.header != "" {
+					w.Header().Set("Retry-After", tc.header)
+				}
+				w.Header().Set("Content-Type", "application/problem+json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(`{"code":"rate_limited","detail":"发送过于频繁"}`))
+			}))
+			defer srv.Close()
+
+			c := NewAPIClient(srv.URL)
+			var err error
+			if tc.method == http.MethodGet {
+				_, err = c.Me()
+			} else {
+				_, err = c.Login("a@b.c", "password123")
+			}
+			var ae *APIError
+			if !errors.As(err, &ae) {
+				t.Fatalf("429 应返回 *APIError，得到 %v", err)
+			}
+			if ae.Status != http.StatusTooManyRequests || ae.Code != "rate_limited" {
+				t.Fatalf("错误解码异常: %+v", ae)
+			}
+			if ae.RetryAfter != tc.want {
+				t.Fatalf("RetryAfter = %d, want %d", ae.RetryAfter, tc.want)
+			}
+		})
+	}
+}
+
+// TestListMessagesClampsLimit 客户端把 limit 夹到契约范围（1–50），
+// 不把非法值发给 fail-closed 的服务端（#31）。
+func TestListMessagesClampsLimit(t *testing.T) {
+	var mu sync.Mutex
+	var got []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/channels/7/messages" {
+			http.NotFound(w, r)
+			return
+		}
+		mu.Lock()
+		got = append(got, r.URL.Query().Get("limit"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+
+	c := NewAPIClient(srv.URL)
+	for _, limit := range []int{0, -3, 1, 50, 51} {
+		if _, err := c.ListMessages(7, limit); err != nil {
+			t.Fatalf("ListMessages(limit=%d): %v", limit, err)
+		}
+	}
+	want := []string{"50", "50", "1", "50", "50"}
+	mu.Lock()
+	defer mu.Unlock()
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("发送的 limit = %v, want %v", got, want)
+	}
+}
+
 // TestIsTransientRefreshError 刷新错误分类（#84 复审 4.1）：只有传输层错误
 // 可退避重试；服务端明确应答、被顶替、换服与无刷新源都不可恢复。
 func TestIsTransientRefreshError(t *testing.T) {
