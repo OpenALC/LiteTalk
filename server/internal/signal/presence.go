@@ -34,8 +34,15 @@ func presenceKey(uid string) string { return "presence:" + uid }
 //
 // 不能把边沿上算出的 online 直接落 KV：边沿判定与 KV 应用之间还有窗口，
 // 断线清理与重连可能交错，按各自捕获的状态落盘会让后执行的旧状态覆盖新状态。
-// 这里在 presenceMu 下重新数连接数，后到的写入总是取最新事实；presencePublished
-// 记录本进程已发布的态，兜住重复推送（同设备顶替、并发首连都只推一次）。
+// 这里在 presenceMu 下重新数连接数，后到的写入总是取最新事实。
+//
+// KV 写入与推送的判据分开：
+//   - 在线：总是重试 SET（即使 presencePublished 已为 true）。重复写同一个值幂等，
+//     而首 SET 失败后键可能只靠 renewPresence 续命；不依赖 published 去重才能
+//     在下一次在线边沿补写。published 只决定是否推 online。
+//   - 离线：无条件幂等 DEL。首 SET 失败后 renewPresence 可能已把键写回，此时
+//     published 仍是 false，若按 published 跳过 DEL 会让 presence 键残留到 TTL；
+//     published 只决定是否推 offline（好友从未收到 online 时不必推）。
 func (h *Hub) syncPresence(uid string) {
 	if h.presence == nil {
 		return
@@ -45,31 +52,33 @@ func (h *Hub) syncPresence(uid string) {
 	if h.presencePublished == nil {
 		h.presencePublished = make(map[string]bool)
 	}
-	online := h.connCount(uid) > 0
-	if h.presencePublished[uid] == online {
-		return // 状态未变：不重写、不重推
-	}
 	ctx := context.Background()
-	if online {
+	if h.connCount(uid) > 0 {
 		if err := h.presence.Set(ctx, presenceKey(uid), "1", h.ttl()); err != nil {
 			h.log.Printf("presence: SET %s 失败: %v", uid, err)
 			return
 		}
-	} else {
-		if err := h.presence.Del(ctx, presenceKey(uid)); err != nil {
-			h.log.Printf("presence: DEL %s 失败: %v", uid, err)
-			return
+		if h.presencePublished[uid] {
+			return // 已推过 online：只补写 KV，不重推
 		}
-	}
-	if online {
 		h.presencePublished[uid] = true
-	} else {
-		delete(h.presencePublished, uid) // 缺省即离线，避免 map 随历史用户无限增长
+		h.pushPresence(uid, true)
+		return
 	}
-	h.pushPresence(uid, online)
+	if err := h.presence.Del(ctx, presenceKey(uid)); err != nil {
+		h.log.Printf("presence: DEL %s 失败: %v", uid, err)
+		return
+	}
+	pushed := h.presencePublished[uid]
+	delete(h.presencePublished, uid) // 缺省即离线，避免 map 随历史用户无限增长
+	if pushed {
+		h.pushPresence(uid, false)
+	}
 }
 
-// renewPresence 心跳成功续期（25s 一拍，TTL 90s）。仅续期，不推送。
+// renewPresence 心跳成功续期（25s 一拍，TTL 90s）。仅续期，不推送，也不改
+// presencePublished：首 SET 失败时好友从未收到 online，续期只让 REST/成员快照
+// 看到在线，断线时由 syncPresence 无条件 DEL 收掉键，不应补推一条 offline。
 // 与 syncPresence 共用 presenceMu：若连接已被顶替/摘除，取消续期，避免在
 // 离线 DEL 之后又把键写回来。
 func (h *Hub) renewPresence(c *client) {
