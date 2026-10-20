@@ -21,10 +21,11 @@ tasks:
       - go build {{.BUILD_FLAGS}} -o {{.BIN_DIR}}/{{.APP_NAME}}.exe .
     vars:
       PRODUCTION: '{{.PRODUCTION | default "false"}}'
-      VERSION: '{{.VERSION | default "dev"}}'
+      VERSION: '{{.VERSION | default .DEFAULT_VERSION}}'
       # dev：无 production 标签（开发版 runtime.js，走 FRONTEND_DEVSERVER_URL）；
-      # production：与 CI 一致（-H windowsgui 去控制台窗，-s -w 瘦身）。
-      BUILD_FLAGS: '{{if eq .PRODUCTION "true"}}-tags production -trimpath -buildvcs=false -ldflags="-s -w -X main.version={{.VERSION}} -H windowsgui"{{else}}-buildvcs=false{{end}}'
+      # production：与 CI 一致（-s -w 瘦身）。
+      # 两条分支都加 -H windowsgui：dev 产物双击也不弹控制台，日志看 app.log。
+      BUILD_FLAGS: '{{if eq .PRODUCTION "true"}}-tags production -trimpath -buildvcs=false -ldflags="-s -w -X main.version={{.VERSION}} -H windowsgui"{{else}}-buildvcs=false -ldflags="-X main.version={{.VERSION}} -H windowsgui"{{end}}'
     env:
       CGO_ENABLED: '1'
       CC: '{{.MINGW_BIN}}/gcc.exe'
