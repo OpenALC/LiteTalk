@@ -148,8 +148,7 @@ async function invite() {
 
 <template>
   <div class="voice-room">
-    <!-- data-ctx：成员卡片右键菜单（v0.1.2 批次③在此挂自定义菜单） -->
-    <div class="voice-grid" data-ctx>
+    <div class="voice-grid">
       <div v-for="m in voice.members" :key="m.user_id" class="vcard"
            @contextmenu.prevent="openMemberCtx($event, m)">
         <!-- 自己的卡片不弹「更多」（音量调节/资料都对他人有意义） -->
