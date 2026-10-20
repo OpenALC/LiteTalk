@@ -64,7 +64,8 @@ type Hub struct {
 	// 实现为进程内环形队列（单实例假设，见 gateway.go 头注释）。
 	evlog EventLog
 
-	// 配额与频控（#20）：maxConns 单 uid 连接数；joinRate/offerRate 每分钟每连接。
+	// 配额与频控（#20）：maxConns 单 uid 连接数；joinRate/offerRate 每分钟每 uid
+	// （走 KV 全局限流，重连不清零；limits 为 nil 时回落到单连接计数）。
 	maxConns  int
 	joinRate  int
 	offerRate int
@@ -105,7 +106,8 @@ type client struct {
 	mu     sync.Mutex
 	roomID string // 当前所在频道（空 = 未加入）
 	state  VoiceStateData
-	rate   map[string]*rateWin // 单连接消息频控窗口（#20，随连接销毁丢弃）
+	// rate 单连接消息频控窗口（#20）：limits 为 nil 时的回落实现，随连接销毁丢弃。
+	rate map[string]*rateWin
 
 	// protoVer 协议版本（#29）：protoVerUnnegotiated=未收 client.hello（按 v1 处理）、
 	// protoVerIncompatible=版本无交集（拒收业务消息但不断连，裁定 #9）、≥1=协商结果。
@@ -113,7 +115,7 @@ type client struct {
 	protoVer atomic.Int64
 }
 
-// rateWin 固定窗计数（1 分钟窗，#20）。
+// rateWin 单连接固定窗计数（1 分钟窗，#20；仅 limits 为 nil 时使用）。
 type rateWin struct {
 	start time.Time
 	n     int
@@ -141,7 +143,7 @@ type ChatDeps struct {
 	Dev bool
 	// MaxConns 单 uid 的 WS 连接数上限（多设备，#20）；0 = 不限。
 	MaxConns int
-	// JoinRate / OfferRate 单连接 channel.join、rtc.offer 的每分钟次数上限（#20）；0 = 不限。
+	// JoinRate / OfferRate 单 uid channel.join、rtc.offer 的每分钟次数上限（#20）；0 = 不限。
 	JoinRate  int
 	OfferRate int
 	// Backlog 每会话事件环条数（LITETALK_GATEWAY_BACKLOG，#32）；0 = 默认 256。
@@ -563,7 +565,7 @@ func (h *Hub) handleMessage(c *client, data []byte) {
 			h.sendError(c, ErrCodeBadMessage, "channel.join 需要 channel_id")
 			return
 		}
-		// join 频控（#20）：单连接每分钟上限，超限 rate_limited。
+		// join 频控（#20）：单 uid 每分钟上限（跨连接累计），超限 rate_limited。
 		if !h.allowRate(c, TypeChannelJoin, h.joinRate) {
 			h.sendError(c, ErrCodeRateLimited, "入房过于频繁")
 			return
@@ -581,7 +583,7 @@ func (h *Hub) handleMessage(c *client, data []byte) {
 			h.sendError(c, ErrCodeBadMessage, "rtc.offer 需要 sdp")
 			return
 		}
-		// offer 频控（#20）：单连接每分钟上限，超限 rate_limited。
+		// offer 频控（#20）：单 uid 每分钟上限（跨连接累计），超限 rate_limited。
 		if !h.allowRate(c, TypeRTCOffer, h.offerRate) {
 			h.sendError(c, ErrCodeRateLimited, "协商过于频繁")
 			return
@@ -1087,14 +1089,22 @@ func (h *Hub) connQuotaOK(uid, dev string) bool {
 	return n < h.maxConns
 }
 
-// rateWindow 单连接消息频控窗长（固定窗 1 分钟，#20）。
+// rateWindow 消息频控窗长（固定窗 1 分钟，#20）。
 const rateWindow = time.Minute
 
-// allowRate 单连接消息频控（键 = 消息类型，计数在连接上、随 cleanup 销毁）。
-// limit<=0 不限流；超限返回 false（调用方回 rate_limited）。
+// allowRate 消息频控（#20）：join/offer 按 uid、按消息类型限流，键 ws:<uid>:<msgType>，
+// 与 chat 的 msg:<uid> 同一 KV 通道。按 uid 而非按连接是必须的——连接级计数在重连/
+// 多设备之间各自归零，等于没有上限；KV 窗口（Mem/Redis）跨连接累计。
+// 调用点在 WS 读循环，Allow 是一次本地 Mem 或单次 Redis 调用，与 chat 频控同路径，
+// 不引入额外阻塞。h.limits 为 nil（测试/过渡）时回落到单连接计数，此时重连会清零。
+// limit<=0 不限流；超限或 KV 出错返回 false（fail-closed，与 chat 一致）。
 func (h *Hub) allowRate(c *client, msgType string, limit int) bool {
 	if limit <= 0 {
 		return true
+	}
+	if h.limits != nil {
+		ok, err := h.limits.Allow(context.Background(), "ws:"+c.userID+":"+msgType, limit, rateWindow)
+		return err == nil && ok
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
