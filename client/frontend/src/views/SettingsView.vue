@@ -15,6 +15,7 @@ import {
   HOTKEY_ACTIONS, bindingFromKeyEvent, bindingFromMouseEvent, bindingLabel,
   findHotkeyConflicts, findInAppClashes, normalizeBinding, type HotkeyActionID,
 } from '../utils/hotkeySpec'
+import { cleanErrorText } from '../utils/errorText'
 import ServerConnPanel from '../components/ServerConnPanel.vue'
 import Toast from '../components/Toast.vue'
 
@@ -192,7 +193,7 @@ async function testMic() {
       toast.value?.show('未检测到声音——测试时请对着麦克风说话；若已说话仍如此，请检查麦克风权限或所选设备', true)
     }
   } catch (e) {
-    toast.value?.show(`麦克风测试失败：${e}`, true)
+    toast.value?.show(`麦克风测试失败：${cleanErrorText(e, '未知错误')}`, true)
   } finally {
     try {
       await levelBridge().StopLevelMonitor?.()
@@ -225,7 +226,7 @@ async function testSpeaker() {
     await goApp().TestSpeaker()
     toast.value?.show('已播放测试音，听到蜂鸣说明扬声器正常')
   } catch (e) {
-    toast.value?.show(`扬声器测试失败：${e}`, true)
+    toast.value?.show(`扬声器测试失败：${cleanErrorText(e, '未知错误')}`, true)
   } finally {
     testingSpk.value = false
   }
@@ -236,7 +237,7 @@ async function applyAudio() {
   try {
     await goApp().SetAudioSettings({ ...audio.value })
   } catch (e) {
-    toast.value?.show(`语音设置保存失败：${e}`, true)
+    toast.value?.show(`语音设置保存失败：${cleanErrorText(e, '未知错误')}`, true)
   }
 }
 
@@ -279,7 +280,7 @@ async function applyHotkey() {
   try {
     await goApp().SetHotkeySettings({ ...hk.value })
   } catch (e) {
-    toast.value?.show(`按键说话设置保存失败：${e}`, true)
+    toast.value?.show(`按键说话设置保存失败：${cleanErrorText(e, '未知错误')}`, true)
   }
 }
 

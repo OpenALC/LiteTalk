@@ -11,6 +11,7 @@ import AuthLayout from './AuthLayout.vue'
 import Toast from '../../components/Toast.vue'
 import { eventsOn, goApp } from '../../api/bridge'
 import { useAuthStore, kickedBannerText } from '../../stores/auth'
+import { cleanErrorText } from '../../utils/errorText'
 import './auth-forms.css'
 
 const router = useRouter()
@@ -85,7 +86,7 @@ async function submit() {
     toast.value?.show('登录成功')
     router.push('/')
   } catch (e) {
-    toast.value?.show(String(e), true)
+    toast.value?.show(cleanErrorText(e, '登录失败'), true)
   } finally {
     loading.value = false
   }
@@ -99,7 +100,7 @@ async function guestEnter() {
     await auth.guest()
     router.push('/')
   } catch (e) {
-    toast.value?.show(String(e), true)
+    toast.value?.show(cleanErrorText(e, '游客登录失败'), true)
   } finally {
     guestLoading.value = false
   }
