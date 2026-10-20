@@ -10,12 +10,15 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
-// outRoute 一条下行路由：outbound 轨道 + 其 RTPSender（摘除时 RemoveTrack 要用）。
+// outRoute 一条下行路由：outbound 轨道 + 其 RTPSender（摘除时 RemoveTrack 要用），
+// src 为建立该路由时的源 Peer **实例**（#23）。同 uid 可能先后存在多个实例
+// （同 WS 连接重入房时 connID 不变），只按 userID 摘除会误删重入后新建的路由。
 // 离房/ICE 失败/连接顶替必须成对摘掉（#23）：惰性保留会让 srcUserID 重入后
 // ensureRoute 见旧条目跳过，订阅端拿不到新 OnTrack。
 type outRoute struct {
 	track  *webrtc.TrackLocalStaticRTP
 	sender *webrtc.RTPSender
+	src    *Peer
 }
 
 // Peer 房间中的一个成员：每客户端恰好一条 PeerConnection
@@ -43,6 +46,10 @@ type Peer struct {
 	initialAnswered   bool
 	negotiateAgain    bool
 	closed            bool
+
+	// retired 本实例已从房间摘除（#23）：退役后并发到达的 ensureRoute（旧实例
+	// 迟到的 OnTrack）不得再为它建路由；见 room.go ensureRoute 的尾部自检。
+	retired atomic.Bool
 
 	// —— RFC 6464 电平与活跃门控（#33）——
 	// level 最近一包的电平（0=0dB … 127=静音；-1=尚未收到）。forward 写、判定循环读。
@@ -117,7 +124,7 @@ func newPeer(room *Room, userID, connID string, sig SignalSender) (*Peer, error)
 
 		// 对端 SR 等 RTCP 仅 drain，防读缓冲淤积
 		go drainRTCPReceiver(receiver)
-		p.room.addRoutesFrom(p.userID, remote)
+		p.room.addRoutesFrom(p, remote)
 		go p.room.forward(p, remote, levelExtID)
 	})
 
