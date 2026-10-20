@@ -191,45 +191,66 @@ func initLogging() {
 }
 
 // 运行时内存默认值（#96）。GOMEMLIMIT 是 Go 堆的软上限，不是进程 RSS：
-// Wails/WebView2、cgo 音频缓冲与设备驱动占用都不计入其中。实测 core 语音
-// 全链路 GC 后存活堆约 3–5MB，15MiB 留有余量；GOGC=50 让堆在约 1.5 倍
-// 存活时回收，避免默认 100 把观测堆抬到约两倍存活。
+// Wails/WebView2、cgo 音频缓冲与设备驱动占用都不计入其中。
+// 默认走低 CPU 档：关闭基于堆增长的 GC（等价 GOGC=off），回收仅在堆接近
+// 18MiB 软上限时触发。实测 core 语音全链路 live heap 约 6–12MB，18MiB 留有
+// 余量；上一版 GOGC=50 + 15MiB 压得过低，GC 频繁触发导致 CPU 抖动。
+// 若 live heap 逼近软上限，runtime 会连续强制回收——此时应调高上限或显式设 GOGC。
 const (
-	defaultGOGC        = 50
-	defaultMemoryLimit = 15 << 20
+	defaultMemoryLimit = 18 << 20
+
+	// gcKeep：GOGC 已显式设置，保持 runtime 当前值，不覆盖。
+	gcKeep = -1
+	// gcOff：GOGC 未设置，关闭基于堆增长的 GC（SetGCPercent(-1)）。
+	gcOff = -2
+	// memLimitKeep：GOMEMLIMIT 已显式设置，不覆盖。
+	memLimitKeep = -1
 )
 
-// runtimeMemoryPolicy 决定启动时要补的默认值；负值表示保持 runtime 当前值。
-// 只看环境变量是否存在、不解析内容：显式设置的 GOGC/GOMEMLIMIT（含空值和
-// 非法值）一律不覆盖，非法值由 runtime 在进程启动时自行报错，避免这里与
-// runtime 的校验规则漂移。
+// runtimeMemoryPolicy 决定启动时要补的默认值，只看环境变量是否存在、不解析
+// 内容：显式设置的 GOGC/GOMEMLIMIT（含空值和非法值）一律不覆盖，交由 runtime
+// 按自己的规则处理，避免这里与 runtime 的校验规则漂移。
+// 返回的 gcPercent：非负数为 GOGC 百分比，gcOff 表示关闭，gcKeep 表示保持；
+// memLimit：>0 为字节软上限，memLimitKeep 表示不覆盖。
 func runtimeMemoryPolicy(lookupEnv func(string) (string, bool)) (gcPercent int, memLimit int64) {
-	gcPercent, memLimit = -1, -1
-	if _, ok := lookupEnv("GOGC"); !ok {
-		gcPercent = defaultGOGC
+	gcPercent, memLimit = gcOff, defaultMemoryLimit
+	if _, ok := lookupEnv("GOGC"); ok {
+		gcPercent = gcKeep
 	}
-	if _, ok := lookupEnv("GOMEMLIMIT"); !ok {
-		memLimit = defaultMemoryLimit
+	if _, ok := lookupEnv("GOMEMLIMIT"); ok {
+		memLimit = memLimitKeep
 	}
 	return gcPercent, memLimit
 }
 
 // applyRuntimeMemoryDefaults 补齐未显式设置的内存策略，返回写进 app.log 的
-// 生效值描述：显式设置时打印环境变量原值，未设置时打印刚补的默认值。
+// 生效值描述。SetGCPercent/SetMemoryLimit 是进程级全局状态，ServiceStartup
+// 早于会话与音频初始化，调用一次即覆盖整个进程生命周期。
 func applyRuntimeMemoryDefaults() string {
 	gcPercent, memLimit := runtimeMemoryPolicy(os.LookupEnv)
-	if gcPercent >= 0 {
+	switch gcPercent {
+	case gcOff:
+		debug.SetGCPercent(-1) // 关闭基于堆增长的 GC，回收交给软上限
+	case gcKeep:
+		// 显式 GOGC 已由 runtime 在启动时处理，不再覆盖
+	default:
 		debug.SetGCPercent(gcPercent)
 	}
-	if memLimit >= 0 {
+	if memLimit > 0 {
 		debug.SetMemoryLimit(memLimit)
 	}
-	gogc := strconv.Itoa(defaultGOGC)
-	if v, ok := os.LookupEnv("GOGC"); ok {
+	return formatRuntimeMemoryLog(os.LookupEnv)
+}
+
+// formatRuntimeMemoryLog 生成生效值描述：显式设置时打印环境变量原值，未设置
+// 时打印默认值。与 apply 分离，测试格式化不会改测试进程的全局 GC 状态。
+func formatRuntimeMemoryLog(lookupEnv func(string) (string, bool)) string {
+	gogc := "off"
+	if v, ok := lookupEnv("GOGC"); ok {
 		gogc = v
 	}
 	limit := strconv.FormatInt(defaultMemoryLimit, 10)
-	if v, ok := os.LookupEnv("GOMEMLIMIT"); ok {
+	if v, ok := lookupEnv("GOMEMLIMIT"); ok {
 		limit = v
 	}
 	return fmt.Sprintf("runtime memory: GOGC=%s GOMEMLIMIT=%s", gogc, limit)
