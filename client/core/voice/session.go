@@ -96,6 +96,28 @@ type VoiceStats struct {
 	PeerIDs    []string `json:"peer_ids"`
 	EncPackets uint64   `json:"enc_packets"`
 	RtpSent    uint64   `json:"rtp_sent"`
+
+	// 音频链路诊断（#95）：播放缓冲与下行丢包可观测性。新增字段，旧前端
+	// 忽略未知键即可；Peers 为空时不输出。
+	PlaybackBufferedMS int            `json:"playback_buffered_ms"`
+	PlaybackUnderruns  uint64         `json:"playback_underruns"`
+	PlaybackDropped    uint64         `json:"playback_dropped"`
+	Peers              []PeerLinkDiag `json:"peers,omitempty"`
+}
+
+// PeerLinkDiag 单路下行链路诊断（#95）：抖动缓冲深度、丢失/FEC/PLC 计数
+// 与混音输入环占用。
+type PeerLinkDiag struct {
+	PeerID                string  `json:"peer_id"`
+	JitterMs              float64 `json:"jitter_ms"`
+	JitterTargetPackets   int     `json:"jitter_target_packets"`
+	JitterBufferedPackets int     `json:"jitter_buffered_packets"`
+	JitterLost            uint64  `json:"jitter_lost"`
+	RingSamples           int     `json:"ring_samples"`
+	PLCFrames             uint64  `json:"plc_frames"`
+	FECFrames             uint64  `json:"fec_frames"`
+	UnderrunFrames        uint64  `json:"underrun_frames"`
+	DroppedSamples        uint64  `json:"dropped_samples"`
 }
 
 // PeerView UI 侧成员视图。
@@ -1107,8 +1129,35 @@ func (s *Session) Members() []PeerView {
 // Stats 统计快照（JSON 给 UI）。
 func (s *Session) Stats() string {
 	vs := VoiceStats{}
+	var ps audio.StatsSnapshot
+	havePipe := s.pipe != nil
+	if havePipe {
+		ps = s.pipe.Stats()
+		vs.PlaybackBufferedMS = int(s.pipe.PlaybackBuffered().Milliseconds())
+		vs.PlaybackUnderruns = ps.PlaybackUnderruns
+		vs.PlaybackDropped = ps.PlaybackDropped
+	}
 	if s.remoteMgr != nil {
 		vs.PeerIDs = s.remoteMgr.PeerIDs()
+		// 下行链路诊断（#95）：app 层每 2s 入房期间调用，快照读取。
+		for _, id := range vs.PeerIDs {
+			ls, ok := s.remoteMgr.LinkStats(id)
+			if !ok {
+				continue
+			}
+			vs.Peers = append(vs.Peers, PeerLinkDiag{
+				PeerID:                id,
+				JitterMs:              ls.Jitter.JitterMs,
+				JitterTargetPackets:   ls.Jitter.TargetPackets,
+				JitterBufferedPackets: ls.Jitter.Buffered,
+				JitterLost:            ls.Jitter.Lost,
+				RingSamples:           ls.RingAvailable,
+				PLCFrames:             ls.PLCFrames,
+				FECFrames:             ls.FECFrames,
+				UnderrunFrames:        ls.UnderrunFrames,
+				DroppedSamples:        ls.DroppedSamples,
+			})
+		}
 	}
 	if p := s.peerRef.Load(); p != nil {
 		vs.RtpSent = p.Stats.PacketsSent.Load()
@@ -1117,10 +1166,10 @@ func (s *Session) Stats() string {
 		// 用 ok 作哨兵而非值——RTT 真实但 <1ms 时会被错误覆盖（S1）。
 		if rtt, ok := p.RTT(); ok {
 			vs.LatencyMS = int(rtt.Milliseconds())
-		} else if s.pipe != nil {
+		} else if havePipe {
 			// 无 RTT 样本时回落管线回环估计（本机联调场景）。
-			vs.EncPackets = s.pipe.Stats().PacketsEncoded
-			vs.LatencyMS = int(s.pipe.Stats().LatencyAvgUS / 1000)
+			vs.EncPackets = ps.PacketsEncoded
+			vs.LatencyMS = int(ps.LatencyAvgUS / 1000)
 		}
 	}
 	s.mu.Lock()

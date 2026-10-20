@@ -49,6 +49,9 @@ func (p *PeerInput) SetMuted(m bool) { p.muted.Store(m) }
 // Muted 当前静音状态。
 func (p *PeerInput) Muted() bool { return p.muted.Load() }
 
+// BufferedSamples 输入环当前可读采样数（诊断用；只读原子，不干扰混音）。
+func (p *PeerInput) BufferedSamples() int { return p.ring.Available() }
+
 // Mixer 多路混音器：N 路 peer 输入环（480 采样/10ms）→ per-peer 增益 →
 // int32 求和截断 → 单一输出（管线播放环）。
 //

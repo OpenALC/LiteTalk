@@ -360,31 +360,28 @@ func main() {
 func printStats(logger *log.Logger, pipe *audio.Pipeline, peer *rtc.Peer, mixer *audio.Mixer, remoteMgr *audio.RemoteManager, drained uint64) {
 	ps := pipe.Stats()
 	var b strings.Builder
-	fmt.Fprintf(&b, "stats: enc=%d(avg %.0fB) err=%d | play: samples=%d underrun=%d drop=%d",
+	fmt.Fprintf(&b, "stats: enc=%d(avg %.0fB) err=%d | play: samples=%d underrun=%d drop=%d buf=%dms",
 		ps.PacketsEncoded, ps.AvgPacketBytes, ps.EncodeErrors+ps.DecodeErrors,
-		ps.PlaybackSamples, ps.PlaybackUnderruns, ps.PlaybackDropped)
+		ps.PlaybackSamples, ps.PlaybackUnderruns, ps.PlaybackDropped,
+		pipe.PlaybackBuffered().Milliseconds())
 	if peer != nil {
-		fmt.Fprintf(&b, " | up: rtp=%d(%dB) muted-drop=%d state=%s",
+		fmt.Fprintf(&b, " | up: rtp=%d(%dB) dtx=%d muted-drop=%d state=%s",
 			peer.Stats.PacketsSent.Load(), peer.Stats.BytesSent.Load(),
-			peer.Stats.MutedDropped.Load(), peer.ConnectionState())
+			peer.Stats.SentDTX.Load(), peer.Stats.MutedDropped.Load(), peer.ConnectionState())
 	}
 	fmt.Fprintf(&b, " | mix: frames=%d clip=%d", mixer.FramesMixed.Load(), mixer.ClippedSamples.Load())
 	if drained > 0 {
 		fmt.Fprintf(&b, " drained=%d", drained)
 	}
 	for _, id := range remoteMgr.PeerIDs() {
-		js, ok := remoteMgr.JitterStats(id)
+		ls, ok := remoteMgr.LinkStats(id)
 		if !ok {
 			continue
 		}
-		in := mixer.Peer(id)
-		var underrun, written uint64
-		if in != nil {
-			underrun = in.UnderrunFrames.Load()
-			written = in.WrittenSamples.Load()
-		}
-		fmt.Fprintf(&b, " | %s: rtp=%d lost=%d plc~ jit=%.1fms tgt=%d buf=%d pcm=%d underrun=%d",
-			id, js.Received, js.Lost, js.JitterMs, js.TargetPackets, js.Buffered, written, underrun)
+		fmt.Fprintf(&b, " | %s: rtp=%d lost=%d plc=%d fec=%d jit=%.1fms tgt=%d jbuf=%d ring=%d pcm=%d underrun=%d drop=%d",
+			id, ls.RTPReceived, ls.Jitter.Lost, ls.PLCFrames, ls.FECFrames,
+			ls.Jitter.JitterMs, ls.Jitter.TargetPackets, ls.Jitter.Buffered,
+			ls.RingAvailable, ls.WrittenSamples, ls.UnderrunFrames, ls.DroppedSamples)
 	}
 	logger.Print(b.String())
 }

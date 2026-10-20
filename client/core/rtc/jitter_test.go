@@ -150,6 +150,81 @@ func TestJitterStarvationReturnsToPrefill(t *testing.T) {
 	}
 }
 
+// TestJitterDTXHeartbeatNoHole 静音期每 20ms 一个 1~2 字节 DTX 心跳包（发送端
+// 不再丢弃）：jitter 视其为正常到达帧，不判空洞、不重回预填。
+func TestJitterDTXHeartbeatNoHole(t *testing.T) {
+	jb := NewJitterBuffer()
+	out := make([]byte, JitterMaxPayload)
+
+	pushInOrder(jb, 100, 3)
+	for want := uint16(100); want <= 102; want++ {
+		if _, lost, ok := jb.Pop(out); !ok || lost {
+			t.Fatalf("prefill pop %d: lost=%v ok=%v", want, lost, ok)
+		}
+	}
+
+	// DTX 心跳：1 字节载荷，按 20ms 节拍与 Pop 交错。
+	for i := 0; i < 30; i++ {
+		seq := uint16(103 + i)
+		jb.Push(seq, []byte{0xFF}, jitterBase.Add(time.Duration(seq)*JitterFrameMS*time.Millisecond))
+		n, lost, ok := jb.Pop(out)
+		if !ok {
+			t.Fatalf("tick %d: jitter re-entered prefill on DTX heartbeat", i)
+		}
+		if lost {
+			t.Fatalf("tick %d: DTX heartbeat judged as loss", i)
+		}
+		if n != 1 {
+			t.Fatalf("tick %d: payload = %d bytes, want 1", i, n)
+		}
+	}
+
+	st := jb.Stats()
+	if st.Lost != 0 {
+		t.Fatalf("Lost = %d, want 0", st.Lost)
+	}
+	if !st.Started {
+		t.Fatal("should stay started through DTX silence")
+	}
+	if st.Resets != 0 {
+		t.Fatalf("Resets = %d, want 0", st.Resets)
+	}
+}
+
+// TestJitterPeekNextDoesNotConsume 窥视后继包不推进消费位置、不改缓冲计数；
+// 随后 Pop 仍能拿到同一包（FEC 恢复依赖此语义）。
+func TestJitterPeekNextDoesNotConsume(t *testing.T) {
+	jb := NewJitterBuffer()
+	out := make([]byte, JitterMaxPayload)
+
+	pushInOrder(jb, 100, 4)
+	jb.Pop(out) // 100
+	jb.Pop(out) // 101
+
+	before := jb.Stats()
+	n, ok := jb.PeekNext(out)
+	if !ok || n != 3 || out[0] != 102 {
+		t.Fatalf("PeekNext = (%d, %v), payload %v; want 102", n, ok, out[:n])
+	}
+	if n2, ok2 := jb.PeekNext(out); !ok2 || n2 != n {
+		t.Fatalf("second PeekNext = (%d, %v), want (%d, true)", n2, ok2, n)
+	}
+	after := jb.Stats()
+	if after.Buffered != before.Buffered || after.Received != before.Received {
+		t.Fatalf("PeekNext mutated stats: before=%+v after=%+v", before, after)
+	}
+
+	if n, lost, ok := jb.Pop(out); !ok || lost || n != 3 || out[0] != 102 {
+		t.Fatalf("Pop after PeekNext = (%d, lost=%v, ok=%v), want 102", n, lost, ok)
+	}
+
+	// 无后继（连续丢包）时返回 ok=false。
+	jb.Pop(out) // 103
+	if _, ok := jb.PeekNext(out); ok {
+		t.Fatal("PeekNext on empty successor should be false")
+	}
+}
+
 func TestJitterLargeJumpReset(t *testing.T) {
 	jb := NewJitterBuffer()
 	out := make([]byte, JitterMaxPayload)

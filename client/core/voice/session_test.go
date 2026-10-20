@@ -1272,3 +1272,23 @@ func TestGatewayResumeAfterReconnect(t *testing.T) {
 		}
 	}
 }
+
+// TestStatsAudioDiagnostics voice:stats 音频诊断字段（#95）：播放缓冲时长
+// 可观测；无下行 peer 时省略 peers，旧前端不受影响。
+func TestStatsAudioDiagnostics(t *testing.T) {
+	s := NewSession(api.NewAPIClient("http://127.0.0.1:1"), "tok", "n", Events{}, nil)
+	s.pipe = newNullPipeline(t)
+	s.pipe.WritePlayback(make([]int16, audio.SampleRate/50)) // 20ms
+
+	raw := s.Stats()
+	var vs VoiceStats
+	if err := json.Unmarshal([]byte(raw), &vs); err != nil {
+		t.Fatalf("Stats JSON: %v (%s)", err, raw)
+	}
+	if vs.PlaybackBufferedMS != 20 {
+		t.Fatalf("PlaybackBufferedMS = %d, want 20 (%s)", vs.PlaybackBufferedMS, raw)
+	}
+	if strings.Contains(raw, "\"peers\"") {
+		t.Fatalf("empty peers should be omitted: %s", raw)
+	}
+}
