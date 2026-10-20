@@ -3,6 +3,7 @@ package signal
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -441,6 +442,137 @@ func TestPresenceReconnectRace(t *testing.T) {
 			t.Fatalf("第 %d 轮收尾后 presence 键应删除", round)
 		}
 		drainUpdates(t, bob) // 每轮推 0~2 条（边沿交错时会去重），及时清空队列
+	}
+}
+
+// flakyPresence 包一层 store.Mem：可控 SET 失败次数并记录 SET/DEL 调用次数，
+// 复现「首 SET 失败 → 心跳续期成功 → 断线」的时序（复审 4.2）。
+type flakyPresence struct {
+	*store.Mem
+	mu      sync.Mutex
+	failSet int
+	sets    int
+	dels    int
+}
+
+func (s *flakyPresence) Set(ctx context.Context, key, value string, ttl time.Duration) error {
+	s.mu.Lock()
+	s.sets++
+	fail := s.failSet > 0
+	if fail {
+		s.failSet--
+	}
+	s.mu.Unlock()
+	if fail {
+		return errors.New("注入的 SET 失败")
+	}
+	return s.Mem.Set(ctx, key, value, ttl)
+}
+
+func (s *flakyPresence) Del(ctx context.Context, keys ...string) error {
+	s.mu.Lock()
+	s.dels++
+	s.mu.Unlock()
+	return s.Mem.Del(ctx, keys...)
+}
+
+func (s *flakyPresence) counts() (sets, dels int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sets, s.dels
+}
+
+// TestPresenceFirstSetFailureStillDel 复审 4.2：首 SET 失败后心跳续期把键写回，
+// 断线必须仍执行 DEL（不能因 published=false 跳过），且好友从未收到 online 时
+// 不补推一条 offline。
+func TestPresenceFirstSetFailureStillDel(t *testing.T) {
+	h, mem, bob := newPresenceHub(t)
+	fs := &flakyPresence{Mem: mem, failSet: 1}
+	h.presence = fs
+	ctx := context.Background()
+
+	alice := &client{hub: h, userID: "1", dev: "desktop"}
+	if _, became := h.register(alice); !became {
+		t.Fatal("首连应判定为 0→1 边沿")
+	}
+	h.syncPresence("1") // 首次 SET 失败
+	if _, err := mem.Get(ctx, presenceKey("1")); err == nil {
+		t.Fatal("SET 失败后键不应存在")
+	}
+	if ups := drainUpdates(t, bob); len(ups) != 0 {
+		t.Fatalf("SET 失败不应推 online，实际 %+v", ups)
+	}
+
+	h.renewPresence(alice) // 心跳续期成功，把键写回
+	if _, err := mem.Get(ctx, presenceKey("1")); err != nil {
+		t.Fatalf("续期后键应存在: %v", err)
+	}
+
+	if !h.unregister(alice) {
+		t.Fatal("最后一条连接断开应判定为 1→0 边沿")
+	}
+	h.syncPresence("1")
+	if _, err := mem.Get(ctx, presenceKey("1")); err == nil {
+		t.Fatal("断线后 presence 键应被 DEL（首 SET 失败不能跳过离线清理）")
+	}
+	if _, dels := fs.counts(); dels != 1 {
+		t.Fatalf("DEL 应被调用 1 次，实际 %d", dels)
+	}
+	if ups := drainUpdates(t, bob); len(ups) != 0 {
+		t.Fatalf("好友未收到 online，断线不应补推 offline，实际 %+v", ups)
+	}
+}
+
+// TestPresenceRetrySetOnOnlineEdge 首 SET 失败后，下一次在线边沿（断线重连）
+// 必须重试 SET，不能被 presencePublished 去重永久挡住；已发布后重复同步也会
+// 补写丢失的键，但不重推 online。
+func TestPresenceRetrySetOnOnlineEdge(t *testing.T) {
+	h, mem, bob := newPresenceHub(t)
+	fs := &flakyPresence{Mem: mem, failSet: 1}
+	h.presence = fs
+	ctx := context.Background()
+
+	alice := &client{hub: h, userID: "1", dev: "desktop"}
+	if _, became := h.register(alice); !became {
+		t.Fatal("首连应判定为 0→1 边沿")
+	}
+	h.syncPresence("1") // SET 失败
+	if sets, _ := fs.counts(); sets != 1 {
+		t.Fatalf("首次 SET 应已尝试，实际 %d 次", sets)
+	}
+
+	// 断线：键本来就不存在，离线 DEL 仍是幂等路径。
+	if !h.unregister(alice) {
+		t.Fatal("断线应判定为 1→0 边沿")
+	}
+	h.syncPresence("1")
+
+	// 重连：下一次在线边沿必须重试 SET 并成功。
+	alice = &client{hub: h, userID: "1", dev: "desktop"}
+	if _, became := h.register(alice); !became {
+		t.Fatal("重连应判定为 0→1 边沿")
+	}
+	h.syncPresence("1")
+	if _, err := mem.Get(ctx, presenceKey("1")); err != nil {
+		t.Fatalf("重连后应重试 SET 并写回键: %v", err)
+	}
+	if sets, _ := fs.counts(); sets != 2 {
+		t.Fatalf("重连应重试 SET（共 2 次），实际 %d 次", sets)
+	}
+	if ups := drainUpdates(t, bob); len(ups) != 1 || !ups[0].Online {
+		t.Fatalf("重连应恰好推 1 条 online=true，实际 %+v", ups)
+	}
+
+	// published=true 时再次同步也要补写 KV（键丢失/过期后的自愈），但不重推。
+	if err := mem.Del(ctx, presenceKey("1")); err != nil {
+		t.Fatalf("删键: %v", err)
+	}
+	h.syncPresence("1")
+	if _, err := mem.Get(ctx, presenceKey("1")); err != nil {
+		t.Fatalf("已发布状态下同步仍应重写键: %v", err)
+	}
+	if ups := drainUpdates(t, bob); len(ups) != 0 {
+		t.Fatalf("已推过 online 不应重推，实际 %+v", ups)
 	}
 }
 

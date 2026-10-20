@@ -210,7 +210,10 @@ func main() {
 			RelayMaxPort: relayMax,
 			Realm:        envOr("LITETALK_TURN_REALM", envOr("LITETALK_DOMAIN", "litetalk")),
 			Secret:       turnSecret,
-			Logger:       log.Default(),
+			// CGNAT/办公网出口后可能挤着多个用户，IP 层可放宽；uid 层保持小值防刷。
+			MaxPerUID: envInt("LITETALK_TURN_MAX_PER_UID", turn.DefaultMaxAllocationsPerUID),
+			MaxPerIP:  envInt("LITETALK_TURN_MAX_PER_IP", turn.DefaultMaxAllocationsPerIP),
+			Logger:    log.Default(),
 		})
 		if err != nil {
 			log.Fatalf("内置 TURN 启动失败: %v", err)
