@@ -92,6 +92,45 @@ func waitConnected(t testing.TB, peer *Peer, sfu *fakeSFU) {
 	t.Fatalf("not connected: client=%s sfu=%s", peer.ConnectionState(), sfu.pc.ConnectionState())
 }
 
+// startSFUTrickle 把客户端候选按序转投给模拟 SFU：远端描述就位前的候选先
+// 缓冲（pion 在 remote description 未设置时拒绝 AddICECandidate，生产 SFU 的
+// pendingCandidates 正是这个语义），SetRemoteDescription(offer) 后调返回的
+// flush 按序补投；之后到达的候选仍走实时 trickle。done 在源通道关闭后关闭。
+func startSFUTrickle(t *testing.T, pc *webrtc.PeerConnection, src <-chan webrtc.ICECandidateInit) (flush func(), done <-chan struct{}) {
+	t.Helper()
+	var mu sync.Mutex
+	var pending []webrtc.ICECandidateInit
+	ready := false
+	add := func(c webrtc.ICECandidateInit) {
+		if err := pc.AddICECandidate(c); err != nil {
+			t.Errorf("sfu add ice: %v", err)
+		}
+	}
+	doneCh := make(chan struct{})
+	go func() {
+		defer close(doneCh)
+		for c := range src {
+			mu.Lock()
+			if !ready {
+				pending = append(pending, c)
+				mu.Unlock()
+				continue
+			}
+			add(c) // 持锁调用：与 flush 的补投串行，保持候选顺序
+			mu.Unlock()
+		}
+	}()
+	return func() {
+		mu.Lock()
+		defer mu.Unlock()
+		ready = true
+		for _, c := range pending {
+			add(c)
+		}
+		pending = nil
+	}, doneCh
+}
+
 // TestPeerLoopback 本机 loopback pair 全流程：
 // 初始 offer/answer → ICE 连通 → 上行 RTP（seq/ts 递增、pt=111）→
 // SFU 重协商加下行轨 → 客户端自动 answer → OnTrack → 下行 RTP 到达。
@@ -126,15 +165,7 @@ func TestPeerLoopback(t *testing.T) {
 			t.Errorf("HandleRemoteICE: %v", err)
 		}
 	})
-	iceDone := make(chan struct{})
-	go func() {
-		defer close(iceDone)
-		for c := range localICE {
-			if err := sfu.pc.AddICECandidate(c); err != nil {
-				t.Errorf("sfu add ice: %v", err)
-			}
-		}
-	}()
+	flushICE, iceDone := startSFUTrickle(t, sfu.pc, localICE)
 
 	// 1. 客户端初始 offer → SFU answer。
 	if err := peer.Offer(); err != nil {
@@ -147,6 +178,7 @@ func TestPeerLoopback(t *testing.T) {
 	if err := sfu.pc.SetRemoteDescription(offer); err != nil {
 		t.Fatalf("sfu set remote offer: %v", err)
 	}
+	flushICE() // offer 就位后补投此前缓冲的客户端候选
 	answer, err := sfu.pc.CreateAnswer(nil)
 	if err != nil {
 		t.Fatalf("sfu create answer: %v", err)
@@ -327,15 +359,7 @@ func TestPeerSendDTXHeartbeat(t *testing.T) {
 			t.Errorf("HandleRemoteICE: %v", err)
 		}
 	})
-	iceDone := make(chan struct{})
-	go func() {
-		defer close(iceDone)
-		for c := range localICE {
-			if err := sfu.pc.AddICECandidate(c); err != nil {
-				t.Errorf("sfu add ice: %v", err)
-			}
-		}
-	}()
+	flushICE, iceDone := startSFUTrickle(t, sfu.pc, localICE)
 
 	if err := peer.Offer(); err != nil {
 		t.Fatalf("Offer: %v", err)
@@ -344,6 +368,7 @@ func TestPeerSendDTXHeartbeat(t *testing.T) {
 	if err := sfu.pc.SetRemoteDescription(offer); err != nil {
 		t.Fatalf("sfu set remote offer: %v", err)
 	}
+	flushICE() // offer 就位后补投此前缓冲的客户端候选
 	answer, err := sfu.pc.CreateAnswer(nil)
 	if err != nil {
 		t.Fatalf("sfu create answer: %v", err)
