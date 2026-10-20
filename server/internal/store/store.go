@@ -157,6 +157,65 @@ type UserSession struct {
 	UpdatedAt  time.Time `json:"updated_at" db:"updated_at"`
 }
 
+// Role 角色（迁移 0010）。BuiltinKey 三值 member/admin/owner 为内置（不可改删、
+// 每服各一条），空串 = 自定义角色（DB 存 NULL）。Permissions 只用低 15 位。
+type Role struct {
+	ID          int64      `json:"id" db:"id"`
+	ServerID    int64      `json:"server_id" db:"server_id"`
+	Name        string     `json:"name" db:"name"`
+	Color       string     `json:"color" db:"color"`
+	Position    int        `json:"position" db:"position"`
+	Permissions Permission `json:"permissions" db:"permissions"`
+	BuiltinKey  string     `json:"builtin_key,omitempty" db:"builtin_key"`
+	CreatedAt   time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at" db:"updated_at"`
+}
+
+// IsBuiltin 是否内置角色。
+func (r *Role) IsBuiltin() bool { return r.BuiltinKey != "" }
+
+// MemberRoleAssignment 成员角色分配（member_roles 表）。
+type MemberRoleAssignment struct {
+	ServerID   int64     `json:"server_id" db:"server_id"`
+	UserID     int64     `json:"user_id" db:"user_id"`
+	RoleID     int64     `json:"role_id" db:"role_id"`
+	AssignedAt time.Time `json:"assigned_at" db:"assigned_at"`
+	AssignedBy int64     `json:"assigned_by" db:"assigned_by"`
+}
+
+// OverwriteTargetType 覆盖目标类型。
+type OverwriteTargetType string
+
+const (
+	OverwriteTargetRole   OverwriteTargetType = "role"
+	OverwriteTargetMember OverwriteTargetType = "member"
+)
+
+// ChannelOverwrite 频道权限覆盖（channel_overwrites 表）。Allow/Deny 只应含
+// ChannelPermissionMask 里的位（是否校验由调用方决定，Store 不截断）。
+type ChannelOverwrite struct {
+	ChannelID  int64               `json:"channel_id" db:"channel_id"`
+	TargetType OverwriteTargetType `json:"target_type" db:"target_type"`
+	TargetID   int64               `json:"target_id" db:"target_id"`
+	Allow      Permission          `json:"allow" db:"allow"`
+	Deny       Permission          `json:"deny" db:"deny"`
+	UpdatedAt  time.Time           `json:"updated_at" db:"updated_at"`
+}
+
+// AuditLog 审计日志（audit_log 表）。ID 由调用方 Snowflake 预置或 WriteAudit 回填；
+// TargetType 空串、TargetID/ChannelID 为 nil 时存 NULL。
+type AuditLog struct {
+	ID         int64     `json:"id" db:"id"`
+	ServerID   int64     `json:"server_id" db:"server_id"`
+	ActorID    int64     `json:"actor_id" db:"actor_id"`
+	Action     string    `json:"action" db:"action"`
+	TargetType string    `json:"target_type,omitempty" db:"target_type"`
+	TargetID   *int64    `json:"target_id,omitempty" db:"target_id"`
+	ChannelID  *int64    `json:"channel_id,omitempty" db:"channel_id"`
+	Detail     string    `json:"detail" db:"detail"`
+	CreatedAt  time.Time `json:"created_at" db:"created_at"`
+}
+
 // Store 数据访问接口（MySQL 与内存实现共同契约）。
 type Store interface {
 	// users
@@ -182,13 +241,17 @@ type Store interface {
 	DeleteFriendship(ctx context.Context, id int64) error
 
 	// servers
+	// CreateServer 同一事务/锁内写 server + 三条 builtin 角色（#35）。
 	CreateServer(ctx context.Context, s *Server) error
 	ServerByID(ctx context.Context, id int64) (*Server, error)
 	// ServersOfUser 返回用户所在服务器（经 server_members 关联）。
 	ServersOfUser(ctx context.Context, userID int64) ([]Server, error)
 	UpdateServer(ctx context.Context, s *Server) error
+	// DeleteServer 级联删除该服 roles/member_roles/频道覆盖/audit_log 及既有子资源。
 	DeleteServer(ctx context.Context, id int64) error
+	// AddMember 同一事务/锁内写成员 + @everyone 分配，并按 legacy role 追加 admin/owner builtin。
 	AddMember(ctx context.Context, m *ServerMember) error
+	// RemoveMember 删成员行 + 其角色分配 + 该服内以该成员为目标的频道覆盖。
 	RemoveMember(ctx context.Context, serverID, userID int64) error
 	Member(ctx context.Context, serverID, userID int64) (*ServerMember, error)
 	MembersOfServer(ctx context.Context, serverID int64) ([]ServerMember, error)
@@ -198,13 +261,14 @@ type Store interface {
 	ChannelByID(ctx context.Context, id int64) (*Channel, error)
 	ChannelsOfServer(ctx context.Context, serverID int64) ([]Channel, error)
 	UpdateChannel(ctx context.Context, c *Channel) error
+	// DeleteChannel 同事务删消息、该频道覆盖与频道行。
 	DeleteChannel(ctx context.Context, id int64) error
 
 	// categories（v0.1.2 迁移 0003）
 	CreateCategory(ctx context.Context, c *Category) error
 	CategoryByID(ctx context.Context, id int64) (*Category, error)
 	CategoriesOfServer(ctx context.Context, serverID int64) ([]Category, error)
-	// DeleteCategoryWithChannels 单事务删除分类及其下全部频道（含各频道消息）。
+	// DeleteCategoryWithChannels 单事务删除分类及其下全部频道（含各频道消息与覆盖）。
 	DeleteCategoryWithChannels(ctx context.Context, id int64) error
 	// UpdateCategory 全量写 name/position（不动 created_at/所属服务器）。
 	UpdateCategory(ctx context.Context, c *Category) error
@@ -230,7 +294,8 @@ type Store interface {
 	UseInvite(ctx context.Context, code string) error
 	// UseInviteAndAddMember 原子地消费邀请码并把 userID 加入邀请码所属服务器（#22）：
 	// 邀请码校验（存在/未过期/次数未用尽）与成员插入在同一事务里完成，成员已存在
-	// 时返回 ErrConflict 且不消耗邀请码。服务器 ID 取自 invitation 行，避免调用方传错。
+	// 时返回 ErrConflict 且不消耗邀请码、不留角色分配。默认角色分配随成员同事务写入（#35）。
+	// 服务器 ID 取自 invitation 行，避免调用方传错。
 	UseInviteAndAddMember(ctx context.Context, code string, userID int64, role MemberRole) (*ServerMember, error)
 
 	// user_sessions（v1.1.0 迁移 0004，多设备会话）
@@ -241,6 +306,42 @@ type Store interface {
 	DeleteUserSession(ctx context.Context, userID int64, deviceType string) error
 	// DeleteAllUserSessions 删除该用户全部设备会话（重置密码用）。
 	DeleteAllUserSessions(ctx context.Context, userID int64) error
+
+	// roles / member_roles / channel_overwrites / audit_log（迁移 0010，#35 B1）。
+	// 「不属于该服务器」与「不存在」统一返回 ErrNotFound，不泄露跨服资源是否存在。
+
+	// ListRoles 按 position、id 升序。
+	ListRoles(ctx context.Context, serverID int64) ([]Role, error)
+	RoleByID(ctx context.Context, id int64) (*Role, error)
+	// CreateRole 仅自定义角色：builtin_key 必须空，否则 ErrForbidden；
+	// 未定义权限位拒绝入参。ID 未预置时取 Snowflake。
+	CreateRole(ctx context.Context, r *Role) error
+	// UpdateRole 全量写 name/color/position/permissions；builtin 返回 ErrForbidden。
+	UpdateRole(ctx context.Context, r *Role) error
+	// DeleteRole builtin 返回 ErrForbidden；级联删除其分配与以它为目标的频道覆盖。
+	DeleteRole(ctx context.Context, id int64) error
+	// RolesOfMember 成员的有效角色（含 @everyone，即使分配行缺失也强制带上），
+	// 按 position、id 升序；成员不存在返回 ErrNotFound。
+	RolesOfMember(ctx context.Context, serverID, userID int64) ([]Role, error)
+	// SetMemberRoles 事务替换该成员的分配：roleIDs 去重后逐个校验同服；
+	// 强制保留 @everyone，server owner（或 legacy role=owner）强制保留 owner builtin；
+	// 同步 server_members.role 投影（有 owner 角色→owner；有 admin→admin；否则 member）。
+	SetMemberRoles(ctx context.Context, serverID, userID int64, roleIDs []int64, assignedBy int64) error
+	// RoleAssignmentsOfServer 全服分配，按 user_id、role_id 升序。
+	RoleAssignmentsOfServer(ctx context.Context, serverID int64) ([]MemberRoleAssignment, error)
+	// ChannelOverwrites 按 target_type、target_id 升序。
+	ChannelOverwrites(ctx context.Context, channelID int64) ([]ChannelOverwrite, error)
+	// ChannelOverwritesOfServer 经 channels 关联取全服覆盖，按 channel_id、target_type、target_id 升序。
+	ChannelOverwritesOfServer(ctx context.Context, serverID int64) ([]ChannelOverwrite, error)
+	// SetChannelOverwrite upsert；校验 target_type 合法、频道存在、目标（角色/成员）同服。
+	SetChannelOverwrite(ctx context.Context, o *ChannelOverwrite) error
+	// DeleteChannelOverwrite 删除指定目标的覆盖；未命中返回 ErrNotFound。
+	DeleteChannelOverwrite(ctx context.Context, channelID int64, targetType OverwriteTargetType, targetID int64) error
+	// WriteAudit 落审计行，回填 ID（未预置时 Snowflake）与 CreatedAt。
+	WriteAudit(ctx context.Context, a *AuditLog) error
+	// AuditLogBefore 倒序游标（新→旧返回）：beforeID=0 取最新 limit 条；
+	// limit 越界回落 50（与 MessagesBefore 同口径）。
+	AuditLogBefore(ctx context.Context, serverID, beforeID int64, limit int) ([]AuditLog, error)
 }
 
 // KV 键值抽象（Redis、SQLite 与内存实现共同契约；auth 的验证码/刷新令牌/限流使用）。
