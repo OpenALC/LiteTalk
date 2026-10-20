@@ -68,6 +68,44 @@ func remoteArrival(seq int) time.Time {
 	return remoteArrivalBase.Add(time.Duration(seq) * JitterPopInterval)
 }
 
+// encodeRampedSinePackets 编码 n 个 20ms 包：440Hz 正弦，逐帧提升幅度，
+// 开启带内 FEC 并告知 20% 丢包率。幅度递增让「FEC 恢复真实丢帧」与
+// 「PLC 沿用上一帧包络」的能量差异可判定。
+func encodeRampedSinePackets(t testing.TB, n int) [][]byte {
+	t.Helper()
+	enc, err := codec.NewEncoder(SampleRate, 1, codec.AppVoIP)
+	if err != nil {
+		t.Fatalf("new encoder: %v", err)
+	}
+	defer enc.Close()
+	if err := enc.SetBitrate(32000); err != nil {
+		t.Fatalf("set bitrate: %v", err)
+	}
+	if err := enc.SetInBandFEC(true); err != nil {
+		t.Fatalf("set fec: %v", err)
+	}
+	if err := enc.SetPacketLossPerc(20); err != nil {
+		t.Fatalf("set packet loss: %v", err)
+	}
+	pcm := make([]int16, OpusFrameSize)
+	buf := make([]byte, 4000)
+	var phase float64
+	out := make([][]byte, 0, n)
+	for i := 0; i < n; i++ {
+		amp := 4000 + 1000*float64(i)
+		for j := range pcm {
+			phase += 2 * math.Pi * 440 / SampleRate
+			pcm[j] = int16(amp * math.Sin(phase))
+		}
+		m, err := enc.Encode(pcm, buf)
+		if err != nil {
+			t.Fatalf("encode %d: %v", i, err)
+		}
+		out = append(out, append([]byte(nil), buf[:m]...))
+	}
+	return out
+}
+
 // TestRemoteDecodeOnce 预填满后逐拍弹出：正常帧解码 960 采样写入混音输入环，
 // 解码信号必须为非静音正弦。
 func TestRemoteDecodeOnce(t *testing.T) {
@@ -88,6 +126,9 @@ func TestRemoteDecodeOnce(t *testing.T) {
 	if got := rp.Stats.PLCFrames.Load(); got != 0 {
 		t.Fatalf("PLCFrames = %d, want 0", got)
 	}
+	if got := rp.Stats.FECFrames.Load(); got != 0 {
+		t.Fatalf("FECFrames = %d, want 0", got)
+	}
 	if got := rp.input.WrittenSamples.Load(); got != 3*OpusFrameSize {
 		t.Fatalf("WrittenSamples = %d, want %d", got, 3*OpusFrameSize)
 	}
@@ -101,29 +142,140 @@ func TestRemoteDecodeOnce(t *testing.T) {
 	}
 }
 
-// TestRemoteDecodePLC 空洞帧必须走 PLC 并照常合成 960 采样送混音。
+// TestRemoteDecodePLC 无后继包的空洞帧必须回落 PLC 并照常合成 960 采样送混音。
 func TestRemoteDecodePLC(t *testing.T) {
 	m, _ := newTestMixer()
 	rp := newTestRemotePeer(t, "a", m)
 	pkts := encodeSinePackets(t, 3)
 
-	// 100, 101, 103：丢 102。
+	// 100,101,102 正常；103 丢失且无后继包（断流）。
 	rp.jb.Push(100, pkts[0], remoteArrival(100))
 	rp.jb.Push(101, pkts[1], remoteArrival(101))
-	rp.jb.Push(103, pkts[2], remoteArrival(103))
+	rp.jb.Push(102, pkts[2], remoteArrival(102))
 
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 4; i++ {
 		rp.decodeOnce()
 	}
 
-	if got := rp.Stats.FramesPopped.Load(); got != 2 {
-		t.Fatalf("FramesPopped = %d, want 2", got)
+	if got := rp.Stats.FramesPopped.Load(); got != 3 {
+		t.Fatalf("FramesPopped = %d, want 3", got)
 	}
 	if got := rp.Stats.PLCFrames.Load(); got != 1 {
 		t.Fatalf("PLCFrames = %d, want 1", got)
 	}
-	if got := rp.input.WrittenSamples.Load(); got != 3*OpusFrameSize {
-		t.Fatalf("WrittenSamples = %d, want %d (PLC 帧同样 960)", got, 3*OpusFrameSize)
+	if got := rp.Stats.FECFrames.Load(); got != 0 {
+		t.Fatalf("FECFrames = %d, want 0", got)
+	}
+	if got := rp.input.WrittenSamples.Load(); got != 4*OpusFrameSize {
+		t.Fatalf("WrittenSamples = %d, want %d (PLC 帧同样 960)", got, 4*OpusFrameSize)
+	}
+}
+
+// TestRemoteDecodeFECRecoversLostFrame 丢帧时若后继包已在 jitter 槽内，用后继包
+// 的带内 FEC 恢复该帧：恢复信号能量应接近真实帧、明显优于 PLC；后继包随后
+// 仍按正常路径解码（未被消费）。对照 PLC 走独立解码器，初始状态一致。
+func TestRemoteDecodeFECRecoversLostFrame(t *testing.T) {
+	pkts := encodeRampedSinePackets(t, 8)
+	drain := make([]int16, OpusFrameSize)
+
+	m, _ := newTestMixer()
+	rp := newTestRemotePeer(t, "a", m)
+	for i := 0; i < 3; i++ {
+		rp.jb.Push(uint16(100+i), pkts[i], remoteArrival(100+i))
+	}
+	for i := 0; i < 3; i++ {
+		rp.decodeOnce()
+		rp.input.ring.Read(drain) // 排空正常帧
+	}
+
+	// 103 丢失、104 已到：FEC 恢复 103。
+	rp.jb.Push(104, pkts[4], remoteArrival(104))
+	rp.decodeOnce()
+	if n := rp.input.ring.Read(drain); n != OpusFrameSize {
+		t.Fatalf("FEC frame produced %d samples, want %d", n, OpusFrameSize)
+	}
+	fecRMS := rmsInt16(drain)
+	if got := rp.Stats.FECFrames.Load(); got != 1 {
+		t.Fatalf("FECFrames = %d, want 1", got)
+	}
+	if got := rp.Stats.PLCFrames.Load(); got != 0 {
+		t.Fatalf("PLCFrames = %d, want 0", got)
+	}
+
+	// 后继 104 正常解码，解码器状态未被 FEC 破坏。
+	rp.decodeOnce()
+	if n := rp.input.ring.Read(drain); n != OpusFrameSize {
+		t.Fatalf("successor frame produced %d samples, want %d", n, OpusFrameSize)
+	}
+	if got := rp.Stats.FramesPopped.Load(); got != 4 {
+		t.Fatalf("FramesPopped = %d, want 4 (3 prefill + successor)", got)
+	}
+	if r := rmsInt16(drain); r < 3000 {
+		t.Fatalf("successor decoded RMS %.0f too low", r)
+	}
+
+	// PLC 对照：同样的解码器历史，103 丢失且无后继。
+	m2, _ := newTestMixer()
+	rp2 := newTestRemotePeer(t, "b", m2)
+	for i := 0; i < 3; i++ {
+		rp2.jb.Push(uint16(100+i), pkts[i], remoteArrival(100+i))
+	}
+	for i := 0; i < 3; i++ {
+		rp2.decodeOnce()
+		rp2.input.ring.Read(drain)
+	}
+	rp2.decodeOnce()
+	if n := rp2.input.ring.Read(drain); n != OpusFrameSize {
+		t.Fatalf("PLC frame produced %d samples, want %d", n, OpusFrameSize)
+	}
+	plcRMS := rmsInt16(drain)
+	if got := rp2.Stats.PLCFrames.Load(); got != 1 {
+		t.Fatalf("control PLCFrames = %d, want 1", got)
+	}
+
+	if fecRMS <= plcRMS*1.15 {
+		t.Fatalf("FEC RMS %.0f not clearly better than PLC RMS %.0f", fecRMS, plcRMS)
+	}
+}
+
+// TestRemoteDecodeFECFallsBackToPLC 连续丢包时，紧邻后继缺失的丢帧回落 PLC；
+// 后继到达后仍可用它恢复再前一帧。全程每拍都写出 960 采样。
+func TestRemoteDecodeFECFallsBackToPLC(t *testing.T) {
+	m, _ := newTestMixer()
+	rp := newTestRemotePeer(t, "a", m)
+	pkts := encodeRampedSinePackets(t, 8)
+	drain := make([]int16, OpusFrameSize)
+
+	for i := 0; i < 3; i++ {
+		rp.jb.Push(uint16(100+i), pkts[i], remoteArrival(100+i))
+	}
+	for i := 0; i < 3; i++ {
+		rp.decodeOnce()
+		rp.input.ring.Read(drain)
+	}
+
+	// 103、104 连续丢失，105 已到。
+	rp.jb.Push(105, pkts[5], remoteArrival(105))
+	rp.decodeOnce() // 103：紧邻后继 104 未到 → PLC
+	if got := rp.Stats.PLCFrames.Load(); got != 1 {
+		t.Fatalf("PLCFrames after first consecutive loss = %d, want 1", got)
+	}
+	if got := rp.Stats.FECFrames.Load(); got != 0 {
+		t.Fatalf("FECFrames after first consecutive loss = %d, want 0", got)
+	}
+	rp.decodeOnce() // 104：后继 105 已到 → FEC
+	if got := rp.Stats.FECFrames.Load(); got != 1 {
+		t.Fatalf("FECFrames after second loss = %d, want 1", got)
+	}
+	if got := rp.Stats.PLCFrames.Load(); got != 1 {
+		t.Fatalf("PLCFrames after second loss = %d, want 1", got)
+	}
+	rp.decodeOnce() // 105：正常帧
+	if got := rp.Stats.FramesPopped.Load(); got != 4 {
+		t.Fatalf("FramesPopped = %d, want 4", got)
+	}
+	if got := rp.input.WrittenSamples.Load(); got != 6*OpusFrameSize {
+		t.Fatalf("WrittenSamples = %d, want %d", got, 6*OpusFrameSize)
 	}
 }
 
@@ -144,6 +296,40 @@ func TestRemoteDecodeError(t *testing.T) {
 	}
 	if got := rp.input.WrittenSamples.Load(); got != 0 {
 		t.Fatalf("WrittenSamples = %d, want 0", got)
+	}
+}
+
+// TestRemoteLinkStats 诊断快照（#95）：抖动统计、链路计数与混音输入环占用
+// 与解码路径一致；未知 peer 返回 false。
+func TestRemoteLinkStats(t *testing.T) {
+	m, _ := newTestMixer()
+	rm := NewRemoteManager(m, nil)
+	rp := newTestRemotePeer(t, "a", m)
+	rm.peers["a"] = rp
+	pkts := encodeSinePackets(t, 3)
+	for i := 0; i < 3; i++ {
+		rp.jb.Push(uint16(100+i), pkts[i], remoteArrival(100+i))
+		rp.Stats.RTPReceived.Add(1) // 模拟 readLoop 计数
+	}
+	for i := 0; i < 3; i++ {
+		rp.decodeOnce()
+	}
+
+	ls, ok := rm.LinkStats("a")
+	if !ok {
+		t.Fatal("LinkStats(a) not found")
+	}
+	if ls.RTPReceived != 3 || ls.FramesPopped != 3 || ls.PLCFrames != 0 || ls.FECFrames != 0 {
+		t.Fatalf("link counters = %+v, want rtp=3 popped=3 plc=0 fec=0", ls)
+	}
+	if ls.RingAvailable != 3*OpusFrameSize || ls.WrittenSamples != 3*OpusFrameSize {
+		t.Fatalf("ring = %d/%d, want %d/%d", ls.RingAvailable, ls.WrittenSamples, 3*OpusFrameSize, 3*OpusFrameSize)
+	}
+	if !ls.Jitter.Started || ls.Jitter.TargetPackets < 3 || ls.Jitter.Buffered != 0 {
+		t.Fatalf("jitter stats = %+v, want started, target>=3, buffered=0", ls.Jitter)
+	}
+	if _, ok := rm.LinkStats("missing"); ok {
+		t.Fatal("LinkStats(missing) should be false")
 	}
 }
 
@@ -471,7 +657,8 @@ func BenchmarkRemoteDecodeFrame(b *testing.B) {
 }
 
 // BenchmarkRemoteDecodePLCFrame 丢包路径：只推偶数 seq，每包弹两拍
-// （空洞 PLC + 正常），验证 PLC 分支同样零分配。
+// （空洞用后继包 FEC 恢复/回落 PLC + 正常帧），验证丢帧分支（含 PeekNext
+// 与 FEC 解码）同样零分配。
 func BenchmarkRemoteDecodePLCFrame(b *testing.B) {
 	m := NewMixer(func([]int16) int { return FrameSize })
 	rp := newTestRemotePeer(b, "a", m)

@@ -200,6 +200,29 @@ func (b *JitterBuffer) Pop(out []byte) (n int, lost bool, ok bool) {
 	return 0, true, true
 }
 
+// PeekNext 复制「下一个应弹出」槽位的载荷，但不消费：不推进 nextPop、
+// 不改缓冲计数与断流状态。仅用于丢帧瞬间取后继包做带内 FEC 恢复
+// （先 Pop 得到 lost，再 PeekNext 判断后继是否已到）；连续丢包时 ok=false。
+// 锁语义与 Pop 一致，零分配。
+func (b *JitterBuffer) PeekNext(out []byte) (n int, ok bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if !b.started {
+		return 0, false
+	}
+	slot := &b.slots[b.nextPop%jitterSlots]
+	if !slot.present || slot.seq != b.nextPop {
+		return 0, false
+	}
+	n = slot.n
+	if len(out) < n {
+		n = len(out) // 防御：与 Pop 相同的截断策略
+	}
+	copy(out[:n], slot.buf[:n])
+	return n, true
+}
+
 // Stats 返回统计快照。
 func (b *JitterBuffer) Stats() JitterStats {
 	b.mu.Lock()
