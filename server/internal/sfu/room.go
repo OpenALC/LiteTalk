@@ -43,7 +43,7 @@ func (r *Room) getPeer(userID string) *Peer {
 
 // addPeer 登记成员并创建其 PeerConnection。同 room 同 uid 仅允许一个 peer（§0.9）：
 // 同人重入（同 connID 重协商）或新连接顶替（异 connID）都先清掉旧 peer。
-// 顶替路径还要摘掉其余成员指向该 uid 的旧下行路由（#23，与 removePeerIf 同因）。
+// 顶替路径还要摘掉其余成员指向旧实例的旧下行路由（#23，按实例核对）。
 func (r *Room) addPeer(userID, connID string, sig SignalSender) (*Peer, error) {
 	r.mu.Lock()
 	var replaced *Peer
@@ -55,7 +55,7 @@ func (r *Room) addPeer(userID, connID string, sig SignalSender) (*Peer, error) {
 	if len(r.peers) >= r.sfu.cfg.MaxMembers {
 		r.mu.Unlock()
 		if replaced != nil {
-			r.dropRoutesFrom(userID)
+			r.retirePeer(replaced)
 			go replaced.close()
 		}
 		return nil, ErrRoomFull
@@ -64,7 +64,7 @@ func (r *Room) addPeer(userID, connID string, sig SignalSender) (*Peer, error) {
 	if err != nil {
 		r.mu.Unlock()
 		if replaced != nil {
-			r.dropRoutesFrom(userID)
+			r.retirePeer(replaced)
 			go replaced.close()
 		}
 		return nil, err
@@ -74,8 +74,8 @@ func (r *Room) addPeer(userID, connID string, sig SignalSender) (*Peer, error) {
 	r.mu.Unlock()
 	if replaced != nil {
 		// 新 peer 的上行路由要等它 OnTrack 后才建（在本函数返回之后），
-		// 这里先摘旧路由是安全的，不会误删重入后的新轨道。
-		r.dropRoutesFrom(userID)
+		// 这里先摘旧实例的路由是安全的，不会误删重入后的新轨道。
+		r.retirePeer(replaced)
 		go replaced.close()
 	}
 	r.sfu.log.Printf("sfu: 成员 %s 加入房间 %s（connID %s，当前 %d 人）", userID, r.id, connID, n)
@@ -94,6 +94,12 @@ func (r *Room) releaseJoin() {
 // 同 uid 的新连接已顶替旧 peer 时，旧连接的清理不得误删新连接），返回是否真实摘除。
 // 其余成员指向它的下行轨道一并真摘（#23）：惰性保留会让 srcUserID 重入后
 // ensureRoute 见旧条目跳过，订阅端已按 peer_left 拆掉读取循环却拿不到新 OnTrack。
+//
+// 残留理论窗口：delete 与 teardownPeer 之间，同 uid+connID 的重入可能建出新 peer
+// 并建立路由；teardownPeer 按旧实例核对路由（outRoute.src），不会误删新路由。
+// 但本函数只看 connID，KickChannel 等路径若在重入后对同一连接执行 LeaveIf，
+// 仍可能摘掉新 peer 本身——该窗口与路由清理无关，属信令层「同一 WS 连接
+// 顺序处理」前提之外的理论竞态。
 func (r *Room) removePeerIf(userID, connID string) bool {
 	r.mu.Lock()
 	p, ok := r.peers[userID]
@@ -122,9 +128,11 @@ func (r *Room) removePeerInstance(p *Peer) bool {
 	return true
 }
 
-// teardownPeer 摘除收尾：先摘其余成员指向它的下行路由，再关其 PC。
+// teardownPeer 摘除收尾：先按**实例**摘其余成员指向它的下行路由，再关其 PC。
+// 不能只按 userID 摘（#23）：重入房的新 peer 与旧实例同 uid、同 connID，按 uid
+// 摘除会把新实例刚建立的路由一并抹掉，订阅端听不到声音。
 func (r *Room) teardownPeer(p *Peer) {
-	r.dropRoutesFrom(p.userID)
+	r.retirePeer(p)
 	p.close()
 	r.mu.RLock()
 	n := len(r.peers)
@@ -132,37 +140,46 @@ func (r *Room) teardownPeer(p *Peer) {
 	r.sfu.log.Printf("sfu: 成员 %s 离开房间 %s（connID %s，剩余 %d 人）", p.userID, r.id, p.connID, n)
 }
 
-// dropRoutesFrom 摘除其余成员指向 srcUserID 的下行路由（离房/ICE 失败/连接顶替）。
+// retirePeer 标记实例退役并摘除其余成员指向该实例的下行路由（#23）。
+// 退役标记先置位再摘路由：并发到达的 ensureRoute（旧实例迟到的 OnTrack）会据此
+// 拒绝建路由或自行收掉，避免在 dropRoutesFrom 快照之后留下孤儿路由。
+func (r *Room) retirePeer(p *Peer) {
+	p.retired.Store(true)
+	r.dropRoutesFrom(p)
+}
+
+// dropRoutesFrom 摘除其余成员指向 src 实例的下行路由（离房/ICE 失败/连接顶替）。
 // 只在 room.mu 读锁内快照目标，真正摘除在锁外（RemoveTrack 可能阻塞，见 dropRoute）。
-func (r *Room) dropRoutesFrom(srcUserID string) {
+// 按实例而非 uid 匹配（#23）：同 uid 重入后新实例的路由必须保留。
+func (r *Room) dropRoutesFrom(src *Peer) {
 	r.mu.RLock()
 	targets := make([]*Peer, 0, len(r.peers))
-	for uid, p := range r.peers {
-		if uid != srcUserID {
-			targets = append(targets, p)
-		}
+	for _, p := range r.peers {
+		targets = append(targets, p)
 	}
 	r.mu.RUnlock()
 	for _, t := range targets {
-		t.dropRoute(srcUserID)
+		t.dropRoute(src)
 	}
 }
 
-// dropRoute 删本 peer 指向 srcUserID 的下行路由并 RemoveTrack。持 target.mu 完成
+// dropRoute 删本 peer 指向 src 实例的下行路由并 RemoveTrack。持 target.mu 完成
 // 「删条目 + RemoveTrack」整个序列（#23 陷阱：顺序必须先删条目再 RemoveTrack，
 // 且不能在 room.mu 内调 pion 的 RemoveTrack——可能阻塞，会连带卡住整个房间的 forward）。
+// 条目存在但 src 不是同一实例时保留：那是重入后的新路由（#23）。
 // RemoveTrack 会触发 OnNegotiationNeeded → SFU 发重协商 offer，走既有 S→C rtc.offer
 // 路径，不涉及 rtc.failed。
-func (p *Peer) dropRoute(srcUserID string) {
+func (p *Peer) dropRoute(src *Peer) {
 	p.mu.Lock()
-	route, ok := p.outbound[srcUserID]
-	if ok {
-		delete(p.outbound, srcUserID)
+	route, ok := p.outbound[src.userID]
+	dropped := ok && route.src == src
+	if dropped {
+		delete(p.outbound, src.userID)
 		_ = p.pc.RemoveTrack(route.sender)
 	}
 	p.mu.Unlock()
-	if ok {
-		p.room.sfu.log.Printf("sfu: 路由 %s → %s 摘除（房间 %s）", srcUserID, p.userID, p.room.id)
+	if dropped {
+		p.room.sfu.log.Printf("sfu: 路由 %s → %s 摘除（房间 %s）", src.userID, p.userID, p.room.id)
 	}
 }
 
@@ -170,7 +187,7 @@ func (p *Peer) dropRoute(srcUserID string) {
 // 把既有成员的全部 inbound track 以 outbound 形式挂到新成员 PC 上（触发重协商）。
 func (r *Room) onPeerReady(p *Peer) {
 	type source struct {
-		userID string
+		peer   *Peer
 		tracks []*webrtc.TrackRemote
 	}
 	r.mu.RLock()
@@ -183,68 +200,90 @@ func (r *Room) onPeerReady(p *Peer) {
 		tracks := append([]*webrtc.TrackRemote(nil), q.inbound...)
 		q.mu.Unlock()
 		if len(tracks) > 0 {
-			srcs = append(srcs, source{userID: uid, tracks: tracks})
+			srcs = append(srcs, source{peer: q, tracks: tracks})
 		}
 	}
 	r.mu.RUnlock()
 
 	for _, src := range srcs {
 		for _, t := range src.tracks {
-			if err := r.ensureRoute(p, src.userID, t); err != nil {
-				r.sfu.log.Printf("sfu: 为新成员 %s 补发 %s 的轨道失败: %v", p.userID, src.userID, err)
+			if err := r.ensureRoute(p, src.peer, t); err != nil {
+				r.sfu.log.Printf("sfu: 为新成员 %s 补发 %s 的轨道失败: %v", p.userID, src.peer.userID, err)
 			}
 		}
 	}
 }
 
 // addRoutesFrom 某成员新上行 track 到达后，给房间内其他成员各挂一条 outbound。
-func (r *Room) addRoutesFrom(srcUserID string, src *webrtc.TrackRemote) {
+// src 为该轨道的**源实例**：路由按实例记账，旧实例迟到的轨道不会覆盖新实例的路由（#23）。
+func (r *Room) addRoutesFrom(src *Peer, track *webrtc.TrackRemote) {
 	r.mu.RLock()
 	targets := make([]*Peer, 0, len(r.peers))
 	for uid, p := range r.peers {
-		if uid != srcUserID {
+		if uid != src.userID {
 			targets = append(targets, p)
 		}
 	}
 	r.mu.RUnlock()
 
 	for _, t := range targets {
-		if err := r.ensureRoute(t, srcUserID, src); err != nil {
-			r.sfu.log.Printf("sfu: 为 %s 添加 %s 的转发轨道失败: %v", t.userID, srcUserID, err)
+		if err := r.ensureRoute(t, src, track); err != nil {
+			r.sfu.log.Printf("sfu: 为 %s 添加 %s 的转发轨道失败: %v", t.userID, src.userID, err)
 		}
 	}
 }
 
-// ensureRoute 保证 target 有一条对应 srcUserID 的 outbound TrackLocalStaticRTP。
-// 幂等：已存在则跳过（OnTrack 与 onPeerReady 两条路径可能并发触发）。
-func (r *Room) ensureRoute(target *Peer, srcUserID string, src *webrtc.TrackRemote) error {
-	if target.userID == srcUserID {
+// ensureRoute 保证 target 有一条对应 src 实例的 outbound TrackLocalStaticRTP。
+// 幂等：同一实例重复调用跳过（OnTrack 与 onPeerReady 两条路径可能并发触发）。
+// 同名条目属于旧实例时替换成新实例的轨道（#23）：同 uid 重入后新轨道必须送达，
+// 不能因为旧条目还在就跳过；替换与旧实例的 dropRoute 都持 target.mu，按 src 核对。
+func (r *Room) ensureRoute(target, src *Peer, track *webrtc.TrackRemote) error {
+	if target.userID == src.userID {
+		return nil
+	}
+	if src.retired.Load() {
 		return nil
 	}
 	target.mu.Lock()
-	defer target.mu.Unlock()
 	if target.closed {
+		target.mu.Unlock()
 		return nil
 	}
-	if _, ok := target.outbound[srcUserID]; ok {
-		return nil
+	if old, ok := target.outbound[src.userID]; ok {
+		if old.src == src {
+			target.mu.Unlock()
+			return nil
+		}
+		// 旧实例的残余路由：先删条目再 RemoveTrack（与 dropRoute 的既定顺序一致），
+		// 整个序列持 target.mu。
+		delete(target.outbound, src.userID)
+		_ = target.pc.RemoveTrack(old.sender)
 	}
-	track, err := webrtc.NewTrackLocalStaticRTP(
-		src.Codec().RTPCodecCapability,
-		"audio-"+srcUserID,
+	lt, err := webrtc.NewTrackLocalStaticRTP(
+		track.Codec().RTPCodecCapability,
+		"audio-"+src.userID,
 		"litetalk-"+r.id,
 	)
 	if err != nil {
+		target.mu.Unlock()
 		return err
 	}
-	sender, err := target.pc.AddTrack(track)
+	sender, err := target.pc.AddTrack(lt)
 	if err != nil {
+		target.mu.Unlock()
 		return err
 	}
-	target.outbound[srcUserID] = &outRoute{track: track, sender: sender}
+	target.outbound[src.userID] = &outRoute{track: lt, sender: sender, src: src}
+	target.mu.Unlock()
 	// RTCP 读循环防淤积（SR/RR 仅 drain + 计数；NACK/PLI 不透传，音频靠 FEC/PLC）
 	go drainRTCPSender(sender)
-	r.sfu.log.Printf("sfu: 路由 %s → %s 建立（房间 %s）", srcUserID, target.userID, r.id)
+	r.sfu.log.Printf("sfu: 路由 %s → %s 建立（房间 %s）", src.userID, target.userID, r.id)
+	// 建路由期间源实例退役：退役方的 dropRoutesFrom 可能已在本次插入之前跑完，
+	// 不会再回来摘这条路由，自行收掉。dropRoute 按实例核对，若同名条目已被
+	// 更新的实例替换则保持不动。
+	if src.retired.Load() {
+		target.dropRoute(src)
+	}
 	return nil
 }
 
@@ -278,7 +317,9 @@ func (r *Room) forward(src *Peer, srcTrack *webrtc.TrackRemote, levelExtID uint8
 			p.mu.Lock()
 			route := p.outbound[src.userID]
 			p.mu.Unlock()
-			if route == nil {
+			// 按实例核对（#23）：同名 uid 已换成新实例的路由时，旧 forward 循环
+			// 不得把旧轨道的包写进新实例的 track。
+			if route == nil || route.src != src {
 				continue
 			}
 			// pion 只改写绑定侧 SSRC/PT，Seq/TS 与 payload 原样透传；写失败（如对端
