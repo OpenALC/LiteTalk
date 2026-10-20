@@ -13,17 +13,18 @@ func validChannelName(s string) bool {
 	return n >= 1 && n <= 64
 }
 
-// CreateChannel POST /api/v1/servers/{id}/channels（owner/admin）
+// CreateChannel POST /api/v1/servers/{id}/channels（需 ManageChannels，#35 B3）
 func (s *Server) CreateChannel(ctx context.Context, request CreateChannelRequestObject) (CreateChannelResponseObject, error) {
 	if e := checkID(request.Id); e != nil {
 		return nil, e
 	}
+	c := currentUser(ctx)
+	// 资源→权限→body（#35 B3）。
+	if e := s.requirePerm(ctx, request.Id, c.UserID, store.ManageChannels); e != nil {
+		return nil, e
+	}
 	if request.Body == nil {
 		return nil, bodyMissing()
-	}
-	c := currentUser(ctx)
-	if e := s.requireRole(ctx, request.Id, c.UserID, store.RoleAdmin); e != nil {
-		return nil, e
 	}
 	req := request.Body
 	if !validChannelName(req.Name) {
@@ -60,22 +61,23 @@ func (s *Server) CreateChannel(ctx context.Context, request CreateChannelRequest
 	return CreateChannel201JSONResponse(channelView(ch)), nil
 }
 
-// PatchChannel PATCH /api/v1/channels/{id}（owner/admin）
+// PatchChannel PATCH /api/v1/channels/{id}（需 ManageChannels，#35 B3）
 func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestObject) (PatchChannelResponseObject, error) {
 	if e := checkID(request.Id); e != nil {
+		return nil, e
+	}
+	c := currentUser(ctx)
+	// 资源→权限→body（#35 B3）：先解析频道（404），再权限（403），最后字段校验（400）。
+	ch, err := s.store.ChannelByID(ctx, request.Id)
+	if err != nil {
+		return nil, s.writeStoreErr(ctx, err)
+	}
+	if e := s.requirePerm(ctx, ch.ServerID, c.UserID, store.ManageChannels); e != nil {
 		return nil, e
 	}
 	req := patchBody(request.JSONBody, request.ApplicationMergePatchPlusJSONBody)
 	if req == nil {
 		return nil, bodyMissing()
-	}
-	c := currentUser(ctx)
-	ch, err := s.store.ChannelByID(ctx, request.Id)
-	if err != nil {
-		return nil, s.writeStoreErr(ctx, err)
-	}
-	if e := s.requireRole(ctx, ch.ServerID, c.UserID, store.RoleAdmin); e != nil {
-		return nil, e
 	}
 	// Merge Patch（#31）：缺省不改，null = 清空（name/type 不可清 → 校验拒 400；
 	// category_id 的 null = 移出分类；position 的 null 拒 400）。
@@ -117,7 +119,7 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 	return PatchChannel200JSONResponse(channelView(ch)), nil
 }
 
-// DeleteChannel DELETE /api/v1/channels/{id}（owner/admin）
+// DeleteChannel DELETE /api/v1/channels/{id}（需 ManageChannels，#35 B3）
 func (s *Server) DeleteChannel(ctx context.Context, request DeleteChannelRequestObject) (DeleteChannelResponseObject, error) {
 	if e := checkID(request.Id); e != nil {
 		return nil, e
@@ -127,12 +129,14 @@ func (s *Server) DeleteChannel(ctx context.Context, request DeleteChannelRequest
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	if e := s.requireRole(ctx, ch.ServerID, c.UserID, store.RoleAdmin); e != nil {
+	if e := s.requirePerm(ctx, ch.ServerID, c.UserID, store.ManageChannels); e != nil {
 		return nil, e
 	}
 	if err := s.store.DeleteChannel(ctx, request.Id); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
+	// 频道级覆盖随频道删除：快照作废，避免旧覆盖继续影响同服其它判定。
+	s.authz.InvalidateServer(ch.ServerID)
 	// 频道删除后踢出该房间内成员（#22，单实例语义）。
 	if s.hub != nil {
 		s.hub.KickChannel(strconv.FormatInt(request.Id, 10), "channel_deleted")
@@ -142,26 +146,30 @@ func (s *Server) DeleteChannel(ctx context.Context, request DeleteChannelRequest
 
 // ListChannels GET /api/v1/servers/{id}/channels（v0.1.2 补缺口）。
 // 返回分类与频道两个数组，频道带 category_id；前端按分类归组渲染。
-// 任意服务器成员可读。
+// 成员可读，但只返回其有 ViewChannel 的频道（#35 B3）；categories 不因空分类过滤。
 func (s *Server) ListChannels(ctx context.Context, request ListChannelsRequestObject) (ListChannelsResponseObject, error) {
 	if e := checkID(request.Id); e != nil {
 		return nil, e
 	}
 	c := currentUser(ctx)
-	if _, err := s.store.Member(ctx, request.Id, c.UserID); err != nil {
-		return nil, errf(http.StatusForbidden, "forbidden", "不是该服务器成员")
+	if e := s.requireMember(ctx, request.Id, c.UserID); e != nil {
+		return nil, e
 	}
 	channels, err := s.store.ChannelsOfServer(ctx, request.Id)
-	if err != nil {
-		return nil, s.writeStoreErr(ctx, err)
-	}
-	categories, err := s.store.CategoriesOfServer(ctx, request.Id)
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
 	// 空结果落 [] 而非 null（契约 ServerChannels）。
 	if channels == nil {
 		channels = []store.Channel{}
+	}
+	channels, err = s.visibleChannels(ctx, c.UserID, request.Id, channels)
+	if err != nil {
+		return nil, s.writeStoreErr(ctx, err)
+	}
+	categories, err := s.store.CategoriesOfServer(ctx, request.Id)
+	if err != nil {
+		return nil, s.writeStoreErr(ctx, err)
 	}
 	if categories == nil {
 		categories = []store.Category{}

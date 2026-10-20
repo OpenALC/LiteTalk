@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/OpenALC/LiteTalk/server/internal/auth"
+	"github.com/OpenALC/LiteTalk/server/internal/authz"
 	"github.com/OpenALC/LiteTalk/server/internal/mailer"
 	"github.com/OpenALC/LiteTalk/server/internal/rtcapi"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
@@ -50,6 +51,8 @@ type Server struct {
 	hub      Hub                // WS 信令 hub（登出/重置密码踢线；nil=不踢）
 	presence PresenceReader     // 在线状态（好友列表 user.online 用；nil=恒离线）
 	selfHost bool               // 一键自托管形态（GET /api/v1/config 自描述，#26）
+	// authz 权限判定（#35 B3）：与 signal.Hub 共享同一实例，缓存失效才同步。
+	authz *authz.Authorizer
 	// bootstrapRequired 管理员邀请码是否未消费（#27 T4 接线；nil=恒 false）。
 	bootstrapRequired func() bool
 	// version 服务端构建版本（GET /api/v1/healthz 回显，#77）。
@@ -90,6 +93,9 @@ type Config struct {
 	RTC rtcapi.Config
 	// RTCAuth 从访问令牌提取 uid（Bearer 或 ?token=，与信令一致）；nil 一律 401。
 	RTCAuth rtcapi.UserFromToken
+	// Authz 权限判定（#35 B3）。nil 时用 Store 自建默认实例（测试兼容）；
+	// 生产必须传入与 signal.Hub 共享的同一实例，否则写后失效不同步。
+	Authz *authz.Authorizer
 }
 
 // New 构造 API Server。
@@ -110,6 +116,11 @@ func New(cfg Config) *Server {
 	if ver == "" {
 		ver = "dev"
 	}
+	az := cfg.Authz
+	if az == nil && cfg.Store != nil {
+		// 测试/单用方场景自建；生产（main.go）注入与 Hub 共享的实例。
+		az = authz.New(cfg.Store, authz.Options{})
+	}
 	return &Server{
 		store:             cfg.Store,
 		jwt:               cfg.JWT,
@@ -124,6 +135,7 @@ func New(cfg Config) *Server {
 		hub:               cfg.Hub,
 		presence:          cfg.Presence,
 		selfHost:          cfg.SelfHost,
+		authz:             az,
 		bootstrapRequired: cfg.BootstrapRequired,
 		version:           ver,
 		rtcCfg:            cfg.RTC,
