@@ -2,6 +2,8 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { eventsOn, goApp } from '../api/bridge'
 import type { ChatMessage } from '../api/types'
+import { cleanErrorText } from '../utils/errorText'
+import { useNotifyStore } from './notify'
 
 // chat 文字聊天状态。消息按 channel_id 分桶存储——此前是单一扁平数组，
 // 切换频道后旧频道消息会被带到新频道（问题：聊天未隔离）。
@@ -29,6 +31,7 @@ export const useChatStore = defineStore('chat', () => {
 
   function bindEvents() {
     if (offs.length) return // 幂等：重复绑定会叠监听
+    const notify = useNotifyStore()
     offs.push(eventsOn('chat:message', (m) => {
       const msg = m as ChatMessage
       if (!msg.channel_id) return
@@ -39,6 +42,13 @@ export const useChatStore = defineStore('chat', () => {
         ...messagesByChannel.value,
         [msg.channel_id]: [...arr, msg],
       }
+    }))
+    // 服务端拒收 chat.send 的异步 error 帧（#34）：app.go 的载荷是 {code, message}，
+    // 不含 channel_id。此前无人监听，消息被拒后输入框毫无反馈；message 优先展示
+    // 服务端中文原因，缺省用统一文案（码本身不展示，见 #15）。
+    offs.push(eventsOn('chat:error', (d) => {
+      const p = d as { code?: string; message?: string } | null
+      notify.show(cleanErrorText(p?.message, '消息发送失败'), true)
     }))
   }
 
