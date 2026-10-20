@@ -1,0 +1,4 @@
+-- 0009_users_nickname_bin.up.sql — SQLite 侧无需变更（#24 P2）
+-- 与 MySQL 同号存在，仅为保持两套方言的 schema_migrations version 对齐。
+-- SQLite 的 TEXT 默认 BINARY 排序规则，nickname 的比较与 uk_users_nickname_tag
+-- 本来就大小写敏感；本文件只有注释，loader 执行 0 条语句后记录版本号。

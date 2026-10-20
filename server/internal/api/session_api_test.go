@@ -24,6 +24,7 @@ func doJSON(t *testing.T, h http.Handler, method, path, token string, body any, 
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	req.Header.Set(clientVersionHeader, testClientVersion)
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -62,8 +63,8 @@ type eofErr struct{}
 
 func (*eofErr) Error() string { return "EOF" }
 
-// registerSimple simple 模式注册并返回令牌对 + user id。
-func registerSimple(t *testing.T, h http.Handler, email, device string) (access, refresh string, uid float64) {
+// registerSimple simple 模式注册并返回令牌对 + user id（Snowflake 后 wire 为字符串）。
+func registerSimple(t *testing.T, h http.Handler, email, device string) (access, refresh string, uid int64) {
 	t.Helper()
 	resp := postJSON(t, h, "/api/v1/auth/register", "", map[string]string{
 		"email": email, "password": "password123", "nickname": "昵称" + email[:4], "device": device,
@@ -71,7 +72,7 @@ func registerSimple(t *testing.T, h http.Handler, email, device string) (access,
 	acc, _ := resp["access_token"].(string)
 	ref, _ := resp["refresh_token"].(string)
 	if user, ok := resp["user"].(map[string]any); ok {
-		uid, _ = user["id"].(float64)
+		uid = asID(user["id"])
 	}
 	return acc, ref, uid
 }
@@ -164,6 +165,7 @@ func TestSessionRefreshRotateAndReplay(t *testing.T) {
 	// 旧刷新令牌重放 → session_replayed。
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/refresh", bytesReader([]byte(`{"refresh_token":"`+oldRefresh+`"}`)))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(clientVersionHeader, testClientVersion)
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {

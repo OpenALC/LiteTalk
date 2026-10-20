@@ -146,3 +146,82 @@ func TestMemStore(t *testing.T) {
 		t.Fatalf("Incr 第二次 = %d", n)
 	}
 }
+
+// TestCategoryUpdateAndReorder 分类改名/重排（0.1.2 PATCH 的 store 语义）：
+// 重排后相对顺序保持并重排 0..n-1；改名不动 created_at；不存在的 id 报 ErrNotFound。
+func TestCategoryUpdateAndReorder(t *testing.T) {
+	ctx := context.Background()
+	m := NewMem()
+	s := &Server{Name: "cat-srv", OwnerID: 1, IconName: "music", IconColor: "#4FA4F3"}
+	if err := m.CreateServer(ctx, s); err != nil {
+		t.Fatal(err)
+	}
+	ids := []int64{}
+	for i, name := range []string{"甲", "乙", "丙"} {
+		c := &Category{ServerID: s.ID, Name: name, Position: i}
+		if err := m.CreateCategory(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, c.ID)
+	}
+
+	// UpdateCategory 改名；created_at 不可变、不许挪服务器。
+	first, err := m.CategoryByID(ctx, ids[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Name = "甲改"
+	if err := m.UpdateCategory(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := m.CategoryByID(ctx, ids[0])
+	if got.Name != "甲改" || !got.CreatedAt.Equal(first.CreatedAt) {
+		t.Fatalf("改名后 = %+v", got)
+	}
+	missing := *got
+	missing.ID = 9999
+	if err := m.UpdateCategory(ctx, &missing); err != ErrNotFound {
+		t.Fatalf("不存在 id 应 ErrNotFound，实际 %v", err)
+	}
+	// 原样保存（值全同）必须成功：用户在对话框里不改内容直接保存是常规操作，
+	// 不是 404（MySQL 无 clientFoundRows 时同样报 0 行，两边语义须一致）。
+	if err := m.UpdateCategory(ctx, got); err != nil {
+		t.Fatalf("原样保存应成功，实际 %v", err)
+	}
+
+	// 末尾移到最前：丙 甲 乙 → 位置 0 1 2。
+	if err := m.ReorderCategories(ctx, s.ID, ids[2], 0); err != nil {
+		t.Fatal(err)
+	}
+	list, _ := m.CategoriesOfServer(ctx, s.ID)
+	want := []int64{ids[2], ids[0], ids[1]}
+	for i, c := range list {
+		if c.ID != want[i] || c.Position != i {
+			t.Fatalf("重排后[%d] = %+v，期望 id=%d pos=%d", i, c, want[i], i)
+		}
+	}
+
+	// 最前移到末尾：甲 乙 丙（越界 position 夹到尾）。
+	if err := m.ReorderCategories(ctx, s.ID, ids[2], 99); err != nil {
+		t.Fatal(err)
+	}
+	list, _ = m.CategoriesOfServer(ctx, s.ID)
+	want = []int64{ids[0], ids[1], ids[2]}
+	for i, c := range list {
+		if c.ID != want[i] || c.Position != i {
+			t.Fatalf("夹尾后[%d] = %+v，期望 id=%d pos=%d", i, c, want[i], i)
+		}
+	}
+
+	// 不存在/跨服务器 id 报 ErrNotFound，不影响现有顺序。
+	other := &Server{Name: "other", OwnerID: 1, IconName: "music", IconColor: "#4FA4F3"}
+	if err := m.CreateServer(ctx, other); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ReorderCategories(ctx, other.ID, ids[0], 0); err != ErrNotFound {
+		t.Fatalf("跨服务器应 ErrNotFound，实际 %v", err)
+	}
+	if err := m.ReorderCategories(ctx, s.ID, 9999, 0); err != ErrNotFound {
+		t.Fatalf("不存在 id 应 ErrNotFound，实际 %v", err)
+	}
+}

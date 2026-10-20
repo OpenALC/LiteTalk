@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litetalk:signal:presence.update",
+  "title": "PresenceUpdateData",
+  "x-wire-type": "presence.update",
+  "x-go-const": "TypePresenceUpdate",
+  "x-direction": "S2C",
+  "x-since": 1,
+  "x-namespace": "event",
+  "description": "某用户在线状态变化。user_id 是状态变化的用户（不是接收者）；只推给与其互为已接受好友的在线连接，状态未变不发（去抖）。",
+  "type": "object",
+  "properties": {
+    "user_id": { "type": "string" },
+    "online": { "type": "boolean" },
+    "ts": { "type": "integer" }
+  },
+  "required": ["user_id", "online", "ts"],
+  "additionalProperties": false
+}

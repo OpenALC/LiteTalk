@@ -1,7 +1,8 @@
 <script setup lang="ts">
 // LoginView 登录页（对齐 Auth.html：分段切换登录/注册、记住密码、忘记密码）。
 // 记住密码（问题 6）：启动自动填充（不自动登录）；成功登录且勾选→保存；
-// 取消勾选→清除已存凭据。密码经 DPAPI 加密落盘（Go 侧）。
+// 取消勾选→清除已存凭据。密码由平台保护后落盘（Windows DPAPI / Linux keyring；
+// keyring 不可用时不保存，见 issue #8）。
 // 游客进入（simple 模式）：一键游客登录，Go 侧复用已记住的游客身份。
 import { onMounted, onUnmounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
@@ -9,7 +10,8 @@ import { Eye, EyeOff, LockKeyhole, Mail, Check, UserRound, Info } from 'lucide-v
 import AuthLayout from './AuthLayout.vue'
 import Toast from '../../components/Toast.vue'
 import { eventsOn, goApp } from '../../api/bridge'
-import { useAuthStore } from '../../stores/auth'
+import { useAuthStore, kickedBannerText } from '../../stores/auth'
+import { cleanErrorText } from '../../utils/errorText'
 import './auth-forms.css'
 
 const router = useRouter()
@@ -21,10 +23,12 @@ const invalid = reactive({ email: false, password: false })
 const showPwd = ref(false)
 const loading = ref(false)
 const guestLoading = ref(false)
+// 无密钥环时「记住密码」不会生效（密码宁可不存），登录页直接说明，避免勾了却没记住。
+const secretMode = ref('')
 
-// kicked 被踢横幅数据源（非空即显示，文案固定）。进入登录页时取走 store 里的
-// 原因并清（横幅生命周期只在本次访问，不留到下次）；挂载期间的 auth:kicked
-// 实时刷新（事件可能在本页挂载后才到，store 层回登录页导航完成前的窗口）。
+// kicked 被踢横幅数据源（非空即显示，文案按 reason 分支）。进入登录页时取走
+// store 里的原因并清（横幅生命周期只在本次访问，不留到下次）；挂载期间的
+// auth:kicked 实时刷新（事件可能在本页挂载后才到，store 层回登录页导航完成前的窗口）。
 const kicked = ref('')
 let offKicked: () => void = () => {}
 
@@ -39,6 +43,7 @@ onMounted(async () => {
     kicked.value = typeof r === 'string' && r !== '' ? r : 'login_elsewhere'
   })
   auth.loadConfig() // 拉服务端能力开关（simple 模式显示「游客进入」）
+  secretMode.value = await goApp().SecretStorageMode().catch(() => '')
   // 自动填充记住的凭据（不自动登录，用户手动点登录）。
   try {
     const c = await goApp().GetSavedCredentials()
@@ -81,7 +86,7 @@ async function submit() {
     toast.value?.show('登录成功')
     router.push('/')
   } catch (e) {
-    toast.value?.show(String(e), true)
+    toast.value?.show(cleanErrorText(e, '登录失败'), true)
   } finally {
     loading.value = false
   }
@@ -95,7 +100,7 @@ async function guestEnter() {
     await auth.guest()
     router.push('/')
   } catch (e) {
-    toast.value?.show(String(e), true)
+    toast.value?.show(cleanErrorText(e, '游客登录失败'), true)
   } finally {
     guestLoading.value = false
   }
@@ -104,10 +109,11 @@ async function guestEnter() {
 
 <template>
   <AuthLayout>
-    <!-- 被踢提示：账号已在其他设备登录，本端会话与令牌已被 Go 侧清除 -->
+    <!-- 被踢提示：本端会话与令牌已被 Go 侧清除。文案按 reason 分支
+         （server_changed 换服、login_expired 登录过期，都不是异地登录）。 -->
     <div v-if="kicked" class="kicked-bar" role="status">
       <Info :size="15" />
-      <span>账号已在其他设备登录</span>
+      <span>{{ kickedBannerText(kicked) }}</span>
     </div>
 
     <div class="seg">
@@ -149,6 +155,7 @@ async function guestEnter() {
         </label>
         <button type="button" class="link" @click="router.push('/forgot')">忘记密码？</button>
       </div>
+      <p v-if="secretMode === 'file'" class="remember-note">密钥环不可用，密码不会被记住</p>
 
       <button type="submit" class="btn-primary" :class="{ loading }" :disabled="loading">
         <span class="spinner" />
@@ -180,4 +187,9 @@ async function guestEnter() {
   font-size: 13px; color: var(--ink-900);
 }
 .kicked-bar svg { color: var(--brand-500); flex: none; }
+/* 无密钥环提示：跟在记住密码行下方，弱化存在感，不打断表单节奏。 */
+.remember-note {
+  margin: -12px 0 14px;
+  font-size: 12px; color: var(--ink-400);
+}
 </style>

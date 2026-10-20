@@ -1,35 +1,61 @@
-// 类型定义（与 Go 侧 state 包对齐）。
-export interface UserProfile {
-  id: number
-  nickname: string
-  tag: string
-  email: string
-  is_guest?: boolean
-}
+// 类型定义。两半：
+// 1) REST 契约类型——来自 api/openapi.yaml 的生成物 types.gen.ts（禁止手改生成物，
+//    改契约先改 openapi.yaml 再跑 go run -C server ./api/tools/openapigen）；
+// 2) 纯前端/桥接类型——UI 视图、Wails 绑定载荷，与 REST wire 不同源。
+import type { components } from './types.gen'
 
+// ---- REST 契约类型（openapi.yaml → types.gen.ts）----
+// Problem：RFC 9457 问题详情（#31）；ApiError 为旧名兼容别名。
+export type Problem = components['schemas']['Problem']
+export type ApiError = Problem
+export type ServerConfig = components['schemas']['ServerConfig']
+export type User = components['schemas']['User']
+export type PublicUser = components['schemas']['PublicUser']
+export type TokenPair = components['schemas']['TokenPair']
+export type ServerInfo = components['schemas']['ServerInfo']
+export type ChannelInfo = components['schemas']['ChannelInfo']
+export type CategoryInfo = components['schemas']['CategoryInfo']
+export type MemberInfo = components['schemas']['MemberInfo']
+export type Message = components['schemas']['Message']
+export type Invite = components['schemas']['Invite']
+export type FriendEntry = components['schemas']['FriendEntry']
+export type ServerChannels = components['schemas']['ServerChannels']
+export type SyncServer = components['schemas']['SyncServer']
+export type SyncSnapshot = components['schemas']['SyncSnapshot']
+
+// ---- 桥接层兼容名（组件/stores 既有命名）----
+// Wails 绑定经 Go state 包中转：字段与契约同源，个别桥接补充字段见注释。
+export type ServerDTO = ServerInfo
+export type ChannelDTO = ChannelInfo
+export type CategoryDTO = CategoryInfo
+// 桥接层把 user 解成值类型，恒非空（REST 侧 accept/patch 极端情况可为 null）。
+export type FriendDTO = Omit<FriendEntry, 'user'> & { user: UserProfile }
+// UserProfile：契约 User + 桥接补充的在线态（好友列表 user.online 用）。
+export type UserProfile = User & { online: boolean }
+
+// AuthResult 登录/注册的桥接载荷（与 REST TokenPair 不同源：无 expires_in，
+// 多 session_ok 报告信令是否已连上——Go 侧登录后连信令的首连结果）。
+// session_ok 可选仅因浏览器 mock 桩不产该字段。
 export interface AuthResult {
   access_token: string
   refresh_token: string
   user: UserProfile
-  // 信令是否已连上（Go 侧登录后连接信令的首连结果）；false 时后台带退避重试，
-  // UI 显示提示条。可选仅因浏览器 mock 桩不产该字段。
   session_ok?: boolean
 }
 
-// ServerConfig 服务端能力开关（GET /api/v1/config）。
-export interface ServerConfig {
-  auth_mode: 'full' | 'simple'
-  mail_configured: boolean
-}
+// ---- 纯前端/桥接类型（不进 REST 契约）----
 
 export interface PeerView {
   user_id: string
   nickname: string
+  tag: string
   speaking: boolean
   mute: boolean
   deafen: boolean
 }
 
+// ChatMessage 语音房聊天（WS chat.message 桥接视图；与 REST Message 不同源，
+// 三方漂移在 #31 统一）。
 export interface ChatMessage {
   id: string
   channel_id: string
@@ -37,6 +63,8 @@ export interface ChatMessage {
   nickname: string
   content: string
   ts: string
+  // nonce 发送方幂等键（#31，协议 v2；老服务端/REST 补拉不带）
+  nonce?: string
 }
 
 // ConnConfigView 当前生效的服务器地址与来源（设置页「连接」）。
@@ -105,40 +133,4 @@ export interface VoiceStateView {
   channel_id: string
   muted: boolean
   deafened: boolean
-}
-
-// FriendDTO 好友（服务端 friendView；批次③好友真实 REST 用）。
-// user.status：0 离线 / 1 在线 / 2 离开 / 3 忙碌（好友归组用，与 Go UserProfile.Status 对齐）。
-export interface FriendDTO {
-  id: number
-  status: string // pending / accepted / blocked
-  incoming: boolean
-  remark: string
-  group: string
-  user: { id: number; nickname: string; tag: string; status: number }
-}
-
-// CategoryDTO 频道分类（服务端实体）。
-export interface CategoryDTO {
-  id: number
-  server_id: number
-  name: string
-  position: number
-}
-
-// ServerDTO 服务器（与 Go 侧 state.ServerDTO 对齐）。
-export interface ServerDTO {
-  id: number
-  name: string
-  owner_id: number
-  icon_name: string
-  icon_color: string
-}
-
-// ChannelDTO 频道（与 Go 侧 state.ChannelDTO 对齐）。
-export interface ChannelDTO {
-  id: number
-  server_id: number
-  name: string
-  type: 'text' | 'voice'
 }

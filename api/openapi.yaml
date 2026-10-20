@@ -1,0 +1,1841 @@
+# LiteTalk REST 契约（唯一事实来源，OpenAPI 3.0.3）。
+# 改 REST 形状必须先改本文件，再运行生成器（server 模块内，与 signalgen 同布局）：
+#   go run -C server ./api/tools/openapigen
+# 生成物：server/internal/api/api.gen.go、client/frontend/src/api/types.gen.ts。
+# 手写实现层（server/internal/api/*.go）只实现生成的接口，禁止手改生成物。
+#
+# 口径说明：
+# - 本文件描述 /api/v1 的现状（行为保持，#28 不改语义）；ID 字符串化、分页、
+#   RFC 9457 等语义演进在 #31 落地时同步更新本文件。
+# - /api/v1 下的全部对外端点都已纳入契约（含 GET /api/v1/healthz 与
+#   POST /api/v1/rtc/credentials，#77 收编）。路径与方法是对外承诺，不得随意变更。
+# - 错误体统一 application/problem+json（RFC 9457）；各操作 description 列出实际会出现的 code。
+openapi: 3.0.3
+info:
+  title: LiteTalk API
+  description: 轻音 LiteTalk 服务端 REST 面（/api/v1）。信令面见 api/signal/。
+  version: 1.5.0
+servers:
+  - url: /
+security:
+  - bearerAuth: []
+tags:
+  - name: system
+    description: 部署探活（免鉴权）
+  - name: config
+    description: 服务端能力开关（免鉴权）
+  - name: auth
+    description: 注册 / 登录 / 令牌 / 找回密码（免鉴权；除 logout 外要求 X-LiteTalk-Client ≥ 1.5）
+  - name: rtc
+    description: RTC 基础设施凭证（TURN/STUN 短期凭证）
+  - name: users
+    description: 当前用户
+  - name: friends
+    description: 好友与好友请求
+  - name: servers
+    description: 服务器、成员与邀请
+  - name: channels
+    description: 频道与分类
+  - name: messages
+    description: 文字频道消息
+  - name: sync
+    description: 事件续传失败后的聚合快照
+paths:
+  /api/v1/healthz:
+    get:
+      operationId: getHealthz
+      summary: 健康检查（部署探活）
+      description: >
+        免鉴权。部署脚本与探针依赖该路径与方法（GET /api/v1/healthz），
+        路径与方法不得变更。version 为构建期注入的服务端版本号。
+      tags: [system]
+      security: []
+      responses:
+        '200':
+          description: 服务存活
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Healthz'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+  /api/v1/rtc/credentials:
+    post:
+      operationId: postRtcCredentials
+      summary: 签发 TURN 短期凭证
+      description: >
+        鉴权方式与信令一致：Authorization: Bearer <access_token>，或查询参数
+        ?token=<access_token>（两者皆可，不要求 X-LiteTalk-Client）。
+        未登录或令牌无效返回 401 unauthorized（不区分原因，避免泄露内部细节）；
+        服务端未配置 TURN（LITETALK_TURN_SECRET 为空且内置 TURN 关闭）返回
+        503 turn_unavailable，客户端按直连降级。响应 iceServers 可直接填入
+        WebRTC 的 RTCConfiguration.iceServers。
+      tags: [rtc]
+      security: []
+      responses:
+        '200':
+          description: ICE server 列表（STUN 条目无凭证；TURN 条目带 username/credential）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RtcCredentials'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '503':
+          $ref: '#/components/responses/TurnUnavailable'
+  /api/v1/config:
+    get:
+      operationId: getConfig
+      summary: 服务端能力开关
+      description: 免鉴权。auth_mode=full|simple，mail_configured 为真实发信通道，self_host 一键自托管形态，bootstrap_required 管理员邀请码未消费。
+      tags: [config]
+      security: []
+      responses:
+        '200':
+          description: 能力开关
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServerConfig'
+  /api/v1/auth/register:
+    post:
+      operationId: register
+      summary: 邮箱注册（simple 模式免验证码）
+      description: >
+        code：bad_device、bad_nickname、bad_email、bad_password、bad_bootstrap、
+        bad_code、bad_request、too_large；409 email_taken；426 client_too_old；
+        429 rate_limited；5xx internal / conflict / internal（writeStoreErr 映射）。
+      tags: [auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: 注册成功并签发令牌（含 bootstrap 认领后的默认服务器）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '426':
+          $ref: '#/components/responses/ClientUpgradeRequired'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/auth/login:
+    post:
+      operationId: login
+      summary: 邮箱密码登录
+      description: >
+        code：bad_device、bad_request、too_large；401 bad_credentials；
+        426 client_too_old；429 rate_limited；5xx internal。
+      tags: [auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: 登录成功并签发令牌
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '426':
+          $ref: '#/components/responses/ClientUpgradeRequired'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/auth/refresh:
+    post:
+      operationId: refresh
+      summary: 刷新令牌（旋转 refresh_token）
+      description: >
+        code：bad_request、too_large；401 unauthorized、session_replaced、
+        session_replayed（另带响应头 X-LiteTalk-Auth）；426 client_too_old；
+        5xx internal。
+      tags: [auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: 新令牌对
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '426':
+          $ref: '#/components/responses/ClientUpgradeRequired'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/auth/logout:
+    post:
+      operationId: logout
+      summary: 登出并吊销 refresh_token
+      description: >
+        鉴权凭据在请求体的 refresh_token（不走 Authorization 头）。
+        code：bad_request、too_large；401 unauthorized；5xx internal。
+      tags: [auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LogoutRequest'
+      responses:
+        '200':
+          description: 已吊销
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusOk'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/auth/email-code:
+    post:
+      operationId: sendEmailCode
+      summary: 发送邮箱验证码
+      description: >
+        code：bad_email、bad_purpose、verification_not_required、bad_request、
+        too_large；404 not_found；409 email_taken；426 client_too_old；
+        429 rate_limited；5xx internal。
+      tags: [auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmailCodeRequest'
+      responses:
+        '200':
+          description: 已投递（或 Console 通道已打印）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusOk'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '426':
+          $ref: '#/components/responses/ClientUpgradeRequired'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/auth/guest:
+    post:
+      operationId: guestLogin
+      summary: 游客一键进入（simple 模式专属）
+      description: >
+        请求体可为空。code：bad_device、bad_request、too_large；
+        403 guest_disabled；426 client_too_old；429 rate_limited；5xx internal。
+      tags: [auth]
+      security: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GuestRequest'
+      responses:
+        '201':
+          description: 游客身份创建成功并签发令牌
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '426':
+          $ref: '#/components/responses/ClientUpgradeRequired'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/auth/password/reset:
+    post:
+      operationId: resetPassword
+      summary: 邮箱验证码重置密码
+      description: >
+        full 模式才可用；成功后吊销全部 refresh 并踢线。
+        code：bad_password、bad_code、bad_request、too_large；
+        403 reset_unavailable；404 not_found；426 client_too_old；
+        429 rate_limited；5xx internal。
+      tags: [auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordResetRequest'
+      responses:
+        '200':
+          description: 已重置
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusOk'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '426':
+          $ref: '#/components/responses/ClientUpgradeRequired'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/users/me:
+    get:
+      operationId: getMe
+      summary: 当前用户（自响应，含 email）
+      description: '401 未登录；404 not_found；5xx internal。'
+      tags: [users]
+      responses:
+        '200':
+          description: 当前用户
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
+    patch:
+      operationId: patchMe
+      summary: 改昵称（无头像字段）
+      description: >
+        昵称变更后 tag 重分配保证 (nickname,tag) 不冲突。
+        code：bad_nickname、bad_request、too_large；401；409 conflict；5xx internal。
+      tags: [users]
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/PatchMeRequest'
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchMeRequest'
+      responses:
+        '200':
+          description: 更新后的当前用户
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/friends:
+    get:
+      operationId: listFriends
+      summary: 好友与好友请求列表
+      description: >
+        remark/group 仅发起方视角非空。user 为 PublicUser（不含 email，
+        online 对已接受关系为真实在线态，pending/blocked 恒 false）。401；5xx internal。
+      tags: [friends]
+      responses:
+        '200':
+          description: 好友条目数组
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/FriendEntry'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/friends/requests:
+    post:
+      operationId: createFriendRequest
+      summary: 按 昵称#tag 发起好友请求
+      description: >
+        nickname 可写成「昵称#tag」整体。code：bad_target、bad_request、
+        too_large；401；404 not_found；409 already_friends、request_exists；
+        5xx internal。
+      tags: [friends]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddFriendRequest'
+      responses:
+        '201':
+          description: 已建立 pending 关系
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FriendEntry'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/friends/{id}:
+    delete:
+      operationId: deleteFriend
+      summary: 删除好友关系（双方任一方向）
+      description: >
+        code：bad_request（路径参数不合法）；401；403 forbidden；
+        404 not_found；5xx internal。
+      tags: [friends]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      responses:
+        '200':
+          description: 已删除
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusOk'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
+    patch:
+      operationId: patchFriend
+      summary: 设置备注/分组（仅发起方）
+      description: >
+        空串清除备注/移出分组。code：bad_remark、bad_group、bad_request、
+        too_large；401；403 forbidden；404 not_found；5xx internal。
+      tags: [friends]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/PatchFriendRequest'
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchFriendRequest'
+      responses:
+        '200':
+          description: 更新后的好友条目
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FriendEntry'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/sync:
+    get:
+      operationId: getSync
+      summary: 事件续传失败后的聚合快照
+      description: >
+        当前用户的全量视图快照：所在服务器（含分类与频道）与好友列表。
+        只返回调用者为成员的服务器与频道；user 为 PublicUser（不含 email），
+        online 对已接受好友关系为真实在线态（pending/blocked 恒 false）。续传失败
+        （gateway.invalid_session）后客户端用
+        一次请求恢复服务器/频道/好友视图；消息仍按会话内已见频道单独补拉。
+        code：401；5xx internal。
+      tags: [sync]
+      responses:
+        '200':
+          description: 聚合快照
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncSnapshot'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/servers:
+    post:
+      operationId: createServer
+      summary: 创建服务器（创建者自动成为 owner）
+      description: >
+        code：bad_name、bad_icon、bad_request、too_large；401；5xx internal。
+        icon_name 默认 messages-square，icon_color 默认 #4FA4F3。
+      tags: [servers]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateServerRequest'
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServerInfo'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        default:
+          $ref: '#/components/responses/Internal'
+    get:
+      operationId: listServers
+      summary: 我所在的服务器列表
+      description: '401；5xx internal。'
+      tags: [servers]
+      responses:
+        '200':
+          description: 服务器数组
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ServerInfo'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/friends/requests/{id}/accept:
+    post:
+      operationId: acceptFriendRequest
+      summary: 接受好友请求（仅被请求方）
+      description: >
+        code：bad_request（路径参数不合法）；401；403 forbidden；
+        404 not_found；409 bad_state；5xx internal。
+      tags: [friends]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      responses:
+        '200':
+          description: 关系变为 accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FriendEntry'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/servers/{id}:
+    patch:
+      operationId: patchServer
+      summary: 改服务器名称/图标（owner/admin）
+      description: >
+        code：bad_name、bad_icon、bad_request、too_large、路径参数不合法；
+        401；403 forbidden；404 not_found；5xx internal。
+      tags: [servers]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/PatchServerRequest'
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchServerRequest'
+      responses:
+        '200':
+          description: 更新后的服务器
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServerInfo'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
+    delete:
+      operationId: deleteServer
+      summary: 解散服务器（仅 owner）
+      description: >
+        删除后踢出各频道房间成员。code：bad_request、路径参数不合法；
+        401；403 forbidden；404 not_found；5xx internal。
+      tags: [servers]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      responses:
+        '200':
+          description: 已删除
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusOk'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/servers/join:
+    post:
+      operationId: joinServer
+      summary: 凭邀请码加入服务器
+      description: >
+        已是成员时直接返回服务器。code：bad_request、too_large；
+        401；404 bad_code；409 code_exhausted；410 code_expired；5xx internal。
+      tags: [servers]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JoinServerRequest'
+      responses:
+        '200':
+          description: 加入成功（或已在服务器中）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServerInfo'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '410':
+          $ref: '#/components/responses/Gone'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/servers/{id}/members:
+    get:
+      operationId: listServerMembers
+      summary: 服务器成员列表（成员可读）
+      description: >
+        支持 ETag 协商缓存（#31）：响应带 ETag，带 If-None-Match 命中回 304 无 body。
+        code：bad_request、路径参数不合法；401；403 forbidden；
+        5xx internal。user_id 为十进制 ID 字符串（#31）。
+      tags: [servers]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+        - name: If-None-Match
+          in: header
+          required: false
+          description: 上次响应的 ETag；命中回 304
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 成员数组
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/MemberInfo'
+        '304':
+          description: ETag 命中（If-None-Match），无 body（#31）
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/servers/{id}/invites:
+    post:
+      operationId: createInvite
+      summary: 创建邀请码（owner/admin）
+      description: >
+        code：bad_request（含 max_uses 为负）、路径参数不合法；401；
+        403 forbidden；5xx internal。
+      tags: [servers]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateInviteRequest'
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Invite'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/servers/{id}/channels:
+    post:
+      operationId: createChannel
+      summary: 创建频道（owner/admin）
+      description: >
+        category_id=0 或缺省视为未分类。code：bad_name、bad_type、
+        bad_category、bad_request、too_large、路径参数不合法；401；
+        403 forbidden；5xx internal。
+      tags: [channels]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateChannelRequest'
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChannelInfo'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        default:
+          $ref: '#/components/responses/Internal'
+    get:
+      operationId: listChannels
+      summary: 服务器的分类与频道（成员可读）
+      description: >
+        返回 categories 与 channels 两数组；空结果为 [] 而非 null。
+        code：bad_request、路径参数不合法；401；403 forbidden；5xx internal。
+      tags: [channels]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+        - name: If-None-Match
+          in: header
+          required: false
+          description: 上次响应的 ETag；命中回 304（#31 协商缓存）
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 分类 + 频道
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServerChannels'
+        '304':
+          description: ETag 命中（If-None-Match），无 body（#31）
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/channels/{id}:
+    patch:
+      operationId: patchChannel
+      summary: 改频道（owner/admin）
+      description: >
+        category_id=0 显式移出分类。code：bad_name、bad_type、bad_category、
+        bad_request、too_large、路径参数不合法；401；403 forbidden；
+        404 not_found；5xx internal。
+      tags: [channels]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/PatchChannelRequest'
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchChannelRequest'
+      responses:
+        '200':
+          description: 更新后的频道
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChannelInfo'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
+    delete:
+      operationId: deleteChannel
+      summary: 删除频道（owner/admin）
+      description: >
+        删除后踢出房间成员。code：bad_request、路径参数不合法；
+        401；403 forbidden；404 not_found；5xx internal。
+      tags: [channels]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      responses:
+        '200':
+          description: 已删除
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusOk'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/servers/{id}/categories:
+    post:
+      operationId: createCategory
+      summary: 创建分类（owner/admin）
+      description: >
+        code：bad_name、bad_request、too_large、路径参数不合法；401；
+        403 forbidden；5xx internal。position 按当前数量追加。
+      tags: [channels]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCategoryRequest'
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CategoryInfo'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/categories/{id}:
+    patch:
+      operationId: patchCategory
+      summary: 改分类名/排序（owner/admin）
+      description: >
+        name 与 position 至少给一个；position 为目标序并重排同服务器其它分类。
+        code：bad_name、bad_request、too_large、路径参数不合法；401；
+        403 forbidden；404 not_found；5xx internal。
+      tags: [channels]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/PatchCategoryRequest'
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchCategoryRequest'
+      responses:
+        '200':
+          description: 更新后的分类（position 为最终序）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CategoryInfo'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
+    delete:
+      operationId: deleteCategory
+      summary: 删除分类（owner/admin，默认仅删空分类）
+      description: >
+        with_channels=1 时连同分类下频道一并删除（含消息）。
+        code：bad_request、路径参数不合法；401；403 forbidden；
+        404 not_found；409 category_not_empty；5xx internal。
+      tags: [channels]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+        - name: with_channels
+          in: query
+          required: false
+          description: '1 = 级联删除分类下频道；缺省仅删空分类'
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 已删除
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusOk'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/channels/{id}/messages:
+    get:
+      operationId: listMessages
+      summary: 消息分页（游标，倒序取页正序返回）
+      description: >
+        游标分页（#31）：limit 上限 50，默认 50；显式给出越界值返回 400 bad_limit。
+        before 取更旧一页（ID 小于游标的最新 limit 条，旧→新正序返回）；after 取更新
+        一页（ID 大于游标最早的 limit 条）。两者互斥，同给时 before 优先。禁用 offset。
+        游标显式给出时必须 > 0（0 或负数返回 400 bad_cursor），缺省才表示「无游标」。
+        before_id 为 before 的旧别名，兼容一个版本后移除。
+        code：bad_request、bad_cursor、bad_limit、路径参数不合法；401；403 forbidden；
+        404 not_found；5xx internal。
+      tags: [messages]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+        - name: before
+          in: query
+          required: false
+          description: 游标：只取 ID 小于该值的消息（缺省 = 最新一页；显式值须 > 0）
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+        - name: after
+          in: query
+          required: false
+          description: 游标：只取 ID 大于该值的消息（向前翻更新；缺省 = 最旧一页；显式值须 > 0）
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+        - name: before_id
+          in: query
+          required: false
+          description: 'before 的旧别名（兼容一个版本，#31；与 before 同义，显式值须 > 0）'
+          deprecated: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+        - name: limit
+          in: query
+          required: false
+          description: 条数上限（1–50，缺省 50；显式越界返回 400 bad_limit）
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+      responses:
+        '200':
+          description: 消息数组（旧→新正序；不含发送者邮箱）
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Message'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
+    post:
+      operationId: createMessage
+      summary: 发送文字消息（≤2000 字 + 频控 20/分 + nonce 幂等）
+      description: >
+        仅文字频道。nonce（#31）：客户端生成的幂等键（≤64 字符），服务端按
+        (channel_id, user_id, nonce) 去重；重复提交回读原消息返回 200（原消息体），
+        新消息返回 201。幂等命中先于频控判断，不消耗配额。不带 nonce 不去重。
+        code：bad_channel、bad_content、bad_nonce、bad_request、too_large、
+        路径参数不合法；401；403 forbidden；404 not_found；429 rate_limited；
+        5xx internal。
+      tags: [messages]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateMessageRequest'
+      responses:
+        '200':
+          description: nonce 重放（幂等命中），原消息体（sender_* 为发送者昵称与 tag）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '201':
+          description: 已发送（sender_* 为发送者昵称与 tag）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Internal'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: '登录签发的 access_token（Authorization: Bearer <token>）'
+  parameters:
+    IDPath:
+      name: id
+      in: path
+      required: true
+      description: 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串）
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+  responses:
+    BadRequest:
+      description: 请求不合法（body.code：bad_request / too_large / 各操作专属校验码）
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: >
+        未登录或令牌失效（body.code：unauthorized / session_replaced /
+        session_replayed / bad_credentials）。session_* 另带响应头 X-LiteTalk-Auth。
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: 无权操作（body.code：forbidden / guest_disabled / reset_unavailable 等）
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: 资源不存在（body.code：not_found / bad_code 等）
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: 资源冲突（body.code：conflict / email_taken / already_friends / request_exists / bad_state / code_exhausted / category_not_empty 等）
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Gone:
+      description: 已过期（body.code：code_expired）
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    RateLimited:
+      description: 触发限流（body.code：rate_limited）
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ClientUpgradeRequired:
+      description: >
+        客户端版本过旧（body.code：client_too_old）。服务端要求请求头
+        X-LiteTalk-Client 不低于 1.5；缺失或更低版本的 /auth/* 请求被拒绝。
+        message 与 detail 同值，旧客户端可直接显示升级提示。
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    MethodNotAllowed:
+      description: 方法不允许（body.code：method_not_allowed）；响应头 Allow 列出该路径的可用方法。
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    TurnUnavailable:
+      description: TURN 未配置或暂不可用（body.code：turn_unavailable）；客户端按直连降级。
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Internal:
+      description: 服务端错误（body.code：internal / conflict / not_found / code_expired，store 错误映射）
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    Attachment:
+      type: object
+      title: Attachment
+      description: >
+        附件元数据（#31 预留 schema 占位，实现移出本批另单跟踪）。
+        计划端点：POST /api/v1/attachments（multipart，登录可传）返回本结构，
+        消息体以 attachment_ids 引用；存储后端可插拔（本地磁盘 / S3 兼容）。
+        本批不实现端点，字段形状以实现落地时为准。
+      required: [id, filename, size, content_type]
+      properties:
+        id:
+          type: string
+          description: 附件 ID（十进制字符串）
+        filename:
+          type: string
+        size:
+          type: integer
+          format: int64
+          description: 字节数
+        content_type:
+          type: string
+    Problem:
+      type: object
+      title: Problem
+      description: >
+        RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段
+        （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错
+        的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段
+        （RFC 9457 允许的扩展字段，至少保留一个版本）。
+      required: [type, title, status, code, detail]
+      properties:
+        type:
+          type: string
+          description: 问题类型 URI（urn:litetalk:error:<code>）
+        title:
+          type: string
+          description: 问题类型摘要（随 status 定，不随实例变）
+        status:
+          type: integer
+          format: int32
+          description: HTTP 状态码（与响应行一致）
+        code:
+          type: string
+          description: 机器可读错误码（扩展字段）
+        detail:
+          type: string
+          description: 本次出错的中文提示
+        message:
+          type: string
+          description: 兼容旧客户端的提示字段（与 detail 同值，至少保留一个版本）
+    StatusOk:
+      type: object
+      title: StatusOk
+      description: 删除/吊销类操作的固定成功体。
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+    Healthz:
+      type: object
+      title: Healthz
+      description: 部署探活响应。路径与方法被部署脚本依赖，不得变更。
+      required: [status, version]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        version:
+          type: string
+          description: 服务端构建版本（未注入版本号的本地构建为 dev）
+    ICEServer:
+      type: object
+      title: ICEServer
+      description: 单条 ICE server（字段与 WebRTC RTCIceServer 对齐）。
+      required: [urls]
+      properties:
+        urls:
+          type: array
+          items:
+            type: string
+          description: 'stun:/stuns:/turn:/turns: URL 列表'
+        username:
+          type: string
+          description: TURN 短期用户名（<expiry_unix>:<uid>）；STUN 条目无此字段
+        credential:
+          type: string
+          description: TURN 短期凭证（HMAC-SHA1 base64）；STUN 条目无此字段
+    RtcCredentials:
+      type: object
+      title: RtcCredentials
+      description: TURN/STUN 短期凭证；iceServers 可直接填入 WebRTC 配置。
+      required: [iceServers, expiresAt]
+      properties:
+        iceServers:
+          type: array
+          items:
+            $ref: '#/components/schemas/ICEServer'
+        expiresAt:
+          type: integer
+          format: int64
+          description: 凭证过期时刻（unix 秒）
+    ServerConfig:
+      type: object
+      title: ServerConfig
+      required: [auth_mode, mail_configured, self_host, bootstrap_required]
+      properties:
+        auth_mode:
+          type: string
+          enum: [full, simple]
+        mail_configured:
+          type: boolean
+          description: 发信通道为真实投递（非 Console 打印）
+        self_host:
+          type: boolean
+          description: 一键自托管形态（SQLite/进程内单机部署）
+        bootstrap_required:
+          type: boolean
+          description: 管理员邀请码未消费（注册页提示等待管理员邀请）
+    User:
+      type: object
+      title: User
+      description: 自响应用户（/users/me、登录/注册/游客/刷新），含 email。ID 为十进制字符串（#31）。
+      required: [id, email, nickname, tag, email_verified, is_guest, status, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          x-go-type: ID
+        email:
+          type: string
+        nickname:
+          type: string
+        tag:
+          type: string
+          description: 四位定宽数字串
+        email_verified:
+          type: boolean
+        is_guest:
+          type: boolean
+        status:
+          type: integer
+          format: int32
+          description: 账号状态枚举
+        created_at:
+          type: string
+          format: date-time
+          x-go-type: Time
+        updated_at:
+          type: string
+          format: date-time
+          x-go-type: Time
+    PublicUser:
+      type: object
+      title: PublicUser
+      description: 对外用户视图（好友/成员等他人信息），不含 email。ID 为十进制字符串（#31）。
+      required: [id, nickname, tag, email_verified, is_guest, status, online, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          x-go-type: ID
+        nickname:
+          type: string
+        tag:
+          type: string
+        email_verified:
+          type: boolean
+        is_guest:
+          type: boolean
+        status:
+          type: integer
+          format: int32
+        online:
+          type: boolean
+          description: 在线态（presence）；仅已接受好友关系填真实值（成员视图用 MemberInfo.online），其余恒 false
+        created_at:
+          type: string
+          format: date-time
+          x-go-type: Time
+        updated_at:
+          type: string
+          format: date-time
+          x-go-type: Time
+    TokenPair:
+      type: object
+      title: TokenPair
+      required: [access_token, refresh_token, expires_in, user]
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        expires_in:
+          type: integer
+          format: int64
+          description: access_token 有效期（秒）
+        user:
+          $ref: '#/components/schemas/User'
+    ServerInfo:
+      type: object
+      title: ServerInfo
+      description: 服务器（群组）。图标为预设 Lucide 图标名 + 颜色，无图片。ID 为十进制字符串（#31）。
+      required: [id, name, owner_id, icon_name, icon_color, created_at]
+      properties:
+        id:
+          type: string
+          x-go-type: ID
+        name:
+          type: string
+        owner_id:
+          type: string
+          x-go-type: ID
+        icon_name:
+          type: string
+        icon_color:
+          type: string
+          description: '#RRGGBB'
+        created_at:
+          type: string
+          format: date-time
+          x-go-type: Time
+    ChannelInfo:
+      type: object
+      title: ChannelInfo
+      description: 频道。ID 为十进制字符串（#31）。
+      required: [id, server_id, name, type, category_id, position, created_at]
+      properties:
+        id:
+          type: string
+          x-go-type: ID
+        server_id:
+          type: string
+          x-go-type: ID
+        name:
+          type: string
+        type:
+          type: string
+          enum: [text, voice]
+        category_id:
+          type: string
+          nullable: true
+          x-go-type: ID
+          description: 分类归属；null = 未分类（请求侧 0 也表示未分类）
+        position:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+          x-go-type: Time
+    CategoryInfo:
+      type: object
+      title: CategoryInfo
+      description: 频道分类。ID 为十进制字符串（#31）。
+      required: [id, server_id, name, position, created_at]
+      properties:
+        id:
+          type: string
+          x-go-type: ID
+        server_id:
+          type: string
+          x-go-type: ID
+        name:
+          type: string
+        position:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+          x-go-type: Time
+    MemberInfo:
+      type: object
+      title: MemberInfo
+      description: 服务器成员（内联昵称/tag，含在线态）。ID 为十进制字符串（#31）。
+      required: [server_id, user_id, role, joined_at, online]
+      properties:
+        server_id:
+          type: string
+          x-go-type: ID
+        user_id:
+          type: string
+          x-go-type: ID
+        role:
+          type: string
+          enum: [owner, admin, member]
+        joined_at:
+          type: string
+          format: date-time
+          x-go-type: Time
+        nickname:
+          type: string
+        tag:
+          type: string
+        online:
+          type: boolean
+          description: 在线态（presence:{uid} 存在即在线）；不依赖好友关系
+    Message:
+      type: object
+      title: Message
+      description: 文字频道消息（发送者昵称/tag 内联，不含邮箱）。ID 为十进制字符串（#31）。
+      required: [id, channel_id, user_id, content, created_at]
+      properties:
+        id:
+          type: string
+          x-go-type: ID
+        channel_id:
+          type: string
+          x-go-type: ID
+        user_id:
+          type: string
+          x-go-type: ID
+        content:
+          type: string
+        nonce:
+          type: string
+          description: 幂等键（#31）；未带 nonce 的消息无此字段
+        created_at:
+          type: string
+          format: date-time
+          x-go-type: Time
+        sender_nickname:
+          type: string
+        sender_tag:
+          type: string
+    Invite:
+      type: object
+      title: Invite
+      description: 邀请码。ID 为十进制字符串（#31）。
+      required: [code, server_id, creator_id, max_uses, uses]
+      properties:
+        code:
+          type: string
+        server_id:
+          type: string
+          x-go-type: ID
+        creator_id:
+          type: string
+          x-go-type: ID
+        max_uses:
+          type: integer
+          description: 0 = 不限
+        uses:
+          type: integer
+        expires_at:
+          type: string
+          format: date-time
+          x-go-type: Time
+          nullable: true
+    FriendEntry:
+      type: object
+      title: FriendEntry
+      description: >
+        好友条目。remark/group 仅发起方视角非空（被请求方恒空串）。
+        user 为 PublicUser（无 email）。
+      required: [id, status, incoming, remark, group, user]
+      properties:
+        id:
+          type: string
+          x-go-type: ID
+          description: 关系行 ID（请求数）
+        status:
+          type: string
+          enum: [pending, accepted, blocked]
+        incoming:
+          type: boolean
+          description: true = 对端发起（我是被请求方）
+        remark:
+          type: string
+        group:
+          type: string
+        user:
+          description: 对端 PublicUser；对端查询失败时为 null（仅 accept/patch 极端情况）
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/PublicUser'
+    ServerChannels:
+      type: object
+      title: ServerChannels
+      description: 分类与频道两数组（空为 []，非 null）。
+      required: [categories, channels]
+      properties:
+        categories:
+          type: array
+          items:
+            $ref: '#/components/schemas/CategoryInfo'
+        channels:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChannelInfo'
+    SyncServer:
+      type: object
+      title: SyncServer
+      description: 聚合快照中的服务器：ServerInfo 字段平铺 + 分类与频道（空为 []，非 null）。
+      allOf:
+        - $ref: '#/components/schemas/ServerInfo'
+        - type: object
+          required: [categories, channels]
+          properties:
+            categories:
+              type: array
+              items:
+                $ref: '#/components/schemas/CategoryInfo'
+            channels:
+              type: array
+              items:
+                $ref: '#/components/schemas/ChannelInfo'
+    SyncSnapshot:
+      type: object
+      title: SyncSnapshot
+      description: >
+        续传失败后的聚合快照（#78）。servers 只含调用者为成员的服务器与其频道；
+        friends 的 user 为 PublicUser（不含 email），online 对已接受关系为真实在线态。
+      required: [servers, friends]
+      properties:
+        servers:
+          type: array
+          items:
+            $ref: '#/components/schemas/SyncServer'
+        friends:
+          type: array
+          items:
+            $ref: '#/components/schemas/FriendEntry'
+    RegisterRequest:
+      type: object
+      title: RegisterRequest
+      required: [nickname, email, password]
+      properties:
+        nickname:
+          type: string
+          description: 2–16 字符
+        email:
+          type: string
+        password:
+          type: string
+          description: 8–72 字节
+        code:
+          type: string
+          description: 邮箱验证码（simple 模式忽略）
+        device:
+          type: string
+          description: 设备类型 desktop/mobile；空 = desktop
+        bootstrap:
+          type: string
+          description: 管理员邀请码（可选；空 = 不使用）
+    LoginRequest:
+      type: object
+      title: LoginRequest
+      required: [email, password]
+      properties:
+        email:
+          type: string
+        password:
+          type: string
+        device:
+          type: string
+    GuestRequest:
+      type: object
+      title: GuestRequest
+      description: 请求体可为空（老客户端兼容）。
+      properties:
+        device:
+          type: string
+    RefreshRequest:
+      type: object
+      title: RefreshRequest
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+    LogoutRequest:
+      type: object
+      title: LogoutRequest
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+    EmailCodeRequest:
+      type: object
+      title: EmailCodeRequest
+      required: [email, purpose]
+      properties:
+        email:
+          type: string
+        purpose:
+          type: string
+          enum: [register, reset]
+    PasswordResetRequest:
+      type: object
+      title: PasswordResetRequest
+      required: [email, code, password]
+      properties:
+        email:
+          type: string
+        code:
+          type: string
+        password:
+          type: string
+    PatchMeRequest:
+      type: object
+      title: PatchMeRequest
+      x-go-type: PatchMeBody
+      description: >
+        JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（昵称不可清，
+        空值被校验拒 400），值 = 设置。部分更新（当前仅 nickname）。
+      properties:
+        nickname:
+          type: string
+          nullable: true
+    AddFriendRequest:
+      type: object
+      title: AddFriendRequest
+      description: nickname 可写成「昵称#tag」整体；分开传则 tag 为 4 位。
+      required: [nickname]
+      properties:
+        nickname:
+          type: string
+        tag:
+          type: string
+    PatchFriendRequest:
+      type: object
+      title: PatchFriendRequest
+      x-go-type: PatchFriendBody
+      description: >
+        JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null/空串 = 清除备注/
+        移出分组，值 = 设置。仅发起方向可写。
+      properties:
+        remark:
+          type: string
+          nullable: true
+          description: 0–64 字符
+        group:
+          type: string
+          nullable: true
+          description: 0–32 字符
+    CreateServerRequest:
+      type: object
+      title: CreateServerRequest
+      required: [name]
+      properties:
+        name:
+          type: string
+          description: 2–32 字符
+        icon_name:
+          type: string
+          description: 预设 Lucide 图标名；空 = messages-square
+        icon_color:
+          type: string
+          description: '#RRGGBB；空 = #4FA4F3'
+    PatchServerRequest:
+      type: object
+      title: PatchServerRequest
+      x-go-type: PatchServerBody
+      description: >
+        JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（名称/图标
+        不可清，空值被校验拒 400），值 = 设置。
+      properties:
+        name:
+          type: string
+          nullable: true
+        icon_name:
+          type: string
+          nullable: true
+        icon_color:
+          type: string
+          nullable: true
+    JoinServerRequest:
+      type: object
+      title: JoinServerRequest
+      required: [code]
+      properties:
+        code:
+          type: string
+    CreateInviteRequest:
+      type: object
+      title: CreateInviteRequest
+      description: 请求体仍需为 JSON 对象；两字段缺省按 0 处理。
+      properties:
+        max_uses:
+          type: integer
+          description: 0 = 不限；不可为负
+        expires_in:
+          type: integer
+          format: int64
+          description: 秒；0 = 不过期
+    CreateChannelRequest:
+      type: object
+      title: CreateChannelRequest
+      required: [name, type]
+      properties:
+        name:
+          type: string
+          description: 1–64 字符
+        type:
+          type: string
+          enum: [text, voice]
+        category_id:
+          type: string
+          nullable: true
+          x-go-type: ID
+          description: 0/缺省 = 未分类；请求侧数字与字符串双接受（#31）
+        position:
+          type: integer
+    PatchChannelRequest:
+      type: object
+      title: PatchChannelRequest
+      x-go-type: PatchChannelBody
+      description: >
+        JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name/type
+        不可清，空值被校验拒 400；category_id 的 null = 移出分类；position 的
+        null 拒 400——「删除位置」无语义），值 = 设置。
+      properties:
+        name:
+          type: string
+          nullable: true
+        type:
+          type: string
+          nullable: true
+          enum: [text, voice]
+        category_id:
+          type: string
+          nullable: true
+          description: 0 = 显式移出分类；请求侧数字与字符串双接受（#31）
+        position:
+          type: integer
+          nullable: true
+    CreateCategoryRequest:
+      type: object
+      title: CreateCategoryRequest
+      required: [name]
+      properties:
+        name:
+          type: string
+          description: 1–32 字符
+    PatchCategoryRequest:
+      type: object
+      title: PatchCategoryRequest
+      x-go-type: PatchCategoryBody
+      description: >
+        JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name 不可清，
+        空值被校验拒 400；position 的 null 拒 400），值 = 设置。
+        name 与 position 至少给一个。
+      properties:
+        name:
+          type: string
+          nullable: true
+        position:
+          type: integer
+          nullable: true
+          description: 目标序（0-based）；服务端重排同服务器其它分类
+    CreateMessageRequest:
+      type: object
+      title: CreateMessageRequest
+      required: [content]
+      properties:
+        content:
+          type: string
+          description: 1–2000 字符
+        nonce:
+          type: string
+          description: 幂等键（#31，≤64 字符）；同频道同用户重复提交回读原消息（200）。缺省不去重。

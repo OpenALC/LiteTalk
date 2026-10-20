@@ -1,13 +1,14 @@
 <script setup lang="ts">
-// ServerRail 服务器轨道（v0.1.2 重构）：顶部介绍页入口 + 服务器列表 + 底部加号。
+// ServerRail 服务器轨道（v0.1.2 重构）：顶部介绍页入口 + 服务器列表 + 底部加号与设置。
 // 图标为预设 Lucide（禁头像/上传图——硬性约束）。
 // 右键菜单：复制邀请码/新建频道/重命名/删除服务器/设为首页；
 // 介绍页右键：删除介绍页（仅当首页不是介绍页，可恢复）。
 // 角标死数据已移除（走查 13：无真实未读数据源）。
 import { computed, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import {
   Plus, Home, MessagesSquare, Gamepad2, Music, Palette, BookOpen, Coffee, Mic,
-  GraduationCap, Heart, Rocket, Camera, Dumbbell, Undo2,
+  GraduationCap, Heart, Rocket, Camera, Dumbbell, Undo2, Settings,
   Link, FolderPlus, Pencil, Trash2,
 } from 'lucide-vue-next'
 import { INTRO_ID, useServersStore } from '../stores/data'
@@ -19,6 +20,7 @@ import PromptDialog from './PromptDialog.vue'
 
 const store = useServersStore()
 const notify = useNotifyStore()
+const router = useRouter()
 
 // Lucide 图标名 → 组件（静态注册，避免动态导入复杂度）。
 // 键集合与 server/internal/api/servers.go 的 allowedIcons 保持一致。
@@ -91,6 +93,25 @@ const prompt = ref<
   | null
 >(null)
 
+// newChannelCats 归入分类候选（#72）：目标服务器的真实分类 + 末位「未分类」。
+// 目标是右键的服务器，不一定当前选中，故按 prompt.id 取；groupsOf 的合成组
+// （chan: 前缀）不是服务端分类，不能当归宿。
+const newChannelCats = computed(() => {
+  const p = prompt.value
+  if (!p || p.mode !== 'new-channel') return []
+  const s = store.findServer(p.id)
+  return [
+    ...store.groupsOf(p.id, s?.channels ?? [])
+      .filter((g) => !g.id.startsWith('chan:'))
+      .map((g) => ({ value: g.id, label: g.name })),
+    { value: '', label: '未分类' },
+  ]
+})
+
+// newChannelDefaultCat 本入口没有「当前选中分类」语境，默认取第一个真实分类。
+const newChannelDefaultCat = computed(() =>
+  newChannelCats.value.find((c) => c.value !== '')?.value ?? '')
+
 async function onCtxSelect(key: string) {
   const c = ctx.value
   if (!c) return
@@ -98,17 +119,14 @@ async function onCtxSelect(key: string) {
   if (!server) return
   switch (key) {
     case 'invite': {
-      // 邀请码为服务端实体操作；内置示例服务器无对应实体。
-      if (server.builtin) { notify.show('示例服务器无邀请码', true); return }
       try {
-        const code = await goApp().CreateInviteCode(Number(c.id))
+        const code = await goApp().CreateInviteCode(c.id)
         await navigator.clipboard.writeText(code)
         notify.show('邀请码已复制')
       } catch (e) { notify.fromErr(e) }
       return
     }
     case 'new-channel':
-      if (server.builtin) { notify.show('示例服务器不可新建频道', true); return }
       prompt.value = { mode: 'new-channel', id: c.id }
       return
     case 'rename':
@@ -126,7 +144,7 @@ async function onCtxSelect(key: string) {
   }
 }
 
-async function onPromptConfirm(value: string, option: string) {
+async function onPromptConfirm(value: string, option: string, option2: string) {
   const p = prompt.value
   prompt.value = null
   if (!p) return
@@ -135,7 +153,8 @@ async function onPromptConfirm(value: string, option: string) {
       await store.renameServer(p.id, value)
       notify.show('已重命名')
     } else {
-      await store.createChannel(p.id, value, option === 'voice' ? 'voice' : 'text')
+      // option 是类型、option2 是归入分类 id（'' = 不归类，#72）。
+      await store.createChannel(p.id, value, option === 'voice' ? 'voice' : 'text', option2)
       notify.show('频道已创建')
     }
   } catch (e) { notify.fromErr(e) }
@@ -150,7 +169,7 @@ async function removeServer(id: string) {
 </script>
 
 <template>
-  <nav class="rail" data-ctx>
+  <nav class="rail">
     <!-- 介绍页入口（v0.1.2 首页体系；被删除时隐藏，底部可恢复） -->
     <div v-if="!store.introHidden" class="rail-item intro-item"
          :class="{ on: store.currentServerId === INTRO_ID }" data-tip="介绍页">
@@ -177,6 +196,9 @@ async function removeServer(id: string) {
     <button class="rail-add" title="创建或加入服务器" @click="showServerDialog = true">
       <Plus :size="20" />
     </button>
+    <button class="rail-add" title="设置" @click="router.push('/settings')">
+      <Settings :size="20" />
+    </button>
 
     <ServerDialog v-if="showServerDialog" @close="showServerDialog = false" />
 
@@ -192,6 +214,8 @@ async function removeServer(id: string) {
                   placeholder="频道名称" cta="创建"
                   :options="[{ value: 'voice', label: '语音频道' }, { value: 'text', label: '文字频道' }]"
                   option-default="voice"
+                  :options2="newChannelCats" :option2-default="newChannelDefaultCat"
+                  options2-label="归入分类"
                   @confirm="onPromptConfirm" @close="prompt = null" />
   </nav>
 </template>

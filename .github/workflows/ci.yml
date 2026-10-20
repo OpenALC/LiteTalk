@@ -32,6 +32,9 @@ env:
   GO_VERSION: '1.27'
   NODE_VERSION: '22'
   NFPM_VERSION: 'v2.48.0'
+  SCHEMATHESIS_VERSION: '4.32.0'
+  # #86：契约破坏性变更检测工具，锁版本（禁止 @latest）
+  OASDIFF_VERSION: 'v1.34.0'
 
 jobs:
   # ======================= 检查组（每次 push / PR，全部阻塞） =======================
@@ -73,6 +76,64 @@ jobs:
         run: go test -race -count=1 ./...
       - name: go build
         run: go build ./...
+      # 生成物新鲜度：契约（api/openapi.yaml + api/signal/）改了必须重新生成并提交。
+      # -skip-ts：TS 半边（types.gen.ts）在 check-frontend 校验（那侧才有 node_modules）。
+      - name: 生成代码新鲜度（signalgen + openapigen）
+        run: |
+          go run ./api/tools/signalgen
+          go run ./api/tools/openapigen -skip-ts
+          git diff --exit-code
+
+  # 契约测试（#30）：契约 ↔ 实现双向比对 + 生成新鲜度 + schemathesis 模糊测试。
+  # 阻塞发版（release 的 needs/if 都含本 job）。types.gen.ts 的新鲜度在 check-frontend
+  # 校验（那侧有 pnpm），这里只管 Go 生成物。
+  check-contract:
+    name: 契约检查
+    needs: check-server
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # #86：git describe 找上一个 release tag 需要完整历史与 tag
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: server/go.sum
+      - name: 生成代码新鲜度（signalgen + openapigen）
+        run: |
+          go run ./api/tools/signalgen
+          go run ./api/tools/openapigen -skip-ts
+          git diff --exit-code
+      # REST 路由双向比对 + 信令 catalog 与两侧生成物一致（server/api/tests）
+      - name: 契约比对测试
+        run: go test ./api/tests/... -count=1 -v
+      # #86：与上一个 release tag 的契约对比，出现未批准的破坏性变更即失败。
+      # tag 不含 api/openapi.yaml 时回落到 api/oasdiff-baseline.yaml（脚本内选择）；
+      # 完整 breaking 列表与允许清单命中情况都打印在日志里。
+      - name: 契约破坏性变更检测（oasdiff，锁版本）
+        env:
+          LITETALK_OASDIFF_DIR: ${{ runner.temp }}/oasdiff
+        run: bash api/tests/run_breaking_check.sh
+      - name: 安装 schemathesis（锁版本）
+        run: |
+          python3 -m venv "$RUNNER_TEMP/sth-venv"
+          "$RUNNER_TEMP/sth-venv/bin/pip" install --quiet "schemathesis==$SCHEMATHESIS_VERSION"
+          echo "$RUNNER_TEMP/sth-venv/bin" >> "$GITHUB_PATH"
+      - name: schemathesis 模糊测试（固定 seed，无 5xx + 形状符合契约）
+        env:
+          LITETALK_FUZZ_DIR: ${{ runner.temp }}/fuzz-data
+        run: bash api/tests/run_schemathesis.sh
+      - name: 上传 fuzz 报告与服务端日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-fuzz
+          path: ${{ runner.temp }}/fuzz-data/
+          retention-days: 7
 
   # 前端只在这里构建一次，dist 以 artifact 分发给客户端检查与各打包 job
   check-frontend:
@@ -95,6 +156,11 @@ jobs:
           cache-dependency-path: client/frontend/pnpm-lock.yaml
       - name: 安装依赖
         run: pnpm install --frozen-lockfile
+      # 生成物新鲜度（TS 半边）：openapi.yaml 改了必须重新生成 types.gen.ts 并提交。
+      - name: 生成代码新鲜度（types.gen.ts）
+        run: |
+          pnpm run gen:types
+          git diff --exit-code -- src/api/types.gen.ts
       - name: 类型检查（vue-tsc）
         run: pnpm run type-check
       - name: 单元测试（vitest）
@@ -117,13 +183,25 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@v4
-      # libx11-dev / libxi-dev 供 client/internal/hotkey/hotkey_linux.go 的 cgo 用
+      # libx11-dev / libxi-dev 供 client/core/hotkey/hotkey_linux.go 的 cgo 用
       # （X11 + XInput2 raw 事件）。只是构建期开发库：libX11.so.6 / libXi.so.6 运行
       # 时已由 libgtk-3-0 传递依赖，nfpm 的 depends 不用动。
-      - name: 安装 GTK/WebKitGTK/libopus/X11 开发库
+      # desktop-file-utils 供 .desktop 静态校验（issue #6），前移到检查
+      # job：不依赖构建产物，dev 期间每次 push 都能发现打包期才暴露的问题。
+      # xvfb / xauth / dbus-daemon 供同 job 的安装后启动冒烟（issue #6）：
+      # v3 单实例锁走会话总线，没有 dbus-run-session 会在 application.New 里
+      # fatal 退出（noble 上 dbus-run-session 属于 dbus-daemon 包，不是 dbus）；
+      # libasound2t64 / libpulse0 与 nfpm 的 Depends 对齐，保证 dpkg -i 能
+      # 独立验证依赖闭包。
+      # glibc 符号基线检查（issue #9）复用本 job 的 production 产物，objdump
+      # 来自 ubuntu-24.04 预装的 binutils，无需额外安装。
+      - name: 安装 GTK/WebKitGTK/libopus/X11/desktop-file/冒烟依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev libopus-dev libx11-dev libxi-dev
+          sudo apt-get install -y pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev libopus-dev libx11-dev libxi-dev desktop-file-utils \
+            xvfb xauth dbus-daemon libasound2t64 libpulse0
+      - name: desktop-file-validate（.desktop 静态校验）
+        run: desktop-file-validate build/linux/io.github.openalc.LiteTalk.desktop
       - uses: actions/download-artifact@v4
         with:
           name: frontend-dist
@@ -144,6 +222,77 @@ jobs:
         run: go test -tags gtk3 -race -count=1 ./...
       - name: go build
         run: go build -tags gtk3 ./...
+      # ---- issue #6：安装后启动冒烟（非 tag 也跑） ----
+      # nfpm 打包此前只在 tag 时执行，PR 上从未验证过「装得上、起得来」。
+      # 前端产物复用 check-frontend 的 artifact，这里不再构建前端。
+      - name: 构建 production 二进制（供 nfpm 安装包）
+        run: go build -tags gtk3,production -trimpath -ldflags "-s -w -X main.version=smoke" -o build/bin/LiteTalk .
+      # glibc 符号版本检查（issue #9）：构建基线 ubuntu-24.04 = glibc 2.39。
+      # 产物引用的最高符号版本不得更高，否则静默抬高最低发行版要求。
+      # 复用上面的 production 产物，不额外构建；检查前移到检查组后每次 push/PR 都跑
+      # （打包 job 只在 tag 时运行，等价于发版前才发现基线被抬高）。
+      - name: glibc 符号版本检查（不得超过 GLIBC_2.39）
+        run: |
+          set -o pipefail
+          objdump -T build/bin/LiteTalk | grep -o 'GLIBC_[0-9.]*' | sort -uV | tee glibc-syms.txt
+          max=$(tail -1 glibc-syms.txt)
+          if [ -z "$max" ]; then
+            echo "::error::objdump 未发现任何 glibc 符号——二进制或工具链异常"
+            exit 1
+          fi
+          if [ "$(printf '%s\n%s\n' "$max" 'GLIBC_2.39' | sort -V | tail -1)" != "GLIBC_2.39" ]; then
+            echo "::error::产物引用了 $max，超过构建基线 GLIBC_2.39"
+            exit 1
+          fi
+          echo "glibc 检查通过（最高 $max）"
+      - name: 安装 nfpm（锁版本）
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@${NFPM_VERSION}
+      - name: 打 deb 并安装
+        run: |
+          export VERSION=0.0.0
+          export ARCH=amd64
+          mkdir -p dist
+          nfpm package --config build/nfpm.yaml --packager deb --target dist/
+          deb="$(ls dist/litetalk_${VERSION}_${ARCH}.deb)"
+          sudo dpkg -i "$deb"
+          # 安装物一致性：.desktop 文件名 = ApplicationID（Wayland 按文件名
+          # 匹配 app_id），StartupWMClass / Icon 同值，与 main.go 的
+          # LinuxOptions.ApplicationID 对齐。
+          desktop=/usr/share/applications/io.github.openalc.LiteTalk.desktop
+          test -f "$desktop"
+          test -x /usr/bin/litetalk
+          test -f /usr/share/icons/hicolor/256x256/apps/io.github.openalc.LiteTalk.png
+          grep -qx 'StartupWMClass=io.github.openalc.LiteTalk' "$desktop"
+          grep -qx 'Icon=io.github.openalc.LiteTalk' "$desktop"
+          desktop-file-validate "$desktop"
+      - name: 启动冒烟（Xvfb，10 秒）
+        env:
+          # 无 GPU 的 Xvfb 下关闭 WebKit 合成/DMABUF，避免软件渲染初始化失败
+          WEBKIT_DISABLE_COMPOSITING_MODE: '1'
+          WEBKIT_DISABLE_DMABUF_RENDERER: '1'
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: |
+          set +e
+          # dbus-run-session 必需：v3 单实例锁走会话总线，无总线时
+          # application.New 直接 fatal（exit 1），与真实桌面环境不符。
+          dbus-run-session -- xvfb-run -a timeout 10 litetalk > smoke.log 2>&1
+          code=$?
+          set -e
+          cat smoke.log
+          # exit 124 = timeout 到点杀进程，说明这 10 秒内 litetalk 一直存活：
+          # 启动成功且没有自行退出。0（提前退出）、1（启动失败）、139（崩溃）
+          # 等一律失败。依据是本应用启动后进入事件循环并驻留，不会自行结束。
+          if [ "$code" -ne 124 ]; then
+            echo "::error::启动冒烟失败：litetalk 退出码 $code（期望 124：限时内持续运行）"
+            exit 1
+          fi
+          # 124 只证明进程没退出，再确认进入了 ServiceStartup 的启动日志，
+          # 排除卡在 GTK/WebKit 初始化之前的假阳性。
+          if ! grep -q "启动 (pid=" smoke.log; then
+            echo "::error::启动冒烟日志缺少启动标记，进程未进入服务启动"
+            exit 1
+          fi
+          echo "启动冒烟通过：litetalk 在 10 秒时限内持续运行且输出了启动日志"
 
   # Windows：主力平台。真实 cgo Opus / DPAPI / WASAPI 路径只在这里被编译与测试
   check-client-windows:
@@ -195,12 +344,11 @@ jobs:
               go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
               -o ../dist/linux-$arch/litetalk-server ./cmd/server
           done
-      # 迁移目前运行时从磁盘读取：随包附带 migrations/，避免升级漏传（改 embed 前的过渡）
-      - name: 打包 tar.gz（二进制 + migrations）
+      # 迁移已 embed 进二进制（migrations.FS），不再随包附带 migrations/ 目录
+      - name: 打包 tar.gz（仅二进制）
         run: |
           for arch in amd64 arm64; do
-            cp -r server/migrations dist/linux-$arch/
-            tar -C dist/linux-$arch -czf dist/litetalk-server-linux-$arch.tar.gz litetalk-server migrations
+            tar -C dist/linux-$arch -czf dist/litetalk-server-linux-$arch.tar.gz litetalk-server
           done
       - uses: actions/upload-artifact@v4
         with:
@@ -281,6 +429,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # 与 check-client-linux 同一批开发库：打包 job 也编译 hotkey_linux.go 的 cgo
+      # （.desktop 静态校验已前移到 check-client-linux，不再在此重复）
       - name: 安装 GTK/WebKitGTK/libopus/X11 开发库
         run: |
           sudo apt-get update
@@ -356,13 +505,15 @@ jobs:
   release:
     name: 发布 GitHub Release
     needs:
+      - check-contract
       - package-server
       - package-client-windows
       - package-client-linux
       - package-client-macos
-    # always() 让 macOS 失败不阻断；显式要求所有阻塞打包 job 为 success
+    # always() 让 macOS 失败不阻断；显式要求所有阻塞 job（含 check-contract）为 success
     if: >-
       always() && startsWith(github.ref, 'refs/tags/v') &&
+      needs.check-contract.result == 'success' &&
       needs.package-server.result == 'success' &&
       needs.package-client-windows.result == 'success' &&
       needs.package-client-linux.result == 'success'

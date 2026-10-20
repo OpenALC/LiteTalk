@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litetalk:signal:client.hello",
+  "title": "ClientHelloData",
+  "x-wire-type": "client.hello",
+  "x-go-const": "TypeClientHello",
+  "x-direction": "C2S",
+  "x-since": 2,
+  "x-namespace": "session",
+  "description": "协议版本协商（#29）：WS 连上并鉴权后客户端立刻发送，声明可接受区间 [min,max]。老服务端不认识本消息会回 error{bad_message}，客户端须容忍（记日志、按 v1 继续，不重连风暴）。不发本消息按 v1 处理。",
+  "type": "object",
+  "properties": {
+    "min": { "type": "integer", "minimum": 1, "description": "可接受的最低协议版本" },
+    "max": { "type": "integer", "minimum": 1, "description": "可接受的最高协议版本" }
+  },
+  "required": ["min", "max"],
+  "additionalProperties": false
+}

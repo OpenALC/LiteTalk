@@ -71,9 +71,10 @@ func newChatFixture(t *testing.T) *chatFixture {
 	st := store.NewMem()
 	ctx := context.Background()
 
-	// 用户（ID 由 mem 自增，这里假定 1、2；下方断言兜底）。
-	u1 := &store.User{Email: "alice@x", Nickname: "alice", Tag: "0001", PasswordHash: "x"}
-	u2 := &store.User{Email: "bob@x", Nickname: "bob", Tag: "0002", PasswordHash: "x"}
+	// 用户 ID 预置 1、2（testAuthenticator 的 token→uid 映射按这两个值走）。
+	// Snowflake 赋值后显式预置不再被覆盖，夹具保持确定性。
+	u1 := &store.User{ID: 1, Email: "alice@x", Nickname: "alice", Tag: "0001", PasswordHash: "x"}
+	u2 := &store.User{ID: 2, Email: "bob@x", Nickname: "bob", Tag: "0002", PasswordHash: "x"}
 	if err := st.CreateUser(ctx, u1); err != nil {
 		t.Fatalf("CreateUser: %v", err)
 	}
@@ -134,6 +135,13 @@ type wsClient struct {
 	t    *testing.T
 	conn *websocket.Conn
 	user string
+
+	// pending 预读缓冲：dial 为等服务端 register 完成会先读到 hello（register
+	// 先于 hello 下发，见 hub.go ServeWS），途中若夹带其它信封则缓存于此，
+	// recvUntil 先排空缓冲再读连接。没有它，"dial 完立刻 send" 会撞上
+	// 服务端尚未 register 的窗口——广播直接跳过该连接，对端永远等不到消息
+	// （CI 上表现为间歇 5s 超时，TestGatewayResumeTrailing 踩过）。
+	pending []Envelope
 }
 
 func (f *chatFixture) dial(token, name string) *wsClient {
@@ -144,7 +152,27 @@ func (f *chatFixture) dial(token, name string) *wsClient {
 		f.t.Fatalf("dial %s: %v", name, err)
 	}
 	f.t.Cleanup(func() { conn.CloseNow() })
-	return &wsClient{t: f.t, conn: conn, user: name}
+	c := &wsClient{t: f.t, conn: conn, user: name}
+	// 等到 hello：服务端 register + 事件环 Bind 都先于它下发（hub.go:235-245），
+	// 收到即保证该连接已被房间广播覆盖。显式 recvUntil(TypeHello) 的测试不受
+	// 影响——hello 进了 pending，recvUntil 会先取到它。
+	c.awaitHello()
+	return c
+}
+
+// awaitHello 读到 hello 为止，途中信封进 pending。超时 5s（与 recvUntil 一致）。
+func (c *wsClient) awaitHello() {
+	c.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		env := c.readOne()
+		if env.Type == TypeHello {
+			c.pending = append(c.pending, env)
+			return
+		}
+		c.pending = append(c.pending, env)
+	}
+	c.t.Fatalf("awaitHello: 5s 内未收到 hello（user=%s）", c.user)
 }
 
 func (c *wsClient) send(msgType string, data any) {
@@ -158,20 +186,33 @@ func (c *wsClient) send(msgType string, data any) {
 	}
 }
 
+// readOne 读一个信封（超时 5s）。awaitHello 与 recvUntil 共用。
+func (c *wsClient) readOne() Envelope {
+	c.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, data, err := c.conn.Read(ctx)
+	if err != nil {
+		c.t.Fatalf("readOne (user=%s): %v", c.user, err)
+	}
+	var env Envelope
+	if err := json.Unmarshal(data, &env); err != nil {
+		c.t.Fatalf("unmarshal envelope: %v", err)
+	}
+	return env
+}
+
 // recvUntil 读到指定类型为止（跳过 hello/joined 等中间消息），超时 5s。
+// 先排空 dial 预读进 pending 的信封，再读连接。
 func (c *wsClient) recvUntil(want string) Envelope {
 	c.t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_, data, err := c.conn.Read(ctx)
-		cancel()
-		if err != nil {
-			c.t.Fatalf("recvUntil %s (user=%s): %v", want, c.user, err)
-		}
 		var env Envelope
-		if err := json.Unmarshal(data, &env); err != nil {
-			c.t.Fatalf("unmarshal envelope: %v", err)
+		if len(c.pending) > 0 {
+			env, c.pending = c.pending[0], c.pending[1:]
+		} else {
+			env = c.readOne()
 		}
 		if env.Type == want {
 			return env
@@ -434,5 +475,194 @@ func TestChannelJoinDevRoom(t *testing.T) {
 	}
 	if joined.ChannelID != "builtin-lobby" || len(joined.Members) != 1 {
 		t.Fatalf("joined 数据不符: %+v", joined)
+	}
+}
+
+// TestKickChannelRemovesAllMembers 频道删除收尾（#22）：房间内全部连接收到
+// session.voice_taken、成员登记与房间清空，WS 连接本身保留并可重新入房。
+func TestKickChannelRemovesAllMembers(t *testing.T) {
+	f := newChatFixture(t)
+	chID := strconv.FormatInt(f.vch.ID, 10)
+
+	a := f.dial("1", "alice")
+	b := f.dial("2", "bob")
+	a.send(TypeChannelJoin, ChannelJoinData{ChannelID: chID})
+	a.recvUntil(TypeChannelJoined)
+	b.send(TypeChannelJoin, ChannelJoinData{ChannelID: chID})
+	b.recvUntil(TypeChannelJoined)
+
+	f.hub.KickChannel(chID, "channel_deleted")
+
+	// 两名成员都应收到 session.voice_taken（中间可能夹带 peer_left）。
+	for _, c := range []*wsClient{a, b} {
+		env := c.recvUntil(TypeSessionVoiceTaken)
+		if env.Type != TypeSessionVoiceTaken {
+			t.Fatalf("%s 未收到 session.voice_taken，实际 %q", c.user, env.Type)
+		}
+	}
+	if got := f.hub.roomMemberCount(chID); got != 0 {
+		t.Fatalf("房间成员数 = %d, want 0", got)
+	}
+	if f.hub.roomMember(chID, "1") != nil || f.hub.roomMember(chID, "2") != nil {
+		t.Fatal("成员登记应已清空")
+	}
+	// 只摘房间归属，不断 WS 连接。
+	if got := f.hub.connCount("1"); got != 1 {
+		t.Fatalf("alice 连接数 = %d, want 1", got)
+	}
+	if got := f.hub.connCount("2"); got != 1 {
+		t.Fatalf("bob 连接数 = %d, want 1", got)
+	}
+	// 房间已销毁，重新入房应正常。
+	a.send(TypeChannelJoin, ChannelJoinData{ChannelID: chID})
+	a.recvUntil(TypeChannelJoined)
+	if f.hub.roomMember(chID, "1") == nil {
+		t.Fatal("重新入房后 alice 应重新登记为成员")
+	}
+}
+
+// TestKickChannelNoRoomIsNoop 房间不存在或为空时 KickChannel 是无操作：
+// 不创建空房间、不 panic（频道/服务器删除路径会无条件调用）。
+func TestKickChannelNoRoomIsNoop(t *testing.T) {
+	hub, _ := newHubServer(t, store.NewMem(), false)
+	hub.KickChannel("404", "channel_deleted")
+	if got := hub.roomMemberCount("404"); got != 0 {
+		t.Fatalf("不存在频道不应被创建房间，实际成员数 %d", got)
+	}
+	hub.KickChannel("404", "") // 空 reason 同样安全
+}
+
+// TestKickChannelIdentityCheck 成员表里的连接若 roomID 已不在该房（陈旧登记），
+// KickChannel 不盲删该登记；正常成员仍被摘除并收到 session.voice_taken。
+func TestKickChannelIdentityCheck(t *testing.T) {
+	hub, _ := newHubServer(t, store.NewMem(), false)
+	stale := &client{hub: hub, userID: "1", dev: "desktop", send: make(chan []byte, 4)}
+	active := &client{hub: hub, userID: "2", dev: "desktop", send: make(chan []byte, 4)}
+	active.setRoomID("7")
+	hub.mu.Lock()
+	hub.rooms["7"] = &roomState{id: "7", members: map[string]*client{
+		"1": stale, // roomID 为空：与该房不一致
+		"2": active,
+	}}
+	hub.mu.Unlock()
+
+	hub.KickChannel("7", "channel_deleted")
+
+	if got := hub.roomMember("7", "1"); got != stale {
+		t.Fatal("陈旧登记不应被盲删（身份核对）")
+	}
+	if got := hub.roomMember("7", "2"); got != nil {
+		t.Fatal("正常成员应被摘除")
+	}
+	select {
+	case raw := <-active.send:
+		var env Envelope
+		if err := json.Unmarshal(raw, &env); err != nil || env.Type != TypeSessionVoiceTaken {
+			t.Fatalf("正常成员应收到 session.voice_taken，实际 %s err=%v", raw, err)
+		}
+	default:
+		t.Fatal("正常成员应收到 session.voice_taken")
+	}
+	// 陈旧登记不会被摘出房间，故仍可能收到 peer_left 广播；但绝不能收到
+	// session.voice_taken（那是给被摘成员的退房通知）。
+drain:
+	for {
+		select {
+		case raw := <-stale.send:
+			var env Envelope
+			if err := json.Unmarshal(raw, &env); err != nil {
+				t.Fatalf("解码下行消息: %v", err)
+			}
+			if env.Type == TypeSessionVoiceTaken {
+				t.Fatalf("陈旧登记不应收到 session.voice_taken，实际 %s", raw)
+			}
+		default:
+			break drain
+		}
+	}
+}
+
+// TestHubShutdown 广播 server.shutdown 后连接关闭（#21）。
+func TestHubShutdown(t *testing.T) {
+	f := newChatFixture(t)
+	c := f.dial("1", "alice")
+	c.recvUntil(TypeHello)
+
+	go f.hub.Shutdown("shutdown")
+
+	env := c.recvUntil(TypeServerShutdown)
+	var d ServerShutdownData
+	if err := json.Unmarshal(env.Data, &d); err != nil {
+		t.Fatalf("decode ServerShutdownData: %v", err)
+	}
+	if d.Reason != "shutdown" {
+		t.Fatalf("reason = %q, want shutdown", d.Reason)
+	}
+
+	// 连接应在发送窗口后被 CloseNow。
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, _, err := c.conn.Read(ctx)
+	if err == nil {
+		t.Fatal("连接应已关闭")
+	}
+}
+
+// TestHubShutdownRejectsNewAndWaitsCleanup (#21)：置位后新 WS 在鉴权/注册之前
+// 返回 503；Shutdown 要等旧连接 cleanup 完成（conns 清零）才返回，而非发完
+// server.shutdown 就立刻返回。等待上限在测试里放宽到 2s，避免拖慢。
+func TestHubShutdownRejectsNewAndWaitsCleanup(t *testing.T) {
+	f := newChatFixture(t)
+	f.hub.shutdownWait = 2 * time.Second
+	old := f.dial("1", "alice")
+	old.recvUntil(TypeHello)
+
+	done := make(chan struct{})
+	go func() {
+		f.hub.Shutdown("shutdown")
+		close(done)
+	}()
+
+	old.recvUntil(TypeServerShutdown)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, _, err := old.conn.Read(ctx); err == nil {
+		t.Fatal("旧连接应已关闭")
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Shutdown 未在旧连接 cleanup 后返回（#21）")
+	}
+	// Shutdown 返回即意味着 cleanup 的 unregister 已执行：conns 必须清零。
+	if n := f.hub.connCount("1"); n != 0 {
+		t.Fatalf("Shutdown 返回时仍有 %d 条连接未完成 cleanup（#21）", n)
+	}
+
+	// 关闭置位后新 WS 一律 503，响应体给出 shutting_down。
+	url := "ws" + strings.TrimPrefix(f.srv.URL, "http") + "/ws?token=2"
+	_, resp, err := websocket.Dial(context.Background(), url, nil)
+	if err == nil {
+		t.Fatal("关闭中不应接受新 WS 连接")
+	}
+	if resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("新 WS 应返回 503，实际 resp=%v err=%v", resp, err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	var e struct{ Code, Message string }
+	if err := json.Unmarshal(body, &e); err != nil || e.Code != "shutting_down" {
+		t.Fatalf("503 响应体 = %s err=%v，期望 code=shutting_down", body, err)
+	}
+
+	// 幂等：重复调用立即返回，不重新进入关闭流程。
+	second := make(chan struct{})
+	go func() {
+		f.hub.Shutdown("again")
+		close(second)
+	}()
+	select {
+	case <-second:
+	case <-time.After(time.Second):
+		t.Fatal("重复 Shutdown 未立即返回（#21 幂等）")
 	}
 }

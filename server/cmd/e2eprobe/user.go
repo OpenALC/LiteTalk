@@ -15,12 +15,32 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
-// ICEServer 与 rtcapi.ICEServer 字段对齐（本地复刻，避免跨 internal 依赖）。
+// ICEServer 与契约 ICEServer（api/openapi.yaml）字段对齐；本地复刻避免依赖
+// 服务端 API 包（探针只做黑盒调用）。
 type ICEServer struct {
 	URLs           any    `json:"urls"`
 	Username       string `json:"username,omitempty"`
 	Credential     string `json:"credential,omitempty"`
 	CredentialType string `json:"credentialType,omitempty"`
+}
+
+// urls 提取 URL 列表（JSON 反序列化后可能是 string、[]any 或 []string）。
+func (s ICEServer) urls() []string {
+	switch v := s.URLs.(type) {
+	case string:
+		return []string{v}
+	case []string:
+		return v
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if str, ok := item.(string); ok {
+				out = append(out, str)
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 // probeUser 一个真实链路探测端：WS 信令 + Pion PC + 哑 RTP 双向计数。
@@ -53,6 +73,7 @@ type probeUser struct {
 	wsErr       atomic.Int64
 	recvMu      sync.Mutex
 	recv        map[string]*atomic.Int64
+	trackStop   map[string]chan struct{} // 每 src 一路读取循环的拆除信号（-rejoin：peer_left 语义）
 	tracksUp    atomic.Int64
 	trackErr    atomic.Int64
 
@@ -61,6 +82,8 @@ type probeUser struct {
 	gotKicked     atomic.Bool
 	gotVoiceTaken atomic.Bool
 	joinedRoom    atomic.Bool
+	joinedN       atomic.Int64  // channel.joined 计数（-rejoin：二次入房断言）
+	peerLeftN     atomic.Int64  // channel.peer_left 计数（-rejoin）
 	closeCode     atomic.Int32  // 0 = 尚未收到服务端 close 帧；-1 = 异常断开（非 close 帧）
 	lastSrvErr    atomic.Value  // string "code: message"，最近一条下行 error（诊断用）
 	readDone      chan struct{} // readLoop 退出信号
@@ -75,7 +98,7 @@ func newUser(cfg *config, room, id, token string, ice []ICEServer, others []stri
 	}
 	return &probeUser{cfg: cfg, id: id, room: room, token: token, ice: ice,
 		connected: make(chan struct{}), atGate: make(chan struct{}), recv: recv,
-		readDone: make(chan struct{})}
+		trackStop: make(map[string]chan struct{}), readDone: make(chan struct{})}
 }
 
 func (u *probeUser) run(ctx context.Context, sendStart, sendStop <-chan struct{}) error {
@@ -168,6 +191,13 @@ func (u *probeUser) readLoop(ctx context.Context) {
 			u.gotHello.Store(true)
 		case signal.TypeChannelJoined:
 			u.joinedRoom.Store(true)
+			u.joinedN.Add(1)
+		case signal.TypeChannelPeerLeft:
+			u.peerLeftN.Add(1)
+			var d signal.PeerLeftData
+			if env.Decode(&d) == nil {
+				u.stopTrack(d.UserID) // 与真实客户端一致：peer_left 即拆该路读取（remote.RemovePeer）
+			}
 		case signal.TypeError:
 			var d signal.ErrorData
 			if env.Decode(&d) == nil {
@@ -187,7 +217,7 @@ func (u *probeUser) readLoop(ctx context.Context) {
 			if env.Decode(&d) == nil {
 				u.handleRenegotiation(d.SDP)
 			}
-		case signal.TypeRTCICE:
+		case signal.TypeRTCIce:
 			var d webrtc.ICECandidateInit
 			if env.Decode(&d) == nil {
 				u.applyCandidate(d)
@@ -202,6 +232,18 @@ func (u *probeUser) srvErr() string {
 	return s
 }
 
+// selectedProtocol 返回 ICE 选中候选对的传输协议描述（"tcp"/"udp"）。
+func (u *probeUser) selectedProtocol() string {
+	if u.pc == nil {
+		return ""
+	}
+	pair, err := u.pc.SCTP().Transport().ICETransport().GetSelectedCandidatePair()
+	if err != nil || pair == nil {
+		return ""
+	}
+	return pair.Local.Protocol.String()
+}
+
 // ---- WebRTC ----
 
 func (u *probeUser) startPeer() error {
@@ -212,6 +254,10 @@ func (u *probeUser) startPeer() error {
 	se := webrtc.SettingEngine{}
 	if u.cfg.loopback {
 		se.SetIncludeLoopbackCandidate(true)
+	}
+	// -tcp：只启用 TCP 网络类型（等价禁 UDP 网络），验证 ICE-TCP 直连（#25）
+	if u.cfg.tcpOnly {
+		se.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeTCP4, webrtc.NetworkTypeTCP6})
 	}
 	// 服务端下发的 STUN/TURN（生产配置，可能为空/不可达——退 host/prflx）
 	var servers []webrtc.ICEServer
@@ -263,7 +309,7 @@ func (u *probeUser) startPeer() error {
 
 	pc.OnICECandidate(func(ic *webrtc.ICECandidate) {
 		if ic != nil {
-			_ = u.wsSend(signal.TypeRTCICE, ic.ToJSON())
+			_ = u.wsSend(signal.TypeRTCIce, ic.ToJSON())
 		}
 	})
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
@@ -279,11 +325,21 @@ func (u *probeUser) startPeer() error {
 		src := strings.TrimPrefix(remote.ID(), "audio-")
 		u.recvMu.Lock()
 		counter := u.recv[src]
+		stop := make(chan struct{})
+		if old, ok := u.trackStop[src]; ok {
+			close(old) // 同 src 旧读取循环退役（重入房换轨）
+		}
+		u.trackStop[src] = stop
 		u.recvMu.Unlock()
 		for {
 			_, _, err := remote.ReadRTP()
 			if err != nil {
 				return
+			}
+			select {
+			case <-stop:
+				return // peer_left 后不再向应用层交付（真实客户端 remote.RemovePeer 语义）
+			default:
 			}
 			if counter != nil {
 				counter.Add(1)
@@ -371,6 +427,25 @@ func (u *probeUser) sendLoop(stop <-chan struct{}) {
 		} else {
 			u.sent.Add(1)
 		}
+	}
+}
+
+// stopTrack 拆除某 src 的下行读取循环（channel.peer_left 处理：真实客户端
+// 会 RemovePeer 销毁该路解码链路，重入房后必须靠新 OnTrack 恢复）。
+func (u *probeUser) stopTrack(src string) {
+	u.recvMu.Lock()
+	if stop, ok := u.trackStop[src]; ok {
+		close(stop)
+		delete(u.trackStop, src)
+	}
+	u.recvMu.Unlock()
+}
+
+// closePC 只关 PeerConnection（-rejoin：离房后信令连接保留，供二次入房）。
+func (u *probeUser) closePC() {
+	if u.pc != nil {
+		_ = u.pc.Close()
+		u.pc = nil
 	}
 }
 

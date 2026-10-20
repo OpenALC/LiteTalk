@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litetalk:signal:chat.send",
+  "title": "ChatSendData",
+  "x-wire-type": "chat.send",
+  "x-go-const": "TypeChatSend",
+  "x-direction": "C2S",
+  "x-since": 1,
+  "x-namespace": "event",
+  "description": "向频道发一条文字消息。type 为消息种类，本期仅支持 text，其他值拒收。",
+  "type": "object",
+  "properties": {
+    "channel_id": { "type": "string" },
+    "type": {
+      "type": "string",
+      "description": "消息种类，本期仅 text"
+    },
+    "content": { "type": "string" },
+    "nonce": {
+      "type": "string",
+      "x-since": 2,
+      "x-go-omitempty": true,
+      "maxLength": 64,
+      "description": "客户端幂等键（#31，≤64 字符）：同频道同用户重复提交只落一条，重复请求回显原消息。缺省不去重（老客户端）。"
+    }
+  },
+  "required": ["channel_id", "type", "content"],
+  "additionalProperties": false
+}

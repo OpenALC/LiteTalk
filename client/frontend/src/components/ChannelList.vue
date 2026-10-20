@@ -1,15 +1,16 @@
 <script setup lang="ts">
 // ChannelList 频道栏（v0.1.2）：双击加入语音频道（单击仅选中，对齐 Discord 语义）；
-// 空白处右键创建频道/分类；分类头右键删除分类（含频道，二次确认）；
-// 分类数据源为 servers.groupsOf（服务端 categories 实体 + 内置示例本地语义）；
+// 空白处右键创建频道/分类；分类头右键重命名/删除分类（含频道，二次确认），
+// 按住分类头拖拽排序（#16，原生 DnD）；空服务器显示空态（#12）；
+// 分类数据源为 servers.groupsOf（服务端 categories 实体）；
 // 底部齿轮跳转 /settings 独立路由页。
 import { computed, onMounted, ref } from 'vue'
 import {
-  ChevronDown, Eye, Hash, Lock, Mic, Volume2, Headphones, HeadphoneOff,
-  MicOff, Settings, Pencil, Trash2, FolderPlus, Folder,
+  ChevronDown, Hash, Lock, Mic, Volume2, Headphones, HeadphoneOff,
+  MicOff, Settings, Pencil, Trash2, FolderPlus, Folder, CircleAlert,
 } from 'lucide-vue-next'
 import { useRouter } from 'vue-router'
-import { useServersStore } from '../stores/data'
+import { useServersStore, catDropIndex } from '../stores/data'
 import { useVoiceStore } from '../stores/voice'
 import { useAuthStore } from '../stores/auth'
 import { useNotifyStore } from '../stores/notify'
@@ -169,21 +170,40 @@ function openBlankCtx(e: MouseEvent) {
 
 const blankPrompt = ref<{ mode: 'channel' | 'category' } | null>(null)
 
+// catChoices 归入分类候选（#72）：真实分类 + 末位「未分类」。
+// groupsOf 的合成组（chan: 前缀，无分类频道归组用）不是服务端分类，不能当归宿。
+const catChoices = computed(() => [
+  ...groups.value.filter((g) => !g.id.startsWith('chan:')).map((g) => ({ value: g.id, label: g.name })),
+  { value: '', label: '未分类' },
+])
+
+// defaultCatId 默认归入当前选中频道所在的分类，没有选中或该频道不在真实分类时
+// 取第一个分类——用户打开对话框就能直接确认，不必每次手动选。
+const defaultCatId = computed(() => {
+  const s = servers.currentServer
+  const ch = s.channels.find((c) => c.id === servers.currentChannelId)
+  const real = groups.value.filter((g) => !g.id.startsWith('chan:'))
+  if (ch) {
+    const g = real.find((x) => x.name === ch.group)
+    if (g) return g.id
+  }
+  return real[0]?.id ?? ''
+})
+
 function onBlankSelect(key: string) {
   if (key === 'new-channel' || key === 'new-category') {
     blankPrompt.value = { mode: key === 'new-channel' ? 'channel' : 'category' }
   }
 }
 
-async function onBlankConfirm(value: string) {
+async function onBlankConfirm(value: string, _option: string, option2: string) {
   const p = blankPrompt.value
   blankPrompt.value = null
   if (!p) return
   try {
     if (p.mode === 'channel') {
-      // 新频道落在该服务器的第一个分类（无分类时服务端/本地默认组）。
-      const firstGroup = groups.value[0]?.name ?? '语音频道'
-      await createChannelInGroup(servers.currentServerId, value, firstGroup)
+      // 第三参数是归入分类 id（'' = 未分类）：显式带 category_id 新建（#72）。
+      await createChannelInGroup(servers.currentServerId, value, option2)
       notify.show('频道已创建')
     } else {
       await servers.createCategory(servers.currentServerId, value)
@@ -192,23 +212,19 @@ async function onBlankConfirm(value: string) {
   } catch (e) { notify.fromErr(e) }
 }
 
-// createChannelInGroup：真实频道创建后归到指定分类（REST 频道暂按类型默认组，
-// 分类归属待 GET channels 端点接齐后由服务端 category_id 驱动，见 store 注释）。
-async function createChannelInGroup(serverId: string, name: string, _group: string) {
-  const s = servers.findServer(serverId)
-  if (!s) return
-  if (s.builtin) {
-    // 内置示例不支持新建（与 ServerRail 右键策略一致）。
-    throw new Error('示例服务器不可新建频道')
-  }
-  await servers.createChannel(serverId, name, 'voice')
+// createChannelInGroup：新建频道并显式归入分类（#72）。categoryId 是服务端分类
+// id（'' = 不归类）；显式分类优先生效，缺省才由 store 走按名归组的旧路径。
+async function createChannelInGroup(serverId: string, name: string, categoryId: string) {
+  await servers.createChannel(serverId, name, 'voice', categoryId)
 }
 
-// ---- 分类头右键：删除分类（含频道，二次确认） ----
+// ---- 分类头右键：重命名 / 删除分类（含频道，二次确认） ----
 const catCtx = ref<{ x: number; y: number; id: string; name: string } | null>(null)
 const catCtxItems: CtxItem[] = [
+  { key: 'rename-cat', label: '重命名分类', icon: Pencil },
   { key: 'del-cat', label: '删除分类（含频道）', icon: Trash2, danger: true, confirm: true },
 ]
+const catRenaming = ref<{ id: string; initial: string } | null>(null)
 
 function openCatCtx(e: MouseEvent, id: string, name: string) {
   catCtx.value = { x: e.clientX, y: e.clientY, id, name }
@@ -216,7 +232,12 @@ function openCatCtx(e: MouseEvent, id: string, name: string) {
 
 async function onCatSelect(key: string) {
   const c = catCtx.value
-  if (!c || key !== 'del-cat') return
+  if (!c) return
+  if (key === 'rename-cat') {
+    catRenaming.value = { id: c.id, initial: c.name }
+    return
+  }
+  if (key !== 'del-cat') return
   try {
     // 身处将被删除频道的语音频道时先离开。
     const s = servers.findServer(servers.currentServerId)
@@ -226,6 +247,66 @@ async function onCatSelect(key: string) {
     await servers.deleteCategory(servers.currentServerId, c.id, c.name)
     notify.show('分类已删除')
   } catch (e) { notify.fromErr(e) }
+}
+
+async function onCatRenameConfirm(value: string) {
+  const r = catRenaming.value
+  catRenaming.value = null
+  if (!r) return
+  try {
+    await servers.renameCategory(servers.currentServerId, r.id, value)
+    notify.show('分类已重命名')
+  } catch (e) { notify.fromErr(e) }
+}
+
+// ---- 分类拖拽排序（#16）：原生 DnD，不引第三方库；动效只用 opacity ----
+const dragCat = ref<string | null>(null)
+const dropIdx = ref<number | null>(null)
+
+// dropPos 把 groups 序号映射到 reorderCategory 的插入序：落到非分类条目（未分类/
+// 内置自带组）取分类区末尾；落到分类上 = 插到它之前（.drop-target 顶边线）。
+function dropPos(gi: number, dragId: string): number {
+  const list = servers.extraGroups[servers.currentServerId] ?? []
+  const g = groups.value[gi]
+  const to = g ? list.findIndex((x) => x.id === g.id) : -1
+  return catDropIndex(list, dragId, to)
+}
+
+function onCatDragStart(e: DragEvent, id: string) {
+  // 未分类/内置自带组（chan: 前缀）无排序语义，不可拖。
+  if (id.startsWith('chan:')) {
+    e.preventDefault()
+    return
+  }
+  dragCat.value = id
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer.setData('text/plain', id)
+  }
+}
+
+function onCatDragOver(e: DragEvent, gi: number) {
+  if (!dragCat.value) return
+  e.preventDefault()
+  dropIdx.value = gi
+}
+
+function onCatDragEnd() {
+  dragCat.value = null
+  dropIdx.value = null
+}
+
+async function onCatDrop(e: DragEvent, gi: number) {
+  e.preventDefault()
+  const id = dragCat.value
+  dragCat.value = null
+  dropIdx.value = null
+  if (!id) return
+  try {
+    await servers.reorderCategory(servers.currentServerId, id, dropPos(gi, id))
+  } catch (err) {
+    notify.fromErr(err, '排序保存失败')
+  }
 }
 </script>
 
@@ -237,13 +318,24 @@ async function onCatSelect(key: string) {
       <ChevronDown :size="16" :class="{ rotated: allCollapsed }" />
     </div>
 
-    <!-- data-ctx：允许自定义右键菜单（全局拦截的白名单容器） -->
-    <div class="chan-scroll" data-ctx @contextmenu.prevent="openBlankCtx">
-      <div v-for="g in groups" :key="g.name" class="cat"
-           :class="{ closed: collapsed[g.name] }">
-        <!-- 分类头：左键折叠/展开，右键删除分类 -->
-        <div class="cat-head" @click="toggleGroup(g.name)"
-             @contextmenu.prevent="openCatCtx($event, g.id, g.name)">
+    <!-- 空白处右键：只挂自定义「创建频道」菜单，原生菜单由全局拦截屏蔽 -->
+    <div class="chan-scroll" @contextmenu.prevent="openBlankCtx">
+      <!-- 空服务器空态（#12）：右键空白处仍可创建频道；加载失败给解释而不是恒空 -->
+      <div v-if="groups.length === 0" class="empty">
+        <CircleAlert v-if="servers.currentServer.unavailable" :size="26" />
+        <Hash v-else :size="26" />
+        <span>{{ servers.currentServer.unavailable ? '无法加载频道' : '暂无频道' }}</span>
+      </div>
+      <div v-for="(g, gi) in groups" :key="g.name" class="cat"
+           :class="{ closed: collapsed[g.name], dragging: dragCat === g.id, 'drop-target': dropIdx === gi && dragCat !== null && dragCat !== g.id }"
+           @dragover.prevent="onCatDragOver($event, gi)"
+           @drop.prevent="onCatDrop($event, gi)">
+        <!-- 分类头：左键折叠/展开，右键重命名/删除，按住拖拽排序（#16） -->
+        <div class="cat-head" draggable="true"
+             @click="toggleGroup(g.name)"
+             @contextmenu.prevent="openCatCtx($event, g.id, g.name)"
+             @dragstart="onCatDragStart($event, g.id)"
+             @dragend="onCatDragEnd">
           <ChevronDown :size="13" />{{ g.name }}
         </div>
         <div class="cat-items">
@@ -254,7 +346,7 @@ async function onCatSelect(key: string) {
                  @click="pick(ch.id)"
                  @dblclick.prevent="joinOnDblClick(ch.id)"
                  @contextmenu.prevent="openCtx($event, ch.id, ch.name)">
-              <component :is="ch.type === 'text' ? Hash : (ch.locked ? Lock : (ch.id === 'ch-audience' ? Eye : Volume2))"
+              <component :is="ch.type === 'text' ? Hash : (ch.locked ? Lock : Volume2)"
                          :size="16" />
               <span class="cname">{{ ch.name }}</span>
               <span v-if="ch.id === voice.channelId" class="count">
@@ -336,11 +428,18 @@ async function onCatSelect(key: string) {
 
     <PromptDialog v-if="renaming" title="重命名频道" :initial="renaming.initial" cta="保存"
                   @confirm="onRenameConfirm" @close="renaming = null" />
+    <!-- 分类名上限 32（服务端 validCategoryName）：上限放到 64 会打到 400 才报错（#16） -->
+    <PromptDialog v-if="catRenaming" title="重命名分类" :initial="catRenaming.initial" cta="保存"
+                  :maxlen="32" @confirm="onCatRenameConfirm" @close="catRenaming = null" />
+    <!-- 归入分类是显式选择（#72）：默认当前选中频道所在分类，改选即可换宿。 -->
     <PromptDialog v-if="blankPrompt?.mode === 'channel'" title="创建频道"
                   placeholder="频道名称" cta="创建"
+                  :options2="catChoices" :option2-default="defaultCatId"
+                  options2-label="归入分类"
                   @confirm="onBlankConfirm" @close="blankPrompt = null" />
     <PromptDialog v-else-if="blankPrompt?.mode === 'category'" title="创建分类"
                   placeholder="分类名称" cta="创建"
+                  :maxlen="32"
                   @confirm="onBlankConfirm" @close="blankPrompt = null" />
   </aside>
 </template>
@@ -366,7 +465,17 @@ async function onCatSelect(key: string) {
 /* 全折叠时箭头旋起，与分组头折叠态一致 */
 .server-head :deep(svg.rotated) { transform: rotate(-90deg); }
 .chan-scroll { flex: 1; overflow-y: auto; padding: 10px 10px 12px; }
-.cat { margin-bottom: 14px; }
+/* 空服务器空态（#12）：四色内的弱化灰，不用 emoji */
+.empty {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 10px; padding: 36px 12px;
+  color: var(--ink-400); font-size: 12.5px;
+}
+.empty :deep(svg) { color: var(--ink-300); }
+.cat { margin-bottom: 14px; transition: opacity 0.15s; }
+/* 拖拽排序（#16）：动效只用 opacity；落点以上边线示意 */
+.cat.dragging { opacity: 0.45; }
+.cat.drop-target { box-shadow: inset 0 2px 0 var(--brand-500); }
 .cat-head {
   display: flex; align-items: center; gap: 3px;
   padding: 4px 6px; font-size: 11.5px; font-weight: 600;

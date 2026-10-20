@@ -5,8 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
-	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -47,17 +48,33 @@ func (m *MySQL) Close() error { return m.db.Close() }
 // DB 暴露底层句柄（迁移工具用）。
 func (m *MySQL) DB() *sql.DB { return m.db }
 
-// Migrate 按文件名顺序执行 migrationsDir 下的 *.up.sql（golang-migrate 命名约定），
+// Migrate 按文件名顺序执行 fsys 下的 *.up.sql（golang-migrate 命名约定），
 // 已执行过的跳过（记录在 schema_migrations）。
-func (m *MySQL) Migrate(ctx context.Context, migrationsDir string) error {
-	if _, err := m.db.ExecContext(ctx,
+// 启动互斥：GET_LOCK('litetalk_migrate', 60) 防多实例并发迁移；拿不到锁返回错误。
+func (m *MySQL) Migrate(ctx context.Context, fsys fs.FS) error {
+	conn, err := m.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	// 同一连接拿锁/解锁——连接池里两条不同连接会锁不住。
+	var got int
+	if err := conn.QueryRowContext(ctx, `SELECT GET_LOCK('litetalk_migrate', 60)`).Scan(&got); err != nil {
+		return fmt.Errorf("migrate lock: %w", err)
+	}
+	if got != 1 {
+		return errors.New("migrate lock: 60s 内另一实例正在迁移")
+	}
+	defer conn.ExecContext(ctx, `SELECT RELEASE_LOCK('litetalk_migrate')`)
+
+	if _, err := conn.ExecContext(ctx,
 		`CREATE TABLE IF NOT EXISTS schema_migrations (
 			version VARCHAR(255) PRIMARY KEY,
 			applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`); err != nil {
 		return fmt.Errorf("create schema_migrations: %w", err)
 	}
-	entries, err := os.ReadDir(migrationsDir)
+	entries, err := fs.ReadDir(fsys, ".")
 	if err != nil {
 		return err
 	}
@@ -71,24 +88,28 @@ func (m *MySQL) Migrate(ctx context.Context, migrationsDir string) error {
 	for _, name := range ups {
 		version := strings.TrimSuffix(name, ".up.sql")
 		var n int
-		if err := m.db.QueryRowContext(ctx,
+		if err := conn.QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM schema_migrations WHERE version = ?`, version).Scan(&n); err != nil {
 			return err
 		}
 		if n > 0 {
 			continue
 		}
-		body, err := os.ReadFile(filepath.Join(migrationsDir, name))
+		body, err := fs.ReadFile(fsys, name)
 		if err != nil {
 			return err
 		}
+		stmts, err := splitSQL(string(body))
+		if err != nil {
+			return fmt.Errorf("parse %s: %w", name, err)
+		}
 		// MySQL 驱动不支持多语句 Exec，逐条执行。
-		for _, stmt := range splitSQL(string(body)) {
-			if _, err := m.db.ExecContext(ctx, stmt); err != nil {
+		for _, stmt := range stmts {
+			if _, err := conn.ExecContext(ctx, stmt); err != nil {
 				return fmt.Errorf("apply %s: %w", name, err)
 			}
 		}
-		if _, err := m.db.ExecContext(ctx,
+		if _, err := conn.ExecContext(ctx,
 			`INSERT INTO schema_migrations (version) VALUES (?)`, version); err != nil {
 			return err
 		}
@@ -97,7 +118,7 @@ func (m *MySQL) Migrate(ctx context.Context, migrationsDir string) error {
 }
 
 // RollbackLast 执行最近一个已应用版本的 *.down.sql（验证 down 迁移用）。
-func (m *MySQL) RollbackLast(ctx context.Context, migrationsDir string) error {
+func (m *MySQL) RollbackLast(ctx context.Context, fsys fs.FS) error {
 	var version string
 	err := m.db.QueryRowContext(ctx,
 		`SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1`).Scan(&version)
@@ -107,11 +128,15 @@ func (m *MySQL) RollbackLast(ctx context.Context, migrationsDir string) error {
 	if err != nil {
 		return err
 	}
-	body, err := os.ReadFile(filepath.Join(migrationsDir, version+".down.sql"))
+	body, err := fs.ReadFile(fsys, version+".down.sql")
 	if err != nil {
 		return err
 	}
-	for _, stmt := range splitSQL(string(body)) {
+	stmts, err := splitSQL(string(body))
+	if err != nil {
+		return fmt.Errorf("parse %s.down.sql: %w", version, err)
+	}
+	for _, stmt := range stmts {
 		if _, err := m.db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("rollback %s: %w", version, err)
 		}
@@ -120,47 +145,127 @@ func (m *MySQL) RollbackLast(ctx context.Context, migrationsDir string) error {
 	return err
 }
 
-// splitSQL 按行分割简单 SQL 脚本（迁移文件不含存储过程/触发器，按分号切分即可）。
-func splitSQL(s string) []string {
-	out := []string{}
-	for _, part := range strings.Split(s, ";") {
-		stmt := strings.TrimSpace(part)
-		// 忽略空段与纯注释段。
-		lines := strings.Split(stmt, "\n")
-		var kept []string
-		for _, l := range lines {
-			t := strings.TrimSpace(l)
-			if t == "" || strings.HasPrefix(t, "--") {
-				continue
-			}
-			kept = append(kept, l)
+// splitSQL 按分号切分迁移脚本。识别字符串/引号标识符（' " `）、SQLite 方括号
+// 标识符 [..]、行注释（-- / #）与块注释（/* */；MySQL 的 /*! 与 /*+ 有真语义，
+// 整体保留）。引号内的 ;、--、# 一律原样保留。
+//
+// 转义规则：MySQL 字符串（' 与 "）里的反斜杠转义（\' \" \\）不结束引号；
+// 反引号只认成对的重复反引号转义，方括号标识符到首个 ] 结束——两者都没有
+// 反斜杠转义。
+//
+// 失败即报错，不静默丢弃 SQL：引号 / 方括号 / 块注释未闭合，或出现
+// CREATE [DEFINER=…] TRIGGER。触发器体 BEGIN…END 内的分号与语句分隔符无法
+// 区分，切碎执行只会得到一半的 DDL；迁移文件不支持触发器，也不应引入。
+func splitSQL(s string) ([]string, error) {
+	var out []string
+	var b strings.Builder
+	flush := func() error {
+		stmt := strings.TrimSpace(b.String())
+		b.Reset()
+		if stmt == "" {
+			return nil
 		}
-		if len(kept) > 0 {
-			out = append(out, strings.Join(kept, "\n"))
+		if createTriggerRe.MatchString(stmt) {
+			return errors.New("splitSQL: 不支持 CREATE TRIGGER（BEGIN…END 体内的分号无法与语句分隔符区分）")
+		}
+		out = append(out, stmt)
+		return nil
+	}
+	for i := 0; i < len(s); {
+		c := s[i]
+		switch {
+		case c == '\'' || c == '"' || c == '`':
+			end, err := scanQuoted(s, i)
+			if err != nil {
+				return nil, err
+			}
+			b.WriteString(s[i:end])
+			i = end
+		case c == '[':
+			// SQLite 方括号标识符：首个 ] 结束，其中的分号原样保留。
+			j := strings.IndexByte(s[i+1:], ']')
+			if j < 0 {
+				return nil, fmt.Errorf("splitSQL: 第 %d 字节起的 [ 标识符未闭合", i)
+			}
+			end := i + 1 + j + 1
+			b.WriteString(s[i:end])
+			i = end
+		case c == '#' || (c == '-' && i+1 < len(s) && s[i+1] == '-'):
+			// 行注释剥到行尾；换行留下，不改变后续语句的行结构。
+			for i < len(s) && s[i] != '\n' {
+				i++
+			}
+		case c == '/' && i+1 < len(s) && s[i+1] == '*':
+			keep := i+2 < len(s) && (s[i+2] == '!' || s[i+2] == '+')
+			j := strings.Index(s[i+2:], "*/")
+			if j < 0 {
+				return nil, fmt.Errorf("splitSQL: 第 %d 字节起的块注释未闭合", i)
+			}
+			end := i + 2 + j + 2
+			if keep {
+				b.WriteString(s[i:end])
+			} else {
+				b.WriteByte(' ') // 补空格防相邻 token 粘连
+			}
+			i = end
+		case c == ';':
+			if err := flush(); err != nil {
+				return nil, err
+			}
+			i++
+		default:
+			b.WriteByte(c)
+			i++
 		}
 	}
-	return out
+	if err := flush(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
+
+// scanQuoted 从 s[i]（' " 或 `）扫到闭合引号，返回闭合后的下标。
+// 单/双引号内支持 MySQL 反斜杠转义与成对引号转义；反引号只认成对转义。
+func scanQuoted(s string, i int) (int, error) {
+	q := s[i]
+	start := i
+	i++
+	for i < len(s) {
+		switch {
+		case s[i] == '\\' && q != '`':
+			i += 2 // 连同下一个字节一起吞掉：\' \" \\ 都不结束引号
+		case s[i] == q:
+			if i+1 < len(s) && s[i+1] == q {
+				i += 2 // '' / "" / `` 形式转义，仍在引号内
+				continue
+			}
+			return i + 1, nil
+		default:
+			i++
+		}
+	}
+	return 0, fmt.Errorf("splitSQL: 第 %d 字节起的 %c 未闭合", start, q)
+}
+
+// createTriggerRe 匹配 CREATE [OR REPLACE] [DEFINER=…] TRIGGER。只用于明确
+// 拒绝触发器脚本，不追求覆盖所有 DDL 变体。
+var createTriggerRe = regexp.MustCompile(`(?is)^create\s+(?:or\s+replace\s+)?(?:definer\s*(?:=\s*)?\S+\s+)?trigger\b`)
 
 // ---- users ----
 
 func (m *MySQL) CreateUser(ctx context.Context, u *User) error {
-	res, err := m.db.ExecContext(ctx,
-		`INSERT INTO users (email, nickname, tag, password_hash, email_verified, is_guest, status)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		u.Email, u.Nickname, u.Tag, u.PasswordHash, u.EmailVerified, u.IsGuest, u.Status)
+	u.ID = newID(u.ID)
+	_, err := m.db.ExecContext(ctx,
+		`INSERT INTO users (id, email, nickname, tag, password_hash, email_verified, is_guest, status)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		u.ID, u.Email, u.Nickname, u.Tag, u.PasswordHash, u.EmailVerified, u.IsGuest, u.Status)
 	if err != nil {
 		if isDup(err) {
 			return ErrConflict
 		}
 		return err
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return err
-	}
-	u.ID = id
-	return m.db.QueryRowContext(ctx, `SELECT created_at, updated_at FROM users WHERE id = ?`, id).
+	return m.db.QueryRowContext(ctx, `SELECT created_at, updated_at FROM users WHERE id = ?`, u.ID).
 		Scan(&u.CreatedAt, &u.UpdatedAt)
 }
 
@@ -205,24 +310,41 @@ func (m *MySQL) UpdateUser(ctx context.Context, u *User) error {
 	return checkAffected(res)
 }
 
+// HasUsers 库内是否已有用户（首启探测；UserByID(1) 随 Snowflake 失效）。
+func (m *MySQL) HasUsers(ctx context.Context) (bool, error) {
+	var n int
+	err := m.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users LIMIT 1`).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// HasServers 库内是否已有服务器（#27：实例是否已被认领的持久判据）。
+func (m *MySQL) HasServers(ctx context.Context) (bool, error) {
+	var n int
+	err := m.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM servers LIMIT 1`).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // ---- friendships ----
 
 func (m *MySQL) CreateFriendship(ctx context.Context, f *Friendship) error {
-	res, err := m.db.ExecContext(ctx,
-		`INSERT INTO friendships (user_id, friend_id, status) VALUES (?, ?, ?)`,
-		f.UserID, f.FriendID, f.Status)
+	f.ID = newID(f.ID)
+	_, err := m.db.ExecContext(ctx,
+		`INSERT INTO friendships (id, user_id, friend_id, status, remark, group_name)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		f.ID, f.UserID, f.FriendID, f.Status, f.Remark, f.GroupName)
 	if err != nil {
 		if isDup(err) {
 			return ErrConflict
 		}
 		return err
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return err
-	}
-	f.ID = id
-	return m.db.QueryRowContext(ctx, `SELECT created_at FROM friendships WHERE id = ?`, id).
+	return m.db.QueryRowContext(ctx, `SELECT created_at FROM friendships WHERE id = ?`, f.ID).
 		Scan(&f.CreatedAt)
 }
 
@@ -296,18 +418,14 @@ func (m *MySQL) DeleteFriendship(ctx context.Context, id int64) error {
 // ---- servers ----
 
 func (m *MySQL) CreateServer(ctx context.Context, s *Server) error {
-	res, err := m.db.ExecContext(ctx,
-		`INSERT INTO servers (name, owner_id, icon_name, icon_color) VALUES (?, ?, ?, ?)`,
-		s.Name, s.OwnerID, s.IconName, s.IconColor)
+	s.ID = newID(s.ID)
+	_, err := m.db.ExecContext(ctx,
+		`INSERT INTO servers (id, name, owner_id, icon_name, icon_color) VALUES (?, ?, ?, ?, ?)`,
+		s.ID, s.Name, s.OwnerID, s.IconName, s.IconColor)
 	if err != nil {
 		return err
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return err
-	}
-	s.ID = id
-	return m.db.QueryRowContext(ctx, `SELECT created_at FROM servers WHERE id = ?`, id).
+	return m.db.QueryRowContext(ctx, `SELECT created_at FROM servers WHERE id = ?`, s.ID).
 		Scan(&s.CreatedAt)
 }
 
@@ -357,28 +475,36 @@ func (m *MySQL) UpdateServer(ctx context.Context, s *Server) error {
 }
 
 func (m *MySQL) DeleteServer(ctx context.Context, id int64) error {
-	// 子表清理：channels/messages/invites/members 一并删除（无 FK 约束，显式清理）。
-	if _, err := m.db.ExecContext(ctx,
-		`DELETE FROM messages WHERE channel_id IN (SELECT id FROM channels WHERE server_id = ?)`, id); err != nil {
-		return err
-	}
-	if _, err := m.db.ExecContext(ctx, `DELETE FROM channels WHERE server_id = ?`, id); err != nil {
-		return err
-	}
-	if _, err := m.db.ExecContext(ctx, `DELETE FROM categories WHERE server_id = ?`, id); err != nil {
-		return err
-	}
-	if _, err := m.db.ExecContext(ctx, `DELETE FROM invites WHERE server_id = ?`, id); err != nil {
-		return err
-	}
-	if _, err := m.db.ExecContext(ctx, `DELETE FROM server_members WHERE server_id = ?`, id); err != nil {
-		return err
-	}
-	res, err := m.db.ExecContext(ctx, `DELETE FROM servers WHERE id = ?`, id)
+	// 单事务删除主体 + 级联子资源（#22）：中途失败时整体回滚。
+	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	return checkAffected(res)
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM messages WHERE channel_id IN (SELECT id FROM channels WHERE server_id = ?)`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM channels WHERE server_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM categories WHERE server_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM invites WHERE server_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM server_members WHERE server_id = ?`, id); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM servers WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	if err := checkAffected(res); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (m *MySQL) AddMember(ctx context.Context, mem *ServerMember) error {
@@ -442,18 +568,14 @@ func (m *MySQL) MembersOfServer(ctx context.Context, serverID int64) ([]ServerMe
 // ---- channels ----
 
 func (m *MySQL) CreateChannel(ctx context.Context, c *Channel) error {
-	res, err := m.db.ExecContext(ctx,
-		`INSERT INTO channels (server_id, name, type, category_id, position) VALUES (?, ?, ?, ?, ?)`,
-		c.ServerID, c.Name, c.Type, c.CategoryID, c.Position)
+	c.ID = newID(c.ID)
+	_, err := m.db.ExecContext(ctx,
+		`INSERT INTO channels (id, server_id, name, type, category_id, position) VALUES (?, ?, ?, ?, ?, ?)`,
+		c.ID, c.ServerID, c.Name, c.Type, c.CategoryID, c.Position)
 	if err != nil {
 		return err
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return err
-	}
-	c.ID = id
-	return m.db.QueryRowContext(ctx, `SELECT created_at FROM channels WHERE id = ?`, id).
+	return m.db.QueryRowContext(ctx, `SELECT created_at FROM channels WHERE id = ?`, c.ID).
 		Scan(&c.CreatedAt)
 }
 
@@ -510,31 +632,36 @@ func (m *MySQL) UpdateChannel(ctx context.Context, c *Channel) error {
 }
 
 func (m *MySQL) DeleteChannel(ctx context.Context, id int64) error {
-	if _, err := m.db.ExecContext(ctx, `DELETE FROM messages WHERE channel_id = ?`, id); err != nil {
-		return err
-	}
-	res, err := m.db.ExecContext(ctx, `DELETE FROM channels WHERE id = ?`, id)
+	// 单事务：消息 + 频道一起删（#22）。
+	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	return checkAffected(res)
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE channel_id = ?`, id); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM channels WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	if err := checkAffected(res); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ---- categories（v0.1.2 迁移 0003） ----
 
 func (m *MySQL) CreateCategory(ctx context.Context, c *Category) error {
-	res, err := m.db.ExecContext(ctx,
-		`INSERT INTO categories (server_id, name, position) VALUES (?, ?, ?)`,
-		c.ServerID, c.Name, c.Position)
+	c.ID = newID(c.ID)
+	_, err := m.db.ExecContext(ctx,
+		`INSERT INTO categories (id, server_id, name, position) VALUES (?, ?, ?, ?)`,
+		c.ID, c.ServerID, c.Name, c.Position)
 	if err != nil {
 		return err
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return err
-	}
-	c.ID = id
-	return m.db.QueryRowContext(ctx, `SELECT created_at FROM categories WHERE id = ?`, id).
+	return m.db.QueryRowContext(ctx, `SELECT created_at FROM categories WHERE id = ?`, c.ID).
 		Scan(&c.CreatedAt)
 }
 
@@ -600,23 +727,114 @@ func (m *MySQL) DeleteCategoryWithChannels(ctx context.Context, id int64) error 
 	return tx.Commit()
 }
 
+func (m *MySQL) UpdateCategory(ctx context.Context, c *Category) error {
+	res, err := m.db.ExecContext(ctx,
+		`UPDATE categories SET name = ?, position = ? WHERE id = ?`,
+		c.Name, c.Position, c.ID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	// MySQL 未开 clientFoundRows：值全同现值时同样报 0 行。行存在即成功（与
+	// Mem 对齐，否则「原样保存」会被误报 404），行不存在才 ErrNotFound。
+	if _, err := m.CategoryByID(ctx, c.ID); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ReorderCategories 把 id 移到 position（0-based，越界夹到首/尾），同服务器
+// 其它分类相对顺序保持并重排为 0..n-1（单事务）。
+func (m *MySQL) ReorderCategories(ctx context.Context, serverID, id int64, position int) error {
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	// Tx 同时只允许一个活跃查询：先把 id 集读完并关闭 rows，再逐条 UPDATE。
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id FROM categories WHERE server_id = ? ORDER BY position, id`, serverID)
+	if err != nil {
+		return err
+	}
+	ids := []int64{}
+	found := false
+	for rows.Next() {
+		var cid int64
+		if err := rows.Scan(&cid); err != nil {
+			rows.Close()
+			return err
+		}
+		if cid == id {
+			found = true
+		}
+		ids = append(ids, cid)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if !found {
+		return ErrNotFound
+	}
+	rest := make([]int64, 0, len(ids))
+	for _, cid := range ids {
+		if cid != id {
+			rest = append(rest, cid)
+		}
+	}
+	if position < 0 {
+		position = 0
+	}
+	if position > len(rest) {
+		position = len(rest)
+	}
+	out := make([]int64, 0, len(ids))
+	out = append(out, rest[:position]...)
+	out = append(out, id)
+	out = append(out, rest[position:]...)
+	for i, cid := range out {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE categories SET position = ? WHERE id = ?`, i, cid); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // ---- messages ----
 
 func (m *MySQL) CreateMessage(ctx context.Context, msg *Message) error {
-	res, err := m.db.ExecContext(ctx,
-		`INSERT INTO messages (channel_id, user_id, content) VALUES (?, ?, ?)`,
-		msg.ChannelID, msg.UserID, msg.Content)
+	msg.ID = newID(msg.ID)
+	// 空 nonce 落 NULL：唯一索引 (channel_id, user_id, nonce) 上 '' 会互相撞，NULL 不受约束。
+	var nonce any
+	if msg.Nonce != "" {
+		nonce = msg.Nonce
+	}
+	_, err := m.db.ExecContext(ctx,
+		`INSERT INTO messages (id, channel_id, user_id, content, nonce) VALUES (?, ?, ?, ?, ?)`,
+		msg.ID, msg.ChannelID, msg.UserID, msg.Content, nonce)
 	if err != nil {
+		if isDup(err) {
+			return ErrConflict
+		}
 		return err
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return err
-	}
-	msg.ID = id
-	return m.db.QueryRowContext(ctx, `SELECT created_at FROM messages WHERE id = ?`, id).
+	return m.db.QueryRowContext(ctx, `SELECT created_at FROM messages WHERE id = ?`, msg.ID).
 		Scan(&msg.CreatedAt)
 }
+
+// messageCols 列清单（nonce 经 COALESCE 归一空串，免 sql.NullString）。
+const messageCols = `m.id, m.channel_id, m.user_id, m.content, COALESCE(m.nonce, ''), m.created_at`
 
 func (m *MySQL) MessagesBefore(ctx context.Context, channelID, beforeID int64, limit int) ([]Message, error) {
 	if limit <= 0 || limit > 50 {
@@ -626,12 +844,12 @@ func (m *MySQL) MessagesBefore(ctx context.Context, channelID, beforeID int64, l
 	var err error
 	if beforeID > 0 {
 		rows, err = m.db.QueryContext(ctx,
-			`SELECT m.id, m.channel_id, m.user_id, m.content, m.created_at, u.nickname, u.tag
+			`SELECT `+messageCols+`, u.nickname, u.tag
 			 FROM messages m JOIN users u ON u.id = m.user_id
 			 WHERE m.channel_id = ? AND m.id < ? ORDER BY m.id DESC LIMIT ?`, channelID, beforeID, limit)
 	} else {
 		rows, err = m.db.QueryContext(ctx,
-			`SELECT m.id, m.channel_id, m.user_id, m.content, m.created_at, u.nickname, u.tag
+			`SELECT `+messageCols+`, u.nickname, u.tag
 			 FROM messages m JOIN users u ON u.id = m.user_id
 			 WHERE m.channel_id = ? ORDER BY m.id DESC LIMIT ?`, channelID, limit)
 	}
@@ -643,8 +861,8 @@ func (m *MySQL) MessagesBefore(ctx context.Context, channelID, beforeID int64, l
 	rev := []Message{}
 	for rows.Next() {
 		var msg Message
-		if err := rows.Scan(&msg.ID, &msg.ChannelID, &msg.UserID, &msg.Content,
-			&msg.CreatedAt, &msg.SenderNickname, &msg.SenderTag); err != nil {
+		if err := rows.Scan(&msg.ID, &msg.ChannelID, &msg.UserID, &msg.Content, &msg.Nonce, &msg.CreatedAt,
+			&msg.SenderNickname, &msg.SenderTag); err != nil {
 			return nil, err
 		}
 		rev = append(rev, msg)
@@ -657,6 +875,58 @@ func (m *MySQL) MessagesBefore(ctx context.Context, channelID, beforeID int64, l
 		out[i] = rev[len(rev)-1-i]
 	}
 	return out, nil
+}
+
+// MessagesAfter 正序分页（向前翻）：id > afterID 的最早 limit 条，按 id 正序返回。
+func (m *MySQL) MessagesAfter(ctx context.Context, channelID, afterID int64, limit int) ([]Message, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 50
+	}
+	var rows *sql.Rows
+	var err error
+	if afterID > 0 {
+		rows, err = m.db.QueryContext(ctx,
+			`SELECT `+messageCols+`, u.nickname, u.tag
+			 FROM messages m JOIN users u ON u.id = m.user_id
+			 WHERE m.channel_id = ? AND m.id > ? ORDER BY m.id ASC LIMIT ?`, channelID, afterID, limit)
+	} else {
+		rows, err = m.db.QueryContext(ctx,
+			`SELECT `+messageCols+`, u.nickname, u.tag
+			 FROM messages m JOIN users u ON u.id = m.user_id
+			 WHERE m.channel_id = ? ORDER BY m.id ASC LIMIT ?`, channelID, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Message{}
+	for rows.Next() {
+		var msg Message
+		if err := rows.Scan(&msg.ID, &msg.ChannelID, &msg.UserID, &msg.Content, &msg.Nonce, &msg.CreatedAt,
+			&msg.SenderNickname, &msg.SenderTag); err != nil {
+			return nil, err
+		}
+		out = append(out, msg)
+	}
+	return out, rows.Err()
+}
+
+// MessageByNonce 幂等回读原消息（带发送者内联信息，响应直接可用；频道维度隔离）。
+func (m *MySQL) MessageByNonce(ctx context.Context, channelID, userID int64, nonce string) (*Message, error) {
+	row := m.db.QueryRowContext(ctx,
+		`SELECT `+messageCols+`, u.nickname, u.tag
+		 FROM messages m JOIN users u ON u.id = m.user_id
+		 WHERE m.channel_id = ? AND m.user_id = ? AND m.nonce = ?`, channelID, userID, nonce)
+	var msg Message
+	err := row.Scan(&msg.ID, &msg.ChannelID, &msg.UserID, &msg.Content, &msg.Nonce, &msg.CreatedAt,
+		&msg.SenderNickname, &msg.SenderTag)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &msg, nil
 }
 
 // ---- invites ----
@@ -696,28 +966,93 @@ func (m *MySQL) InviteByCode(ctx context.Context, code string) (*Invite, error) 
 }
 
 func (m *MySQL) UseInvite(ctx context.Context, code string) error {
-	res, err := m.db.ExecContext(ctx,
-		`UPDATE invites SET uses = uses + 1
-		 WHERE code = ? AND (max_uses = 0 OR uses < max_uses)`, code)
+	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	ok, err := myUseInvite(ctx, tx, code)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return myInviteMiss(ctx, tx, code)
+	}
+	return tx.Commit()
+}
+
+// myUseInvite 邀请码自增（单条 UPDATE 即原子判定 max_uses/过期）；返回是否命中。
+// 不 Commit——调用方决定事务边界（UseInvite 与 UseInviteAndAddMember 共用）。
+func myUseInvite(ctx context.Context, tx *sql.Tx, code string) (bool, error) {
+	res, err := tx.ExecContext(ctx,
+		`UPDATE invites SET uses = uses + 1
+		 WHERE code = ? AND (max_uses = 0 OR uses < max_uses)
+		   AND (expires_at IS NULL OR expires_at > NOW())`, code)
+	if err != nil {
+		return false, err
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// myInviteMiss 区分 UPDATE 0 行的原因：不存在、已过期、次数用尽。
+func myInviteMiss(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, code string) error {
+	var cnt, expired int
+	if err := q.QueryRowContext(ctx,
+		`SELECT COUNT(*), COALESCE(SUM(expires_at IS NOT NULL AND expires_at <= NOW()), 0)
+		 FROM invites WHERE code = ?`, code).Scan(&cnt, &expired); err != nil {
 		return err
 	}
-	if n == 0 {
-		// 区分不存在与已用尽。
-		var cnt int
-		if err := m.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE code = ?`, code).Scan(&cnt); err != nil {
-			return err
-		}
-		if cnt == 0 {
-			return ErrNotFound
-		}
-		return ErrConflict
+	if cnt == 0 {
+		return ErrNotFound
 	}
-	return nil
+	if expired > 0 {
+		return ErrExpired
+	}
+	return ErrConflict
+}
+
+// UseInviteAndAddMember 同一事务内消费邀请码并插入成员（#22）：成员冲突或
+// 插入失败时整体回滚，邀请码次数不增长。
+func (m *MySQL) UseInviteAndAddMember(ctx context.Context, code string, userID int64, role MemberRole) (*ServerMember, error) {
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var serverID int64
+	err = tx.QueryRowContext(ctx, `SELECT server_id FROM invites WHERE code = ?`, code).Scan(&serverID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	ok, err := myUseInvite(ctx, tx, code)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, myInviteMiss(ctx, tx, code)
+	}
+	mem := &ServerMember{ServerID: serverID, UserID: userID, Role: role, JoinedAt: time.Now()}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO server_members (server_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)`,
+		mem.ServerID, mem.UserID, mem.Role, mem.JoinedAt); err != nil {
+		if isDup(err) {
+			return nil, ErrConflict
+		}
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return mem, nil
 }
 
 // ---- user_sessions（v1.1.0 迁移 0004） ----

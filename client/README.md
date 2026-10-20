@@ -20,7 +20,7 @@ Go + Wails v3 桌面端：音频采集/降噪/Opus 编解码、WebRTC 通话、V
 - **静音**：勾选态实时同步当前静音状态
 - **退出**：真正退出应用（关闭按钮只隐藏到托盘，不退出）
 
-托盘为 Wails v3 内建 SystemTray：Windows 用 ICO 图标，Linux（StatusNotifierItem）/macOS 用 PNG 图标（见 internal/tray）。
+托盘为 Wails v3 内建 SystemTray：Windows 用 ICO 图标，Linux（StatusNotifierItem）/macOS 用 PNG 图标（见 desktop/tray）。
 
 ## 最小化休眠（省内存）
 

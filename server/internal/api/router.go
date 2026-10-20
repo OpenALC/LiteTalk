@@ -4,16 +4,15 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"log"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/OpenALC/LiteTalk/server/internal/auth"
 	"github.com/OpenALC/LiteTalk/server/internal/mailer"
+	"github.com/OpenALC/LiteTalk/server/internal/rtcapi"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
 )
 
@@ -27,6 +26,13 @@ const (
 // Defined here to avoid an import cycle (signal imports store, api imports signal would cycle via main wiring).
 type Hub interface {
 	Kick(uid, dev, reason string)
+	KickChannel(channelID, reason string)
+}
+
+// PresenceReader 在线状态读取（#11）：presence:{uid} 存在 = 在线。
+// store.KV 满足；nil 时 user.online 恒 false。键格式与 signal 包手工同步。
+type PresenceReader interface {
+	Get(ctx context.Context, key string) (string, error)
 }
 
 // Server API 依赖集合。
@@ -42,6 +48,16 @@ type Server struct {
 	trusted  []*net.IPNet       // 可信反代（RemoteAddr 命中才采用 X-Real-IP）
 	sess     *auth.SessionIndex // 多设备会话索引（v1.1.0 迁移 0004）
 	hub      Hub                // WS 信令 hub（登出/重置密码踢线；nil=不踢）
+	presence PresenceReader     // 在线状态（好友列表 user.online 用；nil=恒离线）
+	selfHost bool               // 一键自托管形态（GET /api/v1/config 自描述，#26）
+	// bootstrapRequired 管理员邀请码是否未消费（#27 T4 接线；nil=恒 false）。
+	bootstrapRequired func() bool
+	// version 服务端构建版本（GET /api/v1/healthz 回显，#77）。
+	version string
+	// rtcCfg TURN/STUN 凭证签发配置（POST /api/v1/rtc/credentials，#77）。
+	rtcCfg rtcapi.Config
+	// rtcAuth 从访问令牌提取 uid；nil 时该端点一律 401（fail-closed）。
+	rtcAuth rtcapi.UserFromToken
 }
 
 // Config 构造配置。
@@ -61,6 +77,19 @@ type Config struct {
 	Session *auth.SessionIndex
 	// Hub 信令 hub（登出/重置密码踢线；nil 时仅清会话不踢 WS，测试常用）。
 	Hub Hub
+	// Presence 在线状态读取（presence:{uid}，好友列表 user.online 填值用；nil=恒离线）。
+	Presence PresenceReader
+	// SelfHost 一键自托管形态（SQLite/进程内单机部署）：客户端显示自托管引导（#26）。
+	SelfHost bool
+	// BootstrapRequired 管理员邀请码是否尚未被消费；注册页提示「等待管理员邀请」。
+	// nil=恒 false（bootstrap 流程未启用，#27 T4 接线）。
+	BootstrapRequired func() bool
+	// Version 服务端构建版本（GET /api/v1/healthz 回显；空视为 dev，#77）。
+	Version string
+	// RTC TURN/STUN 凭证签发配置；Secret 为空时 rtc/credentials 返回 503（#77）。
+	RTC rtcapi.Config
+	// RTCAuth 从访问令牌提取 uid（Bearer 或 ?token=，与信令一致）；nil 一律 401。
+	RTCAuth rtcapi.UserFromToken
 }
 
 // New 构造 API Server。
@@ -77,18 +106,28 @@ func New(cfg Config) *Server {
 	if mode != AuthModeSimple {
 		mode = AuthModeFull
 	}
+	ver := cfg.Version
+	if ver == "" {
+		ver = "dev"
+	}
 	return &Server{
-		store:    cfg.Store,
-		jwt:      cfg.JWT,
-		refresh:  cfg.Refresh,
-		codes:    cfg.Codes,
-		limits:   cfg.Limits,
-		mailer:   m,
-		authMode: mode,
-		log:      lg,
-		trusted:  parseTrustedProxies(lg, cfg.TrustedProxies),
-		sess:     cfg.Session,
-		hub:      cfg.Hub,
+		store:             cfg.Store,
+		jwt:               cfg.JWT,
+		refresh:           cfg.Refresh,
+		codes:             cfg.Codes,
+		limits:            cfg.Limits,
+		mailer:            m,
+		authMode:          mode,
+		log:               lg,
+		trusted:           parseTrustedProxies(lg, cfg.TrustedProxies),
+		sess:              cfg.Session,
+		hub:               cfg.Hub,
+		presence:          cfg.Presence,
+		selfHost:          cfg.SelfHost,
+		bootstrapRequired: cfg.BootstrapRequired,
+		version:           ver,
+		rtcCfg:            cfg.RTC,
+		rtcAuth:           cfg.RTCAuth,
 	}
 }
 
@@ -131,47 +170,25 @@ func (s *Server) mailConfigured() bool {
 }
 
 // Handler 返回挂载全部路由的 http.Handler（前缀 /api/v1）。
+// 路由表由 api.gen.go 按 openapi.yaml 注册；authMux 在注册时对非免鉴权
+// 路由包 auth 中间件（顺序与旧 s.auth(s.handleXxx) 一致）。
 func (s *Server) Handler() http.Handler {
-	mux := http.NewServeMux()
-	// config（免鉴权，客户端据此适配 UI）
-	mux.HandleFunc("GET /api/v1/config", s.handleConfig)
-	// auth
-	mux.HandleFunc("POST /api/v1/auth/register", s.handleRegister)
-	mux.HandleFunc("POST /api/v1/auth/login", s.handleLogin)
-	mux.HandleFunc("POST /api/v1/auth/guest", s.handleGuest)
-	mux.HandleFunc("POST /api/v1/auth/refresh", s.handleRefresh)
-	mux.HandleFunc("POST /api/v1/auth/logout", s.handleLogout)
-	mux.HandleFunc("POST /api/v1/auth/email-code", s.handleEmailCode)
-	mux.HandleFunc("POST /api/v1/auth/password/reset", s.handlePasswordReset)
-	// users
-	mux.HandleFunc("GET /api/v1/users/me", s.auth(s.handleMe))
-	mux.HandleFunc("PATCH /api/v1/users/me", s.auth(s.handlePatchMe))
-	// friends
-	mux.HandleFunc("GET /api/v1/friends", s.auth(s.handleListFriends))
-	mux.HandleFunc("POST /api/v1/friends/requests", s.auth(s.handleFriendRequest))
-	mux.HandleFunc("POST /api/v1/friends/requests/{id}/accept", s.auth(s.handleFriendAccept))
-	mux.HandleFunc("DELETE /api/v1/friends/{id}", s.auth(s.handleFriendDelete))
-	mux.HandleFunc("PATCH /api/v1/friends/{id}", s.auth(s.handlePatchFriend))
-	// servers
-	mux.HandleFunc("POST /api/v1/servers", s.auth(s.handleCreateServer))
-	mux.HandleFunc("GET /api/v1/servers", s.auth(s.handleListServers))
-	mux.HandleFunc("PATCH /api/v1/servers/{id}", s.auth(s.handlePatchServer))
-	mux.HandleFunc("DELETE /api/v1/servers/{id}", s.auth(s.handleDeleteServer))
-	mux.HandleFunc("POST /api/v1/servers/join", s.auth(s.handleJoinServer))
-	mux.HandleFunc("GET /api/v1/servers/{id}/members", s.auth(s.handleServerMembers))
-	mux.HandleFunc("POST /api/v1/servers/{id}/invites", s.auth(s.handleCreateInvite))
-	// channels
-	mux.HandleFunc("POST /api/v1/servers/{id}/channels", s.auth(s.handleCreateChannel))
-	mux.HandleFunc("GET /api/v1/servers/{id}/channels", s.auth(s.handleListChannels))
-	mux.HandleFunc("PATCH /api/v1/channels/{id}", s.auth(s.handlePatchChannel))
-	mux.HandleFunc("DELETE /api/v1/channels/{id}", s.auth(s.handleDeleteChannel))
-	// categories（v0.1.2 迁移 0003）
-	mux.HandleFunc("POST /api/v1/servers/{id}/categories", s.auth(s.handleCreateCategory))
-	mux.HandleFunc("DELETE /api/v1/categories/{id}", s.auth(s.handleDeleteCategory))
-	// messages
-	mux.HandleFunc("GET /api/v1/channels/{id}/messages", s.auth(s.handleListMessages))
-	mux.HandleFunc("POST /api/v1/channels/{id}/messages", s.auth(s.handleCreateMessage))
-	return mux
+	si := NewStrictHandlerWithOptions(s, []StrictMiddlewareFunc{s.withStrictCtx}, StrictHTTPServerOptions{
+		RequestErrorHandlerFunc:  s.requestErrorHandler,
+		ResponseErrorHandlerFunc: s.responseErrorHandler,
+	})
+	h := HandlerWithOptions(si, StdHTTPServerOptions{
+		BaseRouter:  &authMux{ServeMux: http.NewServeMux(), s: s},
+		Middlewares: []MiddlewareFunc{limitBody},
+		ErrorHandlerFunc: func(w http.ResponseWriter, r *http.Request, err error) {
+			writeErr(w, http.StatusBadRequest, "bad_request", "路径参数不合法")
+		},
+	})
+	// ServeMux 的 405 由 net/http 内部直接 http.Error 写出（纯文本），没有可插拔
+	// 的错误处理点；包一层响应改写，保证 405 也是 RFC 9457 problem+json（#77）。
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.ServeHTTP(&methodNotAllowedWriter{ResponseWriter: w}, r)
+	})
 }
 
 // ---- 上下文 ----
@@ -179,12 +196,6 @@ func (s *Server) Handler() http.Handler {
 type ctxKey int
 
 const userKey ctxKey = 1
-
-// currentUser 从请求上下文取当前用户（auth 中间件注入）。
-func currentUser(r *http.Request) *auth.Claims {
-	c, _ := r.Context().Value(userKey).(*auth.Claims)
-	return c
-}
 
 // legacyTokenGrace 旧版本令牌（无 sid）过渡期：与 signal 侧同值同时长，
 // 服务端升级后已签发令牌在有效期内仍可用，给用户留重新登录窗口（P1-3）。
@@ -236,53 +247,35 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// apiError 统一错误体 {"code","message"}。
-type apiError struct {
+// problemBody RFC 9457 问题详情（#31）：type/title/status/code/detail/message。
+// code 是扩展字段（客户端 APIError.Code 依赖），字符串码与迁移前逐字一致；
+// title 随 status 定（不随实例变），detail 才是本次出错的中文提示。
+//
+// message 与 detail 同值：RFC 9457 允许扩展字段，v1.1 客户端 decodeError 只认
+// message，缺了它任何错误都解析不出来（过期令牌清不掉）。至少保留一个版本（#31）。
+type problemBody struct {
+	Type    string `json:"type"`
+	Title   string `json:"title"`
+	Status  int    `json:"status"`
 	Code    string `json:"code"`
+	Detail  string `json:"detail"`
 	Message string `json:"message"`
 }
 
+// writeErr 统一错误体（RFC 9457，application/problem+json，契约 Problem）。
+// type 形如 urn:litetalk:error:<code>；签名不变，只改写响应形状。
+// detail 与 message 必须同时填：前者是新口径，后者兼容已发布的旧客户端。
 func writeErr(w http.ResponseWriter, status int, code, msg string) {
-	writeJSON(w, status, apiError{Code: code, Message: msg})
-}
-
-// writeStoreErr 把 store 领域错误映射为 HTTP。
-func writeStoreErr(w http.ResponseWriter, err error) {
-	switch {
-	case errors.Is(err, store.ErrNotFound):
-		writeErr(w, http.StatusNotFound, "not_found", "资源不存在")
-	case errors.Is(err, store.ErrConflict):
-		writeErr(w, http.StatusConflict, "conflict", "资源冲突")
-	case errors.Is(err, store.ErrForbidden):
-		writeErr(w, http.StatusForbidden, "forbidden", "无权操作")
-	default:
-		writeErr(w, http.StatusInternalServerError, "internal", "服务器内部错误")
-	}
-}
-
-// decodeJSON 读取并校验请求体。
-func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
-	if r.ContentLength > 1<<20 { // 1MB 上限
-		writeErr(w, http.StatusRequestEntityTooLarge, "too_large", "请求体过大")
-		return false
-	}
-	dec := json.NewDecoder(r.Body)
-	if err := dec.Decode(v); err != nil {
-		writeErr(w, http.StatusBadRequest, "bad_request", "请求体不是合法 JSON")
-		return false
-	}
-	return true
-}
-
-// pathID 读取路径参数 {id}。
-func pathID(w http.ResponseWriter, r *http.Request, name string) (int64, bool) {
-	raw := r.PathValue(name)
-	id, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || id <= 0 {
-		writeErr(w, http.StatusBadRequest, "bad_request", "路径参数不合法")
-		return 0, false
-	}
-	return id, true
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(problemBody{
+		Type:    "urn:litetalk:error:" + code,
+		Title:   http.StatusText(status),
+		Status:  status,
+		Code:    code,
+		Detail:  msg,
+		Message: msg,
+	})
 }
 
 // clientIP 取客户端 IP：仅当 RemoteAddr 命中可信代理列表时才采用 X-Real-IP。

@@ -15,7 +15,7 @@ import IntroView from './IntroView.vue'
 import { useVoiceStore } from '../stores/voice'
 import { useChatStore } from '../stores/chat'
 import { useAuthStore } from '../stores/auth'
-import { INTRO_ID, useServersStore } from '../stores/data'
+import { INTRO_ID, useFriendsStore, useServersStore } from '../stores/data'
 import { useHotkeys } from '../composables/useHotkeys'
 import { eventsOn } from '../api/bridge'
 
@@ -24,10 +24,14 @@ const voice = useVoiceStore()
 const chat = useChatStore()
 const auth = useAuthStore()
 const servers = useServersStore()
+const friends = useFriendsStore()
 
 const tab = ref<'voice' | 'chat'>('voice')
 const showFriends = ref(true)
-const isIntro = computed(() => servers.currentServerId === INTRO_ID)
+// 没有当前服务器（登录前/列表为空）时同样按介绍页处理：频道栏与舞台都依赖
+// currentServer 的字段，不能在列表为空时渲染。
+const isIntro = computed(() =>
+  servers.currentServerId === INTRO_ID || !servers.currentServer)
 
 const hotkeysActive = computed(() => true)
 useHotkeys(
@@ -56,6 +60,10 @@ let offAuthSession: () => void = () => {}
 onMounted(() => {
   voice.bindEvents()
   chat.bindEvents()
+  // 服务器/频道与好友的事件订阅上提到主壳：data:resync（#78）与 presence:update
+  // 必须在登录后立即生效，不能依赖 FriendList 是否展开（它是可隐藏的子组件）。
+  servers.bindEvents()
+  friends.bindEvents()
   offAuthSession = eventsOn('auth:session', (d) => {
     auth.setSignalOk((d as { ok?: boolean }).ok !== false)
   })
@@ -65,7 +73,7 @@ onMounted(() => {
   servers.initHome().then(() => {
     if (!servers.currentServerId) servers.selectServer(servers.homeId)
   })
-  // 登录态下并入真实服务器列表（REST；内置示例保留作语音演练场）。
+  // 登录态下拉取真实服务器列表（REST）。
   // 失败静默：服务器列表不可用不阻断主界面。
   if (auth.loggedIn) {
     servers.loadRemoteServers().catch(() => {})
@@ -75,15 +83,20 @@ onMounted(() => {
 onUnmounted(() => {
   voice.unbindEvents()
   chat.unbindEvents()
+  servers.unbindEvents()
+  friends.unbindEvents()
   offAuthSession()
 })
 </script>
 
 <template>
-  <!-- 信令未连上（登录后连接失败重试中 / 中途断线）：顶部提示条 -->
-  <div v-if="auth.loggedIn && !auth.signalOk" class="signal-bar" role="status">
+  <!-- 信令未连上（登录后连接失败重试中 / 中途断线）：顶部提示条。
+       服务端主动关闭（sys:shutdown）时改口明示——Go 侧已停重连，
+       继续说「信令连接中」等于骗用户它还会回来。 -->
+  <div v-if="auth.loggedIn && (auth.shutdown || !auth.signalOk)"
+       class="signal-bar" :class="{ steady: !!auth.shutdown }" role="status">
     <WifiOff :size="14" />
-    <span>信令连接中，语音暂不可用</span>
+    <span>{{ auth.shutdown ? '服务端已关闭' : '信令连接中，语音暂不可用' }}</span>
   </div>
   <div class="app">
     <ServerRail />
@@ -139,6 +152,8 @@ onUnmounted(() => {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.72; }
 }
+/* steady 终态（服务端已关闭）：脉冲暗示「正在重试」，这里没有重试可等。 */
+.signal-bar.steady { animation: none; }
 .app {
   flex: 1; min-height: 0;
   display: flex;

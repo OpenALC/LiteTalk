@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=LiteTalk
+Name[zh_CN]=轻音
+Comment=Lightweight voice chat
+Exec=litetalk
+Icon=io.github.openalc.LiteTalk
+Terminal=false
+Categories=AudioVideo;Audio;
+StartupWMClass=io.github.openalc.LiteTalk

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litetalk:signal:channel.join",
+  "title": "ChannelJoinData",
+  "x-wire-type": "channel.join",
+  "x-go-const": "TypeChannelJoin",
+  "x-direction": "C2S",
+  "x-since": 1,
+  "x-namespace": "voice",
+  "description": "加入语音频道。",
+  "type": "object",
+  "properties": {
+    "channel_id": { "type": "string" }
+  },
+  "required": ["channel_id"],
+  "additionalProperties": false
+}

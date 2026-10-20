@@ -7,19 +7,27 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	_ "net/http/pprof" // LITETALK_PPROF 探针用：仅在显式开启时监听回环地址
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/OpenALC/LiteTalk/client/internal/audio"
-	"github.com/OpenALC/LiteTalk/client/internal/config"
-	"github.com/OpenALC/LiteTalk/client/internal/hotkey"
-	"github.com/OpenALC/LiteTalk/client/internal/state"
-	"github.com/OpenALC/LiteTalk/client/internal/tray"
+	"github.com/OpenALC/LiteTalk/client/core/api"
+	"github.com/OpenALC/LiteTalk/client/core/audio"
+	"github.com/OpenALC/LiteTalk/client/core/config"
+	"github.com/OpenALC/LiteTalk/client/core/hotkey"
+	"github.com/OpenALC/LiteTalk/client/core/voice"
+	"github.com/OpenALC/LiteTalk/client/desktop"
+	"github.com/OpenALC/LiteTalk/client/desktop/tray"
 	"github.com/gen2brain/malgo"
 	"github.com/wailsapp/wails/v3/pkg/application"
 	"github.com/wailsapp/wails/v3/pkg/events"
@@ -55,15 +63,23 @@ type App struct {
 	forceQuit atomic.Bool
 
 	// trayReady 托盘图标+菜单就绪标志（tray onReady 置位）。
-	// 托盘不可用时关窗必须放行真正关闭，绝不能隐藏窗口把用户锁死（问题 4a）。
+	// 托盘不可用时关窗退回最小化（保留任务栏/Alt-Tab 恢复路径），
+	// 绝不能隐藏或销毁窗口把用户锁死（问题 4a）。
 	trayReady atomic.Bool
 
-	api  *state.APIClient
-	sess *state.Session // 登录并连接信令后创建
+	api  *api.APIClient
+	sess *voice.Session // 登录并连接信令后创建
 
 	// connMu 串行化 connectSession/disconnectSession：双击登录或登录与游客并发
 	// 时，同一时刻只允许一个活跃会话（旧会话在切换时关闭，不再泄漏双管线）。
 	connMu sync.Mutex
+
+	// retargetMu 串行化服务器切换（SetServerConfig 的落盘+retarget 整段）：
+	// Wails 绑定并发调用，两次保存交错执行两个 retarget 会留下「REST 基址指向 B、
+	// 信令会话连着 A」的撕裂态。独立于 a.mu——retarget 内部要调 startSession 等
+	// 取 a.mu 的路径。锁内含 retarget 的 Me() 预检等网络 I/O：切换原子性优先，
+	// 且保存本就是低频用户操作，串行等待可接受；healthz 探活在锁外（不改共享状态）。
+	retargetMu sync.Mutex
 
 	// loginGen 登录代际：登出/新登录 +1，进行中的信令重试循环发现代际变更即退出。
 	loginGen atomic.Uint64
@@ -75,7 +91,7 @@ type App struct {
 
 	mu         sync.Mutex
 	refreshTok string
-	user       state.UserProfile
+	user       api.UserProfile
 
 	audioCtx *audio.Context // 设备枚举用，惰性创建
 
@@ -96,6 +112,10 @@ type App struct {
 	// 托盘自己的点击会更新，另两条路径改了静音托盘不跟着变）。
 	// setupTray 在 ServiceStartup 里赋值，早于热键 goroutine 启动。
 	trayMute *application.MenuItem
+
+	// emitHook 测试专用的事件观察口（emit 广播前同步回调，生产恒为 nil）。
+	// 事件是跨层唯一可观测输出；没有它，测试只能断言状态副作用、断不到 reason。
+	emitHook func(name string, data any)
 }
 
 // NewApp 创建应用实例
@@ -106,6 +126,14 @@ func NewApp() *App {
 // newAppWithConfig 测试用：注入指定路径的配置管理器。
 func newAppWithConfig(m *config.Manager) *App {
 	return &App{cfg: m}
+}
+
+// newAppAPI 构造 REST 客户端并注入构建版本（#31 升级门，未注入时是 dev）。
+// 抽成函数让测试能验证版本头，不必拉起完整 ServiceStartup。
+func newAppAPI(base string) *api.APIClient {
+	c := api.NewAPIClient(base)
+	c.SetClientVersion(version)
+	return c
 }
 
 // Bind 注入 v3 应用与主窗口引用（main() 在创建窗口后调用，晚于 RegisterService——
@@ -130,7 +158,11 @@ func (a *App) setWindow(w *application.WebviewWindow) {
 }
 
 // emit 向前端广播事件的统一出口：测试环境（wails==nil）空转。
+// emitHook 仅在测试里赋值，同步回调——测试据此断言事件与载荷。
 func (a *App) emit(name string, data any) {
+	if a.emitHook != nil {
+		a.emitHook(name, data)
+	}
 	if a.wails != nil {
 		a.wails.Event.Emit(name, data)
 	}
@@ -138,26 +170,156 @@ func (a *App) emit(name string, data any) {
 
 // initLogging 把全局 log 输出重定向到文件：os.UserConfigDir()/LiteTalk/app.log
 // （与 config.json 同目录）。GUI 子系统无控制台，stdout/stderr 不可见，排障
-// 全依赖此文件；超过 5MB 启动时截断。文件排 MultiWriter 首位——无控制台时
-// stderr 写入会失败并短路 MultiWriter，放前面会吞掉文件写入。
+// 全依赖此文件；5MB × 3 档滚动（issue #10：不再启动截断，超限先滚动）。
+// 文件 0600、目录 0700——日志含令牌/连接细节，同用户外不可读。
+// 用 logFanout 而不是 io.MultiWriter：后者在第一个错误处短路，GUI 下 stderr
+// 写失败会吞掉文件日志，轮转后重新打开失败又会吞掉 stderr。
 func initLogging() {
 	dir, err := os.UserConfigDir()
 	if err != nil {
 		return
 	}
 	logDir := filepath.Join(dir, "LiteTalk")
-	_ = os.MkdirAll(logDir, 0o755)
-	f, err := os.OpenFile(filepath.Join(logDir, "app.log"),
-		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	_ = os.MkdirAll(logDir, 0o700)
+	_ = os.Chmod(logDir, 0o700) // 旧版本 0755 建的目录在此收紧
+	w, err := config.NewRotateWriter(filepath.Join(logDir, "app.log"), 5<<20, 3, 0o600)
 	if err != nil {
 		return
 	}
-	if fi, err := f.Stat(); err == nil && fi.Size() > 5<<20 {
-		_ = f.Truncate(0)
-		_, _ = f.Seek(0, 0)
-	}
-	log.SetOutput(io.MultiWriter(f, os.Stderr))
+	log.SetOutput(logFanout{w, os.Stderr})
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+}
+
+// 运行时内存默认值（#96）。GOMEMLIMIT 是 Go 堆的软上限，不是进程 RSS：
+// Wails/WebView2、cgo 音频缓冲与设备驱动占用都不计入其中。
+// 默认走低 CPU 档：关闭基于堆增长的 GC（等价 GOGC=off），回收仅在堆接近
+// 18MiB 软上限时触发。实测 core 语音全链路 live heap 约 6–12MB，18MiB 留有
+// 余量；上一版 GOGC=50 + 15MiB 压得过低，GC 频繁触发导致 CPU 抖动。
+// 若 live heap 逼近软上限，runtime 会连续强制回收——此时应调高上限或显式设 GOGC。
+const (
+	defaultMemoryLimit = 18 << 20
+
+	// gcKeep：GOGC 已显式设置，保持 runtime 当前值，不覆盖。
+	gcKeep = -1
+	// gcOff：GOGC 未设置，关闭基于堆增长的 GC（SetGCPercent(-1)）。
+	gcOff = -2
+	// memLimitKeep：GOMEMLIMIT 已显式设置，不覆盖。
+	memLimitKeep = -1
+)
+
+// runtimeMemoryPolicy 决定启动时要补的默认值，只看环境变量是否存在、不解析
+// 内容：显式设置的 GOGC/GOMEMLIMIT（含空值和非法值）一律不覆盖，交由 runtime
+// 按自己的规则处理，避免这里与 runtime 的校验规则漂移。
+// 返回的 gcPercent：非负数为 GOGC 百分比，gcOff 表示关闭，gcKeep 表示保持；
+// memLimit：>0 为字节软上限，memLimitKeep 表示不覆盖。
+func runtimeMemoryPolicy(lookupEnv func(string) (string, bool)) (gcPercent int, memLimit int64) {
+	gcPercent, memLimit = gcOff, defaultMemoryLimit
+	if _, ok := lookupEnv("GOGC"); ok {
+		gcPercent = gcKeep
+	}
+	if _, ok := lookupEnv("GOMEMLIMIT"); ok {
+		memLimit = memLimitKeep
+	}
+	return gcPercent, memLimit
+}
+
+// applyRuntimeMemoryDefaults 补齐未显式设置的内存策略，返回写进 app.log 的
+// 生效值描述。SetGCPercent/SetMemoryLimit 是进程级全局状态，ServiceStartup
+// 早于会话与音频初始化，调用一次即覆盖整个进程生命周期。
+func applyRuntimeMemoryDefaults() string {
+	gcPercent, memLimit := runtimeMemoryPolicy(os.LookupEnv)
+	switch gcPercent {
+	case gcOff:
+		debug.SetGCPercent(-1) // 关闭基于堆增长的 GC，回收交给软上限
+	case gcKeep:
+		// 显式 GOGC 已由 runtime 在启动时处理，不再覆盖
+	default:
+		debug.SetGCPercent(gcPercent)
+	}
+	if memLimit > 0 {
+		debug.SetMemoryLimit(memLimit)
+	}
+	return formatRuntimeMemoryLog(os.LookupEnv)
+}
+
+// formatRuntimeMemoryLog 生成生效值描述：显式设置时打印环境变量原值，未设置
+// 时打印默认值。与 apply 分离，测试格式化不会改测试进程的全局 GC 状态。
+func formatRuntimeMemoryLog(lookupEnv func(string) (string, bool)) string {
+	gogc := "off"
+	if v, ok := lookupEnv("GOGC"); ok {
+		gogc = v
+	}
+	limit := strconv.FormatInt(defaultMemoryLimit, 10)
+	if v, ok := lookupEnv("GOMEMLIMIT"); ok {
+		limit = v
+	}
+	return fmt.Sprintf("runtime memory: GOGC=%s GOMEMLIMIT=%s", gogc, limit)
+}
+
+// startPprofIfEnabled 按 LITETALK_PPROF 启动本地诊断端口，默认关闭。
+// pprof 无鉴权且会暴露堆栈/命令行，只接受回环地址；非法或非回环值直接拒绝
+// 并留日志。未设置环境变量时不监听、不起额外 goroutine。
+func startPprofIfEnabled() {
+	raw := os.Getenv("LITETALK_PPROF")
+	if raw == "" {
+		return
+	}
+	addr, ok := parsePprofAddr(raw)
+	if !ok {
+		log.Printf("pprof: 忽略 LITETALK_PPROF=%q（只接受回环 host:port）", raw)
+		return
+	}
+	go func() {
+		log.Printf("pprof: 仅本地诊断，监听 http://%s/debug/pprof/", addr)
+		if err := http.ListenAndServe(addr, nil); err != nil {
+			log.Printf("pprof: 监听失败: %v", err)
+		}
+	}()
+}
+
+// parsePprofAddr 校验 LITETALK_PPROF 的值：必须是 host:port，host 只能是
+// 回环地址，port 必须是 1–65535 的数字。空 host（":6060"）会监听所有网卡，
+// 一律拒绝。合法时原样返回交给 ListenAndServe。
+func parsePprofAddr(raw string) (string, bool) {
+	host, port, err := net.SplitHostPort(raw)
+	if err != nil || host == "" {
+		return "", false
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+		return "", false
+	}
+	if host == "localhost" {
+		return raw, true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return "", false
+	}
+	return raw, true
+}
+
+// logFanout 向所有目标写入同一条日志，单个目标失败不短路其余目标。
+// stderr 与轮转文件任一不可用，另一侧仍能留下排障线索。
+type logFanout []io.Writer
+
+func (f logFanout) Write(p []byte) (int, error) {
+	var firstErr error
+	written := false
+	for _, w := range f {
+		if _, err := w.Write(p); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		written = true
+	}
+	if !written {
+		return 0, firstErr
+	}
+	// 至少一个目标成功即视为日志已写出；部分失败没有有意义的返回值，
+	// 全部失败才向上报错。
+	return len(p), nil
 }
 
 // LogFromWeb 前端 console/异常转发入口（前端 main.ts 拦截 console.*、
@@ -175,9 +337,12 @@ func (a *App) LogFromWeb(level, msg string) {
 // 托盘使用 v3 内建 SystemTray（替代 v2 getlantern/systray）；创建后由 Run 统一拉起。
 func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) error {
 	initLogging()
+	// 内存策略在会话/音频/托盘初始化前生效；显式环境变量优先，日志落 app.log。
+	log.Print(applyRuntimeMemoryDefaults())
+	startPprofIfEnabled()
 	log.Printf("=== LiteTalk %s 启动 (pid=%d) ===", version, os.Getpid())
 	r := a.cfg.Resolve()
-	a.api = state.NewAPIClient(r.BaseURL)
+	a.api = newAppAPI(r.BaseURL)
 	// 401 自动刷新重试的令牌来源与回写：refresh_token 存 app 层（区分持久化
 	// 策略——游客落盘 config.json），旋转后的新令牌对经回调回传。
 	a.api.SetRefreshSource(func(ctx context.Context) (string, error) {
@@ -185,7 +350,7 @@ func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) 
 		defer a.mu.Unlock()
 		return a.refreshTok, nil
 	})
-	a.api.SetOnRefreshed(func(t state.AuthTokens) {
+	a.api.SetOnRefreshed(func(t api.AuthTokens) {
 		a.mu.Lock()
 		a.refreshTok = t.RefreshToken
 		isGuest := a.user.IsGuest
@@ -196,6 +361,9 @@ func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) 
 	})
 	a.setupTray()
 	a.startHotkeys()
+	// 机密存储模式推一次给前端（契约 §0.6 sys:secret）：回落明文文件存储必须
+	// 让 UI 可感知，不能静默降级。前端也可能主动调 SecretStorageMode 补拉。
+	a.emit("sys:secret", SecretModeEvent{Mode: config.SecretMode()})
 	return nil
 }
 
@@ -206,6 +374,11 @@ func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) 
 func (a *App) setupTray() {
 	t := a.wails.SystemTray.New()
 	t.SetIcon(tray.IconForRuntime()).SetTooltip("轻音 LiteTalk")
+	// 左键单击托盘 = 显示主界面（与 Windows 行为一致；v3 SystemTray 的点击回调
+	// 两平台共用同一路径，Linux StatusNotifierItem 同样可达）。
+	t.OnClick(func() {
+		a.showFromTray()
+	})
 
 	menu := a.wails.Menu.New()
 	showItem := menu.Add("显示主界面")
@@ -236,12 +409,12 @@ func (a *App) setupTray() {
 
 	t.SetMenu(menu)
 	// Linux 桌面可能没有托盘宿主（GNOME 未装 AppIndicator 扩展）：图标
-	// 不会出现，此时关窗若仍隐藏就等于把应用藏丢。按实际可用性置位，
-	// 不可用则关窗语义由 interceptClose/closeToTrayOrQuit 回落为退出。
+	// 不会出现，此时关窗不能隐藏/销毁（没有恢复入口），由
+	// interceptClose/closeToTrayOrQuit 退回最小化，保留任务栏/Alt-Tab。
 	if available := tray.Available(); available {
 		a.trayReady.Store(true)
 	} else {
-		log.Printf("托盘不可用（无 StatusNotifierWatcher），关窗将退出程序")
+		log.Printf("托盘不可用（无 StatusNotifierWatcher），关窗将最小化窗口")
 	}
 }
 
@@ -301,14 +474,18 @@ func (a *App) showFromTray() {
 			Title:            "轻音 LiteTalk",
 			Width:            1080,
 			Height:           680,
-			MinWidth:         1080,
-			MinHeight:        680,
+			MinWidth:         960,
+			MinHeight:        600,
 			Frameless:        true,
 			BackgroundColour: application.NewRGB(255, 255, 255),
 			Hidden:           true, // 先隐藏创建，恢复最大化态后再 Show，避免闪烁
 		}
 		if a.savedBounds != nil && a.savedBounds.Width > 0 {
-			opts.X, opts.Y = a.savedBounds.X, a.savedBounds.Y
+			// Wayland 协议不允许应用定位窗口（坐标写入被忽略或告警）：只记忆尺寸，
+			// 不写 X/Y，改由 Focus 前置（见下方 show 分支）。X11/Windows 保留完整位置记忆。
+			if !desktop.IsWaylandSession() {
+				opts.X, opts.Y = a.savedBounds.X, a.savedBounds.Y
+			}
 			opts.Width, opts.Height = a.savedBounds.Width, a.savedBounds.Height
 		}
 		win = a.buildWindow(opts)
@@ -329,6 +506,10 @@ func (a *App) showFromTray() {
 	if win.IsMinimised() {
 		win.Restore()
 	}
+	// Wayland 无坐标可用，靠 Focus 抢输入焦点完成前置（X11/Windows 由坐标记忆保证位置）。
+	if desktop.IsWaylandSession() {
+		win.Focus()
+	}
 	a.emit("sys:wake", nil)
 }
 
@@ -343,7 +524,7 @@ func (a *App) emitHibernate() {
 }
 
 // interceptClose 拦截窗口关闭（v3 WindowClosing Hook，替代 v2 OnBeforeClose）：
-// 返回 true = 已拦截（隐藏到托盘或销毁渲染进程），false = 放行真正关闭。
+// 返回 true = 已拦截（最小化、隐藏到托盘或销毁渲染进程），false = 放行真正关闭。
 // 实际语义收敛在 closeToTrayOrQuit，与 WindowClose（前端标题栏按钮）共用；
 // 本函数只叠加 OS 关窗钩子特有的放行条件：
 //   - recreating（程序化销毁渲染进程，里程碑②）→ 放行
@@ -361,28 +542,58 @@ func (a *App) interceptClose() bool {
 	return a.closeToTrayOrQuit()
 }
 
+// closeAction 关窗动作。决策与执行分离，决策是纯函数以便穷举组合测试。
+type closeAction int
+
+const (
+	closeActionQuit     closeAction = iota // 退出程序
+	closeActionMinimise                    // 最小化窗口（托盘不可用时的唯一安全出口）
+	closeActionTray                        // 隐藏到托盘 + 按休眠模式卸载界面
+	closeActionDestroy                     // 销毁渲染进程（destroy 休眠模式）
+)
+
+// closeActionFor 关窗决策表（顺序即优先级）：
+//  1. 托盘不可用 → 最小化。隐藏/销毁都没有恢复入口，退出又违背用户预期；
+//     最小化保留任务栏与 Alt-Tab，重启托盘宿主后仍可正常使用。
+//  2. 托盘可用 + destroy 休眠模式 → 销毁渲染进程（内存释放最彻底，可由托盘重建）。
+//  3. 托盘可用 + 用户设置「关闭窗口时=退出程序」→ 退出。
+//  4. 其余 → 隐藏到托盘，hibernate 模式同步卸载界面。
+func closeActionFor(hibernateMode string, trayReady, closeToTray bool) closeAction {
+	if !trayReady {
+		return closeActionMinimise
+	}
+	if hibernateMode == "destroy" {
+		return closeActionDestroy
+	}
+	if !closeToTray {
+		return closeActionQuit
+	}
+	return closeActionTray
+}
+
 // closeToTrayOrQuit 关窗语义的唯一实现（interceptClose 与 WindowClose 共用，
-// 两条入口行为必然一致）：
-//   - destroy 休眠模式 → 销毁渲染进程替代隐藏（内存释放更彻底）
-//   - 托盘不可用或用户设置「关闭窗口时=退出程序」→ 显式 Quit
-//   - 其余 → 隐藏到托盘 + hibernate 模式同步卸载界面
-//
-// 返回 true 表示已处理且窗口仍在（Hook 侧需 Cancel 关闭），false 表示正在退出。
+// 两条入口行为必然一致）；决策见 closeActionFor。返回 true 表示已处理且窗口
+// 仍在（Hook 侧需 Cancel 关闭），false 表示正在退出。
 func (a *App) closeToTrayOrQuit() bool {
-	if a.cfg.HibernateMode() == "destroy" {
+	switch closeActionFor(a.cfg.HibernateMode(), a.trayReady.Load(), a.cfg.CloseToTray()) {
+	case closeActionDestroy:
 		a.destroyRenderProcess()
 		return true
-	}
-	if !a.trayReady.Load() || !a.cfg.CloseToTray() {
-		// 托盘不可用：隐藏后无任何恢复路径；或用户明确设置关闭即退出。
+	case closeActionMinimise:
+		if win := a.getWindow(); win != nil {
+			win.Minimise()
+		}
+		return true
+	case closeActionTray:
+		if win := a.getWindow(); win != nil {
+			win.Hide()
+		}
+		a.emitHibernate()
+		return true
+	default: // closeActionQuit
 		a.quitAfterClose()
 		return false
 	}
-	if win := a.getWindow(); win != nil {
-		win.Hide()
-	}
-	a.emitHibernate()
-	return true
 }
 
 // quitAfterClose 在窗口关闭完成后退出进程。窗口关闭是异步的（Hook 经 channel
@@ -426,13 +637,15 @@ type SavedCredentialsView struct {
 	Saved    bool   `json:"saved"`
 }
 
-// GetSavedCredentials 读取记住的登录凭据（密码经 DPAPI 解密）。
+// GetSavedCredentials 读取记住的登录凭据（密码由平台实现解密：Windows DPAPI /
+// Linux keyring）。
 func (a *App) GetSavedCredentials() SavedCredentialsView {
 	c := a.cfg.GetSavedCredentials()
 	return SavedCredentialsView{Email: c.Email, Password: c.Password, Saved: c.Saved}
 }
 
-// SetSavedCredentials 保存登录凭据（邮箱明文 + 密码 DPAPI 加密）。
+// SetSavedCredentials 保存登录凭据（邮箱明文；密码 Windows DPAPI / Linux keyring，
+// keyring 不可用时不保存密码）。
 func (a *App) SetSavedCredentials(email, password string) {
 	_ = a.cfg.SetSavedCredentials(email, password)
 }
@@ -440,6 +653,17 @@ func (a *App) SetSavedCredentials(email, password string) {
 // ClearSavedCredentials 清除记住的凭据。
 func (a *App) ClearSavedCredentials() {
 	_ = a.cfg.ClearSavedCredentials()
+}
+
+// SecretModeEvent sys:secret 事件载荷（契约 §0.6）。
+type SecretModeEvent struct {
+	Mode string `json:"mode"` // keyring / file / dpapi
+}
+
+// SecretStorageMode 当前机密存储模式（keyring / file / dpapi）。
+// Linux 回落明文文件存储时前端需明示提示，不静默降级（issue #8）。
+func (a *App) SecretStorageMode() string {
+	return config.SecretMode()
 }
 
 // ---------- 窗口控制（自定义标题栏调用） ----------
@@ -465,8 +689,8 @@ func (a *App) WindowMaximize() {
 }
 
 // WindowClose 关闭。前端自定义标题栏按钮调用，与 OS 关窗（interceptClose）
-// 共用 closeToTrayOrQuit：destroy 模式销毁渲染进程；否则按「关闭窗口时」设置
-// 与托盘可用性决定隐藏入托盘或退出程序（v2 语义曾无条件隐藏，设置不生效）。
+// 共用 closeToTrayOrQuit：托盘不可用则最小化；托盘可用时按休眠模式与
+// 「关闭窗口时」设置决定销毁渲染进程、隐藏入托盘或退出程序。
 func (a *App) WindowClose() {
 	a.closeToTrayOrQuit()
 }
@@ -508,16 +732,147 @@ func (a *App) GetServerConfig() *ServerConfigView {
 	return &ServerConfigView{BaseURL: r.BaseURL, WSURL: r.WSURL, Source: string(r.Source)}
 }
 
-// SetServerConfig 保存服务器地址（WS 自动推导：https→wss、http→ws，末尾补 /ws）。
-// 重启后生效——运行中热切换信令/REST 连接成本高，不做即时切换。
+// sameOrigin 判断两个基址是否同源（scheme + host + port 全同）。
+// scheme/host 大小写不敏感；缺省端口按 scheme 归一化（http/ws→80、https/wss→443），
+// 因此 http://a 与 http://a:80/ 同源。基址里的 path 不参与比较。
+func sameOrigin(a, b string) bool {
+	ua, err := url.Parse(strings.TrimSpace(a))
+	if err != nil || ua.Host == "" {
+		return false
+	}
+	ub, err := url.Parse(strings.TrimSpace(b))
+	if err != nil || ub.Host == "" {
+		return false
+	}
+	if !strings.EqualFold(ua.Scheme, ub.Scheme) || !strings.EqualFold(ua.Hostname(), ub.Hostname()) {
+		return false
+	}
+	return effectivePort(ua) == effectivePort(ub)
+}
+
+// effectivePort 返回 URL 的有效端口：显式端口优先，否则按 scheme 的默认端口。
+func effectivePort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "ws":
+		return "80"
+	case "https", "wss":
+		return "443"
+	}
+	return ""
+}
+
+// SetServerConfig 保存服务器地址并热切换（WS 自动推导：https→wss、http→ws，末尾补 /ws）。
+// 流程：校验 → healthz 探活 → 落盘 → 重定向 REST/信令到新地址 →
+// 同 origin 时用当前令牌重建信令会话；跨 origin 时清空会话回登录页（见 retarget）。
+// 探活失败保持原地址不动，返回错误给前端提示。
 func (a *App) SetServerConfig(baseURL string) error {
 	if err := config.ValidateBase(baseURL); err != nil {
 		return err
 	}
-	return a.cfg.Update(func(c *config.Config) error {
+	// 先探活再落盘：不通的新地址不写盘，运行中状态不受影响。探活在锁外：
+	// 只读探测、不改共享状态，并发保存各自探活即可。
+	r := a.TestServerConnection(baseURL)
+	if !r.OK {
+		return fmt.Errorf("切换失败，已恢复原地址: %s", r.ErrorMsg)
+	}
+	// 落盘 + retarget 整段原子：交错的 retarget 会留下 REST 基址与信令会话
+	// 分属两台服务器的撕裂态（双击保存即可触发）。
+	a.retargetMu.Lock()
+	defer a.retargetMu.Unlock()
+	old := a.cfg.Resolve()
+	if err := a.cfg.Update(func(c *config.Config) error {
 		c.ServerBase = baseURL
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	cur := a.cfg.Resolve()
+	// env 覆盖时 Resolve 结果不变（LITETALK_API 优先于 config.json）：无变化不折腾会话。
+	if cur.BaseURL == old.BaseURL && cur.WSURL == old.WSURL {
+		return nil
+	}
+	a.retarget(cur.BaseURL)
+	return nil
+}
+
+// retarget 把 REST 基址切到新地址并重建信令会话（热切换核心）。
+// 同 origin（仅 path 变化）令牌仍属同一服务端，可做 Me() 预检后重连；
+// 跨 origin 时旧服务器的 access/refresh 一律不发给新地址——预检本身就是泄露面
+// （#17），改为清会话直接回登录页。调用方须持 retargetMu——与落盘合成一个
+// 原子切换，防并发保存交错。
+func (a *App) retarget(baseURL string) {
+	if a.api == nil {
+		return // 测试环境未初始化 API 客户端，跳过
+	}
+	if !sameOrigin(a.api.Base(), baseURL) {
+		// 跨 origin：先停重试与旧会话，原子切换基址并清 access token，再清 app 层
+		// 登录态。
+		//   - loginGen+1 放最前：配置已落盘，旧 startSession 的重试循环下一跳会按
+		//     新地址解析 WS，必须尽快停掉。
+		//   - refresh_token 切换前后各清一次：切换前那次保证新基址上的 401 拿不到
+		//     旧 refresh_token；SetBaseAndClearToken 的写锁会等在飞刷新「复查+安装+
+		//     onRefreshed」读锁段结束，切换后那次抹掉它可能刚回写的令牌。
+		//   - 落盘游客令牌属于旧服务器，无条件作废——否则下次 LoginAsGuest 会把
+		//     它发给新服务器，绕开这里的所有清理。
+		// 在飞请求无法撤销（api.SetBase 的语义是自然结束于旧地址）；刷新请求本身
+		// 钉在请求创建时的 base 快照上，基址已变时结果被丢弃（见 doRefresh）。
+		a.loginGen.Add(1)
+		a.disconnectSession()
+		a.mu.Lock()
+		a.refreshTok = ""
+		a.mu.Unlock()
+		a.api.SetBaseAndClearToken(baseURL)
+		a.mu.Lock()
+		a.refreshTok = ""
+		a.user = api.UserProfile{}
+		a.mu.Unlock()
+		_ = a.cfg.SetGuestRefresh("")
+		// 复用 auth:kicked 让前端走 logout → 登录页（现有唯一回登录页机制）。
+		// 前端随后的 Logout() 因令牌已空，不会向新服务器发 /auth/logout。
+		a.emit("auth:kicked", map[string]any{"reason": "server_changed"})
+		return
+	}
+	a.api.SetBase(baseURL)
+	a.mu.Lock()
+	token := a.api.Token()
+	nickname := a.user.Nickname
+	loggedIn := a.user.ID != 0
+	a.mu.Unlock()
+	// 停旧会话与退避重试（loginGen+1），避免旧地址的重试循环赖着不走。
+	a.loginGen.Add(1)
+	a.disconnectSession()
+	if !loggedIn || token == "" {
+		a.emit("auth:session", map[string]any{"ok": false})
+		return
+	}
+	// 令牌兼容性预检：同 origin 下令牌本就属于该服务端，401 自动刷新不会跨服泄露；
+	// Me() 能通就重连信令，401（含刷新失败）才清会话回登录态。
+	if _, err := a.api.Me(); err != nil {
+		var ae *api.APIError
+		if errors.As(err, &ae) && ae.Status == http.StatusUnauthorized {
+			log.Printf("server switch: token rejected by new server: %v", err)
+			a.mu.Lock()
+			a.refreshTok = ""
+			isGuest := a.user.IsGuest
+			a.user = api.UserProfile{}
+			a.mu.Unlock()
+			// 清 access token：换服后旧令牌不被接受，残留会让 GetMe 把用户
+			// 「登回」到一个无信令连接的僵尸会话。
+			a.api.SetToken("")
+			if isGuest {
+				_ = a.cfg.SetGuestRefresh("")
+			}
+			// 复用 auth:kicked 让前端走 logout → 登录页（现有唯一回登录页机制）。
+			a.emit("auth:kicked", map[string]any{"reason": "server_changed"})
+			return
+		}
+		// 非 401（网络抖动等）：继续尝试连接信令，交给 startSession 的重试兜底。
+		log.Printf("server switch: me check: %v（继续尝试信令连接）", err)
+	}
+	a.startSession(token, nickname)
 }
 
 // ConnTestResult 连通性测试结果。
@@ -558,7 +913,7 @@ func (a *App) TestServerConnection(baseURL string) *ConnTestResult {
 // ---------- 认证（转发 REST，§5.4） ----------
 
 // GetAuthConfig 获取服务端 Auth 模式与发信配置（前端适配 UI 用）。
-func (a *App) GetAuthConfig() (*state.ServerConfig, error) {
+func (a *App) GetAuthConfig() (*api.ServerConfig, error) {
 	return a.api.GetServerConfig()
 }
 
@@ -569,7 +924,7 @@ func (a *App) SendEmailCode(email, purpose string) error {
 
 // Login 邮箱密码登录。成功后连接信令（SessionOK 报告信令是否连上，
 // false 时后台带退避重试，期间前端显示「信令连接中」提示条）。
-func (a *App) Login(email, password string) (*state.AuthResult, error) {
+func (a *App) Login(email, password string) (*api.AuthResult, error) {
 	r, err := a.api.Login(email, password)
 	if err != nil {
 		return nil, err
@@ -582,9 +937,9 @@ func (a *App) Login(email, password string) (*state.AuthResult, error) {
 	return r, nil
 }
 
-// Register 注册并自动登录。
-func (a *App) Register(nickname, email, password, code string) (*state.AuthResult, error) {
-	r, err := a.api.Register(nickname, email, password, code)
+// Register 注册并自动登录。bootstrap 为可选管理员邀请码（#27，空=不使用）。
+func (a *App) Register(nickname, email, password, code, bootstrap string) (*api.AuthResult, error) {
+	r, err := a.api.Register(nickname, email, password, code, bootstrap)
 	if err != nil {
 		return nil, err
 	}
@@ -601,7 +956,7 @@ func (a *App) Register(nickname, email, password, code string) (*state.AuthResul
 // 旧实现 refresh 成功但 Me() 失败会清令牌新建游客——旧身份/好友全丢（S6）；
 // 现在：refresh 响应自带 user 直接用（不带才 Me），令牌先落盘，
 // 只有明确 401 才清令牌，网络错误保留已存令牌下次启动续试。
-func (a *App) LoginAsGuest() (*state.AuthResult, error) {
+func (a *App) LoginAsGuest() (*api.AuthResult, error) {
 	if saved := a.cfg.GetGuestRefresh(); saved != "" {
 		t, err := a.api.Refresh(saved)
 		if err == nil {
@@ -623,12 +978,12 @@ func (a *App) LoginAsGuest() (*state.AuthResult, error) {
 			a.user = *u
 			a.mu.Unlock()
 			ok := a.startSession(t.AccessToken, u.Nickname)
-			return &state.AuthResult{
+			return &api.AuthResult{
 				AccessToken: t.AccessToken, RefreshToken: t.RefreshToken,
 				User: *u, SessionOK: ok,
 			}, nil
 		}
-		var ae *state.APIError
+		var ae *api.APIError
 		if errors.As(err, &ae) && ae.Status == http.StatusUnauthorized {
 			_ = a.cfg.SetGuestRefresh("") // 明确失效（过期/被吊销/服务端迁移）才清
 		} else {
@@ -654,18 +1009,24 @@ func (a *App) ResetPassword(email, code, newPassword string) error {
 	return a.api.ResetPassword(email, code, newPassword)
 }
 
-// Logout 注销：断信令、吊销 refresh。
+// Logout 注销：断信令、吊销 refresh，清空本地用户档案。
 func (a *App) Logout() error {
 	a.loginGen.Add(1) // 使进行中的信令重试循环退出
 	a.mu.Lock()
 	rt := a.refreshTok
 	a.refreshTok = ""
+	a.user = api.UserProfile{} // 清档案，否则 GetMe 仍返回旧用户
 	a.mu.Unlock()
 	a.disconnectSession()
+	var err error
 	if rt != "" {
-		return a.api.Logout(rt)
+		// 吊销请求要带 Bearer，故不能先清 access token。
+		err = a.api.Logout(rt)
 	}
-	return nil
+	// 无条件清 access token：GetMe 在 user 为空时回落 a.api.Me()，残留有效
+	// 令牌会把已登出的用户「登回来」（被踢后 rt 已空、api.Logout 根本不走）。
+	a.api.SetToken("")
+	return err
 }
 
 // onKicked 被服务端踢下线（同类设备在其他设备登录，契约 §0.5/§0.6）：
@@ -690,7 +1051,7 @@ func (a *App) onKicked(reason string) {
 }
 
 // GetMe 当前用户档案。
-func (a *App) GetMe() (*state.UserProfile, error) {
+func (a *App) GetMe() (*api.UserProfile, error) {
 	a.mu.Lock()
 	u := a.user
 	a.mu.Unlock()
@@ -869,10 +1230,10 @@ func (a *App) connectSession(token, nickname string, gen uint64) error {
 // connectSessionLocked 前提：已持 connMu。
 func (a *App) connectSessionLocked(token, nickname string) error {
 	a.disconnectSessionLocked()
-	ev := state.Events{
-		OnPeerJoin: func(userID, nickname string, speaking, mute, deafen bool) {
+	ev := voice.Events{
+		OnPeerJoin: func(userID, nickname, tag string, speaking, mute, deafen bool) {
 			a.emit("voice:peer-join", map[string]any{
-				"user_id": userID, "nickname": nickname,
+				"user_id": userID, "nickname": nickname, "tag": tag,
 				"speaking": speaking, "mute": mute, "deafen": deafen,
 			})
 		},
@@ -904,8 +1265,8 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 				"mute": mute != nil && *mute, "deafen": deafen != nil && *deafen,
 			})
 		},
-		// 媒体管线初始化失败（如 Linux 缺 Opus）：音频不可用但信令已连，
-		// 前端 toast 明确提示，JoinChannel 会返回同因错误。
+		// 媒体不可用（管线初始化失败，或入房后采集/播放启动失败，#80）：
+		// 音频不可用但信令已连，前端 toast 明确提示，JoinChannel 会返回同因错误。
 		OnVoiceUnavailable: func(errMsg string) {
 			a.emit("voice:unavailable", map[string]string{"error": errMsg})
 		},
@@ -920,9 +1281,38 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 		OnVoiceTaken: func() {
 			a.emit("voice:taken", nil)
 		},
+		// 好友在线状态变化（presence.update，#11）：转给前端刷好友状态点。
+		OnPresenceUpdate: func(userID string, online bool) {
+			a.emit("presence:update", map[string]any{"user_id": userID, "online": online})
+		},
+		// 服务端优雅关闭（server.shutdown，#21）：前端提示「服务端已关闭」；
+		// 停止自动重连在 Session 侧已异步处理。
+		OnServerShutdown: func(reason string) {
+			a.emit("sys:shutdown", map[string]any{"reason": reason})
+		},
+		// ICE 失败重建（rtc.failed，#19）：Go 侧已销毁 PC 并重发 join，前端仅
+		// 提示语音链路重建中。回调跑在 ws 读循环 goroutine，不得同步断开会话。
+		OnRTCFailed: func(channelID string) {
+			a.emit("rtc:failed", map[string]any{"channel_id": channelID})
+		},
+		// 进房被服务端拒绝（#91）：Session 已回滚房间态（InRoom=false，重连不
+		// 再重发 join）。前端据 voice:join_failed 清掉 channelId/延迟并提示。
+		// 同一次失败不再走 chat:error（见 ErrorHandlerEx）。
+		OnJoinFailed: func(channelID, code, message string) {
+			a.emit("voice:join_failed", map[string]string{
+				"channel_id": channelID, "code": code, "message": message,
+			})
+		},
+		// 续传补拉完成（#32/#78）：消息与好友在线态已由 Session 内部回灌，
+		// 服务器/频道等 REST 视图可能已过期。事件名固定 data:resync，只做提示，
+		// 前端收到后自行经绑定刷新（data/friends store 各自订阅）。
+		// Session 跑在独立 goroutine，emit 与其它语音事件同用法。
+		OnResync: func() {
+			a.emit("data:resync", nil)
+		},
 	}
 	server := a.cfg.Resolve().WSURL
-	sess := state.NewSession(a.api, token, nickname, ev, log.Default())
+	sess := voice.NewSession(a.api, token, nickname, ev, log.Default())
 	// 按键说话发送门：App 级长期存活的同一个 Gate，重连不换（PTT 按住状态不丢）。
 	sess.SetSendGate(a.hkGate)
 	sess.Connect(server) // 音频降级不阻塞：Connect 不再整体失败
@@ -937,14 +1327,19 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 			log.Printf("apply audio devices: %v", err)
 		}
 	}
-	sess.ChatHandler(func(channelID, msgID, userID, nick, content, ts string) {
+	sess.ChatHandler(func(channelID, msgID, userID, nick, content, ts, nonce string) {
 		a.emit("chat:message", map[string]string{
 			"id": msgID, "channel_id": channelID, "user_id": userID,
-			"nickname": nick, "content": content, "ts": ts,
+			"nickname": nick, "content": content, "ts": ts, "nonce": nonce,
 		})
 	})
 	// 服务端 error 帧转发前端（B1：此前未订阅，服务端拒收时消息凭空消失）。
-	sess.ErrorHandler(func(code, message string) {
+	// 已归属进房路径的错误（#91）由 voice:join_failed 承载，这里跳过以免同一次
+	// 失败弹两条提示。
+	sess.ErrorHandlerEx(func(code, message string, joinHandled bool) {
+		if joinHandled {
+			return
+		}
 		a.emit("chat:error", map[string]string{
 			"code": code, "message": message,
 		})
@@ -1052,61 +1447,87 @@ func (a *App) SetDeafen(deafened bool) {
 }
 
 // ---------- 服务器 / 频道 / 好友（REST CRUD） ----------
-// 以下方法直接代理 state.APIClient；令牌已由登录/注册/游客/刷新路径注入。
+// 以下方法直接代理 api.APIClient；令牌已由登录/注册/游客/刷新路径注入。
 
 // ListServers 列出当前用户加入的服务器。
-func (a *App) ListServers() ([]state.ServerDTO, error) {
+func (a *App) ListServers() ([]api.ServerDTO, error) {
 	return a.api.ListServers()
 }
 
+// ListChannels 列出服务器的分类与频道（成员可读）；重启后频道列表恢复用。
+// ID 参数一律十进制字符串（#31：Snowflake 超出 JS Number 精度，桥上不用数字）。
+func (a *App) ListChannels(serverID string) (*api.ServerChannels, error) {
+	return a.api.ListChannels(serverID)
+}
+
 // CreateServer 创建服务器（名称为唯一必填项）。
-func (a *App) CreateServer(name string) (*state.ServerDTO, error) {
+func (a *App) CreateServer(name string) (*api.ServerDTO, error) {
 	return a.api.CreateServer(name)
 }
 
 // JoinServerByCode 凭邀请码加入服务器。
-func (a *App) JoinServerByCode(code string) (*state.ServerDTO, error) {
+func (a *App) JoinServerByCode(code string) (*api.ServerDTO, error) {
 	return a.api.JoinServer(code)
 }
 
 // RenameServer 重命名服务器（owner/admin）。
-func (a *App) RenameServer(id int64, name string) error {
+func (a *App) RenameServer(id string, name string) error {
 	return a.api.RenameServer(id, name)
 }
 
 // DeleteServer 删除服务器（仅 owner）。
-func (a *App) DeleteServer(id int64) error {
+func (a *App) DeleteServer(id string) error {
 	return a.api.DeleteServer(id)
 }
 
 // CreateInviteCode 为服务器生成邀请码（admin 及以上），返回纯 code。
-func (a *App) CreateInviteCode(serverID int64) (string, error) {
+func (a *App) CreateInviteCode(serverID string) (string, error) {
 	return a.api.CreateInvite(serverID)
 }
 
-// CreateChannel 新建频道（typ: text / voice）。
-func (a *App) CreateChannel(serverID int64, name, typ string) (*state.ChannelDTO, error) {
-	return a.api.CreateChannel(serverID, name, typ)
+// CreateChannel 新建频道（typ: text / voice；categoryID 空串/「0」= 不归类）。
+func (a *App) CreateChannel(serverID string, name, typ string, categoryID string) (*api.ChannelDTO, error) {
+	return a.api.CreateChannel(serverID, name, typ, categoryID)
 }
 
 // RenameChannel 重命名频道（owner/admin）。
-func (a *App) RenameChannel(id int64, name string) error {
+func (a *App) RenameChannel(id string, name string) error {
 	return a.api.RenameChannel(id, name)
 }
 
 // DeleteChannel 删除频道（owner/admin）。
-func (a *App) DeleteChannel(id int64) error {
+func (a *App) DeleteChannel(id string) error {
 	return a.api.DeleteChannel(id)
 }
 
 // CreateCategory 创建频道分类（owner/admin；1–32 字）。
-func (a *App) CreateCategory(serverID int64, name string) (*state.CategoryDTO, error) {
+func (a *App) CreateCategory(serverID string, name string) (*api.CategoryDTO, error) {
 	return a.api.CreateCategory(serverID, name)
 }
 
 // DeleteCategory 删除分类；withChannels=true 级联删除其下频道（服务端单事务）。
-func (a *App) DeleteCategory(id int64, withChannels bool) error {
+func (a *App) DeleteCategory(id string, withChannels bool) error {
 	return a.api.DeleteCategory(id, withChannels)
+}
+
+// RenameCategory 重命名分类（owner/admin；1–32 字）。
+func (a *App) RenameCategory(id string, name string) error {
+	return a.api.RenameCategory(id, name)
+}
+
+// UpdateCategory 改分类名/位置（owner/admin）。Wails 绑定不用指针参数：
+// name 为空串表示不改名，position < 0 表示不改位置；position 为目标序（0-based），
+// 服务端移到此位置并重排同服务器其它分类为 0..n-1。
+func (a *App) UpdateCategory(id string, name string, position int) (*api.CategoryDTO, error) {
+	var n *string
+	if name != "" {
+		n = &name
+	}
+	var p *int
+	if position >= 0 {
+		p = &position
+	}
+	return a.api.UpdateCategory(id, n, p)
 }
 
 // SendFriendRequest 发送好友请求（target 形如 "昵称#1234"）。
@@ -1117,16 +1538,16 @@ func (a *App) SendFriendRequest(target string) error {
 // ---------- 好友管理（v0.1.2：接真实 REST，替换前端 mock） ----------
 
 // ListFriends 好友关系全量（accepted 分在线/离线由前端按 user.status 归组）。
-func (a *App) ListFriends() ([]state.FriendDTO, error) { return a.api.ListFriends() }
+func (a *App) ListFriends() ([]api.FriendDTO, error) { return a.api.ListFriends() }
 
 // AcceptFriend 接受好友请求（仅被请求方）。
-func (a *App) AcceptFriend(id int64) error { return a.api.AcceptFriend(id) }
+func (a *App) AcceptFriend(id string) error { return a.api.AcceptFriend(id) }
 
 // RemoveFriend 删除好友关系。
-func (a *App) RemoveFriend(id int64) error { return a.api.RemoveFriend(id) }
+func (a *App) RemoveFriend(id string) error { return a.api.RemoveFriend(id) }
 
 // UpdateFriend 设置好友备注/分组（仅发起方向；空串清除）。
-func (a *App) UpdateFriend(id int64, remark, group string) error {
+func (a *App) UpdateFriend(id string, remark, group string) error {
 	return a.api.UpdateFriend(id, remark, group)
 }
 
@@ -1144,12 +1565,12 @@ func (a *App) RequestVoiceState(channelID, targetID string, mute, deafen bool) e
 }
 
 // GetVoiceState 当前语音态快照（UI 销毁重载后回填用；channel_id 空=未在频道）。
-func (a *App) GetVoiceState() state.VoiceStateView {
+func (a *App) GetVoiceState() voice.VoiceStateView {
 	a.mu.Lock()
 	s := a.sess
 	a.mu.Unlock()
 	if s == nil {
-		return state.VoiceStateView{}
+		return voice.VoiceStateView{}
 	}
 	return s.VoiceState()
 }
@@ -1222,18 +1643,11 @@ func (a *App) runtimeAudio() audio.RuntimeSettings {
 		AGC:             as.AGC != nil && *as.AGC,
 		Gain:            float64(as.MicVolume) / 100,
 		PlaybackGain:    float64(as.PlaybackVolume) / 100,
-		VADSens:         derefInt(as.VADSens, 2),
+		VADSens:         desktop.DerefInt(as.VADSens, 2),
 		Complexity:      complexity,
 		InputMode:       audio.ParseInputMode(as.InputMode),
 		PreGainDB:       as.PreGainDB,
 	}
-}
-
-func derefInt(p *int, def int) int {
-	if p == nil {
-		return def
-	}
-	return *p
 }
 
 // GetAudioSettings 读取持久化语音设置（设置页初始化用；未设置字段回落默认值）。
@@ -1291,17 +1705,36 @@ func (a *App) SetAudioSettings(s config.AudioSettings) error {
 func (a *App) startHotkeys() {
 	st := a.cfg.GetHotkeySettings()
 	a.hkGate = &hotkey.Gate{}
-	a.hkGate.SetMode(st.Mode)
 	a.hkMgr = hotkey.New(st)
 	// Enabled=false 时 Start 不装钩子（返回 nil）——默认关闭，用户主动开；
 	// 平台不支持时返回 ErrUnsupportedPlatform。两者都不影响可用性语义，
 	// 见 GetHotkeyAvailability（只看 Available，不看 Start 的返回值）。
-	if err := a.hkMgr.Start(); err != nil {
-		log.Printf("hotkey start: %v", err)
+	startErr := a.hkMgr.Start()
+	if startErr != nil {
+		log.Printf("hotkey start: %v", startErr)
 	}
+	// 钩子没装上（平台不支持或安装失败）时 PTT 退化为常开：按键永远等不到，
+	// 按 PTT 收门会把所有上行帧拦掉，服务端就收不到音频。
+	a.hkGate.SetMode(hotkeyGateMode(st, startErr == nil && a.hkMgr.Available()))
 	a.emitHotkeyAvailable()
 	a.hkQuit = make(chan struct{})
 	go a.hotkeyLoop()
+}
+
+// hotkeyGateMode 计算发送门实际应采用的门控模式。hooksAvailable 为 false 时
+// （平台不支持、钩子安装失败或 Manager 未初始化）PTT 退化为常开：按键永远
+// 等不到，门会恒拦。语音激活/常开不依赖钩子，保持原语义。
+func hotkeyGateMode(st hotkey.Settings, hooksAvailable bool) hotkey.Mode {
+	m := hotkey.EffectiveSendMode(st)
+	if m == hotkey.ModePTT && !hooksAvailable {
+		return hotkey.ModeOpen
+	}
+	return m
+}
+
+// sendGateMode 按当前平台能力计算发送门模式（设置热更新路径用）。
+func (a *App) sendGateMode(st hotkey.Settings) hotkey.Mode {
+	return hotkeyGateMode(st, a.hkMgr != nil && a.hkMgr.Available())
 }
 
 // stopHotkeys 退出事件消费 goroutine 并卸载钩子。ServiceShutdown 调用，幂等。
@@ -1346,66 +1779,25 @@ func (a *App) hotkeyLoop() {
 	}
 }
 
-// hotkeyEffect 是一次热键事件要产生的效果。
-type hotkeyEffect struct {
-	pttPress   bool // 按住说话：打开发送门
-	pttRelease bool // 松开说话：关门并开尾包窗
-	mute       bool // 切换闭麦
-	deafen     bool // 切换静音（耳聋）
-	dual       bool // 全关 / 全开
-}
-
-// effectOf 把一次热键事件翻译成要做的动作。
-//
-// 两类动作的触发沿完全不同，混用会出线上事故：
-//   - PTT 是「按住说话」，按下和抬起都要响应，少一个就变成开关或卡在说话；
-//   - 闭麦 / 静音 / 全关全是锁存开关，用户心理模型是「按一下切一次」，
-//     **只能由按下沿触发**。若抬起也响应，实际行为变成「按住闭麦、松开
-//     恢复说话」——与任何用户对快捷键的预期都相反。
-func effectOf(ev hotkey.Event) hotkeyEffect {
-	var e hotkeyEffect
-	switch ev.Action {
-	case hotkey.ActionPTT:
-		if ev.Pressed {
-			e.pttPress = true
-		} else {
-			e.pttRelease = true
-		}
-	case hotkey.ActionMute, hotkey.ActionDeafen, hotkey.ActionDual:
-		if !ev.Pressed {
-			return e // 锁存开关忽略抬起沿
-		}
-		switch ev.Action {
-		case hotkey.ActionMute:
-			e.mute = true
-		case hotkey.ActionDeafen:
-			e.deafen = true
-		case hotkey.ActionDual:
-			e.dual = true
-		}
-	}
-	return e
-}
-
 // handleHotkeyEvent 热键动作分发，跑在专用 goroutine 上。跨线程约定与 OnKicked
 // 一致：不碰会话内部状态，只走 Session 的公开方法（内部已原子/加锁），
 // emit 非阻塞可直调。
 func (a *App) handleHotkeyEvent(ev hotkey.Event) {
-	e := effectOf(ev)
+	e := desktop.EffectOf(ev)
 	switch {
-	case e.pttPress:
+	case e.PTTPress:
 		a.hkGate.Press()
-	case e.pttRelease:
+	case e.PTTRelease:
 		// 尾包窗：松手后补一小段话音，避免末字被硬切。
 		tail := time.Duration(a.cfg.GetHotkeySettings().TailMS) * time.Millisecond
 		a.hkGate.Release(tail)
-	case e.mute:
+	case e.Mute:
 		mute, _ := a.voiceMuteState()
 		a.SetMute(!mute)
-	case e.deafen:
+	case e.Deafen:
 		_, deafen := a.voiceMuteState()
 		a.SetDeafen(!deafen)
-	case e.dual:
+	case e.Dual:
 		// 全关 / 全开：已全关则全开，否则全关（与前端 dual 语义一致）。
 		mute, deafen := a.voiceMuteState()
 		allOff := !(mute && deafen)
@@ -1460,14 +1852,15 @@ func (a *App) SetHotkeySettings(s hotkey.Settings) error {
 		return err
 	}
 	// 热应用：绑定换了立刻重装钩子，模式换了立刻改发送门（未启动时 SetSettings
-	// 只存值，等 Start 生效）。
+	// 只存值，等 Start 生效）。发送门先按新设置收敛：钩子装不上时 PTT 必须落在
+	// 常开，不能停在会拦掉全部上行的 PTT。
+	if a.hkGate != nil {
+		a.hkGate.SetMode(a.sendGateMode(clean))
+	}
 	if a.hkMgr != nil {
 		if err := a.hkMgr.SetSettings(clean); err != nil {
 			return err
 		}
-	}
-	if a.hkGate != nil {
-		a.hkGate.SetMode(clean.Mode)
 	}
 	return nil
 }
@@ -1491,7 +1884,7 @@ func (a *App) SendChat(channelID, content string) error {
 }
 
 // GetVoiceMembers 房间成员快照。
-func (a *App) GetVoiceMembers() []state.PeerView {
+func (a *App) GetVoiceMembers() []voice.PeerView {
 	a.mu.Lock()
 	s := a.sess
 	a.mu.Unlock()
