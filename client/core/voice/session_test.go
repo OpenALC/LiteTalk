@@ -35,6 +35,292 @@ func TestJoinChannelRollback(t *testing.T) {
 	if got := s.roomID.Load().(string); got != "" {
 		t.Fatalf("发送失败后 roomID 应回滚为空, 得到 %q", got)
 	}
+	s.joinMu.Lock()
+	pending := len(s.pendingJoins)
+	s.joinMu.Unlock()
+	if pending != 0 {
+		t.Fatalf("发送失败后 pending join 应清空, 剩 %d", pending)
+	}
+}
+
+// pendingJoinCount 测试读 pending join 队列（joinMu 保护）。
+func (s *Session) pendingJoinCount() int {
+	s.joinMu.Lock()
+	defer s.joinMu.Unlock()
+	return len(s.pendingJoins)
+}
+
+// TestJoinChannelErrorRollsBack 服务端异步拒绝进房（#91）：清理 pending、
+// 回滚 roomID（InRoom=false，重连不再重发 join）、触发 OnJoinFailed，且同一次
+// 失败不再走 chat:error，避免前端弹两条。
+func TestJoinChannelErrorRollsBack(t *testing.T) {
+	type failure struct{ channelID, code, message string }
+	failed := make(chan failure, 1)
+	stub := newJoinReplyStub(t, func(string) []signal.Envelope {
+		return []signal.Envelope{{
+			Type: signal.TypeError, TS: 1,
+			Data: json.RawMessage(`{"code":"forbidden","message":"无权进入该频道"}`),
+		}}
+	})
+	var chatErrs atomic.Int32
+	s := NewSession(api.NewAPIClient(stub.wsURL()), "tok", "n", Events{
+		OnJoinFailed: func(channelID, code, message string) {
+			failed <- failure{channelID, code, message}
+		},
+	}, nil)
+	s.ws = signal.NewClient(signal.Config{URL: stub.wsURL(), ReconnectMin: 20 * time.Millisecond})
+	defer s.ws.Close()
+	s.registerHandlers()
+	s.ErrorHandlerEx(func(code, message string, joinHandled bool) {
+		if !joinHandled {
+			chatErrs.Add(1)
+		}
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.ws.Run(ctx)
+	waitSignalConnected(t, s)
+
+	if err := s.JoinChannel("room1"); err != nil {
+		t.Fatalf("JoinChannel: %v", err)
+	}
+	select {
+	case got := <-failed:
+		if got.channelID != "room1" || got.code != "forbidden" || got.message != "无权进入该频道" {
+			t.Fatalf("OnJoinFailed = %+v, want room1/forbidden/无权进入该频道", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("进房被拒未触发 OnJoinFailed（#91）")
+	}
+	if s.InRoom() {
+		t.Fatal("进房失败后 InRoom 应为 false（重连不得再重发 join）")
+	}
+	if n := s.pendingJoinCount(); n != 0 {
+		t.Fatalf("进房失败后 pending join 应清空, 剩 %d", n)
+	}
+	if n := chatErrs.Load(); n != 0 {
+		t.Fatalf("进房失败不应再走 chat:error, 收到 %d 条", n)
+	}
+}
+
+// TestJoinChannelJoinedKeepsRoom channel.joined 结算 pending 并保留房间；
+// 之后到达的同码 error（例如重复进房的 already_in_channel / 聊天 forbidden）
+// 没有 pending 可归属，不得回滚房间、不得触发 OnJoinFailed。
+func TestJoinChannelJoinedKeepsRoom(t *testing.T) {
+	failed := make(chan struct{}, 1)
+	stub := newJoinReplyStub(t, func(channelID string) []signal.Envelope {
+		joined := signal.Envelope{
+			Type: signal.TypeChannelJoined, TS: 1,
+			Data: json.RawMessage(`{"channel_id":"` + channelID + `","members":[],"self":{"user_id":"u1","nickname":"甲"}}`),
+		}
+		laterErr := signal.Envelope{
+			Type: signal.TypeError, TS: 2,
+			Data: json.RawMessage(`{"code":"forbidden","message":"无权进入该频道"}`),
+		}
+		return []signal.Envelope{joined, laterErr}
+	})
+	errSeen := make(chan bool, 1)
+	s := NewSession(api.NewAPIClient(stub.wsURL()), "tok", "n", Events{
+		OnJoinFailed: func(channelID, code, message string) { failed <- struct{}{} },
+	}, nil)
+	s.ws = signal.NewClient(signal.Config{URL: stub.wsURL(), ReconnectMin: 20 * time.Millisecond})
+	defer s.ws.Close()
+	s.registerHandlers()
+	s.ErrorHandlerEx(func(code, message string, joinHandled bool) { errSeen <- joinHandled })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.ws.Run(ctx)
+	waitSignalConnected(t, s)
+
+	if err := s.JoinChannel("room1"); err != nil {
+		t.Fatalf("JoinChannel: %v", err)
+	}
+	// 后一条 error 到达时 pending 应已被 channel.joined 结算。
+	select {
+	case joinHandled := <-errSeen:
+		if joinHandled {
+			t.Fatal("channel.joined 已结算后，后续 error 不应再归因进房")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("未收到后续 error 帧")
+	}
+	if !s.InRoom() {
+		t.Fatal("channel.joined 后房间应保留")
+	}
+	if got := s.roomID.Load().(string); got != "room1" {
+		t.Fatalf("roomID = %q, want room1", got)
+	}
+	if n := s.pendingJoinCount(); n != 0 {
+		t.Fatalf("channel.joined 后 pending join 应清空, 剩 %d", n)
+	}
+	select {
+	case <-failed:
+		t.Fatal("channel.joined 后不应触发 OnJoinFailed")
+	default:
+	}
+}
+
+// TestJoinErrorWithoutPendingIsChatError 普通聊天错误（无 pending join）不得
+// 触发进房回滚回调，仍按聊天错误转发（#91：不要误伤聊天）。
+func TestJoinErrorWithoutPendingIsChatError(t *testing.T) {
+	stub, _ := newDownlinkStubData(t, signal.Envelope{
+		Type: signal.TypeError, TS: 1,
+		Data: json.RawMessage(`{"code":"forbidden","message":"无权向该频道发送消息"}`),
+	})
+	errSeen := make(chan bool, 1)
+	failed := make(chan struct{}, 1)
+	s := NewSession(api.NewAPIClient(stub.wsURL()), "tok", "n", Events{
+		OnJoinFailed: func(channelID, code, message string) { failed <- struct{}{} },
+	}, nil)
+	s.ws = signal.NewClient(signal.Config{URL: stub.wsURL(), ReconnectMin: 20 * time.Millisecond})
+	defer s.ws.Close()
+	s.registerHandlers()
+	s.ErrorHandlerEx(func(code, message string, joinHandled bool) { errSeen <- joinHandled })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.ws.Run(ctx)
+
+	select {
+	case joinHandled := <-errSeen:
+		if joinHandled {
+			t.Fatal("无 pending join 时 forbidden 应按聊天错误转发")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("未收到聊天错误回调")
+	}
+	select {
+	case <-failed:
+		t.Fatal("普通聊天错误不得触发 OnJoinFailed")
+	default:
+	}
+}
+
+// TestQuotaExceededWithoutPendingIsChatError quota_exceeded 不是进房专用码：
+// rtc.offer 的 SFU 容量上限（hub.handleRTCOffer）也会返回。无 pending join 时
+// 必须继续走聊天错误回调，不能被 join-only 静默丢弃。
+func TestQuotaExceededWithoutPendingIsChatError(t *testing.T) {
+	stub, _ := newDownlinkStubData(t, signal.Envelope{
+		Type: signal.TypeError, TS: 1,
+		Data: json.RawMessage(`{"code":"quota_exceeded","message":"RTC 协商失败: 房间已满"}`),
+	})
+	type seenErr struct {
+		code, message string
+		joinHandled   bool
+	}
+	got := make(chan seenErr, 1)
+	failed := make(chan struct{}, 1)
+	s := NewSession(api.NewAPIClient(stub.wsURL()), "tok", "n", Events{
+		OnJoinFailed: func(channelID, code, message string) { failed <- struct{}{} },
+	}, nil)
+	s.ws = signal.NewClient(signal.Config{URL: stub.wsURL(), ReconnectMin: 20 * time.Millisecond})
+	defer s.ws.Close()
+	s.registerHandlers()
+	s.ErrorHandlerEx(func(code, message string, joinHandled bool) {
+		got <- seenErr{code, message, joinHandled}
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.ws.Run(ctx)
+
+	select {
+	case e := <-got:
+		if e.joinHandled {
+			t.Fatal("无 pending join 时 quota_exceeded 不应归因进房")
+		}
+		if e.code != "quota_exceeded" || !strings.Contains(e.message, "RTC 协商失败") {
+			t.Fatalf("错误回调 = %+v, want quota_exceeded/RTC 协商失败", e)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("无 pending 时 quota_exceeded 必须走聊天错误回调（不得静默丢弃）")
+	}
+	select {
+	case <-failed:
+		t.Fatal("rtc.offer 配额错误不得触发 OnJoinFailed")
+	default:
+	}
+}
+
+// TestJoinChannelQuotaExceededRollsBack 有 pending join 时 quota_exceeded
+// （如房间满员）仍按进房失败回滚房间态并上报 OnJoinFailed。
+func TestJoinChannelQuotaExceededRollsBack(t *testing.T) {
+	failed := make(chan [3]string, 1)
+	stub := newJoinReplyStub(t, func(string) []signal.Envelope {
+		return []signal.Envelope{{
+			Type: signal.TypeError, TS: 1,
+			Data: json.RawMessage(`{"code":"quota_exceeded","message":"语音房间已满"}`),
+		}}
+	})
+	s := NewSession(api.NewAPIClient(stub.wsURL()), "tok", "n", Events{
+		OnJoinFailed: func(channelID, code, message string) {
+			failed <- [3]string{channelID, code, message}
+		},
+	}, nil)
+	s.ws = signal.NewClient(signal.Config{URL: stub.wsURL(), ReconnectMin: 20 * time.Millisecond})
+	defer s.ws.Close()
+	s.registerHandlers()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.ws.Run(ctx)
+	waitSignalConnected(t, s)
+
+	if err := s.JoinChannel("room1"); err != nil {
+		t.Fatalf("JoinChannel: %v", err)
+	}
+	select {
+	case got := <-failed:
+		if got != [3]string{"room1", "quota_exceeded", "语音房间已满"} {
+			t.Fatalf("OnJoinFailed = %v", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("满员拒绝未触发 OnJoinFailed（#91）")
+	}
+	if s.InRoom() {
+		t.Fatal("满员拒绝后 InRoom 应为 false")
+	}
+	if n := s.pendingJoinCount(); n != 0 {
+		t.Fatalf("满员拒绝后 pending join 应清空, 剩 %d", n)
+	}
+}
+
+// TestJoinRollbackDoesNotClobberNewerJoin 快速切房/连点：旧 join 的发送失败或
+// error 只结算自己那条，不能清掉更新的房间意图（#91 并发约束）。
+func TestJoinRollbackDoesNotClobberNewerJoin(t *testing.T) {
+	s := NewSession(api.NewAPIClient("http://127.0.0.1:1"), "tok", "n", Events{}, nil)
+	s.ws = signal.NewClient(signal.Config{URL: "ws://127.0.0.1:1/ws"})
+	defer s.ws.Close()
+
+	seqA := s.beginJoin("roomA")
+	_ = s.beginJoin("roomB")
+	s.abortJoinSend(seqA, true)
+	if got := s.roomID.Load().(string); got != "roomB" {
+		t.Fatalf("旧 join 发送失败不得清掉新房, roomID = %q, want roomB", got)
+	}
+	if n := s.pendingJoinCount(); n != 1 {
+		t.Fatalf("只应摘除失败的那条, 剩 %d 条", n)
+	}
+
+	// 旧 join 的 error 按 FIFO 归属到 roomA：roomID 已是 roomB，不回滚。
+	s.joinMu.Lock()
+	s.pendingJoins = nil
+	s.joinMu.Unlock()
+	s.roomID.Store("")
+	s.beginJoin("roomA")
+	s.beginJoin("roomB")
+	channelID, consumed, rolledBack := s.settlePendingJoin(true)
+	if channelID != "roomA" || !consumed || rolledBack {
+		t.Fatalf("旧 join 错误归属 = (%q, %v, %v), want (roomA, true, false)", channelID, consumed, rolledBack)
+	}
+	if got := s.roomID.Load().(string); got != "roomB" {
+		t.Fatalf("旧 join 失败不得回滚新房, roomID = %q, want roomB", got)
+	}
+	// 新房自己的失败才回滚。
+	channelID, consumed, rolledBack = s.settlePendingJoin(true)
+	if channelID != "roomB" || !consumed || !rolledBack {
+		t.Fatalf("新房失败归属 = (%q, %v, %v), want (roomB, true, true)", channelID, consumed, rolledBack)
+	}
+	if s.InRoom() {
+		t.Fatal("当前房间进房失败后 InRoom 应为 false")
+	}
 }
 
 // TestConnectUsesConfiguredAudioBackend Session.Connect 必须使用 SetAudioBackend
@@ -278,6 +564,62 @@ func (s *downlinkStub) saw(msgType string) bool {
 		}
 	}
 	return false
+}
+
+// joinReplyStub 收到 channel.join 后按 reply 返回一串下行帧（可含
+// channel.joined 与 error），用于服务端异步回执/拒绝的进房用例（#91）。
+type joinReplyStub struct {
+	*httptest.Server
+
+	mu       sync.Mutex
+	received []string
+}
+
+func newJoinReplyStub(t *testing.T, reply func(channelID string) []signal.Envelope) *joinReplyStub {
+	t.Helper()
+	s := &joinReplyStub{}
+	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			_, raw, err := conn.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var env signal.Envelope
+			if json.Unmarshal(raw, &env) != nil {
+				continue
+			}
+			s.mu.Lock()
+			s.received = append(s.received, env.Type)
+			s.mu.Unlock()
+			if env.Type != signal.TypeChannelJoin {
+				continue
+			}
+			var d signal.ChannelJoinData
+			if json.Unmarshal(env.Data, &d) != nil {
+				continue
+			}
+			for _, out := range reply(d.ChannelID) {
+				raw, err := json.Marshal(out)
+				if err != nil {
+					return
+				}
+				if err := conn.Write(r.Context(), websocket.MessageText, raw); err != nil {
+					return
+				}
+			}
+		}
+	}))
+	t.Cleanup(s.Server.Close)
+	return s
+}
+
+func (s *joinReplyStub) wsURL() string {
+	return "ws" + strings.TrimPrefix(s.URL, "http") + "/ws"
 }
 
 // TestVoiceTakenLeavesRoomLocally session.voice_taken：服务端已把本端摘出成员表，
