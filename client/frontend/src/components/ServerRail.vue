@@ -1,13 +1,14 @@
 <script setup lang="ts">
-// ServerRail 服务器轨道（v0.1.2 重构）：顶部介绍页入口 + 服务器列表 + 底部加号。
+// ServerRail 服务器轨道（v0.1.2 重构）：顶部介绍页入口 + 服务器列表 + 底部加号与设置。
 // 图标为预设 Lucide（禁头像/上传图——硬性约束）。
 // 右键菜单：复制邀请码/新建频道/重命名/删除服务器/设为首页；
 // 介绍页右键：删除介绍页（仅当首页不是介绍页，可恢复）。
 // 角标死数据已移除（走查 13：无真实未读数据源）。
 import { computed, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import {
   Plus, Home, MessagesSquare, Gamepad2, Music, Palette, BookOpen, Coffee, Mic,
-  GraduationCap, Heart, Rocket, Camera, Dumbbell, Undo2,
+  GraduationCap, Heart, Rocket, Camera, Dumbbell, Undo2, Settings,
   Link, FolderPlus, Pencil, Trash2,
 } from 'lucide-vue-next'
 import { INTRO_ID, useServersStore } from '../stores/data'
@@ -19,6 +20,7 @@ import PromptDialog from './PromptDialog.vue'
 
 const store = useServersStore()
 const notify = useNotifyStore()
+const router = useRouter()
 
 // Lucide 图标名 → 组件（静态注册，避免动态导入复杂度）。
 // 键集合与 server/internal/api/servers.go 的 allowedIcons 保持一致。
@@ -117,8 +119,6 @@ async function onCtxSelect(key: string) {
   if (!server) return
   switch (key) {
     case 'invite': {
-      // 邀请码为服务端实体操作；内置示例服务器无对应实体。
-      if (server.builtin) { notify.show('示例服务器无邀请码', true); return }
       try {
         const code = await goApp().CreateInviteCode(c.id)
         await navigator.clipboard.writeText(code)
@@ -127,7 +127,6 @@ async function onCtxSelect(key: string) {
       return
     }
     case 'new-channel':
-      if (server.builtin) { notify.show('示例服务器不可新建频道', true); return }
       prompt.value = { mode: 'new-channel', id: c.id }
       return
     case 'rename':
@@ -196,6 +195,9 @@ async function removeServer(id: string) {
     </button>
     <button class="rail-add" title="创建或加入服务器" @click="showServerDialog = true">
       <Plus :size="20" />
+    </button>
+    <button class="rail-add" title="设置" @click="router.push('/settings')">
+      <Settings :size="20" />
     </button>
 
     <ServerDialog v-if="showServerDialog" @close="showServerDialog = false" />

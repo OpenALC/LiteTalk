@@ -1,22 +1,26 @@
 <script setup lang="ts">
-// TitleBar 自定义标题栏（无边框窗口拖拽区 + 最小化/最大化/关闭）。
+// TitleBar 自定义标题栏（无边框窗口拖拽区 + 设置/最小化/最大化/关闭）。
 // Wails 无边框窗口（v2/v3 相同）：拖拽用 --wails-draggable（WebView2 不认 Electron 的
 // -webkit-app-region）。
 // 关闭走 useWindowClose：首次关窗提示「已最小化到托盘」（问题 4d）。
 import { ref } from 'vue'
-import { Minus, Square, X, AudioWaveform } from 'lucide-vue-next'
+import { useRouter } from 'vue-router'
+import { Minus, Square, X, AudioWaveform, Settings } from 'lucide-vue-next'
 import { goApp } from '../api/bridge'
 import { closeWithHint } from '../composables/useWindowClose'
 import Toast from './Toast.vue'
 
 const toast = ref<InstanceType<typeof Toast>>()
+const router = useRouter()
 </script>
 
 <template>
   <header class="titlebar">
     <span class="tb-logo"><AudioWaveform :size="11" /></span>
     <span class="tb-name">轻音 LiteTalk</span>
+    <!-- 设置按钮必须留在 no-drag 的 .tb-controls 内，否则点击会被标题栏拖拽吞掉。 -->
     <div class="tb-controls">
+      <button title="设置" @click="router.push('/settings')"><Settings :size="15" /></button>
       <button title="最小化" @click="goApp().WindowMinimize()"><Minus :size="15" /></button>
       <button title="最大化" @click="goApp().WindowMaximize()"><Square :size="15" /></button>
       <button class="tb-close" title="关闭" @click="closeWithHint()"><X :size="15" /></button>
