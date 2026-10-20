@@ -151,15 +151,17 @@ func TestAllocateUDP(t *testing.T) {
 }
 
 // TestPeerIPPolicy 直接覆盖 PermissionHandler 的地址判定（#25）：内网/环回/
-// 元数据/组播一律拒绝，公网与 v4-mapped 公网放行。
+// 元数据/组播/保留段一律拒绝，公网与 v4-mapped/v4-compatible 公网放行。
 func TestPeerIPPolicy(t *testing.T) {
 	blocked := []string{
-		"127.0.0.1", "127.255.255.254", "::ffff:127.0.0.1",
-		"0.0.0.0", "0.1.2.3", "::",
+		"127.0.0.1", "127.255.255.254", "::ffff:127.0.0.1", "::127.0.0.1",
+		"0.0.0.0", "0.1.2.3", "::", "::0.0.0.1",
 		"10.0.0.1", "172.16.0.1", "172.31.255.255", "192.168.1.1", "::ffff:192.168.1.1",
-		"100.64.0.1", "100.127.255.254",
-		"169.254.169.254", "::ffff:169.254.169.254",
+		"::10.0.0.1", "::192.168.1.1",
+		"100.64.0.1", "100.127.255.254", "::100.64.0.1",
+		"169.254.169.254", "::ffff:169.254.169.254", "::169.254.169.254",
 		"224.0.0.1", "239.255.255.255", "255.255.255.255",
+		"240.0.0.1", "247.1.2.3", "255.255.255.254", "::ffff:240.0.0.1",
 		"::1", "fe80::1", "ff02::1", "fc00::1", "fdff:ffff::1",
 	}
 	for _, s := range blocked {
@@ -172,7 +174,7 @@ func TestPeerIPPolicy(t *testing.T) {
 	}
 	allowed := []string{
 		"8.8.8.8", "1.1.1.1", "203.0.113.10",
-		"::ffff:8.8.8.8", "2001:4860:4860::8888", "2606:4700::1111",
+		"::ffff:8.8.8.8", "::8.8.8.8", "2001:4860:4860::8888", "2606:4700::1111",
 	}
 	for _, s := range allowed {
 		if isBlockedPeerIP(net.ParseIP(s), false) {
@@ -185,13 +187,14 @@ func TestPeerIPPolicy(t *testing.T) {
 	if !isBlockedPeerIP(nil, false) || !isBlockedPeerIP(net.IP{}, false) {
 		t.Error("空 peer IP 应拒绝")
 	}
-	// AllowLoopbackPeers 只放开环回；私网/元数据/组播仍拒绝（仅本机集成测试用）。
-	for _, s := range []string{"127.0.0.1", "::1", "::ffff:127.0.0.1"} {
+	// AllowLoopbackPeers 只放开环回（含映射/兼容表示）；私网/元数据/组播仍拒绝
+	// （仅本机集成测试用）。
+	for _, s := range []string{"127.0.0.1", "::1", "::ffff:127.0.0.1", "::127.0.0.1"} {
 		if isBlockedPeerIP(net.ParseIP(s), true) || !permitPeer(true)(nil, net.ParseIP(s)) {
 			t.Errorf("allowLoopback=true 时环回 %s 应放行", s)
 		}
 	}
-	for _, s := range []string{"10.0.0.1", "192.168.1.1", "169.254.169.254", "224.0.0.1", "fe80::1"} {
+	for _, s := range []string{"10.0.0.1", "192.168.1.1", "169.254.169.254", "224.0.0.1", "fe80::1", "::10.0.0.1", "240.0.0.1"} {
 		if !isBlockedPeerIP(net.ParseIP(s), true) {
 			t.Errorf("allowLoopback=true 时非环回 %s 仍应拒绝", s)
 		}
@@ -227,13 +230,13 @@ func TestAllocationQuotaPerUID(t *testing.T) {
 	}
 	defer func() { _ = srv.Close() }()
 
-	for i := 0; i < maxAllocationsPerUID; i++ {
+	for i := 0; i < DefaultMaxAllocationsPerUID; i++ {
 		if _, err := newUDPAlloc(t, port, cfg.Secret, "quota-uid"); err != nil {
 			t.Fatalf("第 %d 个 allocation 应成功: %v", i+1, err)
 		}
 	}
 	if _, err := newUDPAlloc(t, port, cfg.Secret, "quota-uid"); err == nil {
-		t.Fatalf("同一 uid 第 %d 个 allocation 应被配额拒绝", maxAllocationsPerUID+1)
+		t.Fatalf("同一 uid 第 %d 个 allocation 应被配额拒绝", DefaultMaxAllocationsPerUID+1)
 	} else {
 		t.Logf("同一 uid 超限被拒: %v", err)
 	}
@@ -245,9 +248,9 @@ func TestAllocationQuotaPerUID(t *testing.T) {
 // TestAllocationQuotaIPPure IP 层配额是纯计数逻辑，直接测 tracker：8 个不同
 // uid 后第 9 个即使 uid 未超限也必须被拒。
 func TestAllocationQuotaIPPure(t *testing.T) {
-	q := newAllocationQuota()
+	q := newAllocationQuota(0, 0)
 	src := &net.UDPAddr{IP: net.ParseIP("203.0.113.5"), Port: 12345}
-	for i := 0; i < maxAllocationsPerIP; i++ {
+	for i := 0; i < DefaultMaxAllocationsPerIP; i++ {
 		uid := fmt.Sprintf("uid-%d", i)
 		if !q.allow(uid, "test", src) {
 			t.Fatalf("第 %d 个 uid 不应被拒", i+1)
@@ -258,12 +261,86 @@ func TestAllocationQuotaIPPure(t *testing.T) {
 		t.Fatal("同一 IP 超过上限后应拒绝")
 	}
 	// 计数必须能归零且不为负：全部删除后重新放行。
-	for i := 0; i < maxAllocationsPerIP; i++ {
+	for i := 0; i < DefaultMaxAllocationsPerIP; i++ {
 		q.add(src, fmt.Sprintf("uid-%d", i), -1)
 	}
 	q.add(src, "uid-new", -1) // 多余的删除不得把计数打成负数
 	if !q.allow("uid-new", "test", src) {
 		t.Fatal("计数归零后应重新放行")
+	}
+}
+
+// TestAllocationQuotaDefaults 零值/负数上限必须回落到安全的默认值（4/8）：
+// 配置缺失不能变成不限量。
+func TestAllocationQuotaDefaults(t *testing.T) {
+	for _, q := range []*allocationQuota{newAllocationQuota(0, 0), newAllocationQuota(-1, -1)} {
+		if q.maxPerUID != DefaultMaxAllocationsPerUID || q.maxPerIP != DefaultMaxAllocationsPerIP {
+			t.Fatalf("零值配置应回落默认上限，实际 uid=%d ip=%d", q.maxPerUID, q.maxPerIP)
+		}
+	}
+
+	src := &net.UDPAddr{IP: net.ParseIP("203.0.113.6"), Port: 12345}
+	q := newAllocationQuota(0, 0)
+	for i := 0; i < DefaultMaxAllocationsPerUID; i++ {
+		q.add(src, "uid-same", 1)
+	}
+	if q.allow("uid-same", "test", src) {
+		t.Fatal("默认上限下同 uid 第 5 个 allocation 应拒绝")
+	}
+	q = newAllocationQuota(0, 0)
+	for i := 0; i < DefaultMaxAllocationsPerIP; i++ {
+		q.add(src, fmt.Sprintf("uid-%d", i), 1)
+	}
+	if q.allow("uid-new", "test", src) {
+		t.Fatal("默认上限下同 IP 第 9 个 allocation 应拒绝")
+	}
+}
+
+// TestAllocationQuotaCustomLimits 自定义上限按配置收紧：uid 层与 IP 层分别生效。
+func TestAllocationQuotaCustomLimits(t *testing.T) {
+	src := &net.UDPAddr{IP: net.ParseIP("203.0.113.7"), Port: 12345}
+	q := newAllocationQuota(2, 3)
+
+	q.add(src, "a", 1)
+	q.add(src, "a", 1)
+	if q.allow("a", "test", src) {
+		t.Fatal("同 uid 超过配置上限 2 应拒绝")
+	}
+	if !q.allow("b", "test", src) {
+		t.Fatal("b 未超 uid 上限且 IP 未满时应放行")
+	}
+	q.add(src, "b", 1)
+	if q.allow("c", "test", src) {
+		t.Fatal("同 IP 超过配置上限 3 应拒绝")
+	}
+}
+
+// TestAllocationQuotaConfig 自定义 Config 上限贯通到真实 TURN 服务：
+// MaxPerUID=2、MaxPerIP=3 时同 uid 第 3 个被拒，换 uid 后第 4 个按 IP 层被拒。
+func TestAllocationQuotaConfig(t *testing.T) {
+	port := freePort(t)
+	cfg := testConfig(port, port)
+	cfg.MaxPerUID = 2
+	cfg.MaxPerIP = 3
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = srv.Close() }()
+
+	for i := 0; i < cfg.MaxPerUID; i++ {
+		if _, err := newUDPAlloc(t, port, cfg.Secret, "cfg-uid"); err != nil {
+			t.Fatalf("第 %d 个 allocation 应成功: %v", i+1, err)
+		}
+	}
+	if _, err := newUDPAlloc(t, port, cfg.Secret, "cfg-uid"); err == nil {
+		t.Fatal("同 uid 超过 MaxPerUID 应被拒")
+	}
+	if _, err := newUDPAlloc(t, port, cfg.Secret, "cfg-other"); err != nil {
+		t.Fatalf("换 uid 后应可分配（IP 计数 2 < 3）: %v", err)
+	}
+	if _, err := newUDPAlloc(t, port, cfg.Secret, "cfg-third"); err == nil {
+		t.Fatal("同 IP 超过 MaxPerIP 应被拒")
 	}
 }
 
