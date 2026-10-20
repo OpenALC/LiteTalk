@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litetalk:signal:chat.message",
+  "title": "ChatMessageData",
+  "x-wire-type": "chat.message",
+  "x-go-const": "TypeChatMessage",
+  "x-direction": "S2C",
+  "x-since": 1,
+  "x-namespace": "event",
+  "description": "文字消息广播。字段命名与 REST 消息 DTO 的统一由 #31 收敛，本 schema 先按 WS 现状定形。",
+  "type": "object",
+  "properties": {
+    "id": { "type": "string" },
+    "channel_id": { "type": "string" },
+    "content": { "type": "string" },
+    "ts": { "type": "integer" },
+    "user": { "$ref": "components.schema.json#/$defs/UserBrief" },
+    "nonce": {
+      "type": "string",
+      "x-since": 2,
+      "x-go-omitempty": true,
+      "maxLength": 64,
+      "description": "发送方 chat.send 携带的幂等键；仅发送方带 nonce 时回显（#31，协议 v2）。"
+    }
+  },
+  "required": ["id", "channel_id", "content", "ts", "user"],
+  "additionalProperties": false
+}

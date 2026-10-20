@@ -19,8 +19,8 @@ import (
 	"os/signal"
 	"time"
 
-	"github.com/OpenALC/LiteTalk/client/internal/audio"
-	"github.com/OpenALC/LiteTalk/client/internal/codec"
+	"github.com/OpenALC/LiteTalk/client/core/audio"
+	"github.com/OpenALC/LiteTalk/client/core/codec"
 	"github.com/gen2brain/malgo"
 )
 

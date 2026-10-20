@@ -1,0 +1,2 @@
+-- 0009_users_nickname_bin.down.sql — SQLite 侧无需变更（#24 P2）
+-- 与 up 成对：回滚只删除 schema_migrations 里的版本记录，不改表结构。

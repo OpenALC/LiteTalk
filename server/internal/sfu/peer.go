@@ -4,10 +4,22 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/webrtc/v4"
 )
+
+// outRoute 一条下行路由：outbound 轨道 + 其 RTPSender（摘除时 RemoveTrack 要用），
+// src 为建立该路由时的源 Peer **实例**（#23）。同 uid 可能先后存在多个实例
+// （同 WS 连接重入房时 connID 不变），只按 userID 摘除会误删重入后新建的路由。
+// 离房/ICE 失败/连接顶替必须成对摘掉（#23）：惰性保留会让 srcUserID 重入后
+// ensureRoute 见旧条目跳过，订阅端拿不到新 OnTrack。
+type outRoute struct {
+	track  *webrtc.TrackLocalStaticRTP
+	sender *webrtc.RTPSender
+	src    *Peer
+}
 
 // Peer 房间中的一个成员：每客户端恰好一条 PeerConnection
 // （一条上行 track，N 条下行 track，§5.2）。
@@ -28,12 +40,36 @@ type Peer struct {
 	debounce func(func())
 
 	mu                sync.Mutex
-	inbound           []*webrtc.TrackRemote                  // 本成员上行轨道
-	outbound          map[string]*webrtc.TrackLocalStaticRTP // 源 userID → 下行轨道
-	pendingCandidates []webrtc.ICECandidateInit              // 初始 answer 前到达的 trickle 候选
+	inbound           []*webrtc.TrackRemote     // 本成员上行轨道
+	outbound          map[string]*outRoute      // 源 userID → 下行路由
+	pendingCandidates []webrtc.ICECandidateInit // 初始 answer 前到达的 trickle 候选
 	initialAnswered   bool
 	negotiateAgain    bool
 	closed            bool
+
+	// retired 本实例已从房间摘除（#23）：退役后并发到达的 ensureRoute（旧实例
+	// 迟到的 OnTrack）不得再为它建路由；见 room.go ensureRoute 的尾部自检。
+	retired atomic.Bool
+
+	// —— RFC 6464 电平与活跃门控（#33）——
+	// level 最近一包的电平（0=0dB … 127=静音；-1=尚未收到）。forward 写、判定循环读。
+	level atomic.Int32
+	// pktSeq 上行包计数（forward 每包 +1）：判定循环对比发现停流（muted/DTX/断流）
+	// 后按静音处理，避免最后一包的电平把说话态永久卡住。
+	pktSeq atomic.Uint64
+	// fwdActive 活跃转发门（#33 Phase 1 包级门控）：tickActive 写、forward 读。
+	// true=该源的包参与扇出 WriteRTP；false=只收不发（track 保持挂载，禁 RemoveTrack）。
+	fwdActive atomic.Bool
+
+	// —— 以下仅 speakingLoop goroutine 访问（单写者，免锁）——
+	effLvl       int32     // 停流折算后的有效电平（tickSpeak 写、tickActive 读）
+	spkEnterRun  int       // 连续达进入门限的 tick 数
+	spkExitRun   int       // 连续低于退出门限的 tick 数
+	speaking     bool      // 当前说话态（翻转时经 OnSpeakingFn 下发）
+	gateExitRun  int       // 连续低于退出门限的 tick 数（活跃门 500ms 宽限）
+	gateHoldFrom time.Time // 进入 fwdActive 的时刻（ActiveHoldMS 最少保持）
+	seenSeq      uint64    // 上次判定时的 pktSeq（停流检测）
+	staleRun     int       // 连续无新包的 tick 数
 }
 
 func newPeer(room *Room, userID, connID string, sig SignalSender) (*Peer, error) {
@@ -47,9 +83,14 @@ func newPeer(room *Room, userID, connID string, sig SignalSender) (*Peer, error)
 		room:     room,
 		pc:       pc,
 		signal:   sig,
-		outbound: make(map[string]*webrtc.TrackLocalStaticRTP),
+		outbound: make(map[string]*outRoute),
 		debounce: newDebouncer(50 * time.Millisecond),
 	}
+	// 电平初值 -1=未收到（说话判定跳过；活跃门不拦，v1 兼容）。
+	// fwdActive 初值 true：首包前不丢包，tickActive 下一拍（≤100ms）再收紧。
+	p.level.Store(-1)
+	p.effLvl = -1
+	p.fwdActive.Store(true)
 
 	// SFU 侧 trickle：候选随收随发
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
@@ -74,21 +115,56 @@ func newPeer(room *Room, userID, connID string, sig SignalSender) (*Peer, error)
 		p.inbound = append(p.inbound, remote)
 		p.mu.Unlock()
 
+		// RFC 6464 电平扩展（#33）：从协商到的头扩展里取 ID；未协商（v1 客户端）
+		// 取 0，forward 跳过电平写入，说话判定/活跃门控对该源自动失效。
+		levelExtID := audioLevelExtID(receiver.GetParameters().HeaderExtensions)
+
 		p.room.sfu.log.Printf("sfu: %s 上行轨道就绪 kind=%s ssrc=%d（房间 %s）",
 			p.userID, remote.Kind(), remote.SSRC(), p.room.id)
 
 		// 对端 SR 等 RTCP 仅 drain，防读缓冲淤积
 		go drainRTCPReceiver(receiver)
-		p.room.addRoutesFrom(p.userID, remote)
-		go p.room.forward(p.userID, remote)
+		p.room.addRoutesFrom(p, remote)
+		go p.room.forward(p, remote, levelExtID)
 	})
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		p.room.sfu.log.Printf("sfu: %s 连接状态 %s（房间 %s）", p.userID, state, p.room.id)
-		// M2：断连清理由 WS 层驱动；ICE 失败仅记录，待 M3 接入 ICE restart
+		// ICE 失败 / 非主动关闭（对端销毁 PC、DTLS CloseNotify）→ 清理（#19）。
+		// 主动 close（离房、连接顶替）不动：closed 先于 pc.Close 置位，据此分辨。
+		if state != webrtc.PeerConnectionStateFailed && state != webrtc.PeerConnectionStateClosed {
+			return
+		}
+		p.mu.Lock()
+		deliberate := p.closed
+		p.mu.Unlock()
+		if deliberate {
+			return
+		}
+		p.onConnFailed()
 	})
 
 	return p, nil
+}
+
+// reasonICEFailed rtc.failed.reason 的标准取值（契约 0.2 固定 "ice_failed"）。
+const reasonICEFailed = "ice_failed"
+
+// onConnFailed ICE 失败清理（#19）：按**实例**核对摘除本 peer（含其余成员指向
+// 本端的下行路由，#23），回收空房间，并只通知本端连接 rtc.failed。同 WS 连接
+// 重入的新 peer 与本实例共享 connID，只有指针核对不会误杀它。其余成员的
+// channel.peer_left 由信令层（signal/fail.go）在收到 SendFailed 后广播。
+func (p *Peer) onConnFailed() {
+	if !p.room.removePeerInstance(p) {
+		return
+	}
+	// 摘掉最后一个成员后房间必须回收（#19）：否则空房间留在 rooms map 里
+	// 占满 MaxRooms，之后所有新语音房都会被配额拒绝。
+	p.room.sfu.removeRoomIfEmpty(p.room.id)
+	p.room.sfu.log.Printf("sfu: %s 连接失败清理完成（房间 %s）", p.userID, p.room.id)
+	if p.signal != nil {
+		p.signal.SendFailed(p.room.id, p.userID, reasonICEFailed)
+	}
 }
 
 // handleInitialOffer 处理客户端初始 offer（每个 peer 仅一次），返回 answer SDP。

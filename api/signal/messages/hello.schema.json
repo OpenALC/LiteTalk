@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litetalk:signal:hello",
+  "title": "HelloData",
+  "x-wire-type": "hello",
+  "x-go-const": "TypeHello",
+  "x-direction": "S2C",
+  "x-since": 1,
+  "x-namespace": "session",
+  "description": "鉴权成功后下发的全量初始数据。servers/friends/presence 是无结构占位（M3 前恒空），契约如实描述为无约束容器。",
+  "type": "object",
+  "properties": {
+    "user": { "$ref": "components.schema.json#/$defs/UserBrief" },
+    "servers": { "type": "array", "items": {}, "x-go-type": "[]any" },
+    "friends": { "type": "array", "items": {}, "x-go-type": "[]any" },
+    "presence": { "type": "object", "x-go-type": "map[string]any" }
+  },
+  "required": ["user", "servers", "friends", "presence"],
+  "additionalProperties": false
+}

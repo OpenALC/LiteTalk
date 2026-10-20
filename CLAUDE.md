@@ -16,7 +16,11 @@ LiteTalk 是 OpenALC 组织的开源桌面语音开黑软件，SFU 架构，服�
 ## 1. 硬性约束（违反即返工）
 
 ### 仓库与工具链
-- 远程仓库根目录**只允许**：`client/`、`server/`、`.github/`、`.gitignore`、`README.md`、`LICENSE`、`CLAUDE.md`。新增根目录文件或目录前必须先征得用户同意。
+- 远程仓库根目录**当前实际内容**：`client/`、`server/`、`api/`、`.github/` 四个目录，加 `.gitignore`、`.gitattributes`、`.dockerignore`、`Dockerfile`、`docker-compose.yml`、`README.md`、`LICENSE`、`CLAUDE.md` 八个文件。
+  - `api/`（#28/#29）：REST 与信令契约的单一事实源——`openapi.yaml` + `signal/*.schema.json`，由 `server/api/tools/` 下的生成器消费。
+  - `Dockerfile`/`docker-compose.yml`/`.dockerignore`（#27）：一键自托管。
+  - `.gitattributes`：统一行尾为 LF。
+  新增根目录文件或目录**不再需要逐次征得用户同意**（2026-10-18 一次性授权），但必须与某个 issue 对应，且不得违反其它硬约束——`docs/`、`prototype/` 等本地材料仍然禁止推送。
 - `docs/`、`prototype/`、`.playwright-mcp/` 等本地材料**禁止推送**（已写入 .gitignore，不要 `git add -f`）。
 - 前端包管理**只用 pnpm**，禁止 npm 和 yarn。项目级 `.npmrc` 指向 npmmirror。
 - 本机 Go 走 `GOPROXY=https://goproxy.cn,direct`；CI 在境外，使用默认源，不要把镜像写进 CI。
@@ -106,7 +110,8 @@ git checkout -- .
 | 检查 | `check-frontend` | 每次 push 和 PR | 是 | `pnpm install --frozen-lockfile`、type-check、vitest、build，产出 `frontend-dist` artifact |
 | 检查 | `check-client-linux` | 每次 push 和 PR | 是 | gofmt、tidy、vet、`test -race`、build（`-tags gtk3`） |
 | 检查 | `check-client-windows` | 每次 push 和 PR | 是 | vet、`test -race`、production GUI build。**这是真实 cgo Opus、DPAPI、WASAPI 唯一被测试的地方** |
-| 打包 | `package-server` | 标签 | 是 | linux amd64/arm64，tar.gz 内含二进制和 `migrations/` |
+| 检查 | `check-contract` | 每次 push 和 PR | 是 | 契约 ↔ 实现双向比对（`server/api/tests`，AST + 运行时注册表 + kin-openapi）、Go 生成物新鲜度、schemathesis 模糊测试（锁版本，固定 seed，断言无 5xx 与形状违约）。**阻塞发版** |
+| 打包 | `package-server` | 标签 | 是 | linux amd64/arm64，tar.gz 内含二进制；`migrations/` 已 embed 进二进制（#18），不再随包分发 |
 | 打包 | `package-client-windows` | 标签 | 是 | exe 加 NSIS 安装器（版本号从标签注入）加绿色版 zip |
 | 打包 | `package-client-linux` | 标签 | 是 | 矩阵 amd64/arm64：绿色版、deb、rpm（nfpm 锁版本） |
 | 打包 | `package-client-macos` | 标签 | **否** | 裸二进制 zip，实验性，`continue-on-error` |
@@ -144,19 +149,29 @@ git checkout -- .
 - 默认在 `main` 上小步提交、直接推送（个人项目现状）。
 - 以下改动走 `feat/*` 或 `fix/*` 分支并提 PR（CI 在 PR 上同样运行）：协议或信令变更、数据库迁移、跨多个批次的大改动，以及用户要求评审的改动。合并方式用 squash。
 
+### dev 分支工作流（2026-10-18 起，覆盖 v1.3.0 → v1.5.0）
+- 这一轮所有改动都在 `dev` 上做。**不合入 main、不打标签、不发版**，直到 v1.5.0 审查通过。
+- 三个版本**连续推进，中途不开审查 PR**。用户只在 v1.5.0 全部完成后审一次代码。
+- 每完成一个版本：该版本最后一次 push 的 CI 必须全绿，才能进入下一个版本。
+- v1.5.0 完工后开一个 `dev` → `main` 的 PR，描述里按版本分三段列出提交范围（`git log <版本起点>..dev --oneline`）并链接对应 issue。
+- 审查意见在 PR 上回复；对应的修正照常提交到 `dev`，提交信息引用单号。
+- v1.5.0 审查通过后才把 `dev` 一次性合入 `main`，之后才谈发版。
+- 实施由 SubAgent 在各自 worktree 完成，主会话负责派活、验收、合并、提交推送与监控 CI，**不亲自写实现代码**（节省主上下文）。
+
 ### Issue 跟踪（路线图功能已全部建单）
 - 路线图（`docs/演进建议.md`）与批三范围的每个功能都对应一个 issue，标签分三轴：目标版本（`v1.2.0`…`v2.0.0`/`backlog`）、优先级（`P0`/`P1`/`P2`）、领域（`area/client`、`area/server` 等）。
 - **动手前先认领**：从 issue 的"要点/验收"出发实现，不要在没单的情况下自行扩大范围。
 - **提交信息引用单号**：在摘要后加 `(#N)`，例：`feat(client): 全局热键与按键说话——三平台钩子与 PTT 门控 (#4)`。一次提交只关一个单；跨多个单的改动拆开提交。
-- **关闭时机**：该 issue 的改动已合并/推送且**这次 CI 全绿**后才 `gh issue close N --repo OpenALC/LiteTalk`。CI 没绿就留在 open，不要提前关。
+- **关闭时机（dev 工作流期间）**：该 issue 所属版本**已被用户审查通过且合并到 main** 后才 `gh issue close N --repo OpenALC/LiteTalk`。CI 全绿只说明可以进审查，不是关单条件。
+- dev 工作流之外仍按旧规则：改动已推送且这次 CI 全绿即可关。
 - 复现不出来或决定不做的单，在 issue 里写结论再关，**不留说不清的 open 单**。
 - 版本号以用户批准的执行计划为准，不要按 `docs/演进建议.md` §10 的旧表推断（该表已作废，只作推导留存）。已确认的顺延与修正：PTT 独立成批 = v1.2.0、批三 = v1.3.0、一键自托管 = v1.4.0，其后各版本顺延；**GTK4 迁移改到 v2.0.0**（issue #5，v1.3.0 起的 Linux 工作仍以 `-tags gtk3` 为前提）；**移动端延期不排期**（issue #55 移入 backlog）。
 
 ### 节奏（强制，不再逐次请示用户）
-1. 每完成一个功能：提交，`git push`，**等这次 push 的 CI 全绿**。CI 红了先修，不能带着红灯继续。
-2. 每完成一批：批内最后一次 push 的 CI 必须全绿，才能进入下一批。
-3. 所有批次完成后：本地做一次全量验证（第 3 节全部命令），并确认 main 上最新的 CI 是绿的。
-4. 打轻量标签：`git tag vX.Y.Z-alpha && git push origin vX.Y.Z-alpha`，监控这个标签的 CI 跑到 success，再到 Release 页核对产物清单：
+1. 每完成一个功能：提交，`git push` 到 `dev`，**等这次 push 的 CI 全绿**。CI 红了先修，不能带着红灯继续。
+2. 每完成一个版本：该版本最后一次 push 的 CI 必须全绿，才能进入下一个版本。
+3. 所有版本完成后：本地做一次全量验证（第 3 节全部命令），并确认 `dev` 上最新的 CI 是绿的。
+4. **打标签发版暂停**：dev 工作流期间（v1.3.0 → v1.5.0）禁止 `git tag` 和推送标签。用户审查通过并把 `dev` 合入 `main` 后，再按下面的清单发版：
    - Windows：setup.exe、portable.zip
    - Linux amd64/arm64：portable.tar.gz、deb、rpm
    - 服务端：amd64/arm64 tar.gz
@@ -193,9 +208,16 @@ git checkout -- .
 - 错误统一用 `writeErr(status, code, msg)`；500 必须在服务端记录底层错误。
 
 ### 协议变更
-- 信令消息类型目前有**两份手工同步的定义**：`server/internal/signal/protocol.go` 和 `client/internal/signal/protocol.go`。改一边必须同时改另一边，并补上两侧的测试。
-- REST 改动需要同步 `client/internal/state/api.go` 和 `client/frontend/src/api/types.ts`。
+- 信令消息类型的**单一事实源是 `api/signal/*.json`**（JSON Schema），由 `server/api/tools/signalgen` 生成两侧 `protocol_gen.go`（`server/internal/signal/` 与 `client/core/signal/`，除 package 行外**字节相同**）。**不要手改生成物**——要改消息就改 Schema 再跑生成器；CI 的 `check-server` 会因生成物不新鲜而红，`check-contract` 会因生成物与 Schema 脱钩而红。
+- 手写层只留 `Envelope`/`Identity`/`Bool` 等运行时辅助，且两边仍需逐字对齐。
+- REST 改动需要同步 `client/core/api` 与 `client/frontend/src/api/types.ts`（后者从 `types.gen.ts` re-export，REST 类型由 `api/openapi.yaml` 生成，改契约要重跑 `pnpm run gen:types`）。
 - 只做向后兼容的改动：新增字段可以；删字段或改语义需要升协议版本，并征得用户同意。
+
+### 客户端分层（#34）
+- `client/core/` 是与 UI 无关的业务层：`{api,audio,codec,config,gateway,hotkey,rtc,signal,voice}`。**`core/` 禁止 import `desktop/`、`wails`、`application`、`@wailsio`**——由 `client/core_boundary_test.go` 用 `go/ast` 机制性强制，改 `core/` 后必须 `go test -count=1 -run TestCoreForbidsDesktopImports .`（该测试运行时扫目录，**不加 `-count=1` 会命中测试缓存拿到旧结果**）。
+- `client/internal/` 现在只剩平台壳件；桌面适配层在 `app.go`（Wails 绑定、窗口、托盘、事件转发），只做适配，业务逻辑在 `core/`。
+- 音频热路径文件（`core/audio/{dsp,pipeline,mixer,ringbuffer,remote}.go`）**只做机械搬迁，不改逻辑**；搬迁前后基准必须一致（参考值：`BenchmarkSendOpus` 0 allocs、`SendOpusWrite/noext` 0、`SendOpusWrite/ext` 1——那 1 个是 pion stats 拦截器的 `header.Clone()`，非本项目代码）。
+- 报音频基准一律 `-benchtime=200x -count=3` 或默认 benchtime，**禁用 `-benchtime=1x`**（单次迭代会把懒初始化算进 alloc 计数，数字不可信）。
 
 ### 前端
 - 所有 Go 调用都经过 `src/api/bridge.ts`（`Call.ByName("main.App.<方法>")`），组件里不准直接 import `@wailsio/runtime`。
@@ -219,7 +241,7 @@ git checkout -- .
 ## 8. Agent 协作方式
 
 - 多步任务由主会话拆分并派给 SubAgent 执行，主会话负责分配任务、验收代码、修复阻断问题、提交和发版。里程碑或批次之间连续推进，**不逐步请示用户**。
-- 只有这些情况需要停下来问用户：破坏性操作、协议或数据不兼容、新增根目录文件、升级锁定版本、执行外部下载物、生产环境的写操作。
+- 只有这些情况需要停下来问用户：破坏性操作、协议或数据不兼容、升级锁定版本、执行外部下载物、生产环境的写操作。（新增根目录文件已获一次性授权，不再逐次问。）
 - 实现前先在 `docs/优化完善方案.md` 里找到对应条目；完成后在条目旁标注"✅ 已完成（提交号）"。如果发现新问题，追加登记到这份文档。
 - 跨会话的事实（部署状态、踩过的坑、用户偏好）写入长期记忆，不写进仓库。
 

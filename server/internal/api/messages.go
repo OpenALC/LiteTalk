@@ -1,6 +1,8 @@
 package api
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -8,91 +10,131 @@ import (
 	"github.com/OpenALC/LiteTalk/server/internal/store"
 )
 
-// handleListMessages GET /api/v1/channels/{id}/messages?before_id=&limit=（分页 50 条）
-func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
-	c := currentUser(r)
-	id, ok := pathID(w, r, "id")
-	if !ok {
-		return
+// ListMessages GET /api/v1/channels/{id}/messages?before=&after=&limit=（游标分页 50 条，#31）
+// 游标语义：before 取更旧一页（ID 小于游标最新 limit 条）、after 取更新一页，
+// 均按旧→新正序返回。禁 offset。before_id 是 before 的旧别名（兼容一个版本）。
+// 参数 fail-closed：显式 limit 越界 400 bad_limit，显式游标 <= 0 400 bad_cursor。
+func (s *Server) ListMessages(ctx context.Context, request ListMessagesRequestObject) (ListMessagesResponseObject, error) {
+	if e := checkID(request.Id); e != nil {
+		return nil, e
 	}
-	ch, err := s.store.ChannelByID(r.Context(), id)
+	c := currentUser(ctx)
+	ch, err := s.store.ChannelByID(ctx, request.Id)
 	if err != nil {
-		writeStoreErr(w, err)
-		return
+		return nil, s.writeStoreErr(ctx, err)
 	}
 	// 成员才能读频道消息。
-	if _, err := s.store.Member(r.Context(), ch.ServerID, c.UserID); err != nil {
-		writeErr(w, http.StatusForbidden, "forbidden", "不是服务器成员")
-		return
+	if _, err := s.store.Member(ctx, ch.ServerID, c.UserID); err != nil {
+		return nil, errf(http.StatusForbidden, "forbidden", "不是服务器成员")
 	}
-	var beforeID int64
-	if v := r.URL.Query().Get("before_id"); v != "" {
-		beforeID, _ = strconv.ParseInt(v, 10, 64)
-	}
-	limit := 50
-	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 50 {
-			limit = n
+	// 游标互斥：before（含旧别名 before_id）优先于 after。
+	// 显式给出的游标必须 > 0：0 不是合法消息 ID，不能当作「无游标」静默降级成
+	// 最新一页（契约 minimum:1，客户端传 0 说明它的游标状态已坏，应尽早暴露）。
+	var beforeID, afterID int64
+	if v := request.Params.Before; v != nil {
+		if *v <= 0 {
+			return nil, errf(http.StatusBadRequest, "bad_cursor", "游标须为正 ID")
 		}
+		beforeID = *v
+	} else if v := request.Params.BeforeId; v != nil {
+		if *v <= 0 {
+			return nil, errf(http.StatusBadRequest, "bad_cursor", "游标须为正 ID")
+		}
+		beforeID = *v // 旧参数别名（#31 兼容窗口，一个版本后移除）
+	} else if v := request.Params.After; v != nil {
+		if *v <= 0 {
+			return nil, errf(http.StatusBadRequest, "bad_cursor", "游标须为正 ID")
+		}
+		afterID = *v
 	}
-	msgs, err := s.store.MessagesBefore(r.Context(), id, beforeID, limit)
+	// limit 显式越界即 400，不再静默回落 50：契约（minimum:1, maximum:50）与
+	// 行为必须一致，否则调用方以为拿到了请求的条数。
+	limit := 50
+	if v := request.Params.Limit; v != nil {
+		if *v < 1 || *v > 50 {
+			return nil, errf(http.StatusBadRequest, "bad_limit", "limit 须为 1–50")
+		}
+		limit = *v
+	}
+	if afterID > 0 {
+		msgs, err := s.store.MessagesAfter(ctx, ch.ID, afterID, limit)
+		if err != nil {
+			return nil, s.writeStoreErr(ctx, err)
+		}
+		return ListMessages200JSONResponse(messageViews(msgs)), nil
+	}
+	msgs, err := s.store.MessagesBefore(ctx, ch.ID, beforeID, limit)
 	if err != nil {
-		writeStoreErr(w, err)
-		return
+		return nil, s.writeStoreErr(ctx, err)
 	}
-	writeJSON(w, http.StatusOK, msgs)
-}
-
-type createMessageReq struct {
-	Content string `json:"content"`
+	return ListMessages200JSONResponse(messageViews(msgs)), nil
 }
 
 // 消息发送频控：20 条/分钟/用户。
 const msgRateLimit = 20
 
-// handleCreateMessage POST /api/v1/channels/{id}/messages（≤2000 字 + 频控）
-func (s *Server) handleCreateMessage(w http.ResponseWriter, r *http.Request) {
-	c := currentUser(r)
-	id, ok := pathID(w, r, "id")
-	if !ok {
-		return
+// CreateMessage POST /api/v1/channels/{id}/messages（≤2000 字 + 频控 + nonce 幂等，#31）
+// nonce 幂等：同频道同用户同 nonce 只落一条，重复提交回读原消息 200（弱网重试对账）。
+// 幂等判断先于频控：重试撞上配额时也必须拿回原消息，而不是 429（审查 P2）。
+func (s *Server) CreateMessage(ctx context.Context, request CreateMessageRequestObject) (CreateMessageResponseObject, error) {
+	if e := checkID(request.Id); e != nil {
+		return nil, e
 	}
-	ch, err := s.store.ChannelByID(r.Context(), id)
+	if request.Body == nil {
+		return nil, bodyMissing()
+	}
+	c := currentUser(ctx)
+	ch, err := s.store.ChannelByID(ctx, request.Id)
 	if err != nil {
-		writeStoreErr(w, err)
-		return
+		return nil, s.writeStoreErr(ctx, err)
 	}
 	if ch.Type != store.ChannelText {
-		writeErr(w, http.StatusBadRequest, "bad_channel", "只能向文字频道发消息")
-		return
+		return nil, errf(http.StatusBadRequest, "bad_channel", "只能向文字频道发消息")
 	}
-	if _, err := s.store.Member(r.Context(), ch.ServerID, c.UserID); err != nil {
-		writeErr(w, http.StatusForbidden, "forbidden", "不是服务器成员")
-		return
+	if _, err := s.store.Member(ctx, ch.ServerID, c.UserID); err != nil {
+		return nil, errf(http.StatusForbidden, "forbidden", "不是服务器成员")
 	}
-	var req createMessageReq
-	if !decodeJSON(w, r, &req) {
-		return
+	content := request.Body.Content
+	if n := len([]rune(content)); n == 0 || n > 2000 {
+		return nil, errf(http.StatusBadRequest, "bad_content", "消息长度需为 1–2000 字符")
 	}
-	n := len([]rune(req.Content))
-	if n == 0 || n > 2000 {
-		writeErr(w, http.StatusBadRequest, "bad_content", "消息长度需为 1–2000 字符")
-		return
+	var nonce string
+	if request.Body.Nonce != nil {
+		nonce = *request.Body.Nonce
+		if len(nonce) > 64 {
+			return nil, errf(http.StatusBadRequest, "bad_nonce", "nonce 需为 0–64 字符")
+		}
 	}
-	allowed, err := s.limits.Allow(r.Context(), "msg:"+strconv.FormatInt(c.UserID, 10), msgRateLimit, time.Minute)
-	if err != nil || !allowed {
-		writeErr(w, http.StatusTooManyRequests, "rate_limited", "发送过于频繁")
-		return
+	// 幂等命中直接回原消息，不消耗频控配额（弱网重试先于配额判断）。
+	if nonce != "" {
+		orig, err := s.store.MessageByNonce(ctx, ch.ID, c.UserID, nonce)
+		if err == nil {
+			return CreateMessage200JSONResponse(messageView(orig)), nil
+		}
+		if !errors.Is(err, store.ErrNotFound) {
+			return nil, s.writeStoreErr(ctx, err)
+		}
+	}
+	if e := s.allowRate(ctx, "msg:"+strconv.FormatInt(c.UserID, 10), msgRateLimit, time.Minute, "发送过于频繁"); e != nil {
+		return nil, e
 	}
 	msg := &store.Message{
-		ChannelID: id,
+		ChannelID: ch.ID,
 		UserID:    c.UserID,
-		Content:   req.Content,
+		Content:   content,
+		Nonce:     nonce,
 	}
-	if err := s.store.CreateMessage(r.Context(), msg); err != nil {
-		writeStoreErr(w, err)
-		return
+	if err := s.store.CreateMessage(ctx, msg); err != nil {
+		// 撞 (channel_id, user_id, nonce) 唯一索引 = 幂等重放：回读原消息返回 200。
+		if nonce != "" && errors.Is(err, store.ErrConflict) {
+			orig, rerr := s.store.MessageByNonce(ctx, ch.ID, c.UserID, nonce)
+			if rerr != nil {
+				return nil, s.writeStoreErr(ctx, rerr)
+			}
+			return CreateMessage200JSONResponse(messageView(orig)), nil
+		}
+		return nil, s.writeStoreErr(ctx, err)
 	}
 	msg.SenderNickname, msg.SenderTag = c.Nickname, c.Tag
-	writeJSON(w, http.StatusCreated, msg)
+	return CreateMessage201JSONResponse(messageView(msg)), nil
 }

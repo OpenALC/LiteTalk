@@ -2,8 +2,12 @@ package store
 
 import (
 	"context"
+	"io/fs"
+	"math"
 	"os"
 	"testing"
+
+	"github.com/OpenALC/LiteTalk/server/migrations"
 )
 
 // openTestMySQL 连接真库；DSN 不可用时返回 nil（测试 t.Skip）。
@@ -33,30 +37,45 @@ func TestMySQLMigrateAndCRUD(t *testing.T) {
 	if _, err := m.DB().ExecContext(ctx, "USE litetalk_test"); err != nil {
 		t.Fatal(err)
 	}
-	// 清理历史。
-	for _, tbl := range []string{"invites", "messages", "channels", "server_members", "servers", "friendships", "users", "schema_migrations"} {
+	// 清理历史。必须覆盖每条迁移建过的表（否则跨运行不幂等：上一轮留下的表会让
+	// 下一轮 CREATE TABLE 直接 1050）——新增迁移建表要同步这张清单。
+	for _, tbl := range []string{
+		"invites", "messages", "channels", "categories", "server_members",
+		"servers", "friendships", "users", "user_sessions", "kv", "schema_migrations",
+	} {
 		_, _ = m.DB().ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl)
 	}
 
-	migDir := findMigrations(t)
-	if err := m.Migrate(ctx, migDir); err != nil {
+	migFS := findMigrations(t)
+	if err := m.Migrate(ctx, migFS); err != nil {
 		t.Fatalf("迁移失败: %v", err)
 	}
 	// 幂等：重复执行应跳过。
-	if err := m.Migrate(ctx, migDir); err != nil {
+	if err := m.Migrate(ctx, migFS); err != nil {
 		t.Fatalf("重复迁移应幂等: %v", err)
 	}
 
-	// 回滚验证 down 迁移。
-	if err := m.RollbackLast(ctx, migDir); err != nil {
-		t.Fatalf("回滚失败: %v", err)
+	// 回滚验证 down 迁移。迁移是叠放的，RollbackLast 只撤最新一个——只回滚一次
+	// 就断言 users 消失，是只有 0001_init 的年代写的，0002+ 落地后恒失败。
+	// 这里逐个回滚到空库，再验 users 确实没了。
+	for {
+		var left int
+		if err := m.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&left); err != nil {
+			t.Fatal(err)
+		}
+		if left == 0 {
+			break
+		}
+		if err := m.RollbackLast(ctx, migFS); err != nil {
+			t.Fatalf("回滚失败: %v", err)
+		}
 	}
 	var cnt int
 	if err := m.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='litetalk_test' AND table_name='users'").Scan(&cnt); err != nil || cnt != 0 {
 		t.Fatalf("回滚后 users 表应消失 cnt=%d err=%v", cnt, err)
 	}
 	// 再迁移回来。
-	if err := m.Migrate(ctx, migDir); err != nil {
+	if err := m.Migrate(ctx, migFS); err != nil {
 		t.Fatalf("二次迁移失败: %v", err)
 	}
 
@@ -72,16 +91,95 @@ func TestMySQLMigrateAndCRUD(t *testing.T) {
 	if err := m.CreateUser(ctx, &User{Email: "t@ex.com", Nickname: "x", Tag: "0002"}); err != ErrConflict {
 		t.Fatalf("邮箱唯一约束未生效: %v", err)
 	}
-}
+	// 大 Snowflake ID + 4 位 tag（含前导零）写入并按 昵称#tag 查回（#22）。
+	uBig := &User{ID: math.MaxInt64 - 7919, Email: "big@ex.com", Nickname: "big-user", Tag: "0042", PasswordHash: "h"}
+	if err := m.CreateUser(ctx, uBig); err != nil {
+		t.Fatalf("大 ID CreateUser: %v", err)
+	}
+	if got, err := m.UserByNicknameTag(ctx, "big-user", "0042"); err != nil || got.ID != uBig.ID || got.Tag != "0042" {
+		t.Fatalf("大 ID UserByNicknameTag: %+v %v", got, err)
+	}
 
-// findMigrations 定位 migrations 目录（相对本包 ../../migrations）。
-func findMigrations(t *testing.T) string {
-	t.Helper()
-	for _, p := range []string{"../../migrations", "../migrations", "migrations"} {
-		if _, err := os.Stat(p); err == nil {
-			return p
+	// 分类改名/重排（0.1.2 PATCH）：MySQL 事务路径与 Mem 同语义。
+	sv := &Server{Name: "cat-srv", OwnerID: u.ID, IconName: "music", IconColor: "#4FA4F3"}
+	if err := m.CreateServer(ctx, sv); err != nil {
+		t.Fatalf("CreateServer: %v", err)
+	}
+	catIDs := []int64{}
+	for i, name := range []string{"a", "b", "c"} {
+		c := &Category{ServerID: sv.ID, Name: name, Position: i}
+		if err := m.CreateCategory(ctx, c); err != nil {
+			t.Fatalf("CreateCategory: %v", err)
+		}
+		catIDs = append(catIDs, c.ID)
+	}
+	upd := &Category{ID: catIDs[0], ServerID: sv.ID, Name: "a2", Position: 0}
+	if err := m.UpdateCategory(ctx, upd); err != nil {
+		t.Fatalf("UpdateCategory: %v", err)
+	}
+	// 原样保存（值全同）必须成功：MySQL 无 clientFoundRows 时报 0 行受影响，
+	// 不能误判不存在（与 Mem 对齐）；不存在的 id 仍须 ErrNotFound。
+	if err := m.UpdateCategory(ctx, upd); err != nil {
+		t.Fatalf("原样保存应成功: %v", err)
+	}
+	miss := *upd
+	miss.ID = 999999
+	if err := m.UpdateCategory(ctx, &miss); err != ErrNotFound {
+		t.Fatalf("不存在 id 应 ErrNotFound: %v", err)
+	}
+	// 末位移到最前，重排为 0..n-1。
+	if err := m.ReorderCategories(ctx, sv.ID, catIDs[2], 0); err != nil {
+		t.Fatalf("ReorderCategories: %v", err)
+	}
+	list, err := m.CategoriesOfServer(ctx, sv.ID)
+	if err != nil || len(list) != 3 {
+		t.Fatalf("CategoriesOfServer: %v %v", list, err)
+	}
+	want := []int64{catIDs[2], catIDs[0], catIDs[1]}
+	for i, c := range list {
+		if c.ID != want[i] || c.Position != i {
+			t.Fatalf("重排后[%d] = %+v，期望 id=%d pos=%d", i, c, want[i], i)
 		}
 	}
-	t.Fatal("找不到 migrations 目录")
-	return ""
+	if list[1].Name != "a2" {
+		t.Fatalf("改名未生效: %+v", list[1])
+	}
+
+	// 邀请码消费与加入成员同一事务（#22）：重复加入不消耗次数。
+	uJoin := &User{Email: "join@ex.com", Nickname: "joiner", Tag: "0003", PasswordHash: "h"}
+	if err := m.CreateUser(ctx, uJoin); err != nil {
+		t.Fatalf("CreateUser(joiner): %v", err)
+	}
+	if err := m.CreateInvite(ctx, &Invite{Code: "join001", ServerID: sv.ID, CreatorID: u.ID, MaxUses: 1}); err != nil {
+		t.Fatalf("CreateInvite: %v", err)
+	}
+	jm, err := m.UseInviteAndAddMember(ctx, "join001", uJoin.ID, RoleMember)
+	if err != nil {
+		t.Fatalf("UseInviteAndAddMember: %v", err)
+	}
+	if jm.ServerID != sv.ID || jm.Role != RoleMember || jm.JoinedAt.IsZero() {
+		t.Fatalf("返回成员不符: %+v", jm)
+	}
+	if _, err := m.UseInviteAndAddMember(ctx, "join001", uJoin.ID, RoleMember); err != ErrConflict {
+		t.Fatalf("重复加入应 ErrConflict，实际 %v", err)
+	}
+	if inv, _ := m.InviteByCode(ctx, "join001"); inv.Uses != 1 {
+		t.Fatalf("成员冲突不应消耗邀请码，uses = %d", inv.Uses)
+	}
+	if _, err := m.UseInviteAndAddMember(ctx, "join001", u.ID, RoleMember); err != ErrConflict {
+		t.Fatalf("次数用尽应 ErrConflict，实际 %v", err)
+	}
+
+	// 频道分类归属（#72）：与 Mem 共用同一套断言，两边语义漂移会直接测挂。
+	assertChannelCategoryPersist(t, m)
+}
+
+// findMigrations 定位迁移文件：优先 embed（migrations.FS），回退磁盘目录。
+func findMigrations(t *testing.T) fs.FS {
+	t.Helper()
+	// 磁盘目录覆盖测试（LITETALK_MIGRATIONS_DIR 指定时验证 os.DirFS 路径）。
+	if dir := os.Getenv("LITETALK_MIGRATIONS_DIR"); dir != "" {
+		return os.DirFS(dir)
+	}
+	return migrations.FS
 }

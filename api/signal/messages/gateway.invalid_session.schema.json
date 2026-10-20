@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litetalk:signal:gateway.invalid_session",
+  "title": "GatewayInvalidSessionData",
+  "x-wire-type": "gateway.invalid_session",
+  "x-go-const": "TypeGatewayInvalidSession",
+  "x-direction": "S2C",
+  "x-since": 2,
+  "x-namespace": "session",
+  "description": "续传失败（#32）。reason=unknown_session：会话未知或与当前连接不符；seq_expired：缺失事件已滚出环（含序号超前于环现状）。客户端收到后放弃补发，走 REST 全量补拉（服务器/频道/好友/最近消息），更新本地后继续收新事件；本地按消息 id 幂等去重（补拉与在途增量可能重叠）。",
+  "type": "object",
+  "properties": {
+    "reason": {
+      "type": "string",
+      "enum": ["unknown_session", "seq_expired"],
+      "description": "失败原因"
+    },
+    "latest_seq": {
+      "type": "integer",
+      "minimum": 0,
+      "x-go-omitempty": true,
+      "description": "服务端环当前最大 seq（0=无环/空环），客户端据此重置序号基准"
+    }
+  },
+  "required": ["reason"],
+  "additionalProperties": false
+}

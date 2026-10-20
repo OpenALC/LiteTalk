@@ -29,3 +29,7 @@ client/build/bin/
 .task/
 dist/
 *.exe
+
+# 服务端默认数据目录（SQLite、证书缓存、自动生成的 jwt.secret）
+/data/
+/server/data/

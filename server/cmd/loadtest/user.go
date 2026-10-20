@@ -173,7 +173,7 @@ func (u *loadUser) readLoop(ctx context.Context) {
 				continue
 			}
 			u.handleRenegotiation(d.SDP)
-		case signal.TypeRTCICE:
+		case signal.TypeRTCIce:
 			var d webrtc.ICECandidateInit
 			if env.Decode(&d) != nil {
 				continue
@@ -219,7 +219,7 @@ func (u *loadUser) startPeer() error {
 		if ic == nil {
 			return
 		}
-		_ = u.wsSend(signal.TypeRTCICE, ic.ToJSON())
+		_ = u.wsSend(signal.TypeRTCIce, ic.ToJSON())
 	})
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
 		if s == webrtc.PeerConnectionStateConnected {

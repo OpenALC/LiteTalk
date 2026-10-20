@@ -4,7 +4,8 @@
 //   组内在线在前离线置灰；搜索过滤跨组。
 // - 右键：设置备注 / 移动分组 / 删除好友（删除二次确认）。
 // - 私聊仍为占位提示（服务端无私聊实体）；「加入TA的频道」因服务端无
-//   好友在线/所在频道数据暂不显示（inChannel 恒 false）。
+//   「好友所在频道」数据暂不显示（inChannel 恒 false）。在线点接真实
+//   presence（#11），两态：在线/离线。
 import { computed, onMounted, ref } from 'vue'
 import {
   ChevronDown, MessageCircle, Search, UserPlus, AudioLines,
@@ -25,6 +26,8 @@ const closedGroups = ref<Record<string, boolean>>({})
 
 onMounted(() => {
   // 拉取好友列表；失败静默（不影响主界面）。
+  // presence:update / data:resync 的订阅在 MainView 统一绑定（#78）：好友栏
+  // 可隐藏，订阅不能随本组件的挂载/卸载而丢。
   friends.loadFriends().catch(() => {})
 })
 
@@ -141,7 +144,7 @@ async function onPromptConfirm(value: string) {
 }
 
 // acceptPending 接受好友请求。
-async function acceptPending(id: number) {
+async function acceptPending(id: string) {
   try {
     await friends.acceptRequest(id)
     notify.show('已接受好友请求')
@@ -164,8 +167,7 @@ async function acceptPending(id: number) {
         <input v-model="query" placeholder="搜索好友...">
       </div>
 
-      <!-- data-ctx：好友区自定义右键菜单（全局拦截白名单，走查 7） -->
-      <div class="f-scroll" data-ctx>
+      <div class="f-scroll">
         <!-- 待处理：incoming=对方发来的（可接受）；outgoing=我发出的（S3：仅展示） -->
         <template v-if="friends.pending.length && !query">
           <div class="f-group"><ChevronDown :size="12" />待处理 — {{ friends.pending.length }}</div>

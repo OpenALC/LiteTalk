@@ -1,9 +1,12 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/OpenALC/LiteTalk/server/internal/store"
@@ -38,250 +41,235 @@ func validIcon(name, color string) bool {
 	return true
 }
 
-type createServerReq struct {
-	Name      string `json:"name"`
-	IconName  string `json:"icon_name"`
-	IconColor string `json:"icon_color"`
-}
-
-// handleCreateServer POST /api/v1/servers
-func (s *Server) handleCreateServer(w http.ResponseWriter, r *http.Request) {
-	c := currentUser(r)
-	var req createServerReq
-	if !decodeJSON(w, r, &req) {
-		return
+// CreateServer POST /api/v1/servers
+func (s *Server) CreateServer(ctx context.Context, request CreateServerRequestObject) (CreateServerResponseObject, error) {
+	if request.Body == nil {
+		return nil, bodyMissing()
 	}
+	c := currentUser(ctx)
+	req := request.Body
 	if !validServerName(req.Name) {
-		writeErr(w, http.StatusBadRequest, "bad_name", "名称需为 2–32 个字符")
-		return
+		return nil, errf(http.StatusBadRequest, "bad_name", "名称需为 2–32 个字符")
 	}
-	if req.IconName == "" {
-		req.IconName = "messages-square"
+	name, color := req.Name, "#4FA4F3"
+	if req.IconColor != nil && *req.IconColor != "" {
+		color = *req.IconColor
 	}
-	if req.IconColor == "" {
-		req.IconColor = "#4FA4F3"
+	icon := "messages-square"
+	if req.IconName != nil && *req.IconName != "" {
+		icon = *req.IconName
 	}
-	if !validIcon(req.IconName, req.IconColor) {
-		writeErr(w, http.StatusBadRequest, "bad_icon", "图标或颜色不合法")
-		return
+	if !validIcon(icon, color) {
+		return nil, errf(http.StatusBadRequest, "bad_icon", "图标或颜色不合法")
 	}
 	srv := &store.Server{
-		Name:      req.Name,
+		Name:      name,
 		OwnerID:   c.UserID,
-		IconName:  req.IconName,
-		IconColor: req.IconColor,
+		IconName:  icon,
+		IconColor: color,
 	}
-	if err := s.store.CreateServer(r.Context(), srv); err != nil {
-		writeStoreErr(w, err)
-		return
+	if err := s.store.CreateServer(ctx, srv); err != nil {
+		return nil, s.writeStoreErr(ctx, err)
 	}
 	// 创建者自动成为 owner 成员。
 	mem := &store.ServerMember{ServerID: srv.ID, UserID: c.UserID, Role: store.RoleOwner}
-	if err := s.store.AddMember(r.Context(), mem); err != nil {
-		writeStoreErr(w, err)
-		return
+	if err := s.store.AddMember(ctx, mem); err != nil {
+		return nil, s.writeStoreErr(ctx, err)
 	}
-	writeJSON(w, http.StatusCreated, srv)
+	return CreateServer201JSONResponse(serverView(srv)), nil
 }
 
-// handleListServers GET /api/v1/servers
-func (s *Server) handleListServers(w http.ResponseWriter, r *http.Request) {
-	c := currentUser(r)
-	servers, err := s.store.ServersOfUser(r.Context(), c.UserID)
+// ListServers GET /api/v1/servers
+func (s *Server) ListServers(ctx context.Context, request ListServersRequestObject) (ListServersResponseObject, error) {
+	c := currentUser(ctx)
+	servers, err := s.store.ServersOfUser(ctx, c.UserID)
 	if err != nil {
-		writeStoreErr(w, err)
-		return
+		return nil, s.writeStoreErr(ctx, err)
 	}
-	writeJSON(w, http.StatusOK, servers)
+	return ListServers200JSONResponse(serverViews(servers)), nil
 }
 
-type patchServerReq struct {
-	Name      *string `json:"name"`
-	IconName  *string `json:"icon_name"`
-	IconColor *string `json:"icon_color"`
-}
-
-// handlePatchServer PATCH /api/v1/servers/{id}（仅 owner/admin）
-func (s *Server) handlePatchServer(w http.ResponseWriter, r *http.Request) {
-	c := currentUser(r)
-	id, ok := pathID(w, r, "id")
-	if !ok {
-		return
+// PatchServer PATCH /api/v1/servers/{id}（仅 owner/admin）
+func (s *Server) PatchServer(ctx context.Context, request PatchServerRequestObject) (PatchServerResponseObject, error) {
+	if e := checkID(request.Id); e != nil {
+		return nil, e
 	}
-	if !s.requireRole(w, r, id, c.UserID, store.RoleAdmin) {
-		return
+	req := patchBody(request.JSONBody, request.ApplicationMergePatchPlusJSONBody)
+	if req == nil {
+		return nil, bodyMissing()
 	}
-	srv, err := s.store.ServerByID(r.Context(), id)
+	c := currentUser(ctx)
+	if e := s.requireRole(ctx, request.Id, c.UserID, store.RoleAdmin); e != nil {
+		return nil, e
+	}
+	srv, err := s.store.ServerByID(ctx, request.Id)
 	if err != nil {
-		writeStoreErr(w, err)
-		return
+		return nil, s.writeStoreErr(ctx, err)
 	}
-	var req patchServerReq
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	if req.Name != nil {
-		if !validServerName(*req.Name) {
-			writeErr(w, http.StatusBadRequest, "bad_name", "名称需为 2–32 个字符")
-			return
+	// Merge Patch（#31）：缺省不改，null = 清空（名称/图标不可清 → 校验拒 400）。
+	if req.Name.Set {
+		if !validServerName(req.Name.Val) {
+			return nil, errf(http.StatusBadRequest, "bad_name", "名称需为 2–32 个字符")
 		}
-		srv.Name = *req.Name
+		srv.Name = req.Name.Val
 	}
-	if req.IconName != nil {
-		srv.IconName = *req.IconName
+	if req.IconName.Set {
+		srv.IconName = req.IconName.Val
 	}
-	if req.IconColor != nil {
-		srv.IconColor = *req.IconColor
+	if req.IconColor.Set {
+		srv.IconColor = req.IconColor.Val
 	}
 	if !validIcon(srv.IconName, srv.IconColor) {
-		writeErr(w, http.StatusBadRequest, "bad_icon", "图标或颜色不合法")
-		return
+		return nil, errf(http.StatusBadRequest, "bad_icon", "图标或颜色不合法")
 	}
-	if err := s.store.UpdateServer(r.Context(), srv); err != nil {
-		writeStoreErr(w, err)
-		return
+	if err := s.store.UpdateServer(ctx, srv); err != nil {
+		return nil, s.writeStoreErr(ctx, err)
 	}
-	writeJSON(w, http.StatusOK, srv)
+	return PatchServer200JSONResponse(serverView(srv)), nil
 }
 
-// handleDeleteServer DELETE /api/v1/servers/{id}（仅 owner）
-func (s *Server) handleDeleteServer(w http.ResponseWriter, r *http.Request) {
-	c := currentUser(r)
-	id, ok := pathID(w, r, "id")
-	if !ok {
-		return
+// DeleteServer DELETE /api/v1/servers/{id}（仅 owner）
+func (s *Server) DeleteServer(ctx context.Context, request DeleteServerRequestObject) (DeleteServerResponseObject, error) {
+	if e := checkID(request.Id); e != nil {
+		return nil, e
 	}
-	if !s.requireRole(w, r, id, c.UserID, store.RoleOwner) {
-		return
+	c := currentUser(ctx)
+	// 仅 owner 可删（requireRole 的「不是成员 / 权限不足」文案区分保留）。
+	if e := s.requireRole(ctx, request.Id, c.UserID, store.RoleOwner); e != nil {
+		return nil, e
 	}
-	if err := s.store.DeleteServer(r.Context(), id); err != nil {
-		writeStoreErr(w, err)
-		return
+	// 删前记下频道 ID，删后逐个踢出房间成员（#22）。
+	channels, _ := s.store.ChannelsOfServer(ctx, request.Id)
+	if err := s.store.DeleteServer(ctx, request.Id); err != nil {
+		return nil, s.writeStoreErr(ctx, err)
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	if s.hub != nil {
+		for _, ch := range channels {
+			s.hub.KickChannel(strconv.FormatInt(ch.ID, 10), "server_deleted")
+		}
+	}
+	return DeleteServer200JSONResponse{Status: "ok"}, nil
 }
 
-type joinServerReq struct {
-	Code string `json:"code"`
-}
-
-// handleJoinServer POST /api/v1/servers/join（邀请码）
-func (s *Server) handleJoinServer(w http.ResponseWriter, r *http.Request) {
-	c := currentUser(r)
-	var req joinServerReq
-	if !decodeJSON(w, r, &req) {
-		return
+// JoinServer POST /api/v1/servers/join（邀请码）
+func (s *Server) JoinServer(ctx context.Context, request JoinServerRequestObject) (JoinServerResponseObject, error) {
+	if request.Body == nil {
+		return nil, bodyMissing()
 	}
-	if req.Code == "" {
-		writeErr(w, http.StatusBadRequest, "bad_request", "缺少邀请码")
-		return
+	c := currentUser(ctx)
+	if request.Body.Code == "" {
+		return nil, errf(http.StatusBadRequest, "bad_request", "缺少邀请码")
 	}
-	inv, err := s.store.InviteByCode(r.Context(), req.Code)
+	inv, err := s.store.InviteByCode(ctx, request.Body.Code)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "bad_code", "邀请码无效")
-		return
+		return nil, errf(http.StatusNotFound, "bad_code", "邀请码无效")
 	}
 	if inv.ExpiresAt != nil && time.Now().After(*inv.ExpiresAt) {
-		writeErr(w, http.StatusGone, "code_expired", "邀请码已过期")
-		return
+		return nil, errf(http.StatusGone, "code_expired", "邀请码已过期")
 	}
 	// 已是成员直接返回。
-	if _, err := s.store.Member(r.Context(), inv.ServerID, c.UserID); err == nil {
-		srv, _ := s.store.ServerByID(r.Context(), inv.ServerID)
-		writeJSON(w, http.StatusOK, srv)
-		return
+	if _, err := s.store.Member(ctx, inv.ServerID, c.UserID); err == nil {
+		srv, _ := s.store.ServerByID(ctx, inv.ServerID)
+		return JoinServer200JSONResponse(serverView(srv)), nil
 	}
-	if err := s.store.UseInvite(r.Context(), inv.Code); err != nil {
-		writeErr(w, http.StatusConflict, "code_exhausted", "邀请码使用次数已达上限")
-		return
+	// 消费邀请码与加入成员同一事务（#22）：中途失败时邀请码次数不增长。
+	if _, err := s.store.UseInviteAndAddMember(ctx, inv.Code, c.UserID, store.RoleMember); err != nil {
+		switch {
+		case errors.Is(err, store.ErrConflict):
+			// 邀请码用尽；也可能是同一用户的并发请求已先一步加入，后者按幂等成功返回。
+			if _, e := s.store.Member(ctx, inv.ServerID, c.UserID); e == nil {
+				srv, e := s.store.ServerByID(ctx, inv.ServerID)
+				if e != nil {
+					return nil, s.writeStoreErr(ctx, e)
+				}
+				return JoinServer200JSONResponse(serverView(srv)), nil
+			}
+			return nil, errf(http.StatusConflict, "code_exhausted", "邀请码使用次数已达上限")
+		case errors.Is(err, store.ErrExpired):
+			return nil, errf(http.StatusGone, "code_expired", "邀请码已过期")
+		case errors.Is(err, store.ErrNotFound):
+			return nil, errf(http.StatusNotFound, "bad_code", "邀请码无效")
+		}
+		return nil, s.writeStoreErr(ctx, err)
 	}
-	mem := &store.ServerMember{ServerID: inv.ServerID, UserID: c.UserID, Role: store.RoleMember}
-	if err := s.store.AddMember(r.Context(), mem); err != nil {
-		writeStoreErr(w, err)
-		return
-	}
-	srv, err := s.store.ServerByID(r.Context(), inv.ServerID)
+	srv, err := s.store.ServerByID(ctx, inv.ServerID)
 	if err != nil {
-		writeStoreErr(w, err)
-		return
+		return nil, s.writeStoreErr(ctx, err)
 	}
-	writeJSON(w, http.StatusOK, srv)
+	return JoinServer200JSONResponse(serverView(srv)), nil
 }
 
-// handleServerMembers GET /api/v1/servers/{id}/members
-func (s *Server) handleServerMembers(w http.ResponseWriter, r *http.Request) {
-	c := currentUser(r)
-	id, ok := pathID(w, r, "id")
-	if !ok {
-		return
+// ListServerMembers GET /api/v1/servers/{id}/members
+func (s *Server) ListServerMembers(ctx context.Context, request ListServerMembersRequestObject) (ListServerMembersResponseObject, error) {
+	if e := checkID(request.Id); e != nil {
+		return nil, e
 	}
+	c := currentUser(ctx)
 	// 必须是成员才能看成员列表。
-	if _, err := s.store.Member(r.Context(), id, c.UserID); err != nil {
-		writeErr(w, http.StatusForbidden, "forbidden", "不是服务器成员")
-		return
+	if _, err := s.store.Member(ctx, request.Id, c.UserID); err != nil {
+		return nil, errf(http.StatusForbidden, "forbidden", "不是服务器成员")
 	}
-	members, err := s.store.MembersOfServer(r.Context(), id)
+	members, err := s.store.MembersOfServer(ctx, request.Id)
 	if err != nil {
-		writeStoreErr(w, err)
-		return
+		return nil, s.writeStoreErr(ctx, err)
 	}
-	writeJSON(w, http.StatusOK, members)
+	// ETag 协商（#31）：内容哈希弱标签，命中 If-None-Match 回 304。
+	// 在线态是视图的一部分：presence 变化会让 ETag 变化（#11）。
+	view := s.serverMemberViews(ctx, members)
+	etag := contentETag(view)
+	setETag(ctx, etag)
+	if etagMatch(ifNoneMatch(ctx), etag) {
+		return ListServerMembers304Response{}, nil
+	}
+	return ListServerMembers200JSONResponse(view), nil
 }
 
-type createInviteReq struct {
-	MaxUses   int   `json:"max_uses"`   // 0 = 不限
-	ExpiresIn int64 `json:"expires_in"` // 秒；0 = 不过期
-}
-
-// handleCreateInvite POST /api/v1/servers/{id}/invites
-func (s *Server) handleCreateInvite(w http.ResponseWriter, r *http.Request) {
-	c := currentUser(r)
-	id, ok := pathID(w, r, "id")
-	if !ok {
-		return
+// CreateInvite POST /api/v1/servers/{id}/invites
+func (s *Server) CreateInvite(ctx context.Context, request CreateInviteRequestObject) (CreateInviteResponseObject, error) {
+	if e := checkID(request.Id); e != nil {
+		return nil, e
 	}
-	if !s.requireRole(w, r, id, c.UserID, store.RoleAdmin) {
-		return
+	if request.Body == nil {
+		return nil, bodyMissing()
 	}
-	var req createInviteReq
-	if !decodeJSON(w, r, &req) {
-		return
+	c := currentUser(ctx)
+	if e := s.requireRole(ctx, request.Id, c.UserID, store.RoleAdmin); e != nil {
+		return nil, e
+	}
+	req := request.Body
+	// 邀请参数校验（#22）：max_uses 不可为负。
+	if req.MaxUses != nil && *req.MaxUses < 0 {
+		return nil, errf(http.StatusBadRequest, "bad_request", "max_uses 不可为负")
 	}
 	code, err := randomCode(12)
 	if err != nil {
-		writeStoreErr(w, err)
-		return
+		return nil, s.writeStoreErr(ctx, err)
 	}
-	inv := &store.Invite{
-		Code:      code,
-		ServerID:  id,
-		CreatorID: c.UserID,
-		MaxUses:   req.MaxUses,
+	inv := &store.Invite{Code: code, ServerID: request.Id, CreatorID: c.UserID}
+	if req.MaxUses != nil {
+		inv.MaxUses = *req.MaxUses
 	}
-	if req.ExpiresIn > 0 {
-		t := time.Now().Add(time.Duration(req.ExpiresIn) * time.Second)
+	if req.ExpiresIn != nil && *req.ExpiresIn > 0 {
+		t := time.Now().Add(time.Duration(*req.ExpiresIn) * time.Second)
 		inv.ExpiresAt = &t
 	}
-	if err := s.store.CreateInvite(r.Context(), inv); err != nil {
-		writeStoreErr(w, err)
-		return
+	if err := s.store.CreateInvite(ctx, inv); err != nil {
+		return nil, s.writeStoreErr(ctx, err)
 	}
-	writeJSON(w, http.StatusCreated, inv)
+	return CreateInvite201JSONResponse(inviteView(inv)), nil
 }
 
-// requireRole 校验成员角色；不足返回 false 并已写响应。
-func (s *Server) requireRole(w http.ResponseWriter, r *http.Request, serverID, userID int64, min store.MemberRole) bool {
-	mem, err := s.store.Member(r.Context(), serverID, userID)
+// requireRole 校验成员角色；返回 nil 表示通过（错误文案区分「不是成员/权限不足」）。
+func (s *Server) requireRole(ctx context.Context, serverID, userID int64, min store.MemberRole) *apiErr {
+	mem, err := s.store.Member(ctx, serverID, userID)
 	if err != nil {
-		writeErr(w, http.StatusForbidden, "forbidden", "不是服务器成员")
-		return false
+		return errf(http.StatusForbidden, "forbidden", "不是服务器成员")
 	}
 	rank := map[store.MemberRole]int{store.RoleMember: 1, store.RoleAdmin: 2, store.RoleOwner: 3}
 	if rank[mem.Role] < rank[min] {
-		writeErr(w, http.StatusForbidden, "forbidden", "权限不足")
-		return false
+		return errf(http.StatusForbidden, "forbidden", "权限不足")
 	}
-	return true
+	return nil
 }
 
 // randomCode 生成 n 字节随机 hex 邀请码。

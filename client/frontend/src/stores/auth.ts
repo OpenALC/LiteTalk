@@ -2,6 +2,39 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { eventsOn, goApp } from '../api/bridge'
 import type { ServerConfig, UserProfile } from '../api/types'
+import { useChatStore } from './chat'
+import { useFriendsStore, useServersStore } from './data'
+import { useNotifyStore } from './notify'
+import { useVoiceStore } from './voice'
+
+// resetSessionStores 业务 store 统一复位（#85）：主动登出、被踢、跨域换服与
+// 登录新账号前都走这里。逐个 try——单个 store 复位失败不能阻断后续，否则
+// 残留数据会跨账号带过去。各 store 的订阅不在复位范围（MainView 卸载时
+// unbindEvents 按监听器逐个注销，登录后重新 bind）。
+function resetSessionStores() {
+  const resets: Array<() => void> = [
+    () => useServersStore().resetAll(),
+    () => useFriendsStore().resetAll(),
+    () => useVoiceStore().resetAll(),
+    () => useChatStore().resetAll(),
+  ]
+  for (const reset of resets) {
+    try {
+      reset()
+    } catch {
+      // 单个失败不阻断后续；下一个入口（登录）会再复位一次。
+    }
+  }
+}
+
+// kickedBannerText 登录页被踢横幅文案。reason 来自 auth:kicked：
+// login_expired 是 refresh_token 被服务端吊销（#84 复审 4.1），server_changed
+// 是换服后令牌不被新服务器接受——都不是异地登录，文案必须分开。
+export function kickedBannerText(reason: string): string {
+  if (reason === 'server_changed') return '当前令牌不被新服务器接受，请重新登录'
+  if (reason === 'login_expired') return '登录已过期，请重新登录'
+  return '账号已在其他设备登录'
+}
 
 export const useAuthStore = defineStore('auth', () => {
   const user = ref<UserProfile | null>(null)
@@ -9,15 +42,24 @@ export const useAuthStore = defineStore('auth', () => {
   // 信令连接态：false 时主界面顶部显示「信令连接中」提示条（Go 侧重试中）。
   const signalOk = ref(true)
 
-  // kickedReason 被踢下线原因（auth:kicked 载荷 reason）：非空表示本端已在
-  // 其他设备登录被登出。跨组件的传输通道——LoginView 进入时取走并清，
-  // 横幅文案固定，不按 reason 分支。
+  // shutdown 服务端优雅关闭原因（sys:shutdown 载荷 reason）：非空表示 Go 侧已停
+  // 自动重连、信令不会再连上。此时提示条要改口为「服务端已关闭」——继续显示
+  // 「信令连接中」是在骗用户（那边根本没在重试）。
+  const shutdown = ref('')
+
+  // kickedReason 被踢下线原因（auth:kicked 载荷 reason）：非空表示本端会话已被
+  // Go 侧清除。跨组件的传输通道——LoginView 进入时取走并清，横幅文案按 reason
+  // 分支（见 kickedBannerText：server_changed 换服、login_expired 刷新令牌被
+  // 吊销，均区别于 login_elsewhere 异地登录）。
   const kickedReason = ref('')
 
   // 服务端能力开关（启动时拉取一次，注册/找回页据此适配 UI）。
-  const serverCfg = ref<ServerConfig>({ auth_mode: 'full', mail_configured: false })
+  const serverCfg = ref<ServerConfig>({ auth_mode: 'full', mail_configured: false, self_host: false, bootstrap_required: false })
   const simpleMode = computed(() => serverCfg.value.auth_mode === 'simple')
   const mailConfigured = computed(() => serverCfg.value.mail_configured)
+  // 自托管引导（#27）：self_host 或邀请码未消费时注册页显示可选邀请码输入。
+  const showInviteField = computed(() => !!serverCfg.value.self_host || !!serverCfg.value.bootstrap_required)
+  const bootstrapRequired = computed(() => !!serverCfg.value.bootstrap_required)
 
   async function loadConfig() {
     try {
@@ -29,27 +71,35 @@ export const useAuthStore = defineStore('auth', () => {
 
   async function login(email: string, password: string) {
     const r = await goApp().Login(email, password)
+    // 新会话从干净态开始（#85）：不依赖上一个账号一定走过 logout——会话过期
+    // 被引导回登录页时，业务 store 里可能仍留着旧账号的服务器/好友。
+    resetSessionStores()
     user.value = r.user
     loggedIn.value = true
     signalOk.value = r.session_ok !== false
     clearKickedReason() // 新登录覆盖被踢态，下次进登录页不残留横幅
+    clearShutdown() // 同理：连上的是新会话，旧的「服务端已关闭」不该带过来
   }
 
-  async function register(nickname: string, email: string, password: string, code: string) {
-    const r = await goApp().Register(nickname, email, password, code)
+  async function register(nickname: string, email: string, password: string, code: string, bootstrap = '') {
+    const r = await goApp().Register(nickname, email, password, code, bootstrap)
+    resetSessionStores()
     user.value = r.user
     loggedIn.value = true
     signalOk.value = r.session_ok !== false
     clearKickedReason()
+    clearShutdown()
   }
 
   // 游客一键进入（simple 模式）。Go 侧负责复用已记住的游客身份（refresh 轮换）。
   async function guest() {
     const r = await goApp().LoginAsGuest()
+    resetSessionStores()
     user.value = r.user
     loggedIn.value = true
     signalOk.value = r.session_ok !== false
     clearKickedReason()
+    clearShutdown()
   }
 
   // setSignalOk 由 MainView 订阅 auth:session 事件调用（Go 侧重试/断线状态变化）。
@@ -65,6 +115,14 @@ export const useAuthStore = defineStore('auth', () => {
     kickedReason.value = ''
   }
 
+  function setShutdown(reason: string) {
+    shutdown.value = reason || 'shutdown'
+  }
+
+  function clearShutdown() {
+    shutdown.value = ''
+  }
+
   async function sendEmailCode(email: string, purpose: 'register' | 'reset') {
     await goApp().SendEmailCode(email, purpose)
   }
@@ -74,17 +132,19 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   async function logout() {
-    await goApp().Logout()
+    try {
+      await goApp().Logout()
+    } catch {
+      // 离线登出（#14）：Go 侧已清空本地会话，只有令牌吊销请求失败。不能因此
+      // 跳过前端复位，否则界面停在已登录态，下一个账号会继承上一账号的数据。
+    }
     user.value = null
     loggedIn.value = false
     signalOk.value = true
     clearKickedReason()
-    // 清理各业务 store 的本地缓存（B2：chat.clear 此前是死代码，
-    // 登出后换账号登录会继承上一账号的聊天记录）。
-    const { useChatStore } = await import('./chat')
-    const { useVoiceStore } = await import('./voice')
-    useChatStore().clear()
-    useVoiceStore().$reset()
+    clearShutdown()
+    // 各业务 store 显式复位（#85；setup 风格 store 无 $reset）。
+    resetSessionStores()
   }
 
   // handleKicked 被踢全链路（auth:kicked）：复用 logout 清本地会话缓存与登出态，
@@ -107,6 +167,14 @@ export const useAuthStore = defineStore('auth', () => {
       const r = (d as { reason?: unknown } | null)?.reason
       handleKicked(typeof r === 'string' && r !== '' ? r : 'login_elsewhere').catch(() => {})
     })
+    // 服务端关闭（sys:shutdown，#21）：Go 侧已停自动重连。挂 store 层同上——
+    // 事件到达时用户可能在设置页（MainView 未挂载），不能只等组件订阅。
+    // toast 走既有 notify 通道；提示条据 shutdown 改口见 MainView。
+    eventsOn('sys:shutdown', (d) => {
+      const r = (d as { reason?: unknown } | null)?.reason
+      setShutdown(typeof r === 'string' && r !== '' ? r : 'shutdown')
+      useNotifyStore().show('服务端已关闭', true)
+    })
   }
 
   async function fetchMe() {
@@ -116,8 +184,9 @@ export const useAuthStore = defineStore('auth', () => {
 
   return {
     user, loggedIn, signalOk, serverCfg, simpleMode, mailConfigured,
-    kickedReason,
+    showInviteField, bootstrapRequired,
+    kickedReason, shutdown,
     loadConfig, login, register, guest, sendEmailCode, resetPassword, logout, fetchMe,
-    setSignalOk, setKickedReason, clearKickedReason,
+    setSignalOk, setKickedReason, clearKickedReason, setShutdown, clearShutdown,
   }
 })

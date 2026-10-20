@@ -15,6 +15,7 @@ import {
   HOTKEY_ACTIONS, bindingFromKeyEvent, bindingFromMouseEvent, bindingLabel,
   findHotkeyConflicts, findInAppClashes, normalizeBinding, type HotkeyActionID,
 } from '../utils/hotkeySpec'
+import { cleanErrorText } from '../utils/errorText'
 import ServerConnPanel from '../components/ServerConnPanel.vue'
 import Toast from '../components/Toast.vue'
 
@@ -23,6 +24,19 @@ const auth = useAuthStore()
 const settings = useSettingsStore()
 const hibernateStore = useHibernateStore()
 const version = ref('dev')
+
+// 登出确认弹层（文案克制：「退出登录？」/「取消」「退出」）
+const confirmLogout = ref(false)
+
+async function doLogout() {
+  confirmLogout.value = false
+  try {
+    await auth.logout()
+    router.push({ name: 'login' }).catch(() => {})
+  } catch {
+    toast.value?.show('登出失败', true)
+  }
+}
 // 休眠模式三态（v0.1.2 合并旧版双开关）：
 //   off      不休眠
 //   hibernate 最小化/关窗时卸载界面组件——webview 进程仍在，内存下降有限
@@ -83,12 +97,14 @@ function setInputMode(e: Event) {
   void applyAudio()
 }
 
-// denoiseIdx 降噪强度当前档位（computed 双向：关↔denoise=false，其余↔strength）。
+// denoiseIdx 降噪强度当前档位（0=关，1/2/3=弱/中/强）：加载设置时由
+// syncDenoiseIdx 对齐，点击时由 applyDenoiseIdx 同步，模板高亮只读它。
 const denoiseIdx = ref(2)
 function syncDenoiseIdx() {
   denoiseIdx.value = audio.value.denoise ? audio.value.denoise_strength : 0
 }
 function applyDenoiseIdx(i: number) {
+  denoiseIdx.value = i
   if (i === 0) {
     audio.value.denoise = false
   } else {
@@ -102,6 +118,12 @@ onMounted(async () => {
   version.value = await goApp().GetVersion()
   hibMode.value = (await goApp().GetHibernateMode()) as typeof hibMode.value
   closeToTray.value = await goApp().GetCloseToTray()
+  // 机密存储模式：先订阅（ServiceStartup 已推过也能兜到后续变化），再补拉当前值。
+  cancelSecret = eventsOn('sys:secret', (d) => {
+    const p = d as { mode?: string } | null
+    if (typeof p?.mode === 'string') secretMode.value = p.mode
+  })
+  secretMode.value = await goApp().SecretStorageMode().catch(() => '')
   audio.value = await goApp().GetAudioSettings()
   // omitempty 字段（0/空值不序列化）在 UI 侧补默认，避免滑杆/下拉空值。
   audio.value.input_mode ??= 'auto'
@@ -173,7 +195,7 @@ async function testMic() {
       toast.value?.show('未检测到声音——测试时请对着麦克风说话；若已说话仍如此，请检查麦克风权限或所选设备', true)
     }
   } catch (e) {
-    toast.value?.show(`麦克风测试失败：${e}`, true)
+    toast.value?.show(`麦克风测试失败：${cleanErrorText(e, '未知错误')}`, true)
   } finally {
     try {
       await levelBridge().StopLevelMonitor?.()
@@ -193,6 +215,8 @@ onUnmounted(() => {
   stopRecord()
   cancelHkAvail?.()
   cancelHkAvail = null
+  cancelSecret?.()
+  cancelSecret = null
   void levelBridge().StopLevelMonitor?.().catch(() => {})
 })
 
@@ -204,7 +228,7 @@ async function testSpeaker() {
     await goApp().TestSpeaker()
     toast.value?.show('已播放测试音，听到蜂鸣说明扬声器正常')
   } catch (e) {
-    toast.value?.show(`扬声器测试失败：${e}`, true)
+    toast.value?.show(`扬声器测试失败：${cleanErrorText(e, '未知错误')}`, true)
   } finally {
     testingSpk.value = false
   }
@@ -215,7 +239,7 @@ async function applyAudio() {
   try {
     await goApp().SetAudioSettings({ ...audio.value })
   } catch (e) {
-    toast.value?.show(`语音设置保存失败：${e}`, true)
+    toast.value?.show(`语音设置保存失败：${cleanErrorText(e, '未知错误')}`, true)
   }
 }
 
@@ -236,6 +260,12 @@ const hkConflicts = computed(() => findHotkeyConflicts(hk.value))
 const hkInAppClashes = computed(() => findInAppClashes(hk.value))
 let cancelHkAvail: (() => void) | null = null
 
+// 机密存储模式（keyring / file / dpapi）：Linux 无密钥环时令牌落明文文件，
+// 必须明示提示（issue #8，不静默降级）。sys:secret 在 ServiceStartup 推一次，
+// 本页挂载多半晚于它 → 主动调 SecretStorageMode 补拉，事件仅兜底。
+const secretMode = ref('')
+let cancelSecret: (() => void) | null = null
+
 function setHkMode(i: number) {
   hk.value.mode = (i >= 0 && i <= 2 ? i : 0) as HotkeySettings['mode']
   void applyHotkey()
@@ -252,7 +282,7 @@ async function applyHotkey() {
   try {
     await goApp().SetHotkeySettings({ ...hk.value })
   } catch (e) {
-    toast.value?.show(`按键说话设置保存失败：${e}`, true)
+    toast.value?.show(`按键说话设置保存失败：${cleanErrorText(e, '未知错误')}`, true)
   }
 }
 
@@ -344,7 +374,7 @@ function bindRecording(spec: string) {
     <div class="s-body">
       <section class="s-sec">
         <h3>连接</h3>
-        <ServerConnPanel @saved="toast?.show('已保存，重启后生效')" />
+        <ServerConnPanel @saved="toast?.show('已保存')" />
       </section>
 
       <section class="s-sec">
@@ -353,6 +383,16 @@ function bindRecording(spec: string) {
           <div><div class="k">昵称</div><div class="v">{{ auth.user?.nickname ?? '—' }}</div></div>
           <div><div class="k">邮箱</div><div class="v">{{ auth.user?.email ?? '—' }}</div></div>
         </div>
+        <div class="s-row">
+          <button class="logout-btn" @click="confirmLogout = true">
+            <LogOut :size="14" class="btn-icon" />退出登录
+          </button>
+        </div>
+        <!-- Linux 无密钥环时的降级（issue #8）：密码不保存、游客令牌回落明文文件，
+             两者都必须明示，不静默降级 -->
+        <p v-if="secretMode === 'file'" class="s-note s-warn">
+          <CircleAlert :size="13" />密钥环不可用：登录密码不会被记住；游客令牌以明文文件存储
+        </p>
       </section>
 
       <section class="s-sec">
@@ -567,6 +607,16 @@ function bindRecording(spec: string) {
       </section>
     </div>
     <Toast ref="toast" />
+    <!-- 登出确认弹层（文案克制） -->
+    <div v-if="confirmLogout" class="logout-overlay" @click.self="confirmLogout = false">
+      <div class="logout-card">
+        <p>退出登录？</p>
+        <div class="logout-acts">
+          <button class="logout-cancel" @click="confirmLogout = false">取消</button>
+          <button class="logout-ok" @click="doLogout">退出</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -656,6 +706,39 @@ input[type="range"] { flex: 0 0 140px; accent-color: var(--brand-500); }
 }
 .quit-btn:hover { background: rgba(232, 91, 91, 0.18); }
 .btn-icon { flex: none; }
+
+/* 登出按钮（账号分区）：主色调低调，与退出程序区分 */
+.logout-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 32px; padding: 0 14px; border-radius: 8px;
+  font-size: 13px; font-weight: 600;
+  color: var(--brand-700); background: var(--brand-50);
+  transition: background 0.2s var(--ease);
+}
+.logout-btn:hover { background: var(--brand-200); }
+
+/* 登出确认弹层 */
+.logout-overlay {
+  position: fixed; inset: 0; z-index: 200;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(23, 50, 75, 0.25);
+}
+.logout-card {
+  background: var(--surface); border-radius: 12px; padding: 24px 28px;
+  min-width: 220px; text-align: center;
+  box-shadow: var(--shadow-2, 0 8px 32px rgba(23,50,75,0.18));
+}
+.logout-card p { margin: 0 0 16px; font-size: 15px; font-weight: 600; color: var(--ink-900); }
+.logout-acts { display: flex; gap: 10px; justify-content: center; }
+.logout-cancel, .logout-ok {
+  height: 32px; padding: 0 18px; border-radius: 8px;
+  font-size: 13px; font-weight: 600;
+  transition: background 0.2s var(--ease);
+}
+.logout-cancel { color: var(--ink-600); background: var(--brand-50); }
+.logout-cancel:hover { background: var(--brand-200); }
+.logout-ok { color: #fff; background: var(--brand-500); }
+.logout-ok:hover { background: var(--brand-700); }
 
 /* 说明小字（如休眠「暂不生效」注记）：11px 灰，贴近上一行 */
 .s-note {

@@ -1,0 +1,1596 @@
+// Package voice 是客户端语音会话编排层：把 audio / rtc / signal 管线
+// 装配成面向 UI 的会话（登录 → 连信令 → 入房 → 通话），并经 Go 回调
+// 推送给上层（落地方案 §4.6 事件表）。
+package voice
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"github.com/OpenALC/LiteTalk/client/core/api"
+	"github.com/OpenALC/LiteTalk/client/core/audio"
+	"github.com/OpenALC/LiteTalk/client/core/gateway"
+	"github.com/OpenALC/LiteTalk/client/core/hotkey"
+	"github.com/OpenALC/LiteTalk/client/core/rtc"
+	"github.com/OpenALC/LiteTalk/client/core/signal"
+	"github.com/pion/webrtc/v4"
+)
+
+// KickReasonLoginExpired 本端专用被踢原因（不上 wire）：refresh_token 被服务端
+// 明确拒绝（401/403），access 已无法续期，只能回登录页重新认证。与
+// signal.KickReasonLoginElsewhere（异地登录）区分——后者是 wire 契约里的取值，
+// 本常量只经 OnKicked 传给 UI 决定横幅文案。
+const KickReasonLoginExpired = "login_expired"
+
+// Events 会话 → UI 的事件回调（由 app 层接到 runtime.EventsEmit）。
+type Events struct {
+	// OnPeerJoin 有成员进入房间（含自己首次入房的成员全量推送前的逐个通知）。
+	OnPeerJoin func(userID, nickname, tag string, speaking, mute, deafen bool)
+	// OnPeerLeave 有成员离开。
+	OnPeerLeave func(userID string)
+	// OnPeerSpeaking 远端说话状态变化。
+	OnPeerSpeaking func(userID string, speaking, mute, deafen bool)
+	// OnLatency 回环/远端延迟周期上报（毫秒）。
+	OnLatency func(ms int)
+	// OnVoiceStats 周期语音统计（JSON，字段见 VoiceStats）。
+	OnVoiceStats func(statsJSON string)
+	// OnConnection 信令/RTC 连接状态变化。
+	OnConnection func(state string)
+	// OnSelf 入房后回传自己的 user_id（UI 标记「我」）。
+	OnSelf func(userID string)
+	// OnStateRequest 收到他人发来的闭麦/静音请求（v0.1.2；接收方自行决定执行）。
+	OnStateRequest func(fromID, fromNickname string, mute, deafen *bool)
+	// OnVoiceUnavailable 媒体不可用（管线初始化失败，或入房后采集/播放启动失败）：
+	// 音频不可用但信令照常连接。errMsg 是面向用户的中文提示，不含内部路径。
+	// 线程约定：初始化失败在 Connect 的调用方 goroutine 上报；启动失败在 ws 读
+	// 循环的 channel.joined 处理器内上报——实现侧不得阻塞，也不得同步 Close
+	// 会话（会与读循环互等）。
+	OnVoiceUnavailable func(errMsg string)
+	// OnKicked 被服务端踢下线（session.kicked 消息 / WS 4001：同类设备新登录，
+	// 契约 §0.5）。reason 约定值 login_elsewhere。回调可能跑在 ws 读循环
+	// goroutine（会话 wg 内）：实现侧不得同步 Close 会话，须异步执行。
+	OnKicked func(reason string)
+	// OnVoiceTaken 同账号另一会话抢占语音（session.voice_taken，契约 §0.10）：
+	// 服务端已把本端摘出房间，本地按退房清理完毕。与 OnKicked 同样可能跑在
+	// ws 读循环 goroutine（会话 wg 内），实现侧不得同步 Close 会话。
+	OnVoiceTaken func()
+	// OnPresenceUpdate 好友在线状态变化（presence.update，#11）。
+	// 跑在 ws 读循环 goroutine，实现侧只做转发。
+	OnPresenceUpdate func(userID string, online bool)
+	// OnServerShutdown 服务端优雅关闭（server.shutdown，#21）：停自动重连并提示。
+	// 与 OnKicked 同线程约定。
+	OnServerShutdown func(reason string)
+	// OnRTCFailed 本端 PeerConnection 因 ICE 失败被 SFU 移除（rtc.failed，#19）：
+	// 会话已完成本地重建（销毁 PC、清远端链路、重发 channel.join），此处只报 UI。
+	// 与 OnKicked 同线程约定（ws 读循环 goroutine，实现侧不得同步 Close 会话）。
+	OnRTCFailed func(channelID string)
+	// OnJoinFailed 进房被服务端拒绝（channel.join 的异步 error 帧，#91）：本地
+	// 房间态已回滚（InRoom=false，重连不再重发 join），媒体链路与成员表已清。
+	// channelID 是失败的那次 join；快速切房时旧 join 的失败不回滚当前房间，也
+	// 不会回调。与 OnKicked 同线程约定（ws 读循环 goroutine，实现侧只做转发，
+	// 不得阻塞、不得同步 Close 会话）。
+	OnJoinFailed func(channelID, code, message string)
+	// OnResync 事件面续传失败后的全量补拉提示（#32/#78，gateway.invalid_session）：
+	// 消息与好友在线态已由会话内部补拉完毕，服务器/频道等 REST 视图可能已过期，
+	// UI 层应重新拉取（绑定方法 ListServers/ListChannels/ListFriends 都在）。
+	// app 层固定以 data:resync 事件转发，前端收到后经绑定自取。
+	// 跑在独立 goroutine，可安全触发网络请求；nil = 不通知。
+	OnResync func()
+}
+
+// VoiceStats 推给 UI 的语音房统计快照。
+type VoiceStats struct {
+	LatencyMS  int      `json:"latency_ms"`
+	Members    int      `json:"members"`
+	PeerIDs    []string `json:"peer_ids"`
+	EncPackets uint64   `json:"enc_packets"`
+	RtpSent    uint64   `json:"rtp_sent"`
+
+	// 音频链路诊断（#95）：播放缓冲与下行丢包可观测性。新增字段，旧前端
+	// 忽略未知键即可；Peers 为空时不输出。
+	PlaybackBufferedMS int            `json:"playback_buffered_ms"`
+	PlaybackUnderruns  uint64         `json:"playback_underruns"`
+	PlaybackDropped    uint64         `json:"playback_dropped"`
+	Peers              []PeerLinkDiag `json:"peers,omitempty"`
+}
+
+// PeerLinkDiag 单路下行链路诊断（#95）：抖动缓冲深度、丢失/FEC/PLC 计数
+// 与混音输入环占用。
+type PeerLinkDiag struct {
+	PeerID                string  `json:"peer_id"`
+	JitterMs              float64 `json:"jitter_ms"`
+	JitterTargetPackets   int     `json:"jitter_target_packets"`
+	JitterBufferedPackets int     `json:"jitter_buffered_packets"`
+	JitterLost            uint64  `json:"jitter_lost"`
+	RingSamples           int     `json:"ring_samples"`
+	PLCFrames             uint64  `json:"plc_frames"`
+	FECFrames             uint64  `json:"fec_frames"`
+	UnderrunFrames        uint64  `json:"underrun_frames"`
+	DroppedSamples        uint64  `json:"dropped_samples"`
+}
+
+// PeerView UI 侧成员视图。
+type PeerView struct {
+	UserID   string `json:"user_id"`
+	Nickname string `json:"nickname"`
+	Tag      string `json:"tag"` // 昵称#tag 的 tag，好友请求用
+	Speaking bool   `json:"speaking"`
+	Mute     bool   `json:"mute"`
+	Deafen   bool   `json:"deafen"`
+}
+
+// Session 一次登录后的通话会话：信令连接 + 媒体管线。
+type Session struct {
+	api *api.APIClient
+	log *log.Logger
+	ev  Events
+	// token 构造时的信令令牌，仅在 APIClient 无 access 时回落（dev- 令牌/
+	// 直连测试）。正常路径每次拨号都取 APIClient 当前令牌，REST/WS 侧刷新
+	// 后自动生效。atomic 保并发：TokenFunc 在 ws 重连 goroutine 读。
+	token atomic.Value // string
+	name  string
+
+	// audioMu 保护 audioBackend/connectBegin：后端选择只允许在 Connect 之前，
+	// 两者必须成对判定，否则并发调用会出现「选完之后又被 Connect 读走」的窗口。
+	audioMu      sync.Mutex
+	audioBackend audio.Backend // 零值 = BackendDevice（桌面端默认）
+	connectBegin bool          // Connect 已开始装配，后端不再可改
+
+	ws        *signal.Client
+	pipe      *audio.Pipeline
+	mixer     *audio.Mixer
+	remoteMgr *audio.RemoteManager
+	states    *audio.StateTable
+
+	// voiceUnavailable/voiceErr：媒体管线初始化失败（如 Linux 缺 Opus）。
+	// 降级而非整体失败——信令照常连接，JoinChannel 明确报错供前端 toast。
+	voiceUnavailable bool
+	voiceErr         error
+
+	// voiceSend 说话状态发送队列：容量 1 只保留最新值（说话状态高频翻转，
+	// 积压旧状态无意义），由专用 goroutine 消费发送（音频回调禁止直发网络）。
+	voiceSend    chan signal.VoiceStateData
+	mediaStarted atomic.Bool // 采集/播放是否已启动（入房才启动，按需点亮麦克风）
+	// mediaFailReported 媒体启动失败是否已上报（#80）：同一故障周期只提示一次，
+	// 重入房仍会真实重试但不再重复弹 toast；启动成功后复位，下次故障可再报。
+	mediaFailReported atomic.Bool
+	peerRef           atomic.Pointer[rtc.Peer]
+	roomID            atomic.Value // string
+	muted             atomic.Bool
+	deafened          atomic.Bool
+
+	// joinMu 串行化进房意图与 roomID 的复合变更（#91）。JoinChannel 乐观写
+	// roomID 供断线重连恢复，服务端拒收是异步 error 帧——没有关联 id，
+	// 只能把错误按服务端在同一连接上的处理顺序归属给最早未结算的 join。
+	// pendingJoins 是尚未收到 channel.joined / error 的 join 队列（FIFO）；
+	// seq 仅用于发送失败时精确摘除自己那条，不参与错误归属。
+	// 约束：error 帧无 request id，通用码（forbidden/bad_message/rate_limited/
+	// quota_exceeded）在队列非空时会被当作进房失败消费，存在把同码其他错误
+	//（如 rtc.offer 配额）误判的理论窗口；队列为空时一律按聊天错误转发。
+	joinMu       sync.Mutex
+	pendingJoins []pendingJoin
+	joinSeq      uint64
+
+	// protoVer 服务端协商到的协议版本（#29）：0=尚未收到 server.hello（按 v1 行为）。
+	// v2 客户端据此停发 voice.state{speaking} 等版本相关行为（#33 接线）。
+	protoVer atomic.Int64
+
+	// gw 事件面追踪（#32）：seq 去重/重排、gateway.resume 决策、invalid_session 补拉。
+	gw *gateway.Tracker
+
+	// sendGate 按键说话发送门（PTT/语音激活/常开）。App 层长期持有的值对象，
+	// 会话重建不换门——用户按住的 PTT 状态不能因为重连丢掉。建管线时转交
+	// Pipeline，之后由 Pipeline 每帧自行 Load。
+	sendGate atomic.Pointer[hotkey.Gate]
+
+	// iceMu/iceServers 预取的 STUN/TURN 凭证缓存（#13）：setupPeer 跑在 WS 读
+	// 循环的 channel.joined 处理器里，禁止网络 I/O——凭证由 JoinChannel 在可
+	// 阻塞的 Wails 绑定线程预取，读循环只读缓存；缓存空则降级空 ICE 列表。
+	iceMu      sync.RWMutex
+	iceServers []webrtc.ICEServer
+
+	mu        sync.Mutex
+	members   map[string]PeerView
+	selfID    string
+	chatFn    func(channelID, msgID, userID, nickname, content, ts, nonce string) // ChatHandler 注入
+	seenChans map[string]bool                                                     // 本会话收过 chat.message 的频道（补拉范围）
+	errFns    []func(code, message string, joinHandled bool)                      // ErrorHandlerEx 注入（mu 保护）
+
+	// chatMu/pendingChats 聊天发送 outbox（#31）：断线/写失败时保留 nonce 与内容，
+	// 重连 OnConnect 用同一个 nonce 重发；服务端按 (channel_id, user_id, nonce) 去重。
+	chatMu       sync.Mutex
+	pendingChats []pendingChat
+
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+}
+
+// pendingJoin 一次已发出、尚未被 channel.joined / error 结算的进房请求。
+type pendingJoin struct {
+	channelID string
+	seq       uint64
+}
+
+// maxPendingJoins 未结算 join 队列上限。正常一次只留一条；连点/快速切房
+// 会给服务端留下多条，服务端按序逐条回执或限流，队列随之清空。异常调用方
+// 无限进房时只保留最近 N 次意图，避免队列无界增长。
+const maxPendingJoins = 16
+
+// NewSession 创建会话。token 为信令鉴权令牌；nickname 仅 dev 模式用作 user_id。
+func NewSession(api *api.APIClient, token, nickname string, ev Events, logger *log.Logger) *Session {
+	if logger == nil {
+		logger = log.Default()
+	}
+	s := &Session{
+		api:       api,
+		log:       logger,
+		ev:        ev,
+		name:      nickname,
+		members:   make(map[string]PeerView),
+		seenChans: make(map[string]bool),
+		voiceSend: make(chan signal.VoiceStateData, 1),
+		gw:        gateway.New(),
+	}
+	s.token.Store(token)
+	s.roomID.Store("")
+	return s
+}
+
+// SetAudioBackend 选择音频后端（audio.BackendDevice / audio.BackendNull）。
+// 必须在 Connect 之前调用：管线在 Connect 中按当时的选择装配，运行期换后端
+// 需要重建整条媒体链路，当前不支持——Connect 之后调用返回错误。并发调用
+// 与 Connect 之间由 audioMu 串行化，要么生效、要么明确报错。
+func (s *Session) SetAudioBackend(b audio.Backend) error {
+	if b != audio.BackendDevice && b != audio.BackendNull {
+		return fmt.Errorf("unknown audio backend: %d", int(b))
+	}
+	s.audioMu.Lock()
+	defer s.audioMu.Unlock()
+	if s.connectBegin {
+		return errors.New("audio backend must be set before Connect")
+	}
+	s.audioBackend = b
+	return nil
+}
+
+// AudioBackend 返回当前选择的音频后端；Connect 之后即为管线实际生效值。
+func (s *Session) AudioBackend() audio.Backend {
+	s.audioMu.Lock()
+	defer s.audioMu.Unlock()
+	return s.audioBackend
+}
+
+// Connect 建立信令连接并装配媒体管线（采集/播放入房才启动，见 startMedia）。
+// 媒体管线初始化失败不再让登录整体失败：置 voiceUnavailable、发
+// OnVoiceUnavailable 事件，信令照常连接（纯文字/好友功能仍可用）。
+func (s *Session) Connect(serverURL string) {
+	// 后端选择在装配开始时定格：之后 SetAudioBackend 一律报错（见其注释）。
+	s.audioMu.Lock()
+	s.connectBegin = true
+	backend := s.audioBackend
+	s.audioMu.Unlock()
+
+	wsCfg := signal.Config{
+		URL:    serverURL,
+		Logger: s.log,
+		// 每次拨号取 APIClient 当前令牌：REST 刷新后重连自动携带新值。
+		// 已知过期时先单飞续期；失败不阻断本次拨号——旧令牌交给下面的握手
+		// 401 路径强制刷新一次，仍然失败才停（不会无限重连）。
+		TokenFunc: func(ctx context.Context) (string, error) {
+			if tok := s.api.Token(); tok != "" {
+				if err := s.api.EnsureAccess(ctx); err != nil {
+					s.log.Printf("signal: access 预续期失败: %v", err)
+				}
+				if tok = s.api.Token(); tok != "" {
+					return tok, nil
+				}
+			}
+			// APIClient 无令牌（dev 令牌/直连测试）：回落构造时的令牌。
+			return s.token.Load().(string), nil
+		},
+		// 握手 401（被顶替类已由 OnKicked 收口）：刷新一次 access 再重拨。
+		// 失败按原因分三类（#84 复审 4.1）：
+		//   - 传输层瞬时错误：返回 ErrAuthTransient，signal 层退避重试——网络
+		//     抖动不代表 refresh_token 失效，不能就此永久停连；
+		//   - 服务端明确 401/403：refresh_token 已失效/被吊销，走被踢链路回
+		//     登录页，前端按 login_expired 提示「登录已过期」；
+		//   - ErrSessionReplaced：刷新窗口里发现会话被顶替，按异地登录处理。
+		// errBaseChanged / ErrNoRefreshSource 返回原错误 → 致命（换服流程已接管 /
+		// 根本没有刷新来源，重试只会原地打转）。
+		OnAuthFailed: func(ctx context.Context) error {
+			err := s.api.RefreshAccess(ctx)
+			switch {
+			case err == nil:
+				return nil
+			case errors.Is(err, api.ErrSessionReplaced):
+				s.handleKicked(signal.KickReasonLoginElsewhere)
+				return err
+			case api.IsAuthRejected(err):
+				s.log.Printf("signal: refresh_token 已被服务端拒绝，回登录页: %v", err)
+				s.handleKicked(KickReasonLoginExpired)
+				return err
+			case api.IsTransientRefreshError(err):
+				s.log.Printf("signal: 刷新 access 瞬时失败，退避重试: %v", err)
+				return signal.ErrAuthTransient
+			default:
+				return err
+			}
+		},
+	}
+	wsCfg.OnConnect = s.handleSignalConnect
+	wsCfg.OnDisconnect = func(err error) {
+		if s.ev.OnConnection != nil {
+			s.ev.OnConnection("disconnected")
+		}
+		if p := s.peerRef.Swap(nil); p != nil {
+			_ = p.Close()
+		}
+		if s.remoteMgr != nil {
+			s.remoteMgr.RemoveAll()
+		}
+		s.stopMedia()
+	}
+	// WS close 4001 / 握手 401 带 session_replaced 头：session.kicked 消息在
+	// 服务端发送窗口内可能丢帧，close code 是可靠的那一半。回调跑在 ws Run
+	// goroutine（会话 wg 内），app 侧 OnKicked 已异步化，此处直接调出口即可。
+	wsCfg.OnKicked = func(reason string) { s.handleKicked(reason) }
+	// 事件面门（#32）：seq 去重/重排由 gateway.Tracker 承担，invalid_session
+	// 在门内消化并异步触发 fullResync（独立 goroutine，REST 不进读循环）。
+	wsCfg.Gate = s.gw.Gate
+	s.gw.OnResync(func(reason string) {
+		s.log.Printf("gateway: 续传失败（%s），全量补拉", reason)
+		s.fullResync()
+	})
+	s.ws = signal.NewClient(wsCfg)
+	s.registerHandlers()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancel = cancel
+
+	// 媒体管线：采集→降噪→Opus→(OnPacket→RTP)；下行混音→播放环。
+	// 构造失败（如无 Opus 的平台）降级：跳过音频初始化，信令不受影响。
+	// 后端默认 BackendDevice；无界面/容器/CI 消费方可在 Connect 前经
+	// SetAudioBackend(audio.BackendNull) 改用无声卡自检后端。
+	pcfg := audio.DefaultPipelineConfig()
+	pcfg.Backend = backend
+	pcfg.Loopback = false
+	pcfg.DSP.OnSpeakingChange = func(speaking bool) {
+		// DSP 回调跑在音频 goroutine 上，必须非阻塞：投递到容量 1 的
+		// voiceSend，由下方专用 goroutine 发送；积压时丢弃旧值只留最新。
+		// v2 停发（#33 裁定 #5）：说话态改由服务端按 RFC 6464 电平统一判定
+		//（voice.speaking 回来驱动 UI）；这条上报只留给 v1 兼容路径。
+		if s.protoVer.Load() >= 2 {
+			return
+		}
+		if s.muted.Load() {
+			speaking = false
+		}
+		select {
+		case s.voiceSend <- signal.VoiceStateData{Speaking: signal.Bool(speaking)}:
+		default:
+		}
+	}
+	pcfg.OnPacket = func(pkt []byte) {
+		if p := s.peerRef.Load(); p != nil {
+			_ = p.SendOpus(pkt)
+		}
+	}
+	pipe, err := audio.NewPipeline(pcfg)
+	if err != nil {
+		s.voiceUnavailable = true
+		s.voiceErr = err
+		s.log.Printf("pipeline unavailable: %v (signaling continues)", err)
+		if s.ev.OnVoiceUnavailable != nil {
+			s.ev.OnVoiceUnavailable(err.Error())
+		}
+	} else {
+		s.pipe = pipe
+		// 发包门：App 层在 NewSession 之后、Connect 之前注入；此处补到管线上
+		// （SetSendGate 在管线已存在时也会即时生效，两条路径等价）。
+		if g := s.sendGate.Load(); g != nil {
+			pipe.SetSendGate(g)
+		}
+		s.mixer = audio.NewMixer(pipe.WritePlayback)
+		s.remoteMgr = audio.NewRemoteManager(s.mixer, s.log)
+		s.states = audio.NewStateTable()
+		s.states.OnChange = func(id string, st audio.PeerVoiceState) {
+			if s.ev.OnPeerSpeaking != nil {
+				s.ev.OnPeerSpeaking(id, st.Speaking, st.Mute, st.Deafen)
+			}
+		}
+	}
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case st := <-s.voiceSend:
+				if s.ws != nil {
+					_ = s.ws.Send(signal.TypeVoiceState, st)
+				}
+			}
+		}
+	}()
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		if err := s.ws.Run(ctx); err != nil && err != context.Canceled {
+			s.log.Printf("signal run: %v", err)
+		}
+	}()
+}
+
+// handleSignalConnect 每条（重）连成功后的订阅状态恢复：广播连接状态、重发
+// channel.join、重发断线期间积压的聊天消息（同一 nonce，服务端幂等）。
+// 由 signal.Client 在首次收到下行消息后调用（server.hello 已处理完，protoVer 就绪）。
+func (s *Session) handleSignalConnect(c *signal.Client) {
+	if s.ev.OnConnection != nil {
+		s.ev.OnConnection("connected")
+	}
+	// 重连后若仍在房间，重发 join（channel.joined 会重建媒体链路）。
+	// 同样登记 pending：重连重入也可能被拒（频道删除/权限收回/满员），
+	// 不登记的话异步 error 只会弹 toast，本地仍留在「幽灵房间」里（#91）。
+	if room, _ := s.roomID.Load().(string); room != "" {
+		seq := s.beginJoin(room)
+		if err := c.Send(signal.TypeChannelJoin, signal.ChannelJoinData{ChannelID: room}); err != nil {
+			// 保留 roomID 等下次重连再试（原有语义），只摘掉本次 pending，
+			// 避免后续无关 error 被误归属到这次失败的发送。
+			s.abortJoinSend(seq, false)
+			s.log.Printf("signal: 重连重发 channel.join 失败: %v", err)
+		}
+	}
+	s.flushPendingChats()
+}
+
+// startMedia 启动采集/播放（幂等）。未入房不启动——空闲时也跑
+// 采集+RNNoise+Opus 是白耗 CPU 且 Windows 麦克风指示灯常亮。
+// 启动失败不置 voiceUnavailable（重入房可重试），但必须经 OnVoiceUnavailable
+// 上报：否则 UI 显示在房内、麦克风实际没起来，用户无从得知（#80）。
+// 本函数跑在 ws 读循环的 channel.joined 处理器里，上报只做转发不得阻塞。
+func (s *Session) startMedia() {
+	if s.voiceUnavailable || s.pipe == nil {
+		return
+	}
+	if !s.mediaStarted.CompareAndSwap(false, true) {
+		return
+	}
+	if err := s.mixer.Start(); err != nil {
+		s.mediaStarted.Store(false)
+		s.reportMediaFailure("mixer", err)
+		return
+	}
+	if err := s.pipe.Start(); err != nil {
+		s.mixer.Stop()
+		s.mediaStarted.Store(false)
+		s.reportMediaFailure("pipeline", err)
+		return
+	}
+	// 启动成功：复位故障周期，下次失败重新提示。
+	s.mediaFailReported.Store(false)
+}
+
+// reportMediaFailure 上报媒体启动失败（#80）。日志保留底层错误（含设备名等
+// 诊断信息），事件只发面向用户的中文提示，不暴露内部路径/设备枚举细节。
+// 同一故障周期只上报一次：重入房重试仍会真实重试，但不会把提示刷成风暴。
+func (s *Session) reportMediaFailure(stage string, err error) {
+	s.log.Printf("%s start: %v", stage, err)
+	if !s.mediaFailReported.CompareAndSwap(false, true) {
+		return
+	}
+	if s.ev.OnVoiceUnavailable == nil {
+		return
+	}
+	if stage == "mixer" {
+		s.ev.OnVoiceUnavailable("音频播放启动失败，请检查扬声器")
+		return
+	}
+	s.ev.OnVoiceUnavailable("音频设备启动失败，请检查麦克风和扬声器")
+}
+
+// stopMedia 停止采集/播放（幂等）。与 LeaveChannel/断线/Close 的清理路径
+// 合并调用；Start/Stop 成对后可再 Start（重入房）。
+func (s *Session) stopMedia() {
+	if !s.mediaStarted.CompareAndSwap(true, false) {
+		return
+	}
+	if s.mixer != nil {
+		s.mixer.Stop()
+	}
+	if s.pipe != nil {
+		s.pipe.Stop()
+	}
+}
+
+// registerHandlers 挂信令消息处理（对照 calltest 的接线范式）。
+func (s *Session) registerHandlers() {
+	s.ws.On(signal.TypeHello, func(env signal.Envelope) {
+		var d signal.HelloData
+		if env.Decode(&d) == nil && d.User.ID != "" {
+			s.selfID = d.User.ID
+		}
+	})
+	// server.hello：协议版本协商结果（#29）。hello（初始数据）可能先到也可能后到，
+	// 与本消息的相对顺序不作假设（老服务端根本不发 server.hello，按 v1 继续）。
+	s.ws.On(signal.TypeServerHello, func(env signal.Envelope) {
+		var d signal.ServerHelloData
+		if env.Decode(&d) != nil || d.Version < 1 {
+			return
+		}
+		s.protoVer.Store(d.Version)
+		// server.hello 确认会话后发 gateway.resume（#32）：首次协商也发 last_seq=0
+		//（服务端环可能已有事件，见 #81），同会话重连带已投递的 last_seq。
+		// 老服务端（无 server.hello）没有续传概念，不发；发送失败按普通断线重连处理。
+		if resume, ok := s.gw.OnServerHello(d.SessionID, d.Version); ok {
+			if err := s.ws.Send(signal.TypeGatewayResume, resume); err != nil {
+				s.log.Printf("gateway: resume 发送失败: %v", err)
+			}
+		}
+		s.log.Printf("signal: 协商协议版本 v%d", d.Version)
+	})
+	s.ws.On(signal.TypeChannelJoined, func(env signal.Envelope) {
+		var d signal.ChannelJoinedData
+		if err := env.Decode(&d); err != nil {
+			return
+		}
+		// 服务端回执：结算对应的 pending join（重复/广播帧不匹配则忽略）。
+		s.confirmJoin(d.ChannelID)
+		s.startMedia() // 入房才启动采集/播放
+		s.mu.Lock()
+		s.members = make(map[string]PeerView, len(d.Members))
+		for _, m := range d.Members {
+			s.members[m.UserID] = PeerView{
+				UserID: m.UserID, Nickname: m.Nickname, Tag: m.Tag,
+				Speaking: m.Speaking, Mute: m.Mute, Deafen: m.Deafen,
+			}
+			if m.UserID != d.Self.UserID && s.states != nil {
+				s.states.Set(m.UserID, audio.PeerVoiceState{Speaking: m.Speaking, Mute: m.Mute, Deafen: m.Deafen})
+			}
+		}
+		s.selfID = d.Self.UserID
+		s.mu.Unlock()
+		if s.ev.OnSelf != nil {
+			s.ev.OnSelf(d.Self.UserID)
+		}
+		if s.ev.OnPeerJoin != nil {
+			for _, m := range d.Members {
+				s.ev.OnPeerJoin(m.UserID, m.Nickname, m.Tag, m.Speaking, m.Mute, m.Deafen)
+			}
+		}
+		// 仅在无存活 peer 时建连（他人入房广播不动媒体链路）。
+		if p := s.peerRef.Load(); p != nil &&
+			p.ConnectionState() != webrtc.PeerConnectionStateClosed &&
+			p.ConnectionState() != webrtc.PeerConnectionStateFailed {
+			return
+		}
+		s.setupPeer()
+		// 补发完整语音状态（muted+deafened 现值）：重连/重入房后服务端内存里的
+		// 旧状态可能已丢，peer 又是新建（默认不静音）——不发则「UI 显示已闭麦但声音照传」。
+		if s.ws != nil {
+			_ = s.ws.Send(signal.TypeVoiceState, signal.VoiceStateData{
+				Mute:   signal.Bool(s.muted.Load()),
+				Deafen: signal.Bool(s.deafened.Load()),
+			})
+		}
+	})
+	s.ws.On(signal.TypeRTCOffer, func(env signal.Envelope) {
+		var d signal.SDPData
+		if env.Decode(&d) != nil {
+			return
+		}
+		if p := s.peerRef.Load(); p != nil {
+			_ = p.HandleRemoteSDP(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: d.SDP})
+		}
+	})
+	s.ws.On(signal.TypeRTCAnswer, func(env signal.Envelope) {
+		var d signal.SDPData
+		if env.Decode(&d) != nil {
+			return
+		}
+		if p := s.peerRef.Load(); p != nil {
+			_ = p.HandleRemoteSDP(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: d.SDP})
+		}
+	})
+	s.ws.On(signal.TypeRTCIce, func(env signal.Envelope) {
+		var d signal.ICEData
+		if env.Decode(&d) != nil {
+			return
+		}
+		if p := s.peerRef.Load(); p != nil {
+			_ = p.HandleRemoteICE(iceToPion(d))
+		}
+	})
+	s.ws.On(signal.TypeVoiceState, func(env signal.Envelope) {
+		var d signal.VoiceStateData
+		if env.Decode(&d) != nil || d.UserID == "" {
+			return
+		}
+		s.states.Apply(d.UserID, d.Speaking, d.Mute, d.Deafen)
+		s.mu.Lock()
+		if v, ok := s.members[d.UserID]; ok {
+			if d.Speaking != nil {
+				v.Speaking = *d.Speaking
+			}
+			if d.Mute != nil {
+				v.Mute = *d.Mute
+			}
+			if d.Deafen != nil {
+				v.Deafen = *d.Deafen
+			}
+			s.members[d.UserID] = v
+		}
+		s.mu.Unlock()
+	})
+	// voice.speaking：服务端按 RFC 6464 电平统一判定的说话翻转（#33），含自己
+	//（自己的声波球同源，v1「自己不亮」的问题随本消息消失）。mute/deafen 电平
+	// 表达不了，仍走 voice.state。
+	s.ws.On(signal.TypeVoiceSpeaking, func(env signal.Envelope) {
+		var d signal.VoiceSpeakingData
+		if env.Decode(&d) != nil || d.UserID == "" {
+			return
+		}
+		s.mu.Lock()
+		if v, ok := s.members[d.UserID]; ok {
+			v.Speaking = d.Speaking
+			s.members[d.UserID] = v
+		}
+		selfID := s.selfID
+		s.mu.Unlock()
+		if d.UserID == selfID {
+			// 自己的 mute/deafen 以本地状态为准：StateTable 无 self 条目，
+			// 用表值回填会把前端的闭麦显示冲掉。
+			if s.ev.OnPeerSpeaking != nil {
+				s.ev.OnPeerSpeaking(d.UserID, d.Speaking, s.muted.Load(), s.deafened.Load())
+			}
+			return
+		}
+		if s.states != nil {
+			s.states.Apply(d.UserID, &d.Speaking, nil, nil)
+		}
+	})
+	s.ws.On(signal.TypeChannelPeerLeft, func(env signal.Envelope) {
+		var d signal.PeerLeftData
+		if env.Decode(&d) != nil {
+			return
+		}
+		if s.remoteMgr != nil {
+			s.remoteMgr.RemovePeer(d.UserID)
+		}
+		if s.states != nil {
+			s.states.Remove(d.UserID)
+		}
+		s.mu.Lock()
+		delete(s.members, d.UserID)
+		s.mu.Unlock()
+		if s.ev.OnPeerLeave != nil {
+			s.ev.OnPeerLeave(d.UserID)
+		}
+	})
+	// voice.state_request：他人请求我闭麦/静音（v0.1.2，定向投递）。
+	s.ws.On(signal.TypeVoiceStateRequest, func(env signal.Envelope) {
+		var d signal.VoiceStateRequestData
+		if env.Decode(&d) != nil {
+			return
+		}
+		if s.ev.OnStateRequest != nil {
+			s.ev.OnStateRequest(d.From.ID, d.From.Nickname, d.Mute, d.Deafen)
+		}
+	})
+	// session.kicked：同类设备在其他设备登录，服务端踢本连接（契约 §0.5）。
+	// 断开与清令牌在 app 层 OnKicked 完成，此处只上报原因。
+	// 消息本身「尽力而为」（发送窗口内丢帧即无踪），WS close 4001 与握手
+	// 401 的 session_replaced 头是兜底，见 wsCfg.OnKicked。
+	s.ws.On(signal.TypeSessionKicked, func(env signal.Envelope) {
+		var d signal.SessionKickedData
+		reason := signal.KickReasonLoginElsewhere
+		if env.Decode(&d) == nil && d.Reason != "" {
+			reason = d.Reason
+		}
+		s.handleKicked(reason)
+	})
+	// session.voice_taken：同账号另一会话抢占语音（契约 §0.10）。服务端已把
+	// 本端摘出成员表，本地按退房清理——但绝不发 channel.leave：那条 leave 按
+	// uid 处理，会把抢占端一起带离房间。
+	s.ws.On(signal.TypeSessionVoiceTaken, func(env signal.Envelope) {
+		s.leaveRoomLocal()
+		if s.ev.OnVoiceTaken != nil {
+			s.ev.OnVoiceTaken()
+		}
+	})
+	// presence.update：好友在线状态变化（#11），原样转给 UI 层。
+	s.ws.On(signal.TypePresenceUpdate, func(env signal.Envelope) {
+		var d signal.PresenceUpdateData
+		if env.Decode(&d) != nil || d.UserID == "" {
+			return
+		}
+		if s.ev.OnPresenceUpdate != nil {
+			s.ev.OnPresenceUpdate(d.UserID, d.Online)
+		}
+	})
+	// server.shutdown：服务端优雅关闭（#21）。停掉 ws 自动重连并转给 UI 层提示。
+	// Close 必须异步：同步调用会与读循环互等（Close 等 Run 退出、Run 等读循环返回）。
+	s.ws.On(signal.TypeServerShutdown, func(env signal.Envelope) {
+		var d signal.ServerShutdownData
+		reason := "shutdown"
+		if env.Decode(&d) == nil && d.Reason != "" {
+			reason = d.Reason
+		}
+		if s.ev.OnServerShutdown != nil {
+			s.ev.OnServerShutdown(reason)
+		}
+		go s.ws.Close()
+	})
+	// rtc.failed：SFU 因 ICE 失败移除本端（#19）。服务端已把本端摘出成员表并
+	// 给他人广播 peer_left，本地销毁 PC 与远端链路后重发 channel.join 重建
+	//（channel.joined 见 peerRef 为空会 setupPeer 建新 PC）。契约 0.2。
+	s.ws.On(signal.TypeRTCFailed, func(env signal.Envelope) {
+		var d signal.RTCFailedData
+		if env.Decode(&d) != nil {
+			return
+		}
+		s.rebuildAfterICEFail(d.ChannelID)
+	})
+	// 服务端 error 帧：先归因进房失败并回滚房间态（#91），其余再转聊天错误
+	// 回调。必须内置在会话里——回滚不能依赖 app 层是否注入了 ErrorHandler。
+	s.ws.On(signal.TypeError, s.handleErrorFrame)
+}
+
+// rebuildAfterICEFail ICE 失败重建入房（#19）：销毁本地 PC 与远端链路，重发
+// channel.join 重建（读循环内禁网络 I/O，ICE 用缓存，与 OnConnect 重连同款）。
+// 陈旧通知不折腾：不在该房（已手动离开/换房）忽略；本地 PC 已连通说明是
+// 迟到的失败通知，再拆一次只会把健康链路打断。
+func (s *Session) rebuildAfterICEFail(channelID string) {
+	room, _ := s.roomID.Load().(string)
+	if room == "" || (channelID != "" && channelID != room) {
+		return
+	}
+	if p := s.peerRef.Load(); p != nil &&
+		p.ConnectionState() == webrtc.PeerConnectionStateConnected {
+		return
+	}
+	if p := s.peerRef.Swap(nil); p != nil {
+		_ = p.Close()
+	}
+	if s.remoteMgr != nil {
+		s.remoteMgr.RemoveAll()
+	}
+	if s.ws != nil {
+		// 重建入房同样登记 pending：重建被拒（频道已删/无权限）时按进房失败
+		// 回滚，而不是把幽灵房间留给下一次重连（#91）。
+		seq := s.beginJoin(room)
+		if err := s.ws.Send(signal.TypeChannelJoin, signal.ChannelJoinData{ChannelID: room}); err != nil {
+			s.abortJoinSend(seq, false)
+			s.log.Printf("session: ICE 失败重建 channel.join 发送失败: %v", err)
+		}
+	}
+	s.log.Printf("session: ICE 失败重建入房 %s（#19）", room)
+	if s.ev.OnRTCFailed != nil {
+		s.ev.OnRTCFailed(room)
+	}
+}
+
+// leaveRoomLocal 本地退房（不发 channel.leave）。仅用于服务端已单方面把本端
+// 摘出房间的路径（session.voice_taken），以及进房失败后的本地回滚：再发
+// channel.leave 会让服务端按 uid 把抢占端也带离房间。成员表必须清——否则
+// UI 拿着旧 members 显示「幽灵在房」。
+func (s *Session) leaveRoomLocal() {
+	s.joinMu.Lock()
+	defer s.joinMu.Unlock()
+	// 退房后迟到的 error/joined 不得再回滚或恢复房间态，在途 join 一并作废。
+	s.pendingJoins = nil
+	s.roomID.Store("")
+	s.teardownLocalRoomLocked()
+}
+
+// teardownLocalRoomLocked 清媒体链路、旧 PC、远端链路与成员表。调用方须持
+// joinMu 并已定稿 roomID/pending（本函数不碰 join 状态）。
+func (s *Session) teardownLocalRoomLocked() {
+	s.stopMedia()
+	if p := s.peerRef.Swap(nil); p != nil {
+		_ = p.Close()
+	}
+	if s.remoteMgr != nil {
+		s.remoteMgr.RemoveAll()
+	}
+	if s.mixer != nil {
+		s.mixer.SetDeafen(false)
+	}
+	s.mu.Lock()
+	s.members = make(map[string]PeerView)
+	s.mu.Unlock()
+}
+
+// handleKicked 上报被踢原因（session.kicked 消息、WS close 4001、握手 401 的
+// session_replaced/session_replaced 头，三条路径的统一出口）。
+func (s *Session) handleKicked(reason string) {
+	if s.ev.OnKicked != nil {
+		s.ev.OnKicked(reason)
+	}
+}
+
+// setupPeer 建立对 SFU 的单条 PeerConnection（初始 offer 一次，此后只应答）。
+func (s *Session) setupPeer() {
+	if old := s.peerRef.Swap(nil); old != nil {
+		_ = old.Close()
+	}
+	if s.remoteMgr == nil { // 音频降级路径不可能走到（JoinChannel 已拦截），防御
+		return
+	}
+	s.remoteMgr.RemoveAll()
+	streamID := s.name
+	if s.selfID != "" {
+		streamID = s.selfID
+	}
+	peer, err := rtc.NewPeer(rtc.PeerConfig{
+		StreamID: streamID,
+		// 只读预取缓存，不做网络 I/O：本函数跑在 WS 读循环的 channel.joined
+		// 处理器里，同步拉凭证会把信令收发停摆到撞心跳预算（#13）。
+		ICEServers:      s.cachedICE(),
+		IncludeLoopback: IsLoopbackURL(s.api.Base()), // 环回候选仅本机/内网 SFU 需要
+		// RFC 6464 电平源（#33）：管线 DSP 已算好的帧电平，SendOpus 每包读一次。
+		LevelFn: s.pipe.AudioLevel,
+		Callbacks: rtc.PeerCallbacks{
+			OnLocalSDP: func(sdp webrtc.SessionDescription) {
+				msgType := signal.TypeRTCOffer
+				if sdp.Type == webrtc.SDPTypeAnswer {
+					msgType = signal.TypeRTCAnswer
+				}
+				_ = s.ws.Send(msgType, signal.SDPData{SDP: sdp.SDP})
+			},
+			OnLocalICE: func(c webrtc.ICECandidateInit) {
+				_ = s.ws.Send(signal.TypeRTCIce, iceFromPion(c))
+			},
+			OnTrack: s.remoteMgr.HandleTrack,
+			OnConnectionStateChange: func(st webrtc.PeerConnectionState) {
+				if s.ev.OnConnection != nil {
+					s.ev.OnConnection("rtc:" + st.String())
+				}
+			},
+		},
+		Logger: s.log,
+	})
+	if err != nil {
+		s.log.Printf("new peer: %v", err)
+		return
+	}
+	// 新 peer 默认不静音：必须同步本地静音态，否则重连后出现
+	//「UI 显示已闭麦但声音照传」。deafen 是混音器总线层的口，无 peer 级对应。
+	peer.SetMuted(s.muted.Load())
+	s.peerRef.Store(peer)
+	if err := peer.Offer(); err != nil {
+		s.log.Printf("offer: %v", err)
+	}
+}
+
+// JoinChannel 加入语音频道。发送成功只代表请求已发出——服务端是否接纳是
+// 异步回执（channel.joined / error 帧），见 beginJoin/handleErrorFrame（#91）。
+func (s *Session) JoinChannel(channelID string) error {
+	if s.ws == nil {
+		return fmt.Errorf("session not connected")
+	}
+	if s.voiceUnavailable {
+		return fmt.Errorf("语音不可用: %w", s.voiceErr)
+	}
+	// 预取 ICE 凭证再进房：setupPeer 跑在 WS 读循环上，不能做网络 I/O（#13）。
+	// 这里是 Wails 绑定 goroutine，阻塞可接受；失败留空缓存，降级空 ICE 列表。
+	s.prefetchICE()
+	seq := s.beginJoin(channelID)
+	if err := s.ws.Send(signal.TypeChannelJoin, signal.ChannelJoinData{ChannelID: channelID}); err != nil {
+		// roomID 先存是为断线重连恢复；发送失败必须回滚——否则重连后
+		// OnConnect 重发 join 造成「幽灵入房」。
+		s.abortJoinSend(seq, true)
+		return fmt.Errorf("join channel: %w", err)
+	}
+	return nil
+}
+
+// beginJoin 登记一次进房意图并乐观写 roomID（断线重连据此恢复）。返回的
+// seq 供发送失败时精确摘除本条；并发 join 按登记顺序排队，服务端在同一
+// 连接上按序处理，error 帧据此归属（#91）。
+func (s *Session) beginJoin(channelID string) uint64 {
+	s.joinMu.Lock()
+	defer s.joinMu.Unlock()
+	s.joinSeq++
+	s.pendingJoins = append(s.pendingJoins, pendingJoin{channelID: channelID, seq: s.joinSeq})
+	if n := len(s.pendingJoins); n > maxPendingJoins {
+		// 只保留最近的意图：超限说明调用方在异常连点，旧请求的结算已无意义。
+		s.pendingJoins = append([]pendingJoin(nil), s.pendingJoins[n-maxPendingJoins:]...)
+	}
+	s.roomID.Store(channelID)
+	return s.joinSeq
+}
+
+// abortJoinSend 发送失败：摘掉本次 join。rollbackRoom=true（用户主动 JoinChannel）
+// 且 roomID 仍是该频道时回滚为空；重连/ICE 重建的重发传 false——保留 roomID
+// 等下次重连再试是原有语义。
+func (s *Session) abortJoinSend(seq uint64, rollbackRoom bool) {
+	s.joinMu.Lock()
+	defer s.joinMu.Unlock()
+	idx := -1
+	for i := range s.pendingJoins {
+		if s.pendingJoins[i].seq == seq {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return // 已被 channel.joined / error 结算，不能再动房间态
+	}
+	ch := s.pendingJoins[idx].channelID
+	s.pendingJoins = append(s.pendingJoins[:idx], s.pendingJoins[idx+1:]...)
+	if !rollbackRoom {
+		return
+	}
+	if cur, _ := s.roomID.Load().(string); cur == ch {
+		// 不恢复到更早的 pending：发送失败时那些 join 也未必成功，等回执确认。
+		s.roomID.Store("")
+	}
+}
+
+// confirmJoin channel.joined 回执：摘掉对应的 pending join。仅当匹配到本端
+// 发出且未结算的请求时才认作回执——广播帧（成员变化重发全量）不改变状态。
+func (s *Session) confirmJoin(channelID string) {
+	s.joinMu.Lock()
+	defer s.joinMu.Unlock()
+	for i := range s.pendingJoins {
+		if s.pendingJoins[i].channelID != channelID {
+			continue
+		}
+		s.pendingJoins = append(s.pendingJoins[:i], s.pendingJoins[i+1:]...)
+		// 发送失败曾清空 roomID、而更早的 join 实际成功：以服务端回执为准恢复。
+		// roomID 非空（已有更新的 join 意图）时不得覆盖。
+		if cur, _ := s.roomID.Load().(string); cur == "" {
+			s.roomID.Store(channelID)
+		}
+		return
+	}
+}
+
+// settlePendingJoin 结算最早一次未完成的 join（服务端同一连接按序处理上行，
+// error 帧按 FIFO 归属）。rollback=false 用于 already_in_channel——服务端确认
+// 本连接已在该房，只清 pending，不清房间态。返回的 rolledBack 表示确实回滚了
+// 当前房间，调用方据此决定是否上报 OnJoinFailed。
+func (s *Session) settlePendingJoin(rollback bool) (channelID string, consumed, rolledBack bool) {
+	s.joinMu.Lock()
+	defer s.joinMu.Unlock()
+	if len(s.pendingJoins) == 0 {
+		return "", false, false
+	}
+	head := s.pendingJoins[0]
+	s.pendingJoins = s.pendingJoins[1:]
+	if !rollback {
+		return head.channelID, true, false
+	}
+	// 快速切房：失败的是旧 join，当前 roomID 已指向新房，绝不能回滚新房。
+	if cur, _ := s.roomID.Load().(string); cur != head.channelID {
+		return head.channelID, true, false
+	}
+	s.roomID.Store("")
+	s.teardownLocalRoomLocked()
+	return head.channelID, true, true
+}
+
+// LeaveChannel 离开当前语音频道。
+func (s *Session) LeaveChannel() error {
+	s.joinMu.Lock()
+	room, _ := s.roomID.Load().(string)
+	// 主动离开后迟到的 join 回执/错误不得再改状态：在途意图全部作废。
+	s.pendingJoins = nil
+	s.roomID.Store("")
+	s.joinMu.Unlock()
+	// 无论后续发送成败、是否已在房里：采集/播放随离开停止（幂等），
+	// 否则发送失败路径会把媒体留在运行态。
+	s.stopMedia()
+	if room == "" || s.ws == nil {
+		return nil
+	}
+	if err := s.ws.Send(signal.TypeChannelLeave, signal.ChannelLeaveData{ChannelID: room}); err != nil {
+		return err
+	}
+	if p := s.peerRef.Swap(nil); p != nil {
+		_ = p.Close()
+	}
+	if s.remoteMgr != nil {
+		s.remoteMgr.RemoveAll()
+	}
+	if s.mixer != nil {
+		s.mixer.SetDeafen(false)
+	}
+	return nil
+}
+
+// SetSendGate 注入按键说话发送门（传 nil 清除）。管线已建立时立即生效，
+// 未建立（未 Connect 或音频降级）时先存住，Connect 建管线后自动补上。
+// 跨 goroutine 安全：内部 atomic。
+func (s *Session) SetSendGate(g *hotkey.Gate) {
+	s.sendGate.Store(g)
+	if s.pipe != nil {
+		s.pipe.SetSendGate(g)
+	}
+}
+
+// SendGate 返回当前发送门（未注入为 nil）。
+func (s *Session) SendGate() *hotkey.Gate { return s.sendGate.Load() }
+
+// SetMute 本地静音（停止上行发包 + 隐藏波形）。
+func (s *Session) SetMute(muted bool) {
+	s.muted.Store(muted)
+	if p := s.peerRef.Load(); p != nil {
+		p.SetMuted(muted)
+	}
+	if s.ws != nil {
+		_ = s.ws.Send(signal.TypeVoiceState, signal.VoiceStateData{Mute: signal.Bool(muted)})
+	}
+}
+
+// SetDeafen 耳聋（不听任何人；实现为混音器总输出静音）。
+func (s *Session) SetDeafen(deafened bool) {
+	s.deafened.Store(deafened)
+	if s.mixer != nil {
+		s.mixer.SetDeafen(deafened)
+	}
+	if s.ws != nil {
+		_ = s.ws.Send(signal.TypeVoiceState, signal.VoiceStateData{Deafen: signal.Bool(deafened)})
+	}
+}
+
+// SetPeerVolume 调整某远端成员音量（0.0–2.0）。
+func (s *Session) SetPeerVolume(userID string, gain float64) {
+	if s.mixer != nil {
+		if in := s.mixer.Peer(userID); in != nil {
+			in.SetGain(gain)
+		}
+	}
+}
+
+// RestartDevices 热切换采集/播放设备：管线设备流重启，编解码/混音状态保留。
+func (s *Session) RestartDevices(captureID, playbackID string) error {
+	if s.pipe == nil {
+		return errors.New("no pipeline")
+	}
+	return s.pipe.RestartDevices(captureID, playbackID)
+}
+
+// ApplyAudio 把运行时音频设置热应用到媒体管线（通话中可调，未 Connect 时空操作）。
+// Opus 参数经 ResolveOpusConfig 回落默认；逐项应用，返回首个错误（不中断）。
+// v0.1.2 扩展：复杂度/降噪强度/AGC/扬声器总音量（mixer master gain）。
+// v1.1 扩展：前置增益（原子热生效）/输入声道模式（热重启采集流）。
+func (s *Session) ApplyAudio(rs audio.RuntimeSettings) error {
+	if s.pipe == nil {
+		return nil
+	}
+	rs.Opus = audio.ResolveOpusConfig(rs.Opus)
+	steps := []struct {
+		name string
+		fn   func() error
+	}{
+		{"bitrate", func() error { return s.pipe.SetOpusBitrate(rs.Opus.BitrateKbps) }},
+		{"vbr", func() error { return s.pipe.SetOpusVBR(*rs.Opus.VBR) }},
+		{"dtx", func() error { return s.pipe.SetOpusDTX(*rs.Opus.DTX) }},
+		{"fec", func() error { return s.pipe.SetOpusFEC(*rs.Opus.FEC) }},
+		{"packet_loss", func() error { return s.pipe.SetOpusPacketLoss(rs.Opus.PacketLoss) }},
+		{"pre_gain", func() error { return s.pipe.SetPreGainDB(rs.PreGainDB) }},
+		{"input_mode", func() error { return s.pipe.SetInputMode(rs.InputMode) }},
+	}
+	if rs.Complexity > 0 {
+		steps = append(steps, struct {
+			name string
+			fn   func() error
+		}{"complexity", func() error { return s.pipe.SetComplexity(rs.Complexity) }})
+	}
+	var firstErr error
+	for _, st := range steps {
+		if err := st.fn(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("audio %s: %w", st.name, err)
+		}
+	}
+	s.pipe.SetDenoise(rs.Denoise)
+	if err := s.pipe.SetDenoiseStrength(rs.DenoiseStrength); err != nil && firstErr == nil {
+		firstErr = fmt.Errorf("audio denoise_strength: %w", err)
+	}
+	s.pipe.SetAGC(rs.AGC)
+	s.pipe.SetGain(rs.Gain)
+	if s.mixer != nil {
+		s.mixer.SetMasterGain(rs.PlaybackGain)
+	}
+	s.pipe.SetVADSensitivity(rs.VADSens)
+	return firstErr
+}
+
+// Muted / Deafened 本地状态查询。
+func (s *Session) Muted() bool    { return s.muted.Load() }
+func (s *Session) Deafened() bool { return s.deafened.Load() }
+
+// Members 房间成员快照。
+func (s *Session) Members() []PeerView {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]PeerView, 0, len(s.members))
+	for _, m := range s.members {
+		out = append(out, m)
+	}
+	return out
+}
+
+// Stats 统计快照（JSON 给 UI）。
+func (s *Session) Stats() string {
+	vs := VoiceStats{}
+	var ps audio.StatsSnapshot
+	havePipe := s.pipe != nil
+	if havePipe {
+		ps = s.pipe.Stats()
+		vs.PlaybackBufferedMS = int(s.pipe.PlaybackBuffered().Milliseconds())
+		vs.PlaybackUnderruns = ps.PlaybackUnderruns
+		vs.PlaybackDropped = ps.PlaybackDropped
+	}
+	if s.remoteMgr != nil {
+		vs.PeerIDs = s.remoteMgr.PeerIDs()
+		// 下行链路诊断（#95）：app 层每 2s 入房期间调用，快照读取。
+		for _, id := range vs.PeerIDs {
+			ls, ok := s.remoteMgr.LinkStats(id)
+			if !ok {
+				continue
+			}
+			vs.Peers = append(vs.Peers, PeerLinkDiag{
+				PeerID:                id,
+				JitterMs:              ls.Jitter.JitterMs,
+				JitterTargetPackets:   ls.Jitter.TargetPackets,
+				JitterBufferedPackets: ls.Jitter.Buffered,
+				JitterLost:            ls.Jitter.Lost,
+				RingSamples:           ls.RingAvailable,
+				PLCFrames:             ls.PLCFrames,
+				FECFrames:             ls.FECFrames,
+				UnderrunFrames:        ls.UnderrunFrames,
+				DroppedSamples:        ls.DroppedSamples,
+			})
+		}
+	}
+	if p := s.peerRef.Load(); p != nil {
+		vs.RtpSent = p.Stats.PacketsSent.Load()
+		// 延迟优先取 WebRTC 选中 ICE pair 的真实 RTT（问题：此前恒 0ms——
+		// 管线回环估计只在 Loopback 模式有样本，真实通话不产样本）。
+		// 用 ok 作哨兵而非值——RTT 真实但 <1ms 时会被错误覆盖（S1）。
+		if rtt, ok := p.RTT(); ok {
+			vs.LatencyMS = int(rtt.Milliseconds())
+		} else if havePipe {
+			// 无 RTT 样本时回落管线回环估计（本机联调场景）。
+			vs.EncPackets = ps.PacketsEncoded
+			vs.LatencyMS = int(ps.LatencyAvgUS / 1000)
+		}
+	}
+	s.mu.Lock()
+	vs.Members = len(s.members)
+	s.mu.Unlock()
+	b, _ := json.Marshal(vs)
+	return string(b)
+}
+
+// SendChat 发送文字消息（chat.send，chat.message 由 WS 回落）。
+// type 字段是服务端 chat.send 的必填校验（v1.1.0 §0.12：本期仅 text）。
+//
+// nonce（#31）：每次用户发送生成一次；断线/写失败时消息连同 nonce 入队，
+// 重连后由 OnConnect 用同一个 nonce 重发，服务端据此去重（只落一条、只广播一次）。
+func (s *Session) SendChat(channelID, content string) error {
+	if s.ws == nil || s.ws.Closed() {
+		return fmt.Errorf("session not connected")
+	}
+	nonce, err := newChatNonce()
+	if err != nil {
+		return err
+	}
+	s.chatMu.Lock()
+	defer s.chatMu.Unlock()
+	if len(s.pendingChats) >= maxPendingChats {
+		return fmt.Errorf("离线消息队列已满（%d 条），请等连接恢复后重试", maxPendingChats)
+	}
+	s.pendingChats = append(s.pendingChats, pendingChat{channelID: channelID, content: content, nonce: nonce})
+	s.flushPendingChatsLocked()
+	return nil
+}
+
+// maxPendingChats 断线期间积压的聊天消息上限：超出直接拒绝，不无限占内存。
+const maxPendingChats = 64
+
+// pendingChat 一条待发消息。nonce 在用户发送时生成一次，重试不换。
+type pendingChat struct {
+	channelID string
+	content   string
+	nonce     string
+}
+
+// flushPendingChats 重连后重发积压消息（OnConnect 在 ws 读循环上调用）。
+func (s *Session) flushPendingChats() {
+	s.chatMu.Lock()
+	defer s.chatMu.Unlock()
+	s.flushPendingChatsLocked()
+}
+
+// flushPendingChatsLocked 按入队顺序发送；首个失败即停，保留剩余项等下次重连。
+// 调用方持 chatMu（与 SendChat 串行，保证重发与新消息的相对顺序）。
+func (s *Session) flushPendingChatsLocked() {
+	for len(s.pendingChats) > 0 {
+		if err := s.sendChatFrame(s.pendingChats[0]); err != nil {
+			return
+		}
+		s.pendingChats = s.pendingChats[1:]
+	}
+}
+
+// sendChatFrame 发送一条 chat.send。nonce 的 x-since 是 2：老服务端不协商协议
+// （protoVer=0），不带该字段，wire 与 v1 完全一致；v2 服务端才携带。
+func (s *Session) sendChatFrame(item pendingChat) error {
+	d := signal.ChatSendData{ChannelID: item.channelID, Type: "text", Content: item.content}
+	if s.ProtocolVersion() >= 2 {
+		d.Nonce = item.nonce
+	}
+	return s.ws.Send(signal.TypeChatSend, d)
+}
+
+// newChatNonce 16 字节 crypto/rand 的 hex（32 字符，满足 REST/WS 的 ≤64 上限）。
+func newChatNonce() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("生成消息 nonce 失败: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// RequestVoiceState 请求目标成员闭麦/静音（v0.1.2 voice.request_state；
+// 纯请求语义，目标接受后自行执行，服务端无强制）。
+func (s *Session) RequestVoiceState(channelID, targetID string, mute, deafen bool) error {
+	if s.ws == nil {
+		return fmt.Errorf("session not connected")
+	}
+	return s.ws.Send(signal.TypeVoiceRequestState, signal.VoiceRequestStateData{
+		ChannelID: channelID,
+		TargetID:  targetID,
+		Mute:      &mute,
+		Deafen:    &deafen,
+	})
+}
+
+// VoiceStateView 供 UI 销毁重载后回填的语音态快照（v0.1.2）。
+type VoiceStateView struct {
+	ChannelID string     `json:"channel_id"`
+	Muted     bool       `json:"muted"`
+	Deafened  bool       `json:"deafened"`
+	Members   []PeerView `json:"members"`
+}
+
+// VoiceState 当前语音态快照（channelId 空 = 未在频道）。
+func (s *Session) VoiceState() VoiceStateView {
+	v := VoiceStateView{
+		ChannelID: s.roomID.Load().(string),
+		Muted:     s.muted.Load(),
+		Deafened:  s.deafened.Load(),
+		Members:   s.Members(),
+	}
+	return v
+}
+
+// ChatHandler 注入 chat.message 处理（app 层补挂）。
+// msgID 为服务端消息 ID（文字消息按频道隔离与去重需要真实 ID，
+// 此前回调丢弃了 ID，前端只能拿时间戳当 key，无法可靠去重）。
+// nonce 为发送方 chat.send 携带的幂等键（#31，协议 v2；REST 补拉与老服务端为空串）。
+// 同时记录收过消息的频道（#32 全量补拉的范围），fn 回灌路径复用同一回调。
+func (s *Session) ChatHandler(fn func(channelID, msgID, userID, nickname, content, ts, nonce string)) {
+	if s.ws == nil {
+		return
+	}
+	s.mu.Lock()
+	s.chatFn = fn
+	s.mu.Unlock()
+	s.ws.On(signal.TypeChatMessage, func(env signal.Envelope) {
+		var d struct {
+			ID        string `json:"id"`
+			ChannelID string `json:"channel_id"`
+			Content   string `json:"content"`
+			TS        int64  `json:"ts"`
+			Nonce     string `json:"nonce"`
+			User      struct {
+				ID       string `json:"id"`
+				Nickname string `json:"nickname"`
+			} `json:"user"`
+		}
+		if env.Decode(&d) != nil {
+			return
+		}
+		s.mu.Lock()
+		s.seenChans[d.ChannelID] = true
+		s.mu.Unlock()
+		fn(d.ChannelID, d.ID, d.User.ID, d.User.Nickname, d.Content, fmt.Sprintf("%d", d.TS), d.Nonce)
+	})
+}
+
+// resyncRecentMessages 单频道补拉的消息条数（最新 N 条，覆盖断线窗口）。
+const resyncRecentMessages = 50
+
+// applyFriendPresence 好友在线态回灌（状态型更新，幂等）。
+func (s *Session) applyFriendPresence(friends []api.FriendDTO) {
+	if s.ev.OnPresenceUpdate == nil {
+		return
+	}
+	for _, f := range friends {
+		if f.Status == "accepted" {
+			s.ev.OnPresenceUpdate(f.User.ID.String(), f.User.Online)
+		}
+	}
+}
+
+// fullResync 事件面续传失败后的全量补拉（#32/#78）。跑在独立 goroutine
+// （gateway.Tracker 异步触发），可安全做 REST I/O——WS 读循环禁止阻塞。
+// 范围：
+//  1. 聚合快照 GET /api/v1/sync 一次取回服务器/频道/好友；好友在线态回灌
+//     OnPresenceUpdate。快照本身不落会话状态（服务器/频道视图由 UI 收到
+//     Events.OnResync 后经绑定自取）；失败只降级好友单拉，不影响后续消息补拉。
+//  2. 本会话收过消息的频道各拉最近消息，回灌 ChatHandler（前端按消息 id 幂等，
+//     与在途增量重叠也不重复）。聚合端点不含消息——按用户全部频道返消息的
+//     响应体积不可控，消息仍按 seenChans 范围补拉。
+//  3. Events.OnResync 通知 UI 层刷新服务器/频道等 REST 视图（只发提示不代拉）。
+func (s *Session) fullResync() {
+	s.mu.Lock()
+	chans := make([]string, 0, len(s.seenChans))
+	for ch := range s.seenChans {
+		chans = append(chans, ch)
+	}
+	chatFn := s.chatFn
+	s.mu.Unlock()
+
+	if snap, err := s.api.Sync(); err != nil {
+		s.log.Printf("gateway: 聚合快照拉取失败，好友回落到单拉: %v", err)
+		if friends, ferr := s.api.ListFriends(); ferr != nil {
+			s.log.Printf("gateway: 补拉好友在线态失败: %v", ferr)
+		} else {
+			s.applyFriendPresence(friends)
+		}
+	} else {
+		s.applyFriendPresence(snap.Friends)
+	}
+
+	for _, ch := range chans {
+		cid, err := strconv.ParseInt(ch, 10, 64)
+		if err != nil {
+			continue // dev 内置房间无 REST 实体，无历史可拉
+		}
+		msgs, err := s.api.ListMessages(cid, resyncRecentMessages)
+		if err != nil {
+			s.log.Printf("gateway: 补拉频道 %s 消息失败: %v", ch, err)
+			continue
+		}
+		if chatFn == nil {
+			continue
+		}
+		for _, m := range msgs {
+			chatFn(ch, m.ID.String(), m.UserID.String(), m.SenderNickname, m.Content,
+				strconv.FormatInt(m.CreatedAt.UnixMilli(), 10), "")
+		}
+	}
+
+	if s.ev.OnResync != nil {
+		s.ev.OnResync()
+	}
+}
+
+// handleErrorFrame 服务端 error 帧的统一入口。先尝试按进房失败归因并回滚
+// 房间态（#91），再转给 ErrorHandler/ErrorHandlerEx 注入的聊天错误回调。
+//
+// 归因约束：error 帧没有 request id（api/signal 契约），无法精确关联到上行
+// 消息。这里只能按「pending join 队列非空 + 错误码」过滤，并按服务端在单
+// 连接上的处理顺序把错误归属给最早未结算的 join。通用码（forbidden /
+// bad_message / rate_limited / quota_exceeded）其他路径也会返回——尤其
+// quota_exceeded 还来自 rtc.offer 的 SFU 容量上限（hub.handleRTCOffer）——
+// 队列非空时存在误判的理论窗口；队列为空时一律按聊天错误处理。
+func (s *Session) handleErrorFrame(env signal.Envelope) {
+	var d signal.ErrorData
+	if env.Decode(&d) != nil {
+		return
+	}
+	joinOnly := isJoinOnlyErrorCode(d.Code)
+	joinRelated := joinOnly || isJoinSharedErrorCode(d.Code)
+
+	channelID := ""
+	consumed, rolledBack := false, false
+	if joinRelated {
+		// already_in_channel 是「本连接已在该房」的确认，不是失败：只结算
+		// pending，回滚会把重复点击时刚加入的有效房间清掉。
+		channelID, consumed, rolledBack = s.settlePendingJoin(d.Code != signal.ErrCodeAlreadyInChan)
+	}
+	if !consumed && joinOnly {
+		// 进房专用码（not_found/already_in_channel）不可能来自聊天。没有
+		// pending 时是迟到/重复帧，静默丢弃，避免弹出「消息发送失败」。
+		// quota_exceeded 不在此列：rtc.offer 配额失败同样用它，必须继续转发。
+		return
+	}
+	if rolledBack && s.ev.OnJoinFailed != nil {
+		s.ev.OnJoinFailed(channelID, d.Code, d.Message)
+	}
+	// consumed 的错误已归属进房路径（可能已回滚，也可能是无需提示的结算）：
+	// 仍通知回调，但带 joinHandled=true 让 app 层跳过 chat:error，避免同一次
+	// 失败弹两条提示；CLI 等老调用方经 ErrorHandler 仍能看到全部错误。
+	s.mu.Lock()
+	fns := append([]func(code, message string, joinHandled bool){}, s.errFns...)
+	s.mu.Unlock()
+	for _, fn := range fns {
+		fn(d.Code, d.Message, consumed)
+	}
+}
+
+// isJoinOnlyErrorCode 只会由 channel.join 返回的错误码（server/internal/signal/
+// hub.go 的 authorizeChannelJoin / joinRoom 路径）。chat.send 不会返回这两个码，
+// 无 pending 时可按迟到/重复帧静默丢弃。
+func isJoinOnlyErrorCode(code string) bool {
+	switch code {
+	case signal.ErrCodeNotFound, signal.ErrCodeAlreadyInChan:
+		return true
+	}
+	return false
+}
+
+// isJoinSharedErrorCode channel.join 与其他上行/协商都可能返回的通用码：
+//   - forbidden / bad_message / rate_limited：聊天等上行共用；
+//   - quota_exceeded：进房满员（hub.joinRoom）之外，rtc.offer 的 SFU 容量
+//     上限（hub.handleRTCOffer，§0.1.3）与握手连接数上限也会返回——无 pending
+//     时必须继续走聊天错误回调，不能当 join-only 丢弃。
+func isJoinSharedErrorCode(code string) bool {
+	switch code {
+	case signal.ErrCodeForbidden, signal.ErrCodeBadMessage, signal.ErrCodeRateLimited,
+		signal.ErrCodeQuotaExceeded:
+		return true
+	}
+	return false
+}
+
+// ErrorHandler 注入服务端 error 帧处理（app 层补挂）。
+// 服务端对 chat.send 等消息的校验/拒收是异步 error 帧回落，
+// 此前未订阅导致服务端拒收时消息凭空消失且无提示（阻断 B1）。
+// 进房失败已由会话内部回滚并经 OnJoinFailed 上报，这里仍会收到（无法区分
+// 入参），需要区分请用 ErrorHandlerEx。
+func (s *Session) ErrorHandler(fn func(code, message string)) {
+	if fn == nil {
+		return
+	}
+	s.ErrorHandlerEx(func(code, message string, _ bool) { fn(code, message) })
+}
+
+// ErrorHandlerEx 同 ErrorHandler，额外告知该错误帧是否已被进房路径处理
+// （joinHandled=true：可能是进房失败并已触发 OnJoinFailed，也可能是
+// already_in_channel 这类无需提示的结算）。app 层据此跳过 chat:error，
+// 避免同一次错误重复提示。
+func (s *Session) ErrorHandlerEx(fn func(code, message string, joinHandled bool)) {
+	if s.ws == nil || fn == nil {
+		return
+	}
+	s.mu.Lock()
+	s.errFns = append(s.errFns, fn)
+	s.mu.Unlock()
+}
+
+// Close 释放全部资源。
+func (s *Session) Close() {
+	if s.cancel != nil {
+		s.cancel()
+	}
+	if s.ws != nil {
+		s.ws.Close()
+	}
+	s.wg.Wait()
+	if p := s.peerRef.Swap(nil); p != nil {
+		_ = p.Close()
+	}
+	if s.remoteMgr != nil {
+		s.remoteMgr.RemoveAll()
+	}
+	s.stopMedia()
+	if s.mixer != nil {
+		s.mixer.Stop()
+	}
+	if s.pipe != nil {
+		_ = s.pipe.Close()
+	}
+}
+
+// SignalConnected 报告信令 WS 当前是否有活跃连接（app 层据首次连接结果定 session_ok）。
+func (s *Session) SignalConnected() bool { return s.ws != nil && s.ws.Connected() }
+
+// ProtocolVersion 返回服务端协商到的协议版本（#29）。
+// 0 = 尚未收到 server.hello（老服务端或还没协商完）——按 v1 行为处理。
+func (s *Session) ProtocolVersion() int64 { return s.protoVer.Load() }
+
+// InRoom 报告当前是否在语音频道（app 层 voice:stats ticker 据它门控发送）。
+func (s *Session) InRoom() bool {
+	room, _ := s.roomID.Load().(string)
+	return room != ""
+}
+
+// IsLoopbackURL 判断服务器基址是否指向环回（127.0.0.0/8、::1、localhost）。
+// 环回目标仅本机/内网 SFU 需要收集环回 ICE 候选；公网部署必须关闭，
+// 否则本机环回地址会作为候选暴露给远端对端。
+// 解析失败视为非环回（安全侧，不收集环回候选）。
+func IsLoopbackURL(base string) bool {
+	u, err := url.Parse(strings.TrimSpace(base))
+	if err != nil || u.Host == "" {
+		return false
+	}
+	host := u.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// prefetchICE 预取 STUN/TURN 凭证并写入缓存。只在可阻塞的 goroutine 调用
+// （JoinChannel 的 Wails 绑定线程）；WS 读循环上的 setupPeer 只读缓存（#13）。
+// 失败留空缓存，由 cachedICE 降级空 ICE 列表——本机/内网直连仍可通。
+func (s *Session) prefetchICE() {
+	servers := s.fetchICEServers()
+	s.iceMu.Lock()
+	s.iceServers = servers
+	s.iceMu.Unlock()
+}
+
+// cachedICE 读预取结果。零 I/O，专供 WS 读循环使用；空即降级空 ICE 列表。
+func (s *Session) cachedICE() []webrtc.ICEServer {
+	s.iceMu.RLock()
+	defer s.iceMu.RUnlock()
+	return s.iceServers
+}
+
+// fetchICEServers 拉取 STUN/TURN 凭证并转成 pion 格式。失败或服务端未配置
+// TURN（dev 环境常见）时降级为空 ICE 列表——本机/内网直连仍可通，不阻断进房。
+func (s *Session) fetchICEServers() []webrtc.ICEServer {
+	resp, err := s.api.RTCCredentials()
+	if err != nil {
+		s.log.Printf("rtc credentials: %v（降级为空 ICE 列表）", err)
+		return nil
+	}
+	if resp == nil || len(resp.ICEServers) == 0 {
+		return nil
+	}
+	out := make([]webrtc.ICEServer, 0, len(resp.ICEServers))
+	for _, srv := range resp.ICEServers {
+		out = append(out, webrtc.ICEServer{
+			URLs:       srv.URLs,
+			Username:   srv.Username,
+			Credential: srv.Credential,
+		})
+	}
+	return out
+}
+
+// iceFromPion / iceToPion 信令线格式 ↔ pion（与 calltest 同款）。
+func iceFromPion(c webrtc.ICECandidateInit) signal.ICEData {
+	d := signal.ICEData{Candidate: c.Candidate, SDPMLineIndex: c.SDPMLineIndex}
+	if c.SDPMid != nil {
+		d.SDPMid = *c.SDPMid
+	}
+	if c.UsernameFragment != nil {
+		d.UsernameFragment = *c.UsernameFragment
+	}
+	return d
+}
+
+func iceToPion(d signal.ICEData) webrtc.ICECandidateInit {
+	c := webrtc.ICECandidateInit{Candidate: d.Candidate, SDPMLineIndex: d.SDPMLineIndex}
+	if d.SDPMid != "" {
+		c.SDPMid = &d.SDPMid
+	}
+	if d.UsernameFragment != "" {
+		c.UsernameFragment = &d.UsernameFragment
+	}
+	return c
+}
