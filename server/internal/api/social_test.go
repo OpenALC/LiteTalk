@@ -1,8 +1,12 @@
 package api
 
 import (
+	"context"
 	"fmt"
+	"sync"
 	"testing"
+
+	"github.com/OpenALC/LiteTalk/server/internal/store"
 )
 
 // assertNoEmail 断言 friendView 的 user 子对象不含 email 键。
@@ -274,9 +278,12 @@ func TestPatchCategory(t *testing.T) {
 		}
 	}
 
-	// 同一请求既改名又重排。
-	patchJSON(t, h, fmt.Sprintf("/api/v1/categories/%d", catIDs[1]), aTok,
+	// 同一请求既改名又重排：先重排、读回、再改名，响应带最终 position。
+	out = patchJSON(t, h, fmt.Sprintf("/api/v1/categories/%d", catIDs[1]), aTok,
 		map[string]any{"name": "乙改", "position": 2}, 200)
+	if out["name"] != "乙改" || int(out["position"].(float64)) != 2 {
+		t.Fatalf("改名+重排响应 = %+v，期望 乙改/2", out)
+	}
 	chans = getJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/channels", sid), aTok, 200).(map[string]any)
 	cats = chans["categories"].([]any)
 	want = []string{"丙", "甲改", "乙改"}
@@ -302,5 +309,99 @@ func TestPatchCategory(t *testing.T) {
 	cats = chans["categories"].([]any)
 	if first := cats[0].(map[string]any)["name"]; first != "乙改" {
 		t.Fatalf("no-op 改名后重排未生效，首位 = %v", first)
+	}
+}
+
+// patchOrderStore 记录分类写入顺序的 store 包装（其余方法透传）。
+// 用于断言 PATCH 的执行顺序：重排 → 重新读回 → 改名。
+type patchOrderStore struct {
+	store.Store
+	mu          sync.Mutex
+	calls       []string       // 依次记录的 read / reorder / update
+	writes      map[string]int // 改名时 UpdateCategory 收到的 position
+	reorderHook func(serverID, id int64)
+}
+
+func (s *patchOrderStore) CategoryByID(ctx context.Context, id int64) (*store.Category, error) {
+	s.mu.Lock()
+	s.calls = append(s.calls, "read")
+	s.mu.Unlock()
+	return s.Store.CategoryByID(ctx, id)
+}
+
+func (s *patchOrderStore) ReorderCategories(ctx context.Context, serverID, id int64, position int) error {
+	if err := s.Store.ReorderCategories(ctx, serverID, id, position); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.calls = append(s.calls, "reorder")
+	hook := s.reorderHook
+	s.reorderHook = nil
+	s.mu.Unlock()
+	if hook != nil {
+		hook(serverID, id)
+	}
+	return nil
+}
+
+func (s *patchOrderStore) UpdateCategory(ctx context.Context, c *store.Category) error {
+	s.mu.Lock()
+	s.calls = append(s.calls, "update")
+	if s.writes == nil {
+		s.writes = map[string]int{}
+	}
+	s.writes[c.Name] = c.Position
+	s.mu.Unlock()
+	return s.Store.UpdateCategory(ctx, c)
+}
+
+// TestPatchCategoryReorderBeforeRename name+position 同时给出时的写入顺序（#16 P2）：
+// 必须「重排 → 重新读回 → 改名」，改名携带重排后的 position，而不是加载时的旧值。
+// 在重排之后、读回之前插入一次并发重排，确认处理器的改名不会把旧 position 写回。
+func TestPatchCategoryReorderBeforeRename(t *testing.T) {
+	srv, mem := newTestServer(t)
+	rec := &patchOrderStore{Store: mem}
+	srv.store = rec
+	h := srv.Handler()
+
+	aTok, _ := registerUser(t, h, mem, "po@ex.com", "顺序A", "password123")
+	sv := postJSON(t, h, "/api/v1/servers", aTok, map[string]string{"name": "顺序服"}, 201)
+	sid := int(asID(sv["id"]))
+	ids := map[string]int{}
+	for _, name := range []string{"甲", "乙", "丙"} {
+		cat := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/categories", sid), aTok,
+			map[string]string{"name": name}, 201)
+		ids[name] = int(asID(cat["id"]))
+	}
+
+	// 处理器把乙重排到 0 之后、读回之前，另一路并发把乙挪到 2：
+	// 改名应写入读回后的 2，旧值 1 不得回写。
+	rec.reorderHook = func(serverID, id int64) {
+		done := make(chan error, 1)
+		go func() { done <- mem.ReorderCategories(context.Background(), serverID, id, 2) }()
+		if err := <-done; err != nil {
+			t.Errorf("并发重排失败: %v", err)
+		}
+	}
+
+	out := patchJSON(t, h, fmt.Sprintf("/api/v1/categories/%d", ids["乙"]), aTok,
+		map[string]any{"name": "乙改", "position": 0}, 200)
+	if out["name"] != "乙改" {
+		t.Fatalf("响应 name = %v，期望 乙改", out["name"])
+	}
+	if got := int(out["position"].(float64)); got != 2 {
+		t.Fatalf("响应 position = %d，期望 2（并发重排后的最终序号）", got)
+	}
+
+	rec.mu.Lock()
+	calls := append([]string(nil), rec.calls...)
+	pos, ok := rec.writes["乙改"]
+	rec.mu.Unlock()
+	want := []string{"read", "reorder", "read", "update"}
+	if fmt.Sprint(calls) != fmt.Sprint(want) {
+		t.Fatalf("调用顺序 = %v，期望 %v", calls, want)
+	}
+	if !ok || pos != 2 {
+		t.Fatalf("改名写入 position = %d（存在=%v），期望 2；旧值 1 不得回写", pos, ok)
 	}
 }
