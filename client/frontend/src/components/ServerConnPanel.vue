@@ -5,6 +5,7 @@ import { onMounted, ref } from 'vue'
 import { Server, Wifi, RefreshCw } from 'lucide-vue-next'
 import { goApp } from '../api/bridge'
 import type { ConnConfigView } from '../api/types'
+import { cleanErrorText } from '../utils/errorText'
 
 const props = withDefaults(defineProps<{ autoTest?: boolean }>(), { autoTest: false })
 const emit = defineEmits<{ (e: 'saved'): void; (e: 'unreachable'): void }>()
@@ -51,10 +52,11 @@ async function saveConn() {
     savedHint.value = true
     emit('saved')
   } catch (e) {
-    // Go 侧失败会带原因（如「切换失败，已恢复原地址: …」），原样展示，不吞成固定文案。
+    // Go 侧失败会带原因（如「切换失败，已恢复原地址: …」），清洗机器前缀后展示，
+    // 不吞成固定文案（#15）。
     savedHint.value = false
     testOk.value = false
-    testResult.value = String(e) || '地址无效'
+    testResult.value = cleanErrorText(e, '地址无效')
   }
 }
 </script>
