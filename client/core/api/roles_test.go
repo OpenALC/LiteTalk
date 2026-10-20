@@ -115,4 +115,15 @@ func TestRolesAPIWire(t *testing.T) {
 	if last.method != http.MethodDelete || !strings.HasSuffix(last.path, "/channels/5/overwrites/role/10") {
 		t.Fatalf("DeleteChannelOverwrite 形状: %+v", last)
 	}
+
+	// #36 服务端强制闭麦：PUT .../server-mute，body {"muted":...}。
+	if err := c.SetServerMuted("5", "2", true); err != nil {
+		t.Fatalf("SetServerMuted: %v", err)
+	}
+	if last.method != http.MethodPut || !strings.HasSuffix(last.path, "/channels/5/members/2/server-mute") {
+		t.Fatalf("SetServerMuted 路径: %+v", last)
+	}
+	if last.body != `{"muted":true}` {
+		t.Fatalf("SetServerMuted body: %s", last.body)
+	}
 }

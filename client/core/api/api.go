@@ -975,6 +975,20 @@ func (c *APIClient) DeleteChannel(id string) error {
 	return nil
 }
 
+// SetServerMuted 服务端强制闭麦/解禁（#36，需 MuteMembers）：目标不配合也生效；
+// 房间成员经 voice.state{server_muted} 获知状态。
+func (c *APIClient) SetServerMuted(channelID, userID string, muted bool) error {
+	status, data, err := c.put(fmt.Sprintf("/channels/%s/members/%s/server-mute", channelID, userID),
+		map[string]bool{"muted": muted})
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return decodeError(status, data)
+	}
+	return nil
+}
+
 // CategoryDTO 频道分类（与 store.Category / 契约 CategoryInfo 对齐）。ID 为字符串 wire（#31）。
 type CategoryDTO struct {
 	ID        ID        `json:"id"`

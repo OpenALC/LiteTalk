@@ -127,6 +127,9 @@ type SFU struct {
 	// SFU，交叉持锁必死锁。
 	tickRooms []*Room
 
+	// serverMutedDropped 服务端强制闭麦丢弃的上行包数（#36 诊断计数）。
+	serverMutedDropped atomic.Uint64
+
 	mu    sync.RWMutex
 	rooms map[string]*Room
 }
@@ -510,4 +513,26 @@ func (s *SFU) findPeer(roomID, userID string) *Peer {
 		return nil
 	}
 	return room.getPeer(userID)
+}
+
+// SetServerMuted 设置/解除服务端强制闭麦（#36）：RTP 包级丢弃，track 保持挂载
+// （禁 RemoveTrack）。状态记在 room.serverMuted——removePeer/teardownPeer 不清，
+// 同房间重入/换连接经 newPeer 继承；房间销毁才清。
+// 房间或成员不存在返回 false（调用方按「目标不在房」404）。
+func (s *SFU) SetServerMuted(roomID, userID string, muted bool) bool {
+	room := s.findRoom(roomID)
+	if room == nil {
+		return false
+	}
+	room.mu.Lock()
+	p, ok := room.peers[userID]
+	if !ok {
+		room.mu.Unlock()
+		return false
+	}
+	room.serverMuted[userID] = muted
+	p.serverMuted.Store(muted)
+	room.mu.Unlock()
+	s.log.Printf("sfu: 房间 %s 成员 %s 服务端闭麦=%v", roomID, userID, muted)
+	return true
 }

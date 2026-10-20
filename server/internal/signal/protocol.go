@@ -63,6 +63,9 @@ func (e Envelope) Decode(v any) error {
 // ErrUnauthorized 令牌为空或无法提取用户名。
 var ErrUnauthorized = errors.New("令牌无效")
 
+// ErrNotInChannel 目标不在指定频道/房间（#36 服务端强制闭麦等操作的 404 语义）。
+var ErrNotInChannel = errors.New("目标不在该频道中")
+
 // Identity 鉴权结果：身份 + 会话声明（多设备会话 v1.1.0）。
 type Identity struct {
 	UserID   string

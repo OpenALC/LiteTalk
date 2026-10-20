@@ -1395,6 +1395,42 @@ paths:
           $ref: '#/components/responses/NotFound'
         default:
           $ref: '#/components/responses/Internal'
+  /api/v1/channels/{id}/members/{user_id}/server-mute:
+    put:
+      operationId: setServerMuted
+      summary: 服务端强制闭麦/解禁（需 MuteMembers，#36）
+      description: >
+        服务端在 SFU 转发前丢弃目标的上行 RTP（track 保持挂载），目标不配合也无法
+        绕过；房间成员收到 voice.state{server_muted}。仅语音频道；不能对自己操作。
+        code：bad_channel、bad_request、路径参数不合法；401；403 forbidden；
+        404 not_found（频道不存在或目标不在该频道语音房）；5xx internal。
+      tags: [channels]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+        - $ref: '#/components/parameters/UserIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ServerMuteRequest'
+      responses:
+        '200':
+          description: 已生效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusOk'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
 components:
   securitySchemes:
     bearerAuth:
@@ -2324,3 +2360,11 @@ components:
           type: string
           format: date-time
           x-go-type: Time
+    ServerMuteRequest:
+      type: object
+      title: ServerMuteRequest
+      required: [muted]
+      properties:
+        muted:
+          type: boolean
+          description: true=服务端强制闭麦；false=解禁恢复转发

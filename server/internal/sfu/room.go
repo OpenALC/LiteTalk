@@ -22,6 +22,10 @@ type Room struct {
 	// joining==0 时删除，杜绝「拿到房间 → 被回收 → peer 落进孤儿房」。
 	// 锁序固定为 s.mu → r.mu（acquireRoom / removeRoomIfEmpty 都按此顺序）。
 	joining int
+	// serverMuted 服务端强制闭麦状态（#36，受 mu 保护）：uid → 是否被闭麦。
+	// removePeer/teardownPeer 不清除——同房间重入/换连接经 newPeer 继承，
+	// 房间销毁才随 Room 一起消失。
+	serverMuted map[string]bool
 
 	// tickPeers 成员快照缓冲（复用免分配；仅 speakingLoop goroutine 访问）。
 	tickPeers []*Peer
@@ -29,9 +33,10 @@ type Room struct {
 
 func newRoom(s *SFU, id string) *Room {
 	return &Room{
-		id:    id,
-		sfu:   s,
-		peers: make(map[string]*Peer),
+		id:          id,
+		sfu:         s,
+		peers:       make(map[string]*Peer),
+		serverMuted: make(map[string]bool),
 	}
 }
 
@@ -299,6 +304,16 @@ func (r *Room) forward(src *Peer, srcTrack *webrtc.TrackRemote, levelExtID uint8
 		pkt, _, err := srcTrack.ReadRTP()
 		if err != nil {
 			return
+		}
+		// 服务端强制闭麦（#36）：整包丢弃但 track 保持挂载（RemoveTrack 会触发
+		// 重协商风暴，禁）。电平按静音记（127）避免说话态卡在闭麦前最后一包；
+		// pktSeq 照常 +1——发包仍算「活着」，停流检测语义不变，目标不配合继续
+		// 发包也只是白白带宽，服务端不转发。
+		if src.serverMuted.Load() {
+			src.level.Store(127)
+			src.pktSeq.Add(1)
+			r.sfu.serverMutedDropped.Add(1)
+			continue
 		}
 		if levelExtID != 0 {
 			if ext := pkt.Header.GetExtension(levelExtID); len(ext) > 0 {

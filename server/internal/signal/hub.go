@@ -1059,10 +1059,13 @@ func (h *Hub) handleRTCCandidate(c *client, cand ICECandidateData) {
 // handleVoiceState 更新内存态成员表并向房间其他成员广播（服务端不校验）。
 // v2 客户端的 speaking 字段被忽略（#33 裁定 #5）：协议 2 起说话判定走 RFC 6464
 // 电平（voice.speaking），voice.state 只承载 mute/deafen；v1 客户端照旧全收全发。
+// server_muted 是服务端权威字段（#36）：上行携带一律忽略，只有 SetServerMuted
+// 的广播才带——否则任意客户端可伪造「被闭麦/已解禁」状态。
 func (h *Hub) handleVoiceState(c *client, d VoiceStateData) {
 	if c.protoVer.Load() >= 2 {
 		d.Speaking = nil
 	}
+	d.ServerMuted = nil
 	h.mu.Lock()
 	roomID := c.roomIDLocked()
 	c.mu.Lock()
@@ -1148,6 +1151,36 @@ func (h *Hub) handleVoiceRequestState(c *client, d VoiceRequestStateData) {
 		Deafen: d.Deafen,
 		TS:     time.Now().UnixMilli(),
 	})
+}
+
+// SetServerMuted 服务端强制闭麦/解禁（#36）：SFU 包级丢弃（track 不摘）并向房间
+// 全体广播 voice.state{user_id, server_muted}（目标本人也收，用于状态显示）。
+// 目标不在该频道 → ErrNotInChannel（REST 层映射 404）。与 voice.request_state 的
+// 「请求」语义不同：这里不看目标是否配合，服务端直接生效。
+func (h *Hub) SetServerMuted(channelID, userID string, muted bool) error {
+	h.mu.Lock()
+	room := h.rooms[channelID]
+	if room == nil || room.members[userID] == nil {
+		h.mu.Unlock()
+		return ErrNotInChannel
+	}
+	// 快照成员后放锁再动 SFU/发下行：SFU 侧有自己的锁序（s.mu → r.mu），
+	// 持 h.mu 交叉调用会与 speakingLoop 的回调路径死锁（见 tickRooms 注释）。
+	targets := make([]*client, 0, len(room.members))
+	for _, m := range room.members {
+		targets = append(targets, m)
+	}
+	h.mu.Unlock()
+
+	if !h.sfu.SetServerMuted(channelID, userID, muted) {
+		return ErrNotInChannel
+	}
+	bcast := VoiceStateData{UserID: userID, ServerMuted: &muted}
+	for _, m := range targets {
+		h.sendJSON(m, TypeVoiceState, bcast)
+	}
+	h.log.Printf("ws: 频道 %s 成员 %s 服务端闭麦=%v（%d 人已通知）", channelID, userID, muted, len(targets))
+	return nil
 }
 
 // ---- Hub 带锁快照 ----

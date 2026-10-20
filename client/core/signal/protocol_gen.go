@@ -221,12 +221,13 @@ type VoiceSpeakingData struct {
 	Speaking  bool   `json:"speaking"`
 }
 
-// VoiceStateData 说话/静音/耳聋状态，字段均为可选增量（nil=本次未变）。上行 C→S 不带 user_id；下行广播由服务端补 user_id 标识来源。协议 2 起 speaking 由服务端按 RFC 6464 电平判定（v2 客户端停发 speaking），mute/deafen 仍走上行。
+// VoiceStateData 说话/静音/耳聋状态，字段均为可选增量（nil=本次未变）。上行 C→S 不带 user_id；下行广播由服务端补 user_id 标识来源。协议 2 起 speaking 由服务端按 RFC 6464 电平判定（v2 客户端停发 speaking），mute/deafen 仍走上行。server_muted 为服务端权威强制闭麦状态（#36）。
 type VoiceStateData struct {
-	UserID   string `json:"user_id,omitempty"` // 下行广播补；上行省略
-	Speaking *bool  `json:"speaking,omitempty"`
-	Mute     *bool  `json:"mute,omitempty"`
-	Deafen   *bool  `json:"deafen,omitempty"`
+	UserID      string `json:"user_id,omitempty"` // 下行广播补；上行省略
+	Speaking    *bool  `json:"speaking,omitempty"`
+	Mute        *bool  `json:"mute,omitempty"`
+	Deafen      *bool  `json:"deafen,omitempty"`
+	ServerMuted *bool  `json:"server_muted,omitempty"` // S2C 服务端权威强制闭麦状态（#36）；C2S 携带时服务端忽略
 }
 
 // VoiceStateRequestData 他人对你发出的闭麦/静音请求（voice.request_state 的定向投递）。
