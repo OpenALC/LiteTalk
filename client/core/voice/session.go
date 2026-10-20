@@ -809,9 +809,19 @@ func (s *Session) teardownLocalRoomLocked() {
 	if s.mixer != nil {
 		s.mixer.SetDeafen(false)
 	}
+	s.clearRoomTables()
+}
+
+// clearRoomTables 清空成员表与语音状态表（媒体/peer 的清理由调用方负责）。
+// 状态表只在 peer_left 删条目会让历史成员在同一会话内累积，且退房后旧成员的
+// 说话态仍可能推 UI；这里换新 map 才能释放桶。
+func (s *Session) clearRoomTables() {
 	s.mu.Lock()
 	s.members = make(map[string]PeerView)
 	s.mu.Unlock()
+	if s.states != nil {
+		s.states.Clear()
+	}
 }
 
 // handleKicked 上报被踢原因（session.kicked 消息、WS close 4001、握手 401 的
@@ -991,26 +1001,15 @@ func (s *Session) LeaveChannel() error {
 	// 主动离开后迟到的 join 回执/错误不得再改状态：在途意图全部作废。
 	s.pendingJoins = nil
 	s.roomID.Store("")
+	// 与 voice_taken 共用同一条本地拆房路径：媒体、peer、远端链路、成员表与
+	// 状态表一起清；放在 joinMu 内，避免并发 JoinChannel 装上新 peer 后被误关。
+	s.teardownLocalRoomLocked()
 	s.joinMu.Unlock()
-	// 无论后续发送成败、是否已在房里：采集/播放随离开停止（幂等），
-	// 否则发送失败路径会把媒体留在运行态。
-	s.stopMedia()
 	if room == "" || s.ws == nil {
 		return nil
 	}
-	if err := s.ws.Send(signal.TypeChannelLeave, signal.ChannelLeaveData{ChannelID: room}); err != nil {
-		return err
-	}
-	if p := s.peerRef.Swap(nil); p != nil {
-		_ = p.Close()
-	}
-	if s.remoteMgr != nil {
-		s.remoteMgr.RemoveAll()
-	}
-	if s.mixer != nil {
-		s.mixer.SetDeafen(false)
-	}
-	return nil
+	// 先拆本地再发 leave：发送失败也不留下幽灵成员/旧说话态。
+	return s.ws.Send(signal.TypeChannelLeave, signal.ChannelLeaveData{ChannelID: room})
 }
 
 // SetSendGate 注入按键说话发送门（传 nil 清除）。管线已建立时立即生效，
@@ -1501,6 +1500,7 @@ func (s *Session) Close() {
 	if s.pipe != nil {
 		_ = s.pipe.Close()
 	}
+	s.clearRoomTables()
 }
 
 // SignalConnected 报告信令 WS 当前是否有活跃连接（app 层据首次连接结果定 session_ok）。

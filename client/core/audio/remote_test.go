@@ -434,6 +434,37 @@ func TestStateTable(t *testing.T) {
 	}
 }
 
+// TestStateTableClear 退房清空：条目全删、OnRemove 逐条回调、清空后可继续使用。
+func TestStateTableClear(t *testing.T) {
+	st := NewStateTable()
+	var removes []string
+	st.OnRemove = func(id string) { removes = append(removes, id) }
+	st.Set("a", PeerVoiceState{Speaking: true})
+	st.Set("b", PeerVoiceState{Mute: true})
+
+	st.Clear()
+	if got := len(st.Snapshot()); got != 0 {
+		t.Fatalf("Snapshot after Clear = %d, want 0", got)
+	}
+	seen := make(map[string]bool, len(removes))
+	for _, id := range removes {
+		seen[id] = true
+	}
+	if len(removes) != 2 || !seen["a"] || !seen["b"] {
+		t.Fatalf("OnRemove after Clear = %v, want a and b", removes)
+	}
+
+	st.Clear() // 空表幂等：不重复回调
+	if len(removes) != 2 {
+		t.Fatalf("OnRemove after empty Clear = %d, want 2", len(removes))
+	}
+
+	st.Set("c", PeerVoiceState{Deafen: true})
+	if v, ok := st.Get("c"); !ok || !v.Deafen {
+		t.Fatalf("c after Clear = %+v ok=%v, want deafen", v, ok)
+	}
+}
+
 // newTestSFUPC 构造模拟 SFU 的 pion PeerConnection（opus pt=111，与 rtc.Peer 对齐）。
 func newTestSFUPC(t *testing.T) *webrtc.PeerConnection {
 	t.Helper()
