@@ -104,7 +104,8 @@ func (t *StateTable) Snapshot() map[string]PeerVoiceState {
 type RemoteStats struct {
 	RTPReceived  atomic.Uint64 // 收到的 RTP 包数
 	FramesPopped atomic.Uint64 // jitter 弹出的正常帧数
-	PLCFrames    atomic.Uint64 // PLC 补偿帧数
+	PLCFrames    atomic.Uint64 // 无 FEC 可用时的 PLC 补偿帧数
+	FECFrames    atomic.Uint64 // 用后继包带内 FEC 恢复的丢帧数
 	DecodeErrors atomic.Uint64
 }
 
@@ -123,6 +124,7 @@ type remotePeer struct {
 
 	// 预分配热路径缓冲（仅解码循环使用）
 	payloadBuf [rtc.JitterMaxPayload]byte
+	fecBuf     [rtc.JitterMaxPayload]byte // 丢帧瞬间的后继包副本（FEC 用）
 	pcm        [OpusFrameSize]int16
 }
 
@@ -302,26 +304,40 @@ func (rp *remotePeer) decodeLoop() {
 	}
 }
 
-// decodeOnce 单拍：到点 pop → 解码/PLC → 写该 peer 的混音输入环。
-// 热路径零分配（预分配 payloadBuf/pcm）；测试可同步调用。
+// decodeOnce 单拍：到点 pop → 解码/丢帧补偿 → 写该 peer 的混音输入环。
+// 丢帧时若后继包已在 jitter 槽内，先用它的带内 FEC 恢复丢失帧（不消费后继，
+// 也不做常驻 +1 包 lookahead，稳态延迟不变）；连续丢包/后继未到/后继是 DTX
+// 心跳包时回落 PLC。
+// 热路径零分配（预分配 payloadBuf/fecBuf/pcm）；测试可同步调用。
 func (rp *remotePeer) decodeOnce() {
 	n, lost, ok := rp.jb.Pop(rp.payloadBuf[:])
 	if !ok {
 		return // 预填中/断流静默：本拍不出帧，混音侧自然补零
 	}
-	var m int
-	var err error
 	if lost {
-		m, err = rp.dec.Decode(nil, rp.pcm[:], false) // PLC
+		// 只在丢帧瞬间窥视后继槽位；DTX 包（≤2 字节）不含 FEC 数据。
+		if nn, ok := rp.jb.PeekNext(rp.fecBuf[:]); ok && nn > rtc.DTXPayloadMax {
+			if m, err := rp.dec.Decode(rp.fecBuf[:nn], rp.pcm[:], true); err == nil {
+				rp.Stats.FECFrames.Add(1)
+				rp.input.Write(rp.pcm[:m])
+				return
+			}
+		}
+		m, err := rp.dec.Decode(nil, rp.pcm[:], false) // PLC
+		if err != nil {
+			rp.Stats.DecodeErrors.Add(1)
+			return
+		}
 		rp.Stats.PLCFrames.Add(1)
-	} else {
-		m, err = rp.dec.Decode(rp.payloadBuf[:n], rp.pcm[:], false)
-		rp.Stats.FramesPopped.Add(1)
+		rp.input.Write(rp.pcm[:m])
+		return
 	}
+	m, err := rp.dec.Decode(rp.payloadBuf[:n], rp.pcm[:], false)
 	if err != nil {
 		rp.Stats.DecodeErrors.Add(1)
 		return
 	}
+	rp.Stats.FramesPopped.Add(1)
 	rp.input.Write(rp.pcm[:m])
 }
 
