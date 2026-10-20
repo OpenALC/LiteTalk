@@ -23,7 +23,19 @@ type Mem struct {
 	invites     map[string]*Invite
 	sessions    map[int64]map[string]*UserSession // userID → deviceType → session
 
+	roles       map[int64]*Role                                     // roleID → role（迁移 0010）
+	memberRoles map[int64]map[int64]map[int64]*MemberRoleAssignment // serverID → userID → roleID → 分配
+	overwrites  map[overwriteKey]*ChannelOverwrite                  // (channel,targetType,targetID) → 覆盖
+	auditLogs   map[int64]*AuditLog                                 // id → 审计行
+
 	*MemKV // KV 部分（Get/Set/Del/Incr/IncrCap/Eval 由 MemKV 提供）
+}
+
+// overwriteKey 覆盖行主键（channel_id, target_type, target_id）。
+type overwriteKey struct {
+	channelID  int64
+	targetType OverwriteTargetType
+	targetID   int64
 }
 
 // NewMem 创建内存存储。
@@ -38,6 +50,10 @@ func NewMem() *Mem {
 		messages:    map[int64]*Message{},
 		invites:     map[string]*Invite{},
 		sessions:    map[int64]map[string]*UserSession{},
+		roles:       map[int64]*Role{},
+		memberRoles: map[int64]map[int64]map[int64]*MemberRoleAssignment{},
+		overwrites:  map[overwriteKey]*ChannelOverwrite{},
+		auditLogs:   map[int64]*AuditLog{},
 		MemKV:       NewMemKV(),
 	}
 }
@@ -215,7 +231,33 @@ func (m *Mem) CreateServer(_ context.Context, s *Server) error {
 	s.CreatedAt = time.Now()
 	cp := *s
 	m.servers[s.ID] = &cp
+	// 三条 builtin 角色同锁写入（#35）：缺任一条后续 AddMember/SetMemberRoles 会断不变量。
+	m.insertBuiltinRolesLocked(s.ID)
 	return nil
+}
+
+// insertBuiltinRolesLocked 按模板写入 member/admin/owner 三条 builtin（调用方持 m.mu）。
+func (m *Mem) insertBuiltinRolesLocked(serverID int64) {
+	now := time.Now()
+	for _, tpl := range BuiltinRoleTemplates {
+		r := &Role{
+			ID: newID(0), ServerID: serverID, Name: tpl.Name, Color: DefaultRoleColor,
+			Position: tpl.Position, Permissions: tpl.Permissions, BuiltinKey: tpl.BuiltinKey,
+			CreatedAt: now, UpdatedAt: now,
+		}
+		m.roles[r.ID] = r
+	}
+}
+
+// builtinRoleIDLocked 取该服指定 builtin_key 的角色 id；缺失返回 0（不应发生，
+// CreateServer/迁移回填保证三条齐全，缺失属数据损坏）。
+func (m *Mem) builtinRoleIDLocked(serverID int64, key string) int64 {
+	for _, r := range m.roles {
+		if r.ServerID == serverID && r.BuiltinKey == key {
+			return r.ID
+		}
+	}
+	return 0
 }
 
 func (m *Mem) ServerByID(_ context.Context, id int64) (*Server, error) {
@@ -262,6 +304,22 @@ func (m *Mem) DeleteServer(_ context.Context, id int64) error {
 	}
 	delete(m.servers, id)
 	delete(m.members, id)
+	delete(m.memberRoles, id)
+	for rid, r := range m.roles {
+		if r.ServerID == id {
+			delete(m.roles, rid)
+		}
+	}
+	for k, o := range m.overwrites {
+		if c, ok := m.channels[o.ChannelID]; ok && c.ServerID == id {
+			delete(m.overwrites, k)
+		}
+	}
+	for aid, a := range m.auditLogs {
+		if a.ServerID == id {
+			delete(m.auditLogs, aid)
+		}
+	}
 	for catID, cat := range m.categories {
 		if cat.ServerID == id {
 			delete(m.categories, catID)
@@ -297,10 +355,40 @@ func (m *Mem) AddMember(_ context.Context, mem *ServerMember) error {
 	if _, ok := m.members[mem.ServerID][mem.UserID]; ok {
 		return ErrConflict
 	}
+	// 先解析默认角色再落笔：builtin 缺失时不留孤儿成员行（与 SQL 事务同语义）。
+	keys := defaultRoleKeys(mem.Role)
+	ids := make([]int64, 0, len(keys))
+	for _, key := range keys {
+		roleID := m.builtinRoleIDLocked(mem.ServerID, key)
+		if roleID == 0 {
+			return ErrNotFound
+		}
+		ids = append(ids, roleID)
+	}
 	mem.JoinedAt = time.Now()
 	cp := *mem
 	m.members[mem.ServerID][mem.UserID] = &cp
+	now := mem.JoinedAt
+	for _, roleID := range ids {
+		m.putAssignmentLocked(mem.ServerID, mem.UserID, roleID, 0, now)
+	}
 	return nil
+}
+
+// putAssignmentLocked 幂等写入一条分配（调用方持 m.mu）。
+func (m *Mem) putAssignmentLocked(serverID, userID, roleID, assignedBy int64, at time.Time) {
+	if m.memberRoles[serverID] == nil {
+		m.memberRoles[serverID] = map[int64]map[int64]*MemberRoleAssignment{}
+	}
+	if m.memberRoles[serverID][userID] == nil {
+		m.memberRoles[serverID][userID] = map[int64]*MemberRoleAssignment{}
+	}
+	if _, ok := m.memberRoles[serverID][userID][roleID]; ok {
+		return
+	}
+	m.memberRoles[serverID][userID][roleID] = &MemberRoleAssignment{
+		ServerID: serverID, UserID: userID, RoleID: roleID, AssignedAt: at, AssignedBy: assignedBy,
+	}
 }
 
 func (m *Mem) RemoveMember(_ context.Context, serverID, userID int64) error {
@@ -310,6 +398,15 @@ func (m *Mem) RemoveMember(_ context.Context, serverID, userID int64) error {
 		return ErrNotFound
 	}
 	delete(m.members[serverID], userID)
+	// 成员的角色分配与该服内以该成员为目标的频道覆盖一起清（#35）。
+	delete(m.memberRoles[serverID], userID)
+	for k, o := range m.overwrites {
+		if o.TargetType == OverwriteTargetMember && o.TargetID == userID {
+			if c, ok := m.channels[o.ChannelID]; ok && c.ServerID == serverID {
+				delete(m.overwrites, k)
+			}
+		}
+	}
 	return nil
 }
 
@@ -397,12 +494,22 @@ func (m *Mem) DeleteChannel(_ context.Context, id int64) error {
 		return ErrNotFound
 	}
 	delete(m.channels, id)
+	m.deleteOverwritesOfChannelLocked(id)
 	for mid, msg := range m.messages {
 		if msg.ChannelID == id {
 			delete(m.messages, mid)
 		}
 	}
 	return nil
+}
+
+// deleteOverwritesOfChannelLocked 删指定频道的全部覆盖（调用方持 m.mu）。
+func (m *Mem) deleteOverwritesOfChannelLocked(channelID int64) {
+	for k, o := range m.overwrites {
+		if o.ChannelID == channelID {
+			delete(m.overwrites, k)
+		}
+	}
 }
 
 // ---- categories（v0.1.2 迁移 0003；内存实现同步语义） ----
@@ -451,7 +558,7 @@ func (m *Mem) CategoriesOfServer(_ context.Context, serverID int64) ([]Category,
 	return out, nil
 }
 
-// DeleteCategoryWithChannels 删除分类及其下全部频道（含各频道消息），
+// DeleteCategoryWithChannels 删除分类及其下全部频道（含各频道消息与覆盖），
 // 与 MySQL 实现语义一致（单操作原子性由 m.mu 保证）。
 func (m *Mem) DeleteCategoryWithChannels(_ context.Context, id int64) error {
 	m.mu.Lock()
@@ -463,6 +570,7 @@ func (m *Mem) DeleteCategoryWithChannels(_ context.Context, id int64) error {
 	for cid, ch := range m.channels {
 		if ch.CategoryID != nil && *ch.CategoryID == c.ID {
 			delete(m.channels, cid)
+			m.deleteOverwritesOfChannelLocked(cid)
 			for mid, msg := range m.messages {
 				if msg.ChannelID == cid {
 					delete(m.messages, mid)
@@ -708,7 +816,7 @@ func (m *Mem) UseInvite(_ context.Context, code string) error {
 }
 
 // UseInviteAndAddMember 原子消费邀请码并加入服务器（#22）：同一把锁内完成校验、
-// 自增与成员插入，任何一步失败都不消耗邀请码。
+// 自增、成员插入与默认角色分配，任何一步失败都不消耗邀请码、不留分配。
 func (m *Mem) UseInviteAndAddMember(_ context.Context, code string, userID int64, role MemberRole) (*ServerMember, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -726,10 +834,23 @@ func (m *Mem) UseInviteAndAddMember(_ context.Context, code string, userID int64
 	} else {
 		m.members[inv.ServerID] = map[int64]*ServerMember{}
 	}
+	// 先解析默认角色再落笔：缺角色时不消耗邀请码、不留分配（与 SQL 事务同语义）。
+	keys := defaultRoleKeys(role)
+	ids := make([]int64, 0, len(keys))
+	for _, key := range keys {
+		roleID := m.builtinRoleIDLocked(inv.ServerID, key)
+		if roleID == 0 {
+			return nil, ErrNotFound
+		}
+		ids = append(ids, roleID)
+	}
 	inv.Uses++
 	mem := &ServerMember{ServerID: inv.ServerID, UserID: userID, Role: role, JoinedAt: time.Now()}
 	cp := *mem
 	m.members[inv.ServerID][userID] = &cp
+	for _, roleID := range ids {
+		m.putAssignmentLocked(inv.ServerID, userID, roleID, 0, mem.JoinedAt)
+	}
 	return mem, nil
 }
 
@@ -787,4 +908,336 @@ func (m *Mem) DeleteAllUserSessions(_ context.Context, userID int64) error {
 	defer m.mu.Unlock()
 	delete(m.sessions, userID)
 	return nil
+}
+
+// ---- roles / member_roles / channel_overwrites / audit_log（迁移 0010，#35 B1） ----
+
+func (m *Mem) ListRoles(_ context.Context, serverID int64) ([]Role, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []Role{}
+	for _, r := range m.roles {
+		if r.ServerID == serverID {
+			out = append(out, *r)
+		}
+	}
+	sortRoles(out)
+	return out, nil
+}
+
+func (m *Mem) RoleByID(_ context.Context, id int64) (*Role, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.roles[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	cp := *r
+	return &cp, nil
+}
+
+func (m *Mem) CreateRole(_ context.Context, r *Role) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// builtin 由 CreateServer/迁移回填写入，调用方只能造自定义角色。
+	if r.BuiltinKey != "" {
+		return ErrForbidden
+	}
+	if !r.Permissions.Valid() {
+		return ErrForbidden
+	}
+	if _, ok := m.servers[r.ServerID]; !ok {
+		return ErrNotFound
+	}
+	r.ID = newID(r.ID)
+	now := time.Now()
+	if r.Color == "" {
+		r.Color = DefaultRoleColor
+	}
+	r.CreatedAt, r.UpdatedAt = now, now
+	cp := *r
+	m.roles[r.ID] = &cp
+	return nil
+}
+
+func (m *Mem) UpdateRole(_ context.Context, r *Role) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	old, ok := m.roles[r.ID]
+	if !ok {
+		return ErrNotFound
+	}
+	if old.IsBuiltin() {
+		return ErrForbidden
+	}
+	if !r.Permissions.Valid() {
+		return ErrForbidden
+	}
+	cp := *old
+	cp.Name = r.Name
+	cp.Color = r.Color
+	if cp.Color == "" {
+		cp.Color = DefaultRoleColor
+	}
+	cp.Position = r.Position
+	cp.Permissions = r.Permissions
+	cp.UpdatedAt = time.Now()
+	m.roles[r.ID] = &cp
+	return nil
+}
+
+func (m *Mem) DeleteRole(_ context.Context, id int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.roles[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if r.IsBuiltin() {
+		return ErrForbidden
+	}
+	delete(m.roles, id)
+	// 级联：分配行 + 以该角色为目标的覆盖。
+	for _, byUser := range m.memberRoles {
+		for _, byRole := range byUser {
+			delete(byRole, id)
+		}
+	}
+	for k, o := range m.overwrites {
+		if o.TargetType == OverwriteTargetRole && o.TargetID == id {
+			delete(m.overwrites, k)
+		}
+	}
+	return nil
+}
+
+func (m *Mem) RolesOfMember(_ context.Context, serverID, userID int64) ([]Role, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.members[serverID][userID]; !ok {
+		return nil, ErrNotFound
+	}
+	out := []Role{}
+	seen := map[int64]bool{}
+	for roleID := range m.memberRoles[serverID][userID] {
+		if r, ok := m.roles[roleID]; ok && r.ServerID == serverID {
+			out = append(out, *r)
+			seen[roleID] = true
+		}
+	}
+	// @everyone 恒在结果里：分配行缺失（历史数据/损坏）也不能丢，权限基线靠它。
+	for _, r := range m.roles {
+		if r.ServerID == serverID && r.BuiltinKey == BuiltinKeyMember && !seen[r.ID] {
+			out = append(out, *r)
+			break
+		}
+	}
+	sortRoles(out)
+	return out, nil
+}
+
+func (m *Mem) SetMemberRoles(_ context.Context, serverID, userID int64, roleIDs []int64, assignedBy int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	mem, ok := m.members[serverID][userID]
+	if !ok {
+		return ErrNotFound
+	}
+	srv, ok := m.servers[serverID]
+	if !ok {
+		return ErrNotFound
+	}
+	byID := map[int64]*Role{}
+	var everyoneID, adminID, ownerID int64
+	for _, r := range m.roles {
+		if r.ServerID != serverID {
+			continue
+		}
+		byID[r.ID] = r
+		switch r.BuiltinKey {
+		case BuiltinKeyMember:
+			everyoneID = r.ID
+		case BuiltinKeyAdmin:
+			adminID = r.ID
+		case BuiltinKeyOwner:
+			ownerID = r.ID
+		}
+	}
+	if everyoneID == 0 {
+		return ErrNotFound // 数据损坏：@everyone 缺失
+	}
+	desired := map[int64]bool{}
+	for _, id := range roleIDs {
+		if _, ok := byID[id]; !ok {
+			return ErrNotFound // 不存在或跨服，统一不出存在性
+		}
+		desired[id] = true
+	}
+	desired[everyoneID] = true
+	// owner 强制保留 owner 投影：服主或 legacy owner 都不可被摘掉 owner builtin。
+	if srv.OwnerID == userID || mem.Role == RoleOwner {
+		if ownerID == 0 {
+			return ErrNotFound
+		}
+		desired[ownerID] = true
+	}
+	// 整组替换（先解析后落笔，半写不可见）。
+	if m.memberRoles[serverID] == nil {
+		m.memberRoles[serverID] = map[int64]map[int64]*MemberRoleAssignment{}
+	}
+	delete(m.memberRoles[serverID], userID)
+	now := time.Now()
+	for id := range desired {
+		m.putAssignmentLocked(serverID, userID, id, assignedBy, now)
+	}
+	// legacy 列是投影：owner→owner；有 admin→admin；否则 member。
+	newLegacy := RoleMember
+	switch {
+	case ownerID != 0 && desired[ownerID]:
+		newLegacy = RoleOwner
+	case adminID != 0 && desired[adminID]:
+		newLegacy = RoleAdmin
+	}
+	mem.Role = newLegacy
+	return nil
+}
+
+func (m *Mem) RoleAssignmentsOfServer(_ context.Context, serverID int64) ([]MemberRoleAssignment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []MemberRoleAssignment{}
+	for _, byRole := range m.memberRoles[serverID] {
+		for _, a := range byRole {
+			out = append(out, *a)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].UserID != out[j].UserID {
+			return out[i].UserID < out[j].UserID
+		}
+		return out[i].RoleID < out[j].RoleID
+	})
+	return out, nil
+}
+
+func (m *Mem) ChannelOverwrites(_ context.Context, channelID int64) ([]ChannelOverwrite, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []ChannelOverwrite{}
+	for _, o := range m.overwrites {
+		if o.ChannelID == channelID {
+			out = append(out, *o)
+		}
+	}
+	sortOverwrites(out, false)
+	return out, nil
+}
+
+func (m *Mem) ChannelOverwritesOfServer(_ context.Context, serverID int64) ([]ChannelOverwrite, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []ChannelOverwrite{}
+	for _, o := range m.overwrites {
+		if c, ok := m.channels[o.ChannelID]; ok && c.ServerID == serverID {
+			out = append(out, *o)
+		}
+	}
+	sortOverwrites(out, true)
+	return out, nil
+}
+
+func (m *Mem) SetChannelOverwrite(_ context.Context, o *ChannelOverwrite) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if o.TargetType != OverwriteTargetRole && o.TargetType != OverwriteTargetMember {
+		return ErrForbidden
+	}
+	if !o.Allow.Valid() || !o.Deny.Valid() {
+		return ErrForbidden
+	}
+	ch, ok := m.channels[o.ChannelID]
+	if !ok {
+		return ErrNotFound
+	}
+	// 目标必须与频道同服：角色跨服/非本服成员都不出存在性。
+	switch o.TargetType {
+	case OverwriteTargetRole:
+		r, ok := m.roles[o.TargetID]
+		if !ok || r.ServerID != ch.ServerID {
+			return ErrNotFound
+		}
+	case OverwriteTargetMember:
+		if _, ok := m.members[ch.ServerID][o.TargetID]; !ok {
+			return ErrNotFound
+		}
+	}
+	o.UpdatedAt = time.Now()
+	key := overwriteKey{channelID: o.ChannelID, targetType: o.TargetType, targetID: o.TargetID}
+	cp := *o
+	m.overwrites[key] = &cp
+	return nil
+}
+
+func (m *Mem) DeleteChannelOverwrite(_ context.Context, channelID int64, targetType OverwriteTargetType, targetID int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := overwriteKey{channelID: channelID, targetType: targetType, targetID: targetID}
+	if _, ok := m.overwrites[key]; !ok {
+		return ErrNotFound
+	}
+	delete(m.overwrites, key)
+	return nil
+}
+
+func (m *Mem) WriteAudit(_ context.Context, a *AuditLog) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a.ID = newID(a.ID)
+	if a.CreatedAt.IsZero() {
+		a.CreatedAt = time.Now()
+	}
+	if _, ok := m.auditLogs[a.ID]; ok {
+		return ErrConflict
+	}
+	cp := copyAudit(a)
+	m.auditLogs[a.ID] = &cp
+	return nil
+}
+
+// copyAudit 深拷贝指针字段，避免调用方改 *TargetID/*ChannelID 穿透进内部 map。
+func copyAudit(a *AuditLog) AuditLog {
+	cp := *a
+	if a.TargetID != nil {
+		v := *a.TargetID
+		cp.TargetID = &v
+	}
+	if a.ChannelID != nil {
+		v := *a.ChannelID
+		cp.ChannelID = &v
+	}
+	return cp
+}
+
+func (m *Mem) AuditLogBefore(_ context.Context, serverID, beforeID int64, limit int) ([]AuditLog, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if limit <= 0 || limit > 50 {
+		limit = 50
+	}
+	out := []AuditLog{}
+	for _, a := range m.auditLogs {
+		if a.ServerID != serverID {
+			continue
+		}
+		if beforeID > 0 && a.ID >= beforeID {
+			continue
+		}
+		out = append(out, copyAudit(a))
+	}
+	// 倒序游标（新→旧）。
+	sort.Slice(out, func(i, j int) bool { return out[i].ID > out[j].ID })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }

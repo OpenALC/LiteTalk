@@ -132,6 +132,8 @@ func TestNicknameCaseMigrationSQLite(t *testing.T) {
 	ctx := context.Background()
 	m := openTestSQLite(t)
 	full := findMigrationsSQLite(t)
+	// 只叠到 0009（不含 0010+）：RollbackLast 只撤最新一个，必须让 0009 停在顶上。
+	until0009 := migrationsBefore(t, full, "0010")
 	if err := m.Migrate(ctx, migrationsBefore(t, full, "0009")); err != nil {
 		t.Fatalf("迁移到 0008 失败: %v", err)
 	}
@@ -141,17 +143,17 @@ func TestNicknameCaseMigrationSQLite(t *testing.T) {
 		 (8001, 'mig-up@ex.com', 'Alice', '0001', ''), (8002, 'mig-low@ex.com', 'alice', '0001', '')`); err != nil {
 		t.Fatalf("预置大小写变体失败: %v", err)
 	}
-	if err := m.Migrate(ctx, full); err != nil {
+	if err := m.Migrate(ctx, until0009); err != nil {
 		t.Fatalf("应用 0009 失败: %v", err)
 	}
 	assertNicknameMigrationState(t, m, "0009_users_nickname_bin", true)
 
-	if err := m.RollbackLast(ctx, full); err != nil {
+	if err := m.RollbackLast(ctx, until0009); err != nil {
 		t.Fatalf("回滚 0009 失败: %v", err)
 	}
 	assertNicknameMigrationState(t, m, "0009_users_nickname_bin", false)
 	// 回滚后再迁移一次，确认注释型迁移可重入。
-	if err := m.Migrate(ctx, full); err != nil {
+	if err := m.Migrate(ctx, until0009); err != nil {
 		t.Fatalf("回滚后再迁移失败: %v", err)
 	}
 	assertNicknameMigrationState(t, m, "0009_users_nickname_bin", true)
@@ -189,6 +191,8 @@ func TestNicknameCaseMigrationMySQL(t *testing.T) {
 	ctx := context.Background()
 	m := openNicknameMySQL(t)
 	full := findMigrations(t)
+	// 只叠到 0009（不含 0010+）：RollbackLast 只撤最新一个，必须让 0009 停在顶上。
+	until0009 := migrationsBefore(t, full, "0010")
 	if err := m.Migrate(ctx, migrationsBefore(t, full, "0009")); err != nil {
 		t.Fatalf("迁移到 0008 失败: %v", err)
 	}
@@ -202,7 +206,7 @@ func TestNicknameCaseMigrationMySQL(t *testing.T) {
 		t.Fatalf("迁移前 alice 应命中 Alice: %+v %v", u, err)
 	}
 
-	if err := m.Migrate(ctx, full); err != nil {
+	if err := m.Migrate(ctx, until0009); err != nil {
 		t.Fatalf("应用 0009 失败: %v", err)
 	}
 	if coll := nicknameCollation(t, m); coll != "utf8mb4_bin" {
@@ -225,7 +229,7 @@ func TestNicknameCaseMigrationMySQL(t *testing.T) {
 	}
 
 	// down 在存在大小写变体时按文档失败（唯一索引重建撞 Duplicate entry）。
-	if err := m.RollbackLast(ctx, full); !isDup(err) {
+	if err := m.RollbackLast(ctx, until0009); !isDup(err) {
 		t.Fatalf("存在大小写变体时回滚 0009 应因 Duplicate entry 失败，实际 %v", err)
 	}
 	// 处理后回滚成功，排序规则回到 unicode_ci，旧语义恢复。
@@ -233,7 +237,7 @@ func TestNicknameCaseMigrationMySQL(t *testing.T) {
 		`DELETE FROM users WHERE nickname = ? AND tag = ?`, "alice", "0001"); err != nil {
 		t.Fatalf("清理大小写变体失败: %v", err)
 	}
-	if err := m.RollbackLast(ctx, full); err != nil {
+	if err := m.RollbackLast(ctx, until0009); err != nil {
 		t.Fatalf("回滚 0009 失败: %v", err)
 	}
 	if coll := nicknameCollation(t, m); coll != "utf8mb4_unicode_ci" {
@@ -243,7 +247,7 @@ func TestNicknameCaseMigrationMySQL(t *testing.T) {
 		t.Fatalf("回滚后应恢复大小写不敏感语义: %+v %v", u, err)
 	}
 	// 再次迁移确认可重入。
-	if err := m.Migrate(ctx, full); err != nil {
+	if err := m.Migrate(ctx, until0009); err != nil {
 		t.Fatalf("回滚后再迁移失败: %v", err)
 	}
 	if coll := nicknameCollation(t, m); coll != "utf8mb4_bin" {
