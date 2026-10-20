@@ -10,7 +10,7 @@ import { Eye, EyeOff, LockKeyhole, Mail, Check, UserRound, Info } from 'lucide-v
 import AuthLayout from './AuthLayout.vue'
 import Toast from '../../components/Toast.vue'
 import { eventsOn, goApp } from '../../api/bridge'
-import { useAuthStore } from '../../stores/auth'
+import { useAuthStore, kickedBannerText } from '../../stores/auth'
 import './auth-forms.css'
 
 const router = useRouter()
@@ -108,11 +108,11 @@ async function guestEnter() {
 
 <template>
   <AuthLayout>
-    <!-- 被踢提示：本端会话与令牌已被 Go 侧清除。server_changed 是服务器地址
-         热切换后令牌不被新服务端接受，不是异地登录，文案必须分开。 -->
+    <!-- 被踢提示：本端会话与令牌已被 Go 侧清除。文案按 reason 分支
+         （server_changed 换服、login_expired 登录过期，都不是异地登录）。 -->
     <div v-if="kicked" class="kicked-bar" role="status">
       <Info :size="15" />
-      <span>{{ kicked === 'server_changed' ? '当前令牌不被新服务器接受，请重新登录' : '账号已在其他设备登录' }}</span>
+      <span>{{ kickedBannerText(kicked) }}</span>
     </div>
 
     <div class="seg">

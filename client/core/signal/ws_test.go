@@ -368,6 +368,90 @@ func TestWSHandshake401RefreshFailsFatal(t *testing.T) {
 	}
 }
 
+// TestWSHandshake401RefreshTransientRetry 刷新请求遇到传输层瞬时错误
+// （OnAuthFailed 返回 ErrAuthTransient）：Run 复位刷新预算、退避后重试，
+// 网络恢复即连上，不按致命收场（#84 复审 4.1）。
+func TestWSHandshake401RefreshTransientRetry(t *testing.T) {
+	stub := newStubServer(t)
+	stub.requireToken.Store("dev-new")
+
+	var tok atomic.Value
+	tok.Store("dev-old")
+	var refreshCalls atomic.Int32
+	c := NewClient(Config{
+		URL: stub.wsURL(),
+		TokenFunc: func(context.Context) (string, error) {
+			return tok.Load().(string), nil
+		},
+		OnAuthFailed: func(context.Context) error {
+			if refreshCalls.Add(1) == 1 {
+				return ErrAuthTransient // 第一次刷新请求网络中断
+			}
+			tok.Store("dev-new")
+			return nil
+		},
+		PingInterval: 50 * time.Millisecond,
+		ReconnectMin: 20 * time.Millisecond,
+		ReconnectMax: 100 * time.Millisecond,
+	})
+	defer c.Close()
+
+	done := make(chan error, 1)
+	go func() { done <- c.Run(context.Background()) }()
+	waitFor(t, "connect after transient refresh failure", 5*time.Second, c.Connected)
+
+	if got := refreshCalls.Load(); got != 2 {
+		t.Fatalf("刷新次数 = %d, want 2（瞬时失败后应复位预算）", got)
+	}
+	if got := stub.lastToken(); got != "dev-new" {
+		t.Fatalf("重拨应携带刷新后的令牌, 实际 %q", got)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("瞬时刷新失败后 Run 不应退出: %v", err)
+	default:
+	}
+}
+
+// TestWSHandshake401RefreshTransientKeepsRetrying 刷新始终瞬时失败：Run 不退出，
+// 但必须按退避节奏重拨而不是紧循环（每次 401 都重新拿到一次刷新预算）。
+func TestWSHandshake401RefreshTransientKeepsRetrying(t *testing.T) {
+	stub := newStubServer(t)
+	stub.requireToken.Store("dev-never")
+
+	var refreshCalls atomic.Int32
+	c := NewClient(testConfig(stub.wsURL(), "dev-old"))
+	defer c.Close()
+	c.cfg.OnAuthFailed = func(context.Context) error {
+		refreshCalls.Add(1)
+		return ErrAuthTransient
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- c.Run(context.Background()) }()
+	waitFor(t, "multiple dials while transient", 5*time.Second, func() bool {
+		return stub.denied.Load() >= 3
+	})
+	select {
+	case err := <-done:
+		t.Fatalf("瞬时刷新失败后 Run 不应退出: %v", err)
+	default:
+	}
+	if got := refreshCalls.Load(); got < 2 {
+		t.Fatalf("刷新次数 = %d, want >= 2（预算应随瞬时失败复位）", got)
+	}
+
+	c.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close 后 Run = %v, want nil", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close 后 Run 未退出")
+	}
+}
+
 // TestWSHandshake401RefreshRetryOnce 刷新成功但新令牌仍被拒：只重试一次即停，
 // 不发生握手 401 风暴。
 func TestWSHandshake401RefreshRetryOnce(t *testing.T) {

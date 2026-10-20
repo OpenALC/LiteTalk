@@ -27,6 +27,15 @@ function resetSessionStores() {
   }
 }
 
+// kickedBannerText 登录页被踢横幅文案。reason 来自 auth:kicked：
+// login_expired 是 refresh_token 被服务端吊销（#84 复审 4.1），server_changed
+// 是换服后令牌不被新服务器接受——都不是异地登录，文案必须分开。
+export function kickedBannerText(reason: string): string {
+  if (reason === 'server_changed') return '当前令牌不被新服务器接受，请重新登录'
+  if (reason === 'login_expired') return '登录已过期，请重新登录'
+  return '账号已在其他设备登录'
+}
+
 export const useAuthStore = defineStore('auth', () => {
   const user = ref<UserProfile | null>(null)
   const loggedIn = ref(false)
@@ -40,7 +49,8 @@ export const useAuthStore = defineStore('auth', () => {
 
   // kickedReason 被踢下线原因（auth:kicked 载荷 reason）：非空表示本端会话已被
   // Go 侧清除。跨组件的传输通道——LoginView 进入时取走并清，横幅文案按 reason
-  // 分支（server_changed 是服务器热切换换端拒绝令牌，区别于 login_elsewhere）。
+  // 分支（见 kickedBannerText：server_changed 换服、login_expired 刷新令牌被
+  // 吊销，均区别于 login_elsewhere 异地登录）。
   const kickedReason = ref('')
 
   // 服务端能力开关（启动时拉取一次，注册/找回页据此适配 UI）。
