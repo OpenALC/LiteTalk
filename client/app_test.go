@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -944,5 +946,42 @@ func TestCloseActionFor(t *testing.T) {
 			t.Errorf("closeActionFor(%q, tray=%v, closeToTray=%v) = %v，期望 %v",
 				c.mode, c.trayReady, c.closeToTray, got, c.want)
 		}
+	}
+}
+
+// failWriter 固定失败的 io.Writer，模拟日志文件轮转后重新打开失败。
+type failWriter struct{ err error }
+
+func (w failWriter) Write([]byte) (int, error) { return 0, w.err }
+
+// TestLogFanoutNoShortCircuit 单个日志目标失败不得吞掉其余目标（issue #10 P2）：
+// 旧实现用 io.MultiWriter，轮转后文件重新打开失败时 stderr 收不到那一行。
+func TestLogFanoutNoShortCircuit(t *testing.T) {
+	reopenErr := errors.New("rotate reopen failed")
+
+	// 文件在前（生产顺序）：文件失败时 stderr 仍要拿到整条日志。
+	var stderr bytes.Buffer
+	f := logFanout{failWriter{reopenErr}, &stderr}
+	if n, err := f.Write([]byte("line\n")); err != nil || n != len("line\n") {
+		t.Fatalf("至少一个目标成功时不应报错：n=%d err=%v", n, err)
+	}
+	if got := stderr.String(); got != "line\n" {
+		t.Fatalf("stderr 未收到日志：%q", got)
+	}
+
+	// stderr 失败（GUI 无控制台）时文件侧仍要写入。
+	var file bytes.Buffer
+	f = logFanout{&file, failWriter{errors.New("stderr unavailable")}}
+	if _, err := f.Write([]byte("line\n")); err != nil {
+		t.Fatalf("文件写入成功时不应报错：%v", err)
+	}
+	if got := file.String(); got != "line\n" {
+		t.Fatalf("文件未收到日志：%q", got)
+	}
+
+	// 全部失败才返回错误。
+	f = logFanout{failWriter{reopenErr}, failWriter{errors.New("stderr unavailable")}}
+	if n, err := f.Write([]byte("line\n")); err == nil || n != 0 {
+		t.Fatalf("全部目标失败应返回错误：n=%d err=%v", n, err)
 	}
 }

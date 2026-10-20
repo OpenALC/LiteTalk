@@ -168,8 +168,8 @@ func (a *App) emit(name string, data any) {
 // （与 config.json 同目录）。GUI 子系统无控制台，stdout/stderr 不可见，排障
 // 全依赖此文件；5MB × 3 档滚动（issue #10：不再启动截断，超限先滚动）。
 // 文件 0600、目录 0700——日志含令牌/连接细节，同用户外不可读。
-// 文件排 MultiWriter 首位——无控制台时 stderr 写入会失败并短路 MultiWriter，
-// 放前面会吞掉文件写入。
+// 用 logFanout 而不是 io.MultiWriter：后者在第一个错误处短路，GUI 下 stderr
+// 写失败会吞掉文件日志，轮转后重新打开失败又会吞掉 stderr。
 func initLogging() {
 	dir, err := os.UserConfigDir()
 	if err != nil {
@@ -182,8 +182,32 @@ func initLogging() {
 	if err != nil {
 		return
 	}
-	log.SetOutput(io.MultiWriter(w, os.Stderr))
+	log.SetOutput(logFanout{w, os.Stderr})
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+}
+
+// logFanout 向所有目标写入同一条日志，单个目标失败不短路其余目标。
+// stderr 与轮转文件任一不可用，另一侧仍能留下排障线索。
+type logFanout []io.Writer
+
+func (f logFanout) Write(p []byte) (int, error) {
+	var firstErr error
+	written := false
+	for _, w := range f {
+		if _, err := w.Write(p); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		written = true
+	}
+	if !written {
+		return 0, firstErr
+	}
+	// 至少一个目标成功即视为日志已写出；部分失败没有有意义的返回值，
+	// 全部失败才向上报错。
+	return len(p), nil
 }
 
 // LogFromWeb 前端 console/异常转发入口（前端 main.ts 拦截 console.*、
