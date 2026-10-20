@@ -15,7 +15,8 @@ func sendMsg(t *testing.T, h http.Handler, token string, chID int64, content str
 }
 
 // TestMessageCursorPagination 游标分页（#31）：before 取更旧、after 取更新、
-// 旧别名 before_id 等价 before、负游标 400、禁 offset（不存在的参数直接忽略）。
+// 旧别名 before_id 等价 before、游标 <=0 与 limit 越界均 400（fail-closed）、
+// 禁 offset（不存在的参数直接忽略）。
 func TestMessageCursorPagination(t *testing.T) {
 	srv, mem := newTestServer(t)
 	h := srv.Handler()
@@ -66,14 +67,35 @@ func TestMessageCursorPagination(t *testing.T) {
 		t.Fatalf("after 页应为 ids[2..4]，实际 %d 条", len(fwd))
 	}
 
-	// limit 截断（越界回落 50 的口径下，合法值生效）。
+	// limit 截断（合法值生效）。
 	two := getJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/messages?limit=2", chID), aAccess, http.StatusOK).([]any)
 	if len(two) != 2 || asID(two[0].(map[string]any)["id"]) != ids[3] {
 		t.Fatalf("limit=2 应取最新2条，实际 %d 条", len(two))
 	}
+	// 合法边界 1 与 50：1 只取最新一条，50（上限）取回全部 5 条。
+	one := getJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/messages?limit=1", chID), aAccess, http.StatusOK).([]any)
+	if len(one) != 1 || asID(one[0].(map[string]any)["id"]) != ids[4] {
+		t.Fatalf("limit=1 应只取最新一条，实际 %d 条", len(one))
+	}
+	full := getJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/messages?limit=50", chID), aAccess, http.StatusOK).([]any)
+	if len(full) != 5 {
+		t.Fatalf("limit=50 应取回全部 5 条，实际 %d 条", len(full))
+	}
 
-	// 负游标拒绝。
-	getJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/messages?before=-1", chID), aAccess, http.StatusBadRequest)
+	// 显式越界 limit → 400 bad_limit，不再静默回落 50。
+	for _, lim := range []string{"0", "51"} {
+		body := getJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/messages?limit=%s", chID, lim), aAccess, http.StatusBadRequest)
+		if code := body.(map[string]any)["code"]; code != "bad_limit" {
+			t.Fatalf("limit=%s 应返回 bad_limit，实际 %v", lim, code)
+		}
+	}
+	// 显式游标 <= 0 → 400 bad_cursor：0 不能当作「无游标」拿到最新一页。
+	for _, q := range []string{"before=0", "before_id=0", "after=0", "before=-1", "after=-1"} {
+		body := getJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/messages?%s", chID, q), aAccess, http.StatusBadRequest)
+		if code := body.(map[string]any)["code"]; code != "bad_cursor" {
+			t.Fatalf("%s 应返回 bad_cursor，实际 %v", q, code)
+		}
+	}
 }
 
 // TestMessageNonceIdempotent nonce 幂等（#31）：同 nonce 重放回原消息 200，

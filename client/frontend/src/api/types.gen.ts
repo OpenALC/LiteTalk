@@ -541,7 +541,7 @@ export interface paths {
         };
         /**
          * 消息分页（游标，倒序取页正序返回）
-         * @description 游标分页（#31）：limit 上限 50，默认 50。before 取更旧一页（ID 小于游标 的最新 limit 条，旧→新正序返回）；after 取更新一页（ID 大于游标最早的 limit 条）。两者互斥，同给时 before 优先。禁用 offset。 before_id 为 before 的旧别名，兼容一个版本后移除。 code：bad_request、bad_cursor、路径参数不合法；401；403 forbidden； 404 not_found；5xx internal。
+         * @description 游标分页（#31）：limit 上限 50，默认 50；显式给出越界值返回 400 bad_limit。 before 取更旧一页（ID 小于游标的最新 limit 条，旧→新正序返回）；after 取更新 一页（ID 大于游标最早的 limit 条）。两者互斥，同给时 before 优先。禁用 offset。 游标显式给出时必须 > 0（0 或负数返回 400 bad_cursor），缺省才表示「无游标」。 before_id 为 before 的旧别名，兼容一个版本后移除。 code：bad_request、bad_cursor、bad_limit、路径参数不合法；401；403 forbidden； 404 not_found；5xx internal。
          */
         get: operations["listMessages"];
         put?: never;
@@ -2008,16 +2008,16 @@ export interface operations {
     listMessages: {
         parameters: {
             query?: {
-                /** @description 游标：只取 ID 小于该值的消息（缺省 = 最新一页） */
+                /** @description 游标：只取 ID 小于该值的消息（缺省 = 最新一页；显式值须 > 0） */
                 before?: number;
-                /** @description 游标：只取 ID 大于该值的消息（向前翻更新；缺省 = 最旧一页） */
+                /** @description 游标：只取 ID 大于该值的消息（向前翻更新；缺省 = 最旧一页；显式值须 > 0） */
                 after?: number;
                 /**
                  * @deprecated
-                 * @description before 的旧别名（兼容一个版本，#31；与 before 同义）
+                 * @description before 的旧别名（兼容一个版本，#31；与 before 同义，显式值须 > 0）
                  */
                 before_id?: number;
-                /** @description 条数上限（1–50，越界回落 50） */
+                /** @description 条数上限（1–50，缺省 50；显式越界返回 400 bad_limit） */
                 limit?: number;
             };
             header?: never;
