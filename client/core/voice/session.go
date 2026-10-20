@@ -153,9 +153,9 @@ type Session struct {
 	// 只能把错误按服务端在同一连接上的处理顺序归属给最早未结算的 join。
 	// pendingJoins 是尚未收到 channel.joined / error 的 join 队列（FIFO）；
 	// seq 仅用于发送失败时精确摘除自己那条，不参与错误归属。
-	// 约束：error 帧无 request id，通用码（forbidden/bad_message/rate_limited）
-	// 在队列非空时会被当作进房失败消费，存在把同码聊天错误误判的理论窗口；
-	// 队列为空时一律按聊天错误转发。
+	// 约束：error 帧无 request id，通用码（forbidden/bad_message/rate_limited/
+	// quota_exceeded）在队列非空时会被当作进房失败消费，存在把同码其他错误
+	//（如 rtc.offer 配额）误判的理论窗口；队列为空时一律按聊天错误转发。
 	joinMu       sync.Mutex
 	pendingJoins []pendingJoin
 	joinSeq      uint64
@@ -1342,8 +1342,9 @@ func (s *Session) fullResync() {
 // 归因约束：error 帧没有 request id（api/signal 契约），无法精确关联到上行
 // 消息。这里只能按「pending join 队列非空 + 错误码」过滤，并按服务端在单
 // 连接上的处理顺序把错误归属给最早未结算的 join。通用码（forbidden /
-// bad_message / rate_limited）聊天也会返回，队列非空时存在误判的理论窗口；
-// 队列为空时一律按聊天错误处理。
+// bad_message / rate_limited / quota_exceeded）其他路径也会返回——尤其
+// quota_exceeded 还来自 rtc.offer 的 SFU 容量上限（hub.handleRTCOffer）——
+// 队列非空时存在误判的理论窗口；队列为空时一律按聊天错误处理。
 func (s *Session) handleErrorFrame(env signal.Envelope) {
 	var d signal.ErrorData
 	if env.Decode(&d) != nil {
@@ -1360,8 +1361,9 @@ func (s *Session) handleErrorFrame(env signal.Envelope) {
 		channelID, consumed, rolledBack = s.settlePendingJoin(d.Code != signal.ErrCodeAlreadyInChan)
 	}
 	if !consumed && joinOnly {
-		// 进房专用码（not_found/quota_exceeded/already_in_channel）不可能来自
-		// 聊天。没有 pending 时是迟到/重复帧，静默丢弃，避免弹出「消息发送失败」。
+		// 进房专用码（not_found/already_in_channel）不可能来自聊天。没有
+		// pending 时是迟到/重复帧，静默丢弃，避免弹出「消息发送失败」。
+		// quota_exceeded 不在此列：rtc.offer 配额失败同样用它，必须继续转发。
 		return
 	}
 	if rolledBack && s.ev.OnJoinFailed != nil {
@@ -1379,19 +1381,25 @@ func (s *Session) handleErrorFrame(env signal.Envelope) {
 }
 
 // isJoinOnlyErrorCode 只会由 channel.join 返回的错误码（server/internal/signal/
-// hub.go 的 authorizeChannelJoin / joinRoom 路径）。
+// hub.go 的 authorizeChannelJoin / joinRoom 路径）。chat.send 不会返回这两个码，
+// 无 pending 时可按迟到/重复帧静默丢弃。
 func isJoinOnlyErrorCode(code string) bool {
 	switch code {
-	case signal.ErrCodeNotFound, signal.ErrCodeAlreadyInChan, signal.ErrCodeQuotaExceeded:
+	case signal.ErrCodeNotFound, signal.ErrCodeAlreadyInChan:
 		return true
 	}
 	return false
 }
 
-// isJoinSharedErrorCode channel.join 与 chat.send 等上行都可能返回的通用码。
+// isJoinSharedErrorCode channel.join 与其他上行/协商都可能返回的通用码：
+//   - forbidden / bad_message / rate_limited：聊天等上行共用；
+//   - quota_exceeded：进房满员（hub.joinRoom）之外，rtc.offer 的 SFU 容量
+//     上限（hub.handleRTCOffer，§0.1.3）与握手连接数上限也会返回——无 pending
+//     时必须继续走聊天错误回调，不能当 join-only 丢弃。
 func isJoinSharedErrorCode(code string) bool {
 	switch code {
-	case signal.ErrCodeForbidden, signal.ErrCodeBadMessage, signal.ErrCodeRateLimited:
+	case signal.ErrCodeForbidden, signal.ErrCodeBadMessage, signal.ErrCodeRateLimited,
+		signal.ErrCodeQuotaExceeded:
 		return true
 	}
 	return false

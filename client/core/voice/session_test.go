@@ -195,6 +195,93 @@ func TestJoinErrorWithoutPendingIsChatError(t *testing.T) {
 	}
 }
 
+// TestQuotaExceededWithoutPendingIsChatError quota_exceeded 不是进房专用码：
+// rtc.offer 的 SFU 容量上限（hub.handleRTCOffer）也会返回。无 pending join 时
+// 必须继续走聊天错误回调，不能被 join-only 静默丢弃。
+func TestQuotaExceededWithoutPendingIsChatError(t *testing.T) {
+	stub, _ := newDownlinkStubData(t, signal.Envelope{
+		Type: signal.TypeError, TS: 1,
+		Data: json.RawMessage(`{"code":"quota_exceeded","message":"RTC 协商失败: 房间已满"}`),
+	})
+	type seenErr struct {
+		code, message string
+		joinHandled   bool
+	}
+	got := make(chan seenErr, 1)
+	failed := make(chan struct{}, 1)
+	s := NewSession(api.NewAPIClient(stub.wsURL()), "tok", "n", Events{
+		OnJoinFailed: func(channelID, code, message string) { failed <- struct{}{} },
+	}, nil)
+	s.ws = signal.NewClient(signal.Config{URL: stub.wsURL(), ReconnectMin: 20 * time.Millisecond})
+	defer s.ws.Close()
+	s.registerHandlers()
+	s.ErrorHandlerEx(func(code, message string, joinHandled bool) {
+		got <- seenErr{code, message, joinHandled}
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.ws.Run(ctx)
+
+	select {
+	case e := <-got:
+		if e.joinHandled {
+			t.Fatal("无 pending join 时 quota_exceeded 不应归因进房")
+		}
+		if e.code != "quota_exceeded" || !strings.Contains(e.message, "RTC 协商失败") {
+			t.Fatalf("错误回调 = %+v, want quota_exceeded/RTC 协商失败", e)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("无 pending 时 quota_exceeded 必须走聊天错误回调（不得静默丢弃）")
+	}
+	select {
+	case <-failed:
+		t.Fatal("rtc.offer 配额错误不得触发 OnJoinFailed")
+	default:
+	}
+}
+
+// TestJoinChannelQuotaExceededRollsBack 有 pending join 时 quota_exceeded
+// （如房间满员）仍按进房失败回滚房间态并上报 OnJoinFailed。
+func TestJoinChannelQuotaExceededRollsBack(t *testing.T) {
+	failed := make(chan [3]string, 1)
+	stub := newJoinReplyStub(t, func(string) []signal.Envelope {
+		return []signal.Envelope{{
+			Type: signal.TypeError, TS: 1,
+			Data: json.RawMessage(`{"code":"quota_exceeded","message":"语音房间已满"}`),
+		}}
+	})
+	s := NewSession(api.NewAPIClient(stub.wsURL()), "tok", "n", Events{
+		OnJoinFailed: func(channelID, code, message string) {
+			failed <- [3]string{channelID, code, message}
+		},
+	}, nil)
+	s.ws = signal.NewClient(signal.Config{URL: stub.wsURL(), ReconnectMin: 20 * time.Millisecond})
+	defer s.ws.Close()
+	s.registerHandlers()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.ws.Run(ctx)
+	waitSignalConnected(t, s)
+
+	if err := s.JoinChannel("room1"); err != nil {
+		t.Fatalf("JoinChannel: %v", err)
+	}
+	select {
+	case got := <-failed:
+		if got != [3]string{"room1", "quota_exceeded", "语音房间已满"} {
+			t.Fatalf("OnJoinFailed = %v", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("满员拒绝未触发 OnJoinFailed（#91）")
+	}
+	if s.InRoom() {
+		t.Fatal("满员拒绝后 InRoom 应为 false")
+	}
+	if n := s.pendingJoinCount(); n != 0 {
+		t.Fatalf("满员拒绝后 pending join 应清空, 剩 %d", n)
+	}
+}
+
 // TestJoinRollbackDoesNotClobberNewerJoin 快速切房/连点：旧 join 的发送失败或
 // error 只结算自己那条，不能清掉更新的房间意图（#91 并发约束）。
 func TestJoinRollbackDoesNotClobberNewerJoin(t *testing.T) {
