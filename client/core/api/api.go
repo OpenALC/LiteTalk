@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -314,6 +315,15 @@ func (c *APIClient) doOnce(req *http.Request, auth, retried bool, base string) (
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
+	// 429 在传输层就转成 *APIError：Retry-After 只在响应头里，而所有端点只拿
+	// status/body。在这一层解析后，GET/POST/PATCH/DELETE 与刷新路径都不会把
+	// 该头丢掉；调用方 err != nil 时原样上抛，语义与在端点里 decodeError 一致。
+	if resp.StatusCode == http.StatusTooManyRequests {
+		if ae, ok := decodeError(resp.StatusCode, data).(*APIError); ok {
+			ae.RetryAfter = retryAfterFromHeader(resp.Header)
+			return resp.StatusCode, data, ae
+		}
+	}
 	if resp.StatusCode == http.StatusUnauthorized && auth {
 		// 会话被其他设备顶替/重放：致命，直接上抛，不进刷新重试。
 		if isSessionReplaced(resp.Header.Get(authHeaderSession), data) {
@@ -527,10 +537,13 @@ func (c *APIClient) del(path string) (int, []byte, error) {
 // code 为机器码（扩展字段，与旧版一致）；Message 取 detail（旧 message 字段兼容读）。
 // Status 为对应 HTTP 状态码，不入 JSON——调用方据它区分「明确 401（清令牌）」与
 // 「网络错误（保留重试）」。
+// RetryAfter 为 429 响应头 Retry-After 的秒数（0 = 未给或不可解析）。只有 REST
+// 有 HTTP 头；桌面聊天走 WS，WS 错误里没有也不应伪造这个值。
 type APIError struct {
-	Code    string `json:"code"`
-	Message string `json:"detail"`
-	Status  int    `json:"-"`
+	Code       string `json:"code"`
+	Message    string `json:"detail"`
+	Status     int    `json:"-"`
+	RetryAfter int    `json:"-"`
 }
 
 func (e *APIError) Error() string { return fmt.Sprintf("%s: %s", e.Code, e.Message) }
@@ -561,6 +574,17 @@ func decodeError(status int, data []byte) error {
 		return &e
 	}
 	return fmt.Errorf("http %d: %s", status, string(data))
+}
+
+// retryAfterFromHeader 解析 Retry-After（服务端 setRateLimit 固定写秒整数）。
+// 非数字、非正数或 HTTP-date 一律按 0：宁可不给倒计时，也不要让调用方按
+// 错误时长退避。
+func retryAfterFromHeader(h http.Header) int {
+	n, err := strconv.Atoi(strings.TrimSpace(h.Get("Retry-After")))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }
 
 // ServerConfig 服务端能力开关（GET /api/v1/config，免鉴权）。
@@ -1138,6 +1162,8 @@ type MessageDTO struct {
 
 // ListMessages 拉频道最近消息（旧→新，limit 上限 50）。不带游标只取最新——
 // 断线续传失败后的全量补拉就是这个用法；游标翻页是 REST 列表页的事。
+// limit 在客户端夹到 [1,50]（<=0 按 50、>50 按 50）：服务端对显式越界值
+// fail-closed 返回 400 bad_limit，这里保证发出去的总是契约内的值。
 func (c *APIClient) ListMessages(channelID int64, limit int) ([]MessageDTO, error) {
 	if limit <= 0 || limit > 50 {
 		limit = 50
