@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"sort"
 	"strconv"
 
 	"github.com/OpenALC/LiteTalk/server/internal/store"
@@ -176,10 +177,53 @@ func categoryViews(list []store.Category) []CategoryInfo {
 
 // serverMemberViews 成员列表视图（#11）：逐成员查 presence:{uid} 填 online。
 // 成员数量通常不大，且该端点只在打开成员列表时拉取，先接受逐个 GET。
+// role_ids（#35 B4）：一次 RoleAssignmentsOfServer + 一次 ListRoles 填齐，不做 N+1。
 func (s *Server) serverMemberViews(ctx context.Context, list []store.ServerMember) []MemberInfo {
+	roleIDs := s.memberRoleIDs(ctx, list)
 	out := make([]MemberInfo, 0, len(list))
 	for i := range list {
-		out = append(out, memberView(&list[i], s.online(ctx, list[i].UserID)))
+		v := memberView(&list[i], s.online(ctx, list[i].UserID))
+		if ids, ok := roleIDs[list[i].UserID]; ok {
+			v.RoleIds = &ids
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+// memberRoleIDs uid → 角色 ID（按 position、id 升序，与 RolesOfMember 同口径）。
+// 查询失败返回空映射：role_ids 是可选字段，缺省不回、不阻塞成员列表。
+func (s *Server) memberRoleIDs(ctx context.Context, list []store.ServerMember) map[int64][]ID {
+	if len(list) == 0 {
+		return nil
+	}
+	serverID := list[0].ServerID
+	as, err := s.store.RoleAssignmentsOfServer(ctx, serverID)
+	if err != nil {
+		s.log.Printf("[members] 取角色分配失败 server=%d: %v", serverID, err)
+		return nil
+	}
+	roles, err := s.store.ListRoles(ctx, serverID)
+	if err != nil {
+		s.log.Printf("[members] 取角色列表失败 server=%d: %v", serverID, err)
+		return nil
+	}
+	pos := make(map[int64]int, len(roles))
+	for _, r := range roles {
+		pos[r.ID] = r.Position
+	}
+	out := map[int64][]ID{}
+	for _, a := range as {
+		out[a.UserID] = append(out[a.UserID], ID(a.RoleID))
+	}
+	for uid, ids := range out {
+		sort.Slice(ids, func(i, j int) bool {
+			if pos[int64(ids[i])] != pos[int64(ids[j])] {
+				return pos[int64(ids[i])] < pos[int64(ids[j])]
+			}
+			return ids[i] < ids[j]
+		})
+		out[uid] = ids
 	}
 	return out
 }

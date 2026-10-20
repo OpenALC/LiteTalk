@@ -28,7 +28,11 @@ func validIcon(name, color string) bool {
 	if !allowedIcons[name] {
 		return false
 	}
-	// 简单校验 #RRGGBB。
+	return validIconColor(color)
+}
+
+// validIconColor 校验 #RRGGBB（角色/图标共用）。
+func validIconColor(color string) bool {
 	if len(color) != 7 || color[0] != '#' {
 		return false
 	}
@@ -108,17 +112,22 @@ func (s *Server) PatchServer(ctx context.Context, request PatchServerRequestObje
 		return nil, s.writeStoreErr(ctx, err)
 	}
 	// Merge Patch（#31）：缺省不改，null = 清空（名称/图标不可清 → 校验拒 400）。
+	// 审计只记变更字段（#35 B4）。
+	detail := map[string]any{}
 	if req.Name.Set {
 		if !validServerName(req.Name.Val) {
 			return nil, errf(http.StatusBadRequest, "bad_name", "名称需为 2–32 个字符")
 		}
 		srv.Name = req.Name.Val
+		detail["name"] = req.Name.Val
 	}
 	if req.IconName.Set {
 		srv.IconName = req.IconName.Val
+		detail["icon_name"] = req.IconName.Val
 	}
 	if req.IconColor.Set {
 		srv.IconColor = req.IconColor.Val
+		detail["icon_color"] = req.IconColor.Val
 	}
 	if !validIcon(srv.IconName, srv.IconColor) {
 		return nil, errf(http.StatusBadRequest, "bad_icon", "图标或颜色不合法")
@@ -126,6 +135,10 @@ func (s *Server) PatchServer(ctx context.Context, request PatchServerRequestObje
 	if err := s.store.UpdateServer(ctx, srv); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
+	s.audit(ctx, store.AuditLog{
+		ServerID: request.Id, ActorID: c.UserID, Action: "server.update",
+		TargetType: "server", TargetID: ptrID(request.Id), Detail: auditDetail(detail),
+	})
 	return PatchServer200JSONResponse(serverView(srv)), nil
 }
 
@@ -268,6 +281,11 @@ func (s *Server) CreateInvite(ctx context.Context, request CreateInviteRequestOb
 	if err := s.store.CreateInvite(ctx, inv); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
+	// 审计不记邀请码本身（凭据类，#35 B4）。
+	s.audit(ctx, store.AuditLog{
+		ServerID: request.Id, ActorID: c.UserID, Action: "invite.create",
+		Detail: auditDetail(map[string]any{"max_uses": inv.MaxUses, "expires_in": req.ExpiresIn}),
+	})
 	return CreateInvite201JSONResponse(inviteView(inv)), nil
 }
 
@@ -279,11 +297,7 @@ func (s *Server) requirePerm(ctx context.Context, serverID, userID int64, perm s
 	}
 	ok, err := s.authz.CanServer(ctx, userID, serverID, perm)
 	if err != nil {
-		e := s.writeStoreErr(ctx, err)
-		if ae, ok := e.(*apiErr); ok {
-			return ae
-		}
-		return errf(http.StatusInternalServerError, "internal", "服务器内部错误")
+		return s.writeStoreErr(ctx, err)
 	}
 	if !ok {
 		return errf(http.StatusForbidden, "forbidden", "权限不足")
@@ -298,11 +312,7 @@ func (s *Server) requireMember(ctx context.Context, serverID, userID int64) *api
 	}
 	ok, err := s.authz.IsMember(ctx, userID, serverID)
 	if err != nil {
-		e := s.writeStoreErr(ctx, err)
-		if ae, ok := e.(*apiErr); ok {
-			return ae
-		}
-		return errf(http.StatusInternalServerError, "internal", "服务器内部错误")
+		return s.writeStoreErr(ctx, err)
 	}
 	if !ok {
 		return errf(http.StatusForbidden, "forbidden", "不是服务器成员")
@@ -317,11 +327,7 @@ func (s *Server) requireChannelPerm(ctx context.Context, ch *store.Channel, user
 	}
 	ok, err := s.authz.CanInServer(ctx, userID, ch.ServerID, ch.ID, perm)
 	if err != nil {
-		e := s.writeStoreErr(ctx, err)
-		if ae, ok := e.(*apiErr); ok {
-			return ae
-		}
-		return errf(http.StatusInternalServerError, "internal", "服务器内部错误")
+		return s.writeStoreErr(ctx, err)
 	}
 	if !ok {
 		return errf(http.StatusForbidden, "forbidden", "权限不足")
