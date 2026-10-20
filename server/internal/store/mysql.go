@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -98,8 +99,12 @@ func (m *MySQL) Migrate(ctx context.Context, fsys fs.FS) error {
 		if err != nil {
 			return err
 		}
+		stmts, err := splitSQL(string(body))
+		if err != nil {
+			return fmt.Errorf("parse %s: %w", name, err)
+		}
 		// MySQL 驱动不支持多语句 Exec，逐条执行。
-		for _, stmt := range splitSQL(string(body)) {
+		for _, stmt := range stmts {
 			if _, err := conn.ExecContext(ctx, stmt); err != nil {
 				return fmt.Errorf("apply %s: %w", name, err)
 			}
@@ -127,7 +132,11 @@ func (m *MySQL) RollbackLast(ctx context.Context, fsys fs.FS) error {
 	if err != nil {
 		return err
 	}
-	for _, stmt := range splitSQL(string(body)) {
+	stmts, err := splitSQL(string(body))
+	if err != nil {
+		return fmt.Errorf("parse %s.down.sql: %w", version, err)
+	}
+	for _, stmt := range stmts {
 		if _, err := m.db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("rollback %s: %w", version, err)
 		}
@@ -136,90 +145,111 @@ func (m *MySQL) RollbackLast(ctx context.Context, fsys fs.FS) error {
 	return err
 }
 
-// splitSQL 按分号切分简单 SQL 脚本（迁移文件不含存储过程/触发器，BEGIN…END
-// 内的分号仍会切碎）。扫描时同步识别注释与引号：注释里的半角分号不再把语句
-// 切碎（#75），先剥注释再切分的语义在一趟扫描里完成。
+// splitSQL 按分号切分迁移脚本。识别字符串/引号标识符（' " `）、SQLite 方括号
+// 标识符 [..]、行注释（-- / #）与块注释（/* */；MySQL 的 /*! 与 /*+ 有真语义，
+// 整体保留）。引号内的 ;、--、# 一律原样保留。
 //
-// 字符串字面量与引号标识符整体原样拷贝，其中的 ;、--、# 一律不动；引号转义
-// 只认成对引号转义（连续两个单引号 / 双引号 / 反引号），不认反斜杠（MySQL
-// 专有，迁移里不应出现）。
-// -- 与 # 按行注释剥到行尾（MySQL 的 1--2 紧贴算术写法会被吃掉，不要写）；
-// 普通块注释剥掉并补一个空格防 token 粘连；MySQL 的 /*! 与 /*+ 有真语义，
-// 整体保留（其中的分号同样不切分）。
-func splitSQL(s string) []string {
+// 转义规则：MySQL 字符串（' 与 "）里的反斜杠转义（\' \" \\）不结束引号；
+// 反引号只认成对的重复反引号转义，方括号标识符到首个 ] 结束——两者都没有
+// 反斜杠转义。
+//
+// 失败即报错，不静默丢弃 SQL：引号 / 方括号 / 块注释未闭合，或出现
+// CREATE [DEFINER=…] TRIGGER。触发器体 BEGIN…END 内的分号与语句分隔符无法
+// 区分，切碎执行只会得到一半的 DDL；迁移文件不支持触发器，也不应引入。
+func splitSQL(s string) ([]string, error) {
 	var out []string
 	var b strings.Builder
-	flush := func() {
-		if stmt := strings.TrimSpace(b.String()); stmt != "" {
-			out = append(out, stmt)
-		}
+	flush := func() error {
+		stmt := strings.TrimSpace(b.String())
 		b.Reset()
+		if stmt == "" {
+			return nil
+		}
+		if createTriggerRe.MatchString(stmt) {
+			return errors.New("splitSQL: 不支持 CREATE TRIGGER（BEGIN…END 体内的分号无法与语句分隔符区分）")
+		}
+		out = append(out, stmt)
+		return nil
 	}
 	for i := 0; i < len(s); {
 		c := s[i]
-		// 引号区域（字符串字面量 / 引号标识符）：原样拷贝，只认成对引号转义。
-		if c == '\'' || c == '"' || c == '`' {
-			b.WriteByte(c)
-			i++
-			for i < len(s) {
-				b.WriteByte(s[i])
-				if s[i] != c {
-					i++
-					continue
-				}
-				if i+1 < len(s) && s[i+1] == c { // '' 形式转义，仍在引号内
-					b.WriteByte(c)
-					i += 2
-					continue
-				}
-				i++
-				break
+		switch {
+		case c == '\'' || c == '"' || c == '`':
+			end, err := scanQuoted(s, i)
+			if err != nil {
+				return nil, err
 			}
-			continue
-		}
-		// 行注释剥到行尾；换行留下，不改变后续语句的行结构。
-		if c == '#' || (c == '-' && i+1 < len(s) && s[i+1] == '-') {
+			b.WriteString(s[i:end])
+			i = end
+		case c == '[':
+			// SQLite 方括号标识符：首个 ] 结束，其中的分号原样保留。
+			j := strings.IndexByte(s[i+1:], ']')
+			if j < 0 {
+				return nil, fmt.Errorf("splitSQL: 第 %d 字节起的 [ 标识符未闭合", i)
+			}
+			end := i + 1 + j + 1
+			b.WriteString(s[i:end])
+			i = end
+		case c == '#' || (c == '-' && i+1 < len(s) && s[i+1] == '-'):
+			// 行注释剥到行尾；换行留下，不改变后续语句的行结构。
 			for i < len(s) && s[i] != '\n' {
 				i++
 			}
-			continue
-		}
-		// 块注释：/*! 与 /*+ 原样保留，其余剥掉补空格防相邻 token 粘连。
-		if c == '/' && i+1 < len(s) && s[i+1] == '*' {
+		case c == '/' && i+1 < len(s) && s[i+1] == '*':
 			keep := i+2 < len(s) && (s[i+2] == '!' || s[i+2] == '+')
+			j := strings.Index(s[i+2:], "*/")
+			if j < 0 {
+				return nil, fmt.Errorf("splitSQL: 第 %d 字节起的块注释未闭合", i)
+			}
+			end := i + 2 + j + 2
 			if keep {
-				b.WriteString(s[i : i+3])
-				i += 3
+				b.WriteString(s[i:end])
 			} else {
-				b.WriteByte(' ')
-				i += 2
+				b.WriteByte(' ') // 补空格防相邻 token 粘连
 			}
-			for i < len(s) {
-				if s[i] == '*' && i+1 < len(s) && s[i+1] == '/' {
-					if keep {
-						b.WriteString("*/")
-					}
-					i += 2
-					break
-				}
-				if keep {
-					b.WriteByte(s[i])
-				}
-				i++
+			i = end
+		case c == ';':
+			if err := flush(); err != nil {
+				return nil, err
 			}
-			continue
-		}
-		if c == ';' {
-			flush()
 			i++
-			continue
+		default:
+			b.WriteByte(c)
+			i++
 		}
-		b.WriteByte(c)
-		i++
 	}
-	flush()
-	return out
+	if err := flush(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
+
+// scanQuoted 从 s[i]（' " 或 `）扫到闭合引号，返回闭合后的下标。
+// 单/双引号内支持 MySQL 反斜杠转义与成对引号转义；反引号只认成对转义。
+func scanQuoted(s string, i int) (int, error) {
+	q := s[i]
+	start := i
+	i++
+	for i < len(s) {
+		switch {
+		case s[i] == '\\' && q != '`':
+			i += 2 // 连同下一个字节一起吞掉：\' \" \\ 都不结束引号
+		case s[i] == q:
+			if i+1 < len(s) && s[i+1] == q {
+				i += 2 // '' / "" / `` 形式转义，仍在引号内
+				continue
+			}
+			return i + 1, nil
+		default:
+			i++
+		}
+	}
+	return 0, fmt.Errorf("splitSQL: 第 %d 字节起的 %c 未闭合", start, q)
+}
+
+// createTriggerRe 匹配 CREATE [OR REPLACE] [DEFINER=…] TRIGGER。只用于明确
+// 拒绝触发器脚本，不追求覆盖所有 DDL 变体。
+var createTriggerRe = regexp.MustCompile(`(?is)^create\s+(?:or\s+replace\s+)?(?:definer\s*(?:=\s*)?\S+\s+)?trigger\b`)
 
 // ---- users ----
 

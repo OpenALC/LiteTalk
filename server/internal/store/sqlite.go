@@ -127,8 +127,12 @@ func (s *SQLite) Migrate(ctx context.Context, fsys fs.FS) error {
 		if err != nil {
 			return err
 		}
-		// 迁移文件不含触发器/存储过程（splitSQL 按 ; 切分会碎），逐条执行。
-		for _, stmt := range splitSQL(string(body)) {
+		stmts, err := splitSQL(string(body))
+		if err != nil {
+			return fmt.Errorf("parse %s: %w", name, err)
+		}
+		// 触发器/存储过程会被 splitSQL 明确拒绝（#75），逐条执行即可。
+		for _, stmt := range stmts {
 			if _, err := tx.ExecContext(ctx, stmt); err != nil {
 				return fmt.Errorf("apply %s: %w", name, err)
 			}
@@ -161,7 +165,11 @@ func (s *SQLite) RollbackLast(ctx context.Context, fsys fs.FS) error {
 	if err != nil {
 		return err
 	}
-	for _, stmt := range splitSQL(string(body)) {
+	stmts, err := splitSQL(string(body))
+	if err != nil {
+		return fmt.Errorf("parse %s.down.sql: %w", version, err)
+	}
+	for _, stmt := range stmts {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("rollback %s: %w", version, err)
 		}
