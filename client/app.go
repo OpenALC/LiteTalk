@@ -1590,17 +1590,36 @@ func (a *App) SetAudioSettings(s config.AudioSettings) error {
 func (a *App) startHotkeys() {
 	st := a.cfg.GetHotkeySettings()
 	a.hkGate = &hotkey.Gate{}
-	a.hkGate.SetMode(st.Mode)
 	a.hkMgr = hotkey.New(st)
 	// Enabled=false 时 Start 不装钩子（返回 nil）——默认关闭，用户主动开；
 	// 平台不支持时返回 ErrUnsupportedPlatform。两者都不影响可用性语义，
 	// 见 GetHotkeyAvailability（只看 Available，不看 Start 的返回值）。
-	if err := a.hkMgr.Start(); err != nil {
-		log.Printf("hotkey start: %v", err)
+	startErr := a.hkMgr.Start()
+	if startErr != nil {
+		log.Printf("hotkey start: %v", startErr)
 	}
+	// 钩子没装上（平台不支持或安装失败）时 PTT 退化为常开：按键永远等不到，
+	// 按 PTT 收门会把所有上行帧拦掉，服务端就收不到音频。
+	a.hkGate.SetMode(hotkeyGateMode(st, startErr == nil && a.hkMgr.Available()))
 	a.emitHotkeyAvailable()
 	a.hkQuit = make(chan struct{})
 	go a.hotkeyLoop()
+}
+
+// hotkeyGateMode 计算发送门实际应采用的门控模式。hooksAvailable 为 false 时
+// （平台不支持、钩子安装失败或 Manager 未初始化）PTT 退化为常开：按键永远
+// 等不到，门会恒拦。语音激活/常开不依赖钩子，保持原语义。
+func hotkeyGateMode(st hotkey.Settings, hooksAvailable bool) hotkey.Mode {
+	m := hotkey.EffectiveSendMode(st)
+	if m == hotkey.ModePTT && !hooksAvailable {
+		return hotkey.ModeOpen
+	}
+	return m
+}
+
+// sendGateMode 按当前平台能力计算发送门模式（设置热更新路径用）。
+func (a *App) sendGateMode(st hotkey.Settings) hotkey.Mode {
+	return hotkeyGateMode(st, a.hkMgr != nil && a.hkMgr.Available())
 }
 
 // stopHotkeys 退出事件消费 goroutine 并卸载钩子。ServiceShutdown 调用，幂等。
@@ -1718,14 +1737,15 @@ func (a *App) SetHotkeySettings(s hotkey.Settings) error {
 		return err
 	}
 	// 热应用：绑定换了立刻重装钩子，模式换了立刻改发送门（未启动时 SetSettings
-	// 只存值，等 Start 生效）。
+	// 只存值，等 Start 生效）。发送门先按新设置收敛：钩子装不上时 PTT 必须落在
+	// 常开，不能停在会拦掉全部上行的 PTT。
+	if a.hkGate != nil {
+		a.hkGate.SetMode(a.sendGateMode(clean))
+	}
 	if a.hkMgr != nil {
 		if err := a.hkMgr.SetSettings(clean); err != nil {
 			return err
 		}
-	}
-	if a.hkGate != nil {
-		a.hkGate.SetMode(clean.Mode)
 	}
 	return nil
 }
