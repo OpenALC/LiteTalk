@@ -19,6 +19,11 @@ type RotateWriter struct {
 	perm     os.FileMode
 	f        *os.File
 	size     int64
+
+	// openFile 打开/重建当前档的注入点，生产恒为 os.OpenFile。
+	// 轮转后重新打开失败（磁盘满、权限突变）没有可移植的构造方式，
+	// 测试据此覆盖失败路径（见 TestRotateWriterReopenFailure）。
+	openFile func(string, int, os.FileMode) (*os.File, error)
 }
 
 // NewRotateWriter 打开 path 追加写。maxBytes<=0 或 keep<2 时回落默认
@@ -30,7 +35,7 @@ func NewRotateWriter(path string, maxBytes int64, keep int, perm os.FileMode) (*
 	if keep < 2 {
 		keep = 3
 	}
-	w := &RotateWriter{path: path, maxBytes: maxBytes, keep: keep, perm: perm}
+	w := &RotateWriter{path: path, maxBytes: maxBytes, keep: keep, perm: perm, openFile: os.OpenFile}
 	if err := w.open(); err != nil {
 		return nil, err
 	}
@@ -40,7 +45,11 @@ func NewRotateWriter(path string, maxBytes int64, keep int, perm os.FileMode) (*
 // open 打开当前日志文件并记录尺寸；已有文件超限时先滚动（启动期超限先滚动，
 // 不再 Truncate 丢历史）。perm 同时用于收紧旧版本建出的宽权限文件。
 func (w *RotateWriter) open() error {
-	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, w.perm)
+	openFile := w.openFile
+	if openFile == nil {
+		openFile = os.OpenFile
+	}
+	f, err := openFile(w.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, w.perm)
 	if err != nil {
 		return err
 	}

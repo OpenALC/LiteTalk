@@ -33,7 +33,7 @@ func TestRotateWriterPerm(t *testing.T) {
 	}
 }
 
-// TestConfigDirPerm 配置目录 0700（旧 0755 目录启动收紧）。
+// TestConfigDirPerm 配置目录 0700（旧 0755 目录启动收紧），重开后仍保持。
 func TestConfigDirPerm(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "LiteTalk")
 	// 旧版本用 0755 建的目录：Save 后应收紧。
@@ -50,5 +50,53 @@ func TestConfigDirPerm(t *testing.T) {
 	}
 	if got := fi.Mode().Perm(); got != 0o700 {
 		t.Fatalf("配置目录权限应为 0700，得到 %04o", got)
+	}
+	// 重新打开（模拟重启）再保存：目录权限保持 0700。
+	m2 := NewWithPath(m.Path())
+	if err := m2.SetCloseToTray(false); err != nil {
+		t.Fatal(err)
+	}
+	fi, err = os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o700 {
+		t.Fatalf("重开后配置目录权限应为 0700，得到 %04o", got)
+	}
+}
+
+// TestConfigFilePerm config.json 0600：旧 0644 档在首次 Save 时收紧，
+// 重新打开再保存后仍为 0600（临时文件 + rename 每次都以 0600 重建）。
+func TestConfigFilePerm(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "LiteTalk")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.json")
+	// 旧版本建的 0644 配置：Save 应通过 0600 临时文件 + rename 覆盖收紧。
+	if err := os.WriteFile(path, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := NewWithPath(path)
+	if err := m.SetCloseToTray(true); err != nil {
+		t.Fatal(err)
+	}
+	assertMode(t, path, 0o600)
+
+	m2 := NewWithPath(path)
+	if err := m2.SetCloseToTray(false); err != nil {
+		t.Fatal(err)
+	}
+	assertMode(t, path, 0o600)
+}
+
+func assertMode(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != want {
+		t.Fatalf("%s 权限应为 %04o，得到 %04o", filepath.Base(path), want, got)
 	}
 }
