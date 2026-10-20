@@ -37,8 +37,9 @@ const (
 )
 
 // handleChatSend 文字消息发送：内容/类型/长度校验 → 权限 → 幂等 → 频控 → 落库 → 广播。
-// 广播范围（#32 事件面）：该频道所属服务器**全部成员的会话**——在线实时投递，
-// 断线续传窗口内的进事件环补发，不再依赖是否在语音房；dev 内置房间回退为房内广播。
+// 广播范围（#32 事件面 + #35 B3 过滤）：该频道所属服务器**有 ViewChannel 的成员会话**——
+// 在线实时投递，断线续传窗口内的进事件环补发；无权限成员两路都不收。
+// dev 内置房间回退为房内广播。文字消息只进文字频道（语音频道 bad_message，#35 B3）。
 //
 // nonce 幂等（#31）：同频道同用户同 nonce 只落一条、只广播一次；重复请求把原消息
 // 定向回显给发起者（不进事件环、不再打扰其他成员），弱网重试据此对账。
@@ -80,6 +81,12 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 			if u, err := strconv.ParseInt(c.userID, 10, 64); err == nil {
 				if _, err := h.chatStore.Member(ctx, ch.ServerID, u); err == nil {
 					chID, uid, persist = id, u, true
+					// 频道类型检查（#35 B3）：文字消息只进文字频道，语音频道 bad_message。
+					// 放在成员判定之后——非成员统一 forbidden，不泄露频道类型。
+					if ch.Type != store.ChannelText {
+						h.sendError(c, ErrCodeBadMessage, "语音频道不支持文字消息")
+						return
+					}
 				}
 			}
 		}
@@ -87,6 +94,16 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 	if !inRoom && !persist {
 		h.sendError(c, ErrCodeForbidden, "无权向该频道发送消息")
 		return
+	}
+	// B3 权限：store 频道需 ViewChannel+SendMessages（在幂等回读之前）；
+	// dev 内置房间维持原语义（无频道实体，进房即可见）。
+	if persist {
+		for _, perm := range []store.Permission{store.ViewChannel, store.SendMessages} {
+			if code, msg := h.checkPerm(ctx, uid, serverID, chID, perm, "无权向该频道发送消息"); code != "" {
+				h.sendError(c, code, msg)
+				return
+			}
+		}
 	}
 
 	// 幂等判断先于频控：弱网重试撞上配额时也必须拿回原消息，而不是 rate_limited。
@@ -138,8 +155,9 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 		out.ID = strconv.FormatInt(out.TS, 10)
 	}
 
-	// 广播（#32 事件面）：store 频道 → 该服务器全部成员的会话（在线实时投递，
-	// 断线续传窗口内的会话进事件环供 gateway.resume 补发）；dev 房间 → 房内成员。
+	// 广播（#32 事件面）：store 频道 → 该服务器有 ViewChannel 的成员会话（逐收件人
+	// 过滤（#35 B3）：无权限者不进事件环、不收实时投递，单个收件人查询失败只记日志
+	// 跳过——不能把整条消息拖成 500）；dev 房间 → 房内成员。
 	// 发送者恒在目标内（前端以广播替换本地回显，不另做回执）。
 	uids := map[string]bool{c.userID: true}
 	if persist {
@@ -148,7 +166,17 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 			h.log.Printf("chat: 查服务器 %d 成员失败: %v", serverID, err)
 		}
 		for _, m := range members {
-			uids[formatUID(m.UserID)] = true
+			if m.UserID == uid {
+				continue // 发送者已恒在目标内
+			}
+			ok, err := h.permCheckQuiet(ctx, m.UserID, serverID, chID, store.ViewChannel)
+			if err != nil {
+				h.log.Printf("chat: 收件人 %d 权限查询失败，跳过: %v", m.UserID, err)
+				continue
+			}
+			if ok {
+				uids[formatUID(m.UserID)] = true
+			}
 		}
 	} else {
 		h.mu.Lock()
@@ -160,6 +188,14 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 		h.mu.Unlock()
 	}
 	h.broadcastEvent(uids, TypeChatMessage, out)
+}
+
+// permCheckQuiet 只要结果不翻译错误码（广播过滤用：失败=跳过该收件人）。
+func (h *Hub) permCheckQuiet(ctx context.Context, uid, serverID, channelID int64, perm store.Permission) (bool, error) {
+	if h.authz == nil {
+		return false, errors.New("signal: 权限服务未就绪")
+	}
+	return h.authz.CanInServer(ctx, uid, serverID, channelID, perm)
 }
 
 // chatMessageFromStore 把落库消息还原成 chat.message 载荷（幂等重放定向回显用）。

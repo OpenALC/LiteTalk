@@ -12,18 +12,19 @@ func validCategoryName(s string) bool {
 	return n >= 1 && n <= 32
 }
 
-// CreateCategory POST /api/v1/servers/{id}/categories（owner/admin，v0.1.2）。
+// CreateCategory POST /api/v1/servers/{id}/categories（需 ManageChannels，#35 B3）。
 // 分类允许为空（创建后暂未归入频道），position 按当前数量追加。
 func (s *Server) CreateCategory(ctx context.Context, request CreateCategoryRequestObject) (CreateCategoryResponseObject, error) {
 	if e := checkID(request.Id); e != nil {
 		return nil, e
 	}
+	c := currentUser(ctx)
+	// 资源→权限→body（#35 B3）。
+	if e := s.requirePerm(ctx, request.Id, c.UserID, store.ManageChannels); e != nil {
+		return nil, e
+	}
 	if request.Body == nil {
 		return nil, bodyMissing()
-	}
-	c := currentUser(ctx)
-	if e := s.requireRole(ctx, request.Id, c.UserID, store.RoleAdmin); e != nil {
-		return nil, e
 	}
 	if !validCategoryName(request.Body.Name) {
 		return nil, errf(http.StatusBadRequest, "bad_name", "分类名需为 1–32 个字符")
@@ -39,7 +40,7 @@ func (s *Server) CreateCategory(ctx context.Context, request CreateCategoryReque
 	return CreateCategory201JSONResponse(categoryView(cat)), nil
 }
 
-// DeleteCategory DELETE /api/v1/categories/{id}（owner/admin，v0.1.2）。
+// DeleteCategory DELETE /api/v1/categories/{id}（需 ManageChannels，#35 B3）。
 // 默认仅删空分类：分类下仍有频道且未带 with_channels=1 → 409 category_not_empty，
 // 防止误删；显式带参才级联删除分类及其下全部频道（含消息，单事务）。
 func (s *Server) DeleteCategory(ctx context.Context, request DeleteCategoryRequestObject) (DeleteCategoryResponseObject, error) {
@@ -51,7 +52,7 @@ func (s *Server) DeleteCategory(ctx context.Context, request DeleteCategoryReque
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	if e := s.requireRole(ctx, cat.ServerID, c.UserID, store.RoleAdmin); e != nil {
+	if e := s.requirePerm(ctx, cat.ServerID, c.UserID, store.ManageChannels); e != nil {
 		return nil, e
 	}
 	withChannels := 0
@@ -72,10 +73,12 @@ func (s *Server) DeleteCategory(ctx context.Context, request DeleteCategoryReque
 	if err := s.store.DeleteCategoryWithChannels(ctx, request.Id); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
+	// 连频道一起删时频道覆盖也随之下葬：快照作废。
+	s.authz.InvalidateServer(cat.ServerID)
 	return DeleteCategory200JSONResponse{Status: "ok"}, nil
 }
 
-// PatchCategory PATCH /api/v1/categories/{id}（owner/admin，0.1.2）。
+// PatchCategory PATCH /api/v1/categories/{id}（需 ManageChannels，#35 B3）。
 // name/position 都可选但至少给一个；position 为目标序（0-based），服务端把该分类
 // 移到此位置并重排同服务器其它分类为 0..n-1（相对顺序保持）。分类名复用
 // validCategoryName（与 POST 同一口径），不单独收紧。
@@ -84,18 +87,18 @@ func (s *Server) PatchCategory(ctx context.Context, request PatchCategoryRequest
 	if e := checkID(request.Id); e != nil {
 		return nil, e
 	}
-	req := patchBody(request.JSONBody, request.ApplicationMergePatchPlusJSONBody)
-	if req == nil {
-		return nil, bodyMissing()
-	}
 	c := currentUser(ctx)
 	cat, err := s.store.CategoryByID(ctx, request.Id)
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	// 权限按「分类所属服务器」的 owner/admin 判定：成员只读，不够改。
-	if e := s.requireRole(ctx, cat.ServerID, c.UserID, store.RoleAdmin); e != nil {
+	// 资源→权限→body（#35 B3）：权限按「分类所属服务器」判定。
+	if e := s.requirePerm(ctx, cat.ServerID, c.UserID, store.ManageChannels); e != nil {
 		return nil, e
+	}
+	req := patchBody(request.JSONBody, request.ApplicationMergePatchPlusJSONBody)
+	if req == nil {
+		return nil, bodyMissing()
 	}
 	// Merge Patch（#31）：缺省不改，null = 清空（name 不可清 → 校验拒 400；
 	// position 的 null 拒 400）。至少给一个字段。
