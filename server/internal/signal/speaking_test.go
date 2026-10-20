@@ -48,7 +48,8 @@ func TestVoiceSpeakingFanout(t *testing.T) {
 	}
 
 	// 说话事件不占补发环：随后的聊天事件从 seq=1 开始，不被挤出窗口。
-	b.send(TypeChatSend, ChatSendData{ChannelID: chID, Type: "text", Content: "after-speaking"})
+	// 聊天走文字频道（#35 B3：语音频道拒收文字）。
+	b.send(TypeChatSend, ChatSendData{ChannelID: strconv.FormatInt(f.ch.ID, 10), Type: "text", Content: "after-speaking"})
 	if env := a.recvUntil(TypeChatMessage); env.Seq != 1 {
 		t.Fatalf("聊天 seq = %d, want 1（说话事件不应占环）", env.Seq)
 	}

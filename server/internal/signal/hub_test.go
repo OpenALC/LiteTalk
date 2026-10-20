@@ -224,19 +224,17 @@ func (c *wsClient) recvUntil(want string) Envelope {
 
 // ---- 测试用例 ----
 
-// TestChatBroadcast 双客户端同房：A 发 chat.send → 双方收 chat.message（内容/用户正确），
-// 且消息落库可查。
+// TestChatBroadcast 文字频道：A 发 chat.send → 服务器成员收 chat.message（内容/用户正确），
+// 且消息落库可查。#35 B3 起语音频道拒收文字（bad_message），聊天场景走文字频道。
 func TestChatBroadcast(t *testing.T) {
 	f := newChatFixture(t)
-	chID := strconv.FormatInt(f.vch.ID, 10)
+	chID := strconv.FormatInt(f.ch.ID, 10)
 
 	a := f.dial("1", "alice")
 	b := f.dial("2", "bob")
-	a.send(TypeChannelJoin, ChannelJoinData{ChannelID: chID})
-	b.send(TypeChannelJoin, ChannelJoinData{ChannelID: chID})
-	// 各自吃掉 channel.joined（含对方加入后的第二份广播）。
-	a.recvUntil(TypeChannelJoined)
-	b.recvUntil(TypeChannelJoined)
+	for _, c := range []*wsClient{a, b} {
+		c.recvUntil(TypeHello)
+	}
 
 	a.send(TypeChatSend, ChatSendData{ChannelID: chID, Type: "text", Content: "你好 bob"})
 
@@ -261,7 +259,7 @@ func TestChatBroadcast(t *testing.T) {
 	}
 
 	// 落库可查。
-	msgs, err := f.st.MessagesBefore(context.Background(), f.vch.ID, 0, 10)
+	msgs, err := f.st.MessagesBefore(context.Background(), f.ch.ID, 0, 10)
 	if err != nil {
 		t.Fatalf("MessagesBefore: %v", err)
 	}
@@ -273,11 +271,10 @@ func TestChatBroadcast(t *testing.T) {
 // TestChatBadContent 超长（2001 字）与空内容拒收（bad_message）。
 func TestChatBadContent(t *testing.T) {
 	f := newChatFixture(t)
-	chID := strconv.FormatInt(f.vch.ID, 10)
+	chID := strconv.FormatInt(f.ch.ID, 10)
 
 	a := f.dial("1", "alice")
-	a.send(TypeChannelJoin, ChannelJoinData{ChannelID: chID})
-	a.recvUntil(TypeChannelJoined)
+	a.recvUntil(TypeHello)
 
 	over := strings.Repeat("字", 2001)
 	for _, content := range []string{"", over} {
@@ -293,7 +290,7 @@ func TestChatBadContent(t *testing.T) {
 	}
 
 	// 拒收后不落库。
-	msgs, err := f.st.MessagesBefore(context.Background(), f.vch.ID, 0, 10)
+	msgs, err := f.st.MessagesBefore(context.Background(), f.ch.ID, 0, 10)
 	if err != nil {
 		t.Fatalf("MessagesBefore: %v", err)
 	}
@@ -305,11 +302,10 @@ func TestChatBadContent(t *testing.T) {
 // TestChatRateLimit 20 条/分：第 21 条触发 rate_limited。
 func TestChatRateLimit(t *testing.T) {
 	f := newChatFixture(t)
-	chID := strconv.FormatInt(f.vch.ID, 10)
+	chID := strconv.FormatInt(f.ch.ID, 10)
 
 	a := f.dial("1", "alice")
-	a.send(TypeChannelJoin, ChannelJoinData{ChannelID: chID})
-	a.recvUntil(TypeChannelJoined)
+	a.recvUntil(TypeHello)
 
 	for i := 0; i < 20; i++ {
 		a.send(TypeChatSend, ChatSendData{ChannelID: chID, Type: "text", Content: "msg"})

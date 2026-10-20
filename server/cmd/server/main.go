@@ -24,6 +24,7 @@ import (
 	"github.com/OpenALC/LiteTalk/server/internal/acme"
 	"github.com/OpenALC/LiteTalk/server/internal/api"
 	"github.com/OpenALC/LiteTalk/server/internal/auth"
+	"github.com/OpenALC/LiteTalk/server/internal/authz"
 	"github.com/OpenALC/LiteTalk/server/internal/bootstrap"
 	"github.com/OpenALC/LiteTalk/server/internal/mailer"
 	"github.com/OpenALC/LiteTalk/server/internal/rtcapi"
@@ -249,6 +250,9 @@ func main() {
 		}
 		log.Println("WS 鉴权: JWT")
 	}
+	// 权限判定唯一实例（#35 B3）：REST 与 WS 共用，写后失效（InvalidateServer）
+	// 才能同时作用于两侧的缓存——两个实例会各自缓存、互相看不到失效。
+	authzInst := authz.New(st, authz.Options{})
 	hub := signal.NewHub(sfuInst, authenticator, sessIndex, log.Default(), 0, signal.ChatDeps{
 		Store:     st,
 		Limits:    limits,
@@ -259,6 +263,7 @@ func main() {
 		OfferRate: envInt("LITETALK_OFFER_RATE", 60),
 		// 每会话事件环条数（#32）：断线续传窗口 = min(环容量, 30min 空闲 TTL)。
 		Backlog: cfg.gatewayBacklog,
+		Authz:   authzInst,
 	})
 	// LITETALK_PROTOCOL_MAX：服务端宣布的协议版本上限（#29 逃生阀）。
 	// 0/缺省 = 构建期 ProtocolVersionMax；调小可临时挡住过新的客户端区间。
@@ -352,6 +357,8 @@ func main() {
 		Version: version,
 		RTC:     rtcCfg,
 		RTCAuth: rtcAuth,
+		// 权限判定与信令 hub 共用同一实例（#35 B3）。
+		Authz: authzInst,
 	})
 
 	mux := http.NewServeMux()

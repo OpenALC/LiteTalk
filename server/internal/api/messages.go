@@ -23,9 +23,9 @@ func (s *Server) ListMessages(ctx context.Context, request ListMessagesRequestOb
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	// 成员才能读频道消息。
-	if _, err := s.store.Member(ctx, ch.ServerID, c.UserID); err != nil {
-		return nil, errf(http.StatusForbidden, "forbidden", "不是服务器成员")
+	// 有 ViewChannel 才能读频道消息（#35 B3；成员身份包含在权限判定里）。
+	if e := s.requireChannelPerm(ctx, ch, c.UserID, store.ViewChannel); e != nil {
+		return nil, e
 	}
 	// 游标互斥：before（含旧别名 before_id）优先于 after。
 	// 显式给出的游标必须 > 0：0 不是合法消息 ID，不能当作「无游标」静默降级成
@@ -91,8 +91,12 @@ func (s *Server) CreateMessage(ctx context.Context, request CreateMessageRequest
 	if ch.Type != store.ChannelText {
 		return nil, errf(http.StatusBadRequest, "bad_channel", "只能向文字频道发消息")
 	}
-	if _, err := s.store.Member(ctx, ch.ServerID, c.UserID); err != nil {
-		return nil, errf(http.StatusForbidden, "forbidden", "不是服务器成员")
+	// VIEW+SEND 双门（#35 B3），且在 nonce 幂等回读之前——无权者连回显都拿不到。
+	if e := s.requireChannelPerm(ctx, ch, c.UserID, store.ViewChannel); e != nil {
+		return nil, e
+	}
+	if e := s.requireChannelPerm(ctx, ch, c.UserID, store.SendMessages); e != nil {
+		return nil, e
 	}
 	content := request.Body.Content
 	if n := len([]rune(content)); n == 0 || n > 2000 {

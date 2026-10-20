@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/OpenALC/LiteTalk/server/internal/auth"
+	"github.com/OpenALC/LiteTalk/server/internal/authz"
 	"github.com/OpenALC/LiteTalk/server/internal/sfu"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
 	"github.com/coder/websocket"
@@ -48,6 +49,8 @@ type Hub struct {
 	limits    RateLimiter
 	dev       bool          // 开发模式：放行非数字的内置房间（生产必须为 false）
 	presence  PresenceStore // 在线状态（presence:{uid}，#11）；nil=不做 presence
+	// authz 权限判定（#35 B3）：与 api.Server 共享实例；nil 时权限门 fail-closed。
+	authz Authz
 
 	// 心跳参数（默认值见包常量；测试可缩短）
 	heartbeatEvery time.Duration
@@ -143,6 +146,13 @@ func (c *client) closeNow() {
 	_ = c.conn.CloseNow()
 }
 
+// Authz 频道权限判定（#35 B3，*authz.Authorizer 满足；测试可注入故障假实现）。
+// CanInServer 语义与 authz 包一致：非成员/无权限 (false, nil)，故障 (false, err)。
+type Authz interface {
+	CanInServer(ctx context.Context, uid, serverID, channelID int64, perm store.Permission) (bool, error)
+	InvalidateServer(serverID int64)
+}
+
 // ChatDeps 聊天持久化与频控依赖（可零值：仅广播不落库、不限流）。
 type ChatDeps struct {
 	Store  ChatStore
@@ -159,6 +169,9 @@ type ChatDeps struct {
 	OfferRate int
 	// Backlog 每会话事件环条数（LITETALK_GATEWAY_BACKLOG，#32）；0 = 默认 256。
 	Backlog int
+	// Authz 权限判定（#35 B3）。nil 且 Store 是 store.Store 时自建默认实例（测试兼容）；
+	// 生产必须注入与 api 共享的同一实例，否则写后失效不同步。
+	Authz Authz
 }
 
 // NewHub 构造信令 hub。maxMembers <= 0 时取 SFU 的上限。
@@ -169,6 +182,14 @@ func NewHub(s *sfu.SFU, authn Authenticator, sess *auth.SessionIndex, logger *lo
 	}
 	if logger == nil {
 		logger = log.Default()
+	}
+	az := chat.Authz
+	if az == nil {
+		// 测试/单用方场景自建（#35 B3）：Store 是 store.Store 才能建；
+		// 生产（main.go）注入与 api 共享的实例。
+		if st, ok := chat.Store.(store.Store); ok {
+			az = authz.New(st, authz.Options{})
+		}
 	}
 	h := &Hub{
 		sfu:               s,
@@ -183,6 +204,7 @@ func NewHub(s *sfu.SFU, authn Authenticator, sess *auth.SessionIndex, logger *lo
 		maxConns:          chat.MaxConns,
 		joinRate:          chat.JoinRate,
 		offerRate:         chat.OfferRate,
+		authz:             az,
 		heartbeatEvery:    defaultHeartbeatEvery,
 		pongWait:          defaultPongWait,
 		readIdle:          defaultReadIdle,
@@ -782,8 +804,10 @@ func (h *Hub) serverMax() int64 {
 }
 
 // authorizeChannelJoin 进房权限校验（P0 S1）：返回 (错误码, 消息)，code 为空即放行。
-// 数字频道要求存在、Type 为 voice、请求者是其所属服务器成员；
-// 非数字房间是 M2 内置房间（无 store 频道实体），仅 dev 模式放行。
+// 数字频道要求存在、Type 为 voice、请求者是其所属服务器成员，且有 ViewChannel+
+// ConnectVoice（#35 B3）；非数字房间是 M2 内置房间（无 store 频道实体），仅 dev 模式放行。
+// 权限检查放在既有检查之后，保持既有错误优先级：不存在→not_found、文本频道→forbidden、
+// 非成员→forbidden，然后才是权限不足。
 // 校验含 store 查询，调用方不得持有 hub.mu。
 func (h *Hub) authorizeChannelJoin(c *client, channelID string) (code, msg string) {
 	ctx := context.Background()
@@ -812,10 +836,35 @@ func (h *Hub) authorizeChannelJoin(c *client, channelID string) (code, msg strin
 	if err != nil {
 		return ErrCodeForbidden, "无权进入该频道"
 	}
+	// B3 权限：进语音房 = 看得见频道 + 允许连线；无权限 forbidden，故障 internal。
+	for _, perm := range []store.Permission{store.ViewChannel, store.ConnectVoice} {
+		code, msg := h.checkPerm(ctx, uid, ch.ServerID, chID, perm, "无权进入该频道")
+		if code != "" {
+			return code, msg
+		}
+	}
 	// 缓存 tag 到连接上（成员快照填充用；join 是低频路径，一次查询即可）
 	c.mu.Lock()
 	c.tag = mem.Tag
 	c.mu.Unlock()
+	return "", ""
+}
+
+// checkPerm 单权限判定（#35 B3）：无权限 → (forbidden, msg)，查询故障 → (internal, …)，
+// 通过 → ("", "")。authz 未注入同样按 internal 拒绝（fail-closed，不做假放行）。
+func (h *Hub) checkPerm(ctx context.Context, uid, serverID, channelID int64, perm store.Permission, denyMsg string) (code, msg string) {
+	if h.authz == nil {
+		return ErrCodeInternal, "权限服务未就绪"
+	}
+	ok, err := h.authz.CanInServer(ctx, uid, serverID, channelID, perm)
+	if err != nil {
+		// 故障只记日志 + internal：不能把 500 伪装成 403。
+		h.log.Printf("ws: 权限查询失败（用户 %d 频道 %d）: %v", uid, channelID, err)
+		return ErrCodeInternal, "权限查询失败"
+	}
+	if !ok {
+		return ErrCodeForbidden, denyMsg
+	}
 	return "", ""
 }
 
