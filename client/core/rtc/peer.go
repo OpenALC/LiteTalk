@@ -26,6 +26,11 @@ const opusSDPFmtpLine = "minptime=10;useinbandfec=1"
 // rtpTimestampStep 20ms Opus 帧的 RTP 时戳步进（48kHz × 0.02s）。
 const rtpTimestampStep = 960
 
+// DTXPayloadMax 是 Opus DTX 静音心跳包的最大长度（1~2 字节，仅 TOC/极短载荷）。
+// 发送端照常发送以保持 RTP 时间线连续（接收端 jitter 不判空洞、不重预填）；
+// 接收端不用这种包做带内 FEC（DTX 包不含 FEC 数据）。
+const DTXPayloadMax = 2
+
 // audioLevelURI RFC 6464 音频电平头扩展（#33）：SDP 由 MediaEngine 协商，
 // RTP 载荷为 one-byte 元素数据 V|level（0x00=0dB … 0x7F=静音）。
 const audioLevelURI = "urn:ietf:params:rtp-hdrext:ssrc-audio-level"
@@ -68,8 +73,8 @@ type PeerConfig struct {
 type PeerStats struct {
 	PacketsSent   atomic.Uint64 // 上行 RTP 包数
 	BytesSent     atomic.Uint64 // 上行载荷字节数
-	MutedDropped  atomic.Uint64 // 本地静音丢弃的包数（DTX 语义）
-	DTXDropped    atomic.Uint64 // 发送端丢弃的 DTX 空包数（≤2 字节，静音期 Opus 心跳包）
+	MutedDropped  atomic.Uint64 // 本地静音丢弃的包数（用户主动静音，整包不发）
+	SentDTX       atomic.Uint64 // 已发送的 DTX 心跳包数（≤2 字节，静音期 Opus 产物）
 	RemoteSDPs    atomic.Uint64 // 处理的对端 SDP 数
 	RemoteICEs    atomic.Uint64 // 处理的对端候选数
 	TracksRecv    atomic.Uint64 // OnTrack 次数
@@ -80,7 +85,7 @@ type PeerStats struct {
 //   - 初始由本端 Offer（1 条 sendonly Opus track, pt=111）；
 //   - 此后只接收 SFU 的 offer 并 answer（永不主动 re-offer，无 glare）；
 //   - trickle ICE 双向；
-//   - 上行 SendOpus 打包发送，本地静音时停发（DTX，对端 PLC 兜底）。
+//   - 上行 SendOpus 打包发送；用户静音时停发，Opus DTX 心跳包照常转发。
 type Peer struct {
 	pc        *webrtc.PeerConnection
 	sendTrack *webrtc.TrackLocalStaticRTP
@@ -350,11 +355,11 @@ func audioLevelExtID(exts []webrtc.RTPHeaderExtensionParameter) (uint8, bool) {
 }
 
 // SendOpus 把一个 Opus 包打包为 RTP 发出（seq 自增 1，时戳步进 960）。
-// 本地静音时直接丢弃（停止上行 = DTX 语义，对端 PLC 兜底）。
-// Opus DTX 在静音期产出的 1~2 字节空包同样丢弃：对端解码 ≤1 字节本就走
-// PLC 路径，发了也只是让对端持续做无意义的丢包补偿，N 个静默成员就是
-// N 路空转 PLC。丢弃时 seq/时戳照常推进，时间线保持连续，对端 jitter
-// buffer 把这段当断流处理（预填态回归），恢复说话后无突发。
+// 用户主动静音时整包丢弃（MutedDropped 计数，恢复后重新预填）。
+// Opus DTX 在静音期产出的 1~2 字节心跳包照常发送：RTP seq/时戳时间线连续，
+// 对端 jitter 看到的是正常到达的空帧（libopus 解码 DTX 包得到对应长度的
+// 静音），不会判空洞、不会 2×target 后重回预填——此前丢弃心跳包导致每次
+// 起句多 60~120ms 缓冲且 PLC 涂抹。
 // 在管线 OnPacket 回调（20ms）上调用；payload 底层缓冲不会被保留。
 func (p *Peer) SendOpus(payload []byte) error {
 	if p.closed.Load() {
@@ -362,16 +367,6 @@ func (p *Peer) SendOpus(payload []byte) error {
 	}
 	if p.muted.Load() {
 		p.Stats.MutedDropped.Add(1)
-		return nil
-	}
-	if len(payload) <= 2 {
-		p.Stats.DTXDropped.Add(1)
-		// 时戳/序号照常推进：对端看到的时间线连续（等同空包被发出），
-		// 只是中间这一段全部按丢包补偿。
-		p.sendMu.Lock()
-		p.pkt.SequenceNumber++
-		p.pkt.Timestamp += rtpTimestampStep
-		p.sendMu.Unlock()
 		return nil
 	}
 	p.sendMu.Lock()
@@ -389,6 +384,9 @@ func (p *Peer) SendOpus(payload []byte) error {
 	}
 	p.Stats.PacketsSent.Add(1)
 	p.Stats.BytesSent.Add(uint64(len(payload)))
+	if len(payload) <= DTXPayloadMax {
+		p.Stats.SentDTX.Add(1)
+	}
 	return nil
 }
 

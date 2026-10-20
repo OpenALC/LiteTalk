@@ -150,6 +150,47 @@ func TestJitterStarvationReturnsToPrefill(t *testing.T) {
 	}
 }
 
+// TestJitterDTXHeartbeatNoHole 静音期每 20ms 一个 1~2 字节 DTX 心跳包（发送端
+// 不再丢弃）：jitter 视其为正常到达帧，不判空洞、不重回预填。
+func TestJitterDTXHeartbeatNoHole(t *testing.T) {
+	jb := NewJitterBuffer()
+	out := make([]byte, JitterMaxPayload)
+
+	pushInOrder(jb, 100, 3)
+	for want := uint16(100); want <= 102; want++ {
+		if _, lost, ok := jb.Pop(out); !ok || lost {
+			t.Fatalf("prefill pop %d: lost=%v ok=%v", want, lost, ok)
+		}
+	}
+
+	// DTX 心跳：1 字节载荷，按 20ms 节拍与 Pop 交错。
+	for i := 0; i < 30; i++ {
+		seq := uint16(103 + i)
+		jb.Push(seq, []byte{0xFF}, jitterBase.Add(time.Duration(seq)*JitterFrameMS*time.Millisecond))
+		n, lost, ok := jb.Pop(out)
+		if !ok {
+			t.Fatalf("tick %d: jitter re-entered prefill on DTX heartbeat", i)
+		}
+		if lost {
+			t.Fatalf("tick %d: DTX heartbeat judged as loss", i)
+		}
+		if n != 1 {
+			t.Fatalf("tick %d: payload = %d bytes, want 1", i, n)
+		}
+	}
+
+	st := jb.Stats()
+	if st.Lost != 0 {
+		t.Fatalf("Lost = %d, want 0", st.Lost)
+	}
+	if !st.Started {
+		t.Fatal("should stay started through DTX silence")
+	}
+	if st.Resets != 0 {
+		t.Fatalf("Resets = %d, want 0", st.Resets)
+	}
+}
+
 func TestJitterLargeJumpReset(t *testing.T) {
 	jb := NewJitterBuffer()
 	out := make([]byte, JitterMaxPayload)
