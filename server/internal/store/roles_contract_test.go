@@ -341,6 +341,60 @@ func runRolesContract(t *testing.T, st Store) {
 		}
 	})
 
+	t.Run("非 owner 不得持有 owner 角色", func(t *testing.T) {
+		srv, owner, admin, member := seedRolesServer(t, st)
+		roles, err := st.ListRoles(ctx, srv.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var ownerID int64
+		for _, r := range roles {
+			if r.BuiltinKey == BuiltinKeyOwner {
+				ownerID = r.ID
+			}
+		}
+		if ownerID == 0 {
+			t.Fatal("缺 owner builtin")
+		}
+		// 普通成员经 roleIDs 自授 owner → ErrForbidden。
+		if err := st.SetMemberRoles(ctx, srv.ID, member.ID, []int64{ownerID}, member.ID); !errors.Is(err, ErrForbidden) {
+			t.Fatalf("成员自授 owner 应 ErrForbidden，实际 %v", err)
+		}
+		// admin 同样无权持有 owner builtin。
+		if err := st.SetMemberRoles(ctx, srv.ID, admin.ID, []int64{ownerID}, admin.ID); !errors.Is(err, ErrForbidden) {
+			t.Fatalf("admin 持有 owner 应 ErrForbidden，实际 %v", err)
+		}
+		// 被拒不得半写：成员仍是原分配（@everyone），没有 owner。
+		list, err := st.RolesOfMember(ctx, srv.ID, member.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(list) != 1 || list[0].BuiltinKey != BuiltinKeyMember {
+			t.Fatalf("拒绝后不得改动分配: %+v", list)
+		}
+		mem, err := st.Member(ctx, srv.ID, member.ID)
+		if err != nil || mem.Role != RoleMember {
+			t.Fatalf("拒绝后投影应不变: %+v %v", mem, err)
+		}
+		// 服主自己保留/指定 owner 角色仍成功。
+		if err := st.SetMemberRoles(ctx, srv.ID, owner.ID, []int64{ownerID}, owner.ID); err != nil {
+			t.Fatalf("服主保留 owner 角色应成功: %v", err)
+		}
+		list, err = st.RolesOfMember(ctx, srv.ID, owner.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hasOwner := false
+		for _, r := range list {
+			if r.ID == ownerID {
+				hasOwner = true
+			}
+		}
+		if !hasOwner {
+			t.Fatalf("服主应持有 owner 角色: %+v", list)
+		}
+	})
+
 	t.Run("builtin 不可改删且禁造", func(t *testing.T) {
 		srv, _, _, _ := seedRolesServer(t, st)
 		list, err := st.ListRoles(ctx, srv.ID)
@@ -532,6 +586,17 @@ func runRolesContract(t *testing.T, st Store) {
 			ChannelID: ch.ID, TargetType: OverwriteTargetRole, TargetID: r.ID, Allow: AllPermissions + 1,
 		}); !errors.Is(err, ErrForbidden) {
 			t.Fatalf("未定义位应 ErrForbidden，实际 %v", err)
+		}
+		// 频道覆盖只收频道位：管理类位是脏数据，Store 拒绝。
+		if err := st.SetChannelOverwrite(ctx, &ChannelOverwrite{
+			ChannelID: ch.ID, TargetType: OverwriteTargetRole, TargetID: r.ID, Allow: ManageRoles,
+		}); !errors.Is(err, ErrForbidden) {
+			t.Fatalf("Allow 含 ManageRoles 应 ErrForbidden，实际 %v", err)
+		}
+		if err := st.SetChannelOverwrite(ctx, &ChannelOverwrite{
+			ChannelID: ch.ID, TargetType: OverwriteTargetRole, TargetID: r.ID, Deny: Administrator,
+		}); !errors.Is(err, ErrForbidden) {
+			t.Fatalf("Deny 含 Administrator 应 ErrForbidden，实际 %v", err)
 		}
 
 		// 删除覆盖。
