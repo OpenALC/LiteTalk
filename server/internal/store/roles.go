@@ -296,8 +296,9 @@ func dbRolesOfMember(ctx context.Context, q sqlExecer, serverID, userID int64) (
 	return out, nil
 }
 
-// dbSetMemberRoles 整组替换分配（调用方开事务）：校验同服、强制保留 @everyone、
-// owner 强制保留 owner builtin，并把 server_members.role 投影同步回去。
+// dbSetMemberRoles 整组替换分配（调用方开事务）：校验同服、非 owner 不得持有
+// owner builtin、强制保留 @everyone、owner 强制保留 owner builtin，并把
+// server_members.role 投影同步回去。
 func dbSetMemberRoles(ctx context.Context, tx *sql.Tx, serverID, userID int64, roleIDs []int64, assignedBy int64) error {
 	var legacy MemberRole
 	err := tx.QueryRowContext(ctx,
@@ -347,6 +348,7 @@ func dbSetMemberRoles(ctx context.Context, tx *sql.Tx, serverID, userID int64, r
 	if everyoneID == 0 {
 		return ErrNotFound // 数据损坏：@everyone 缺失（与 Mem 同码）
 	}
+	isOwner := ownerUID == userID || legacy == RoleOwner
 	desired := map[int64]bool{}
 	for _, id := range roleIDs {
 		if _, ok := byID[id]; !ok {
@@ -354,9 +356,14 @@ func dbSetMemberRoles(ctx context.Context, tx *sql.Tx, serverID, userID int64, r
 		}
 		desired[id] = true
 	}
+	// owner builtin 只有服主/legacy owner 能持有（#35 硬化）：非 owner 经 roleIDs
+	// 自授 owner 角色一律拒绝，防止成员抬权。
+	if !isOwner && ownerID != 0 && desired[ownerID] {
+		return ErrForbidden
+	}
 	desired[everyoneID] = true
 	// owner 强制保留 owner 投影：服主或 legacy owner 都不可被摘掉 owner builtin。
-	if ownerUID == userID || legacy == RoleOwner {
+	if isOwner {
 		if ownerID == 0 {
 			return ErrNotFound // 数据损坏：owner 角色缺失（与 Mem 同码）
 		}
@@ -518,13 +525,15 @@ func dbChannelOverwritesOfServer(ctx context.Context, q sqlExecer, serverID int6
 	return out, nil
 }
 
-// dbOverwriteTargetOK 校验 target_type 合法、频道存在、目标（角色/成员）同服。
-// 不出跨服存在性：目标不属于该服一律 ErrNotFound。
+// dbOverwriteTargetOK 校验 target_type 合法、覆盖位在频道掩码内、频道存在、
+// 目标（角色/成员）同服。不出跨服存在性：目标不属于该服一律 ErrNotFound。
 func dbOverwriteTargetOK(ctx context.Context, q sqlExecer, o *ChannelOverwrite) error {
 	if o.TargetType != OverwriteTargetRole && o.TargetType != OverwriteTargetMember {
 		return ErrForbidden
 	}
-	if !o.Allow.Valid() || !o.Deny.Valid() {
+	// 频道覆盖只作用于频道位：管理类位（ManageRoles 等）与未定义位都是脏数据，
+	// Store 直接拒绝（该检查涵盖 Valid）。
+	if o.Allow&^ChannelPermissionMask != 0 || o.Deny&^ChannelPermissionMask != 0 {
 		return ErrForbidden
 	}
 	var serverID int64
