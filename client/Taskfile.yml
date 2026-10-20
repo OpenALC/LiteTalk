@@ -9,6 +9,9 @@ includes:
 vars:
   APP_NAME: "LiteTalk"
   BIN_DIR: "build/bin"
+  # 本地构建未显式传 VERSION 时注入的版本；CI 标签打包走 plain go build，
+  # 用 github.ref_name 注入，不经过这里。
+  DEFAULT_VERSION: "v1.5.0-alpha"
   # wails3 dev 注入 WAILS_VITE_PORT（dev.go 默认 9245）。
   VITE_PORT: '{{.WAILS_VITE_PORT | default 9245}}'
 
