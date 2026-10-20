@@ -13,8 +13,8 @@ tasks:
       - go build {{.BUILD_FLAGS}} -o {{.BIN_DIR}}/{{.APP_NAME}} .
     vars:
       PRODUCTION: '{{.PRODUCTION | default "false"}}'
-      VERSION: '{{.VERSION | default "dev"}}'
-      BUILD_FLAGS: '{{if eq .PRODUCTION "true"}}-tags gtk3,production -trimpath -buildvcs=false -ldflags="-s -w -X main.version={{.VERSION}}"{{else}}-tags gtk3 -buildvcs=false{{end}}'
+      VERSION: '{{.VERSION | default .DEFAULT_VERSION}}'
+      BUILD_FLAGS: '{{if eq .PRODUCTION "true"}}-tags gtk3,production -trimpath -buildvcs=false -ldflags="-s -w -X main.version={{.VERSION}}"{{else}}-tags gtk3 -buildvcs=false -ldflags="-X main.version={{.VERSION}}"{{end}}'
     env:
       CGO_ENABLED: '1'
       GOOS: linux
