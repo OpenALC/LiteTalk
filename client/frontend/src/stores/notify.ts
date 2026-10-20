@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
+import { cleanErrorText } from '../utils/errorText'
 
 // 全局轻提示：跨组件动作（右键菜单、弹层提交等）的统一反馈通道。
 // 渲染端为 GlobalToast（挂在 App.vue 根部，覆盖全部路由页）；
@@ -46,10 +47,10 @@ export const useNotifyStore = defineStore('notify', () => {
     fn?.()
   }
 
-  // fromErr 从异常提取可读文案：剥掉 JS Error 前缀，服务端 message 通常已是中文。
+  // fromErr 从异常提取可读文案：统一剥掉 RuntimeError 前缀与机器码（#15），
+  // 服务端 message 通常已是中文；清洗为空时回落 fallback。
   function fromErr(e: unknown, fallback = '操作失败，请稍后再试') {
-    const m = String(e ?? '').replace(/^Error:\s*/i, '').trim()
-    show(m || fallback, true)
+    show(cleanErrorText(e, fallback), true)
   }
 
   return { visible, text, isError, actionLabel, show, showAction, runAction, fromErr }
