@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -69,6 +70,38 @@ func TestRotateWriterRotation(t *testing.T) {
 	// keep=3：不存在 app.log.3。
 	if data := readGen(t, path+".3"); data != nil {
 		t.Fatal("不应出现 app.log.3")
+	}
+}
+
+// TestRotateWriterReopenFailure 轮转后重新打开失败（磁盘满/权限突变）：
+// 错误必须传到 Write 调用方，且不能留下指向已关闭文件的半开状态。
+func TestRotateWriterReopenFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	w, err := NewRotateWriter(path, 4*1024, 3, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	mustWrite(t, w, kbBlocks('A', 4))
+
+	// 首次打开已成功；后续重建当前档一律失败，模拟轮转后的重开失败。
+	w.openFile = func(string, int, os.FileMode) (*os.File, error) {
+		return nil, errors.New("injected reopen failure")
+	}
+	n, err := w.Write(kbBlocks('B', 4))
+	if err == nil {
+		t.Fatal("轮转后重新打开失败应返回错误")
+	}
+	if n != 0 {
+		t.Fatalf("失败写入不应报告写入字节数，得到 %d", n)
+	}
+	if w.f != nil {
+		t.Fatal("重新打开失败后不应保留文件句柄")
+	}
+	// 轮转本身已完成：旧档已挪到 .1，失败发生在重建当前档。
+	if !bytes.Equal(readGen(t, path+".1"), kbBlocks('A', 4)) {
+		t.Fatal("重新打开失败前应已完成旧档轮转（app.log.1 为档 1 内容 A）")
 	}
 }
 
