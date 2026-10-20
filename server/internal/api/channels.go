@@ -58,6 +58,11 @@ func (s *Server) CreateChannel(ctx context.Context, request CreateChannelRequest
 	if err := s.store.CreateChannel(ctx, ch); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
+	s.audit(ctx, store.AuditLog{
+		ServerID: request.Id, ActorID: c.UserID, Action: "channel.create",
+		TargetType: "channel", TargetID: ptrID(ch.ID), ChannelID: ptrID(ch.ID),
+		Detail: auditDetail(map[string]any{"name": ch.Name, "type": string(ch.Type)}),
+	})
 	return CreateChannel201JSONResponse(channelView(ch)), nil
 }
 
@@ -81,11 +86,14 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 	}
 	// Merge Patch（#31）：缺省不改，null = 清空（name/type 不可清 → 校验拒 400；
 	// category_id 的 null = 移出分类；position 的 null 拒 400）。
+	// 审计只记变更字段（#35 B4）。
+	detail := map[string]any{}
 	if req.Name.Set {
 		if !validChannelName(req.Name.Val) {
 			return nil, errf(http.StatusBadRequest, "bad_name", "频道名需为 1–64 个字符")
 		}
 		ch.Name = req.Name.Val
+		detail["name"] = req.Name.Val
 	}
 	if req.Type.Set {
 		t := store.ChannelType(req.Type.Val)
@@ -93,10 +101,12 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 			return nil, errf(http.StatusBadRequest, "bad_type", "类型必须是 text 或 voice")
 		}
 		ch.Type = t
+		detail["type"] = string(t)
 	}
 	if req.CategoryID.Set {
 		if req.CategoryID.Clearing() || req.CategoryID.Val == 0 {
 			ch.CategoryID = nil // 显式移出分类（null 或 0，#31）
+			detail["category_id"] = nil
 		} else {
 			// 校验分类归属本服务器，防止跨服挂载。
 			cat, err := s.store.CategoryByID(ctx, int64(req.CategoryID.Val))
@@ -105,6 +115,7 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 			}
 			v := int64(req.CategoryID.Val)
 			ch.CategoryID = &v
+			detail["category_id"] = req.CategoryID.Val
 		}
 	}
 	if req.Position.Set {
@@ -112,10 +123,16 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 			return nil, errf(http.StatusBadRequest, "bad_request", "position 不可清除")
 		}
 		ch.Position = req.Position.Val
+		detail["position"] = req.Position.Val
 	}
 	if err := s.store.UpdateChannel(ctx, ch); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
+	s.audit(ctx, store.AuditLog{
+		ServerID: ch.ServerID, ActorID: c.UserID, Action: "channel.update",
+		TargetType: "channel", TargetID: ptrID(ch.ID), ChannelID: ptrID(ch.ID),
+		Detail: auditDetail(detail),
+	})
 	return PatchChannel200JSONResponse(channelView(ch)), nil
 }
 
@@ -137,6 +154,11 @@ func (s *Server) DeleteChannel(ctx context.Context, request DeleteChannelRequest
 	}
 	// 频道级覆盖随频道删除：快照作废，避免旧覆盖继续影响同服其它判定。
 	s.authz.InvalidateServer(ch.ServerID)
+	s.audit(ctx, store.AuditLog{
+		ServerID: ch.ServerID, ActorID: c.UserID, Action: "channel.delete",
+		TargetType: "channel", TargetID: ptrID(ch.ID), ChannelID: ptrID(ch.ID),
+		Detail: auditDetail(map[string]any{"name": ch.Name, "type": string(ch.Type)}),
+	})
 	// 频道删除后踢出该房间内成员（#22，单实例语义）。
 	if s.hub != nil {
 		s.hub.KickChannel(strconv.FormatInt(request.Id, 10), "channel_deleted")

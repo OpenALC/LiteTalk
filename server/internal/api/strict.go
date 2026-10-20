@@ -31,7 +31,7 @@ func errf(status int, code, msg string) *apiErr {
 
 // writeStoreErr 把 store 领域错误映射为 *apiErr（500 记底层错误与路径）。
 // strict 迁移后方法签名改为返回错误对象——它是方法不是自由函数，陷阱不变。
-func (s *Server) writeStoreErr(ctx context.Context, err error) error {
+func (s *Server) writeStoreErr(ctx context.Context, err error) *apiErr {
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		return errf(http.StatusNotFound, "not_found", "资源不存在")
