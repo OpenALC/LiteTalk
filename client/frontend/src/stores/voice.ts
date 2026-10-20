@@ -36,11 +36,26 @@ export const useVoiceStore = defineStore('voice', () => {
   // 前端又显示「在房内」（#85）。
   let generation = 0
 
+  // pendingJoin 在飞入房：voice:join_failed 可能早于 JoinChannel 的 Promise 返回，
+  // 处理器凭它认领失败并递增 joinSeq；join() 返回后只有 seq 仍匹配才写 channelId，
+  // 否则会把已失败的房间重新写回（幽灵房间）。
+  let pendingJoin: { id: string; seq: number } | null = null
+  let joinSeq = 0
+
   async function join(id: string) {
     const gen = generation
+    const seq = ++joinSeq
+    pendingJoin = { id, seq }
     // 先不写 channelId——JoinChannel 失败时不置位，守卫不会拦死重试（B1）
-    await goApp().JoinChannel(id)
-    if (gen !== generation) return
+    try {
+      await goApp().JoinChannel(id)
+    } catch (e) {
+      if (pendingJoin?.seq === seq) pendingJoin = null
+      throw e
+    }
+    // 失败事件已认领（pending 被清、seq 前移）或会话已复位：丢弃这次迟到的成功。
+    if (gen !== generation || pendingJoin?.seq !== seq) return
+    pendingJoin = null
     channelId.value = id
     const list = await goApp().GetVoiceMembers()
     if (gen !== generation) return
@@ -53,13 +68,15 @@ export const useVoiceStore = defineStore('voice', () => {
     await goApp().LeaveChannel()
   }
 
-  // resetRoom 本地清空房间态（主动退房 / 语音被抢占）。不发 LeaveChannel——
-  // 抢占路径下 Go 侧已本地退房，再发会把抢占端也带离房间。
+  // resetRoom 本地清空房间态（主动退房 / 语音被抢占 / 入房失败）。不发
+  // LeaveChannel——抢占路径下 Go 侧已本地退房，再发会把抢占端也带离房间。
   function resetRoom() {
     channelId.value = ''
     members.value = []
     latencyMs.value = 0 // Q4：挂断即归零，避免 voice-bar 重开瞬间残留旧延迟
     connected.value = false
+    // 在飞的 join 不得在复位后把房间态写回。
+    pendingJoin = null
   }
 
   // resetAll 登出/被踢/换服时全量清理（含 resetRoom 不覆盖的 muted/deafened/
@@ -181,6 +198,29 @@ export const useVoiceStore = defineStore('voice', () => {
     offs.push(eventsOn('voice:taken', () => {
       resetRoom()
       notify.show('已在其他设备加入语音')
+    }))
+    // 入房失败（voice:join_failed）：Go 侧已放弃入房。清掉房间态，左下角
+    // 「正在频道中」与延迟条随之消失。Go 侧对这条失败路径不再发 chat:error
+    //（joinHandled=true 时 ErrorHandlerEx 直接返回），提示只能在这里弹。
+    offs.push(eventsOn('voice:join_failed', (d) => {
+      const p = d as { channel_id?: string; message?: string } | null
+      const failedId = p?.channel_id
+      if (pendingJoin) {
+        // 有新的在飞 join 时，旧频道的迟到失败不能把它误伤。
+        if (failedId && pendingJoin.id !== failedId) return
+        // 事件先于 JoinChannel 的 Promise 返回：认领失败并递增 seq，
+        // 让在飞 Promise 回来后不再把 channelId 写回（幽灵房间）。
+        pendingJoin = null
+        joinSeq++
+        resetRoom()
+      } else if (failedId && channelId.value === failedId) {
+        // 已在该频道：Go 侧已放弃入房，清房间态。
+        resetRoom()
+      } else {
+        // 没有在飞 join、也不在当前失败频道：离开后的迟到失败，忽略。
+        return
+      }
+      notify.show(p?.message?.trim() || '进入语音频道失败', true)
     }))
     // 音频不可用（管线初始化失败，或入房后采集/播放启动失败，#80）：Go 侧对
     // 同一故障周期只上报一次，这里直接提示。toast 是瞬时的（notify 自动隐藏），

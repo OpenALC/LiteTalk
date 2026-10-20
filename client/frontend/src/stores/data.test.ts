@@ -8,6 +8,8 @@ const mockGoApp = vi.hoisted(() => ({
   ListServers: vi.fn(),
   ListChannels: vi.fn(),
   CreateChannel: vi.fn(),
+  CreateServer: vi.fn(),
+  JoinServerByCode: vi.fn(),
   RenameCategory: vi.fn(async () => {}),
   UpdateCategory: vi.fn(async (id: string, name: string, position: number) => ({
     id, server_id: '0', name: name || `分类${id}`, position: position < 0 ? 0 : position,
@@ -51,6 +53,8 @@ function resetMock() {
   mockGoApp.ListServers.mockReset()
   mockGoApp.ListChannels.mockReset()
   mockGoApp.CreateChannel.mockReset()
+  mockGoApp.CreateServer.mockReset()
+  mockGoApp.JoinServerByCode.mockReset()
   mockGoApp.RenameCategory.mockReset().mockResolvedValue(undefined)
   mockGoApp.UpdateCategory.mockReset().mockImplementation(async (id, name, position) => ({
     id, server_id: '0', name: name || `分类${id}`, position: position < 0 ? 0 : position,
@@ -171,8 +175,8 @@ describe('频道列表恢复', () => {
     expect(notify.visible).toBe(true)
     expect(notify.isError).toBe(true)
     expect(notify.text).toBe('服务器列表加载失败')
-    // 内置示例保留，界面其余操作照常。
-    expect(s.findServer('hq')).toBeTruthy()
+    // 列表保持为空，不再回落到示例服务器。
+    expect(s.servers).toEqual([])
 
     mockGoApp.ListServers.mockResolvedValueOnce([
       { id: 7, name: '服七', owner_id: 1, icon_name: 'music', icon_color: '#4FA4F3' },
@@ -215,19 +219,6 @@ describe('分类改名与排序', () => {
     resetMock()
   })
 
-  it('内置示例改名只改本地（含归组频道的 group），不调 REST', async () => {
-    const s = useServersStore()
-    await s.createCategory('design', '本地组')
-    s.findServer('design')!.channels.push({ id: 'c1', name: '房', type: 'voice', group: '本地组' })
-    const cat = s.extraGroups['design'].find((g) => g.name === '本地组')!
-
-    await s.renameCategory('design', cat.id, '改过名')
-
-    expect(s.extraGroups['design'][0].name).toBe('改过名')
-    expect(s.findServer('design')!.channels[0].group).toBe('改过名')
-    expect(mockGoApp.RenameCategory).not.toHaveBeenCalled()
-  })
-
   it('真实分类改名走 PATCH 并同步频道 group', async () => {
     mockGoApp.ListServers.mockResolvedValue([
       { id: 21, name: '服21', owner_id: 1, icon_name: 'music', icon_color: '#4FA4F3' },
@@ -244,20 +235,6 @@ describe('分类改名与排序', () => {
     expect(mockGoApp.RenameCategory).toHaveBeenCalledWith('211', '新名')
     expect(s.extraGroups['21'][0].name).toBe('新名')
     expect(s.findServer('21')!.channels[0].group).toBe('新名')
-  })
-
-  it('本地排序：移到目标序并重排 position，不调 REST', async () => {
-    const s = useServersStore()
-    await s.createCategory('design', '甲')
-    await s.createCategory('design', '乙')
-    await s.createCategory('design', '丙')
-    const ids = s.extraGroups['design'].map((g) => g.id)
-
-    await s.reorderCategory('design', ids[2], 0)
-
-    expect(s.extraGroups['design'].map((g) => g.name)).toEqual(['丙', '甲', '乙'])
-    expect(s.extraGroups['design'].map((g) => g.position)).toEqual([0, 1, 2])
-    expect(mockGoApp.UpdateCategory).not.toHaveBeenCalled()
   })
 
   it('真实分类排序乐观更新，失败回滚顺序', async () => {
@@ -381,7 +358,7 @@ describe('data:resync 刷新', () => {
     await vi.waitFor(() => expect(s.findServer('7')?.name).toBe('新名'))
     await vi.waitFor(() => expect(s.findServer('8')).toBeUndefined())
     expect(mockGoApp.ListChannels).toHaveBeenLastCalledWith('7')
-    // 当前选中的服务器被移出：回退到第一个可用服务器（内置示例在前）。
+    // 当前选中的服务器被移出：回退到第一个可用服务器。
     expect(s.currentServerId).not.toBe('8')
     expect(s.findServer(s.currentServerId)).toBeTruthy()
     s.unbindEvents()
@@ -509,7 +486,7 @@ describe('store 统一复位', () => {
     id: String(id), name, owner_id: '1', icon_name: 'music', icon_color: '#4FA4F3',
   })
 
-  it('servers.resetAll 回到内置示例并清空会话选中/分类缓存，保留客户端偏好', async () => {
+  it('servers.resetAll 清空服务器与会话选中/分类缓存，保留客户端偏好', async () => {
     mockGoApp.ListServers.mockResolvedValue([serverDTO(7, '服七')])
     mockGoApp.ListChannels.mockResolvedValue({
       categories: [{ id: 71, server_id: 7, name: '甲组', position: 0 }],
@@ -518,15 +495,13 @@ describe('store 统一复位', () => {
     const s = useServersStore()
     await s.loadRemoteServers()
     s.selectServer('7')
-    // 内置示例的本地改动（改名）必须在复位后消失，否则会跨账号带过去。
-    s.findServer('hq')!.name = '改过的总部'
     s.homeId = '7'
     s.introHidden = true
 
     s.resetAll()
 
-    expect(s.servers.map((x) => x.id)).toEqual(['hq', 'game', 'music', 'design', 'book'])
-    expect(s.findServer('hq')?.name).toBe('语音总部')
+    // 没有内置示例可回退：登出后列表为空，登录后再由 loadRemoteServers 填充。
+    expect(s.servers).toEqual([])
     expect(s.findServer('7')).toBeUndefined()
     expect(s.currentServerId).toBe('')
     expect(s.currentChannelId).toBe('')
@@ -536,14 +511,15 @@ describe('store 统一复位', () => {
     expect(s.introHidden).toBe(true)
   })
 
-  it('servers.resetAll 幂等：重复调用不报错且仍为出厂态', () => {
+  it('servers.resetAll 幂等：重复调用不报错且仍为空列表', () => {
     const s = useServersStore()
-    s.selectServer('hq')
+    s.servers.push({ id: '7', name: '服七', icon: 'Music', channels: [] })
+    s.selectServer('7')
 
     s.resetAll()
     s.resetAll()
 
-    expect(s.servers).toHaveLength(5)
+    expect(s.servers).toEqual([])
     expect(s.currentServerId).toBe('')
     expect(s.currentChannelId).toBe('')
   })
@@ -598,5 +574,98 @@ describe('store 统一复位', () => {
     expect(s.online).toEqual([])
     expect(s.offline).toEqual([])
     expect(s.pending).toEqual([])
+  })
+})
+
+// 加入/创建服务器后立即加载频道与分类（#91）：服务端允许任意成员读取频道，
+// 此前只有登录/重连会 loadChannels，好友加入后永远看不到频道/分类。
+describe('加入/创建服务器后加载频道', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    resetMock()
+  })
+
+  const serverDTO = (id: number, name: string) => ({
+    id, name, owner_id: 1, icon_name: 'music', icon_color: '#4FA4F3',
+  })
+
+  it('joinServer 成功后拉取频道与分类，并选中第一个频道', async () => {
+    mockGoApp.JoinServerByCode.mockResolvedValue(serverDTO(41, '服41'))
+    mockGoApp.ListChannels.mockResolvedValue({
+      categories: [{ id: 411, server_id: 41, name: '甲组', position: 0 }],
+      channels: [{ id: 4101, server_id: 41, name: '大厅', type: 'voice', category_id: 411, position: 0 }],
+    })
+    const s = useServersStore()
+
+    await s.joinServer('invite-code')
+
+    expect(mockGoApp.JoinServerByCode).toHaveBeenCalledWith('invite-code')
+    expect(mockGoApp.ListChannels).toHaveBeenCalledWith('41')
+    expect(s.findServer('41')!.channels).toEqual([
+      { id: '4101', name: '大厅', type: 'voice', group: '甲组' },
+    ])
+    expect(s.extraGroups['41'].map((g) => g.name)).toEqual(['甲组'])
+    expect(s.currentServerId).toBe('41')
+    expect(s.currentChannelId).toBe('4101')
+  })
+
+  it('重复加入（服务器已在本地）同样拉取频道', async () => {
+    const s = useServersStore()
+    s.servers.push({ id: '41', name: '旧名', icon: 'Music', channels: [] })
+    mockGoApp.JoinServerByCode.mockResolvedValue(serverDTO(41, '服41'))
+    mockGoApp.ListChannels.mockResolvedValue({
+      categories: [],
+      channels: [{ id: 4102, server_id: 41, name: '闲聊', type: 'text', category_id: 0, position: 0 }],
+    })
+
+    await s.joinServer('invite-code')
+
+    expect(mockGoApp.ListChannels).toHaveBeenCalledWith('41')
+    expect(s.findServer('41')!.channels.map((c) => c.id)).toEqual(['4102'])
+    expect(s.currentChannelId).toBe('4102')
+  })
+
+  it('createServer 同样拉取频道与空分类', async () => {
+    mockGoApp.CreateServer.mockResolvedValue(serverDTO(42, '新服'))
+    mockGoApp.ListChannels.mockResolvedValue({
+      categories: [{ id: 421, server_id: 42, name: '空组', position: 0 }],
+      channels: [],
+    })
+    const s = useServersStore()
+
+    await s.createServer('新服')
+
+    expect(mockGoApp.CreateServer).toHaveBeenCalledWith('新服')
+    expect(mockGoApp.ListChannels).toHaveBeenCalledWith('42')
+    expect(s.findServer('42')!.channels).toEqual([])
+    expect(s.extraGroups['42'].map((g) => g.name)).toEqual(['空组'])
+    expect(s.currentServerId).toBe('42')
+  })
+
+  it('频道拉取失败不阻断加入：标记不可用并提示', async () => {
+    mockGoApp.JoinServerByCode.mockResolvedValue(serverDTO(43, '服43'))
+    mockGoApp.ListChannels.mockRejectedValue(new Error('dial tcp: connection refused'))
+    const s = useServersStore()
+    const notify = useNotifyStore()
+
+    await expect(s.joinServer('invite-code')).resolves.toBeUndefined()
+
+    expect(s.currentServerId).toBe('43')
+    expect(s.findServer('43')!.unavailable).toBe(true)
+    expect(notify.isError).toBe(true)
+    expect(notify.text).toContain('频道加载失败')
+  })
+
+  it('resetAll 后列表为空，不出现示例服务器或示例频道', async () => {
+    mockGoApp.ListServers.mockResolvedValue([serverDTO(7, '服七')])
+    mockGoApp.ListChannels.mockResolvedValue({ categories: [], channels: [] })
+    const s = useServersStore()
+    await s.loadRemoteServers()
+    expect(s.servers).toHaveLength(1)
+
+    s.resetAll()
+
+    expect(s.servers).toEqual([])
+    expect(s.findServer('hq')).toBeUndefined()
   })
 })
