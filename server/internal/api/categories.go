@@ -37,6 +37,11 @@ func (s *Server) CreateCategory(ctx context.Context, request CreateCategoryReque
 	if err := s.store.CreateCategory(ctx, cat); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
+	s.audit(ctx, store.AuditLog{
+		ServerID: request.Id, ActorID: c.UserID, Action: "category.create",
+		TargetType: "category", TargetID: ptrID(cat.ID),
+		Detail: auditDetail(map[string]any{"name": cat.Name, "position": cat.Position}),
+	})
 	return CreateCategory201JSONResponse(categoryView(cat)), nil
 }
 
@@ -75,6 +80,11 @@ func (s *Server) DeleteCategory(ctx context.Context, request DeleteCategoryReque
 	}
 	// 连频道一起删时频道覆盖也随之下葬：快照作废。
 	s.authz.InvalidateServer(cat.ServerID)
+	s.audit(ctx, store.AuditLog{
+		ServerID: cat.ServerID, ActorID: c.UserID, Action: "category.delete",
+		TargetType: "category", TargetID: ptrID(cat.ID),
+		Detail: auditDetail(map[string]any{"name": cat.Name, "with_channels": withChannels == 1}),
+	})
 	return DeleteCategory200JSONResponse{Status: "ok"}, nil
 }
 
@@ -132,11 +142,21 @@ func (s *Server) PatchCategory(ctx context.Context, request PatchCategoryRequest
 		}
 		cat = updated
 	}
+	detail := map[string]any{}
+	if req.Position.Set {
+		detail["position"] = cat.Position
+	}
 	if req.Name.Set {
 		cat.Name = req.Name.Val
+		detail["name"] = cat.Name
 		if err := s.store.UpdateCategory(ctx, cat); err != nil {
 			return nil, s.writeStoreErr(ctx, err)
 		}
 	}
+	s.audit(ctx, store.AuditLog{
+		ServerID: cat.ServerID, ActorID: c.UserID, Action: "category.update",
+		TargetType: "category", TargetID: ptrID(cat.ID),
+		Detail: auditDetail(detail),
+	})
 	return PatchCategory200JSONResponse(categoryView(cat)), nil
 }

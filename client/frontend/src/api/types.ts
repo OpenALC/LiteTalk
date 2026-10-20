@@ -22,6 +22,14 @@ export type FriendEntry = components['schemas']['FriendEntry']
 export type ServerChannels = components['schemas']['ServerChannels']
 export type SyncServer = components['schemas']['SyncServer']
 export type SyncSnapshot = components['schemas']['SyncSnapshot']
+// #35 B4：角色 / 频道覆盖 / 审计（permissions 为十进制字符串）。
+export type Role = components['schemas']['Role']
+export type CreateRoleRequest = components['schemas']['CreateRoleRequest']
+export type UpdateRoleRequest = components['schemas']['UpdateRoleRequest']
+export type SetMemberRolesRequest = components['schemas']['SetMemberRolesRequest']
+export type ChannelOverwrite = components['schemas']['ChannelOverwrite']
+export type SetOverwriteRequest = components['schemas']['SetOverwriteRequest']
+export type AuditLogEntry = components['schemas']['AuditLogEntry']
 
 // ---- 桥接层兼容名（组件/stores 既有命名）----
 // Wails 绑定经 Go state 包中转：字段与契约同源，个别桥接补充字段见注释。
