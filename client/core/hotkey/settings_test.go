@@ -26,6 +26,33 @@ func TestDefaultSettings(t *testing.T) {
 	}
 }
 
+// TestEffectiveSendMode 出厂配置（Enabled=false、ModePTT、无绑定）必须退化为
+// 常开：否则 Gate 在 PTT 模式下恒拦，上行音频全丢，服务端收不到任何帧（#93）。
+func TestEffectiveSendMode(t *testing.T) {
+	cases := []struct {
+		name string
+		in   Settings
+		want Mode
+	}{
+		{"出厂配置退化为常开", DefaultSettings(), ModeOpen},
+		{"PTT 未启用退化为常开", Settings{Mode: ModePTT, PTT: "ctrl+m"}, ModeOpen},
+		{"PTT 启用但未绑定退化为常开", Settings{Enabled: true, Mode: ModePTT}, ModeOpen},
+		{"PTT 绑定为空白退化为常开", Settings{Enabled: true, Mode: ModePTT, PTT: "  \t"}, ModeOpen},
+		{"PTT 启用且绑定保持 PTT", Settings{Enabled: true, Mode: ModePTT, PTT: "ctrl+m"}, ModePTT},
+		{"PTT 绑定大小写不影响判定", Settings{Enabled: true, Mode: ModePTT, PTT: "Ctrl+M"}, ModePTT},
+		{"语音激活不依赖启用", Settings{Mode: ModeVoice}, ModeVoice},
+		{"语音激活即使有绑定也保持", Settings{Enabled: true, Mode: ModeVoice, PTT: "ctrl+m"}, ModeVoice},
+		{"常开保持", Settings{Mode: ModeOpen}, ModeOpen},
+		{"越界模式按 PTT 收敛后退化为常开", Settings{Mode: Mode(9)}, ModeOpen},
+		{"越界模式 + 启用 + 绑定按 PTT", Settings{Enabled: true, Mode: Mode(9), PTT: "f13"}, ModePTT},
+	}
+	for _, c := range cases {
+		if got := EffectiveSendMode(c.in); got != c.want {
+			t.Errorf("%s: EffectiveSendMode = %v，期望 %v（输入 %+v）", c.name, got, c.want, c.in)
+		}
+	}
+}
+
 func TestSanitizeConverges(t *testing.T) {
 	in := Settings{
 		Enabled:  true,
