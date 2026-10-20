@@ -51,8 +51,9 @@ const (
 	FriendBlocked  FriendshipStatus = "blocked"
 )
 
-// Friendship 好友关系（单行表示一对，user_id < friend_id 由 API 层保证顺序）。
-// remark/group_name 为发起方视角的本地备注与分组（v0.1.2 迁移 0003）。
+// Friendship 好友关系（单行表示一对，user_id 是发起方，方向有语义）。
+// remark/group_name 为发起方视角的本地备注与分组（v0.1.2 迁移 0003）；
+// 迁移 0008 起数据库按无序对唯一，反向重复插入返回 ErrConflict。
 type Friendship struct {
 	ID        int64            `json:"id" db:"id"`
 	UserID    int64            `json:"user_id" db:"user_id"`
@@ -171,6 +172,7 @@ type Store interface {
 	HasServers(ctx context.Context) (bool, error)
 
 	// friendships
+	// CreateFriendship 写入 remark/group_name；同一无序对（含反向）重复返回 ErrConflict。
 	CreateFriendship(ctx context.Context, f *Friendship) error
 	FriendshipByID(ctx context.Context, id int64) (*Friendship, error)
 	// FriendshipsOfUser 返回该用户参与的全部关系（两个方向）。

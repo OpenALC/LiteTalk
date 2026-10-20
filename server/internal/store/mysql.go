@@ -305,8 +305,9 @@ func (m *MySQL) HasServers(ctx context.Context) (bool, error) {
 func (m *MySQL) CreateFriendship(ctx context.Context, f *Friendship) error {
 	f.ID = newID(f.ID)
 	_, err := m.db.ExecContext(ctx,
-		`INSERT INTO friendships (id, user_id, friend_id, status) VALUES (?, ?, ?, ?)`,
-		f.ID, f.UserID, f.FriendID, f.Status)
+		`INSERT INTO friendships (id, user_id, friend_id, status, remark, group_name)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		f.ID, f.UserID, f.FriendID, f.Status, f.Remark, f.GroupName)
 	if err != nil {
 		if isDup(err) {
 			return ErrConflict
