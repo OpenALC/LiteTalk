@@ -81,10 +81,21 @@ func newTokenStub(t *testing.T) *tokenStub {
 		case "unauthorized":
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte(`{"code":"token_expired","detail":"refresh token expired"}`))
+		case "forbidden":
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"code":"forbidden","detail":"refresh token revoked"}`))
 		case "replaced":
 			w.Header().Set("X-LiteTalk-Auth", "session_replaced")
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte(`{"code":"session_replaced","detail":"replaced"}`))
+		case "network":
+			// 传输层失败：不应答直接断开，客户端拿到 EOF/connection reset，
+			// 与服务端明确拒绝（401/403）必须区分（#84 复审 4.1）。
+			if hj, ok := w.(http.Hijacker); ok {
+				if conn, _, err := hj.Hijack(); err == nil {
+					_ = conn.Close()
+				}
+			}
 		default:
 			_, _ = w.Write([]byte(`{"access_token":"` + s.freshToken + `","refresh_token":"rt-new","expires_in":7200}`))
 		}
@@ -169,18 +180,70 @@ func TestSessionRefreshesOnHandshake401AndReconnects(t *testing.T) {
 	}
 }
 
-// TestSessionRefreshFailureStopsReconnecting 刷新失败：停止重连，不无限撞墙。
-func TestSessionRefreshFailureStopsReconnecting(t *testing.T) {
+// TestSessionRefreshRejectedKicksLoginExpired 服务端明确拒绝刷新（401/403）：
+// refresh_token 已失效/被吊销，走被踢链路回登录页（reason=login_expired），
+// 停止重连、不无限撞墙（#84 复审 4.1）。
+func TestSessionRefreshRejectedKicksLoginExpired(t *testing.T) {
+	for _, mode := range []string{"unauthorized", "forbidden"} {
+		t.Run(mode, func(t *testing.T) {
+			stub := newTokenStub(t)
+			stub.refreshMode.Store(mode)
+			c := api.NewAPIClient(stub.URL)
+			c.SetToken("stale-access")
+			c.SetRefreshSource(func(context.Context) (string, error) { return "rt-1", nil })
+
+			kicked := make(chan string, 1)
+			s := NewSession(c, "fallback", "n", Events{
+				OnKicked: func(reason string) { kicked <- reason },
+			}, nil)
+			s.Connect(stub.wsURL())
+			defer s.Close()
+
+			select {
+			case reason := <-kicked:
+				if reason != KickReasonLoginExpired {
+					t.Fatalf("被踢原因 = %q, want %q", reason, KickReasonLoginExpired)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("刷新被服务端拒绝后未触发被踢")
+			}
+			if got := stub.refreshCount(); got != 1 {
+				t.Fatalf("刷新次数 = %d, want 1", got)
+			}
+			// 默认 ReconnectMin 500ms：给足退避窗口，仍应只有一次拨号、一次刷新。
+			time.Sleep(700 * time.Millisecond)
+			if got := stub.refreshCount(); got != 1 {
+				t.Fatalf("刷新失败后仍在重试: %d 次", got)
+			}
+			if toks := stub.tokens(); len(toks) != 1 {
+				t.Fatalf("刷新失败后仍在拨号: %v", toks)
+			}
+			if s.SignalConnected() {
+				t.Fatal("刷新失败后不应保持连接")
+			}
+		})
+	}
+}
+
+// TestSessionRefreshTransientFailureKeepsRetrying 刷新请求遇到传输层错误
+// （服务端并未应答）：不能按登录过期处理、不触发被踢；signal 层退避重试，
+// 网络恢复后自动连上（#84 复审 4.1）。
+func TestSessionRefreshTransientFailureKeepsRetrying(t *testing.T) {
 	stub := newTokenStub(t)
-	stub.refreshMode.Store("unauthorized")
+	stub.refreshMode.Store("network")
+	stub.acceptToken.Store("fresh-access")
 	c := api.NewAPIClient(stub.URL)
-	c.SetToken("stale-access")
+	c.SetToken("stale-access") // opaque：本地判不出过期，靠握手 401 驱动刷新
 	c.SetRefreshSource(func(context.Context) (string, error) { return "rt-1", nil })
 
-	s := NewSession(c, "fallback", "n", Events{}, nil)
+	kicked := make(chan string, 1)
+	s := NewSession(c, "fallback", "n", Events{
+		OnKicked: func(reason string) { kicked <- reason },
+	}, nil)
 	s.Connect(stub.wsURL())
 	defer s.Close()
 
+	// 首次刷新撞网络错误。
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) && stub.refreshCount() == 0 {
 		time.Sleep(10 * time.Millisecond)
@@ -188,16 +251,22 @@ func TestSessionRefreshFailureStopsReconnecting(t *testing.T) {
 	if got := stub.refreshCount(); got != 1 {
 		t.Fatalf("刷新次数 = %d, want 1", got)
 	}
-	// 默认 ReconnectMin 500ms：给足退避窗口，仍应只有一次拨号、一次刷新。
-	time.Sleep(700 * time.Millisecond)
-	if got := stub.refreshCount(); got != 1 {
-		t.Fatalf("刷新失败后仍在重试: %d 次", got)
-	}
-	if toks := stub.tokens(); len(toks) != 1 {
-		t.Fatalf("刷新失败后仍在拨号: %v", toks)
+	select {
+	case reason := <-kicked:
+		t.Fatalf("网络错误不应触发被踢（reason=%q）", reason)
+	case <-time.After(300 * time.Millisecond):
 	}
 	if s.SignalConnected() {
-		t.Fatal("刷新失败后不应保持连接")
+		t.Fatal("刷新失败期间不应保持连接")
+	}
+
+	// 网络恢复：退避重试的下一次刷新成功并连上。
+	stub.refreshMode.Store("ok")
+	waitSignalConnected(t, s)
+	select {
+	case reason := <-kicked:
+		t.Fatalf("恢复后不应触发被踢（reason=%q）", reason)
+	default:
 	}
 }
 
