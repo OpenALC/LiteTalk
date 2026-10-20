@@ -79,6 +79,7 @@ func (s *Server) DeleteCategory(ctx context.Context, request DeleteCategoryReque
 // name/position 都可选但至少给一个；position 为目标序（0-based），服务端把该分类
 // 移到此位置并重排同服务器其它分类为 0..n-1（相对顺序保持）。分类名复用
 // validCategoryName（与 POST 同一口径），不单独收紧。
+// 同时给 name 与 position 时先重排、读回再改名，避免把旧 position 写回（#16）。
 func (s *Server) PatchCategory(ctx context.Context, request PatchCategoryRequestObject) (PatchCategoryResponseObject, error) {
 	if e := checkID(request.Id); e != nil {
 		return nil, e
@@ -101,25 +102,37 @@ func (s *Server) PatchCategory(ctx context.Context, request PatchCategoryRequest
 	if !req.Name.Set && !req.Position.Set {
 		return nil, errf(http.StatusBadRequest, "bad_request", "name 与 position 至少给一个")
 	}
-	if req.Name.Set {
-		if !validCategoryName(req.Name.Val) {
-			return nil, errf(http.StatusBadRequest, "bad_name", "分类名需为 1–32 个字符")
-		}
-		cat.Name = req.Name.Val
-		if err := s.store.UpdateCategory(ctx, cat); err != nil {
-			return nil, s.writeStoreErr(ctx, err)
-		}
+	// 两个字段都先校验再写：任一项非法时不应留下半次写入。
+	if req.Name.Set && !validCategoryName(req.Name.Val) {
+		return nil, errf(http.StatusBadRequest, "bad_name", "分类名需为 1–32 个字符")
 	}
+	if req.Position.Set && req.Position.Clearing() {
+		return nil, errf(http.StatusBadRequest, "bad_request", "position 不可清除")
+	}
+
+	// position 必须先重排、再重新读回，最后才改名：UpdateCategory 会全量写
+	// name+position，若在重排前调用就会把加载时的旧 position 写回去（#16 P2，
+	// 并发重排期间可能覆盖别人的排序）。先重排则改名写入的永远是重排后的序号。
+	//
+	// 注意：重排与改名仍是两次独立写入，不是同一事务；两者之间若发生并发重排，
+	// 最后一次 UpdateCategory 仍可能覆盖它刚读到之后落下的 position。要做到
+	// 完全原子需要 store 层新增「改名+重排」单事务方法，本轮不做。
 	if req.Position.Set {
-		if req.Position.Clearing() {
-			return nil, errf(http.StatusBadRequest, "bad_request", "position 不可清除")
-		}
 		if err := s.store.ReorderCategories(ctx, cat.ServerID, request.Id, req.Position.Val); err != nil {
 			return nil, s.writeStoreErr(ctx, err)
 		}
-		// 重排后重新读回，响应里的 position 是最终序号。
-		if updated, err := s.store.CategoryByID(ctx, request.Id); err == nil {
-			cat = updated
+		// 重排会把越界 position 夹到首/尾，必须重新读回才能得到最终序号；
+		// 读失败时也绝不能拿旧 cat 去改名，否则又写回旧 position。
+		updated, err := s.store.CategoryByID(ctx, request.Id)
+		if err != nil {
+			return nil, s.writeStoreErr(ctx, err)
+		}
+		cat = updated
+	}
+	if req.Name.Set {
+		cat.Name = req.Name.Val
+		if err := s.store.UpdateCategory(ctx, cat); err != nil {
+			return nil, s.writeStoreErr(ctx, err)
 		}
 	}
 	return PatchCategory200JSONResponse(categoryView(cat)), nil
