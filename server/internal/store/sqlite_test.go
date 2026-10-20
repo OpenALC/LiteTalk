@@ -168,8 +168,8 @@ func TestSQLiteCRUD(t *testing.T) {
 		t.Fatalf("不存在用户应 ErrNotFound: %v", err)
 	}
 
-	// friendships：双向查询 + 成对唯一。CreateFriendship 与 MySQL 同款只写
-	// user_id/friend_id/status（备注经 UpdateFriendship 写，API 真实路径如此）。
+	// friendships：双向查询 + 无序对唯一（迁移 0008）。CreateFriendship 与 MySQL
+	// 同款写入 remark/group_name，反向重复由唯一索引拒绝。
 	f := &Friendship{UserID: u1.ID, FriendID: u2.ID, Status: FriendPending}
 	if err := m.CreateFriendship(ctx, f); err != nil {
 		t.Fatal(err)
