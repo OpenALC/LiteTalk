@@ -27,6 +27,12 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
+// KickReasonLoginExpired 本端专用被踢原因（不上 wire）：refresh_token 被服务端
+// 明确拒绝（401/403），access 已无法续期，只能回登录页重新认证。与
+// signal.KickReasonLoginElsewhere（异地登录）区分——后者是 wire 契约里的取值，
+// 本常量只经 OnKicked 传给 UI 决定横幅文案。
+const KickReasonLoginExpired = "login_expired"
+
 // Events 会话 → UI 的事件回调（由 app 层接到 runtime.EventsEmit）。
 type Events struct {
 	// OnPeerJoin 有成员进入房间（含自己首次入房的成员全量推送前的逐个通知）。
@@ -242,14 +248,32 @@ func (s *Session) Connect(serverURL string) {
 			return s.token.Load().(string), nil
 		},
 		// 握手 401（被顶替类已由 OnKicked 收口）：刷新一次 access 再重拨。
-		// 刷新窗口里发现会话被顶替（refresh 自身 401 + session_replaced），
-		// 转成被踢事件，让 app 层清令牌回登录页。
+		// 失败按原因分三类（#84 复审 4.1）：
+		//   - 传输层瞬时错误：返回 ErrAuthTransient，signal 层退避重试——网络
+		//     抖动不代表 refresh_token 失效，不能就此永久停连；
+		//   - 服务端明确 401/403：refresh_token 已失效/被吊销，走被踢链路回
+		//     登录页，前端按 login_expired 提示「登录已过期」；
+		//   - ErrSessionReplaced：刷新窗口里发现会话被顶替，按异地登录处理。
+		// errBaseChanged / ErrNoRefreshSource 返回原错误 → 致命（换服流程已接管 /
+		// 根本没有刷新来源，重试只会原地打转）。
 		OnAuthFailed: func(ctx context.Context) error {
 			err := s.api.RefreshAccess(ctx)
-			if errors.Is(err, api.ErrSessionReplaced) {
+			switch {
+			case err == nil:
+				return nil
+			case errors.Is(err, api.ErrSessionReplaced):
 				s.handleKicked(signal.KickReasonLoginElsewhere)
+				return err
+			case api.IsAuthRejected(err):
+				s.log.Printf("signal: refresh_token 已被服务端拒绝，回登录页: %v", err)
+				s.handleKicked(KickReasonLoginExpired)
+				return err
+			case api.IsTransientRefreshError(err):
+				s.log.Printf("signal: 刷新 access 瞬时失败，退避重试: %v", err)
+				return signal.ErrAuthTransient
+			default:
+				return err
 			}
-			return err
 		},
 	}
 	wsCfg.OnConnect = s.handleSignalConnect

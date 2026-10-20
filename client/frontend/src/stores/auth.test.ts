@@ -36,7 +36,7 @@ const mockRouter = vi.hoisted(() => ({
 vi.mock('../router', () => ({ default: mockRouter }))
 
 import type { AuthResult, UserProfile } from '../api/types'
-import { useAuthStore } from './auth'
+import { kickedBannerText, useAuthStore } from './auth'
 import { useChatStore } from './chat'
 import { useFriendsStore, useServersStore } from './data'
 import { useNotifyStore } from './notify'
@@ -114,6 +114,23 @@ describe('auth store 被踢原因', () => {
     auth.setSignalOk(true)
     expect(auth.kickedReason).toBe('login_elsewhere')
     expect(auth.signalOk).toBe(true)
+  })
+})
+
+// 登录页被踢横幅文案（#84 复审 4.1）：三种原因必须给出不同提示，
+// login_expired（refresh_token 被吊销）不能显示成「账号已在其他设备登录」。
+describe('kickedBannerText 被踢横幅文案', () => {
+  it('server_changed 提示令牌不被新服务器接受', () => {
+    expect(kickedBannerText('server_changed')).toBe('当前令牌不被新服务器接受，请重新登录')
+  })
+
+  it('login_expired 提示登录已过期', () => {
+    expect(kickedBannerText('login_expired')).toBe('登录已过期，请重新登录')
+  })
+
+  it('login_elsewhere 与未知原因回落异地登录', () => {
+    expect(kickedBannerText('login_elsewhere')).toBe('账号已在其他设备登录')
+    expect(kickedBannerText('')).toBe('账号已在其他设备登录')
   })
 })
 
