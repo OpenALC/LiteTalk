@@ -463,7 +463,9 @@ func (s *SFU) HandleOffer(roomID, userID, connID, sdp string, sig SignalSender) 
 	}
 	answerSDP, err := peer.handleInitialOffer(sdp)
 	if err != nil {
-		room.removePeerIf(userID, connID)
+		// 按实例摘除（#23）：同 connID 的重入可能已建出新 peer，只按 connID 核
+		// 会误删新实例。
+		room.removePeerInstance(peer)
 		s.removeRoomIfEmpty(roomID)
 		return "", err
 	}

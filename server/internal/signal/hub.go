@@ -27,6 +27,12 @@ const (
 	kickSendWindow        = 400 * time.Millisecond
 	// session.kicked 发送窗口（§0.6：300~500ms）
 	writeTimeout = 10 * time.Second // 单条下行写超时
+
+	// 优雅关闭（#21）：server.shutdown 的发送窗口、等待 cleanup 的上限与轮询间隔。
+	// 超时后打日志继续关闭——不能因为个别连接卡住就拖住进程退出。
+	shutdownSendWindow  = 150 * time.Millisecond
+	defaultShutdownWait = 5 * time.Second
+	shutdownPollEvery   = 20 * time.Millisecond
 )
 
 // Hub WS 信令 hub：连接管理、房间登记与广播（docs/落地方案.md §5.3）。
@@ -48,6 +54,11 @@ type Hub struct {
 	pongWait       time.Duration
 	readIdle       time.Duration
 	presenceTTL    time.Duration // 在线态 TTL（默认 defaultPresenceTTL，测试可缩短）
+	shutdownWait   time.Duration // Shutdown 等待 cleanup 的上限（默认 defaultShutdownWait，测试可缩短）
+
+	// shuttingDown 关闭标记（#21）：在 Shutdown 广播/断连之前置位，ServeWS 据此
+	// 拒绝新连接，杜绝「广播之后仍有新 WS 接入」的窗口。
+	shuttingDown atomic.Bool
 
 	mu         sync.Mutex
 	rooms      map[string]*roomState
@@ -191,6 +202,17 @@ func (h *Hub) SetProtoMax(n int) { h.protoMax = n }
 
 // ServeWS 处理 GET /ws?token=<jwt|dev-xxx>。
 func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
+	// 关闭中拒绝新连接（#21）：必须排在鉴权/注册之前，否则握手会绕过 Shutdown
+	// 的连接快照，连接既不收 server.shutdown 也不被关闭。
+	if h.shuttingDown.Load() {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"code":    "shutting_down",
+			"message": "服务正在关闭",
+		})
+		return
+	}
 	id, err := h.auth(r.URL.Query().Get("token"))
 	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -391,25 +413,78 @@ func (h *Hub) Kick(uid, dev, reason string) {
 	}
 }
 
-// Shutdown 优雅关闭广播（#21）：对全部连接投递 server.shutdown，150ms 发送窗口后 CloseNow。
+// Shutdown 优雅关闭（#21）：先置关闭标记再广播 server.shutdown，发送窗口后
+// CloseNow 全部连接，并等待 conns 清零（各 WS 处理器已进入 cleanup 的 unregister；
+// 其后的离房与 presence 摘除在 cleanup 内继续执行）。等待有上限（默认 5s，测试
+// 可缩短）：超时打日志后返回，不阻塞进程退出。幂等：重复/并发调用只有首个调用者
+// 执行关闭流程。
+//
+// 与 main 的关闭序兼容：本函数返回后再关 HTTP，此时 WS 已全部断开。
 func (h *Hub) Shutdown(reason string) {
 	if reason == "" {
 		reason = "shutdown"
 	}
-	h.mu.Lock()
-	targets := make([]*client, 0, len(h.conns))
-	for _, c := range h.conns {
-		targets = append(targets, c)
+	// 标记必须在取连接快照之前置位：先广播再置位的话，广播与断连之间完成握手的
+	// 新连接会错过 server.shutdown（复审 #21 指出的窗口）。
+	if !h.shuttingDown.CompareAndSwap(false, true) {
+		return
 	}
-	h.mu.Unlock()
-	for _, c := range targets {
-		h.sendEvent(c, TypeServerShutdown, ServerShutdownData{Reason: reason, TS: time.Now().UnixMilli()})
+	wait := h.shutdownWait
+	if wait <= 0 {
+		wait = defaultShutdownWait
 	}
-	if len(targets) > 0 {
-		time.Sleep(150 * time.Millisecond) // 发送窗口：让下行队列把 shutdown 消息写出去
+	deadline := time.Now().Add(wait)
+
+	// 分批关闭：ServeWS 的关闭检查与 register 之间仍有在途握手的残余窗口，
+	// 这类连接可能落在首轮快照之外。每轮把新出现的连接一并关闭，直到 conns
+	// 清零或超时；等待期间不持 h.mu，cleanup 的 unregister 才能拿到锁。
+	closed := make(map[*client]struct{})
+	for {
+		h.mu.Lock()
+		fresh := make([]*client, 0, len(h.conns))
+		for _, c := range h.conns {
+			if _, ok := closed[c]; !ok {
+				fresh = append(fresh, c)
+			}
+		}
+		h.mu.Unlock()
+
+		for _, c := range fresh {
+			h.sendEvent(c, TypeServerShutdown, ServerShutdownData{Reason: reason, TS: time.Now().UnixMilli()})
+			closed[c] = struct{}{}
+		}
+		if len(fresh) > 0 {
+			// 发送窗口：让下行队列把 shutdown 消息写出去（锁外睡眠）。
+			if rem := time.Until(deadline); rem > 0 {
+				time.Sleep(min(rem, shutdownSendWindow))
+			}
+			for _, c := range fresh {
+				c.closeNow()
+			}
+		}
+
+		n := h.waitConnsDrained(deadline)
+		if n == 0 {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			h.log.Printf("ws: 关闭等待超时（上限 %v），仍有 %d 条连接未完成 cleanup，继续关闭", wait, n)
+			return
+		}
 	}
-	for _, c := range targets {
-		c.closeNow()
+}
+
+// waitConnsDrained 轮询等待 conns 清零，返回剩余连接数。每次轮询单独持锁，
+// 睡眠不持 h.mu。
+func (h *Hub) waitConnsDrained(deadline time.Time) int {
+	for {
+		h.mu.Lock()
+		n := len(h.conns)
+		h.mu.Unlock()
+		if n == 0 || !time.Now().Before(deadline) {
+			return n
+		}
+		time.Sleep(shutdownPollEvery)
 	}
 }
 

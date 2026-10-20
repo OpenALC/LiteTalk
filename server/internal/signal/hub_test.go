@@ -607,3 +607,62 @@ func TestHubShutdown(t *testing.T) {
 		t.Fatal("连接应已关闭")
 	}
 }
+
+// TestHubShutdownRejectsNewAndWaitsCleanup (#21)：置位后新 WS 在鉴权/注册之前
+// 返回 503；Shutdown 要等旧连接 cleanup 完成（conns 清零）才返回，而非发完
+// server.shutdown 就立刻返回。等待上限在测试里放宽到 2s，避免拖慢。
+func TestHubShutdownRejectsNewAndWaitsCleanup(t *testing.T) {
+	f := newChatFixture(t)
+	f.hub.shutdownWait = 2 * time.Second
+	old := f.dial("1", "alice")
+	old.recvUntil(TypeHello)
+
+	done := make(chan struct{})
+	go func() {
+		f.hub.Shutdown("shutdown")
+		close(done)
+	}()
+
+	old.recvUntil(TypeServerShutdown)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, _, err := old.conn.Read(ctx); err == nil {
+		t.Fatal("旧连接应已关闭")
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Shutdown 未在旧连接 cleanup 后返回（#21）")
+	}
+	// Shutdown 返回即意味着 cleanup 的 unregister 已执行：conns 必须清零。
+	if n := f.hub.connCount("1"); n != 0 {
+		t.Fatalf("Shutdown 返回时仍有 %d 条连接未完成 cleanup（#21）", n)
+	}
+
+	// 关闭置位后新 WS 一律 503，响应体给出 shutting_down。
+	url := "ws" + strings.TrimPrefix(f.srv.URL, "http") + "/ws?token=2"
+	_, resp, err := websocket.Dial(context.Background(), url, nil)
+	if err == nil {
+		t.Fatal("关闭中不应接受新 WS 连接")
+	}
+	if resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("新 WS 应返回 503，实际 resp=%v err=%v", resp, err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	var e struct{ Code, Message string }
+	if err := json.Unmarshal(body, &e); err != nil || e.Code != "shutting_down" {
+		t.Fatalf("503 响应体 = %s err=%v，期望 code=shutting_down", body, err)
+	}
+
+	// 幂等：重复调用立即返回，不重新进入关闭流程。
+	second := make(chan struct{})
+	go func() {
+		f.hub.Shutdown("again")
+		close(second)
+	}()
+	select {
+	case <-second:
+	case <-time.After(time.Second):
+		t.Fatal("重复 Shutdown 未立即返回（#21 幂等）")
+	}
+}
