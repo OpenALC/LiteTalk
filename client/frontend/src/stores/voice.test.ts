@@ -21,7 +21,11 @@ const mockEventsOn = vi.hoisted(() => {
     },
   }
 })
-vi.mock('../api/bridge', () => ({ goApp: () => ({}), eventsOn: mockEventsOn.on }))
+const mockGoApp = vi.hoisted(() => ({
+  JoinChannel: vi.fn(),
+  GetVoiceMembers: vi.fn(async () => [] as PeerView[]),
+}))
+vi.mock('../api/bridge', () => ({ goApp: () => mockGoApp, eventsOn: mockEventsOn.on }))
 
 import { useVoiceStore } from './voice'
 import { useNotifyStore } from './notify'
@@ -33,6 +37,8 @@ describe('voice store 房间态清理', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
     mockEventsOn.reset()
+    mockGoApp.JoinChannel.mockReset()
+    mockGoApp.GetVoiceMembers.mockReset().mockResolvedValue([])
   })
 
   const peer: PeerView = {
@@ -199,10 +205,10 @@ describe('voice store 房间态清理', () => {
     expect(notify.visible).toBe(false)
   })
 
-  // 入房失败（voice:join_failed）：提示由 chat:error 负责（Go 侧同一次失败还会
-  // 发一条 chat:error），voice store 只清房间态——否则左下角残留「正在频道中」
-  // 与 0ms 延迟，看起来像人还在房里。
-  it('voice:join_failed 清空频道/成员/延迟/连接态，且不重复弹 toast', () => {
+  // 入房失败（voice:join_failed）：Go 侧对这条路径不再发 chat:error（joinHandled
+  // 时 ErrorHandlerEx 直接返回），提示只能由本 store 弹；同时清房间态，否则
+  // 左下角残留「正在频道中」与 0ms 延迟，看起来像人还在房里。
+  it('voice:join_failed 清空频道/成员/延迟/连接态并弹出服务端原因', () => {
     const voice = useVoiceStore()
     const notify = useNotifyStore()
     voice.bindEvents()
@@ -212,20 +218,65 @@ describe('voice store 房间态清理', () => {
     voice.connected = true
 
     mockEventsOn.fire('voice:join_failed', {
-      channel_id: 'room1', code: 'join_failed', message: '进入语音频道失败',
+      channel_id: 'room1', code: 'join_failed', message: '频道不存在',
     })
 
     expect(voice.channelId).toBe('')
     expect(voice.members).toEqual([])
     expect(voice.latencyMs).toBe(0)
     expect(voice.connected).toBe(false)
-    // 错误提示只由 chat:error 弹一次，voice store 不再 toast。
-    expect(notify.visible).toBe(false)
+    expect(notify.visible).toBe(true)
+    expect(notify.isError).toBe(true)
+    expect(notify.text).toBe('频道不存在')
+    voice.unbindEvents()
+  })
+
+  it('voice:join_failed 缺 message 时回落到通用文案', () => {
+    const voice = useVoiceStore()
+    const notify = useNotifyStore()
+    voice.bindEvents()
+    voice.channelId = 'room1'
+
+    mockEventsOn.fire('voice:join_failed', { channel_id: 'room1', code: 'join_failed' })
+
+    expect(notify.text).toBe('进入语音频道失败')
+    voice.unbindEvents()
+  })
+
+  // 失败事件可能早于 JoinChannel 的 Promise 返回：必须凭 pendingJoin 认领并让
+  // 迟到的成功结果失效，否则 await 返回后会把刚失败的频道重新写回（幽灵房间）。
+  it('join_failed 早于 JoinChannel 返回：成功后不写回幽灵房间，只提示一次', async () => {
+    const voice = useVoiceStore()
+    const notify = useNotifyStore()
+    const show = vi.spyOn(notify, 'show')
+    voice.bindEvents()
+
+    let resolveJoin!: () => void
+    mockGoApp.JoinChannel.mockReturnValue(new Promise<void>((res) => { resolveJoin = res }))
+
+    const p = voice.join('room1')
+    mockEventsOn.fire('voice:join_failed', {
+      channel_id: 'room1', code: 'join_failed', message: '频道不存在',
+    })
+
+    expect(voice.channelId).toBe('')
+    expect(show).toHaveBeenCalledTimes(1)
+    expect(show).toHaveBeenCalledWith('频道不存在', true)
+
+    resolveJoin()
+    await p
+
+    expect(voice.channelId).toBe('')
+    expect(voice.members).toEqual([])
+    // 失败已认领：不再拉成员，也不再弹第二条提示。
+    expect(mockGoApp.GetVoiceMembers).not.toHaveBeenCalled()
+    expect(show).toHaveBeenCalledTimes(1)
     voice.unbindEvents()
   })
 
   it('voice:join_failed 的迟到事件不影响已在的其它频道', () => {
     const voice = useVoiceStore()
+    const notify = useNotifyStore()
     voice.bindEvents()
     voice.channelId = 'room1'
     voice.latencyMs = 42
@@ -234,6 +285,19 @@ describe('voice store 房间态清理', () => {
 
     expect(voice.channelId).toBe('room1')
     expect(voice.latencyMs).toBe(42)
+    expect(notify.visible).toBe(false)
+    voice.unbindEvents()
+  })
+
+  it('离开后的迟到失败（无 pending、无 channelId）被忽略', () => {
+    const voice = useVoiceStore()
+    const notify = useNotifyStore()
+    voice.bindEvents()
+
+    mockEventsOn.fire('voice:join_failed', { channel_id: 'room1', code: 'join_failed', message: '失败' })
+
+    expect(voice.channelId).toBe('')
+    expect(notify.visible).toBe(false)
     voice.unbindEvents()
   })
 
