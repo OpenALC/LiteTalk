@@ -191,8 +191,8 @@ const (
 	OverwriteTargetMember OverwriteTargetType = "member"
 )
 
-// ChannelOverwrite 频道权限覆盖（channel_overwrites 表）。Allow/Deny 只应含
-// ChannelPermissionMask 里的位（是否校验由调用方决定，Store 不截断）。
+// ChannelOverwrite 频道权限覆盖（channel_overwrites 表）。Allow/Deny 只允许
+// ChannelPermissionMask 内的位——管理类位属于角色，越界位由 Store 拒绝入参。
 type ChannelOverwrite struct {
 	ChannelID  int64               `json:"channel_id" db:"channel_id"`
 	TargetType OverwriteTargetType `json:"target_type" db:"target_type"`
@@ -324,6 +324,7 @@ type Store interface {
 	// 按 position、id 升序；成员不存在返回 ErrNotFound。
 	RolesOfMember(ctx context.Context, serverID, userID int64) ([]Role, error)
 	// SetMemberRoles 事务替换该成员的分配：roleIDs 去重后逐个校验同服；
+	// 非 owner 不得持有 owner builtin（含经 roleIDs 自授，返回 ErrForbidden）；
 	// 强制保留 @everyone，server owner（或 legacy role=owner）强制保留 owner builtin；
 	// 同步 server_members.role 投影（有 owner 角色→owner；有 admin→admin；否则 member）。
 	SetMemberRoles(ctx context.Context, serverID, userID int64, roleIDs []int64, assignedBy int64) error
@@ -333,7 +334,8 @@ type Store interface {
 	ChannelOverwrites(ctx context.Context, channelID int64) ([]ChannelOverwrite, error)
 	// ChannelOverwritesOfServer 经 channels 关联取全服覆盖，按 channel_id、target_type、target_id 升序。
 	ChannelOverwritesOfServer(ctx context.Context, serverID int64) ([]ChannelOverwrite, error)
-	// SetChannelOverwrite upsert；校验 target_type 合法、频道存在、目标（角色/成员）同服。
+	// SetChannelOverwrite upsert；校验 target_type 合法、Allow/Deny 在频道掩码内、
+	// 频道存在、目标（角色/成员）同服。
 	SetChannelOverwrite(ctx context.Context, o *ChannelOverwrite) error
 	// DeleteChannelOverwrite 删除指定目标的覆盖；未命中返回 ErrNotFound。
 	DeleteChannelOverwrite(ctx context.Context, channelID int64, targetType OverwriteTargetType, targetID int64) error

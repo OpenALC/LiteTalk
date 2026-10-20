@@ -1066,6 +1066,7 @@ func (m *Mem) SetMemberRoles(_ context.Context, serverID, userID int64, roleIDs 
 	if everyoneID == 0 {
 		return ErrNotFound // 数据损坏：@everyone 缺失
 	}
+	isOwner := srv.OwnerID == userID || mem.Role == RoleOwner
 	desired := map[int64]bool{}
 	for _, id := range roleIDs {
 		if _, ok := byID[id]; !ok {
@@ -1073,9 +1074,14 @@ func (m *Mem) SetMemberRoles(_ context.Context, serverID, userID int64, roleIDs 
 		}
 		desired[id] = true
 	}
+	// owner builtin 只有服主/legacy owner 能持有（#35 硬化）：非 owner 经 roleIDs
+	// 自授 owner 角色一律拒绝，防止成员抬权。
+	if !isOwner && ownerID != 0 && desired[ownerID] {
+		return ErrForbidden
+	}
 	desired[everyoneID] = true
 	// owner 强制保留 owner 投影：服主或 legacy owner 都不可被摘掉 owner builtin。
-	if srv.OwnerID == userID || mem.Role == RoleOwner {
+	if isOwner {
 		if ownerID == 0 {
 			return ErrNotFound
 		}
@@ -1152,7 +1158,9 @@ func (m *Mem) SetChannelOverwrite(_ context.Context, o *ChannelOverwrite) error 
 	if o.TargetType != OverwriteTargetRole && o.TargetType != OverwriteTargetMember {
 		return ErrForbidden
 	}
-	if !o.Allow.Valid() || !o.Deny.Valid() {
+	// 频道覆盖只作用于频道位：管理类位与未定义位都是脏数据，Store 直接拒绝
+	// （该检查涵盖 Valid）。
+	if o.Allow&^ChannelPermissionMask != 0 || o.Deny&^ChannelPermissionMask != 0 {
 		return ErrForbidden
 	}
 	ch, ok := m.channels[o.ChannelID]
