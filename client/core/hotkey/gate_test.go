@@ -127,6 +127,40 @@ func TestGateSetModeSwitches(t *testing.T) {
 	}
 }
 
+// TestGateEffectiveSendModeIntegration 锁住 #93：出厂配置下发送门必须放行。
+// 热键未启用、PTT 未绑定时若仍按 PTT 收门，所有上行帧会被丢弃。
+func TestGateEffectiveSendModeIntegration(t *testing.T) {
+	var g Gate
+	g.SetMode(EffectiveSendMode(DefaultSettings()))
+	if !g.Allow(false) {
+		t.Fatal("出厂配置下发送门必须放行，否则上行音频全丢")
+	}
+
+	// 启用并绑定后恢复 PTT：按下放行、松开拦截。
+	g.SetMode(EffectiveSendMode(Settings{Enabled: true, Mode: ModePTT, PTT: "ctrl+m"}))
+	if g.Allow(false) {
+		t.Fatal("启用 PTT 且未按下时应拦住")
+	}
+	g.Press()
+	if !g.Allow(false) {
+		t.Fatal("启用 PTT 且按下后应放行")
+	}
+	g.Release(0)
+	if g.Allow(false) {
+		t.Fatal("启用 PTT 松开后应拦住")
+	}
+
+	// 语音激活 / 常开语义不变。
+	g.SetMode(EffectiveSendMode(Settings{Mode: ModeVoice}))
+	if g.Allow(false) || !g.Allow(true) {
+		t.Fatal("语音激活模式应只放行 VAD 判定为说话的帧")
+	}
+	g.SetMode(EffectiveSendMode(Settings{Mode: ModeOpen}))
+	if !g.Allow(false) {
+		t.Fatal("常开模式应恒放行")
+	}
+}
+
 func TestGateConcurrentUse(t *testing.T) {
 	var g Gate
 	g.SetMode(ModePTT)

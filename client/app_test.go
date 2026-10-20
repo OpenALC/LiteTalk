@@ -335,6 +335,41 @@ func boolToInt(b bool) int {
 	return 0
 }
 
+// TestHotkeyGateMode 发送门模式必须把「平台能否装钩子」算进去：钩子不可用时
+// PTT 永远等不到按键，必须退化为常开，否则上行音频全丢（#93）；
+// 语音激活/常开不依赖钩子，不受影响。
+func TestHotkeyGateMode(t *testing.T) {
+	bound := hotkey.Settings{Enabled: true, Mode: hotkey.ModePTT, PTT: "ctrl+m"}
+	cases := []struct {
+		name      string
+		st        hotkey.Settings
+		available bool
+		want      hotkey.Mode
+	}{
+		{"默认配置钩子可用也常开", hotkey.DefaultSettings(), true, hotkey.ModeOpen},
+		{"默认配置钩子不可用也常开", hotkey.DefaultSettings(), false, hotkey.ModeOpen},
+		{"钩子可用时保持 PTT", bound, true, hotkey.ModePTT},
+		{"钩子不可用时 PTT 退化常开", bound, false, hotkey.ModeOpen},
+		{"语音激活不依赖钩子", hotkey.Settings{Enabled: true, Mode: hotkey.ModeVoice, PTT: "ctrl+m"}, false, hotkey.ModeVoice},
+		{"常开不依赖钩子", hotkey.Settings{Mode: hotkey.ModeOpen}, false, hotkey.ModeOpen},
+	}
+	for _, c := range cases {
+		if got := hotkeyGateMode(c.st, c.available); got != c.want {
+			t.Errorf("%s: hotkeyGateMode = %v，期望 %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestSendGateModeWithoutManager Manager 未初始化（等价于没有全局热键能力）时，
+// PTT 也必须退化为常开，不能把上行全部拦掉。
+func TestSendGateModeWithoutManager(t *testing.T) {
+	app := &App{}
+	st := hotkey.Settings{Enabled: true, Mode: hotkey.ModePTT, PTT: "ctrl+m"}
+	if got := app.sendGateMode(st); got != hotkey.ModeOpen {
+		t.Fatalf("无 Manager 时 PTT 应退化为常开，得到 %v", got)
+	}
+}
+
 // TestSetServerConfigHotSwitch 验证热切换：探活通过 → 落盘 + 重定向 API 基址；
 // 探活失败 → 不动原地址，返回错误。
 func TestSetServerConfigHotSwitch(t *testing.T) {
