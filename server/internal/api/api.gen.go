@@ -625,6 +625,12 @@ type ServerInfo struct {
 	OwnerId   ID     `json:"owner_id"`
 }
 
+// ServerMuteRequest defines model for ServerMuteRequest.
+type ServerMuteRequest struct {
+	// Muted true=服务端强制闭麦；false=解禁恢复转发
+	Muted bool `json:"muted"`
+}
+
 // SetMemberRolesRequest defines model for SetMemberRolesRequest.
 type SetMemberRolesRequest struct {
 	// RoleIds 全量替换（@everyone 强制保留；owner builtin 不可分配）
@@ -839,6 +845,9 @@ type PatchChannelJSONRequestBody = PatchChannelRequest
 // PatchChannelApplicationMergePatchPlusJSONRequestBody defines body for PatchChannel for application/merge-patch+json ContentType.
 type PatchChannelApplicationMergePatchPlusJSONRequestBody = PatchChannelRequest
 
+// SetServerMutedJSONRequestBody defines body for SetServerMuted for application/json ContentType.
+type SetServerMutedJSONRequestBody = ServerMuteRequest
+
 // CreateMessageJSONRequestBody defines body for CreateMessage for application/json ContentType.
 type CreateMessageJSONRequestBody = CreateMessageRequest
 
@@ -925,6 +934,9 @@ type ServerInterface interface {
 	// PatchChannel 改频道（owner/admin）
 	// (PATCH /api/v1/channels/{id})
 	PatchChannel(w http.ResponseWriter, r *http.Request, id IDPath)
+	// SetServerMuted 服务端强制闭麦/解禁（需 MuteMembers，#36）
+	// (PUT /api/v1/channels/{id}/members/{user_id}/server-mute)
+	SetServerMuted(w http.ResponseWriter, r *http.Request, id IDPath, userId UserIDPath)
 	// ListMessages 消息分页（游标，倒序取页正序返回）
 	// (GET /api/v1/channels/{id}/messages)
 	ListMessages(w http.ResponseWriter, r *http.Request, id IDPath, params ListMessagesParams)
@@ -1241,6 +1253,41 @@ func (siw *ServerInterfaceWrapper) PatchChannel(w http.ResponseWriter, r *http.R
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.PatchChannel(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// SetServerMuted operation middleware
+func (siw *ServerInterfaceWrapper) SetServerMuted(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "user_id" -------------
+	var userId UserIDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "user_id", r.PathValue("user_id"), &userId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "user_id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.SetServerMuted(w, r, id, userId)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -2290,6 +2337,7 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodDelete+" "+options.BaseURL+"/api/v1/channels/{id}/overwrites/{target_type}/{target_id}", wrapper.DeleteChannelOverwrite)
 	m.HandleFunc(http.MethodPut+" "+options.BaseURL+"/api/v1/channels/{id}/overwrites/{target_type}/{target_id}", wrapper.SetChannelOverwrite)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/servers/{id}/audit-log", wrapper.ListAuditLog)
+	m.HandleFunc(http.MethodPut+" "+options.BaseURL+"/api/v1/channels/{id}/members/{user_id}/server-mute", wrapper.SetServerMuted)
 
 	return m
 }
@@ -3443,6 +3491,111 @@ type PatchChanneldefaultApplicationProblemPlusJSONResponse struct {
 }
 
 func (response PatchChanneldefaultApplicationProblemPlusJSONResponse) VisitPatchChannelResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SetServerMutedRequestObject struct {
+	Id     IDPath     `json:"id"`
+	UserId UserIDPath `json:"user_id"`
+	Body   *SetServerMutedJSONRequestBody
+}
+
+type SetServerMutedResponseObject interface {
+	VisitSetServerMutedResponse(w http.ResponseWriter) error
+}
+
+type SetServerMuted200JSONResponse StatusOk
+
+func (response SetServerMuted200JSONResponse) VisitSetServerMutedResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SetServerMuted400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response SetServerMuted400ApplicationProblemPlusJSONResponse) VisitSetServerMutedResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SetServerMuted401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response SetServerMuted401ApplicationProblemPlusJSONResponse) VisitSetServerMutedResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SetServerMuted403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response SetServerMuted403ApplicationProblemPlusJSONResponse) VisitSetServerMutedResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SetServerMuted404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response SetServerMuted404ApplicationProblemPlusJSONResponse) VisitSetServerMutedResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SetServerMuteddefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response SetServerMuteddefaultApplicationProblemPlusJSONResponse) VisitSetServerMutedResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
@@ -6395,6 +6548,9 @@ type StrictServerInterface interface {
 	// PatchChannel 改频道（owner/admin）
 	// (PATCH /api/v1/channels/{id})
 	PatchChannel(ctx context.Context, request PatchChannelRequestObject) (PatchChannelResponseObject, error)
+	// SetServerMuted 服务端强制闭麦/解禁（需 MuteMembers，#36）
+	// (PUT /api/v1/channels/{id}/members/{user_id}/server-mute)
+	SetServerMuted(ctx context.Context, request SetServerMutedRequestObject) (SetServerMutedResponseObject, error)
 	// ListMessages 消息分页（游标，倒序取页正序返回）
 	// (GET /api/v1/channels/{id}/messages)
 	ListMessages(ctx context.Context, request ListMessagesRequestObject) (ListMessagesResponseObject, error)
@@ -6890,6 +7046,40 @@ func (sh *strictHandler) PatchChannel(w http.ResponseWriter, r *http.Request, id
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
 	} else if validResponse, ok := response.(PatchChannelResponseObject); ok {
 		if err := validResponse.VisitPatchChannelResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// SetServerMuted operation middleware
+func (sh *strictHandler) SetServerMuted(w http.ResponseWriter, r *http.Request, id IDPath, userId UserIDPath) {
+	var request SetServerMutedRequestObject
+
+	request.Id = id
+	request.UserId = userId
+
+	var body SetServerMutedJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.SetServerMuted(ctx, request.(SetServerMutedRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "SetServerMuted")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(SetServerMutedResponseObject); ok {
+		if err := validResponse.VisitSetServerMutedResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {
