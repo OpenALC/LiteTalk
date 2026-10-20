@@ -318,8 +318,8 @@ async function onCatDrop(e: DragEvent, gi: number) {
       <ChevronDown :size="16" :class="{ rotated: allCollapsed }" />
     </div>
 
-    <!-- data-ctx：允许自定义右键菜单（全局拦截的白名单容器） -->
-    <div class="chan-scroll" data-ctx @contextmenu.prevent="openBlankCtx">
+    <!-- 空白处右键：只挂自定义「创建频道」菜单，原生菜单由全局拦截屏蔽 -->
+    <div class="chan-scroll" @contextmenu.prevent="openBlankCtx">
       <!-- 空服务器空态（#12）：右键空白处仍可创建频道；加载失败给解释而不是恒空 -->
       <div v-if="groups.length === 0" class="empty">
         <CircleAlert v-if="servers.currentServer.unavailable" :size="26" />

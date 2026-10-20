@@ -167,8 +167,7 @@ async function acceptPending(id: string) {
         <input v-model="query" placeholder="搜索好友...">
       </div>
 
-      <!-- data-ctx：好友区自定义右键菜单（全局拦截白名单，走查 7） -->
-      <div class="f-scroll" data-ctx>
+      <div class="f-scroll">
         <!-- 待处理：incoming=对方发来的（可接受）；outgoing=我发出的（S3：仅展示） -->
         <template v-if="friends.pending.length && !query">
           <div class="f-group"><ChevronDown :size="12" />待处理 — {{ friends.pending.length }}</div>

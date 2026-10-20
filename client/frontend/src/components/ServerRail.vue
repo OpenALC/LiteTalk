@@ -169,7 +169,7 @@ async function removeServer(id: string) {
 </script>
 
 <template>
-  <nav class="rail" data-ctx>
+  <nav class="rail">
     <!-- 介绍页入口（v0.1.2 首页体系；被删除时隐藏，底部可恢复） -->
     <div v-if="!store.introHidden" class="rail-item intro-item"
          :class="{ on: store.currentServerId === INTRO_ID }" data-tip="介绍页">
