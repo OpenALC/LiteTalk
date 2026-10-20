@@ -97,12 +97,14 @@ function setInputMode(e: Event) {
   void applyAudio()
 }
 
-// denoiseIdx 降噪强度当前档位（computed 双向：关↔denoise=false，其余↔strength）。
+// denoiseIdx 降噪强度当前档位（0=关，1/2/3=弱/中/强）：加载设置时由
+// syncDenoiseIdx 对齐，点击时由 applyDenoiseIdx 同步，模板高亮只读它。
 const denoiseIdx = ref(2)
 function syncDenoiseIdx() {
   denoiseIdx.value = audio.value.denoise ? audio.value.denoise_strength : 0
 }
 function applyDenoiseIdx(i: number) {
+  denoiseIdx.value = i
   if (i === 0) {
     audio.value.denoise = false
   } else {
