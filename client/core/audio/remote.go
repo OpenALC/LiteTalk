@@ -260,6 +260,46 @@ func (rm *RemoteManager) JitterStats(peerID string) (rtc.JitterStats, bool) {
 	return rp.jb.Stats(), true
 }
 
+// RemoteLinkStats 单路远端链路诊断快照（#95）：抖动缓冲、FEC/PLC 计数与
+// 混音输入环占用。全部为原子/快照读取，不在音频热路径上。
+type RemoteLinkStats struct {
+	Jitter         rtc.JitterStats
+	RTPReceived    uint64
+	FramesPopped   uint64
+	PLCFrames      uint64
+	FECFrames      uint64
+	DecodeErrors   uint64
+	RingAvailable  int    // 该 peer 混音输入环当前可读采样数
+	UnderrunFrames uint64 // 混音 tick 读到不足的帧数
+	WrittenSamples uint64
+	DroppedSamples uint64
+}
+
+// LinkStats 查询某 peer 的下行链路诊断快照。
+func (rm *RemoteManager) LinkStats(peerID string) (RemoteLinkStats, bool) {
+	rm.mu.Lock()
+	rp, ok := rm.peers[peerID]
+	rm.mu.Unlock()
+	if !ok {
+		return RemoteLinkStats{}, false
+	}
+	st := RemoteLinkStats{
+		Jitter:       rp.jb.Stats(),
+		RTPReceived:  rp.Stats.RTPReceived.Load(),
+		FramesPopped: rp.Stats.FramesPopped.Load(),
+		PLCFrames:    rp.Stats.PLCFrames.Load(),
+		FECFrames:    rp.Stats.FECFrames.Load(),
+		DecodeErrors: rp.Stats.DecodeErrors.Load(),
+	}
+	if rp.input != nil {
+		st.RingAvailable = rp.input.BufferedSamples()
+		st.UnderrunFrames = rp.input.UnderrunFrames.Load()
+		st.WrittenSamples = rp.input.WrittenSamples.Load()
+		st.DroppedSamples = rp.input.DroppedSamples.Load()
+	}
+	return st, true
+}
+
 // stop 停止并回收单路（解码器、goroutine、混音输入）。
 func (rp *remotePeer) stop() {
 	close(rp.done)
