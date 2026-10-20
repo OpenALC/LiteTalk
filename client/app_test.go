@@ -912,3 +912,37 @@ func TestIsWaylandEnv(t *testing.T) {
 		}
 	}
 }
+
+// TestCloseActionFor 穷举关窗决策组合（issue #7 P2）：托盘可用性优先于
+// destroy 休眠模式与「关闭窗口时」设置。
+func TestCloseActionFor(t *testing.T) {
+	cases := []struct {
+		mode        string
+		trayReady   bool
+		closeToTray bool
+		want        closeAction
+	}{
+		// 托盘不可用：任何模式/设置都只能最小化，保留任务栏与 Alt-Tab 恢复路径。
+		{"off", false, true, closeActionMinimise},
+		{"off", false, false, closeActionMinimise},
+		{"hibernate", false, true, closeActionMinimise},
+		{"hibernate", false, false, closeActionMinimise},
+		{"destroy", false, true, closeActionMinimise},
+		{"destroy", false, false, closeActionMinimise},
+		// 托盘可用 + destroy：销毁渲染进程（可由托盘重建）。
+		{"destroy", true, true, closeActionDestroy},
+		{"destroy", true, false, closeActionDestroy},
+		// 托盘可用 + 用户明确关闭即退出。
+		{"off", true, false, closeActionQuit},
+		{"hibernate", true, false, closeActionQuit},
+		// 托盘可用 + 关闭到托盘。
+		{"off", true, true, closeActionTray},
+		{"hibernate", true, true, closeActionTray},
+	}
+	for _, c := range cases {
+		if got := closeActionFor(c.mode, c.trayReady, c.closeToTray); got != c.want {
+			t.Errorf("closeActionFor(%q, tray=%v, closeToTray=%v) = %v，期望 %v",
+				c.mode, c.trayReady, c.closeToTray, got, c.want)
+		}
+	}
+}
