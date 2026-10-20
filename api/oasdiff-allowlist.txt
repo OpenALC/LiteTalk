@@ -199,3 +199,6 @@ response-property-became-optional	PATCH	/api/v1/users/me	the response property `
 response-property-became-optional	PATCH	/api/v1/users/me	the response property `message` became optional for the status `401`
 response-property-became-optional	PATCH	/api/v1/users/me	the response property `message` became optional for the status `409`
 response-property-became-optional	PATCH	/api/v1/users/me	the response property `message` became optional for the status `default`
+
+# ---- request-parameter-min-set（#31：游标 fail-closed，before_id 最小值 1）（1 条）----
+request-parameter-min-set	GET	/api/v1/channels/{id}/messages	for the `query` request parameter `before_id`, the min was set to `1.00`
