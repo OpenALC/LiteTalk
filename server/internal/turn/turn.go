@@ -17,11 +17,13 @@ import (
 )
 
 const (
-	// 每 uid 的并发 allocation 上限（#25）：正常客户端一条连接只用 1 个中继，
-	// 4 个留给重连/多网卡场景，同时把单凭证刷爆中继端口的成本压到最低。
-	maxAllocationsPerUID = 4
-	// 每客户端 IP 的并发上限：同一 NAT 出口后可能有多个不同 uid 的用户。
-	maxAllocationsPerIP = 8
+	// DefaultMaxAllocationsPerUID 每 uid 的并发 allocation 默认上限（#25）：正常
+	// 客户端一条连接只用 1 个中继，4 个留给重连/多网卡场景，同时把单凭证刷爆
+	// 中继端口的成本压到最低。
+	DefaultMaxAllocationsPerUID = 4
+	// DefaultMaxAllocationsPerIP 每客户端 IP 的并发默认上限：同一 NAT 出口后可能
+	// 有多个不同 uid 的用户；CGNAT/办公网出口可经 LITETALK_TURN_MAX_PER_IP 放宽。
+	DefaultMaxAllocationsPerIP = 8
 )
 
 // Config 内置 TURN 配置。
@@ -38,6 +40,11 @@ type Config struct {
 	Realm string
 	// Secret REST 短期凭证共享密钥（env LITETALK_TURN_SECRET，与 rtcapi 同源）
 	Secret string
+	// MaxPerUID / MaxPerIP 每 uid / 每源 IP 的并发 allocation 上限
+	// （env LITETALK_TURN_MAX_PER_UID / LITETALK_TURN_MAX_PER_IP）。
+	// 零值或负数回落 DefaultMaxAllocationsPerUID / DefaultMaxAllocationsPerIP。
+	MaxPerUID int
+	MaxPerIP  int
 	// AllowLoopbackPeers 允许中继到环回 peer。仅供本机集成测试/本地联调：
 	// 生产必须保持 false——合法凭证不能借中继访问本机服务（#25 P0）。
 	// 私网、链路本地（云元数据）与组播地址无论该值如何始终拒绝。
@@ -75,6 +82,12 @@ func New(cfg Config) (*Server, error) {
 	if cfg.RelayMaxPort == 0 {
 		cfg.RelayMaxPort = 49200
 	}
+	if cfg.MaxPerUID <= 0 {
+		cfg.MaxPerUID = DefaultMaxAllocationsPerUID
+	}
+	if cfg.MaxPerIP <= 0 {
+		cfg.MaxPerIP = DefaultMaxAllocationsPerIP
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = log.Default()
@@ -95,7 +108,7 @@ func New(cfg Config) (*Server, error) {
 
 	// 配额按 uid 与客户端 IP 两层计数（#25）：pion 的 QuotaHandler 只负责
 	// 分配前检查，真实计数由生命周期事件维护。
-	quota := newAllocationQuota()
+	quota := newAllocationQuota(cfg.MaxPerUID, cfg.MaxPerIP)
 	permission := permitPeer(cfg.AllowLoopbackPeers)
 	sc := turnpkg.ServerConfig{
 		Realm:        cfg.Realm,
@@ -198,8 +211,14 @@ func permitPeer(allowLoopback bool) turnpkg.PermissionHandler {
 }
 
 // isBlockedPeerIP 判定不允许中继的 peer 地址。IPv4-mapped IPv6 先经 To4()
-// 归一到 IPv4 再判断，避免用 ::ffff:127.0.0.1 之类的表示绕过。
+// 归一到 IPv4 再判断，IPv4-compatible IPv6（::a.b.c.d）也归一后递归判断，
+// 避免用 ::ffff:127.0.0.1、::10.0.0.1 之类的表示绕过。
 // allowLoopback 只放开环回（127.0.0.0/8、::1）；私网/元数据/组播始终拒绝。
+//
+// 尚未覆盖的罕见保留段：192.0.0.0/24（IETF 协议分配）、198.18/15（基准测试）、
+// 文档段（192.0.2/24、198.51.100/24、203.0.113/24），以及 IPv6 过渡/NAT64 段
+// （64:ff9b::/96、2002::/16、2001::/32）。它们不指向本机或云元数据，是否可达
+// 取决于宿主机路由与运营商转换器，命中概率极低，暂不为它们增加判断分支。
 func isBlockedPeerIP(ip net.IP, allowLoopback bool) bool {
 	if len(ip) == 0 {
 		return true
@@ -213,33 +232,64 @@ func isBlockedPeerIP(ip net.IP, allowLoopback bool) bool {
 		case v4[0] == 100 && v4[1]&0xc0 == 64: // 100.64/10 CGNAT
 		case v4[0] == 169 && v4[1] == 254: // 169.254/16 链路本地（云元数据）
 		case v4.IsMulticast(): // 224.0.0.0/4
-		case v4.Equal(net.IPv4bcast): // 255.255.255.255
+		case v4[0] >= 240: // 240/4 保留段，含 255.255.255.255 受限广播
 		default:
 			return false
 		}
 		return true
 	}
-	// IPv6：::1、未指定地址、fe80::/10、ff00::/8、fc00::/7（ULA）。
+	// IPv6：::1 与未指定地址先判，避免 ::1 被下面的 IPv4-compatible 归一
+	// 成 0.0.0.1 后连 allowLoopback 也放不开。
 	if ip.IsLoopback() {
 		return !allowLoopback
 	}
-	return ip.IsUnspecified() || ip.IsLinkLocalUnicast() ||
-		ip.IsMulticast() || ip[0]&0xfe == 0xfc
+	if ip.IsUnspecified() {
+		return true
+	}
+	// IPv4-compatible IPv6（::a.b.c.d，前 12 字节为 0）是已废弃的过渡表示，
+	// Go 的 To4() 不认它：归一成 IPv4 递归判定，::10.0.0.1 / ::169.254.169.254
+	// 才不会漏网。
+	if len(ip) == 16 && isZeroPrefix12(ip) {
+		return isBlockedPeerIP(net.IPv4(ip[12], ip[13], ip[14], ip[15]), allowLoopback)
+	}
+	// fe80::/10、ff00::/8、fc00::/7（ULA）。
+	return ip.IsLinkLocalUnicast() || ip.IsMulticast() || ip[0]&0xfe == 0xfc
+}
+
+// isZeroPrefix12 判断 16 字节地址前 12 字节是否为 0（IPv4-compatible 形态）。
+func isZeroPrefix12(ip net.IP) bool {
+	for _, b := range ip[:12] {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // allocationQuota 按 uid 与客户端 IP 双层限制并发 allocation（#25）。
 // QuotaHandler 只在分配前做只读检查，计数由 OnAllocationCreated/Deleted 维护；
 // TCP 多连接并发分配时检查与计数之间不具原子性，可能少量超额，作为软上限足够。
 type allocationQuota struct {
-	mu    sync.Mutex
-	byUID map[string]int
-	byIP  map[string]int
+	mu        sync.Mutex
+	byUID     map[string]int
+	byIP      map[string]int
+	maxPerUID int
+	maxPerIP  int
 }
 
-func newAllocationQuota() *allocationQuota {
+// newAllocationQuota 上限 <=0 回落默认值（配置零值必须落在安全默认上）。
+func newAllocationQuota(maxPerUID, maxPerIP int) *allocationQuota {
+	if maxPerUID <= 0 {
+		maxPerUID = DefaultMaxAllocationsPerUID
+	}
+	if maxPerIP <= 0 {
+		maxPerIP = DefaultMaxAllocationsPerIP
+	}
 	return &allocationQuota{
-		byUID: make(map[string]int),
-		byIP:  make(map[string]int),
+		byUID:     make(map[string]int),
+		byIP:      make(map[string]int),
+		maxPerUID: maxPerUID,
+		maxPerIP:  maxPerIP,
 	}
 }
 
@@ -249,10 +299,10 @@ func (q *allocationQuota) allow(username, _ string, srcAddr net.Addr) bool {
 	ip := normalizedIPFromAddr(srcAddr)
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if uid != "" && q.byUID[uid] >= maxAllocationsPerUID {
+	if uid != "" && q.byUID[uid] >= q.maxPerUID {
 		return false
 	}
-	if ip != "" && q.byIP[ip] >= maxAllocationsPerIP {
+	if ip != "" && q.byIP[ip] >= q.maxPerIP {
 		return false
 	}
 	return true
