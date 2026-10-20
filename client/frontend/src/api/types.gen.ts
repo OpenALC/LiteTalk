@@ -688,6 +688,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/channels/{id}/members/{user_id}/server-mute": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * 服务端强制闭麦/解禁（需 MuteMembers，#36）
+         * @description 服务端在 SFU 转发前丢弃目标的上行 RTP（track 保持挂载），目标不配合也无法 绕过；房间成员收到 voice.state{server_muted}。仅语音频道；不能对自己操作。 code：bad_channel、bad_request、路径参数不合法；401；403 forbidden； 404 not_found（频道不存在或目标不在该频道语音房）；5xx internal。
+         */
+        put: operations["setServerMuted"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -1202,6 +1222,11 @@ export interface components {
             detail: string;
             /** Format: date-time */
             created_at: string;
+        };
+        /** ServerMuteRequest */
+        ServerMuteRequest: {
+            /** @description true=服务端强制闭麦；false=解禁恢复转发 */
+            muted: boolean;
         };
     };
     responses: {
@@ -2591,6 +2616,40 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AuditLogEntry"][];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    setServerMuted: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+                /** @description 目标用户 ID 的十进制数字串（#35 B4） */
+                user_id: components["parameters"]["UserIDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ServerMuteRequest"];
+            };
+        };
+        responses: {
+            /** @description 已生效 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StatusOk"];
                 };
             };
             400: components["responses"]["BadRequest"];

@@ -28,6 +28,8 @@ const (
 type Hub interface {
 	Kick(uid, dev, reason string)
 	KickChannel(channelID, reason string)
+	// SetServerMuted 服务端强制闭麦/解禁（#36）：目标不在该频道返回 signal.ErrNotInChannel。
+	SetServerMuted(channelID, userID string, muted bool) error
 }
 
 // PresenceReader 在线状态读取（#11）：presence:{uid} 存在 = 在线。

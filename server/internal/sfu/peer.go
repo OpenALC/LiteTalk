@@ -60,6 +60,9 @@ type Peer struct {
 	// fwdActive 活跃转发门（#33 Phase 1 包级门控）：tickActive 写、forward 读。
 	// true=该源的包参与扇出 WriteRTP；false=只收不发（track 保持挂载，禁 RemoveTrack）。
 	fwdActive atomic.Bool
+	// serverMuted 服务端强制闭麦（#36）：forward 整包丢弃（track 保持挂载）。
+	// 初值继承 room.serverMuted[userID]（同房重入/换连接仍生效）；服务端解禁复位。
+	serverMuted atomic.Bool
 
 	// —— 以下仅 speakingLoop goroutine 访问（单写者，免锁）——
 	effLvl       int32     // 停流折算后的有效电平（tickSpeak 写、tickActive 读）
@@ -91,6 +94,9 @@ func newPeer(room *Room, userID, connID string, sig SignalSender) (*Peer, error)
 	p.level.Store(-1)
 	p.effLvl = -1
 	p.fwdActive.Store(true)
+	// 服务端强制闭麦继承（#36）：同房间换连接/重入仍生效。
+	// 调用方（addPeer）持 r.mu，直接读房间表安全。
+	p.serverMuted.Store(room.serverMuted[userID])
 
 	// SFU 侧 trickle：候选随收随发
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
