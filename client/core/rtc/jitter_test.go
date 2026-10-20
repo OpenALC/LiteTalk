@@ -191,6 +191,40 @@ func TestJitterDTXHeartbeatNoHole(t *testing.T) {
 	}
 }
 
+// TestJitterPeekNextDoesNotConsume 窥视后继包不推进消费位置、不改缓冲计数；
+// 随后 Pop 仍能拿到同一包（FEC 恢复依赖此语义）。
+func TestJitterPeekNextDoesNotConsume(t *testing.T) {
+	jb := NewJitterBuffer()
+	out := make([]byte, JitterMaxPayload)
+
+	pushInOrder(jb, 100, 4)
+	jb.Pop(out) // 100
+	jb.Pop(out) // 101
+
+	before := jb.Stats()
+	n, ok := jb.PeekNext(out)
+	if !ok || n != 3 || out[0] != 102 {
+		t.Fatalf("PeekNext = (%d, %v), payload %v; want 102", n, ok, out[:n])
+	}
+	if n2, ok2 := jb.PeekNext(out); !ok2 || n2 != n {
+		t.Fatalf("second PeekNext = (%d, %v), want (%d, true)", n2, ok2, n)
+	}
+	after := jb.Stats()
+	if after.Buffered != before.Buffered || after.Received != before.Received {
+		t.Fatalf("PeekNext mutated stats: before=%+v after=%+v", before, after)
+	}
+
+	if n, lost, ok := jb.Pop(out); !ok || lost || n != 3 || out[0] != 102 {
+		t.Fatalf("Pop after PeekNext = (%d, lost=%v, ok=%v), want 102", n, lost, ok)
+	}
+
+	// 无后继（连续丢包）时返回 ok=false。
+	jb.Pop(out) // 103
+	if _, ok := jb.PeekNext(out); ok {
+		t.Fatal("PeekNext on empty successor should be false")
+	}
+}
+
 func TestJitterLargeJumpReset(t *testing.T) {
 	jb := NewJitterBuffer()
 	out := make([]byte, JitterMaxPayload)
