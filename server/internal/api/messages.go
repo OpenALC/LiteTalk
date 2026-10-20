@@ -13,6 +13,7 @@ import (
 // ListMessages GET /api/v1/channels/{id}/messages?before=&after=&limit=（游标分页 50 条，#31）
 // 游标语义：before 取更旧一页（ID 小于游标最新 limit 条）、after 取更新一页，
 // 均按旧→新正序返回。禁 offset。before_id 是 before 的旧别名（兼容一个版本）。
+// 参数 fail-closed：显式 limit 越界 400 bad_limit，显式游标 <= 0 400 bad_cursor。
 func (s *Server) ListMessages(ctx context.Context, request ListMessagesRequestObject) (ListMessagesResponseObject, error) {
 	if e := checkID(request.Id); e != nil {
 		return nil, e
@@ -27,19 +28,32 @@ func (s *Server) ListMessages(ctx context.Context, request ListMessagesRequestOb
 		return nil, errf(http.StatusForbidden, "forbidden", "不是服务器成员")
 	}
 	// 游标互斥：before（含旧别名 before_id）优先于 after。
+	// 显式给出的游标必须 > 0：0 不是合法消息 ID，不能当作「无游标」静默降级成
+	// 最新一页（契约 minimum:1，客户端传 0 说明它的游标状态已坏，应尽早暴露）。
 	var beforeID, afterID int64
 	if v := request.Params.Before; v != nil {
+		if *v <= 0 {
+			return nil, errf(http.StatusBadRequest, "bad_cursor", "游标须为正 ID")
+		}
 		beforeID = *v
 	} else if v := request.Params.BeforeId; v != nil {
+		if *v <= 0 {
+			return nil, errf(http.StatusBadRequest, "bad_cursor", "游标须为正 ID")
+		}
 		beforeID = *v // 旧参数别名（#31 兼容窗口，一个版本后移除）
 	} else if v := request.Params.After; v != nil {
+		if *v <= 0 {
+			return nil, errf(http.StatusBadRequest, "bad_cursor", "游标须为正 ID")
+		}
 		afterID = *v
 	}
-	if beforeID < 0 || afterID < 0 {
-		return nil, errf(http.StatusBadRequest, "bad_cursor", "游标须为非负 ID")
-	}
+	// limit 显式越界即 400，不再静默回落 50：契约（minimum:1, maximum:50）与
+	// 行为必须一致，否则调用方以为拿到了请求的条数。
 	limit := 50
-	if v := request.Params.Limit; v != nil && *v > 0 && *v <= 50 {
+	if v := request.Params.Limit; v != nil {
+		if *v < 1 || *v > 50 {
+			return nil, errf(http.StatusBadRequest, "bad_limit", "limit 须为 1–50")
+		}
 		limit = *v
 	}
 	if afterID > 0 {

@@ -582,17 +582,17 @@ type DeleteCategoryParams struct {
 
 // ListMessagesParams defines parameters for ListMessages.
 type ListMessagesParams struct {
-	// Before 游标：只取 ID 小于该值的消息（缺省 = 最新一页）
+	// Before 游标：只取 ID 小于该值的消息（缺省 = 最新一页；显式值须 > 0）
 	Before *int64 `form:"before,omitempty" json:"before,omitempty"`
 
-	// After 游标：只取 ID 大于该值的消息（向前翻更新；缺省 = 最旧一页）
+	// After 游标：只取 ID 大于该值的消息（向前翻更新；缺省 = 最旧一页；显式值须 > 0）
 	After *int64 `form:"after,omitempty" json:"after,omitempty"`
 
-	// BeforeId before 的旧别名（兼容一个版本，#31；与 before 同义）
+	// BeforeId before 的旧别名（兼容一个版本，#31；与 before 同义，显式值须 > 0）
 	// Deprecated: this property has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 	BeforeId *int64 `form:"before_id,omitempty" json:"before_id,omitempty"`
 
-	// Limit 条数上限（1–50，越界回落 50）
+	// Limit 条数上限（1–50，缺省 50；显式越界返回 400 bad_limit）
 	Limit *int `form:"limit,omitempty" json:"limit,omitempty"`
 }
 
