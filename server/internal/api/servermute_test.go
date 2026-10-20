@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -9,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/OpenALC/LiteTalk/server/internal/signal"
+	"github.com/OpenALC/LiteTalk/server/internal/store"
 )
 
 // #36 服务端强制闭麦 REST：权限门、频道形态、自我操作、目标不在房与审计。
@@ -126,4 +128,42 @@ func TestServerMuteHubNil(t *testing.T) {
 	doJSON(t, w.h, http.MethodPut,
 		fmt.Sprintf("/api/v1/channels/%d/members/%d/server-mute", asID(ch["id"]), memberID),
 		w.owner, map[string]bool{"muted": true}, http.StatusNotFound)
+}
+
+// TestServerMuteHierarchy 层级闸（#36 验收追加）：非 owner 不能对同级及以上成员
+// 强制闭麦——admin 闭麦 owner 后对方无法自助解禁（self 被拒），必须拦在前面。
+func TestServerMuteHierarchy(t *testing.T) {
+	w, h, voiceID, memberID := setupServerMute(t)
+	rt := w.h
+	ctx := context.Background()
+	// 第二个 admin（直写 store 挂 builtin）。
+	admin2 := mustReg(t, rt, w.mem, "sm-a2@ex.com", "smAdmin2")
+	admin2ID := meID(t, rt, admin2)
+	if err := w.mem.AddMember(ctx, &store.ServerMember{ServerID: w.serverID, UserID: admin2ID, Role: store.RoleAdmin}); err != nil {
+		t.Fatalf("AddMember(admin2): %v", err)
+	}
+	ownerID := meID(t, rt, w.owner)
+	adminID := meID(t, rt, w.admin)
+	body := map[string]bool{"muted": true}
+	at := func(target int64) string {
+		return fmt.Sprintf("/api/v1/channels/%d/members/%d/server-mute", voiceID, target)
+	}
+
+	// admin 闭麦 owner / 另一个 admin → 403。
+	doJSON(t, rt, http.MethodPut, at(ownerID), w.admin, body, http.StatusForbidden)
+	doJSON(t, rt, http.MethodPut, at(admin2ID), w.admin, body, http.StatusForbidden)
+	// self 保持 400（先于层级：对自己操作是更具体的错误）。
+	doJSON(t, rt, http.MethodPut, at(adminID), w.admin, body, http.StatusBadRequest)
+
+	// admin 闭麦普通成员 → 200。
+	doJSON(t, rt, http.MethodPut, at(memberID), w.admin, body, http.StatusOK)
+	if got := h.last(); got != fmt.Sprintf("%d|%d|true", voiceID, memberID) {
+		t.Fatalf("hub 调用 = %q", got)
+	}
+	// owner 闭麦 admin → 200（owner 不受层级限制）。
+	doJSON(t, rt, http.MethodPut, at(admin2ID), w.owner, body, http.StatusOK)
+
+	// 目标不是成员 → 404（admin 与 owner 同口径）。
+	doJSON(t, rt, http.MethodPut, at(4242424242), w.admin, body, http.StatusNotFound)
+	doJSON(t, rt, http.MethodPut, at(4242424242), w.owner, body, http.StatusNotFound)
 }

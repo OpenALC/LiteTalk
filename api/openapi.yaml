@@ -1401,9 +1401,10 @@ paths:
       summary: 服务端强制闭麦/解禁（需 MuteMembers，#36）
       description: >
         服务端在 SFU 转发前丢弃目标的上行 RTP（track 保持挂载），目标不配合也无法
-        绕过；房间成员收到 voice.state{server_muted}。仅语音频道；不能对自己操作。
+        绕过；房间成员收到 voice.state{server_muted}。仅语音频道；不能对自己操作；
+        非 owner 只能对角色层级严格低于自己的成员操作（与角色管理同口径）。
         code：bad_channel、bad_request、路径参数不合法；401；403 forbidden；
-        404 not_found（频道不存在或目标不在该频道语音房）；5xx internal。
+        404 not_found（频道不存在、目标不是成员或不在该频道语音房）；5xx internal。
       tags: [channels]
       parameters:
         - $ref: '#/components/parameters/IDPath'

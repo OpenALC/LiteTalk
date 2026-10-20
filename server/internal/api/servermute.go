@@ -40,6 +40,20 @@ func (s *Server) SetServerMuted(ctx context.Context, request SetServerMutedReque
 	if request.UserId == c.UserID {
 		return nil, errf(http.StatusBadRequest, "bad_request", "不能对自己操作")
 	}
+	// 层级闸（#36 验收追加，与 #35 口径一致）：目标不是成员一律 404（与「不在房」
+	// 同口径，不泄露存在性）；非 owner 只能动角色层级严格低于自己的成员——否则
+	// admin 能闭麦 owner/同级 admin，而 self 解禁被拒会把人锁死。owner 操作者不受限。
+	tRank, e := s.targetMaxRank(ctx, ch.ServerID, request.UserId)
+	if e != nil {
+		return nil, e
+	}
+	rr, e := s.roleRankOf(ctx, ch.ServerID, c.UserID)
+	if e != nil {
+		return nil, e
+	}
+	if !rr.owner && tRank >= rr.max {
+		return nil, errf(http.StatusForbidden, "forbidden", "不能对不低于自己的成员强制闭麦")
+	}
 	muted := request.Body.Muted
 	if s.hub == nil {
 		// 无信令面（纯 REST 测试/降级）：没有语音房，目标必然不在房。
