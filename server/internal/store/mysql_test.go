@@ -42,6 +42,7 @@ func TestMySQLMigrateAndCRUD(t *testing.T) {
 	for _, tbl := range []string{
 		"invites", "messages", "channels", "categories", "server_members",
 		"servers", "friendships", "users", "user_sessions", "kv", "schema_migrations",
+		"audit_log", "channel_overwrites", "member_roles", "roles",
 	} {
 		_, _ = m.DB().ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl)
 	}
