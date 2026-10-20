@@ -25,6 +25,7 @@ vi.mock('../api/bridge', () => ({ goApp: () => ({}), eventsOn: mockEventsOn.on }
 
 import type { ChatMessage } from '../api/types'
 import { useChatStore } from './chat'
+import { useNotifyStore } from './notify'
 
 const msg = (id: string, channelId = 'c1'): ChatMessage => ({
   id, channel_id: channelId, user_id: 'u1', nickname: '甲', content: 'hi',
@@ -88,5 +89,45 @@ describe('chat store 复位', () => {
     mockEventsOn.fire('chat:message', msg('m9'))
     expect(chat.messagesByChannel).toEqual({}) // 本 store 已注销
     expect(other.map((m) => m.id)).toEqual(['m9']) // 外部监听仍在
+  })
+
+  // chat:error（#34）：服务端拒收 chat.send 的异步 error 帧必须给用户反馈，
+  // 载荷 {code, message} 与 app.go 的 emit 口径一致。
+  it('chat:error 用 notify 显示服务端原因', () => {
+    const chat = useChatStore()
+    const notify = useNotifyStore()
+    chat.bindEvents()
+
+    mockEventsOn.fire('chat:error', { code: 'forbidden', message: '无权向该频道发送消息' })
+
+    expect(notify.visible).toBe(true)
+    expect(notify.isError).toBe(true)
+    expect(notify.text).toBe('无权向该频道发送消息')
+    chat.unbindEvents()
+  })
+
+  it('chat:error 缺 message 时回落统一文案，带机器前缀则清洗', () => {
+    const chat = useChatStore()
+    const notify = useNotifyStore()
+    chat.bindEvents()
+
+    mockEventsOn.fire('chat:error', { code: 'internal' })
+    expect(notify.isError).toBe(true)
+    expect(notify.text).toBe('消息发送失败')
+
+    mockEventsOn.fire('chat:error', { code: 'forbidden', message: 'forbidden: 无权向该频道发送消息' })
+    expect(notify.text).toBe('无权向该频道发送消息')
+    chat.unbindEvents()
+  })
+
+  it('unbindEvents 注销 chat:error 后不再提示', () => {
+    const chat = useChatStore()
+    const notify = useNotifyStore()
+    chat.bindEvents()
+    chat.unbindEvents()
+
+    expect(mockEventsOn.handlers.get('chat:error')).toHaveLength(0)
+    mockEventsOn.fire('chat:error', { code: 'forbidden', message: '无权向该频道发送消息' })
+    expect(notify.visible).toBe(false)
   })
 })

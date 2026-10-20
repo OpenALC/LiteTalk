@@ -189,6 +189,12 @@ export const useVoiceStore = defineStore('voice', () => {
       const msg = (d as { error?: string } | null)?.error
       notify.show(msg?.trim() || '语音不可用', true)
     }))
+    // ICE 失败重建（rtc.failed，#19/#34）：Go 侧已销毁 PC 并自动重发 join，
+    // 前端只提示链路正在重建。载荷是 {channel_id}，不参与文案（用户已在房里，
+    // 频道名在界面上可见）；重建成功后无需清除，toast 本身就是瞬时的。
+    offs.push(eventsOn('rtc:failed', () => {
+      notify.show('语音连接失败', true)
+    }))
   }
 
   // unbindEvents 休眠态清理：逐个注销本 store 注册的监听器。
