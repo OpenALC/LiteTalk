@@ -194,13 +194,42 @@ func (c *APIClient) EnsureAccess(ctx context.Context) error {
 // RefreshAccess 强制单飞刷新一次 access 令牌。WS 握手 401 后调用：服务端已经
 // 拒绝当前令牌，即便本地判断未过期也要换新值再试。
 // refresh 自身撞上 session_replaced/session_replayed 时返回 ErrSessionReplaced，
-// 供上层走被踢链路；其余错误原样上抛（上层据此停止重连，回登录态）。
+// 供上层走被踢链路；其余错误原样上抛，由调用方用 IsAuthRejected /
+// IsTransientRefreshError 分类决定「回登录页」还是「退避重试」。
 func (c *APIClient) RefreshAccess(ctx context.Context) error {
 	if c.refreshSource == nil {
 		return ErrNoRefreshSource
 	}
 	_, err := c.refreshOnce(ctx, c.Base())
 	return err
+}
+
+// IsAuthRejected 判断刷新失败是否属于服务端对凭据的明确拒绝（*APIError 且
+// HTTP 401/403）：refresh_token 已失效、过期或被吊销，重试没有意义，只能让
+// 用户重新登录。刷新请求的传输层失败不是这一类（见 IsTransientRefreshError）。
+func IsAuthRejected(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.Status == http.StatusUnauthorized || apiErr.Status == http.StatusForbidden
+}
+
+// IsTransientRefreshError 判断刷新失败是否值得退避重试：只有传输层错误
+// （网络中断、DNS、超时等）算瞬时。服务端明确应答的 *APIError（含 401/403）、
+// 会话被顶替（ErrSessionReplaced）、换服（errBaseChanged）与无刷新源
+// （ErrNoRefreshSource）都不可恢复——重试只会原地打转，必须按致命处理。
+func IsTransientRefreshError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return false
+	}
+	return !errors.Is(err, ErrSessionReplaced) &&
+		!errors.Is(err, errBaseChanged) &&
+		!errors.Is(err, ErrNoRefreshSource)
 }
 
 // accessExpiring 判断 access 令牌是否已过期或将在 leeway 内过期。

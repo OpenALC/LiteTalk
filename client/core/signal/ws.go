@@ -22,6 +22,11 @@ var ErrNotConnected = errors.New("signal: not connected")
 // ErrAuthFatal 鉴权失败（HTTP 401/403），Run 直接返回，不再重连。
 var ErrAuthFatal = errors.New("signal: authentication failed")
 
+// ErrAuthTransient 由 OnAuthFailed 返回，表示刷新令牌的请求本身（传输层）
+// 失败了——网络中断、DNS、超时等，服务端并未拒绝刷新令牌。令牌未必失效，
+// 因此 Run 不按致命收场：复位刷新预算、按重连退避后再来一轮（#84 复审 4.1）。
+var ErrAuthTransient = errors.New("signal: token refresh failed transiently")
+
 // ErrSilentReplace 同 sid 的半开连接被服务端的新连接替换（WS close 4000，
 // 契约 §0.6）。服务端那条新连接已经跑起来，本端重连只会把它再顶掉、互相踢，
 // 因此 Run 直接返回，由上层决定后续（通常是跟着一次新的登录流程）。
@@ -55,9 +60,11 @@ type Config struct {
 	// 实现侧不得同步 Close 本客户端（Close 会等 Run 退出，自成死锁）。
 	OnKicked func(reason string)
 	// OnAuthFailed 握手 401（被顶替类除外）时回调，供上层刷新 access 令牌。
-	// 返回 nil = 已刷新，Run 立即重拨一次（不叠加退避）；返回非 nil = 刷新
-	// 失败，Run 以 ErrAuthFatal 返回，不再重连——宁可回登录态，也不拿旧令牌
-	// 无限撞墙。每次连接生命周期只有一次重试预算：刷新后仍被拒即停。
+	// 返回 nil = 已刷新，Run 立即重拨一次（不叠加退避）；返回 ErrAuthTransient =
+	// 刷新请求是传输层失败（令牌本身未必失效），Run 复位刷新预算、按普通断线
+	// 退避后继续重连；返回其他非 nil = 刷新被服务端明确拒绝或不可恢复，Run 以
+	// ErrAuthFatal 返回，不再重连——宁可回登录态，也不拿旧令牌无限撞墙。
+	// 每次连接生命周期只有一次重试预算：刷新后仍被拒即停（瞬时失败不计入预算）。
 	// 被顶替类 401 走 OnKicked，不经过本回调。nil = 不刷新（旧行为）。
 	OnAuthFailed func(ctx context.Context) error
 	// Gate 事件面排序/去重门（#32）：对每条下行信封返回应投递给订阅者的信封
@@ -180,7 +187,8 @@ func (c *Client) Close() {
 
 // Run 连接并维持信令会话：断线指数退避自动重连，直到 ctx 取消、
 // Close、鉴权失败（ErrAuthFatal）或被新会话替换（ErrSilentReplace）。
-// 其余错误只会触发重连，不会返回。
+// 其余错误只会触发重连，不会返回——包括 OnAuthFailed 报告的瞬时刷新失败
+// （ErrAuthTransient，见该字段注释）。
 func (c *Client) Run(ctx context.Context) error {
 	backoff := c.cfg.ReconnectMin
 	// authRetried 一条连接的 401 刷新重试预算：拨号成功即复位（下一条连接
@@ -219,14 +227,28 @@ func (c *Client) Run(ctx context.Context) error {
 				if resp.StatusCode == http.StatusUnauthorized && !authRetried && c.cfg.OnAuthFailed != nil {
 					authRetried = true
 					c.logf("auth failed (HTTP %d), refreshing access token", resp.StatusCode)
-					if rerr := c.cfg.OnAuthFailed(ctx); rerr == nil {
+					rerr := c.cfg.OnAuthFailed(ctx)
+					if rerr == nil {
 						continue
-					} else if ctx.Err() != nil || c.closed.Load() {
-						return nil
-					} else {
-						c.logf("token refresh failed: %v, giving up", rerr)
-						return ErrAuthFatal
 					}
+					if ctx.Err() != nil || c.closed.Load() {
+						return nil
+					}
+					if errors.Is(rerr, ErrAuthTransient) {
+						// 刷新请求没到服务端（网络抖动/超时）：刷新令牌未必失效，
+						// 按致命收场会让常驻托盘的用户在网络恢复后也永久离线。
+						// 复位预算，按普通断线的退避节奏再来一轮；退避是硬约束，
+						// 否则这条路会变成握手 401 紧循环（#84 复审 4.1）。
+						authRetried = false
+						c.logf("token refresh transiently failed: %v (retry in %v)", rerr, backoff)
+						if werr := c.wait(ctx, backoff); werr != nil {
+							return nil
+						}
+						backoff = nextBackoff(backoff, c.cfg.ReconnectMax)
+						continue
+					}
+					c.logf("token refresh failed: %v, giving up", rerr)
+					return ErrAuthFatal
 				}
 				c.logf("auth failed (HTTP %d), giving up", resp.StatusCode)
 				return ErrAuthFatal

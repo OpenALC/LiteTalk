@@ -675,3 +675,53 @@ func TestSyncDecode(t *testing.T) {
 		t.Fatalf("好友快照解码异常: %+v", snap.Friends)
 	}
 }
+
+// TestIsTransientRefreshError 刷新错误分类（#84 复审 4.1）：只有传输层错误
+// 可退避重试；服务端明确应答、被顶替、换服与无刷新源都不可恢复。
+func TestIsTransientRefreshError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"网络错误", errors.New("dial tcp: no route to host"), true},
+		{"包装后的网络错误", fmt.Errorf("post /auth/refresh: %w", errors.New("EOF")), true},
+		{"服务端 401", &APIError{Code: "token_expired", Status: 401}, false},
+		{"服务端 403", &APIError{Code: "forbidden", Status: 403}, false},
+		{"服务端 500", &APIError{Code: "internal", Status: 500}, false},
+		{"会话被顶替", ErrSessionReplaced, false},
+		{"换服", errBaseChanged, false},
+		{"无刷新源", ErrNoRefreshSource, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsTransientRefreshError(tc.err); got != tc.want {
+				t.Fatalf("IsTransientRefreshError(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestIsAuthRejected 服务端明确拒绝 refresh_token 的判定：只认 401/403 的
+// *APIError（含包装），网络错误与 5xx 都不算「登录已过期」。
+func TestIsAuthRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"401", &APIError{Code: "token_expired", Status: 401}, true},
+		{"403", &APIError{Code: "forbidden", Status: 403}, true},
+		{"500", &APIError{Code: "internal", Status: 500}, false},
+		{"包装后的 401", fmt.Errorf("post /auth/refresh: %w", &APIError{Status: 401}), true},
+		{"网络错误", errors.New("connection reset"), false},
+		{"无刷新源", ErrNoRefreshSource, false},
+		{"nil", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsAuthRejected(tc.err); got != tc.want {
+				t.Fatalf("IsAuthRejected(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
