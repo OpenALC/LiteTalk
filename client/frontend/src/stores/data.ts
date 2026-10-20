@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { eventsOn, goApp } from '../api/bridge'
-import type { ServerChannels } from '../api/types'
+import type { ServerChannels, ServerDTO } from '../api/types'
 import { useNotifyStore } from './notify'
 
 // 频道/服务器/好友数据域。
@@ -176,6 +176,8 @@ export const useServersStore = defineStore('servers', () => {
 
   // loadRemoteServers 登录后拉取真实服务器并恢复各自频道列表（数字 ID 与内置示例不冲突）。
   // 逐服调 ListChannels；单服失败标记 unavailable 并提示（#12，不重试），不阻断其它服。
+  // ListServers 失败不再静默（#12）：toast 一次后保留内置示例，界面其余操作照常；
+  // 与 loadChannels 一致在内部消化失败，调用方无需再 catch。
   // 快照语义（#78）：续传失败后也会再调一次，已存在的服务器更新名称/图标，
   // 服务端已不存在的真实服务器（被移出/解散）从本地剔除——否则视图永远停在
   // 断线前的陈旧列表。内置示例不是服务端实体，不参与对账。
@@ -198,7 +200,15 @@ export const useServersStore = defineStore('servers', () => {
 
   async function doLoadRemoteServers(gen: number) {
     if (gen !== generation) return
-    const list = await goApp().ListServers()
+    let list: ServerDTO[]
+    try {
+      list = await goApp().ListServers()
+    } catch {
+      // 会话已复位：旧账号的失败提示也不该出现在新会话里。
+      if (gen !== generation) return
+      useNotifyStore().show('服务器列表加载失败', true)
+      return
+    }
     if (gen !== generation) return
     const ids = new Set<string>()
     for (const s of list) {
