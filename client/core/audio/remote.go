@@ -81,6 +81,23 @@ func (t *StateTable) Remove(peerID string) {
 	}
 }
 
+// Clear 清空全部对端状态并逐条触发 OnRemove（退房/会话关闭用）。
+// 直接换新 map 而不是逐键 delete：Go map 不会因删除而收缩桶，换表才能
+// 把历史成员占用的桶真正交给 GC。回调在锁外触发，允许回调再调本表。
+func (t *StateTable) Clear() {
+	t.mu.Lock()
+	old := t.states
+	t.states = make(map[string]PeerVoiceState)
+	cb := t.OnRemove
+	t.mu.Unlock()
+	if cb == nil {
+		return
+	}
+	for id := range old {
+		cb(id)
+	}
+}
+
 // Get 查询某对端状态。
 func (t *StateTable) Get(peerID string) (PeerVoiceState, bool) {
 	t.mu.RLock()

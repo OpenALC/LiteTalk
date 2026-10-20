@@ -645,6 +645,8 @@ func TestVoiceTakenLeavesRoomLocally(t *testing.T) {
 	s.mu.Lock()
 	s.members = map[string]PeerView{"u1": {UserID: "u1", Nickname: "甲"}}
 	s.mu.Unlock()
+	s.states = audio.NewStateTable()
+	s.states.Set("u1", audio.PeerVoiceState{Speaking: true, Mute: true})
 	s.remoteMgr = audio.NewRemoteManager(audio.NewMixer(func([]int16) int { return 0 }), nil)
 	peer, err := rtc.NewPeer(rtc.PeerConfig{StreamID: "u1"})
 	if err != nil {
@@ -667,6 +669,9 @@ func TestVoiceTakenLeavesRoomLocally(t *testing.T) {
 	if n := len(s.Members()); n != 0 {
 		t.Fatalf("members = %d, want 0", n)
 	}
+	if n := len(s.states.Snapshot()); n != 0 {
+		t.Fatalf("states = %d, want 0", n)
+	}
 	if p := s.peerRef.Load(); p != nil {
 		t.Fatal("peerRef should be cleared")
 	}
@@ -680,6 +685,35 @@ func TestVoiceTakenLeavesRoomLocally(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if stub.saw(signal.TypeChannelLeave) {
 		t.Fatal("must not send channel.leave on session.voice_taken")
+	}
+}
+
+// TestLeaveChannelClearsRoomState 主动退房即使 leave 发送失败，也必须清成员表与
+// 状态表——否则同一会话内历史成员累积、UI 残留幽灵成员/旧说话态。
+func TestLeaveChannelClearsRoomState(t *testing.T) {
+	s := NewSession(api.NewAPIClient("http://127.0.0.1:1"), "tok", "n", Events{}, nil)
+	s.ws = signal.NewClient(signal.Config{URL: "ws://127.0.0.1:1/ws"})
+	defer s.ws.Close()
+
+	s.roomID.Store("room1")
+	s.mu.Lock()
+	s.members = map[string]PeerView{"u1": {UserID: "u1", Nickname: "甲"}}
+	s.mu.Unlock()
+	s.states = audio.NewStateTable()
+	s.states.Set("u1", audio.PeerVoiceState{Speaking: true, Mute: true})
+
+	// ws 未 Run：Send 返回 ErrNotConnected，覆盖发送失败路径。
+	if err := s.LeaveChannel(); err == nil {
+		t.Fatal("未连接的 LeaveChannel 应返回发送错误")
+	}
+	if got := s.roomID.Load().(string); got != "" {
+		t.Fatalf("roomID = %q, want empty", got)
+	}
+	if n := len(s.Members()); n != 0 {
+		t.Fatalf("members = %d, want 0", n)
+	}
+	if n := len(s.states.Snapshot()); n != 0 {
+		t.Fatalf("states = %d, want 0", n)
 	}
 }
 
