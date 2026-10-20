@@ -198,4 +198,53 @@ describe('voice store 房间态清理', () => {
     mockEventsOn.fire('rtc:failed', { channel_id: 'room1' })
     expect(notify.visible).toBe(false)
   })
+
+  // 入房失败（voice:join_failed）：提示由 chat:error 负责（Go 侧同一次失败还会
+  // 发一条 chat:error），voice store 只清房间态——否则左下角残留「正在频道中」
+  // 与 0ms 延迟，看起来像人还在房里。
+  it('voice:join_failed 清空频道/成员/延迟/连接态，且不重复弹 toast', () => {
+    const voice = useVoiceStore()
+    const notify = useNotifyStore()
+    voice.bindEvents()
+    voice.channelId = 'room1'
+    voice.members = [peer]
+    voice.latencyMs = 42
+    voice.connected = true
+
+    mockEventsOn.fire('voice:join_failed', {
+      channel_id: 'room1', code: 'join_failed', message: '进入语音频道失败',
+    })
+
+    expect(voice.channelId).toBe('')
+    expect(voice.members).toEqual([])
+    expect(voice.latencyMs).toBe(0)
+    expect(voice.connected).toBe(false)
+    // 错误提示只由 chat:error 弹一次，voice store 不再 toast。
+    expect(notify.visible).toBe(false)
+    voice.unbindEvents()
+  })
+
+  it('voice:join_failed 的迟到事件不影响已在的其它频道', () => {
+    const voice = useVoiceStore()
+    voice.bindEvents()
+    voice.channelId = 'room1'
+    voice.latencyMs = 42
+
+    mockEventsOn.fire('voice:join_failed', { channel_id: 'room2', code: 'join_failed', message: '失败' })
+
+    expect(voice.channelId).toBe('room1')
+    expect(voice.latencyMs).toBe(42)
+    voice.unbindEvents()
+  })
+
+  it('unbindEvents 注销 voice:join_failed，注销后不再清房间态', () => {
+    const voice = useVoiceStore()
+    voice.bindEvents()
+    voice.channelId = 'room1'
+    voice.unbindEvents()
+
+    expect(mockEventsOn.handlers.get('voice:join_failed')).toHaveLength(0)
+    mockEventsOn.fire('voice:join_failed', { channel_id: 'room1', code: 'join_failed' })
+    expect(voice.channelId).toBe('room1')
+  })
 })

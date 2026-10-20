@@ -182,6 +182,15 @@ export const useVoiceStore = defineStore('voice', () => {
       resetRoom()
       notify.show('已在其他设备加入语音')
     }))
+    // 入房失败（voice:join_failed）：Go 侧已放弃入房，前端清掉房间态，左下角
+    // 「正在频道中」与延迟条随之消失。错误提示由 chat:error 负责（同一次失败
+    // Go 侧还会发一条），这里不再 toast，避免两条重复。
+    offs.push(eventsOn('voice:join_failed', (d) => {
+      const p = d as { channel_id?: string } | null
+      // 迟到的旧失败不能把已进入的其它频道踢掉。
+      if (p?.channel_id && channelId.value && p.channel_id !== channelId.value) return
+      resetRoom()
+    }))
     // 音频不可用（管线初始化失败，或入房后采集/播放启动失败，#80）：Go 侧对
     // 同一故障周期只上报一次，这里直接提示。toast 是瞬时的（notify 自动隐藏），
     // 重入房重试成功后无需清除状态；若再次失败，Go 侧会在新故障周期重新上报。

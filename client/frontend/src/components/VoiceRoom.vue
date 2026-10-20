@@ -132,10 +132,6 @@ async function onAddFriendConfirm(target: string) {
 // 展示在 toast 里，不让邀请码凭空丢失（批次① review 建议 8）。
 async function invite() {
   const s = servers.currentServer
-  if (s.builtin) {
-    notify.show('示例服务器暂不支持邀请，请先通过 + 创建服务器', true)
-    return
-  }
   try {
     const code = await goApp().CreateInviteCode(s.id)
     try {

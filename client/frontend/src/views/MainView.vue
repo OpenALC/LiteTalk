@@ -28,7 +28,10 @@ const friends = useFriendsStore()
 
 const tab = ref<'voice' | 'chat'>('voice')
 const showFriends = ref(true)
-const isIntro = computed(() => servers.currentServerId === INTRO_ID)
+// 没有当前服务器（登录前/列表为空）时同样按介绍页处理：频道栏与舞台都依赖
+// currentServer 的字段，不能在列表为空时渲染。
+const isIntro = computed(() =>
+  servers.currentServerId === INTRO_ID || !servers.currentServer)
 
 const hotkeysActive = computed(() => true)
 useHotkeys(
@@ -70,7 +73,7 @@ onMounted(() => {
   servers.initHome().then(() => {
     if (!servers.currentServerId) servers.selectServer(servers.homeId)
   })
-  // 登录态下并入真实服务器列表（REST；内置示例保留作语音演练场）。
+  // 登录态下拉取真实服务器列表（REST）。
   // 失败静默：服务器列表不可用不阻断主界面。
   if (auth.loggedIn) {
     servers.loadRemoteServers().catch(() => {})

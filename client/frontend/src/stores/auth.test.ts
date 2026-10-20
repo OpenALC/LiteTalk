@@ -245,7 +245,8 @@ describe('auth store 业务 store 复位（#85）', () => {
 
   function expectCleared() {
     const servers = useServersStore()
-    expect(servers.servers.map((s) => s.id)).toEqual(['hq', 'game', 'music', 'design', 'book'])
+    // 示例服务器已移除：登出后列表为空，登录后由 loadRemoteServers 重新填充。
+    expect(servers.servers).toEqual([])
     expect(servers.findServer('100')).toBeUndefined()
     expect(servers.currentServerId).toBe('')
     expect(servers.currentChannelId).toBe('')
