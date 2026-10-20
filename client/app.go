@@ -7,11 +7,15 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	_ "net/http/pprof" // LITETALK_PPROF 探针用：仅在显式开启时监听回环地址
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -186,6 +190,93 @@ func initLogging() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 }
 
+// 运行时内存默认值（#96）。GOMEMLIMIT 是 Go 堆的软上限，不是进程 RSS：
+// Wails/WebView2、cgo 音频缓冲与设备驱动占用都不计入其中。实测 core 语音
+// 全链路 GC 后存活堆约 3–5MB，15MiB 留有余量；GOGC=50 让堆在约 1.5 倍
+// 存活时回收，避免默认 100 把观测堆抬到约两倍存活。
+const (
+	defaultGOGC        = 50
+	defaultMemoryLimit = 15 << 20
+)
+
+// runtimeMemoryPolicy 决定启动时要补的默认值；负值表示保持 runtime 当前值。
+// 只看环境变量是否存在、不解析内容：显式设置的 GOGC/GOMEMLIMIT（含空值和
+// 非法值）一律不覆盖，非法值由 runtime 在进程启动时自行报错，避免这里与
+// runtime 的校验规则漂移。
+func runtimeMemoryPolicy(lookupEnv func(string) (string, bool)) (gcPercent int, memLimit int64) {
+	gcPercent, memLimit = -1, -1
+	if _, ok := lookupEnv("GOGC"); !ok {
+		gcPercent = defaultGOGC
+	}
+	if _, ok := lookupEnv("GOMEMLIMIT"); !ok {
+		memLimit = defaultMemoryLimit
+	}
+	return gcPercent, memLimit
+}
+
+// applyRuntimeMemoryDefaults 补齐未显式设置的内存策略，返回写进 app.log 的
+// 生效值描述：显式设置时打印环境变量原值，未设置时打印刚补的默认值。
+func applyRuntimeMemoryDefaults() string {
+	gcPercent, memLimit := runtimeMemoryPolicy(os.LookupEnv)
+	if gcPercent >= 0 {
+		debug.SetGCPercent(gcPercent)
+	}
+	if memLimit >= 0 {
+		debug.SetMemoryLimit(memLimit)
+	}
+	gogc := strconv.Itoa(defaultGOGC)
+	if v, ok := os.LookupEnv("GOGC"); ok {
+		gogc = v
+	}
+	limit := strconv.FormatInt(defaultMemoryLimit, 10)
+	if v, ok := os.LookupEnv("GOMEMLIMIT"); ok {
+		limit = v
+	}
+	return fmt.Sprintf("runtime memory: GOGC=%s GOMEMLIMIT=%s", gogc, limit)
+}
+
+// startPprofIfEnabled 按 LITETALK_PPROF 启动本地诊断端口，默认关闭。
+// pprof 无鉴权且会暴露堆栈/命令行，只接受回环地址；非法或非回环值直接拒绝
+// 并留日志。未设置环境变量时不监听、不起额外 goroutine。
+func startPprofIfEnabled() {
+	raw := os.Getenv("LITETALK_PPROF")
+	if raw == "" {
+		return
+	}
+	addr, ok := parsePprofAddr(raw)
+	if !ok {
+		log.Printf("pprof: 忽略 LITETALK_PPROF=%q（只接受回环 host:port）", raw)
+		return
+	}
+	go func() {
+		log.Printf("pprof: 仅本地诊断，监听 http://%s/debug/pprof/", addr)
+		if err := http.ListenAndServe(addr, nil); err != nil {
+			log.Printf("pprof: 监听失败: %v", err)
+		}
+	}()
+}
+
+// parsePprofAddr 校验 LITETALK_PPROF 的值：必须是 host:port，host 只能是
+// 回环地址，port 必须是 1–65535 的数字。空 host（":6060"）会监听所有网卡，
+// 一律拒绝。合法时原样返回交给 ListenAndServe。
+func parsePprofAddr(raw string) (string, bool) {
+	host, port, err := net.SplitHostPort(raw)
+	if err != nil || host == "" {
+		return "", false
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+		return "", false
+	}
+	if host == "localhost" {
+		return raw, true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return "", false
+	}
+	return raw, true
+}
+
 // logFanout 向所有目标写入同一条日志，单个目标失败不短路其余目标。
 // stderr 与轮转文件任一不可用，另一侧仍能留下排障线索。
 type logFanout []io.Writer
@@ -225,6 +316,9 @@ func (a *App) LogFromWeb(level, msg string) {
 // 托盘使用 v3 内建 SystemTray（替代 v2 getlantern/systray）；创建后由 Run 统一拉起。
 func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) error {
 	initLogging()
+	// 内存策略在会话/音频/托盘初始化前生效；显式环境变量优先，日志落 app.log。
+	log.Print(applyRuntimeMemoryDefaults())
+	startPprofIfEnabled()
 	log.Printf("=== LiteTalk %s 启动 (pid=%d) ===", version, os.Getpid())
 	r := a.cfg.Resolve()
 	a.api = newAppAPI(r.BaseURL)
