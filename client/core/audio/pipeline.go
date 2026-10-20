@@ -492,6 +492,9 @@ func (p *Pipeline) Close() error {
 // Stats 返回运行统计快照。
 func (p *Pipeline) Stats() StatsSnapshot { return p.stats.Snapshot() }
 
+// PlaybackBuffered 播放环当前排队时长（诊断用，2s 统计节拍读取，非热路径）。
+func (p *Pipeline) PlaybackBuffered() time.Duration { return p.playRing.BufferedDuration() }
+
 // Backend 返回构造时选定的音频后端（只读，诊断/测试用）。
 func (p *Pipeline) Backend() Backend { return p.cfg.Backend }
 

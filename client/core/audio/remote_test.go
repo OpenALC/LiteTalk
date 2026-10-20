@@ -299,6 +299,40 @@ func TestRemoteDecodeError(t *testing.T) {
 	}
 }
 
+// TestRemoteLinkStats 诊断快照（#95）：抖动统计、链路计数与混音输入环占用
+// 与解码路径一致；未知 peer 返回 false。
+func TestRemoteLinkStats(t *testing.T) {
+	m, _ := newTestMixer()
+	rm := NewRemoteManager(m, nil)
+	rp := newTestRemotePeer(t, "a", m)
+	rm.peers["a"] = rp
+	pkts := encodeSinePackets(t, 3)
+	for i := 0; i < 3; i++ {
+		rp.jb.Push(uint16(100+i), pkts[i], remoteArrival(100+i))
+		rp.Stats.RTPReceived.Add(1) // 模拟 readLoop 计数
+	}
+	for i := 0; i < 3; i++ {
+		rp.decodeOnce()
+	}
+
+	ls, ok := rm.LinkStats("a")
+	if !ok {
+		t.Fatal("LinkStats(a) not found")
+	}
+	if ls.RTPReceived != 3 || ls.FramesPopped != 3 || ls.PLCFrames != 0 || ls.FECFrames != 0 {
+		t.Fatalf("link counters = %+v, want rtp=3 popped=3 plc=0 fec=0", ls)
+	}
+	if ls.RingAvailable != 3*OpusFrameSize || ls.WrittenSamples != 3*OpusFrameSize {
+		t.Fatalf("ring = %d/%d, want %d/%d", ls.RingAvailable, ls.WrittenSamples, 3*OpusFrameSize, 3*OpusFrameSize)
+	}
+	if !ls.Jitter.Started || ls.Jitter.TargetPackets < 3 || ls.Jitter.Buffered != 0 {
+		t.Fatalf("jitter stats = %+v, want started, target>=3, buffered=0", ls.Jitter)
+	}
+	if _, ok := rm.LinkStats("missing"); ok {
+		t.Fatal("LinkStats(missing) should be false")
+	}
+}
+
 // TestRemoteManagerRemove peer 离开：链路与混音输入一并销毁，幂等。
 func TestRemoteManagerRemove(t *testing.T) {
 	m, _ := newTestMixer()
