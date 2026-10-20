@@ -59,7 +59,8 @@ type App struct {
 	forceQuit atomic.Bool
 
 	// trayReady 托盘图标+菜单就绪标志（tray onReady 置位）。
-	// 托盘不可用时关窗必须放行真正关闭，绝不能隐藏窗口把用户锁死（问题 4a）。
+	// 托盘不可用时关窗退回最小化（保留任务栏/Alt-Tab 恢复路径），
+	// 绝不能隐藏或销毁窗口把用户锁死（问题 4a）。
 	trayReady atomic.Bool
 
 	api  *api.APIClient
@@ -269,12 +270,12 @@ func (a *App) setupTray() {
 
 	t.SetMenu(menu)
 	// Linux 桌面可能没有托盘宿主（GNOME 未装 AppIndicator 扩展）：图标
-	// 不会出现，此时关窗若仍隐藏就等于把应用藏丢。按实际可用性置位，
-	// 不可用则关窗语义由 interceptClose/closeToTrayOrQuit 回落为退出。
+	// 不会出现，此时关窗不能隐藏/销毁（没有恢复入口），由
+	// interceptClose/closeToTrayOrQuit 退回最小化，保留任务栏/Alt-Tab。
 	if available := tray.Available(); available {
 		a.trayReady.Store(true)
 	} else {
-		log.Printf("托盘不可用（无 StatusNotifierWatcher），关窗将退出程序")
+		log.Printf("托盘不可用（无 StatusNotifierWatcher），关窗将最小化窗口")
 	}
 }
 
@@ -384,7 +385,7 @@ func (a *App) emitHibernate() {
 }
 
 // interceptClose 拦截窗口关闭（v3 WindowClosing Hook，替代 v2 OnBeforeClose）：
-// 返回 true = 已拦截（隐藏到托盘或销毁渲染进程），false = 放行真正关闭。
+// 返回 true = 已拦截（最小化、隐藏到托盘或销毁渲染进程），false = 放行真正关闭。
 // 实际语义收敛在 closeToTrayOrQuit，与 WindowClose（前端标题栏按钮）共用；
 // 本函数只叠加 OS 关窗钩子特有的放行条件：
 //   - recreating（程序化销毁渲染进程，里程碑②）→ 放行
@@ -402,28 +403,58 @@ func (a *App) interceptClose() bool {
 	return a.closeToTrayOrQuit()
 }
 
+// closeAction 关窗动作。决策与执行分离，决策是纯函数以便穷举组合测试。
+type closeAction int
+
+const (
+	closeActionQuit     closeAction = iota // 退出程序
+	closeActionMinimise                    // 最小化窗口（托盘不可用时的唯一安全出口）
+	closeActionTray                        // 隐藏到托盘 + 按休眠模式卸载界面
+	closeActionDestroy                     // 销毁渲染进程（destroy 休眠模式）
+)
+
+// closeActionFor 关窗决策表（顺序即优先级）：
+//  1. 托盘不可用 → 最小化。隐藏/销毁都没有恢复入口，退出又违背用户预期；
+//     最小化保留任务栏与 Alt-Tab，重启托盘宿主后仍可正常使用。
+//  2. 托盘可用 + destroy 休眠模式 → 销毁渲染进程（内存释放最彻底，可由托盘重建）。
+//  3. 托盘可用 + 用户设置「关闭窗口时=退出程序」→ 退出。
+//  4. 其余 → 隐藏到托盘，hibernate 模式同步卸载界面。
+func closeActionFor(hibernateMode string, trayReady, closeToTray bool) closeAction {
+	if !trayReady {
+		return closeActionMinimise
+	}
+	if hibernateMode == "destroy" {
+		return closeActionDestroy
+	}
+	if !closeToTray {
+		return closeActionQuit
+	}
+	return closeActionTray
+}
+
 // closeToTrayOrQuit 关窗语义的唯一实现（interceptClose 与 WindowClose 共用，
-// 两条入口行为必然一致）：
-//   - destroy 休眠模式 → 销毁渲染进程替代隐藏（内存释放更彻底）
-//   - 托盘不可用或用户设置「关闭窗口时=退出程序」→ 显式 Quit
-//   - 其余 → 隐藏到托盘 + hibernate 模式同步卸载界面
-//
-// 返回 true 表示已处理且窗口仍在（Hook 侧需 Cancel 关闭），false 表示正在退出。
+// 两条入口行为必然一致）；决策见 closeActionFor。返回 true 表示已处理且窗口
+// 仍在（Hook 侧需 Cancel 关闭），false 表示正在退出。
 func (a *App) closeToTrayOrQuit() bool {
-	if a.cfg.HibernateMode() == "destroy" {
+	switch closeActionFor(a.cfg.HibernateMode(), a.trayReady.Load(), a.cfg.CloseToTray()) {
+	case closeActionDestroy:
 		a.destroyRenderProcess()
 		return true
-	}
-	if !a.trayReady.Load() || !a.cfg.CloseToTray() {
-		// 托盘不可用：隐藏后无任何恢复路径；或用户明确设置关闭即退出。
+	case closeActionMinimise:
+		if win := a.getWindow(); win != nil {
+			win.Minimise()
+		}
+		return true
+	case closeActionTray:
+		if win := a.getWindow(); win != nil {
+			win.Hide()
+		}
+		a.emitHibernate()
+		return true
+	default: // closeActionQuit
 		a.quitAfterClose()
 		return false
 	}
-	if win := a.getWindow(); win != nil {
-		win.Hide()
-	}
-	a.emitHibernate()
-	return true
 }
 
 // quitAfterClose 在窗口关闭完成后退出进程。窗口关闭是异步的（Hook 经 channel
@@ -519,8 +550,8 @@ func (a *App) WindowMaximize() {
 }
 
 // WindowClose 关闭。前端自定义标题栏按钮调用，与 OS 关窗（interceptClose）
-// 共用 closeToTrayOrQuit：destroy 模式销毁渲染进程；否则按「关闭窗口时」设置
-// 与托盘可用性决定隐藏入托盘或退出程序（v2 语义曾无条件隐藏，设置不生效）。
+// 共用 closeToTrayOrQuit：托盘不可用则最小化；托盘可用时按休眠模式与
+// 「关闭窗口时」设置决定销毁渲染进程、隐藏入托盘或退出程序。
 func (a *App) WindowClose() {
 	a.closeToTrayOrQuit()
 }
