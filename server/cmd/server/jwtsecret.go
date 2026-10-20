@@ -16,9 +16,10 @@ import (
 const jwtSecretFile = "jwt.secret"
 
 // 并发首启败者的读回重试：胜者用 O_EXCL 建好文件后还要写入内容，
-// 败者可能读到空文件或半截内容；总等待上限 1s，正常情况首次就读到完整内容。
+// 败者可能读到空文件或半截内容；总等待上限 5s。CI 满载/race 调度下胜者
+// 可能被延迟片刻，1s 会在空文件上误判失败（TestResolveJWTSecretConcurrentFirstStart 踩过）。
 const (
-	jwtSecretReadRetries  = 100
+	jwtSecretReadRetries  = 500
 	jwtSecretReadInterval = 10 * time.Millisecond
 )
 
