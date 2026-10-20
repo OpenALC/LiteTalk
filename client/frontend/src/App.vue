@@ -6,8 +6,8 @@
 //   Go 侧直接 WindowReloadApp，重载后凭守卫 GetMe() 恢复会话）。
 // - 原生初始化失败：生产环境等待原生标志超时（bridge 置 nativeInitFailed），
 //   渲染错误页替代业务界面——此时绝不进入路由，mock 会让「登录一律成功」。
-// - 全局禁用原生右键：捕获阶段拦截，仅 [data-ctx] 容器内的右键可用
-//   （频道列表/服务器栏/好友列表/语音成员网格各自提供自定义菜单）。
+// - 全局禁用原生右键：捕获阶段拦截，只有输入类元素放行；自定义菜单由各组件的
+//   @contextmenu.prevent 自行挂载，不依赖容器白名单。
 import { onMounted, onUnmounted, ref } from 'vue'
 import TitleBar from './components/TitleBar.vue'
 import GlobalToast from './components/GlobalToast.vue'
@@ -19,15 +19,19 @@ const hibernate = useHibernateStore()
 // 模块级失败标志此刻已尘埃落定，无需再等待。
 const nativeFailed = ref(isNativeInitFailed())
 
-// onCtxMenu 全局右键拦截：data-ctx 白名单外一律屏蔽原生菜单（走查 7）。
-// 捕获阶段执行，先于各组件的 contextmenu 处理。
+// onCtxMenu 全局右键拦截：除输入类元素外一律屏蔽原生菜单。
+// 捕获阶段执行，先于各组件的 contextmenu 处理；组件自己的
+// @contextmenu.prevent 仍会照常触发，自定义菜单不受影响。
 // 例外：input/textarea/contenteditable 放行——密码框/聊天框的右键粘贴是刚需
 //（review S4：一刀切会让所有输入框无法粘贴）。
 function onCtxMenu(e: MouseEvent) {
-  const t = e.target as HTMLElement | null
-  if (!t || typeof t.closest !== 'function') return
-  if (t.closest('input, textarea, [contenteditable="true"]')) return
-  if (!t.closest('[data-ctx]')) e.preventDefault()
+  // target 可能是 Text/SVG 等非 HTMLElement 节点，统一落到最近的 Element 上判断
+  const target = e.target
+  const el = target instanceof Element
+    ? target
+    : target instanceof Node ? target.parentElement : null
+  if (el?.closest('input, textarea, [contenteditable=""], [contenteditable="true"]')) return
+  e.preventDefault()
 }
 
 // retry 重试：整体重载页面。原生标志若只是迟到（慢启动），重载后即恢复；
