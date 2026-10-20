@@ -122,7 +122,7 @@ type Category struct {
 }
 
 // Message 文字频道消息。
-// Nonce 客户端幂等键（#31）：空 = 不去重；(channel_id, user_id, nonce) 唯一索引见迁移 0006。
+// Nonce 客户端幂等键（#31）：空 = 不去重；(channel_id, user_id, nonce) 唯一索引见迁移 0007。
 type Message struct {
 	ID        int64     `json:"id" db:"id"`
 	ChannelID int64     `json:"channel_id" db:"channel_id"`
