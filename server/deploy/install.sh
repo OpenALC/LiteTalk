@@ -228,29 +228,43 @@ EOF
     else
       log "保留已有 /etc/litetalk-updater.env"
     fi
-    # webhook secret：缺失才生成，0600 root:root（systemd 以 root 读取后注入，更新器进程内不再落盘）
+    # webhook secret：缺失才生成；无论新旧都把属主/权限校正到 root:$SVC_USER 0640
+    #（旧版误配 0600 root:root 时更新器读不到，重跑安装即修复）。
+    # 更新器以 $SVC_USER 运行且自己读本文件：other 位必须为 0，服务用户必须可读。
     if [ ! -e /etc/litetalk-updater.webhook.secret ]; then
-      umask 077
-      openssl rand -hex 32 > /etc/litetalk-updater.webhook.secret
-      chmod 600 /etc/litetalk-updater.webhook.secret
-      chown root:root /etc/litetalk-updater.webhook.secret
+      (umask 077; openssl rand -hex 32 > /etc/litetalk-updater.webhook.secret)
       log "已生成 webhook secret（/etc/litetalk-updater.webhook.secret，不回显）"
       log "配置 GitHub webhook 时用: sudo cat /etc/litetalk-updater.webhook.secret"
     else
-      log "保留已有 /etc/litetalk-updater.webhook.secret"
+      log "保留已有 /etc/litetalk-updater.webhook.secret（校正属主/权限）"
     fi
+    chown "root:$SVC_USER" /etc/litetalk-updater.webhook.secret
+    chmod 640 /etc/litetalk-updater.webhook.secret
     mkdir -p /var/lib/litetalk-updater/autocert
     chown -R "$SVC_USER:$SVC_USER" /var/lib/litetalk-updater
     chmod 700 /var/lib/litetalk-updater /var/lib/litetalk-updater/autocert
   fi
 fi
 
-# ---- systemd 单元（路径/用户按本次安装参数渲染；不覆盖已有自定义）----
-# 说明：更新器经 sudo 重启主服务，其单元不能开 NoNewPrivileges（与 setuid 提权冲突）。
+# ---- systemd 单元（路径/用户按本次安装参数渲染）----
+# 不覆盖已有文件：已存在时把新模板写到 .new 供对比合并（.new 不会被 systemd/sudo 读取）。
+# 更新器经 sudo 重启主服务，其单元不能开 NoNewPrivileges（与 setuid 提权冲突）；
+# 主服务不用 sudo，保留 NoNewPrivileges=true。
+write_conf() {
+  local path="$1"
+  if [ -e "$path" ]; then
+    log "保留已有 $path（新模板另存 $path.new，请自行对比合并）"
+    cat > "$path.new"
+  else
+    cat > "$path"
+    log "已写入 $path"
+  fi
+}
+
 if [ "$DRY_RUN" = 1 ]; then
-  echo "  将安装: /etc/systemd/system/litetalk.service（User=$SVC_USER Dir=$DIR）"
+  echo "  将安装（不覆盖已有）: /etc/systemd/system/litetalk.service（User=$SVC_USER Dir=$DIR，含 443 capability）"
   if [ "$WITH_UPDATER" = 1 ]; then
-    echo "  将安装: /etc/systemd/system/litetalk-updater.service、/etc/sudoers.d/litetalk-updater"
+    echo "  将安装（不覆盖已有）: /etc/systemd/system/litetalk-updater.service、/etc/sudoers.d/litetalk-updater"
     echo "  将执行: systemctl daemon-reload && systemctl enable --now litetalk.service litetalk-updater.service"
   else
     echo "  将执行: systemctl daemon-reload && systemctl enable --now litetalk.service"
@@ -259,7 +273,7 @@ if [ "$DRY_RUN" = 1 ]; then
   exit 0
 fi
 
-cat > /etc/systemd/system/litetalk.service <<EOF
+write_conf /etc/systemd/system/litetalk.service <<EOF
 [Unit]
 Description=LiteTalk Server (signaling + SFU + REST)
 After=network.target
@@ -277,6 +291,9 @@ StartLimitIntervalSec=60
 StartLimitBurst=10
 StandardOutput=journal
 StandardError=journal
+# 内置 ACME（LITETALK_DOMAIN）监听 443 是特权端口：非 root 必须放行绑定 capability
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 ProtectSystem=full
 PrivateTmp=true
@@ -286,7 +303,7 @@ WantedBy=multi-user.target
 EOF
 
 if [ "$WITH_UPDATER" = 1 ]; then
-  cat > /etc/systemd/system/litetalk-updater.service <<EOF
+  write_conf /etc/systemd/system/litetalk-updater.service <<EOF
 [Unit]
 Description=LiteTalk Updater (GitHub release webhook auto-update)
 After=network-online.target litetalk.service
@@ -315,15 +332,20 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-  cat > /etc/sudoers.d/litetalk-updater <<EOF
+  if [ -e /etc/sudoers.d/litetalk-updater ]; then
+    log "保留已有 /etc/sudoers.d/litetalk-updater"
+  else
+    cat > /etc/sudoers.d/litetalk-updater <<EOF
 # 轻音 LiteTalk 自动更新器最小 sudoers（#97）
 $SVC_USER ALL=(root) NOPASSWD: /usr/bin/systemctl restart litetalk.service, /usr/bin/systemctl is-active litetalk.service
 EOF
-  chmod 440 /etc/sudoers.d/litetalk-updater
-  if ! visudo -cf /etc/sudoers.d/litetalk-updater >/dev/null 2>&1; then
-    echo "sudoers 校验失败，已回滚" >&2
-    rm -f /etc/sudoers.d/litetalk-updater
-    exit 1
+    chmod 440 /etc/sudoers.d/litetalk-updater
+    if ! visudo -cf /etc/sudoers.d/litetalk-updater >/dev/null 2>&1; then
+      echo "sudoers 校验失败，已回滚" >&2
+      rm -f /etc/sudoers.d/litetalk-updater
+      exit 1
+    fi
+    log "已写入 /etc/sudoers.d/litetalk-updater"
   fi
 fi
 

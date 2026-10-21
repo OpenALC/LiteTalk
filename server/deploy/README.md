@@ -222,8 +222,12 @@ sudo bash install.sh --dir /opt/litetalk --user litetalk --no-updater
 - 检测 root/OS/arch，从 GitHub Release 下载 `litetalk-server-linux-<arch>.tar.gz`
   （内含 `litetalk-server` + `litetalk-updater` + `update.sh`）并校验 `SHA256SUMS.txt`；
 - 安全解包（成员白名单、拒绝路径穿越/符号链接），二进制 root 所有 0755，安装目录属主是服务用户；
-- 生成 `/etc/litetalk.env` 与更新器 env/secret 模板（**不覆盖已有文件**；secret 生成后不回显）；
-- 安装 systemd 单元并 `enable --now`。`--no-updater` 只装主服务；
+- 生成 `/etc/litetalk.env` 与更新器 env/secret 模板（**不覆盖已有文件**；secret 生成后不回显，
+  权限 `0640 root:<服务用户>`——更新器以服务用户运行要自己读它，other 位为 0）；
+- 安装 systemd 单元与 sudoers 并 `enable --now`。**已存在的 unit/sudoers 不会被覆盖**，
+  新模板写到同目录 `.new` 供对比合并（`.new` 不会被 systemd/sudo 读取）。`--no-updater` 只装主服务；
+- 生成的 `litetalk.service` 已带 `AmbientCapabilities/CapabilityBoundingSet=CAP_NET_BIND_SERVICE`：
+  非 root 服务用户也能用 `LITETALK_DOMAIN` 起内置 ACME 监听 443，不必事后手改 unit；
 - **通道策略**：默认只装正式版 tag；预发布（`-alpha/-beta/-rc`）需显式 `--prerelease`。
 
 ## 9. 自动更新（#97）
@@ -251,7 +255,7 @@ HMAC 校验）→ 下载 + SHA256 → 原子替换 → `systemctl restart liteta
    | `LITETALK_UPDATER_ENABLED` | `1` | `0` 时 webhook 只校验签名与格式并返回 202 ignored，不下载不替换不重启；`update.sh --once` 手工升级不受影响 |
    | `LITETALK_UPDATER_ALLOW_PRERELEASE` | `0` | 默认只接受正式版 tag；**当前 release 全是 `-alpha`，自动更新预发布需显式设 `1`** |
    | `LITETALK_UPDATER_DOMAIN` | `update.example.com` | TLS-ALPN-01 签发域名 |
-   | `LITETALK_UPDATER_SECRET_FILE` | `/etc/litetalk-updater.webhook.secret` | webhook secret（0600，缺失/为空时更新器拒绝启动） |
+   | `LITETALK_UPDATER_SECRET_FILE` | `/etc/litetalk-updater.webhook.secret` | webhook secret，**`0640 root:<服务用户>`**（更新器以服务用户运行需组读；other 位为 0；0600 root:root 会让进程读不到而起不来）。缺失/为空时更新器拒绝启动 |
    | `LITETALK_UPDATER_REPO` | `OpenALC/LiteTalk` | 仓库白名单 |
    | `LITETALK_UPDATER_INSTALL_DIR` | `/www/wwwroot/LiteTalk` | 主服务安装目录 |
    | `LITETALK_UPDATER_SERVICE` | `litetalk.service` | 重启目标（与 sudoers 同名） |
@@ -264,7 +268,10 @@ HMAC 校验）→ 下载 + SHA256 → 原子替换 → `systemctl restart liteta
 
 ```bash
 # 生成 secret 并写入服务器（不回显到终端历史之外的地方）
+# 权限 0640 root:www：更新器以 www 运行、自己读本文件；other 位为 0
 sudo bash -c 'umask 077; openssl rand -hex 32 > /etc/litetalk-updater.webhook.secret'
+sudo chown root:www /etc/litetalk-updater.webhook.secret
+sudo chmod 640 /etc/litetalk-updater.webhook.secret
 
 gh api repos/OpenALC/LiteTalk/hooks \
   -f name=web -f active=true \

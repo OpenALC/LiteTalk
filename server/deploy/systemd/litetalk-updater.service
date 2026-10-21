@@ -1,7 +1,8 @@
 # 轻音 LiteTalk — 自动更新器 systemd 单元（#97）
 # 部署位置：/etc/systemd/system/litetalk-updater.service
-# 前置：/etc/litetalk-updater.env（0600 root:root）与 webhook secret 文件已就位
-#（见 deploy/env/litetalk-updater.env.example 与 deploy/README.md「自动更新」）。
+# 前置：/etc/litetalk-updater.env（0600 root:root，systemd 以 root 读取注入环境）
+# 与 webhook secret 文件（0640 root:www——本服务以 www 运行且自己读它）已就位，
+# 见 deploy/env/litetalk-updater.env.example 与 deploy/README.md「自动更新」。
 [Unit]
 Description=LiteTalk Updater (GitHub release webhook auto-update)
 After=network-online.target litetalk.service
