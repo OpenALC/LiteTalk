@@ -86,9 +86,20 @@ func (u *Updater) logf(format string, args ...any) {
 	}
 }
 
-// RunOnce 执行一次完整更新并记录状态（webhook 后台 worker 与 --once 共用）。
-// dry-run 不写状态；tag 为 latest 时先解析成具体 tag。
+// RunOnce 执行一次完整更新并记录状态（--once 入口）。
+// 先取跨进程锁：服务进程的后台 worker 正在更新时直接返回 ErrLocked；dry-run 也持锁。
 func (u *Updater) RunOnce(ctx context.Context, tag, delivery string) (Result, error) {
+	lock, err := AcquireLock(u.cfg.StateDir)
+	if err != nil {
+		return Result{Tag: tag, DryRun: u.cfg.DryRun}, err
+	}
+	defer lock.Release()
+	return u.runOnce(ctx, tag, delivery)
+}
+
+// runOnce 更新主体，不含锁：调用方必须已持有跨进程锁（RunOnce 或 server.runUpdate）。
+// dry-run 不写状态；tag 为 latest 时先解析成具体 tag。
+func (u *Updater) runOnce(ctx context.Context, tag, delivery string) (Result, error) {
 	start := u.now()
 	res, err := u.Execute(ctx, tag)
 	res.Duration = u.now().Sub(start)

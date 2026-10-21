@@ -1,5 +1,6 @@
 // 轻音 LiteTalk 服务端自动更新器入口（#97）。
-// 服务模式：443 TLS-ALPN-01 收 GitHub release webhook，后台单飞执行更新。
+// 服务模式：8088 明文 HTTP 收 GitHub release webhook（公网仅此入口；/status 仅 loopback）。
+// 443 与证书签发归主服务，本进程不做 TLS。
 // --once 模式：手工/SSH 兜底执行同一条更新流水线后退出（update.sh 转发到这里）。
 package main
 
@@ -9,14 +10,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
-
-	"golang.org/x/crypto/acme/autocert"
 
 	"github.com/OpenALC/LiteTalk/server/internal/updater"
 )
@@ -29,7 +27,8 @@ func main() {
 
 	cfg := updater.DefaultConfig()
 	if err := cfg.LoadEnv(os.Getenv); err != nil {
-		logger.Fatalf("环境变量非法: %v", err)
+		logger.Printf("环境变量非法: %v", err)
+		os.Exit(2)
 	}
 
 	fs := flag.NewFlagSet("litetalk-updater", flag.ContinueOnError)
@@ -40,10 +39,7 @@ func main() {
 	showVersion := fs.Bool("version", false, "打印版本号后退出")
 	fs.BoolVar(&cfg.Enabled, "enabled", cfg.Enabled, "0 时 webhook 只校验记录不执行更新（--once 不受影响）")
 	fs.BoolVar(&cfg.AllowPrerelease, "allow-prerelease", cfg.AllowPrerelease, "接受 -alpha/-beta/-rc 预发布 tag")
-	fs.StringVar(&cfg.Listen, "listen", cfg.Listen, "监听地址")
-	fs.StringVar(&cfg.Domain, "domain", cfg.Domain, "TLS-ALPN-01 签发域名")
-	fs.BoolVar(&cfg.NoTLS, "no-tls", cfg.NoTLS, "明文 HTTP（仅本地/测试）")
-	fs.StringVar(&cfg.TLSCacheDir, "tls-cache", cfg.TLSCacheDir, "证书缓存目录（0700）")
+	fs.StringVar(&cfg.Listen, "listen", cfg.Listen, "明文 HTTP 监听地址")
 	fs.StringVar(&cfg.SecretFile, "secret-file", cfg.SecretFile, "webhook secret 文件路径")
 	fs.StringVar(&cfg.Repo, "repo", cfg.Repo, "仓库白名单 owner/name")
 	fs.StringVar(&cfg.AssetName, "asset", cfg.AssetName, "资产名覆盖（默认 litetalk-server-linux-<arch>.tar.gz）")
@@ -64,12 +60,14 @@ func main() {
 	cfg.NoRestart = *noRestart
 
 	if err := cfg.Validate(*once); err != nil {
-		logger.Fatalf("配置非法: %v", err)
+		logger.Printf("配置非法: %v", err)
+		os.Exit(2)
 	}
 
 	if *once {
 		if *tag == "" {
-			logger.Fatal("--once 必须指定 --tag（如 --tag v1.6.2-alpha 或 --tag latest）")
+			logger.Print("--once 必须指定 --tag（如 --tag v1.6.2-alpha 或 --tag latest）")
+			os.Exit(2)
 		}
 		os.Exit(runOnce(cfg, *tag, logger))
 	}
@@ -88,6 +86,12 @@ func runOnce(cfg updater.Config, tag string, logger *log.Logger) int {
 	defer cancel()
 	res, err := up.RunOnce(ctx, tag, "")
 	if err != nil {
+		// 75 = EX_TEMPFAIL：锁被占用是暂时状态，脚本/cron 可稍后重试；
+		// 与真正的更新失败（1）、参数/配置错误（2）区分开。
+		if errors.Is(err, updater.ErrLocked) {
+			logger.Printf("另一个更新进程正在运行（锁 %s/updater.lock 被占用），本次未执行；请稍后重试或先确认没有并行更新", cfg.StateDir)
+			return 75
+		}
 		logger.Printf("更新失败 tag=%s 回滚=%v 耗时=%s: %v", res.Tag, res.RolledBack, res.Duration.Round(time.Millisecond), err)
 		return 1
 	}
@@ -124,27 +128,8 @@ func runService(cfg updater.Config, logger *log.Logger) {
 	}
 
 	errCh := make(chan error, 1)
-	if cfg.NoTLS {
-		logger.Printf("监听 http://%s（--no-tls，仅供本地/测试）", cfg.Listen)
-		go func() { errCh <- httpSrv.ListenAndServe() }()
-	} else {
-		if err := os.MkdirAll(cfg.TLSCacheDir, 0o700); err != nil {
-			logger.Fatalf("建证书缓存目录失败: %v", err)
-		}
-		// TLS-ALPN-01：不依赖 80 端口；HostPolicy 限定单域名防被 CA 限流
-		m := &autocert.Manager{
-			Prompt:     autocert.AcceptTOS,
-			HostPolicy: autocert.HostWhitelist(cfg.Domain),
-			Cache:      autocert.DirCache(cfg.TLSCacheDir),
-		}
-		httpSrv.TLSConfig = m.TLSConfig()
-		ln, err := net.Listen("tcp", cfg.Listen)
-		if err != nil {
-			logger.Fatalf("监听 %s 失败: %v", cfg.Listen, err)
-		}
-		logger.Printf("监听 https://%s 域名=%s", cfg.Listen, cfg.Domain)
-		go func() { errCh <- httpSrv.ServeTLS(ln, "", "") }()
-	}
+	logger.Printf("监听 http://%s（明文；公网仅 webhook，/status 仅 loopback/SSH 隧道）", cfg.Listen)
+	go func() { errCh <- httpSrv.ListenAndServe() }()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
