@@ -1,0 +1,41 @@
+# 轻音 LiteTalk — 自动更新器 systemd 单元（#97）
+# 部署位置：/etc/systemd/system/litetalk-updater.service
+# 前置：/etc/litetalk-updater.env（0600 root:root）与 webhook secret 文件已就位
+#（见 deploy/env/litetalk-updater.env.example 与 deploy/README.md「自动更新」）。
+[Unit]
+Description=LiteTalk Updater (GitHub release webhook auto-update)
+After=network-online.target litetalk.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 与主服务同用户（安装目录属主），不给 root 常驻
+User=www
+Group=www
+WorkingDirectory=/www/wwwroot/LiteTalk
+EnvironmentFile=/etc/litetalk-updater.env
+ExecStart=/www/wwwroot/LiteTalk/litetalk-updater
+
+# 443 是特权端口：TLS-ALPN-01 直接监听需要绑定特权端口
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# 不要加 NoNewPrivileges=true：它会禁掉 setuid 提权，sudo -n systemctl restart
+#（更新器重启主服务的唯一通道）将全部失败。最小权限由下面的 sudoers 保证：
+# www 只能 restart/is-active litetalk.service（见 deploy/sudoers/litetalk-updater）。
+
+# 基础加固：系统树只读，只放行安装目录与状态目录写入
+NoNewPrivileges=false
+ProtectSystem=full
+ReadWritePaths=/www/wwwroot/LiteTalk /var/lib/litetalk-updater
+PrivateTmp=true
+
+Restart=on-failure
+RestartSec=5
+
+# 日志走 journald：journalctl -u litetalk-updater -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
