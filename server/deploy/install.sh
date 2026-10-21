@@ -211,7 +211,7 @@ fi
 
 if [ "$WITH_UPDATER" = 1 ]; then
   if [ "$DRY_RUN" = 1 ]; then
-    echo "  将生成（不覆盖已有）: /etc/litetalk-updater.env /etc/litetalk-updater.webhook.secret"
+    echo "  将生成（不覆盖已有）: /etc/litetalk-updater.env（LISTEN=:8088 明文 HTTP）、webhook secret"
   else
     if [ ! -e /etc/litetalk-updater.env ]; then
       cat > /etc/litetalk-updater.env <<EOF
@@ -219,7 +219,8 @@ if [ "$WITH_UPDATER" = 1 ]; then
 # 完整说明见 server/deploy/env/litetalk-updater.env.example
 LITETALK_UPDATER_ENABLED=1
 LITETALK_UPDATER_ALLOW_PRERELEASE=$ALLOW_PRERELEASE
-LITETALK_UPDATER_DOMAIN=update.openalc.cc
+# 8088 明文 HTTP：公网只需放行 webhook；/status 仅环回（SSH 隧道）
+LITETALK_UPDATER_LISTEN=:8088
 LITETALK_UPDATER_INSTALL_DIR=$DIR
 LITETALK_UPDATER_STATE_DIR=/var/lib/litetalk-updater
 EOF
@@ -227,6 +228,20 @@ EOF
       log "已生成 /etc/litetalk-updater.env（secret 不写入本文件）"
     else
       log "保留已有 /etc/litetalk-updater.env"
+      # 存量 env 只读检查：旧模板的 TLS 变量在 8088 模式下无效，LISTEN=:443 会被拒绝启动。
+      # 生产文件不自动改（安装脚本必须幂等且不覆盖既有配置），只提示人工合并。
+      stale_env=0
+      if grep -Eq '^[[:space:]]*(export[[:space:]]+)?LITETALK_UPDATER_(DOMAIN|NO_TLS|TLS_CACHE)=' /etc/litetalk-updater.env; then
+        log "警告: 仍有 LITETALK_UPDATER_DOMAIN/NO_TLS/TLS_CACHE，8088 模式下会被忽略"
+        stale_env=1
+      fi
+      if grep -Eq '^[[:space:]]*(export[[:space:]]+)?LITETALK_UPDATER_LISTEN=:443([[:space:]]|$)' /etc/litetalk-updater.env; then
+        log "警告: LITETALK_UPDATER_LISTEN=:443 会被拒绝启动（443 归主服务内置 ACME）"
+        stale_env=1
+      fi
+      if [ "$stale_env" = 1 ]; then
+        log "      编辑建议: 删除上述变量，改为 LITETALK_UPDATER_LISTEN=:8088，然后 systemctl restart litetalk-updater"
+      fi
     fi
     # webhook secret：缺失才生成；无论新旧都把属主/权限校正到 root:$SVC_USER 0640
     #（旧版误配 0600 root:root 时更新器读不到，重跑安装即修复）。
@@ -240,9 +255,10 @@ EOF
     fi
     chown "root:$SVC_USER" /etc/litetalk-updater.webhook.secret
     chmod 640 /etc/litetalk-updater.webhook.secret
-    mkdir -p /var/lib/litetalk-updater/autocert
+    mkdir -p /var/lib/litetalk-updater
+    # -R 顺带修正历史遗留的 root 属主（曾用 root 跑过 update.sh 会让 www 读不到状态/拿不到锁）
     chown -R "$SVC_USER:$SVC_USER" /var/lib/litetalk-updater
-    chmod 700 /var/lib/litetalk-updater /var/lib/litetalk-updater/autocert
+    chmod 700 /var/lib/litetalk-updater
   fi
 fi
 
@@ -265,6 +281,7 @@ if [ "$DRY_RUN" = 1 ]; then
   echo "  将安装（不覆盖已有）: /etc/systemd/system/litetalk.service（User=$SVC_USER Dir=$DIR，含 443 capability）"
   if [ "$WITH_UPDATER" = 1 ]; then
     echo "  将安装（不覆盖已有）: /etc/systemd/system/litetalk-updater.service、/etc/sudoers.d/litetalk-updater"
+    echo "  更新器监听 :8088 明文 HTTP：公网只需放行 TCP 8088，/status 仅环回"
     echo "  将执行: systemctl daemon-reload && systemctl enable --now litetalk.service litetalk-updater.service"
   else
     echo "  将执行: systemctl daemon-reload && systemctl enable --now litetalk.service"
@@ -308,29 +325,50 @@ if [ "$WITH_UPDATER" = 1 ]; then
 Description=LiteTalk Updater (GitHub release webhook auto-update)
 After=network-online.target litetalk.service
 Wants=network-online.target
+# 8088 被占用时进程会秒退：限流，避免 Restart=on-failure 打成重启风暴。
+# 这两项必须写在 [Unit]，写在 [Service] 会被 systemd 忽略。
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 Type=simple
+# 与主服务同用户（安装目录属主），不给 root 常驻
 User=$SVC_USER
 Group=$SVC_USER
 WorkingDirectory=$DIR
 EnvironmentFile=/etc/litetalk-updater.env
 ExecStart=$DIR/litetalk-updater
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-# 不要加 NoNewPrivileges=true：会禁掉 sudo 的 setuid 提权，重启主服务会失败
+
+# 8088 是普通端口，不需要 CAP_NET_BIND_SERVICE（443 归主服务内置 ACME）。
+# 不要加 NoNewPrivileges=true：它会禁掉 setuid 提权，sudo -n systemctl restart
+#（更新器重启主服务的唯一通道）将全部失败。最小权限由下面的 sudoers 保证：
+# $SVC_USER 只能 restart/is-active litetalk.service（见 deploy/sudoers/litetalk-updater）。
+
+# 基础加固：系统树只读，只放行安装目录与状态目录写入
 NoNewPrivileges=false
 ProtectSystem=full
 ReadWritePaths=$DIR /var/lib/litetalk-updater
 PrivateTmp=true
+
 Restart=on-failure
 RestartSec=5
+
+# 日志走 journald：journalctl -u litetalk-updater -f
 StandardOutput=journal
 StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
+  # 存量 unit 只读检查：旧模板带 443 capability，8088 用不到且会误导排障。
+  # 不自动覆盖（上面已另存 .new），只提示人工合并。先滤掉注释行：
+  # 新模板的注释本身会提到 CAP_NET_BIND_SERVICE，不能当作残留。
+  if grep -Ev '^[[:space:]]*(#|$)' /etc/systemd/system/litetalk-updater.service \
+     | grep -Eq 'CAP_NET_BIND_SERVICE|:443'; then
+    log "警告: 现有 /etc/systemd/system/litetalk-updater.service 仍含 CAP_NET_BIND_SERVICE 或 :443"
+    log "      8088 是普通端口，不需要 capability；请对比同目录 .new 后手工合并并 daemon-reload"
+  fi
 
   if [ -e /etc/sudoers.d/litetalk-updater ]; then
     log "保留已有 /etc/sudoers.d/litetalk-updater"
@@ -358,5 +396,9 @@ fi
 log "安装完成。"
 log "验证: curl -fsS http://127.0.0.1:8077/api/v1/healthz"
 if [ "$WITH_UPDATER" = 1 ]; then
-  log "自动更新接入步骤（DNS/443/webhook/ping 演练）见 server/deploy/README.md「自动更新」"
+  log "自动更新接入："
+  log "  1) 安全组/防火墙放行 TCP 8088（无需 DNS/证书，443 仍归主服务）"
+  log "  2) GitHub 仓库 Settings → Webhooks 指向 http://<服务器IP>:8088/hooks/github-release（content_type=json）"
+  log "  3) /status 只允许环回：ssh -N -L 127.0.0.1:8088:127.0.0.1:8088 <用户>@<服务器>"
+  log "详见 server/deploy/README.md「自动更新」"
 fi

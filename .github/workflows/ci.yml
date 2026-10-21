@@ -60,6 +60,9 @@ jobs:
         working-directory: server
     steps:
       - uses: actions/checkout@v4
+      # 部署脚本没有单元测试：至少让语法错误在检查阶段暴露
+      - name: 部署脚本语法检查
+        run: bash -n deploy/install.sh deploy/update.sh
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
@@ -541,13 +544,22 @@ jobs:
       - name: 生成 SHA256SUMS
         working-directory: dist
         run: sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
-      - name: 发布 Release
+      - name: 创建 Release（draft，先传完资产）
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
           generate_release_notes: true
+          # 先建 draft：资产上传完成前不触发 published，更新器收到的第一个 published
+          # 事件就带完整资产（更新器仍保留 12×5s 晚到重试）。
+          draft: true
           # -alpha / -beta / -rc 标签标记为预发布
           prerelease: ${{ contains(github.ref_name, '-') }}
+      # 资产全部上传后再发布。本步失败则 Release 停留在 draft：需手工发布或重跑本 job；
+      # 已发布后重跑只会产生 edited 事件（更新器忽略），此时靠 Redeliver 或 SSH 兜底。
+      - name: 发布 Release（draft → published）
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --repo "$GITHUB_REPOSITORY"
 
   # SSH 兜底（#97）：webhook 投递不稳时经 SSH 调服务器上的 update.sh --tag <tag>。
   # DEPLOY_SSH_KEY / DEPLOY_HOST / DEPLOY_USER 任一缺失即跳过（不阻塞 release）；
@@ -590,10 +602,25 @@ jobs:
             echo "::error::DEPLOY_UPDATE_PATH 形态非法: $script"
             exit 1
           fi
+          # 预发布 tag 要 --allow-prerelease：tag 已被上面的正则锁成封闭字符集，
+          # 这里追加的是固定字面量，不构成注入面。
+          allow=""
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            allow=" --allow-prerelease"
+          fi
           mkdir -p "$HOME/.ssh"
           printf '%s\n' "$DEPLOY_SSH_KEY" > "$HOME/.ssh/deploy_key"
           chmod 600 "$HOME/.ssh/deploy_key"
+          set +e
           ssh -i "$HOME/.ssh/deploy_key" \
             -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 \
             "$DEPLOY_USER@$DEPLOY_HOST" \
-            "bash '$script' --tag '$GITHUB_REF_NAME'"
+            "bash '$script' --tag '$GITHUB_REF_NAME'$allow"
+          rc=$?
+          set -e
+          # 75 = 更新器跨进程锁被占用（webhook 已在跑同一次更新）：视为已覆盖，不算失败
+          if [ "$rc" -eq 75 ]; then
+            echo "::notice::服务器已有更新在运行，跳过 SSH 兜底"
+            exit 0
+          fi
+          exit "$rc"

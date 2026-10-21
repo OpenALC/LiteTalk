@@ -2,6 +2,10 @@
 # 轻音 LiteTalk 服务端手工/兜底升级入口（#97）。
 # 转发到同目录 litetalk-updater --once：与 webhook 走同一条更新流水线，避免两套实现分叉。
 # 幂等：同一 tag 重复执行等价于再校验一次；dry-run 不改任何文件。
+# 推荐 sudo -u <服务用户> 运行：root 生成的 state/lock 属主会让以服务用户运行的更新器
+# 读不到状态、拿不到锁（EACCES）。
+# 退出码：0 成功；1 更新失败（已回滚）；2 用法/参数错误；
+#         75 已有更新在运行（跨进程锁被 webhook 或另一个 --once 占用）。
 set -euo pipefail
 
 usage() {
@@ -13,6 +17,9 @@ usage() {
   --allow-prerelease  放行 -alpha/-beta/-rc（默认通道只收正式版）
   --timeout           healthz 断言超时秒数（默认 60）
   -h, --help          显示帮助
+
+推荐: sudo -u www /www/wwwroot/LiteTalk/update.sh --tag vX.Y.Z
+退出码: 0 成功 / 1 更新失败（已回滚）/ 2 参数错误 / 75 已有更新在运行
 EOF
 }
 
