@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"strconv"
 
 	"github.com/OpenALC/LiteTalk/server/internal/store"
 )
@@ -75,6 +76,28 @@ func (s *Server) DeleteCategory(ctx context.Context, request DeleteCategoryReque
 			}
 		}
 	}
+	// 删除前收集频道（含子频道）：删完行就查不到，踢房要覆盖语音房（#37 补缺口）。
+	all, err := s.store.ChannelsOfServer(ctx, cat.ServerID)
+	if err != nil {
+		return nil, s.writeStoreErr(ctx, err)
+	}
+	var kickIDs []int64
+	inCat := map[int64]bool{}
+	for _, ch := range all {
+		if ch.CategoryID != nil && *ch.CategoryID == request.Id {
+			inCat[ch.ID] = true
+		}
+	}
+	for _, ch := range all {
+		if ch.ParentID != nil && inCat[*ch.ParentID] {
+			inCat[ch.ID] = true
+		}
+	}
+	for _, ch := range all {
+		if inCat[ch.ID] && ch.Type == store.ChannelVoice {
+			kickIDs = append(kickIDs, ch.ID)
+		}
+	}
 	if err := s.store.DeleteCategoryWithChannels(ctx, request.Id); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
@@ -85,6 +108,11 @@ func (s *Server) DeleteCategory(ctx context.Context, request DeleteCategoryReque
 		TargetType: "category", TargetID: ptrID(cat.ID),
 		Detail: auditDetail(map[string]any{"name": cat.Name, "with_channels": withChannels == 1}),
 	})
+	if s.hub != nil {
+		for _, id := range kickIDs {
+			s.hub.KickChannel(strconv.FormatInt(id, 10), "channel_deleted")
+		}
+	}
 	return DeleteCategory200JSONResponse{Status: "ok"}, nil
 }
 

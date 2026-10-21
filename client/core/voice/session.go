@@ -181,6 +181,10 @@ type Session struct {
 	joinMu       sync.Mutex
 	pendingJoins []pendingJoin
 	joinSeq      uint64
+	// roomPassword 当前房的入房密码（#37，joinMu 保护）：用户发起 join 时覆盖
+	//（含空串）；重连/ICE 重建的 channel.join 从这里取。Leave/voice_taken/
+	// 进房失败回滚即清空。不落盘、不日志。
+	roomPassword string
 
 	// protoVer 服务端协商到的协议版本（#29）：0=尚未收到 server.hello（按 v1 行为）。
 	// v2 客户端据此停发 voice.state{speaking} 等版本相关行为（#33 接线）。
@@ -447,7 +451,7 @@ func (s *Session) handleSignalConnect(c *signal.Client) {
 	// 不登记的话异步 error 只会弹 toast，本地仍留在「幽灵房间」里（#91）。
 	if room, _ := s.roomID.Load().(string); room != "" {
 		seq := s.beginJoin(room)
-		if err := c.Send(signal.TypeChannelJoin, signal.ChannelJoinData{ChannelID: room}); err != nil {
+		if err := c.Send(signal.TypeChannelJoin, signal.ChannelJoinData{ChannelID: room, Password: s.roomPasswordCached()}); err != nil {
 			// 保留 roomID 等下次重连再试（原有语义），只摘掉本次 pending，
 			// 避免后续无关 error 被误归属到这次失败的发送。
 			s.abortJoinSend(seq, false)
@@ -772,7 +776,7 @@ func (s *Session) rebuildAfterICEFail(channelID string) {
 		// 重建入房同样登记 pending：重建被拒（频道已删/无权限）时按进房失败
 		// 回滚，而不是把幽灵房间留给下一次重连（#91）。
 		seq := s.beginJoin(room)
-		if err := s.ws.Send(signal.TypeChannelJoin, signal.ChannelJoinData{ChannelID: room}); err != nil {
+		if err := s.ws.Send(signal.TypeChannelJoin, signal.ChannelJoinData{ChannelID: room, Password: s.roomPasswordCached()}); err != nil {
 			s.abortJoinSend(seq, false)
 			s.log.Printf("session: ICE 失败重建 channel.join 发送失败: %v", err)
 		}
@@ -793,6 +797,7 @@ func (s *Session) leaveRoomLocal() {
 	// 退房后迟到的 error/joined 不得再回滚或恢复房间态，在途 join 一并作废。
 	s.pendingJoins = nil
 	s.roomID.Store("")
+	s.roomPassword = "" // #37：退房即清密码（voice_taken/进房失败回滚走这里）
 	s.teardownLocalRoomLocked()
 }
 
@@ -886,9 +891,16 @@ func (s *Session) setupPeer() {
 	}
 }
 
-// JoinChannel 加入语音频道。发送成功只代表请求已发出——服务端是否接纳是
-// 异步回执（channel.joined / error 帧），见 beginJoin/handleErrorFrame（#91）。
+// JoinChannel 加入语音频道（不带密码；带密码用 JoinChannelWithPassword）。
+// 发送成功只代表请求已发出——服务端是否接纳是异步回执（channel.joined /
+// error 帧），见 beginJoin/handleErrorFrame（#91）。
 func (s *Session) JoinChannel(channelID string) error {
+	return s.JoinChannelWithPassword(channelID, "")
+}
+
+// JoinChannelWithPassword 带密码入房（#37）。password 每次 join 覆盖缓存（含空串），
+// 重连/ICE 重建的 channel.join 从缓存取——缓存不落盘、不日志。
+func (s *Session) JoinChannelWithPassword(channelID, password string) error {
 	if s.ws == nil {
 		return fmt.Errorf("session not connected")
 	}
@@ -898,14 +910,30 @@ func (s *Session) JoinChannel(channelID string) error {
 	// 预取 ICE 凭证再进房：setupPeer 跑在 WS 读循环上，不能做网络 I/O（#13）。
 	// 这里是 Wails 绑定 goroutine，阻塞可接受；失败留空缓存，降级空 ICE 列表。
 	s.prefetchICE()
+	s.setRoomPassword(password)
 	seq := s.beginJoin(channelID)
-	if err := s.ws.Send(signal.TypeChannelJoin, signal.ChannelJoinData{ChannelID: channelID}); err != nil {
+	if err := s.ws.Send(signal.TypeChannelJoin, signal.ChannelJoinData{ChannelID: channelID, Password: password}); err != nil {
 		// roomID 先存是为断线重连恢复；发送失败必须回滚——否则重连后
 		// OnConnect 重发 join 造成「幽灵入房」。
 		s.abortJoinSend(seq, true)
 		return fmt.Errorf("join channel: %w", err)
 	}
 	return nil
+}
+
+// setRoomPassword 覆写入房密码缓存（#37）：仅用户主动 join 时调用；
+// 重连/ICE 重建只读不写。
+func (s *Session) setRoomPassword(pw string) {
+	s.joinMu.Lock()
+	s.roomPassword = pw
+	s.joinMu.Unlock()
+}
+
+// roomPasswordCached 读入房密码缓存（#37）：重连/ICE 重建的 channel.join 用。
+func (s *Session) roomPasswordCached() string {
+	s.joinMu.Lock()
+	defer s.joinMu.Unlock()
+	return s.roomPassword
 }
 
 // beginJoin 登记一次进房意图并乐观写 roomID（断线重连据此恢复）。返回的
@@ -948,6 +976,7 @@ func (s *Session) abortJoinSend(seq uint64, rollbackRoom bool) {
 	if cur, _ := s.roomID.Load().(string); cur == ch {
 		// 不恢复到更早的 pending：发送失败时那些 join 也未必成功，等回执确认。
 		s.roomID.Store("")
+		s.roomPassword = "" // #37：发送失败回滚即清密码
 	}
 }
 
@@ -990,6 +1019,7 @@ func (s *Session) settlePendingJoin(rollback bool) (channelID string, consumed, 
 		return head.channelID, true, false
 	}
 	s.roomID.Store("")
+	s.roomPassword = "" // #37：进房失败回滚即清密码
 	s.teardownLocalRoomLocked()
 	return head.channelID, true, true
 }
@@ -1001,6 +1031,7 @@ func (s *Session) LeaveChannel() error {
 	// 主动离开后迟到的 join 回执/错误不得再改状态：在途意图全部作废。
 	s.pendingJoins = nil
 	s.roomID.Store("")
+	s.roomPassword = "" // #37：主动退房清密码
 	// 与 voice_taken 共用同一条本地拆房路径：媒体、peer、远端链路、成员表与
 	// 状态表一起清；放在 joinMu 内，避免并发 JoinChannel 装上新 peer 后被误关。
 	s.teardownLocalRoomLocked()
@@ -1444,10 +1475,12 @@ func isJoinOnlyErrorCode(code string) bool {
 //   - quota_exceeded：进房满员（hub.joinRoom）之外，rtc.offer 的 SFU 容量
 //     上限（hub.handleRTCOffer，§0.1.3）与握手连接数上限也会返回——无 pending
 //     时必须继续走聊天错误回调，不能当 join-only 丢弃。
+//   - bad_password（#37）：频道密码错误，join 专属但走同一错误帧通道；
+//     归入共享码让 pending 非空时按进房失败回滚并触发 OnJoinFailed。
 func isJoinSharedErrorCode(code string) bool {
 	switch code {
 	case signal.ErrCodeForbidden, signal.ErrCodeBadMessage, signal.ErrCodeRateLimited,
-		signal.ErrCodeQuotaExceeded:
+		signal.ErrCodeQuotaExceeded, signal.ErrCodeBadPassword:
 		return true
 	}
 	return false

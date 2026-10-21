@@ -157,17 +157,19 @@ func TestRolesMigrationSQLite(t *testing.T) {
 	ctx := context.Background()
 	m := openTestSQLite(t)
 	full := findMigrationsSQLite(t)
+	// 只叠到 0010（不含 0011+）：RollbackLast 只撤最新一个，必须让 0010 停在顶上。
+	until0010 := migrationsBefore(t, full, "0011")
 	if err := m.Migrate(ctx, migrationsBefore(t, full, "0010")); err != nil {
 		t.Fatalf("迁移到 0009 失败: %v", err)
 	}
 	seedLegacy0010(t, m.DB())
-	if err := m.Migrate(ctx, full); err != nil {
+	if err := m.Migrate(ctx, until0010); err != nil {
 		t.Fatalf("应用 0010 失败: %v", err)
 	}
 	assertBackfill0010(t, m.DB())
 
 	// down：四张新表消失、旧表与 legacy 数据保留。
-	if err := m.RollbackLast(ctx, full); err != nil {
+	if err := m.RollbackLast(ctx, until0010); err != nil {
 		t.Fatalf("down 失败: %v", err)
 	}
 	assertTablesGone0010(t, func(table string) bool {
@@ -180,7 +182,7 @@ func TestRolesMigrationSQLite(t *testing.T) {
 	})
 
 	// 再 up：重新回填（新行 id 由 rowid 分配，按 builtin_key 断言）。
-	if err := m.Migrate(ctx, full); err != nil {
+	if err := m.Migrate(ctx, until0010); err != nil {
 		t.Fatalf("再 up 失败: %v", err)
 	}
 	assertBackfill0010(t, m.DB())
@@ -191,11 +193,13 @@ func TestRolesMigrationMySQL(t *testing.T) {
 	ctx := context.Background()
 	m := openRolesMySQL(t)
 	full := findMigrations(t)
+	// 只叠到 0010（不含 0011+）：RollbackLast 只撤最新一个，必须让 0010 停在顶上。
+	until0010 := migrationsBefore(t, full, "0011")
 	if err := m.Migrate(ctx, migrationsBefore(t, full, "0010")); err != nil {
 		t.Fatalf("迁移到 0009 失败: %v", err)
 	}
 	seedLegacy0010(t, m.DB())
-	if err := m.Migrate(ctx, full); err != nil {
+	if err := m.Migrate(ctx, until0010); err != nil {
 		t.Fatalf("应用 0010 失败: %v", err)
 	}
 	assertBackfill0010(t, m.DB())
@@ -206,7 +210,7 @@ func TestRolesMigrationMySQL(t *testing.T) {
 		`DELETE FROM schema_migrations WHERE version = '0010_roles_permissions'`); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Migrate(ctx, full); err != nil {
+	if err := m.Migrate(ctx, until0010); err != nil {
 		t.Fatalf("重跑 0010 失败: %v", err)
 	}
 	var roleCnt, assignCnt int
@@ -225,7 +229,7 @@ func TestRolesMigrationMySQL(t *testing.T) {
 	assertBackfill0010(t, m.DB())
 
 	// down：四张新表消失、旧表保留。
-	if err := m.RollbackLast(ctx, full); err != nil {
+	if err := m.RollbackLast(ctx, until0010); err != nil {
 		t.Fatalf("down 失败: %v", err)
 	}
 	assertTablesGone0010(t, func(table string) bool {
@@ -239,7 +243,7 @@ func TestRolesMigrationMySQL(t *testing.T) {
 	})
 
 	// 再 up。
-	if err := m.Migrate(ctx, full); err != nil {
+	if err := m.Migrate(ctx, until0010); err != nil {
 		t.Fatalf("再 up 失败: %v", err)
 	}
 	assertBackfill0010(t, m.DB())

@@ -473,6 +473,14 @@ func (m *Mem) ChannelsOfServer(_ context.Context, serverID int64) ([]Channel, er
 			out = append(out, *c)
 		}
 	}
+	// 与 MySQL/SQLite 的 ORDER BY position, id 对齐（#37）：map 遍历序随机，
+	// 不排序会让频道列表/父子收集的顺序三实现不一致。
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Position != out[j].Position {
+			return out[i].Position < out[j].Position
+		}
+		return out[i].ID < out[j].ID
+	})
 	return out, nil
 }
 
@@ -492,6 +500,18 @@ func (m *Mem) DeleteChannel(_ context.Context, id int64) error {
 	defer m.mu.Unlock()
 	if _, ok := m.channels[id]; !ok {
 		return ErrNotFound
+	}
+	// 子频道行级联（#37）：消息/覆盖一并清，与 SQL 实现同语义。
+	for cid, c := range m.channels {
+		if c.ParentID != nil && *c.ParentID == id {
+			delete(m.channels, cid)
+			m.deleteOverwritesOfChannelLocked(cid)
+			for mid, msg := range m.messages {
+				if msg.ChannelID == cid {
+					delete(m.messages, mid)
+				}
+			}
+		}
 	}
 	delete(m.channels, id)
 	m.deleteOverwritesOfChannelLocked(id)
@@ -559,7 +579,8 @@ func (m *Mem) CategoriesOfServer(_ context.Context, serverID int64) ([]Category,
 }
 
 // DeleteCategoryWithChannels 删除分类及其下全部频道（含各频道消息与覆盖），
-// 与 MySQL 实现语义一致（单操作原子性由 m.mu 保证）。
+// 与 MySQL 实现语义一致（单操作原子性由 m.mu 保证）。子频道同分类是 API 不变量，
+// 按 parent_id 再兜一圈防数据漂移漏行（#37）。
 func (m *Mem) DeleteCategoryWithChannels(_ context.Context, id int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -567,14 +588,23 @@ func (m *Mem) DeleteCategoryWithChannels(_ context.Context, id int64) error {
 	if !ok {
 		return ErrNotFound
 	}
+	inCat := map[int64]bool{}
 	for cid, ch := range m.channels {
-		if ch.CategoryID != nil && *ch.CategoryID == c.ID {
-			delete(m.channels, cid)
-			m.deleteOverwritesOfChannelLocked(cid)
-			for mid, msg := range m.messages {
-				if msg.ChannelID == cid {
-					delete(m.messages, mid)
-				}
+		if ch.ServerID == c.ServerID && ch.CategoryID != nil && *ch.CategoryID == c.ID {
+			inCat[cid] = true
+		}
+	}
+	for cid, ch := range m.channels {
+		if ch.ParentID != nil && inCat[*ch.ParentID] {
+			inCat[cid] = true
+		}
+	}
+	for cid := range inCat {
+		delete(m.channels, cid)
+		m.deleteOverwritesOfChannelLocked(cid)
+		for mid, msg := range m.messages {
+			if msg.ChannelID == cid {
+				delete(m.messages, mid)
 			}
 		}
 	}
