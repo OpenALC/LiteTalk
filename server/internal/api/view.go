@@ -257,6 +257,43 @@ func (s *Server) friendUserView(ctx context.Context, u *store.User, status store
 	return s.userView(ctx, u)
 }
 
+// fillFriendChannel 给好友条目填当前语音房快照（#92）。隐私口径：
+//   - 门槛只看查看者的 ViewChannel，不要求 ConnectVoice；
+//   - 无权限、authz 未注入、查询故障、VoicePresence 缺失/失败一律省略字段
+//     （channel_id/server_id 键不得出现在原始 JSON），不 500、不记为有权；
+//   - 只出频道/服务器 ID，永不携带频道名；dev 内置房间（serverID=0）省略。
+//
+// viewer 是好友列表的持有者（查看者），subject 是对端（被查看的好友）。
+func (s *Server) fillFriendChannel(ctx context.Context, viewer, subject int64, entry *FriendEntry) {
+	if s.voice == nil {
+		return
+	}
+	chStr, sidStr, ok := s.voice.VoiceChannelOf(strconv.FormatInt(subject, 10))
+	if !ok || sidStr == "" || sidStr == "0" {
+		return // 不在语音房 / dev 内置房间（无 store 频道实体）
+	}
+	chID, errCh := strconv.ParseInt(chStr, 10, 64)
+	sid, errSid := strconv.ParseInt(sidStr, 10, 64)
+	if errCh != nil || errSid != nil {
+		s.log.Printf("api: 好友频道快照省略（ID 非法 user=%d ch=%q srv=%q）", subject, chStr, sidStr)
+		return
+	}
+	if s.authz == nil {
+		s.log.Printf("api: 好友频道快照省略（权限服务未就绪） viewer=%d ch=%d", viewer, chID)
+		return
+	}
+	okView, err := s.authz.CanInServer(ctx, viewer, sid, chID, store.ViewChannel)
+	if err != nil {
+		// 故障不当有权（出字段）也不当无权（伪造 403/假事实）：省略并记日志。
+		s.log.Printf("api: 好友频道权限查询失败（viewer=%d ch=%d）: %v", viewer, chID, err)
+		return
+	}
+	if !okView {
+		return
+	}
+	entry.ChannelId, entry.ServerId = idPtr(chID), idPtr(sid)
+}
+
 // online presence:{uid} 存在 = 在线；无 KV 依赖时恒离线。
 func (s *Server) online(ctx context.Context, uid int64) bool {
 	if s.presence == nil {

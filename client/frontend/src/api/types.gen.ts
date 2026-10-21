@@ -951,7 +951,7 @@ export interface components {
         };
         /**
          * FriendEntry
-         * @description 好友条目。remark/group 仅发起方视角非空（被请求方恒空串）。 user 为 PublicUser（无 email）。
+         * @description 好友条目。remark/group 仅发起方视角非空（被请求方恒空串）。 user 为 PublicUser（无 email）。 channel_id/server_id 是对端当前语音房快照（#92 好友频道 presence）， 两字段必须同时出现或同时缺省：仅 accepted 且在线、且查看者对该频道有 ViewChannel 权限时出现；无权限/查询故障时键缺省（不得泄露频道）。 载荷不含频道名。
          */
         FriendEntry: {
             /** @description 关系行 ID（请求数） */
@@ -964,6 +964,10 @@ export interface components {
             group: string;
             /** @description 对端 PublicUser；对端查询失败时为 null（仅 accept/patch 极端情况） */
             user: components["schemas"]["PublicUser"] | null;
+            /** @description 对端当前语音频道 ID（#92，可选）；与 server_id 同现同缺。 仅 accepted 且对端在线、查看者对该频道有 ViewChannel 权限时出现。 */
+            channel_id?: string;
+            /** @description channel_id 所属服务器 ID（#92，可选）；与 channel_id 同现同缺。 */
+            server_id?: string;
         };
         /**
          * ServerChannels

@@ -63,16 +63,24 @@ type Hub struct {
 	// 拒绝新连接，杜绝「广播之后仍有新 WS 接入」的窗口。
 	shuttingDown atomic.Bool
 
-	mu         sync.Mutex
-	rooms      map[string]*roomState
-	conns      map[connKey]*client // uid+"\x00"+dev → 当前连接（§0.8）
-	nextConnID uint64              // 连接标识自增（SFU peer 归属核对用）
+	mu    sync.Mutex
+	rooms map[string]*roomState
+	conns map[connKey]*client // uid+"\x00"+dev → 当前连接（§0.8）
+	// userRooms uid → 当前语音房 ID（#92 好友频道 presence 反查）。
+	// 只在成员真正写入 room.members[uid] 的同一临界区设置；leaveWorkLocked
+	// 核对 members[uid]==c 且映射值等于本次 roomID 才删除，旧连接迟到的
+	// cleanup 不得删新连接的映射。同受 h.mu 保护。
+	userRooms  map[string]string
+	nextConnID uint64 // 连接标识自增（SFU peer 归属核对用）
 
 	// presence 写入串行化（#11）：KV SET/DEL 与好友推送都在 h.mu 之外执行，
 	// 但必须按「当前连接事实」依次应用，否则旧连接的 DEL 可能落到新连接的
 	// SET 之后。锁序固定 presenceMu → h.mu，禁止反向获取。
 	presenceMu        sync.Mutex
 	presencePublished map[string]bool // uid → 本进程已发布/已推送的在线态
+	// presenceChanPublished 好友频道 presence 的去抖缓存（#92）：uid → 上次推送的
+	// 语音房状态。无键 = 尚未推过（离线边沿清空，重进同一频道必须重推）。
+	presenceChanPublished map[string]presenceChanState
 
 	// evlog 事件面每会话事件环（#32）：seq 分配与断线续传补发。
 	// 实现为进程内环形队列（单实例假设，见 gateway.go 头注释）。
@@ -96,9 +104,12 @@ func makeConnKey(uid, dev string) connKey { return connKey(uid + "\x00" + dev) }
 
 // roomState 信令层房间：成员表与语音状态（全内存态，M3 换成频道模型）。
 // members 按 uid 索引且同 uid 仅一个连接（多设备会话切换由 join 抢占完成）。
+// serverID 来自 ChannelByID（#92）；dev 内置房间无 store 实体为 0，好友频道
+// presence 据此不带频道字段。
 type roomState struct {
-	id      string
-	members map[string]*client // userID → client
+	id       string
+	serverID int64
+	members  map[string]*client // userID → client
 }
 
 // client 一条 WS 连接。
@@ -212,6 +223,7 @@ func NewHub(s *sfu.SFU, authn Authenticator, sess *auth.SessionIndex, logger *lo
 		readIdle:          defaultReadIdle,
 		rooms:             make(map[string]*roomState),
 		conns:             make(map[connKey]*client),
+		userRooms:         make(map[string]string),
 		evlog:             newMemEventLog(chat.Backlog),
 		presencePublished: make(map[string]bool),
 	}
@@ -534,6 +546,15 @@ func (h *Hub) KickChannel(channelID, reason string) {
 	h.mu.Unlock()
 	for _, w := range pending {
 		h.finishLeave(w)
+	}
+	// 好友频道 presence（#92）：被真正摘除的 uid 逐个收口（离房后在线-only）。
+	synced := make(map[string]bool, len(removed))
+	for _, w := range pending {
+		if !w.removed || synced[w.c.userID] {
+			continue
+		}
+		synced[w.c.userID] = true
+		h.syncPresenceChannel(w.c.userID)
 	}
 	if reason != "" {
 		h.log.Printf("ws: 频道 %s 被移除（%s），%d 人已离房", channelID, reason, len(removed))
@@ -895,6 +916,11 @@ func (h *Hub) joinRoom(c *client, channelID, password string) {
 		}
 		ch = c2
 	}
+	// roomState.serverID（#92）：dev 内置房间保持 0，好友频道 presence 不带字段。
+	var roomServerID int64
+	if ch != nil {
+		roomServerID = ch.ServerID
+	}
 	uid, uidErr := strconv.ParseInt(c.userID, 10, 64)
 
 	// 已在目标房（#37 顺序在密码之前：重发 join 不应被密码门拦）。
@@ -968,7 +994,7 @@ func (h *Hub) joinRoom(c *client, channelID, password string) {
 	}
 	room := h.rooms[channelID]
 	if room == nil {
-		room = &roomState{id: channelID, members: make(map[string]*client)}
+		room = &roomState{id: channelID, serverID: roomServerID, members: make(map[string]*client)}
 		h.rooms[channelID] = room
 	}
 	// 语音单处：摘同 uid 其他会话（锁内），通知与 SFU 清理走 pending（锁外）。
@@ -992,11 +1018,16 @@ func (h *Hub) joinRoom(c *client, channelID, password string) {
 	// 同房抢占会摘掉旧成员——若目标房因此被销毁则重建。
 	room = h.rooms[channelID]
 	if room == nil {
-		room = &roomState{id: channelID, members: make(map[string]*client)}
+		room = &roomState{id: channelID, serverID: roomServerID, members: make(map[string]*client)}
 		h.rooms[channelID] = room
 	}
 	room.members[c.userID] = c
 	c.setRoomID(channelID)
+	// 频道反查（#92）：与成员登记同一临界区写入，避免读侧看到「在房但无映射」。
+	if h.userRooms == nil {
+		h.userRooms = make(map[string]string)
+	}
+	h.userRooms[c.userID] = channelID
 	members := room.snapshotLocked()
 	h.mu.Unlock()
 
@@ -1021,6 +1052,10 @@ func (h *Hub) joinRoom(c *client, channelID, password string) {
 			Self:      byUID[m.userID],
 		})
 	}
+	// 好友频道 presence（#92）：登记完成才是状态变化点。中途 leaveWork 不单独推，
+	// 否则切房会先推一条「无频道」再推目标房；失败路径都 return 在登记之前。
+	// 同 uid 被 voice_taken 的旧连接也是同一 uid 的状态迁移，由这里一次收口。
+	h.syncPresenceChannel(c.userID)
 }
 
 // leaveWork 一次离房的锁内计算结果：锁外执行 SFU 清理与广播。
@@ -1032,7 +1067,8 @@ type leaveWork struct {
 }
 
 // leaveWorkLocked 离房（调用方须持 h.mu）：清本连接 roomID、身份核对后摘成员。
-// members[uid] 不是本连接（已被同账号新连接顶替）时不摘成员、不广播（§0.8 盲删防护）。
+// members[uid] 不是本连接（已被同账号新连接顶替）时不摘成员、不广播（§0.8 盲删防护）；
+// userRooms 同理——旧连接迟到的 cleanup 不得删掉新连接写入的映射（#92）。
 func (h *Hub) leaveWorkLocked(c *client) *leaveWork {
 	roomID := c.roomIDLocked()
 	if roomID == "" {
@@ -1046,6 +1082,9 @@ func (h *Hub) leaveWorkLocked(c *client) *leaveWork {
 	}
 	if room.members[c.userID] == c {
 		delete(room.members, c.userID)
+		if h.userRooms[c.userID] == roomID {
+			delete(h.userRooms, c.userID)
+		}
 		w.removed = true
 	}
 	if len(room.members) == 0 {
@@ -1072,12 +1111,15 @@ func (h *Hub) finishLeave(w leaveWork) {
 }
 
 // leaveRoom 离房：移除成员、SFU 归属清理、向剩余成员广播 channel.peer_left。
+// 离房成功后收口好友频道 presence（#92）；joinRoom 的中途离房不走本函数，
+// 状态变化由 join 成功后的那次 sync 一次收口（见 joinRoom 尾注）。
 func (h *Hub) leaveRoom(c *client) {
 	h.mu.Lock()
 	w := h.leaveWorkLocked(c)
 	h.mu.Unlock()
 	if w != nil {
 		h.finishLeave(*w)
+		h.syncPresenceChannel(c.userID)
 	}
 }
 
@@ -1277,6 +1319,23 @@ func (h *Hub) roomMemberCount(channelID string) int {
 		return 0
 	}
 	return len(room.members)
+}
+
+// VoiceChannelOf 反查 uid 当前语音房（#92 好友频道 presence，api.VoicePresence 满足）。
+// serverID 为十进制字符串；dev 内置房间无 store 实体为 "0"，调用方据此不带频道字段。
+// 只读内存映射，不查 store、不读 presence KV。持 h.mu。
+func (h *Hub) VoiceChannelOf(uid string) (channelID, serverID string, ok bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	ch, ok := h.userRooms[uid]
+	if !ok {
+		return "", "", false
+	}
+	room, ok := h.rooms[ch]
+	if !ok {
+		return "", "", false // 映射与房间表不一致：防御性视为不在房
+	}
+	return ch, formatUID(room.serverID), true
 }
 
 // connByDevice 某 uid+dev 的当前连接（不在线 → nil）。持 h.mu。

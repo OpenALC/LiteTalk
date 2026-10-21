@@ -1917,6 +1917,10 @@ components:
       description: >
         好友条目。remark/group 仅发起方视角非空（被请求方恒空串）。
         user 为 PublicUser（无 email）。
+        channel_id/server_id 是对端当前语音房快照（#92 好友频道 presence），
+        两字段必须同时出现或同时缺省：仅 accepted 且在线、且查看者对该频道有
+        ViewChannel 权限时出现；无权限/查询故障时键缺省（不得泄露频道）。
+        载荷不含频道名。
       required: [id, status, incoming, remark, group, user]
       properties:
         id:
@@ -1938,6 +1942,16 @@ components:
           nullable: true
           allOf:
             - $ref: '#/components/schemas/PublicUser'
+        channel_id:
+          type: string
+          x-go-type: ID
+          description: >
+            对端当前语音频道 ID（#92，可选）；与 server_id 同现同缺。
+            仅 accepted 且对端在线、查看者对该频道有 ViewChannel 权限时出现。
+        server_id:
+          type: string
+          x-go-type: ID
+          description: channel_id 所属服务器 ID（#92，可选）；与 channel_id 同现同缺。
     ServerChannels:
       type: object
       title: ServerChannels
