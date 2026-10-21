@@ -38,5 +38,8 @@ Dockerfile     text eol=lf
 .env       text eol=lf
 .gitattributes text eol=lf
 
+# sudoers 片段（#97，无扩展名）：带 \r 会让 sudo 解析失败，单独钉死 LF
+server/deploy/sudoers/*  text eol=lf
+
 # 第三方 vendored 代码不设规则：行尾随上游，不为统一格式制造无意义 diff
 # （client/third_party/** 保持原样）
