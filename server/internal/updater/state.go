@@ -79,6 +79,24 @@ func (s *StateStore) Get() State {
 	return s.st
 }
 
+// Reload 从磁盘重读状态：--once 或另一个更新进程可能已推进 CurrentVersion，
+// 只靠启动时读一次会让 webhook 的去重/防降级闸用上过期快照。
+// 只有解析成功才替换内存；文件不存在/解析失败返回错误并保留旧内存（后续读取仍可用）。
+func (s *StateStore) Reload() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, err := os.ReadFile(s.path)
+	if err != nil {
+		return fmt.Errorf("读 %s: %w", s.path, err)
+	}
+	var st State
+	if err := json.Unmarshal(b, &st); err != nil {
+		return fmt.Errorf("解析 %s: %w", s.path, err)
+	}
+	s.st = st
+	return nil
+}
+
 // Update 在锁内变更状态并原子落盘。fn 抛错时不落盘。
 func (s *StateStore) Update(fn func(*State)) error {
 	s.mu.Lock()

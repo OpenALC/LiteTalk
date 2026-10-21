@@ -260,6 +260,52 @@ func TestWebhookConcurrentConflict(t *testing.T) {
 	waitFor(t, 2*time.Second, func() bool { return env.st.Get().CurrentVersion == "v1.1.0-alpha" }, "更新完成")
 }
 
+func TestWebhookExternalLockConflict(t *testing.T) {
+	env := newWebhookEnv(t, func(c *Config) { c.AllowPrerelease = true })
+	lock, err := AcquireLock(env.server.cfg.StateDir)
+	if err != nil {
+		t.Fatalf("预占锁失败: %v", err)
+	}
+	defer lock.Release()
+
+	// 外部进程（--once/另一个实例）持锁：webhook 必须 409，且不得启动更新
+	if rec := env.post(t, "release", "d-ext", releaseBody("v1.1.0-alpha", true), true); rec.Code != http.StatusConflict {
+		t.Fatalf("外部锁 = %d, want 409", rec.Code)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if calls := env.runner.snapshot(); len(calls) != 0 {
+		t.Fatalf("外部锁下不得更新: %v", calls)
+	}
+	if env.st.Get().LastResult != "" {
+		t.Fatalf("锁拒绝不应写状态: %+v", env.st.Get())
+	}
+
+	// 锁释放后同一 delivery 应被正常受理（拒绝路径不记 delivery）
+	lock.Release()
+	env.health.arm("v1.1.0-alpha")
+	if rec := env.post(t, "release", "d-ext", releaseBody("v1.1.0-alpha", true), true); rec.Code != http.StatusAccepted {
+		t.Fatalf("释放后 = %d, want 202", rec.Code)
+	}
+	waitFor(t, 2*time.Second, func() bool { return env.st.Get().CurrentVersion == "v1.1.0-alpha" }, "更新完成")
+}
+
+func TestWebhookReleasesLockAfterUpdate(t *testing.T) {
+	env := newWebhookEnv(t, func(c *Config) { c.AllowPrerelease = true })
+	env.health.arm("v1.1.0-alpha")
+	if rec := env.post(t, "release", "d-lockrel", releaseBody("v1.1.0-alpha", true), true); rec.Code != http.StatusAccepted {
+		t.Fatalf("首次 = %d, want 202", rec.Code)
+	}
+	// 状态写入可能比 worker 的 defer 释锁早几微秒：轮询直到能再次取锁
+	waitFor(t, 2*time.Second, func() bool {
+		l, err := AcquireLock(env.server.cfg.StateDir)
+		if err != nil {
+			return false
+		}
+		l.Release()
+		return true
+	}, "更新结束后锁释放")
+}
+
 func TestStatusLoopbackOnly(t *testing.T) {
 	env := newWebhookEnv(t, nil)
 	req := httptest.NewRequest(http.MethodGet, "/status", nil)

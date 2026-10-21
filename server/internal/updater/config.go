@@ -1,26 +1,28 @@
 // Package updater 服务端 Release 自动更新器（#97）。
 // webhook → HMAC 校验 → 下载 + SHA256 → 原子替换 → systemd 重启 → healthz 断言 → 失败回滚。
-// 不导入 server/internal 业务包：独立小二进制、低攻击面；TLS 用 x/crypto/acme/autocert（TLS-ALPN-01，不依赖 80）。
+// 不导入 server/internal 业务包：独立小二进制、低攻击面。
+// 监听明文 HTTP（默认 :8088）：公网仅暴露 webhook，/status 仅 loopback；
+// 443 与证书签发归主服务，本进程不碰 TLS。
 package updater
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // 默认值与生产部署形态对齐（/www/wwwroot/LiteTalk + www 用户 + litetalk.service）。
 const (
-	DefaultListen       = ":443"
-	DefaultDomain       = "update.example.com"
+	DefaultListen       = ":8088"
 	DefaultRepo         = "OpenALC/LiteTalk"
 	DefaultInstallDir   = "/www/wwwroot/LiteTalk"
 	DefaultService      = "litetalk.service"
 	DefaultHealthURL    = "http://127.0.0.1:8077/api/v1/healthz"
 	DefaultStateDir     = "/var/lib/litetalk-updater"
-	DefaultTLSCacheDir  = DefaultStateDir + "/autocert"
 	DefaultSecretFile   = "/etc/litetalk-updater.webhook.secret"
 	DefaultGitHubAPI    = "https://api.github.com"
 	DefaultHealthTimout = 60 * time.Second
@@ -55,9 +57,6 @@ type Config struct {
 	AllowPrerelease bool
 
 	Listen        string
-	Domain        string
-	NoTLS         bool
-	TLSCacheDir   string
 	SecretFile    string
 	Secret        []byte // 测试/嵌入场景直接注入；为空时从 SecretFile 读
 	Repo          string
@@ -80,8 +79,6 @@ func DefaultConfig() Config {
 		Enabled:         true,
 		AllowPrerelease: false,
 		Listen:          DefaultListen,
-		Domain:          DefaultDomain,
-		TLSCacheDir:     DefaultTLSCacheDir,
 		SecretFile:      DefaultSecretFile,
 		Repo:            DefaultRepo,
 		InstallDir:      DefaultInstallDir,
@@ -94,6 +91,7 @@ func DefaultConfig() Config {
 }
 
 // LoadEnv 读取 LITETALK_UPDATER_* 覆盖当前值。取值非法直接报错（fail-closed），不静默回落。
+// 旧版 TLS 相关变量（域名/明文开关/证书缓存）已废弃：升级时留在环境里不报错，但不再读取。
 func (c *Config) LoadEnv(getenv func(string) string) error {
 	str := func(k string, dst *string) {
 		if v := getenv(k); v != "" {
@@ -112,13 +110,6 @@ func (c *Config) LoadEnv(getenv func(string) string) error {
 		}
 	}
 	str("LITETALK_UPDATER_LISTEN", &c.Listen)
-	str("LITETALK_UPDATER_DOMAIN", &c.Domain)
-	if v := getenv("LITETALK_UPDATER_NO_TLS"); v != "" {
-		if c.NoTLS, err = parseBool(v); err != nil {
-			return fmt.Errorf("LITETALK_UPDATER_NO_TLS: %w", err)
-		}
-	}
-	str("LITETALK_UPDATER_TLS_CACHE", &c.TLSCacheDir)
 	str("LITETALK_UPDATER_SECRET_FILE", &c.SecretFile)
 	str("LITETALK_UPDATER_REPO", &c.Repo)
 	str("LITETALK_UPDATER_ASSET", &c.AssetName)
@@ -161,11 +152,19 @@ func (c Config) Validate(once bool) error {
 	if once {
 		return nil
 	}
-	if c.Listen == "" {
-		return fmt.Errorf("监听地址为空")
+	_, portStr, err := net.SplitHostPort(c.Listen)
+	if err != nil {
+		return fmt.Errorf("监听地址非法（应形如 host:port，如 :8088）: %q: %w", c.Listen, err)
 	}
-	if !c.NoTLS && c.Domain == "" {
-		return fmt.Errorf("启用 TLS 时域名不能为空")
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return fmt.Errorf("监听端口不是数字: %q", portStr)
+	}
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("监听端口超出 1..65535: %d", port)
+	}
+	if port < 1024 {
+		return fmt.Errorf("拒绝监听特权端口 %d：updater 已改为 8088 明文、443 归主服务 ACME，请删除旧 TLS 环境变量并使用 :8088", port)
 	}
 	return nil
 }

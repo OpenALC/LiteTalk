@@ -72,3 +72,66 @@ func TestStateHasDeliveryEmpty(t *testing.T) {
 		t.Fatal("空 delivery 不应命中")
 	}
 }
+
+func TestStateReloadSeesOtherInstance(t *testing.T) {
+	dir := t.TempDir()
+	a, err := OpenState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := OpenState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A 持有过期内存快照，B 相当于 --once 或另一个更新进程
+	if err := b.RecordSuccess("v1.1.0", "d-b", "sum", time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.Get().CurrentVersion; got != "" {
+		t.Fatalf("Reload 前 A 不应看到 B 的写入: %q", got)
+	}
+	if err := a.Reload(); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	s := a.Get()
+	if s.CurrentVersion != "v1.1.0" {
+		t.Fatalf("Reload 后 CurrentVersion = %q", s.CurrentVersion)
+	}
+	if !s.HasDelivery("d-b") {
+		t.Fatalf("Reload 应带上 delivery 去重记录: %+v", s.Deliveries)
+	}
+}
+
+func TestStateReloadKeepsMemoryOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordSuccess("v1.0.0", "d1", "", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// 文件损坏：Reload 报错且不覆盖内存
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte("{broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Reload(); err == nil {
+		t.Fatal("解析失败应报错")
+	}
+	if got := st.Get().CurrentVersion; got != "v1.0.0" {
+		t.Fatalf("解析失败不得覆盖内存: %q", got)
+	}
+
+	// 初始状态（文件不存在）：同样只报错，调用方记日志继续
+	st2, err := OpenState(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st2.Reload(); err == nil {
+		t.Fatal("文件不存在应报错")
+	}
+	if st2.Get().CurrentVersion != "" {
+		t.Fatal("缺失文件不得产生状态")
+	}
+}
