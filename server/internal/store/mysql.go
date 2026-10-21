@@ -617,8 +617,10 @@ func (m *MySQL) MembersOfServer(ctx context.Context, serverID int64) ([]ServerMe
 func (m *MySQL) CreateChannel(ctx context.Context, c *Channel) error {
 	c.ID = newID(c.ID)
 	_, err := m.db.ExecContext(ctx,
-		`INSERT INTO channels (id, server_id, name, type, category_id, position) VALUES (?, ?, ?, ?, ?, ?)`,
-		c.ID, c.ServerID, c.Name, c.Type, c.CategoryID, c.Position)
+		`INSERT INTO channels (id, server_id, name, type, category_id, position, password_hash, user_limit, parent_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.ID, c.ServerID, c.Name, c.Type, c.CategoryID, c.Position,
+		c.PasswordHash, c.UserLimit, c.ParentID)
 	if err != nil {
 		return err
 	}
@@ -626,13 +628,14 @@ func (m *MySQL) CreateChannel(ctx context.Context, c *Channel) error {
 		Scan(&c.CreatedAt)
 }
 
-const channelCols = `id, server_id, name, type, category_id, position, created_at`
+const channelCols = `id, server_id, name, type, category_id, position, created_at, password_hash, user_limit, parent_id`
 
-// scanChannel 扫描一行频道（category_id 可空）。
+// scanChannel 扫描一行频道（category_id/parent_id 可空）。
 func scanChannel(rows interface{ Scan(...any) error }) (*Channel, error) {
 	var c Channel
-	var catID sql.NullInt64
-	err := rows.Scan(&c.ID, &c.ServerID, &c.Name, &c.Type, &catID, &c.Position, &c.CreatedAt)
+	var catID, parentID sql.NullInt64
+	err := rows.Scan(&c.ID, &c.ServerID, &c.Name, &c.Type, &catID, &c.Position, &c.CreatedAt,
+		&c.PasswordHash, &c.UserLimit, &parentID)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -641,6 +644,9 @@ func scanChannel(rows interface{ Scan(...any) error }) (*Channel, error) {
 	}
 	if catID.Valid {
 		c.CategoryID = &catID.Int64
+	}
+	if parentID.Valid {
+		c.ParentID = &parentID.Int64
 	}
 	return &c, nil
 }
@@ -668,10 +674,14 @@ func (m *MySQL) ChannelsOfServer(ctx context.Context, serverID int64) ([]Channel
 	return out, rows.Err()
 }
 
+// UpdateChannel 全行写（#37 B1 起含 password_hash/user_limit/parent_id）：
+// 调用方必须先读再写，清除密码写空串、提升顶层写 NULL。
 func (m *MySQL) UpdateChannel(ctx context.Context, c *Channel) error {
 	res, err := m.db.ExecContext(ctx,
-		`UPDATE channels SET name = ?, type = ?, category_id = ?, position = ? WHERE id = ?`,
-		c.Name, c.Type, c.CategoryID, c.Position, c.ID)
+		`UPDATE channels SET name = ?, type = ?, category_id = ?, position = ?,
+		 password_hash = ?, user_limit = ?, parent_id = ? WHERE id = ?`,
+		c.Name, c.Type, c.CategoryID, c.Position,
+		c.PasswordHash, c.UserLimit, c.ParentID, c.ID)
 	if err != nil {
 		return err
 	}
@@ -679,16 +689,25 @@ func (m *MySQL) UpdateChannel(ctx context.Context, c *Channel) error {
 }
 
 func (m *MySQL) DeleteChannel(ctx context.Context, id int64) error {
-	// 单事务：消息 + 频道覆盖 + 频道一起删（#22/#35）。
+	// 单事务：消息 + 频道覆盖 + 子频道行 + 频道一起删（#22/#35/#37）。
+	// 子频道与父同行级联（消息/覆盖一并）；IN 子查询指向 channels，
+	// 不是被删的 messages/overwrites 自身，无 1093 限制。
 	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE channel_id = ?`, id); err != nil {
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM messages WHERE channel_id = ?
+		   OR channel_id IN (SELECT id FROM channels WHERE parent_id = ?)`, id, id); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM channel_overwrites WHERE channel_id = ?`, id); err != nil {
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM channel_overwrites WHERE channel_id = ?
+		   OR channel_id IN (SELECT id FROM channels WHERE parent_id = ?)`, id, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM channels WHERE parent_id = ?`, id); err != nil {
 		return err
 	}
 	res, err := tx.ExecContext(ctx, `DELETE FROM channels WHERE id = ?`, id)
@@ -753,6 +772,7 @@ func (m *MySQL) CategoriesOfServer(ctx context.Context, serverID int64) ([]Categ
 }
 
 // DeleteCategoryWithChannels 单事务删除分类及其下全部频道（含各频道消息与覆盖）。
+// 子频道同分类（API 保证），但删除集按 parent_id 再兜一圈，防数据漂移漏行（#37）。
 // 调用方须先确认分类存在（checkAffected 在事务内同样生效）。
 func (m *MySQL) DeleteCategoryWithChannels(ctx context.Context, id int64) error {
 	tx, err := m.db.BeginTx(ctx, nil)
@@ -761,11 +781,24 @@ func (m *MySQL) DeleteCategoryWithChannels(ctx context.Context, id int64) error 
 	}
 	defer func() { _ = tx.Rollback() }()
 	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM messages WHERE channel_id IN (SELECT id FROM channels WHERE category_id = ?)`, id); err != nil {
+		`DELETE FROM messages WHERE channel_id IN (
+		   SELECT id FROM channels WHERE category_id = ?
+		   UNION
+		   SELECT id FROM channels WHERE parent_id IN (SELECT id FROM channels WHERE category_id = ?)
+		 )`, id, id); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM channel_overwrites WHERE channel_id IN (SELECT id FROM channels WHERE category_id = ?)`, id); err != nil {
+		`DELETE FROM channel_overwrites WHERE channel_id IN (
+		   SELECT id FROM channels WHERE category_id = ?
+		   UNION
+		   SELECT id FROM channels WHERE parent_id IN (SELECT id FROM channels WHERE category_id = ?)
+		 )`, id, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM channels WHERE parent_id IN (
+		   SELECT id FROM (SELECT id FROM channels WHERE category_id = ?) t)`, id); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM channels WHERE category_id = ?`, id); err != nil {

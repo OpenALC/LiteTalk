@@ -150,6 +150,8 @@ func (c *client) closeNow() {
 // CanInServer 语义与 authz 包一致：非成员/无权限 (false, nil)，故障 (false, err)。
 type Authz interface {
 	CanInServer(ctx context.Context, uid, serverID, channelID int64, perm store.Permission) (bool, error)
+	// CanServer 服务器级判定（#37 密码旁路：Administrator/owner）。
+	CanServer(ctx context.Context, uid, serverID int64, perm store.Permission) (bool, error)
 	InvalidateServer(serverID int64)
 }
 
@@ -671,7 +673,7 @@ func (h *Hub) handleMessage(c *client, data []byte) {
 			h.sendError(c, code, msg)
 			return
 		}
-		h.joinRoom(c, d.ChannelID)
+		h.joinRoom(c, d.ChannelID, d.Password)
 	case TypeChannelLeave:
 		h.leaveRoom(c)
 	case TypeRTCOffer:
@@ -870,19 +872,92 @@ func (h *Hub) checkPerm(ctx context.Context, uid, serverID, channelID int64, per
 
 // joinRoom 登记成员并向全房间重发 channel.joined（成员全量，§5.3 无 peer_joined 消息，
 // 成员变化以全量下发，客户端做全量替换）。整个登记在一把 hub.mu 内原子完成。
-// 语音单处（§0.10）：同 uid 其他会话在任一语音房 → 先发 session.voice_taken、
-// 清其房间成员与 SFU peer，然后本连接进房。
-func (h *Hub) joinRoom(c *client, channelID string) {
+// #37 顺序（joinRoom 是密码/人数的唯一权威入口）：结构/权限 → 已在目标房 →
+// 密码（管理员旁路）→ 人数上限 → 离开旧房 → 登记。密码校验不持 hub.mu
+// （bcrypt 贵，不能让整个 hub 排队）；人数检查在 h.mu 内且先于离开旧房——
+// 满员被拒不得改变原房间成员关系。语音单处（§0.10）：同 uid 其他会话在任一
+// 语音房 → 先发 session.voice_taken、清其房间成员与 SFU peer，然后本连接进房
+// （自己另一设备已在目标房时走此路，容量检查对它放行顶替）。
+func (h *Hub) joinRoom(c *client, channelID, password string) {
 	// 兜底再校验一次：joinRoom 可能被 channel.join 之外的路径调用，权限不可绕。
 	if code, msg := h.authorizeChannelJoin(c, channelID); code != "" {
 		h.sendError(c, code, msg)
 		return
 	}
+	// 数字频道取频道行（密码/人数上限）；dev 内置房间无 store 实体，跳过两道门。
+	// authorize 已确认存在，此刻再查失败按 not_found（竞态删频道）。
+	var ch *store.Channel
+	if chID, err := strconv.ParseInt(channelID, 10, 64); err == nil && h.chatStore != nil {
+		c2, err := h.chatStore.ChannelByID(context.Background(), chID)
+		if err != nil {
+			h.sendError(c, ErrCodeNotFound, "频道不存在")
+			return
+		}
+		ch = c2
+	}
+	uid, uidErr := strconv.ParseInt(c.userID, 10, 64)
+
+	// 已在目标房（#37 顺序在密码之前：重发 join 不应被密码门拦）。
+	h.mu.Lock()
+	already := c.roomIDLocked() == channelID
+	h.mu.Unlock()
+	if already {
+		h.sendError(c, ErrCodeAlreadyInChan, "已在该频道中")
+		return
+	}
+
+	// 密码（#37）：频道未设密码时忽略携带值；管理员（Administrator/owner）旁路。
+	// 没带密码 → forbidden（老客户端安全回滚）；带错 → bad_password。
+	if ch != nil && ch.PasswordHash != "" {
+		if uidErr != nil {
+			h.sendError(c, ErrCodeForbidden, "无权进入该频道")
+			return
+		}
+		bypass := false
+		if h.authz != nil {
+			var aerr error
+			bypass, aerr = h.authz.CanServer(context.Background(), uid, ch.ServerID, store.Administrator)
+			if aerr != nil {
+				h.log.Printf("ws: 密码旁路查询失败（用户 %d 频道 %d）: %v", uid, ch.ID, aerr)
+				h.sendError(c, ErrCodeInternal, "权限查询失败")
+				return
+			}
+		}
+		if !bypass {
+			if password == "" {
+				h.sendError(c, ErrCodeForbidden, "该频道需要密码")
+				return
+			}
+			if !auth.CheckPassword(ch.PasswordHash, password) {
+				h.sendError(c, ErrCodeBadPassword, "频道密码错误")
+				return
+			}
+		}
+	}
+
 	h.mu.Lock()
 	if c.roomIDLocked() == channelID {
 		h.mu.Unlock()
 		h.sendError(c, ErrCodeAlreadyInChan, "已在该频道中")
 		return
+	}
+	// 人数上限（#37）：频道限与全局限取小；自己另一设备已在目标房可顶替腾位。
+	// 在离开旧房之前判（满员被拒不得改变原房间成员关系），且不留空房壳。
+	limit := h.maxPer
+	if ch != nil && ch.UserLimit > 0 && ch.UserLimit < limit {
+		limit = ch.UserLimit
+	}
+	if room := h.rooms[channelID]; room != nil {
+		occ := len(room.members)
+		if other := room.members[c.userID]; other != nil && other != c {
+			occ-- // 同 uid 另一设备在目标房：语音单处会顶替它，提前腾位
+		}
+		if occ >= limit {
+			h.mu.Unlock()
+			// 容量超限统一 quota_exceeded（§0.1.3），文案可区分。
+			h.sendError(c, ErrCodeQuotaExceeded, "语音房间已满")
+			return
+		}
 	}
 	var pending []leaveWork
 	// 先离开旧房（成员摘除在锁内，SFU 清理与广播在锁外执行）。
@@ -895,15 +970,6 @@ func (h *Hub) joinRoom(c *client, channelID string) {
 	if room == nil {
 		room = &roomState{id: channelID, members: make(map[string]*client)}
 		h.rooms[channelID] = room
-	}
-	if len(room.members) >= h.maxPer {
-		h.mu.Unlock()
-		for _, w := range pending {
-			h.finishLeave(w)
-		}
-		// 容量超限统一 quota_exceeded（§0.1.3）。
-		h.sendError(c, ErrCodeQuotaExceeded, "语音房间已满")
-		return
 	}
 	// 语音单处：摘同 uid 其他会话（锁内），通知与 SFU 清理走 pending（锁外）。
 	var voiceTakens []*client

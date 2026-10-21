@@ -813,6 +813,10 @@ type ChannelDTO struct {
 	CategoryID *ID       `json:"category_id"`
 	Position   int       `json:"position"`
 	CreatedAt  time.Time `json:"created_at"`
+	// #37 频道选项：父级（nil=顶层）、是否设密码（密码本体永不回显）、人数上限（0=不限）。
+	ParentID    *ID  `json:"parent_id"`
+	HasPassword bool `json:"has_password"`
+	UserLimit   int  `json:"user_limit"`
 }
 
 // ServerChannels GET /servers/{id}/channels 响应（categories + channels 两数组）。

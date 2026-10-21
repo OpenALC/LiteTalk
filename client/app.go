@@ -1411,6 +1411,18 @@ func (a *App) JoinChannel(channelID string) error {
 	return s.JoinChannel(channelID)
 }
 
+// JoinChannelWithPassword 带密码入房（#37）。密码由 Session 缓存供重连复用；
+// 不落盘、不进日志（桥接/前端 B2 再接 UI）。
+func (a *App) JoinChannelWithPassword(channelID, password string) error {
+	a.mu.Lock()
+	s := a.sess
+	a.mu.Unlock()
+	if s == nil {
+		return fmt.Errorf("not connected")
+	}
+	return s.JoinChannelWithPassword(channelID, password)
+}
+
 // LeaveChannel 离开语音频道。
 func (a *App) LeaveChannel() error {
 	a.mu.Lock()

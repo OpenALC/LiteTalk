@@ -270,13 +270,22 @@ type CategoryInfo struct {
 // ChannelInfo 频道。ID 为十进制字符串（#31）。
 type ChannelInfo struct {
 	// CategoryId 分类归属；null = 未分类（请求侧 0 也表示未分类）
-	CategoryId *ID             `json:"category_id"`
-	CreatedAt  Time            `json:"created_at"`
-	Id         ID              `json:"id"`
-	Name       string          `json:"name"`
-	Position   int             `json:"position"`
-	ServerId   ID              `json:"server_id"`
-	Type       ChannelInfoType `json:"type"`
+	CategoryId *ID  `json:"category_id"`
+	CreatedAt  Time `json:"created_at"`
+
+	// HasPassword 是否设有频道密码（#37）；密码明文/哈希永不回显。可选属性，服务端始终返回
+	HasPassword *bool  `json:"has_password,omitempty"`
+	Id          ID     `json:"id"`
+	Name        string `json:"name"`
+
+	// ParentId 父频道 ID（#37 子频道树，仅语音频道）；null = 顶层。可选属性，服务端始终返回
+	ParentId *ID             `json:"parent_id,omitempty"`
+	Position int             `json:"position"`
+	ServerId ID              `json:"server_id"`
+	Type     ChannelInfoType `json:"type"`
+
+	// UserLimit 语音人数上限（#37）；0 = 不限。可选属性，服务端始终返回
+	UserLimit *int `json:"user_limit,omitempty"`
 }
 
 // ChannelInfoType defines model for ChannelInfo.Type.
@@ -310,9 +319,18 @@ type CreateChannelRequest struct {
 	CategoryId *ID `json:"category_id,omitempty"`
 
 	// Name 1–64 字符
-	Name     string                   `json:"name"`
+	Name string `json:"name"`
+
+	// ParentId 父频道 ID（#37，仅语音频道、最多两级）；省略 category_id 时继承父分类
+	ParentId *ID `json:"parent_id,omitempty"`
+
+	// Password 频道密码（#37，1–72 字节，仅语音频道）；只写不读，响应只出 has_password
+	Password *string                  `json:"password,omitempty"`
 	Position *int                     `json:"position,omitempty"`
 	Type     CreateChannelRequestType `json:"type"`
+
+	// UserLimit 语音人数上限 0..100（#37，仅语音频道）；0 = 不限
+	UserLimit *int `json:"user_limit,omitempty"`
 }
 
 // CreateChannelRequestType defines model for CreateChannelRequest.Type.
@@ -491,7 +509,7 @@ type PasswordResetRequest struct {
 // PatchCategoryRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name 不可清， 空值被校验拒 400；position 的 null 拒 400），值 = 设置。 name 与 position 至少给一个。
 type PatchCategoryRequest = PatchCategoryBody
 
-// PatchChannelRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name/type 不可清，空值被校验拒 400；category_id 的 null = 移出分类；position 的 null 拒 400——「删除位置」无语义），值 = 设置。
+// PatchChannelRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name/type 不可清，空值被校验拒 400；category_id 的 null = 移出分类；position 的 null 拒 400——「删除位置」无语义），值 = 设置。#37：password 三态 （缺省不改、null/空串清除、非空设置）；user_limit 的 null 拒 400； parent_id 的 null/0 = 提升顶层、值 = 设置父级。
 type PatchChannelRequest = PatchChannelBody
 
 // PatchFriendRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null/空串 = 清除备注/ 移出分组，值 = 设置。仅发起方向可写。

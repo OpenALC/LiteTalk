@@ -35,6 +35,11 @@ func (s *stubAuthz) CanInServer(_ context.Context, uid, _, _ int64, _ store.Perm
 	return !s.deny[uid], nil
 }
 
+// CanServer 与 CanInServer 同一套桩语义（#37 密码旁路走这里）。
+func (s *stubAuthz) CanServer(ctx context.Context, uid, serverID int64, perm store.Permission) (bool, error) {
+	return s.CanInServer(ctx, uid, serverID, 0, perm)
+}
+
 func (s *stubAuthz) InvalidateServer(int64) {}
 
 // denyOnChannel 对指定成员写个人覆盖并失效缓存。

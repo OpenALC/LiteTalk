@@ -34,6 +34,17 @@ func (s *Server) CreateChannel(ctx context.Context, request CreateChannelRequest
 	if chType != store.ChannelText && chType != store.ChannelVoice {
 		return nil, errf(http.StatusBadRequest, "bad_type", "类型必须是 text 或 voice")
 	}
+	// #37 选项：密码/人数上限仅语音频道；父级校验顺带收口分类归属。
+	if req.Password != nil && *req.Password != "" {
+		if e := checkChannelPassword(*req.Password, chType); e != nil {
+			return nil, e
+		}
+	}
+	if req.UserLimit != nil {
+		if e := checkUserLimit(*req.UserLimit, chType); e != nil {
+			return nil, e
+		}
+	}
 	// 分类归属校验（与 PATCH 同规则）：存在且属于本服务器，防止跨服挂载/悬空 id。
 	// 0 = 显式无分类，落库前归一成 NULL——否则 0 与 NULL 两种「无分类」并存，
 	// 而 PATCH 那侧一律落 NULL（见 PatchChannel）。
@@ -46,22 +57,46 @@ func (s *Server) CreateChannel(ctx context.Context, request CreateChannelRequest
 		v := int64(*req.CategoryId)
 		catID = &v
 	}
+	var parentID int64
+	if req.ParentId != nil {
+		parentID = int64(*req.ParentId)
+	}
+	// 分类显式给定（含显式 0=无分类）才参与父子一致性校验；缺省随父（#37）。
+	_, catID, e := s.resolveParent(ctx, request.Id, 0, parentID, chType, catID, req.CategoryId != nil)
+	if e != nil {
+		return nil, e
+	}
+	hash, err := hashChannelPassword(derefString(req.Password))
+	if err != nil {
+		return nil, s.writeStoreErr(ctx, err)
+	}
 	ch := &store.Channel{
-		ServerID:   request.Id,
-		Name:       req.Name,
-		Type:       chType,
-		CategoryID: catID,
+		ServerID:     request.Id,
+		Name:         req.Name,
+		Type:         chType,
+		CategoryID:   catID,
+		PasswordHash: hash,
 	}
 	if req.Position != nil {
 		ch.Position = *req.Position
 	}
+	if req.UserLimit != nil {
+		ch.UserLimit = *req.UserLimit
+	}
+	if parentID != 0 {
+		ch.ParentID = &parentID
+	}
 	if err := s.store.CreateChannel(ctx, ch); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
+	// 审计只记 has_password/user_limit/parent_id（#37）：密码明文与哈希都不进 detail。
 	s.audit(ctx, store.AuditLog{
 		ServerID: request.Id, ActorID: c.UserID, Action: "channel.create",
 		TargetType: "channel", TargetID: ptrID(ch.ID), ChannelID: ptrID(ch.ID),
-		Detail: auditDetail(map[string]any{"name": ch.Name, "type": string(ch.Type)}),
+		Detail: auditDetail(map[string]any{
+			"name": ch.Name, "type": string(ch.Type),
+			"has_password": hash != "", "user_limit": ch.UserLimit, "parent_id": parentID,
+		}),
 	})
 	return CreateChannel201JSONResponse(channelView(ch)), nil
 }
@@ -84,9 +119,20 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 	if req == nil {
 		return nil, bodyMissing()
 	}
+	// 有子频道时禁改 category/type/挂父（#37）：子树的分类/类型/层级跟着父走，
+	// 半改会造成树形漂移；先于任何字段应用判，避免半写。
+	if req.CategoryID.Set || req.Type.Set || req.ParentID.Set {
+		has, err := s.hasChildren(ctx, ch.ServerID, ch.ID)
+		if err != nil {
+			return nil, s.writeStoreErr(ctx, err)
+		}
+		if has {
+			return nil, errf(http.StatusConflict, "channel_has_children", "频道已有子频道，不能改分类/类型/父级")
+		}
+	}
 	// Merge Patch（#31）：缺省不改，null = 清空（name/type 不可清 → 校验拒 400；
 	// category_id 的 null = 移出分类；position 的 null 拒 400）。
-	// 审计只记变更字段（#35 B4）。
+	// 审计只记变更字段（#35 B4）；#37 起密码只记 password_changed。
 	detail := map[string]any{}
 	if req.Name.Set {
 		if !validChannelName(req.Name.Val) {
@@ -125,6 +171,47 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 		ch.Position = req.Position.Val
 		detail["position"] = req.Position.Val
 	}
+	// #37 密码三态：缺省不改、null/空串清除、非空设置（校验用上方定稿的频道类型）。
+	if req.Password.Set {
+		if req.Password.Clearing() || req.Password.Val == "" {
+			ch.PasswordHash = ""
+		} else {
+			if e := checkChannelPassword(req.Password.Val, ch.Type); e != nil {
+				return nil, e
+			}
+			hash, err := hashChannelPassword(req.Password.Val)
+			if err != nil {
+				return nil, s.writeStoreErr(ctx, err)
+			}
+			ch.PasswordHash = hash
+		}
+		detail["password_changed"] = true
+	}
+	if req.UserLimit.Set {
+		if req.UserLimit.Clearing() {
+			return nil, errf(http.StatusBadRequest, "bad_request", "user_limit 不可清除")
+		}
+		if e := checkUserLimit(req.UserLimit.Val, ch.Type); e != nil {
+			return nil, e
+		}
+		ch.UserLimit = req.UserLimit.Val
+		detail["user_limit"] = req.UserLimit.Val
+	}
+	if req.ParentID.Set {
+		if req.ParentID.Clearing() || req.ParentID.Val == 0 {
+			ch.ParentID = nil // 提升顶层
+			detail["parent_id"] = nil
+		} else {
+			_, catID, e := s.resolveParent(ctx, ch.ServerID, ch.ID, int64(req.ParentID.Val), ch.Type, ch.CategoryID, req.CategoryID.Set)
+			if e != nil {
+				return nil, e
+			}
+			v := int64(req.ParentID.Val)
+			ch.ParentID = &v
+			ch.CategoryID = catID // 父子同分类：未显式给分类时随父
+			detail["parent_id"] = req.ParentID.Val
+		}
+	}
 	if err := s.store.UpdateChannel(ctx, ch); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
@@ -137,6 +224,7 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 }
 
 // DeleteChannel DELETE /api/v1/channels/{id}（需 ManageChannels，#35 B3）
+// 级联删除子频道（行级在 Store），并把父与全部语音子频道的房间成员踢出（#37）。
 func (s *Server) DeleteChannel(ctx context.Context, request DeleteChannelRequestObject) (DeleteChannelResponseObject, error) {
 	if e := checkID(request.Id); e != nil {
 		return nil, e
@@ -149,6 +237,11 @@ func (s *Server) DeleteChannel(ctx context.Context, request DeleteChannelRequest
 	if e := s.requirePerm(ctx, ch.ServerID, c.UserID, store.ManageChannels); e != nil {
 		return nil, e
 	}
+	// 先收集子频道（Store 级联后就查不到了），踢房要覆盖父与全部语音子频道。
+	children, err := s.channelChildren(ctx, ch.ServerID, ch.ID)
+	if err != nil {
+		return nil, s.writeStoreErr(ctx, err)
+	}
 	if err := s.store.DeleteChannel(ctx, request.Id); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
@@ -157,11 +250,20 @@ func (s *Server) DeleteChannel(ctx context.Context, request DeleteChannelRequest
 	s.audit(ctx, store.AuditLog{
 		ServerID: ch.ServerID, ActorID: c.UserID, Action: "channel.delete",
 		TargetType: "channel", TargetID: ptrID(ch.ID), ChannelID: ptrID(ch.ID),
-		Detail: auditDetail(map[string]any{"name": ch.Name, "type": string(ch.Type)}),
+		Detail: auditDetail(map[string]any{
+			"name": ch.Name, "type": string(ch.Type), "children": len(children),
+		}),
 	})
-	// 频道删除后踢出该房间内成员（#22，单实例语义）。
+	// 频道删除后踢出房间内成员（#22）；语音子频道一并踢（#37，不留幽灵房）。
 	if s.hub != nil {
-		s.hub.KickChannel(strconv.FormatInt(request.Id, 10), "channel_deleted")
+		if ch.Type == store.ChannelVoice {
+			s.hub.KickChannel(strconv.FormatInt(request.Id, 10), "channel_deleted")
+		}
+		for _, child := range children {
+			if child.Type == store.ChannelVoice {
+				s.hub.KickChannel(strconv.FormatInt(child.ID, 10), "channel_deleted")
+			}
+		}
 	}
 	return DeleteChannel200JSONResponse{Status: "ok"}, nil
 }
