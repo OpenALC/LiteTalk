@@ -60,9 +60,11 @@ jobs:
         working-directory: server
     steps:
       - uses: actions/checkout@v4
-      # 部署脚本没有单元测试：至少让语法错误在检查阶段暴露
+      # 部署脚本没有单元测试：至少让语法错误在检查阶段暴露。
+      # bash -n 只解析第一个文件（其余会被当作位置参数），必须逐个检查。
       - name: 部署脚本语法检查
-        run: bash -n deploy/install.sh deploy/update.sh
+        run: |
+          for f in deploy/install.sh deploy/update.sh; do bash -n "$f"; done
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
