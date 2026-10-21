@@ -7,12 +7,24 @@
   "x-direction": "S2C",
   "x-since": 1,
   "x-namespace": "event",
-  "description": "某用户在线状态变化。user_id 是状态变化的用户（不是接收者）；只推给与其互为已接受好友的在线连接，状态未变不发（去抖）。",
+  "description": "某用户在线状态变化。user_id 是状态变化的用户（不是接收者）；只推给与其互为已接受好友的在线连接，状态未变不发（去抖）。channel_id/server_id 是该用户当前语音房（#92 好友频道 presence），两字段必须同时出现或同时缺省；接收者对该频道无 ViewChannel 权限时只推 online 载荷（不得泄露频道标识）。载荷不含频道名。",
   "type": "object",
   "properties": {
     "user_id": { "type": "string" },
     "online": { "type": "boolean" },
-    "ts": { "type": "integer" }
+    "ts": { "type": "integer" },
+    "channel_id": {
+      "type": "string",
+      "x-go-omitempty": true,
+      "x-since": 1,
+      "description": "当前语音频道 ID（#92，可选）；与 server_id 同现同缺，不在语音房或接收者无查看权限时不出现"
+    },
+    "server_id": {
+      "type": "string",
+      "x-go-omitempty": true,
+      "x-since": 1,
+      "description": "channel_id 所属服务器 ID（#92，可选）；与 channel_id 同现同缺"
+    }
   },
   "required": ["user_id", "online", "ts"],
   "additionalProperties": false

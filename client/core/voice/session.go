@@ -65,9 +65,10 @@ type Events struct {
 	// 服务端已把本端摘出房间，本地按退房清理完毕。与 OnKicked 同样可能跑在
 	// ws 读循环 goroutine（会话 wg 内），实现侧不得同步 Close 会话。
 	OnVoiceTaken func()
-	// OnPresenceUpdate 好友在线状态变化（presence.update，#11）。
-	// 跑在 ws 读循环 goroutine，实现侧只做转发。
-	OnPresenceUpdate func(userID string, online bool)
+	// OnPresenceUpdate 好友在线状态变化（presence.update，#11/#92）。
+	// channelID/serverID 是该好友当前语音房（同现同缺，无查看权限或不在
+	// 语音房时为空串）。跑在 ws 读循环 goroutine，实现侧只做转发。
+	OnPresenceUpdate func(userID string, online bool, channelID, serverID string)
 	// OnServerShutdown 服务端优雅关闭（server.shutdown，#21）：停自动重连并提示。
 	// 与 OnKicked 同线程约定。
 	OnServerShutdown func(reason string)
@@ -715,14 +716,14 @@ func (s *Session) registerHandlers() {
 			s.ev.OnVoiceTaken()
 		}
 	})
-	// presence.update：好友在线状态变化（#11），原样转给 UI 层。
+	// presence.update：好友在线状态变化（#11/#92），原样转给 UI 层。
 	s.ws.On(signal.TypePresenceUpdate, func(env signal.Envelope) {
 		var d signal.PresenceUpdateData
 		if env.Decode(&d) != nil || d.UserID == "" {
 			return
 		}
 		if s.ev.OnPresenceUpdate != nil {
-			s.ev.OnPresenceUpdate(d.UserID, d.Online)
+			s.ev.OnPresenceUpdate(d.UserID, d.Online, d.ChannelID, d.ServerID)
 		}
 	})
 	// server.shutdown：服务端优雅关闭（#21）。停掉 ws 自动重连并转给 UI 层提示。
@@ -1349,14 +1350,15 @@ func (s *Session) ChatHandler(fn func(channelID, msgID, userID, nickname, conten
 // resyncRecentMessages 单频道补拉的消息条数（最新 N 条，覆盖断线窗口）。
 const resyncRecentMessages = 50
 
-// applyFriendPresence 好友在线态回灌（状态型更新，幂等）。
+// applyFriendPresence 好友在线态回灌（状态型更新，幂等）；频道快照字段（#92）
+// 与在线态一起透传，UI 刷新好友所在语音房。
 func (s *Session) applyFriendPresence(friends []api.FriendDTO) {
 	if s.ev.OnPresenceUpdate == nil {
 		return
 	}
 	for _, f := range friends {
 		if f.Status == "accepted" {
-			s.ev.OnPresenceUpdate(f.User.ID.String(), f.User.Online)
+			s.ev.OnPresenceUpdate(f.User.ID.String(), f.User.Online, f.ChannelID, f.ServerID)
 		}
 	}
 }

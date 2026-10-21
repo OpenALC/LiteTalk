@@ -45,6 +45,11 @@ func (s *Server) friendEntries(ctx context.Context, uid int64) ([]FriendEntry, e
 		if !incoming {
 			entry.Remark, entry.Group = f.Remark, f.GroupName
 		}
+		// 好友频道 presence 快照（#92）：仅 accepted 且对端在线时反查语音房，
+		// 再按查看者 ViewChannel 过滤；无权限/故障一律省略字段（键不出现）。
+		if f.Status == store.FriendAccepted && entry.User != nil && entry.User.Online {
+			s.fillFriendChannel(ctx, uid, other, &entry)
+		}
 		out = append(out, entry)
 	}
 	return out, nil

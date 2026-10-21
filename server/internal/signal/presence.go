@@ -65,6 +65,9 @@ func (h *Hub) syncPresence(uid string) {
 		h.pushPresence(uid, true)
 		return
 	}
+	// 离线边沿（#92）：先无条件清频道去抖缓存——不能依赖 KV DEL 成功，
+	// 否则重连再进同一频道会被当成「状态未变」而不重推。
+	delete(h.presenceChanPublished, uid)
 	if err := h.presence.Del(ctx, presenceKey(uid)); err != nil {
 		h.log.Printf("presence: DEL %s 失败: %v", uid, err)
 		return
@@ -140,6 +143,129 @@ func (h *Hub) ttl() time.Duration {
 		return h.presenceTTL
 	}
 	return defaultPresenceTTL
+}
+
+// presenceChanState 去抖缓存的语音房状态（#92）。serverID 为十进制字符串，
+// "0" = dev 内置房间（推时不带频道字段）。零值 = 不在语音房。
+type presenceChanState struct {
+	channelID string
+	serverID  string
+}
+
+// friendView 查看者对目标语音房的 ViewChannel 判定结果（#92）。
+// unknown 专用于「查不出来」（authz 未注入/查询故障）：跳过该接收者，
+// 不把故障当有权（泄露频道）或无权（当作无权会把故障伪装成否定事实）。
+type friendView int
+
+const (
+	viewUnknown friendView = iota
+	viewYes
+	viewNo
+)
+
+// syncPresenceChannel 把 uid 的语音房变化推给其互为已接受好友的会话（#92）。
+// 与 syncPresence 共用 presenceMu（锁序 presenceMu → h.mu）。触发点：join 登记
+// 成功、leaveRoom、KickChannel 摘除、断线 cleanup 的离房；失败路径不推。
+//
+//   - 最后一条连接断开时跳过：离线由 syncPresence 的 offline 载荷表达，
+//     频道去抖缓存也在那个边沿被无条件清空。
+//   - 与去抖缓存比较，状态未变不推；无频道只推 online=true（不带频道键）。
+//   - 有频道时逐个接收者按其 ViewChannel 过滤：通过推带 channel_id/server_id
+//     的载荷，不通过推 online-only，查询故障跳过该接收者并记日志。
+//   - dev 非数字房间（serverID==0）一律不带频道字段；载荷永不包含频道名。
+func (h *Hub) syncPresenceChannel(uid string) {
+	if h.presence == nil {
+		return
+	}
+	h.presenceMu.Lock()
+	defer h.presenceMu.Unlock()
+	if h.connCount(uid) == 0 {
+		return
+	}
+	chID, sid, inRoom := h.VoiceChannelOf(uid)
+	cur := presenceChanState{}
+	if inRoom {
+		cur = presenceChanState{channelID: chID, serverID: sid}
+	}
+	if h.presenceChanPublished == nil {
+		h.presenceChanPublished = make(map[string]presenceChanState)
+	}
+	if prev, seen := h.presenceChanPublished[uid]; seen && prev == cur {
+		return // 状态未变（同房重复 join、同房换设备等）：去抖
+	}
+	ctx := context.Background()
+	id, err := parseUID(uid)
+	if err != nil {
+		return // dev 等非数字 uid 无好友关系
+	}
+	fs, err := h.presence.FriendshipsOfUser(ctx, id)
+	if err != nil {
+		h.log.Printf("presence: 查 %s 好友失败: %v", uid, err)
+		return // 不更新缓存：下一次状态变化重试
+	}
+	ts := time.Now().UnixMilli()
+	onlineOnly := PresenceUpdateData{UserID: uid, Online: true, TS: ts}
+	full := onlineOnly
+	// dev 非数字房间（serverID==0）不推频道字段；两字段同现同缺。
+	if cur.serverID != "" && cur.serverID != "0" {
+		full.ChannelID, full.ServerID = cur.channelID, cur.serverID
+	}
+	withChan := make(map[string]bool, len(fs))
+	only := make(map[string]bool, len(fs))
+	for _, f := range fs {
+		if f.Status != store.FriendAccepted {
+			continue
+		}
+		other := f.FriendID
+		if f.FriendID == id {
+			other = f.UserID
+		}
+		if full.ChannelID == "" {
+			only[formatUID(other)] = true
+			continue
+		}
+		switch h.friendViewChannel(ctx, other, cur) {
+		case viewYes:
+			withChan[formatUID(other)] = true
+		case viewNo:
+			only[formatUID(other)] = true
+		default: // viewUnknown：跳过，不推
+		}
+	}
+	if len(withChan) > 0 {
+		h.broadcastEvent(withChan, TypePresenceUpdate, full)
+	}
+	if len(only) > 0 {
+		h.broadcastEvent(only, TypePresenceUpdate, onlineOnly)
+	}
+	h.presenceChanPublished[uid] = cur
+}
+
+// friendViewChannel 判定查看者对目标语音房是否有 ViewChannel（#92）。
+// 权限门槛只看 ViewChannel，不要求 ConnectVoice；authz 未注入与查询故障同路径。
+func (h *Hub) friendViewChannel(ctx context.Context, viewerID int64, ch presenceChanState) friendView {
+	if h.authz == nil {
+		h.log.Printf("presence: 频道推送跳过查看者 %d（权限服务未就绪）", viewerID)
+		return viewUnknown
+	}
+	channelID, err := strconv.ParseInt(ch.channelID, 10, 64)
+	if err != nil {
+		return viewNo // serverID!=0 的房间必是数字频道；解析失败按无权，不出频道字段
+	}
+	serverID, err := strconv.ParseInt(ch.serverID, 10, 64)
+	if err != nil {
+		h.log.Printf("presence: 频道推送跳过查看者 %d（server_id %q 非法）", viewerID, ch.serverID)
+		return viewUnknown
+	}
+	ok, err := h.authz.CanInServer(ctx, viewerID, serverID, channelID, store.ViewChannel)
+	if err != nil {
+		h.log.Printf("presence: 频道权限查询失败（查看者 %d 频道 %d）: %v", viewerID, channelID, err)
+		return viewUnknown
+	}
+	if ok {
+		return viewYes
+	}
+	return viewNo
 }
 
 // parseUID/formatUID hub 的 string uid 与 store 的 int64 uid 互转（presence 推送

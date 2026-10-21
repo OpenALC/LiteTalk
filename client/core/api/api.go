@@ -1079,14 +1079,17 @@ func (c *APIClient) SendFriendRequest(target string) error {
 }
 
 // FriendDTO 好友条目（与服务端 friendView 对齐；Remark/Group 仅发起方视角非空）。
-// ID 为字符串 wire（#31）。
+// ID 为字符串 wire（#31）。ChannelID/ServerID 是对端当前语音房快照（#92）：
+// 两字段同现同缺，无查看权限/对端不在语音房时为空串（键缺省）。
 type FriendDTO struct {
-	ID       ID          `json:"id"`
-	Status   string      `json:"status"` // pending | accepted | blocked
-	Incoming bool        `json:"incoming"`
-	Remark   string      `json:"remark"`
-	Group    string      `json:"group"`
-	User     UserProfile `json:"user"`
+	ID        ID          `json:"id"`
+	Status    string      `json:"status"` // pending | accepted | blocked
+	Incoming  bool        `json:"incoming"`
+	Remark    string      `json:"remark"`
+	Group     string      `json:"group"`
+	User      UserProfile `json:"user"`
+	ChannelID string      `json:"channel_id"`
+	ServerID  string      `json:"server_id"`
 }
 
 // ListFriends 好友关系全量（含 pending；v0.1.2 替换前端 mock）。

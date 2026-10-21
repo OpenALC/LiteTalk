@@ -86,7 +86,11 @@ func (c *console) events() voice.Events {
 		OnVoiceTaken: func() {
 			fmt.Println("event voice-taken")
 		},
-		OnPresenceUpdate: func(userID string, online bool) {
+		OnPresenceUpdate: func(userID string, online bool, channelID, serverID string) {
+			if channelID != "" {
+				fmt.Printf("event presence uid=%s online=%v channel=%s server=%s\n", userID, online, channelID, serverID)
+				return
+			}
 			fmt.Printf("event presence uid=%s online=%v\n", userID, online)
 		},
 		OnServerShutdown: func(reason string) {
