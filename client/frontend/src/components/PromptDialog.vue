@@ -19,7 +19,12 @@ const props = withDefaults(defineProps<{
   options2?: { value: string; label: string }[]
   option2Default?: string
   options2Label?: string
-}>(), { placeholder: '', cta: '确定', initial: '', maxlen: 64 })
+  // secret 密码输入（#37 B2）：type=password + autocomplete=off，且不 trim
+  //（密码允许首尾空格——由 trim=false 单独控制时这里只给默认）。
+  secret?: boolean
+  // trim 提交前是否去掉首尾空白（默认 true；密码场景传 false）。
+  trim?: boolean
+}>(), { placeholder: '', cta: '确定', initial: '', maxlen: 64, secret: false, trim: true })
 
 const emit = defineEmits<{
   (e: 'confirm', value: string, option: string, option2: string): void
@@ -30,8 +35,13 @@ const value = ref(props.initial)
 const option = ref(props.optionDefault ?? props.options?.[0]?.value ?? '')
 const option2 = ref(props.option2Default ?? props.options2?.[0]?.value ?? '')
 
+// effective 提交值：trim=false 原样（密码可含首尾空格），默认去空白。
+function effective(): string {
+  return props.trim ? value.value.trim() : value.value
+}
+
 function submit() {
-  const v = value.value.trim()
+  const v = effective()
   if (!v) return
   emit('confirm', v, option.value, option2.value)
 }
@@ -46,6 +56,7 @@ function submit() {
         <button class="pd-close" title="关闭" @click="emit('close')"><X :size="16" /></button>
       </div>
       <input ref="inputEl" v-model="value" class="pd-input" :placeholder="placeholder"
+             :type="secret ? 'password' : 'text'" :autocomplete="secret ? 'off' : undefined"
              :maxlength="maxlen" autofocus @keydown.enter.prevent="submit">
       <div v-if="options?.length" class="pd-opts">
         <button v-for="o in options" :key="o.value" type="button"
@@ -62,7 +73,7 @@ function submit() {
       </div>
       <div class="pd-acts">
         <button class="pd-cancel" @click="emit('close')">取消</button>
-        <button class="pd-ok" :disabled="!value.trim()" @click="submit">{{ cta }}</button>
+        <button class="pd-ok" :disabled="!effective()" @click="submit">{{ cta }}</button>
       </div>
     </div>
   </div>

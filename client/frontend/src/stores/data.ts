@@ -19,6 +19,10 @@ export interface Channel {
   locked?: boolean
   members?: number
   group: string
+  // #37 B2 频道选项：父频道（空 = 顶层）、是否设密码、语音人数上限（0 = 不限）。
+  parentId?: string
+  hasPassword?: boolean
+  userLimit?: number
 }
 
 export interface Server {
@@ -52,6 +56,43 @@ export interface Friend {
 // isRealID 判断是否为服务端实体 ID（纯数字）；groupsOf 合成的 chan: 分组不是实体。
 export function isRealID(id: string): boolean {
   return /^\d+$/.test(id)
+}
+
+// ChannelNode 频道树节点（#37 B2）：频道 + 其直接子频道（按输入顺序）。
+export interface ChannelNode {
+  ch: Channel
+  children: Channel[]
+}
+
+// channelTree 把一个分类内的频道排成两级树（#37 B2 纯函数）：
+// 根 = 无父 / 父不在本组（孤儿降级）/ 父自身带父（超两级的防御，不丢节点）；
+// 其余挂到父下。保持输入顺序（服务端 position,id），不按 Snowflake 数字排序。
+export function channelTree(channels: Channel[]): ChannelNode[] {
+  const raw = new Map(channels.map((c) => [c.id, c]))
+  const parentOf = (ch: Channel): string | undefined =>
+    ch.parentId && ch.parentId !== ch.id ? ch.parentId : undefined
+  const isRoot = (ch: Channel): boolean => {
+    const p = parentOf(ch)
+    if (!p || !raw.has(p)) return true // 无父 / 孤儿
+    const parent = raw.get(p)!
+    return !!parentOf(parent) // 父自身带父 → 本节点升根，不做成孙级
+  }
+  const roots: ChannelNode[] = []
+  const byId = new Map<string, ChannelNode>()
+  for (const ch of channels) {
+    if (isRoot(ch)) {
+      const node = { ch, children: [] as Channel[] }
+      roots.push(node)
+      byId.set(ch.id, node)
+    }
+  }
+  for (const ch of channels) {
+    const p = parentOf(ch)
+    if (!isRoot(ch) && p) {
+      byId.get(p)?.children.push(ch)
+    }
+  }
+  return roots
 }
 
 // catDropIndex 把拖拽落点换算成 reorderCategory 的插入序（#16）。落点语义是
@@ -238,6 +279,10 @@ export const useServersStore = defineStore('servers', () => {
       name: c.name,
       type: c.type,
       group: (c.category_id ? nameOf.get(c.category_id) : undefined) || UNCATEGORIZED,
+      // #37 B2：新字段映射，顺序沿用服务端（position,id）不重排。
+      parentId: c.parent_id == null || c.parent_id === '' ? undefined : String(c.parent_id),
+      hasPassword: !!c.has_password,
+      userLimit: typeof c.user_limit === 'number' ? c.user_limit : 0,
     }))
     extraGroups.value = {
       ...extraGroups.value,
@@ -341,6 +386,39 @@ export const useServersStore = defineStore('servers', () => {
     if (!ch) return
     await goApp().RenameChannel(chId, name)
     ch.name = name
+  }
+
+  // createSubchannel 建子频道（#37 B2）：类型继承父、分类由服务端随父；
+  // 成功后按返回 DTO 回填 parentId/hasPassword/userLimit。
+  async function createSubchannel(serverId: string, name: string, parentId: string) {
+    const s = findServer(serverId)
+    if (!s) return
+    const parent = s.channels.find((c) => c.id === parentId)
+    const typ = parent?.type ?? 'voice'
+    const c = await goApp().CreateSubchannel(serverId, name, typ, parentId)
+    s.channels.push({
+      id: String(c.id), name: c.name, type: typ,
+      group: parent?.group ?? UNCATEGORIZED,
+      parentId: String(c.parent_id ?? parentId),
+      hasPassword: !!c.has_password,
+      userLimit: c.user_limit ?? 0,
+    })
+  }
+
+  // updateChannelOptions 更新频道选项（#37 B2）：只发变更字段（bridge 侧同约定）；
+  // 成功后用返回 DTO 回填 parentId/hasPassword/userLimit。
+  async function updateChannelOptions(serverId: string, chId: string, parentId: string | null, userLimit: number, password: string, clearPassword: boolean) {
+    const s = findServer(serverId)
+    const ch = s?.channels.find((c) => c.id === chId)
+    if (!ch) return
+    // parentId null = 不改；'0' = 提升顶层；其余 = 设置父。
+    const p = parentId === null ? '' : parentId
+    const c = await goApp().UpdateChannelOptions(chId, p, userLimit, password, clearPassword)
+    if (c.parent_id == null || c.parent_id === '') ch.parentId = undefined
+    else ch.parentId = String(c.parent_id)
+    ch.hasPassword = !!c.has_password
+    ch.userLimit = typeof c.user_limit === 'number' ? c.user_limit : 0
+    // 挂父/换父后分类不变（服务端限父子同分类），group 无需重算。
   }
 
   // deleteChannel 删除频道（REST）。调用方负责先离开语音频道。
@@ -510,6 +588,7 @@ export const useServersStore = defineStore('servers', () => {
     selectServer, selectChannel, findServer,
     loadRemoteServers, createServer, joinServer, renameServer, removeServer,
     createChannel, renameChannel, deleteChannel,
+    createSubchannel, updateChannelOptions,
     extraGroups, groupsOf, createCategory, deleteCategory, renameCategory, reorderCategory,
     resetAll, bindEvents, unbindEvents,
   }
