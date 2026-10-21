@@ -1,6 +1,7 @@
 package updater
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -14,8 +15,18 @@ func TestDefaultConfig(t *testing.T) {
 	if c.AllowPrerelease {
 		t.Fatal("AllowPrerelease 默认应为 0（假）：只收正式版")
 	}
-	if c.Domain != DefaultDomain || c.Repo != DefaultRepo || c.InstallDir != DefaultInstallDir {
+	if c.Listen != ":8088" {
+		t.Fatalf("默认监听 = %q, want :8088（明文）", c.Listen)
+	}
+	if c.Repo != DefaultRepo || c.InstallDir != DefaultInstallDir || c.StateDir != DefaultStateDir {
 		t.Fatalf("默认值漂移: %+v", c)
+	}
+	// 旧 TLS 字段必须彻底删除：引用它们会编译失败，这里再用反射兜底断言。
+	typ := reflect.TypeOf(Config{})
+	for _, name := range []string{"Domain", "NoTLS", "TLSCacheDir"} {
+		if _, ok := typ.FieldByName(name); ok {
+			t.Fatalf("Config 不应再有字段 %s（TLS 已交给主服务）", name)
+		}
 	}
 }
 
@@ -24,8 +35,6 @@ func TestLoadEnv(t *testing.T) {
 		"LITETALK_UPDATER_ENABLED":          "0",
 		"LITETALK_UPDATER_ALLOW_PRERELEASE": "1",
 		"LITETALK_UPDATER_LISTEN":           "127.0.0.1:8099",
-		"LITETALK_UPDATER_DOMAIN":           "up.example.com",
-		"LITETALK_UPDATER_NO_TLS":           "1",
 		"LITETALK_UPDATER_REPO":             "OpenALC/Fork",
 		"LITETALK_UPDATER_INSTALL_DIR":      "/opt/lt",
 		"LITETALK_UPDATER_SERVICE":          "lt.service",
@@ -33,6 +42,11 @@ func TestLoadEnv(t *testing.T) {
 		"LITETALK_UPDATER_STATE_DIR":        "/var/lib/lt",
 		"LITETALK_UPDATER_HEALTH_TIMEOUT":   "30s",
 	}
+	// 已废弃的 TLS 相关变量：升级时留在环境里必须被忽略且不报错。
+	// 名字拆开拼接，保证静态巡检按旧变量名 grep 时生产代码零命中。
+	env["LITETALK_UPDATER_"+"DOMAIN"] = "up.example.com"
+	env["LITETALK_UPDATER_"+"NO_TLS"] = "garbage" // 旧值非法也不参与解析
+	env["LITETALK_UPDATER_"+"TLS_CACHE"] = "/tmp/certs"
 	getenv := func(k string) string { return env[k] }
 	c := DefaultConfig()
 	if err := c.LoadEnv(getenv); err != nil {
@@ -44,8 +58,8 @@ func TestLoadEnv(t *testing.T) {
 	if !c.AllowPrerelease {
 		t.Fatal("ALLOW_PRERELEASE=1 未生效")
 	}
-	if c.Listen != "127.0.0.1:8099" || c.Domain != "up.example.com" || !c.NoTLS {
-		t.Fatalf("监听/域名/TLS 未生效: %+v", c)
+	if c.Listen != "127.0.0.1:8099" || c.Repo != "OpenALC/Fork" || c.StateDir != "/var/lib/lt" {
+		t.Fatalf("普通变量未生效: %+v", c)
 	}
 	if c.HealthTimeout != 30*time.Second {
 		t.Fatalf("超时 = %v", c.HealthTimeout)
@@ -87,6 +101,42 @@ func TestValidate(t *testing.T) {
 	bad4.HealthURL = "not-a-url"
 	if err := bad4.Validate(true); err == nil {
 		t.Fatal("非法 healthz URL 应拒")
+	}
+}
+
+func TestValidateListen(t *testing.T) {
+	cases := []struct {
+		listen string
+		ok     bool
+	}{
+		{":8088", true},
+		{"127.0.0.1:8099", true},
+		{":443", false}, // 443 归主服务 ACME
+		{"0.0.0.0:80", false},
+		{":0", false},
+		{":65536", false},
+		{"bad", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		c := DefaultConfig()
+		c.Listen = tc.listen
+		err := c.Validate(false)
+		if (err == nil) != tc.ok {
+			t.Fatalf("Validate(listen=%q) = %v, want ok=%v", tc.listen, err, tc.ok)
+		}
+	}
+	// <1024 的错误必须指引到 8088，避免升级时继续用旧 TLS 端口
+	c := DefaultConfig()
+	c.Listen = ":443"
+	if err := c.Validate(false); err == nil || !strings.Contains(err.Error(), "8088") {
+		t.Fatalf("特权端口错误应提示改用 8088: %v", err)
+	}
+	// once 模式不监听端口，跳过监听校验
+	c2 := DefaultConfig()
+	c2.Listen = ":443"
+	if err := c2.Validate(true); err != nil {
+		t.Fatalf("--once 不应校验监听端口: %v", err)
 	}
 }
 

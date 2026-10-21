@@ -88,6 +88,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
+	// 状态可能已被 --once 或另一个进程推进：best-effort 重读，失败沿用内存快照。
+	if err := s.st.Reload(); err != nil {
+		s.logf("重读状态失败（沿用内存快照）: %v", err)
+	}
 	s.mu.Lock()
 	updating := s.busy
 	s.mu.Unlock()
@@ -170,6 +174,11 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 状态可能已被 --once 或另一个进程推进：best-effort 重读，失败沿用内存快照。
+	// 去重与防降级都依赖 CurrentVersion，用过期快照会重复更新或误判降级。
+	if err := s.st.Reload(); err != nil {
+		s.logf("重读状态失败（沿用内存快照）delivery=%s: %v", delivery, err)
+	}
 	s.mu.Lock()
 	st := s.st.Get()
 	if st.HasDelivery(delivery) {
@@ -190,22 +199,40 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "update in progress", http.StatusConflict)
 		return
 	}
+	// 进程内 busy 通过后再取跨进程锁：--once/另一个实例正在更新时同样 409。
+	// 非阻塞，可以在 s.mu 内做；失败路径都不设置 busy。
+	lock, err := AcquireLock(s.cfg.StateDir)
+	if errors.Is(err, ErrLocked) {
+		s.mu.Unlock()
+		s.logf("webhook 拒绝：外部更新进程持有锁 tag=%s delivery=%s", tag, delivery)
+		http.Error(w, "update in progress", http.StatusConflict)
+		return
+	}
+	if err != nil {
+		s.mu.Unlock()
+		s.logf("webhook 拒绝：获取更新锁失败 delivery=%s: %v", delivery, err)
+		http.Error(w, "updater unavailable", http.StatusInternalServerError)
+		return
+	}
 	s.busy = true
 	s.mu.Unlock()
 
 	w.WriteHeader(http.StatusAccepted)
-	go s.runUpdate(tag, delivery)
+	go s.runUpdate(tag, delivery, lock)
 }
 
-// runUpdate 后台单飞执行。结束才释放锁；失败不记 delivery，允许重投重试。
-func (s *Server) runUpdate(tag, delivery string) {
+// runUpdate 后台单飞执行。锁由 handleWebhook 在受理时取得，这里负责释放；
+// 失败不记 delivery，允许重投重试。
+func (s *Server) runUpdate(tag, delivery string, lock *Lock) {
 	defer func() {
+		lock.Release()
 		s.mu.Lock()
 		s.busy = false
 		s.mu.Unlock()
 	}()
 	s.logf("更新开始 tag=%s delivery=%s", tag, delivery)
-	res, err := s.up.RunOnce(context.Background(), tag, delivery)
+	// 走 runOnce：锁已在受理时持有，再调 RunOnce 会自己撞 ErrLocked。
+	res, err := s.up.runOnce(context.Background(), tag, delivery)
 	if err != nil {
 		s.logf("更新失败 tag=%s 回滚=%v 耗时=%s err=%v", tag, res.RolledBack, res.Duration.Round(time.Millisecond), err)
 		return
