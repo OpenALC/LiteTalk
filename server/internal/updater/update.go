@@ -448,9 +448,9 @@ func sanitizeVer(v string) string {
 	return b.String()
 }
 
-// equalHex 常量时间比较两个等长字节串。
+// equalHex 常量时间比较两个 SHA256 摘要。长度不符或非 32 字节一律 false（fail-closed）。
 func equalHex(a, b []byte) bool {
-	if len(a) != len(b) {
+	if len(a) != 32 || len(b) != 32 {
 		return false
 	}
 	var v byte
