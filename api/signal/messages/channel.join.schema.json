@@ -10,7 +10,13 @@
   "description": "加入语音频道。",
   "type": "object",
   "properties": {
-    "channel_id": { "type": "string" }
+    "channel_id": { "type": "string" },
+    "password": {
+      "type": "string",
+      "x-go-omitempty": true,
+      "maxLength": 72,
+      "description": "频道密码（#37，可选）；频道未设密码时忽略，设了则必须匹配（管理员可不带）"
+    }
   },
   "required": ["channel_id"],
   "additionalProperties": false

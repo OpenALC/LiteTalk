@@ -16,14 +16,28 @@ import (
 // #36 服务端强制闭麦 REST：权限门、频道形态、自我操作、目标不在房与审计。
 
 // fakeHub 记录 SetServerMuted 调用；按 "channelID|userID" 模拟目标不在房。
+// KickChannel 也记录（#37 删频道/分类的踢房断言）。
 type fakeHub struct {
 	mu    sync.Mutex
 	calls []string
 	notIn map[string]bool
+	kicks []string
 }
 
-func (f *fakeHub) Kick(uid, dev, reason string)         {}
-func (f *fakeHub) KickChannel(channelID, reason string) {}
+func (f *fakeHub) Kick(uid, dev, reason string) {}
+
+func (f *fakeHub) KickChannel(channelID, reason string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.kicks = append(f.kicks, channelID)
+}
+
+// kicked 返回被踢频道 id 列表快照。
+func (f *fakeHub) kicked() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.kicks...)
+}
 
 func (f *fakeHub) SetServerMuted(channelID, userID string, muted bool) error {
 	f.mu.Lock()

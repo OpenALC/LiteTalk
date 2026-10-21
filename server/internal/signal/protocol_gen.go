@@ -54,6 +54,7 @@ const (
 	ErrCodeNotFound            = "not_found"
 	ErrCodeRateLimited         = "rate_limited"
 	ErrCodeQuotaExceeded       = "quota_exceeded"
+	ErrCodeBadPassword         = "bad_password"
 	ErrCodeProtocolUnsupported = "protocol_unsupported"
 )
 
@@ -97,6 +98,7 @@ type UserBrief struct {
 // ChannelJoinData 加入语音频道。
 type ChannelJoinData struct {
 	ChannelID string `json:"channel_id"`
+	Password  string `json:"password,omitempty"` // 频道密码（#37，可选）；频道未设密码时忽略，设了则必须匹配（管理员可不带）
 }
 
 // ChannelJoinedData 房间成员全量。成员变化时向房间内每个成员重发全量（Self 为接收者本人的快照）。

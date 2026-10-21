@@ -111,6 +111,12 @@ type Channel struct {
 	CategoryID *int64      `json:"category_id" db:"category_id"`
 	Position   int         `json:"position" db:"position"`
 	CreatedAt  time.Time   `json:"created_at" db:"created_at"`
+	// #37 B1 频道选项：密码（bcrypt）、人数上限（0=不限）、子频道父级（NULL=顶层）。
+	// PasswordHash 不出 JSON——wire 只暴露 has_password，明文/哈希都不回显。
+	// 更新是全行写：读到的 hash 必须原样写回，清除密码写空串。
+	ParentID     *int64 `json:"parent_id" db:"parent_id"`
+	UserLimit    int    `json:"user_limit" db:"user_limit"`
+	PasswordHash string `json:"-" db:"password_hash"`
 }
 
 // Category 频道分类（v0.1.2 迁移 0003）。空分类可持久化，删除可连带频道。
