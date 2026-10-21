@@ -42,7 +42,8 @@ type Server struct {
 	busy bool
 }
 
-// NewServer 构造 HTTP 面。secret 优先取 cfg.Secret，否则从 SecretFile 读（0600 语义由部署保证）。
+// NewServer 构造 HTTP 面。secret 优先取 cfg.Secret，否则从 SecretFile 读。
+// 部署形态是 0640 root:<服务用户>：进程以服务用户运行必须能组读，other 位为 0。
 // secret 为空直接报错：无签名密钥时宁可不启动，也不开无鉴权入口。
 func NewServer(cfg Config, up *Updater, st *StateStore, logger *log.Logger) (*Server, error) {
 	if st == nil {
