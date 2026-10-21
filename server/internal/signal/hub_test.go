@@ -160,10 +160,15 @@ func (f *chatFixture) dial(token, name string) *wsClient {
 	return c
 }
 
-// awaitHello 读到 hello 为止，途中信封进 pending。超时 5s（与 recvUntil 一致）。
+// wsReadTimeout 测试夹具的读超时。CI -race 全量并行下负载高，调度延迟可让
+// 5s 的旧值偶发过期（表现为 TestJoinPasswordGate 等读超时 flake）；放宽到 15s
+// 只影响夹具超时，不改生产代码、不加 sleep。
+const wsReadTimeout = 15 * time.Second
+
+// awaitHello 读到 hello 为止，途中信封进 pending。超时与 recvUntil 一致。
 func (c *wsClient) awaitHello() {
 	c.t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(wsReadTimeout)
 	for time.Now().Before(deadline) {
 		env := c.readOne()
 		if env.Type == TypeHello {
@@ -172,7 +177,7 @@ func (c *wsClient) awaitHello() {
 		}
 		c.pending = append(c.pending, env)
 	}
-	c.t.Fatalf("awaitHello: 5s 内未收到 hello（user=%s）", c.user)
+	c.t.Fatalf("awaitHello: %v 内未收到 hello（user=%s）", wsReadTimeout, c.user)
 }
 
 func (c *wsClient) send(msgType string, data any) {
@@ -186,10 +191,10 @@ func (c *wsClient) send(msgType string, data any) {
 	}
 }
 
-// readOne 读一个信封（超时 5s）。awaitHello 与 recvUntil 共用。
+// readOne 读一个信封。awaitHello 与 recvUntil 共用。
 func (c *wsClient) readOne() Envelope {
 	c.t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), wsReadTimeout)
 	defer cancel()
 	_, data, err := c.conn.Read(ctx)
 	if err != nil {
@@ -202,11 +207,11 @@ func (c *wsClient) readOne() Envelope {
 	return env
 }
 
-// recvUntil 读到指定类型为止（跳过 hello/joined 等中间消息），超时 5s。
+// recvUntil 读到指定类型为止（跳过 hello/joined 等中间消息）。
 // 先排空 dial 预读进 pending 的信封，再读连接。
 func (c *wsClient) recvUntil(want string) Envelope {
 	c.t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(wsReadTimeout)
 	for time.Now().Before(deadline) {
 		var env Envelope
 		if len(c.pending) > 0 {
