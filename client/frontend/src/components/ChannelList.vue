@@ -4,13 +4,14 @@
 // 按住分类头拖拽排序（#16，原生 DnD）；空服务器显示空态（#12）；
 // 分类数据源为 servers.groupsOf（服务端 categories 实体）；
 // 底部齿轮跳转 /settings 独立路由页。
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import {
   ChevronDown, Hash, Lock, Mic, Volume2, Headphones, HeadphoneOff,
   MicOff, Settings, Pencil, Trash2, FolderPlus, Folder, CircleAlert,
+  Wrench,
 } from 'lucide-vue-next'
 import { useRouter } from 'vue-router'
-import { useServersStore, catDropIndex } from '../stores/data'
+import { useServersStore, catDropIndex, channelTree, type Channel } from '../stores/data'
 import { useVoiceStore } from '../stores/voice'
 import { useAuthStore } from '../stores/auth'
 import { useNotifyStore } from '../stores/notify'
@@ -18,6 +19,7 @@ import { goApp } from '../api/bridge'
 import type { AudioSettings } from '../api/types'
 import ContextMenu, { type CtxItem } from './ContextMenu.vue'
 import PromptDialog from './PromptDialog.vue'
+import ChannelSettingsDialog from './ChannelSettingsDialog.vue'
 import VolumeSlider from './VolumeSlider.vue'
 
 const router = useRouter()
@@ -95,35 +97,80 @@ function pick(id: string) {
   servers.selectChannel(id)
 }
 
+// ---- 密码入房（#37 B2）：hasPassword 先弹密码框；确认后带密码 join ----
+const pwdPrompt = ref<{ id: string } | null>(null)
+
+function joinChannel(id: string, password?: string) {
+  voice.join(id, password).catch((e) => notify.fromErr(e, '加入频道失败'))
+}
+
 // joinOnDblClick 双击语音频道行加入；已在频道时不重复 join。
 // 仅语音频道可加入——双击文字频道进语音房是 review S2 抓的洞。
+// hasPassword 先弹密码框（#37 B2）；取消不发请求。
 async function joinOnDblClick(id: string) {
   servers.selectChannel(id)
   if (id === voice.channelId) return
   const ch = servers.currentServer.channels.find((c) => c.id === id)
   if (ch && ch.type !== 'voice') return
-  try {
-    await voice.join(id)
-  } catch (e) {
-    notify.fromErr(e, '加入频道失败')
+  if (ch?.hasPassword) {
+    pwdPrompt.value = { id }
+    return
   }
+  joinChannel(id)
 }
 
-// ---- 频道右键菜单 ----
-const ctx = ref<{ x: number; y: number; id: string; name: string } | null>(null)
-const ctxItems: CtxItem[] = [
-  { key: 'rename', label: '重命名频道', icon: Pencil },
-  { key: 'delete', label: '删除频道', icon: Trash2, danger: true, confirm: true },
-]
-const renaming = ref<{ id: string; initial: string } | null>(null)
+function onPwdConfirm(value: string) {
+  const p = pwdPrompt.value
+  pwdPrompt.value = null
+  if (!p) return
+  joinChannel(p.id, value)
+}
 
-function openCtx(e: MouseEvent, id: string, name: string) {
-  ctx.value = { x: e.clientX, y: e.clientY, id, name }
+// 入房失败 forbidden/bad_password → 重新弹密码框（#37 B2）：
+// 覆盖 hasPassword 过期（本地以为无密码）或输错密码的情况。
+watch(() => voice.lastJoinFailed, (f) => {
+  if (!f) return
+  if (f.code === 'bad_password' || f.code === 'forbidden') {
+    pwdPrompt.value = { id: f.channelId }
+  }
+})
+
+// ---- 频道右键菜单 ----
+const ctx = ref<{ x: number; y: number; ch: Channel } | null>(null)
+// 菜单项按频道动态出（#37 B2）：设置对所有频道开放；新建子频道仅顶层频道。
+const ctxItems = computed<CtxItem[]>(() => {
+  const c = ctx.value?.ch
+  if (!c) return []
+  const items: CtxItem[] = [
+    { key: 'settings', label: '频道设置', icon: Wrench },
+  ]
+  if (!c.parentId) {
+    items.push({ key: 'subchannel', label: '新建子频道', icon: FolderPlus })
+  }
+  items.push({ key: 'rename', label: '重命名频道', icon: Pencil })
+  items.push({ key: 'delete', label: '删除频道', icon: Trash2, danger: true, confirm: true })
+  return items
+})
+const renaming = ref<{ id: string; initial: string } | null>(null)
+const settingsFor = ref<string | null>(null)
+const subPrompt = ref<{ id: string; type: 'text' | 'voice' } | null>(null)
+
+function openCtx(e: MouseEvent, ch: Channel) {
+  ctx.value = { x: e.clientX, y: e.clientY, ch }
 }
 
 function onCtxSelect(key: string) {
-  const c = ctx.value
+  const c = ctx.value?.ch
   if (!c) return
+  if (key === 'settings') {
+    settingsFor.value = c.id
+    return
+  }
+  if (key === 'subchannel') {
+    // 类型继承父（#37 B2）：分类由服务端随父。
+    subPrompt.value = { id: c.id, type: c.type }
+    return
+  }
   if (key === 'rename') {
     renaming.value = { id: c.id, initial: c.name }
     return
@@ -131,6 +178,17 @@ function onCtxSelect(key: string) {
   if (key === 'delete') {
     removeChannel(c.id)
   }
+}
+
+// onSubConfirm 新建子频道：名称经 PromptDialog，类型随父。
+async function onSubConfirm(value: string) {
+  const p = subPrompt.value
+  subPrompt.value = null
+  if (!p) return
+  try {
+    await servers.createSubchannel(servers.currentServerId, value, p.id)
+    notify.show('子频道已创建')
+  } catch (e) { notify.fromErr(e) }
 }
 
 async function onRenameConfirm(value: string) {
@@ -339,28 +397,43 @@ async function onCatDrop(e: DragEvent, gi: number) {
           <ChevronDown :size="13" />{{ g.name }}
         </div>
         <div class="cat-items">
-          <template v-for="ch in servers.currentServer.channels.filter((c) => c.group === g.name)" :key="ch.id">
+          <!-- 频道树（#37 B2）：根 + 缩进子频道，保持服务端顺序 -->
+          <template v-for="node in channelTree(servers.currentServer.channels.filter((c) => c.group === g.name))" :key="node.ch.id">
             <div class="chan"
-                 :class="{ active: ch.id === servers.currentChannelId, 'in-voice': ch.id === voice.channelId }"
-                 :title="ch.type === 'voice' ? '双击加入语音频道' : ''"
-                 @click="pick(ch.id)"
-                 @dblclick.prevent="joinOnDblClick(ch.id)"
-                 @contextmenu.prevent="openCtx($event, ch.id, ch.name)">
-              <component :is="ch.type === 'text' ? Hash : (ch.locked ? Lock : Volume2)"
+                 :class="{ active: node.ch.id === servers.currentChannelId, 'in-voice': node.ch.id === voice.channelId }"
+                 :title="node.ch.type === 'voice' ? '双击加入语音频道' : ''"
+                 @click="pick(node.ch.id)"
+                 @dblclick.prevent="joinOnDblClick(node.ch.id)"
+                 @contextmenu.prevent="openCtx($event, node.ch)">
+              <component :is="node.ch.hasPassword || node.ch.locked ? Lock : (node.ch.type === 'text' ? Hash : Volume2)"
                          :size="16" />
-              <span class="cname">{{ ch.name }}</span>
-              <span v-if="ch.id === voice.channelId" class="count">
+              <span class="cname">{{ node.ch.name }}</span>
+              <span v-if="node.ch.id === voice.channelId" class="count">
                 <Mic :size="12" />{{ voice.members.length }}
               </span>
-              <span v-else-if="ch.members" class="count"><Mic :size="12" />{{ ch.members }}</span>
+              <span v-else-if="node.ch.members" class="count"><Mic :size="12" />{{ node.ch.members }}</span>
             </div>
             <!-- 所在语音频道行内成员列表（频道内谁在说话可见） -->
-            <div v-if="ch.id === voice.channelId && voice.members.length" class="chan-members">
+            <div v-if="node.ch.id === voice.channelId && voice.members.length" class="chan-members">
               <div v-for="m in voice.members" :key="m.user_id" class="cm-row">
                 <span class="cm-dot" :class="{ on: m.speaking, off: m.mute }" />
                 <span class="cm-name">{{ m.nickname }}</span>
                 <MicOff v-if="m.mute" :size="11" class="cm-mute" />
               </div>
+            </div>
+            <div v-for="child in node.children" :key="child.id" class="chan sub"
+                 :class="{ active: child.id === servers.currentChannelId, 'in-voice': child.id === voice.channelId }"
+                 :title="child.type === 'voice' ? '双击加入语音频道' : ''"
+                 @click="pick(child.id)"
+                 @dblclick.prevent="joinOnDblClick(child.id)"
+                 @contextmenu.prevent="openCtx($event, child)">
+              <component :is="child.hasPassword || child.locked ? Lock : (child.type === 'text' ? Hash : Volume2)"
+                         :size="16" />
+              <span class="cname">{{ child.name }}</span>
+              <span v-if="child.id === voice.channelId" class="count">
+                <Mic :size="12" />{{ voice.members.length }}
+              </span>
+              <span v-else-if="child.members" class="count"><Mic :size="12" />{{ child.members }}</span>
             </div>
           </template>
         </div>
@@ -441,6 +514,18 @@ async function onCatDrop(e: DragEvent, gi: number) {
                   placeholder="分类名称" cta="创建"
                   :maxlen="32"
                   @confirm="onBlankConfirm" @close="blankPrompt = null" />
+    <!-- 密码入房（#37 B2）：secret 输入、不 trim；取消不发请求 -->
+    <PromptDialog v-if="pwdPrompt" title="输入频道密码"
+                  placeholder="频道密码" cta="进入" :maxlen="72"
+                  secret :trim="false"
+                  @confirm="onPwdConfirm" @close="pwdPrompt = null" />
+    <!-- 新建子频道（#37 B2）：名称输入，类型随父、分类由服务端随父 -->
+    <PromptDialog v-if="subPrompt" title="新建子频道"
+                  placeholder="子频道名称" cta="创建"
+                  @confirm="onSubConfirm" @close="subPrompt = null" />
+    <!-- 频道设置（#37 B2）：密码/人数上限/父频道 -->
+    <ChannelSettingsDialog v-if="settingsFor" :channel-id="settingsFor"
+                           @close="settingsFor = null" />
   </aside>
 </template>
 
@@ -508,6 +593,8 @@ async function onCatDrop(e: DragEvent, gi: number) {
 .chan.active :deep(svg) { color: var(--brand-600); }
 /* 所在语音频道：左侧品牌色边条提示 */
 .chan.in-voice { box-shadow: inset 2px 0 0 var(--brand-500); }
+/* 子频道缩进（#37 B2 频道树两级） */
+.chan.sub { padding-left: 26px; }
 
 /* 频道行内成员列表（仅所在语音频道展开） */
 .chan-members { padding: 2px 0 6px 33px; }
