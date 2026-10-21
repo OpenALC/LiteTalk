@@ -37,7 +37,7 @@ type ghRelease struct {
 type GitHubClient struct {
 	APIBase string
 	Repo    string
-	Client  *http.Client
+	Client  *http.Client // API 查询（短超时）
 	Log     *log.Logger
 
 	// 测试注入点
@@ -51,6 +51,12 @@ func (g *GitHubClient) http() *http.Client {
 		return g.Client
 	}
 	return http.DefaultClient
+}
+
+// downloadClient 资产下载用独立客户端：API 的 60s 整体超时会把慢链路上的大文件掐断，
+// 下载放宽到 10 分钟（外层仍有 ctx 可取消）。
+func (g *GitHubClient) downloadClient() *http.Client {
+	return &http.Client{Timeout: 10 * time.Minute}
 }
 
 func (g *GitHubClient) now() time.Time {
@@ -173,7 +179,7 @@ func (g *GitHubClient) Download(ctx context.Context, url, destPath string) (stri
 		return "", err
 	}
 	req.Header.Set("Accept", "application/octet-stream")
-	resp, err := g.http().Do(req)
+	resp, err := g.downloadClient().Do(req)
 	if err != nil {
 		return "", fmt.Errorf("下载 %s: %w", url, err)
 	}
