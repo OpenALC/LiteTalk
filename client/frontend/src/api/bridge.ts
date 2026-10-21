@@ -43,6 +43,8 @@ type GoApp = {
   SetHotkeySettings(s: HotkeySettings): Promise<void>
   GetHotkeyAvailability(): Promise<boolean>
   JoinChannel(channelID: string): Promise<void>
+  // JoinChannelWithPassword 带密码入房（#37）；密码由 Go 侧缓存供重连复用。
+  JoinChannelWithPassword(channelID: string, password: string): Promise<void>
   LeaveChannel(): Promise<void>
   SetMute(muted: boolean): Promise<void>
   SetDeafen(deafened: boolean): Promise<void>
@@ -65,6 +67,10 @@ type GoApp = {
   CreateInviteCode(serverID: string): Promise<string>
   // categoryID 空串/「0」= 不归类（#72 新建即归组，不用等重启对账）。
   CreateChannel(serverID: string, name: string, typ: string, categoryID: string): Promise<ChannelDTO>
+  // 频道选项（#37 B2）：子频道（类型随父）与选项更新（parentID ""=不改/"0"=顶层；
+  // userLimit <0 不改；password 空串不改，clearPassword 清除）。
+  CreateSubchannel(serverID: string, name: string, typ: string, parentID: string): Promise<ChannelDTO>
+  UpdateChannelOptions(channelID: string, parentID: string, userLimit: number, password: string, clearPassword: boolean): Promise<ChannelDTO>
   RenameChannel(id: string, name: string): Promise<void>
   DeleteChannel(id: string): Promise<void>
   CreateCategory(serverID: string, name: string): Promise<CategoryDTO>
@@ -190,6 +196,7 @@ const mockApp: GoApp = {
     }
   },
   async JoinChannel() {},
+  async JoinChannelWithPassword() {},
   async LeaveChannel() {},
   async SetMute() {},
   async SetDeafen() {},
@@ -224,6 +231,20 @@ const mockApp: GoApp = {
   },
   async RenameChannel() {},
   async DeleteChannel() {},
+  async CreateSubchannel(serverID: string, name: string, typ: string, parentID: string) {
+    return {
+      id: String(Date.now()), server_id: serverID, name, type: typ as 'text' | 'voice',
+      category_id: null, position: 0, created_at: '2026-01-01T00:00:00Z',
+      parent_id: parentID, has_password: false, user_limit: 0,
+    }
+  },
+  async UpdateChannelOptions(channelID: string) {
+    return {
+      id: channelID, server_id: '0', name: '频道', type: 'voice' as const,
+      category_id: null, position: 0, created_at: '2026-01-01T00:00:00Z',
+      parent_id: null, has_password: false, user_limit: 0,
+    }
+  },
   async CreateCategory(serverID: string, name: string) {
     return { id: String(Date.now()), server_id: serverID, name, position: 0, created_at: '2026-01-01T00:00:00Z' }
   },

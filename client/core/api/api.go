@@ -955,6 +955,54 @@ func (c *APIClient) CreateChannel(serverID string, name, typ string, categoryID 
 	return &ch, nil
 }
 
+// CreateSubchannel 建子频道（#37 B2）：类型继承父、分类由服务端随父，
+// body 只带 name/type/parent_id。
+func (c *APIClient) CreateSubchannel(serverID, name, typ, parentID string) (*ChannelDTO, error) {
+	status, data, err := c.post(fmt.Sprintf("/servers/%s/channels", serverID),
+		map[string]any{"name": name, "type": typ, "parent_id": parentID}, true)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK && status != http.StatusCreated {
+		return nil, decodeError(status, data)
+	}
+	var ch ChannelDTO
+	if err := json.Unmarshal(data, &ch); err != nil {
+		return nil, fmt.Errorf("decode channel: %w", err)
+	}
+	return &ch, nil
+}
+
+// UpdateChannelOptions 更新频道选项（#37 B2）：只发送要改的字段——
+// parentID 空串不改 / "0" 提升顶层 / 其余设置父；userLimit <0 不改，>=0 设置；
+// password 空串不改，clearPassword 清除，非空设置。不触碰 name/type/position。
+func (c *APIClient) UpdateChannelOptions(channelID, parentID string, userLimit int, password string, clearPassword bool) (*ChannelDTO, error) {
+	body := map[string]any{}
+	if parentID != "" {
+		body["parent_id"] = parentID
+	}
+	if userLimit >= 0 {
+		body["user_limit"] = userLimit
+	}
+	if clearPassword {
+		body["password"] = nil
+	} else if password != "" {
+		body["password"] = password
+	}
+	status, data, err := c.patch(fmt.Sprintf("/channels/%s", channelID), body)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, decodeError(status, data)
+	}
+	var ch ChannelDTO
+	if err := json.Unmarshal(data, &ch); err != nil {
+		return nil, fmt.Errorf("decode channel: %w", err)
+	}
+	return &ch, nil
+}
+
 // RenameChannel 重命名频道（owner/admin）。
 func (c *APIClient) RenameChannel(id string, name string) error {
 	status, data, err := c.patch(fmt.Sprintf("/channels/%s", id), map[string]string{"name": name})

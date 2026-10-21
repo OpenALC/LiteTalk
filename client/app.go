@@ -1510,6 +1510,17 @@ func (a *App) CreateChannel(serverID string, name, typ string, categoryID string
 	return a.api.CreateChannel(serverID, name, typ, categoryID)
 }
 
+// CreateSubchannel 建子频道（#37 B2）：类型继承父、分类由服务端随父。
+func (a *App) CreateSubchannel(serverID, name, typ, parentID string) (*api.ChannelDTO, error) {
+	return a.api.CreateSubchannel(serverID, name, typ, parentID)
+}
+
+// UpdateChannelOptions 更新频道选项（#37 B2）：parentID 空串不改/"0" 顶层；
+// userLimit <0 不改；password 空串不改，clearPassword 清除。
+func (a *App) UpdateChannelOptions(channelID, parentID string, userLimit int, password string, clearPassword bool) (*api.ChannelDTO, error) {
+	return a.api.UpdateChannelOptions(channelID, parentID, userLimit, password, clearPassword)
+}
+
 // RenameChannel 重命名频道（owner/admin）。
 func (a *App) RenameChannel(id string, name string) error {
 	return a.api.RenameChannel(id, name)
