@@ -301,7 +301,8 @@ gh api repos/OpenALC/LiteTalk/hooks \
 
 ```bash
 curl -fsS https://update.openalc.cc/healthz               # 更新器存活 + 证书正常
-curl -fsS http://127.0.0.1:8099/status                    # 仅环回：状态 JSON（enabled/allow_prerelease/updating/state）
+# /status 只允许环回访问：本机用 --resolve 保持 SNI=域名（证书校验过），来源是 127.0.0.1
+curl -fsS --resolve update.openalc.cc:443:127.0.0.1 https://update.openalc.cc/status
 journalctl -u litetalk-updater -n 100 --no-pager
 ls -lt /www/wwwroot/LiteTalk/litetalk-server.bak-* | head  # 备份
 curl -fsS http://127.0.0.1:8077/api/v1/healthz             # 主服务版本应为目标 tag
