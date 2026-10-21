@@ -13,6 +13,8 @@ export interface CtxItem {
   danger?: boolean   // 红色项；配合 confirm 启用二次确认
   confirm?: boolean  // 首次点击不派发，转为确认态
   disabled?: boolean
+  // title 禁用原因等提示（#92）：绑定到按钮 title 属性，禁用项仍可悬停看原因。
+  title?: string
 }
 
 const props = defineProps<{ x: number; y: number; items: CtxItem[] }>()
@@ -57,7 +59,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
     <div ref="menuEl" class="ctx-menu" :style="pos" @click.stop>
       <button v-for="it in items" :key="it.key" class="ctx-item"
               :class="{ danger: it.danger, armed: confirming === it.key }"
-              :disabled="it.disabled" @click="onItem(it)">
+              :disabled="it.disabled" :title="it.title" @click="onItem(it)">
         <component :is="it.icon" v-if="it.icon" :size="14" />
         {{ confirming === it.key ? '再次点击确认' : it.label }}
       </button>
