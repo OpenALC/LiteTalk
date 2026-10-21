@@ -200,3 +200,201 @@ sudo systemctl start litetalk
 - 升级前建议备份数据目录：SQLite 在停止服务后复制 `litetalk.db` 即可（WAL 会在正常关闭时
   回放合并）；整个 `/opt/litetalk/data` 一起复制最稳妥。
 - 旧部署的宽松权限会在首次启动时自动收紧，不需要手工 chmod。
+- 装了自动更新器后优先用一键升级（与 webhook 同一条流水线，失败自动回滚）：
+
+  ```bash
+  sudo /www/wwwroot/LiteTalk/update.sh --tag v1.6.2-alpha --allow-prerelease   # 手工升级
+  sudo /www/wwwroot/LiteTalk/update.sh --tag v1.6.2-alpha --dry-run --allow-prerelease  # 只校验不落地
+  ```
+
+## 8. 一键安装（#97）
+
+`install.sh` 把上面 2-5 步压成一条命令（幂等，重复执行只补齐缺失项，不覆盖已有配置）：
+
+```bash
+sudo bash install.sh                        # 默认装到 /www/wwwroot/LiteTalk，用户 www
+sudo bash install.sh --dry-run              # 只打印动作，不改文件
+sudo bash install.sh --dir /opt/litetalk --user litetalk --no-updater
+```
+
+行为：
+
+- 检测 root/OS/arch，从 GitHub Release 下载 `litetalk-server-linux-<arch>.tar.gz`
+  （内含 `litetalk-server` + `litetalk-updater` + `update.sh`）并校验 `SHA256SUMS.txt`；
+- 安全解包（成员白名单、拒绝路径穿越/符号链接），二进制 root 所有 0755，安装目录属主是服务用户；
+- 生成 `/etc/litetalk.env` 与更新器 env/secret 模板（**不覆盖已有文件**；secret 生成后不回显）；
+- 安装 systemd 单元并 `enable --now`。`--no-updater` 只装主服务；
+- **通道策略**：默认只装正式版 tag；预发布（`-alpha/-beta/-rc`）需显式 `--prerelease`。
+
+## 9. 自动更新（#97）
+
+发布 Release 后服务器自动更新：GitHub `release` webhook → `litetalk-updater`（443 TLS-ALPN-01，
+HMAC 校验）→ 下载 + SHA256 → 原子替换 → `systemctl restart litetalk` → healthz 版本断言
+→ 失败回滚旧二进制。更新器与主服务是两个独立进程：主服务重启期间更新器存活，才能完成
+断言与回滚。
+
+### 9.1 前置：systemd 收敛与网络
+
+1. **进程托管必须收敛到 systemd**（见 §10 生产切换）：更新器重启的目标是
+   `litetalk.service`，孤儿进程形态下更新没有可靠生效点。
+2. DNS：`update.openalc.cc` A 记录指向服务器 IP；安全组/防火墙放行 **TCP 443**
+   （TLS-ALPN-01 不依赖 80）。主服务若占用 443，需调整拓扑（更新器域名独立、
+   不与主服务共用 IP 端口时互不影响；同机 443 冲突见 §9.5）。
+3. 更新器单元与 sudoers 见 `systemd/litetalk-updater.service` 与 `sudoers/litetalk-updater`
+   （`install.sh` 已装则跳过）。**注意**：更新器单元不能开 `NoNewPrivileges=true`——
+   它会禁掉 sudo 的 setuid 提权，`sudo -n systemctl restart` 全部失败；最小权限由
+   sudoers 保证（只放行 `restart`/`is-active litetalk.service`）。
+4. 配置 `/etc/litetalk-updater.env`（0600 root:root）：
+
+   | 变量 | 默认 | 说明 |
+   |---|---|---|
+   | `LITETALK_UPDATER_ENABLED` | `1` | `0` 时 webhook 只校验签名与格式并返回 202 ignored，不下载不替换不重启；`update.sh --once` 手工升级不受影响 |
+   | `LITETALK_UPDATER_ALLOW_PRERELEASE` | `0` | 默认只接受正式版 tag；**当前 release 全是 `-alpha`，自动更新预发布需显式设 `1`** |
+   | `LITETALK_UPDATER_DOMAIN` | `update.openalc.cc` | TLS-ALPN-01 签发域名 |
+   | `LITETALK_UPDATER_SECRET_FILE` | `/etc/litetalk-updater.webhook.secret` | webhook secret（0600，缺失/为空时更新器拒绝启动） |
+   | `LITETALK_UPDATER_REPO` | `OpenALC/LiteTalk` | 仓库白名单 |
+   | `LITETALK_UPDATER_INSTALL_DIR` | `/www/wwwroot/LiteTalk` | 主服务安装目录 |
+   | `LITETALK_UPDATER_SERVICE` | `litetalk.service` | 重启目标（与 sudoers 同名） |
+   | `LITETALK_UPDATER_HEALTH_URL` | `http://127.0.0.1:8077/api/v1/healthz` | 更新后版本断言 |
+   | `LITETALK_UPDATER_STATE_DIR` | `/var/lib/litetalk-updater` | 状态/去重记录 |
+
+   secret 只存在于 webhook 配置与服务器 env 侧，不进仓库、不进 CI、不出日志。
+
+### 9.2 创建 webhook
+
+```bash
+# 生成 secret 并写入服务器（不回显到终端历史之外的地方）
+sudo bash -c 'umask 077; openssl rand -hex 32 > /etc/litetalk-updater.webhook.secret'
+
+gh api repos/OpenALC/LiteTalk/hooks \
+  -f name=web -f active=true \
+  -f 'events[]=release' \
+  -f 'config[url]=https://update.openalc.cc/hooks/github-release' \
+  -f 'config[content_type]=json' \
+  -f "config[secret]=$(sudo cat /etc/litetalk-updater.webhook.secret)"
+```
+
+- ping 验证：`gh api repos/OpenALC/LiteTalk/hooks/<id>/ping`，更新器应返回 202，
+  `journalctl -u litetalk-updater` 可见 `ping 已忽略`。
+- 真实投递验证：对某次 release 用 GitHub 网页 "Redeliver" 重投一次，或等下一次发版。
+- 更新器只接受 `release` + `action=published`；其他 action 返回 202 ignored。
+  同一 delivery 重投返回 200 no-op；不新于当前版本的 tag 会被防降级闸忽略（200）；
+  更新进行中的并发投递返回 409。
+
+### 9.3 更新流程与安全约束
+
+1. 校验 `X-Hub-Signature-256`（HMAC-SHA256，常量时间比较），请求体上限 1MiB；
+2. 仓库白名单 + tag 白名单 `^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc))?$` + 通道策略；
+3. 校验通过立即 202，后台单飞 worker 执行（GitHub 10s 超时不会打断下载）；
+4. GitHub API 查资产（晚到重试 12×5s）→ 下载 `litetalk-server-linux-<arch>.tar.gz` +
+   `SHA256SUMS.txt`（只认同名行）→ SHA256 校验；
+5. 安全解包：只接受白名单成员（`litetalk-server`/`litetalk-updater`/`update.sh`），
+   拒绝路径穿越/符号链接/额外条目/超大文件；只安装 `litetalk-server`（更新器不自我替换）；
+6. 磁盘 ≥200MB → 备份旧二进制为 `litetalk-server.bak-<旧版本>-<时间戳>`（留最近 3 份）
+   → 同文件系统原子 rename → `sudo -n systemctl restart litetalk.service`；
+7. healthz 轮询直到 `version == tag`（默认 60s）；失败回滚备份并再重启，写失败状态。
+   webhook 层面失败记录在状态文件（`/status` 可查），由 GitHub 重投或 `update.sh` 重试。
+
+日志只记 tag、资产、校验和、耗时、结果——不记 secret、请求体、密码。
+
+### 9.4 状态与排查
+
+```bash
+curl -fsS https://update.openalc.cc/healthz               # 更新器存活 + 证书正常
+curl -fsS http://127.0.0.1:8099/status                    # 仅环回：状态 JSON（enabled/allow_prerelease/updating/state）
+journalctl -u litetalk-updater -n 100 --no-pager
+ls -lt /www/wwwroot/LiteTalk/litetalk-server.bak-* | head  # 备份
+curl -fsS http://127.0.0.1:8077/api/v1/healthz             # 主服务版本应为目标 tag
+```
+
+常见问题：
+
+| 症状 | 原因与处置 |
+|---|---|
+| webhook 401 | secret 不一致；重新同步 GitHub webhook 的 secret 与 `/etc/litetalk-updater.webhook.secret` |
+| ping/发布后无动作、日志 `忽略：预发布` | 当前 tag 带 `-alpha` 等后缀，`LITETALK_UPDATER_ALLOW_PRERELEASE=0`（默认）；接受预发布就显式设 `1` |
+| 日志 `忽略：更新器已关闭` | `LITETALK_UPDATER_ENABLED=0`；排障完成改回 `1` |
+| 更新失败 `sudo ... : exit status 1` | sudoers 缺失/未 `chmod 440`，或单元开了 `NoNewPrivileges`（见 §9.1 注） |
+| 更新失败 `healthz 未在…内报告版本` | 新版本起不来；已自动回滚。查 `journalctl -u litetalk` 定位启动失败原因 |
+| 更新失败 `磁盘可用空间不足` | 清理备份/日志，需 ≥200MB |
+| 证书申请失败 | DNS 未生效 / 443 未放行 / 域名被 CA 限流；先 `curl https://update.openalc.cc/healthz` 验证 |
+| webhook 投递不稳（GitHub → 国内 443） | 兜底：release 流水线可 SSH 触发（见 §9.5），或对 release 做 Redeliver |
+
+### 9.5 兜底触发（SSH）
+
+webhook 不可达时，GitHub Actions 在 release 发布后可经 SSH 调服务器上的
+`update.sh --tag <tag>`（secrets：`DEPLOY_SSH_KEY` / `DEPLOY_HOST` / `DEPLOY_USER`；
+缺任一即跳过，不阻塞 release）。与 webhook 走同一条流水线，重复触发不会二次替换。
+
+**443 冲突**：主服务内置 ACME 也监听 443 时，两者不能同机同端口。可选方案：
+(1) 更新器换独立 IP/机；(2) 更新器 `--listen 127.0.0.1:8099 --no-tls` 前置已有反代；
+(3) 暂时只用 SSH 兜底（`LITETALK_UPDATER_ENABLED=0`）。
+
+### 9.6 回滚
+
+自动回滚由更新器自己完成（healthz 断言失败即恢复备份并重启）。手工回滚：
+
+```bash
+sudo systemctl stop litetalk
+sudo cp /www/wwwroot/LiteTalk/litetalk-server.bak-<旧版本>-<时间戳> /www/wwwroot/LiteTalk/litetalk-server
+sudo systemctl start litetalk
+curl -fsS http://127.0.0.1:8077/api/v1/healthz   # version 应为旧版本
+# 或直接指定旧 tag 走标准流水线（显式手工操作不受防降级闸限制）：
+sudo /www/wwwroot/LiteTalk/update.sh --tag v1.6.1-alpha --allow-prerelease
+```
+
+## 10. 生产切换 runbook（面板/孤儿进程 → systemd，维护窗口）
+
+适用于「服务由面板或登录会话启动、没有可靠 supervisor」的存量机器。约 10 分钟。
+**先备份，后切换**；任一步失败按 §10.5 回滚。
+
+### 10.1 备份
+
+```bash
+PID=$(pgrep -f 'litetalk-server' | head -1)          # 确认是目标进程后再继续
+sudo cp -a /www/wwwroot/LiteTalk /www/wwwroot/LiteTalk.bak-$(date +%Y%m%d-%H%M%S)
+sudo systemctl stop litetalk 2>/dev/null || true      # 停空转的坏 unit（如果有）
+sudo kill "$PID" && sleep 2 && pgrep -f litetalk-server || echo "孤儿进程已停止"
+```
+
+### 10.2 生成 /etc/litetalk.env（保留现网运行参数）
+
+```bash
+# 从现网进程环境提取 LITETALK_*；迁移已 embed，LITETALK_MIGRATIONS_DIR 必须删除
+sudo bash -c "tr '\0' '\n' < /proc/$PID/environ | grep '^LITETALK_' | grep -v '^LITETALK_MIGRATIONS_DIR=' > /etc/litetalk.env"
+sudo chmod 600 /etc/litetalk.env
+sudo sed -i '/^LITETALK_MIGRATIONS_DIR=/d' /etc/litetalk.env   # 双保险
+sudo cat /etc/litetalk.env    # 自查：无密码外泄、无 LITETALK_MIGRATIONS_DIR
+```
+
+### 10.3 修正 unit 并切 systemd
+
+`/etc/systemd/system/litetalk.service`：`User=www` / `Group=www` / `WorkingDirectory=/www/wwwroot/LiteTalk`
+/ `EnvironmentFile=/etc/litetalk.env` / `ExecStart=/www/wwwroot/LiteTalk/litetalk-server`
+/ `Restart=on-failure` / `StartLimitIntervalSec=60` / `StartLimitBurst=10`
+（防再次空转重启风暴；`install.sh` 生成的模板已满足）。
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now litetalk
+systemctl status litetalk --no-pager     # active (running)，且不再空转重启
+```
+
+### 10.4 验证
+
+```bash
+curl -fsS http://127.0.0.1:8077/api/v1/healthz        # {"status":"ok","version":"..."}
+# MySQL/Redis（若配置）：journalctl -u litetalk | grep -i -E 'mysql|redis'
+# SFU/TURN：7845/udp、3478/udp 监听（ss -lunp | grep -E '7845|3478'），客户端进房通话拨测
+# 全链路：go run ./cmd/e2eprobe -addr 127.0.0.1:8077
+```
+
+### 10.5 回滚方式
+
+```bash
+sudo systemctl disable --now litetalk
+# 恢复备份二进制后按面板原方式启动
+sudo cp -a /www/wwwroot/LiteTalk.bak-<时间戳>/. /www/wwwroot/LiteTalk/
+```
+
+切换完成后再按 §9 装更新器、配 DNS/443/webhook，并用 ping + Redeliver 做演练。
