@@ -55,7 +55,8 @@ func TestFullResyncUsesSyncSnapshot(t *testing.T) {
 				{"id":"1","status":"accepted","incoming":false,"remark":"","group":"",
 				 "user":{"id":"99","nickname":"好友A","tag":"0001","email_verified":true,
 				         "is_guest":false,"status":1,"online":true,
-				         "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}},
+				         "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"},
+				 "channel_id":"700","server_id":"800"},
 				{"id":"2","status":"pending","incoming":true,"remark":"","group":"",
 				 "user":{"id":"100","nickname":"待处理","tag":"0002","email_verified":true,
 				         "is_guest":false,"status":0,"online":false,
@@ -85,8 +86,8 @@ func TestFullResyncUsesSyncSnapshot(t *testing.T) {
 	var chats []string
 	resyncs := 0
 	s := NewSession(api.NewAPIClient(srv.URL), "tok", "n", Events{
-		OnPresenceUpdate: func(userID string, online bool) {
-			presence = append(presence, fmt.Sprintf("%s:%v", userID, online))
+		OnPresenceUpdate: func(userID string, online bool, channelID, serverID string) {
+			presence = append(presence, fmt.Sprintf("%s:%v:%s:%s", userID, online, channelID, serverID))
 		},
 		OnResync: func() { resyncs++ },
 	}, nil)
@@ -108,8 +109,8 @@ func TestFullResyncUsesSyncSnapshot(t *testing.T) {
 	if got := stub.seen("/api/v1/channels/123/messages"); got != 1 {
 		t.Fatalf("应按 seenChans 补拉频道消息，实际 %d", got)
 	}
-	if len(presence) != 1 || presence[0] != "99:true" {
-		t.Fatalf("好友在线态应只回灌 accepted 条目，实际 %v", presence)
+	if len(presence) != 1 || presence[0] != "99:true:700:800" {
+		t.Fatalf("好友在线态应只回灌 accepted 条目且透传频道快照（#92），实际 %v", presence)
 	}
 	if len(chats) != 1 || chats[0] != "123/500/补拉消息" {
 		t.Fatalf("消息回灌不正确: %v", chats)
@@ -151,8 +152,8 @@ func TestFullResyncFallsBackWhenSyncFails(t *testing.T) {
 	var chats []string
 	resyncs := 0
 	s := NewSession(api.NewAPIClient(srv.URL), "tok", "n", Events{
-		OnPresenceUpdate: func(userID string, online bool) {
-			presence = append(presence, fmt.Sprintf("%s:%v", userID, online))
+		OnPresenceUpdate: func(userID string, online bool, channelID, serverID string) {
+			presence = append(presence, fmt.Sprintf("%s:%v:%s:%s", userID, online, channelID, serverID))
 		},
 		OnResync: func() { resyncs++ },
 	}, nil)
@@ -171,8 +172,8 @@ func TestFullResyncFallsBackWhenSyncFails(t *testing.T) {
 	if got := stub.seen("/api/v1/friends"); got != 1 {
 		t.Fatalf("聚合端点失败后应回落 ListFriends，实际 %d", got)
 	}
-	if len(presence) != 1 || presence[0] != "99:false" {
-		t.Fatalf("回落好友在线态不正确: %v", presence)
+	if len(presence) != 1 || presence[0] != "99:false::" {
+		t.Fatalf("回落好友在线态不正确（无频道快照时两字段为空）: %v", presence)
 	}
 	if len(chats) != 1 || chats[0] != "回落消息" {
 		t.Fatalf("聚合端点失败不应影响消息补拉: %v", chats)

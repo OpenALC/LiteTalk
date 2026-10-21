@@ -38,6 +38,15 @@ type PresenceReader interface {
 	Get(ctx context.Context, key string) (string, error)
 }
 
+// VoicePresence 好友频道 presence 反查（#92）：uid → 当前语音房。
+// *signal.Hub 满足（VoiceChannelOf）；窄接口单独注入，不塞进 Hub——
+// api.Hub 只管踢线，fakeHub 不必为好友快照补方法。
+type VoicePresence interface {
+	// VoiceChannelOf 返回 uid 当前语音房 ID 与所属服务器 ID（均为十进制字符串）。
+	// dev 内置房间 serverID 为 "0"（无 store 频道实体，调用方不带频道字段）。
+	VoiceChannelOf(uid string) (channelID, serverID string, ok bool)
+}
+
 // Server API 依赖集合。
 type Server struct {
 	store    store.Store
@@ -52,6 +61,7 @@ type Server struct {
 	sess     *auth.SessionIndex // 多设备会话索引（v1.1.0 迁移 0004）
 	hub      Hub                // WS 信令 hub（登出/重置密码踢线；nil=不踢）
 	presence PresenceReader     // 在线状态（好友列表 user.online 用；nil=恒离线）
+	voice    VoicePresence      // 语音房反查（好友频道 presence 快照，#92；nil=不带频道字段）
 	selfHost bool               // 一键自托管形态（GET /api/v1/config 自描述，#26）
 	// authz 权限判定（#35 B3）：与 signal.Hub 共享同一实例，缓存失效才同步。
 	authz *authz.Authorizer
@@ -84,6 +94,9 @@ type Config struct {
 	Hub Hub
 	// Presence 在线状态读取（presence:{uid}，好友列表 user.online 填值用；nil=恒离线）。
 	Presence PresenceReader
+	// VoicePresence 语音房反查（好友频道 presence 快照，#92）；nil=好友条目不带频道字段。
+	// 生产传与 signal.Hub 同一实例（*signal.Hub 满足本接口）。
+	VoicePresence VoicePresence
 	// SelfHost 一键自托管形态（SQLite/进程内单机部署）：客户端显示自托管引导（#26）。
 	SelfHost bool
 	// BootstrapRequired 管理员邀请码是否尚未被消费；注册页提示「等待管理员邀请」。
@@ -136,6 +149,7 @@ func New(cfg Config) *Server {
 		sess:              cfg.Session,
 		hub:               cfg.Hub,
 		presence:          cfg.Presence,
+		voice:             cfg.VoicePresence,
 		selfHost:          cfg.SelfHost,
 		authz:             az,
 		bootstrapRequired: cfg.BootstrapRequired,

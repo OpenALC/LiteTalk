@@ -894,23 +894,23 @@ func newDownlinkStubData(t *testing.T, env signal.Envelope) (*downlinkStub, *int
 	return s, &conns
 }
 
-// TestPresenceUpdateForwards presence.update 解码后转给 OnPresenceUpdate（#11）；
-// 缺 user_id 的坏包不回调。
+// TestPresenceUpdateForwards presence.update 解码后转给 OnPresenceUpdate（#11/#92）；
+// 频道快照字段透传；缺 user_id 的坏包不回调。
 func TestPresenceUpdateForwards(t *testing.T) {
 	got := make(chan struct {
-		uid    string
-		online bool
+		uid, ch, sid string
+		online       bool
 	}, 2)
 	stub, _ := newDownlinkStubData(t, signal.Envelope{
 		Type: signal.TypePresenceUpdate, TS: 1,
-		Data: json.RawMessage(`{"user_id":"42","online":true,"ts":1}`),
+		Data: json.RawMessage(`{"user_id":"42","online":true,"ts":1,"channel_id":"700","server_id":"800"}`),
 	})
 	s := NewSession(api.NewAPIClient(stub.wsURL()), "tok", "n", Events{
-		OnPresenceUpdate: func(userID string, online bool) {
+		OnPresenceUpdate: func(userID string, online bool, channelID, serverID string) {
 			got <- struct {
-				uid    string
-				online bool
-			}{userID, online}
+				uid, ch, sid string
+				online       bool
+			}{userID, channelID, serverID, online}
 		},
 	}, nil)
 	s.ws = signal.NewClient(signal.Config{URL: stub.wsURL(), ReconnectMin: 20 * time.Millisecond})
@@ -922,7 +922,7 @@ func TestPresenceUpdateForwards(t *testing.T) {
 
 	select {
 	case d := <-got:
-		if d.uid != "42" || !d.online {
+		if d.uid != "42" || !d.online || d.ch != "700" || d.sid != "800" {
 			t.Fatalf("回调参数错误: %+v", d)
 		}
 	case <-time.After(5 * time.Second):

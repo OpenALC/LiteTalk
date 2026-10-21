@@ -347,6 +347,8 @@ func main() {
 		Hub: hub,
 		// 在线状态读取（presence:{uid}，好友列表 user.online 填值）。
 		Presence: kv,
+		// 语音房反查（好友频道 presence 快照，#92）：与踢线同一个 hub。
+		VoicePresence: hub,
 		// 自托管形态自描述（GET /api/v1/config，#26）：SQLite/进程内单机部署 = true，
 		// MySQL 全栈部署 = false。客户端据此显示自托管引导（邀请码等）。
 		SelfHost: pickStoreKind() != "mysql",

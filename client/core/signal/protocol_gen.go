@@ -169,11 +169,13 @@ type HelloData struct {
 	Presence map[string]any `json:"presence"`
 }
 
-// PresenceUpdateData 某用户在线状态变化。user_id 是状态变化的用户（不是接收者）；只推给与其互为已接受好友的在线连接，状态未变不发（去抖）。
+// PresenceUpdateData 某用户在线状态变化。user_id 是状态变化的用户（不是接收者）；只推给与其互为已接受好友的在线连接，状态未变不发（去抖）。channel_id/server_id 是该用户当前语音房（#92 好友频道 presence），两字段必须同时出现或同时缺省；接收者对该频道无 ViewChannel 权限时只推 online 载荷（不得泄露频道标识）。载荷不含频道名。
 type PresenceUpdateData struct {
-	UserID string `json:"user_id"`
-	Online bool   `json:"online"`
-	TS     int64  `json:"ts"`
+	UserID    string `json:"user_id"`
+	Online    bool   `json:"online"`
+	TS        int64  `json:"ts"`
+	ChannelID string `json:"channel_id,omitempty"` // 当前语音频道 ID（#92，可选）；与 server_id 同现同缺，不在语音房或接收者无查看权限时不出现
+	ServerID  string `json:"server_id,omitempty"`  // channel_id 所属服务器 ID（#92，可选）；与 channel_id 同现同缺
 }
 
 // RTCFailedData SFU 因 ICE 失败移除本端 PeerConnection。只发给该 peer 的连接；客户端收到后销毁本地 PC 并重新入房，其余成员走 channel.peer_left。

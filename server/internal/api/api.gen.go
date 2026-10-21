@@ -390,16 +390,21 @@ type EmailCodeRequest struct {
 // EmailCodeRequestPurpose defines model for EmailCodeRequest.Purpose.
 type EmailCodeRequestPurpose string
 
-// FriendEntry 好友条目。remark/group 仅发起方视角非空（被请求方恒空串）。 user 为 PublicUser（无 email）。
+// FriendEntry 好友条目。remark/group 仅发起方视角非空（被请求方恒空串）。 user 为 PublicUser（无 email）。 channel_id/server_id 是对端当前语音房快照（#92 好友频道 presence）， 两字段必须同时出现或同时缺省：仅 accepted 且在线、且查看者对该频道有 ViewChannel 权限时出现；无权限/查询故障时键缺省（不得泄露频道）。 载荷不含频道名。
 type FriendEntry struct {
-	Group string `json:"group"`
+	// ChannelId 对端当前语音频道 ID（#92，可选）；与 server_id 同现同缺。 仅 accepted 且对端在线、查看者对该频道有 ViewChannel 权限时出现。
+	ChannelId *ID    `json:"channel_id,omitempty"`
+	Group     string `json:"group"`
 
 	// Id 关系行 ID（请求数）
 	Id ID `json:"id"`
 
 	// Incoming true = 对端发起（我是被请求方）
-	Incoming bool              `json:"incoming"`
-	Remark   string            `json:"remark"`
+	Incoming bool   `json:"incoming"`
+	Remark   string `json:"remark"`
+
+	// ServerId channel_id 所属服务器 ID（#92，可选）；与 channel_id 同现同缺。
+	ServerId *ID               `json:"server_id,omitempty"`
 	Status   FriendEntryStatus `json:"status"`
 
 	// User 对端 PublicUser；对端查询失败时为 null（仅 accept/patch 极端情况）

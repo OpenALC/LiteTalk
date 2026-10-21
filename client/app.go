@@ -1281,9 +1281,17 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 		OnVoiceTaken: func() {
 			a.emit("voice:taken", nil)
 		},
-		// 好友在线状态变化（presence.update，#11）：转给前端刷好友状态点。
-		OnPresenceUpdate: func(userID string, online bool) {
-			a.emit("presence:update", map[string]any{"user_id": userID, "online": online})
+		// 好友在线状态变化（presence.update，#11/#92）：转给前端刷好友状态点；
+		// 频道快照字段同现同缺，空串不发（键缺省，与服务端隐私口径一致）。
+		OnPresenceUpdate: func(userID string, online bool, channelID, serverID string) {
+			payload := map[string]any{"user_id": userID, "online": online}
+			if channelID != "" {
+				payload["channel_id"] = channelID
+			}
+			if serverID != "" {
+				payload["server_id"] = serverID
+			}
+			a.emit("presence:update", payload)
 		},
 		// 服务端优雅关闭（server.shutdown，#21）：前端提示「服务端已关闭」；
 		// 停止自动重连在 Session 侧已异步处理。
