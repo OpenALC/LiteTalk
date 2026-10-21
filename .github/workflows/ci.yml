@@ -469,6 +469,11 @@ jobs:
           nfpm package --config build/nfpm.yaml --packager deb --target dist/
           nfpm package --config build/nfpm.yaml --packager rpm --target dist/
           mv dist/*.rpm "dist/litetalk_${VERSION}_${ARCH}.rpm"
+          # GitHub 资产名会把 `~` 归一为 `.`，校验和必须使用上传安全的文件名（只改文件名，deb 内部 Debian 版本语义不动）
+          for f in dist/*.deb; do
+            want="dist/litetalk_${VERSION}_${ARCH}.deb"
+            [ "$f" = "$want" ] || mv "$f" "$want"
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: dist-client-linux-${{ matrix.arch }}
