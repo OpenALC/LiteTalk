@@ -88,6 +88,15 @@ func newTokenStub(t *testing.T) *tokenStub {
 			w.Header().Set("X-LiteTalk-Auth", "session_replaced")
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte(`{"code":"session_replaced","detail":"replaced"}`))
+		case "server_error":
+			// 服务端临时故障：刷新令牌本身未必失效，客户端应按瞬时错误退避
+			// 重试，而不是把用户踢回登录页（#98）。
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"code":"internal","detail":"database unavailable"}`))
+		case "rate_limited":
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"code":"rate_limited","detail":"too many requests"}`))
 		case "network":
 			// 传输层失败：不应答直接断开，客户端拿到 EOF/connection reset，
 			// 与服务端明确拒绝（401/403）必须区分（#84 复审 4.1）。
@@ -182,7 +191,8 @@ func TestSessionRefreshesOnHandshake401AndReconnects(t *testing.T) {
 
 // TestSessionRefreshRejectedKicksLoginExpired 服务端明确拒绝刷新（401/403）：
 // refresh_token 已失效/被吊销，走被踢链路回登录页（reason=login_expired），
-// 停止重连、不无限撞墙（#84 复审 4.1）。
+// 停止重连、不无限撞墙（#84 复审 4.1）；OnKicked 恰好一次——Run 因
+// ErrAuthFatal 退出时的兜底回调必须被去重（#98）。
 func TestSessionRefreshRejectedKicksLoginExpired(t *testing.T) {
 	for _, mode := range []string{"unauthorized", "forbidden"} {
 		t.Run(mode, func(t *testing.T) {
@@ -192,7 +202,7 @@ func TestSessionRefreshRejectedKicksLoginExpired(t *testing.T) {
 			c.SetToken("stale-access")
 			c.SetRefreshSource(func(context.Context) (string, error) { return "rt-1", nil })
 
-			kicked := make(chan string, 1)
+			kicked := make(chan string, 4)
 			s := NewSession(c, "fallback", "n", Events{
 				OnKicked: func(reason string) { kicked <- reason },
 			}, nil)
@@ -212,6 +222,11 @@ func TestSessionRefreshRejectedKicksLoginExpired(t *testing.T) {
 			}
 			// 默认 ReconnectMin 500ms：给足退避窗口，仍应只有一次拨号、一次刷新。
 			time.Sleep(700 * time.Millisecond)
+			select {
+			case reason := <-kicked:
+				t.Fatalf("OnKicked 重复回调（reason=%q），一次鉴权失败只应上报一次（#98）", reason)
+			default:
+			}
 			if got := stub.refreshCount(); got != 1 {
 				t.Fatalf("刷新失败后仍在重试: %d 次", got)
 			}
@@ -270,6 +285,93 @@ func TestSessionRefreshTransientFailureKeepsRetrying(t *testing.T) {
 	}
 }
 
+// TestSessionRefreshServerErrorKeepsRetrying 刷新请求撞上服务端临时故障
+// （5xx / 429）：与传输层错误同属瞬时失败，不得当登录过期把人踢回登录页；
+// signal 层按退避重试，服务端恢复后自动连上（#98）。
+func TestSessionRefreshServerErrorKeepsRetrying(t *testing.T) {
+	for _, mode := range []string{"server_error", "rate_limited"} {
+		t.Run(mode, func(t *testing.T) {
+			stub := newTokenStub(t)
+			stub.refreshMode.Store(mode)
+			c := api.NewAPIClient(stub.URL)
+			c.SetToken("stale-access") // opaque：本地判不出过期，靠握手 401 驱动刷新
+			c.SetRefreshSource(func(context.Context) (string, error) { return "rt-1", nil })
+
+			kicked := make(chan string, 4)
+			s := NewSession(c, "fallback", "n", Events{
+				OnKicked: func(reason string) { kicked <- reason },
+			}, nil)
+			s.Connect(stub.wsURL())
+			defer s.Close()
+
+			// 至少两轮刷新证明 Run 未退出、按退避重试（每轮刷新前都有一次拨号）。
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) && stub.refreshCount() < 2 {
+				time.Sleep(10 * time.Millisecond)
+			}
+			if got := stub.refreshCount(); got < 2 {
+				t.Fatalf("刷新次数 = %d, want >=2（瞬时故障后应退避重试，Run 不得退出）", got)
+			}
+			select {
+			case reason := <-kicked:
+				t.Fatalf("5xx/429 不应触发被踢（reason=%q）", reason)
+			default:
+			}
+			if s.SignalConnected() {
+				t.Fatal("刷新失败期间不应保持连接")
+			}
+
+			// 服务端恢复：退避后的下一轮刷新成功并连上。
+			stub.refreshMode.Store("ok")
+			waitSignalConnected(t, s)
+			select {
+			case reason := <-kicked:
+				t.Fatalf("恢复后不应触发被踢（reason=%q）", reason)
+			default:
+			}
+		})
+	}
+}
+
+// TestSessionRefreshNoSourceKicksLoginExpired 无 refresh_token 来源等不可恢复的
+// 鉴权失败：Run 以 ErrAuthFatal 退出后仍必须上报 login_expired——否则登录页
+// 一直卡在「信令连接中」，用户既进不去也不知道该重新登录（#98）。
+// 上报恰好一次。
+func TestSessionRefreshNoSourceKicksLoginExpired(t *testing.T) {
+	stub := newTokenStub(t)
+	c := api.NewAPIClient(stub.URL)
+	c.SetToken("stale-access")
+	// 不注入 RefreshSource：RefreshAccess 返回 ErrNoRefreshSource → ErrAuthFatal。
+
+	kicked := make(chan string, 4)
+	s := NewSession(c, "fallback", "n", Events{
+		OnKicked: func(reason string) { kicked <- reason },
+	}, nil)
+	s.Connect(stub.wsURL())
+	defer s.Close()
+
+	select {
+	case reason := <-kicked:
+		if reason != KickReasonLoginExpired {
+			t.Fatalf("被踢原因 = %q, want %q", reason, KickReasonLoginExpired)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ErrAuthFatal 退出后未上报 login_expired（登录页会卡住）")
+	}
+	if got := stub.refreshCount(); got != 0 {
+		t.Fatalf("无刷新源不应发刷新请求, 实际 %d 次", got)
+	}
+	time.Sleep(700 * time.Millisecond)
+	select {
+	case reason := <-kicked:
+		t.Fatalf("OnKicked 重复回调（reason=%q）", reason)
+	default:
+	}
+	if toks := stub.tokens(); len(toks) != 1 {
+		t.Fatalf("ErrAuthFatal 后不得重连, 拨号 %v", toks)
+	}
+}
+
 // TestSessionRefreshSessionReplacedKicks 刷新窗口发现会话已被顶替：
 // 走被踢链路（app 层清令牌回登录页），不重连。
 func TestSessionRefreshSessionReplacedKicks(t *testing.T) {
@@ -279,7 +381,7 @@ func TestSessionRefreshSessionReplacedKicks(t *testing.T) {
 	c.SetToken("stale-access")
 	c.SetRefreshSource(func(context.Context) (string, error) { return "rt-1", nil })
 
-	kicked := make(chan string, 1)
+	kicked := make(chan string, 4)
 	s := NewSession(c, "fallback", "n", Events{
 		OnKicked: func(reason string) { kicked <- reason },
 	}, nil)
@@ -293,6 +395,13 @@ func TestSessionRefreshSessionReplacedKicks(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("刷新撞上 session_replaced 后未触发被踢")
+	}
+	// Run 因 ErrAuthFatal 退出时的兜底 login_expired 必须被去重（#98）。
+	time.Sleep(700 * time.Millisecond)
+	select {
+	case reason := <-kicked:
+		t.Fatalf("OnKicked 重复回调（reason=%q），会话被顶替只应上报一次", reason)
+	default:
 	}
 	if got := stub.refreshCount(); got != 1 {
 		t.Fatalf("刷新次数 = %d, want 1", got)

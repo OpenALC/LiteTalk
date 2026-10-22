@@ -755,8 +755,9 @@ func TestListMessagesClampsLimit(t *testing.T) {
 	}
 }
 
-// TestIsTransientRefreshError 刷新错误分类（#84 复审 4.1）：只有传输层错误
-// 可退避重试；服务端明确应答、被顶替、换服与无刷新源都不可恢复。
+// TestIsTransientRefreshError 刷新错误分类（#84 复审 4.1、#98）：传输层错误与
+// 服务端临时故障（408/429/5xx）可退避重试；服务端明确拒绝（其余 4xx）、
+// 被顶替、换服与无刷新源都不可恢复。
 func TestIsTransientRefreshError(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -766,9 +767,15 @@ func TestIsTransientRefreshError(t *testing.T) {
 		{"nil", nil, false},
 		{"网络错误", errors.New("dial tcp: no route to host"), true},
 		{"包装后的网络错误", fmt.Errorf("post /auth/refresh: %w", errors.New("EOF")), true},
+		{"服务端 408", &APIError{Code: "request_timeout", Status: 408}, true},
+		{"服务端 429", &APIError{Code: "rate_limited", Status: 429, RetryAfter: 2}, true},
+		{"服务端 500", &APIError{Code: "internal", Status: 500}, true},
+		{"服务端 503", &APIError{Code: "unavailable", Status: 503}, true},
+		{"包装后的 500", fmt.Errorf("post /auth/refresh: %w", &APIError{Status: 500}), true},
+		{"服务端 400", &APIError{Code: "bad_request", Status: 400}, false},
 		{"服务端 401", &APIError{Code: "token_expired", Status: 401}, false},
 		{"服务端 403", &APIError{Code: "forbidden", Status: 403}, false},
-		{"服务端 500", &APIError{Code: "internal", Status: 500}, false},
+		{"服务端 404", &APIError{Code: "not_found", Status: 404}, false},
 		{"会话被顶替", ErrSessionReplaced, false},
 		{"换服", errBaseChanged, false},
 		{"无刷新源", ErrNoRefreshSource, false},

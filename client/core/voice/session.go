@@ -28,7 +28,8 @@ import (
 )
 
 // KickReasonLoginExpired 本端专用被踢原因（不上 wire）：refresh_token 被服务端
-// 明确拒绝（401/403），access 已无法续期，只能回登录页重新认证。与
+// 明确拒绝（401/403），access 已无法续期，只能回登录页重新认证；或 ws.Run 因
+// 不可恢复的鉴权失败（ErrAuthFatal，如无刷新来源）退出时兜底上报。与
 // signal.KickReasonLoginElsewhere（异地登录）区分——后者是 wire 契约里的取值，
 // 本常量只经 OnKicked 传给 UI 决定横幅文案。
 const KickReasonLoginExpired = "login_expired"
@@ -170,6 +171,11 @@ type Session struct {
 	roomID            atomic.Value // string
 	muted             atomic.Bool
 	deafened          atomic.Bool
+	// kicked 被踢事件一次性去重（#98）：同一条不可恢复的鉴权失败可能先由
+	// OnAuthFailed 回调 handleKicked（401 被拒/会话顶替），ws.Run 返回
+	// ErrAuthFatal 时又被 Run goroutine 回调一次；重复事件会让 UI 重复弹
+	// 横幅/重复清理。首次生效、后续直接返回。
+	kicked atomic.Bool
 
 	// joinMu 串行化进房意图与 roomID 的复合变更（#91）。JoinChannel 乐观写
 	// roomID 供断线重连恢复，服务端拒收是异步 error 帧——没有关联 id，
@@ -305,14 +311,16 @@ func (s *Session) Connect(serverURL string) {
 			return s.token.Load().(string), nil
 		},
 		// 握手 401（被顶替类已由 OnKicked 收口）：刷新一次 access 再重拨。
-		// 失败按原因分三类（#84 复审 4.1）：
-		//   - 传输层瞬时错误：返回 ErrAuthTransient，signal 层退避重试——网络
-		//     抖动不代表 refresh_token 失效，不能就此永久停连；
+		// 失败按原因分三类（#84 复审 4.1、#98）：
+		//   - 传输层错误与服务端临时故障（408/429/5xx）：返回 ErrAuthTransient，
+		//     signal 层退避重试——网络抖动或服务端过载不代表 refresh_token 失效，
+		//     不能就此永久停连；
 		//   - 服务端明确 401/403：refresh_token 已失效/被吊销，走被踢链路回
 		//     登录页，前端按 login_expired 提示「登录已过期」；
 		//   - ErrSessionReplaced：刷新窗口里发现会话被顶替，按异地登录处理。
 		// errBaseChanged / ErrNoRefreshSource 返回原错误 → 致命（换服流程已接管 /
-		// 根本没有刷新来源，重试只会原地打转）。
+		// 根本没有刷新来源）；Run 以 ErrAuthFatal 退出后由 Run goroutine 兜底
+		// 上报 login_expired，避免登录页一直卡在「信令连接中」。
 		OnAuthFailed: func(ctx context.Context) error {
 			err := s.api.RefreshAccess(ctx)
 			switch {
@@ -435,6 +443,12 @@ func (s *Session) Connect(serverURL string) {
 	go func() {
 		defer s.wg.Done()
 		if err := s.ws.Run(ctx); err != nil && err != context.Canceled {
+			// ErrAuthFatal：刷新被明确拒绝 / 无刷新来源 / 换服，Run 已停止重连。
+			// 必须上报被踢回登录页——否则前端停在「信令连接中」永远等不到结果。
+			// 已在 OnAuthFailed 里回调过的路径由 handleKicked 一次性去重（#98）。
+			if errors.Is(err, signal.ErrAuthFatal) {
+				s.handleKicked(KickReasonLoginExpired)
+			}
 			s.log.Printf("signal run: %v", err)
 		}
 	}()
@@ -831,8 +845,13 @@ func (s *Session) clearRoomTables() {
 }
 
 // handleKicked 上报被踢原因（session.kicked 消息、WS close 4001、握手 401 的
-// session_replaced/session_replaced 头，三条路径的统一出口）。
+// session_replaced/session_replaced 头、Run 的 ErrAuthFatal 兜底，统一出口）。
+// 同一会话只上报一次（#98）：不可恢复的鉴权失败可能先经 OnAuthFailed 回调、
+// 再由 Run 退出兜底，重复事件会让 UI 重复弹横幅。
 func (s *Session) handleKicked(reason string) {
+	if !s.kicked.CompareAndSwap(false, true) {
+		return
+	}
 	if s.ev.OnKicked != nil {
 		s.ev.OnKicked(reason)
 	}

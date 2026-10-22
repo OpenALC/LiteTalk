@@ -216,17 +216,21 @@ func IsAuthRejected(err error) bool {
 	return apiErr.Status == http.StatusUnauthorized || apiErr.Status == http.StatusForbidden
 }
 
-// IsTransientRefreshError 判断刷新失败是否值得退避重试：只有传输层错误
-// （网络中断、DNS、超时等）算瞬时。服务端明确应答的 *APIError（含 401/403）、
-// 会话被顶替（ErrSessionReplaced）、换服（errBaseChanged）与无刷新源
-// （ErrNoRefreshSource）都不可恢复——重试只会原地打转，必须按致命处理。
+// IsTransientRefreshError 判断刷新失败是否值得退避重试：传输层错误（网络中断、
+// DNS、超时等）与服务端临时故障（408 请求超时、429 限流、5xx）都算瞬时——
+// 服务端并未否认 refresh_token 本身，退避后可能自行恢复。只有服务端明确拒绝
+// 凭据（401/403 等其余 4xx）、会话被顶替（ErrSessionReplaced）、换服
+// （errBaseChanged）与无刷新源（ErrNoRefreshSource）才不可恢复，必须按致命
+// 处理——重试只会原地打转。
 func IsTransientRefreshError(err error) bool {
 	if err == nil {
 		return false
 	}
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
-		return false
+		return apiErr.Status == http.StatusRequestTimeout ||
+			apiErr.Status == http.StatusTooManyRequests ||
+			apiErr.Status >= http.StatusInternalServerError
 	}
 	return !errors.Is(err, ErrSessionReplaced) &&
 		!errors.Is(err, errBaseChanged) &&
