@@ -53,10 +53,12 @@ func (g *GitHubClient) http() *http.Client {
 	return http.DefaultClient
 }
 
-// downloadClient 资产下载用独立客户端：API 的 60s 整体超时会把慢链路上的大文件掐断，
-// 下载放宽到 10 分钟（外层仍有 ctx 可取消）。
+// downloadClient 资产下载用独立客户端：API 的 60s 整体超时会把慢链路上的大文件掐断。
+// 生产实测 GitHub → 国内服务器约 17KB/s，11MB 资产需要约 11 分钟，原 10 分钟上限
+// 会在下载尾部被 Client.Timeout 掐断；放宽到 30 分钟留足慢链路余量（外层仍有
+// ctx 可取消，不会无限挂起）。
 func (g *GitHubClient) downloadClient() *http.Client {
-	return &http.Client{Timeout: 10 * time.Minute}
+	return &http.Client{Timeout: 30 * time.Minute}
 }
 
 func (g *GitHubClient) now() time.Time {
