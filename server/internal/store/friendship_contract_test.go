@@ -235,7 +235,47 @@ func migrationsBefore(t *testing.T, fsys fs.FS, version string) fs.FS {
 	return out
 }
 
-// TestFriendshipPairMigrationSQLite #76：老库里的反向重复在 0008 迁移时去重，
+// friendshipPairRow 无序对中的一行，只取去重断言关心的字段。
+type friendshipPairRow struct {
+	ID     int64
+	Status string
+}
+
+// friendshipPairRows 返回无序对 {a, b} 现存的行（按 id 升序）。
+func friendshipPairRows(t *testing.T, ctx context.Context, db *sql.DB, a, b int64) []friendshipPairRow {
+	t.Helper()
+	rows, err := db.QueryContext(ctx,
+		`SELECT id, status FROM friendships
+		  WHERE (user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?)
+		  ORDER BY id`, a, b, b, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []friendshipPairRow
+	for rows.Next() {
+		var r friendshipPairRow
+		if err := rows.Scan(&r.ID, &r.Status); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// assertPairKept 断言无序对只剩 wantID 一行且状态为 wantStatus（0008 去重结果）。
+func assertPairKept(t *testing.T, ctx context.Context, db *sql.DB, a, b, wantID int64, wantStatus string) {
+	t.Helper()
+	got := friendshipPairRows(t, ctx, db, a, b)
+	if len(got) != 1 || got[0].ID != wantID || got[0].Status != wantStatus {
+		t.Fatalf("无序对 (%d,%d) 应只保留 id=%d status=%s，实际 %+v", a, b, wantID, wantStatus, got)
+	}
+}
+
+// TestFriendshipPairMigrationSQLite #76/#100：老库里的反向重复在 0008 迁移时去重，
 // 之后唯一索引拒绝反向再插入。
 func TestFriendshipPairMigrationSQLite(t *testing.T) {
 	ctx := context.Background()
@@ -244,53 +284,52 @@ func TestFriendshipPairMigrationSQLite(t *testing.T) {
 	if err := m.Migrate(ctx, migrationsBefore(t, full, "0008")); err != nil {
 		t.Fatalf("迁移到 0007 失败: %v", err)
 	}
-	// 预置：一对反向重复 + 一对正常数据（迁移不得误删）。
+	// 预置：
+	//   601/602：accepted 在较小 id，新旧规则都应保留 7001；
+	//   605/606（#100）：pending 在小 id、反向 accepted 在大 id，旧规则会误删 accepted；
+	//   607/608：pending 在小 id、反向 blocked 在大 id，blocked 应优先于 pending；
+	//   603/604：正常数据，迁移不得误删。
 	if _, err := m.DB().ExecContext(ctx,
 		`INSERT INTO friendships (id, user_id, friend_id, status) VALUES
-		 (7001, 601, 602, 'accepted'), (7002, 602, 601, 'pending'), (7003, 603, 604, 'accepted')`); err != nil {
+		 (7001, 601, 602, 'accepted'), (7002, 602, 601, 'pending'),
+		 (7011, 605, 606, 'pending'), (7012, 606, 605, 'accepted'),
+		 (7021, 607, 608, 'pending'), (7022, 608, 607, 'blocked'),
+		 (7003, 603, 604, 'accepted')`); err != nil {
 		t.Fatalf("预置重复数据失败: %v", err)
 	}
 	if err := m.Migrate(ctx, full); err != nil {
 		t.Fatalf("应用 0008 失败: %v", err)
 	}
 
-	var ids []int64
-	rows, err := m.DB().QueryContext(ctx,
-		`SELECT id FROM friendships
-		  WHERE (user_id = 601 AND friend_id = 602) OR (user_id = 602 AND friend_id = 601)
-		  ORDER BY id`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			t.Fatal(err)
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
-	}
-	if len(ids) != 1 || ids[0] != 7001 {
-		t.Fatalf("去重应只保留最早一行 7001，实际 %v", ids)
-	}
+	assertPairKept(t, ctx, m.DB(), 601, 602, 7001, "accepted")
+	assertPairKept(t, ctx, m.DB(), 605, 606, 7012, "accepted")
+	assertPairKept(t, ctx, m.DB(), 607, 608, 7022, "blocked")
 	var kept int
 	if err := m.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM friendships WHERE id = 7003`).Scan(&kept); err != nil || kept != 1 {
 		t.Fatalf("无关关系不应被删除 cnt=%d err=%v", kept, err)
 	}
 
+	// 无序对唯一索引确实存在。
+	var idx int
+	if err := m.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'uk_friendships_unordered'`).Scan(&idx); err != nil || idx != 1 {
+		t.Fatalf("无序对唯一索引应存在 cnt=%d err=%v", idx, err)
+	}
 	// 唯一索引拒绝反向与同向重复，Store 层映射为 ErrConflict。
 	if _, err := m.DB().ExecContext(ctx,
 		`INSERT INTO friendships (id, user_id, friend_id, status) VALUES (7004, 602, 601, 'pending')`); err == nil || !isDupSQLite(err) {
 		t.Fatalf("反向重复应被唯一索引拒绝，实际 %v", err)
 	}
-	if err := m.CreateFriendship(ctx, &Friendship{UserID: 602, FriendID: 601, Status: FriendPending}); !errors.Is(err, ErrConflict) {
+	if _, err := m.DB().ExecContext(ctx,
+		`INSERT INTO friendships (id, user_id, friend_id, status) VALUES (7013, 606, 605, 'pending')`); err == nil || !isDupSQLite(err) {
+		t.Fatalf("同向重复应被唯一索引拒绝，实际 %v", err)
+	}
+	if err := m.CreateFriendship(ctx, &Friendship{UserID: 605, FriendID: 606, Status: FriendPending}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("Store 层反向重复应 ErrConflict，实际 %v", err)
 	}
 }
 
-// TestFriendshipPairMigrationMySQL #76：MySQL 函数索引方案的真库验证
+// TestFriendshipPairMigrationMySQL #76/#100：MySQL 函数索引方案的真库验证
 // （老库去重、唯一索引生效、down 只删索引）。
 func TestFriendshipPairMigrationMySQL(t *testing.T) {
 	ctx := context.Background()
@@ -299,41 +338,44 @@ func TestFriendshipPairMigrationMySQL(t *testing.T) {
 	if err := m.Migrate(ctx, migrationsBefore(t, full, "0008")); err != nil {
 		t.Fatalf("迁移到 0007 失败: %v", err)
 	}
+	// 预置同 SQLite 用例：accepted 小 id、反序 accepted（#100）、反序 blocked、无关数据。
 	if _, err := m.DB().ExecContext(ctx,
 		`INSERT INTO friendships (id, user_id, friend_id, status) VALUES
-		 (7101, 611, 612, 'accepted'), (7102, 612, 611, 'pending'), (7103, 613, 614, 'accepted')`); err != nil {
+		 (7101, 611, 612, 'accepted'), (7102, 612, 611, 'pending'),
+		 (7111, 615, 616, 'pending'), (7112, 616, 615, 'accepted'),
+		 (7121, 617, 618, 'pending'), (7122, 618, 617, 'blocked'),
+		 (7103, 613, 614, 'accepted')`); err != nil {
 		t.Fatalf("预置重复数据失败: %v", err)
 	}
 	if err := m.Migrate(ctx, full); err != nil {
 		t.Fatalf("应用 0008 失败: %v", err)
 	}
 
-	var ids []int64
-	rows, err := m.DB().QueryContext(ctx,
-		`SELECT id FROM friendships
-		  WHERE (user_id = 611 AND friend_id = 612) OR (user_id = 612 AND friend_id = 611)
-		  ORDER BY id`)
-	if err != nil {
-		t.Fatal(err)
+	assertPairKept(t, ctx, m.DB(), 611, 612, 7101, "accepted")
+	assertPairKept(t, ctx, m.DB(), 615, 616, 7112, "accepted")
+	assertPairKept(t, ctx, m.DB(), 617, 618, 7122, "blocked")
+	var unrelated int
+	if err := m.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM friendships WHERE id = 7103`).Scan(&unrelated); err != nil || unrelated != 1 {
+		t.Fatalf("无关关系不应被删除 cnt=%d err=%v", unrelated, err)
 	}
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			t.Fatal(err)
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
-	}
-	if len(ids) != 1 || ids[0] != 7101 {
-		t.Fatalf("去重应只保留最早一行 7101，实际 %v", ids)
+
+	// 无序对唯一索引确实存在。
+	var idx int
+	if err := m.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM information_schema.statistics
+		  WHERE table_schema = DATABASE() AND table_name = 'friendships' AND index_name = 'uk_friendships_unordered'`).
+		Scan(&idx); err != nil || idx == 0 {
+		t.Fatalf("无序对唯一索引应存在 cnt=%d err=%v", idx, err)
 	}
 	if _, err := m.DB().ExecContext(ctx,
 		`INSERT INTO friendships (id, user_id, friend_id, status) VALUES (7104, 612, 611, 'pending')`); err == nil || !isDup(err) {
 		t.Fatalf("反向重复应被唯一索引拒绝，实际 %v", err)
 	}
-	if err := m.CreateFriendship(ctx, &Friendship{UserID: 612, FriendID: 611, Status: FriendPending}); !errors.Is(err, ErrConflict) {
+	if _, err := m.DB().ExecContext(ctx,
+		`INSERT INTO friendships (id, user_id, friend_id, status) VALUES (7113, 616, 615, 'pending')`); err == nil || !isDup(err) {
+		t.Fatalf("同向重复应被唯一索引拒绝，实际 %v", err)
+	}
+	if err := m.CreateFriendship(ctx, &Friendship{UserID: 615, FriendID: 616, Status: FriendPending}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("Store 层反向重复应 ErrConflict，实际 %v", err)
 	}
 
