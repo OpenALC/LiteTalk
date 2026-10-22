@@ -294,6 +294,9 @@ write_conf /etc/systemd/system/litetalk.service <<EOF
 [Unit]
 Description=LiteTalk Server (signaling + SFU + REST)
 After=network.target
+# 启动失败限流必须写在 [Unit]：写在 [Service] 会被 systemd 忽略，坏配置会无限重启。
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -304,8 +307,6 @@ EnvironmentFile=/etc/litetalk.env
 ExecStart=$DIR/litetalk-server
 Restart=always
 RestartSec=3
-StartLimitIntervalSec=60
-StartLimitBurst=10
 StandardOutput=journal
 StandardError=journal
 # 内置 ACME（LITETALK_DOMAIN）监听 443 是特权端口：非 root 必须放行绑定 capability
