@@ -19,12 +19,15 @@ import (
 // ErrNotConnected 在无可用连接时由 Send 返回（重连窗口期）。
 var ErrNotConnected = errors.New("signal: not connected")
 
-// ErrAuthFatal 鉴权失败（HTTP 401/403），Run 直接返回，不再重连。
+// ErrAuthFatal 鉴权失败且不可恢复（令牌被服务端明确拒绝、无刷新来源等），
+// Run 直接返回，不再重连。刷新请求的临时故障（传输层错误、408/429/5xx）
+// 走 ErrAuthTransient，不归入本错误。
 var ErrAuthFatal = errors.New("signal: authentication failed")
 
-// ErrAuthTransient 由 OnAuthFailed 返回，表示刷新令牌的请求本身（传输层）
-// 失败了——网络中断、DNS、超时等，服务端并未拒绝刷新令牌。令牌未必失效，
-// 因此 Run 不按致命收场：复位刷新预算、按重连退避后再来一轮（#84 复审 4.1）。
+// ErrAuthTransient 由 OnAuthFailed 返回，表示刷新令牌的请求本身失败了——
+// 网络中断、DNS、超时，或服务端临时故障（408/429/5xx）；服务端并未拒绝
+// 刷新令牌。令牌未必失效，因此 Run 不按致命收场：复位刷新预算、按重连
+// 退避后再来一轮（#84 复审 4.1、#98）。
 var ErrAuthTransient = errors.New("signal: token refresh failed transiently")
 
 // ErrSilentReplace 同 sid 的半开连接被服务端的新连接替换（WS close 4000，
