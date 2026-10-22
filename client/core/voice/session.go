@@ -567,7 +567,17 @@ func (s *Session) registerHandlers() {
 			return
 		}
 		// 服务端回执：结算对应的 pending join（重复/广播帧不匹配则忽略）。
-		s.confirmJoin(d.ChannelID)
+		matched := s.confirmJoin(d.ChannelID)
+		// 迟到回执（#99）：退房后或快速切房时，旧房的 channel.joined 可能晚于
+		// 新的房间意图到达。roomID 已不指向该频道就整帧丢弃——不启动媒体、
+		// 不重建成员表、不发 OnSelf/OnPeerJoin、不触发 peer 重协商。startMedia
+		// 幂等只能防重复启动，防不住成员表被旧房数据覆盖。
+		if room, _ := s.roomID.Load().(string); room != d.ChannelID {
+			if matched {
+				s.log.Printf("session: 忽略迟到 channel.joined %s（当前房 %q，#99）", d.ChannelID, room)
+			}
+			return
+		}
 		s.startMedia() // 入房才启动采集/播放
 		s.mu.Lock()
 		s.members = make(map[string]PeerView, len(d.Members))
@@ -1000,9 +1010,10 @@ func (s *Session) abortJoinSend(seq uint64, rollbackRoom bool) {
 	}
 }
 
-// confirmJoin channel.joined 回执：摘掉对应的 pending join。仅当匹配到本端
-// 发出且未结算的请求时才认作回执——广播帧（成员变化重发全量）不改变状态。
-func (s *Session) confirmJoin(channelID string) {
+// confirmJoin channel.joined 回执：匹配到本端发出且未结算的请求时摘除并返回
+// true；广播帧（成员变化重发全量）与迟到帧不改变状态，返回 false——调用方
+// 据此区分「我方 join 的确认」与「房内广播」。
+func (s *Session) confirmJoin(channelID string) bool {
 	s.joinMu.Lock()
 	defer s.joinMu.Unlock()
 	for i := range s.pendingJoins {
@@ -1015,8 +1026,9 @@ func (s *Session) confirmJoin(channelID string) {
 		if cur, _ := s.roomID.Load().(string); cur == "" {
 			s.roomID.Store(channelID)
 		}
-		return
+		return true
 	}
+	return false
 }
 
 // settlePendingJoin 结算最早一次未完成的 join（服务端同一连接按序处理上行，

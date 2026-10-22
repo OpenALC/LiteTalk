@@ -1326,3 +1326,308 @@ func TestStatsAudioDiagnostics(t *testing.T) {
 		t.Fatalf("empty peers should be omitted: %s", raw)
 	}
 }
+
+// ---- 迟到 channel.joined（#99）----
+
+// lateJoinStub 可控下行桩：记录上行消息类型，测试可随时 push 任意下行信封
+// （#99 需要在 join/leave 之后精确注入迟到的 channel.joined）。
+type lateJoinStub struct {
+	*httptest.Server
+	mu       sync.Mutex
+	cur      *websocket.Conn
+	received []string
+}
+
+func newLateJoinStub(t *testing.T) *lateJoinStub {
+	t.Helper()
+	s := &lateJoinStub{}
+	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		s.mu.Lock()
+		s.cur = conn
+		s.mu.Unlock()
+		for {
+			_, raw, err := conn.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var env signal.Envelope
+			if json.Unmarshal(raw, &env) != nil {
+				continue
+			}
+			s.mu.Lock()
+			s.received = append(s.received, env.Type)
+			s.mu.Unlock()
+		}
+	}))
+	t.Cleanup(s.Server.Close)
+	return s
+}
+
+func (s *lateJoinStub) wsURL() string {
+	return "ws" + strings.TrimPrefix(s.URL, "http") + "/ws"
+}
+
+func (s *lateJoinStub) push(t *testing.T, env signal.Envelope) {
+	t.Helper()
+	raw, err := json.Marshal(env)
+	if err != nil {
+		t.Fatalf("marshal push: %v", err)
+	}
+	s.mu.Lock()
+	conn := s.cur
+	s.mu.Unlock()
+	if conn == nil {
+		t.Fatal("无连接可推送")
+	}
+	if err := conn.Write(context.Background(), websocket.MessageText, raw); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+}
+
+func (s *lateJoinStub) saw(msgType string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, m := range s.received {
+		if m == msgType {
+			return true
+		}
+	}
+	return false
+}
+
+// joinedEnv 构造一条 channel.joined 下行帧。memberIDs 含自己（服务端全量）。
+func joinedEnv(t *testing.T, channelID, selfID string, memberIDs ...string) signal.Envelope {
+	t.Helper()
+	d := signal.ChannelJoinedData{
+		ChannelID: channelID,
+		Self:      signal.MemberInfo{UserID: selfID, Nickname: selfID},
+	}
+	for _, id := range memberIDs {
+		d.Members = append(d.Members, signal.MemberInfo{UserID: id, Nickname: id})
+	}
+	raw, err := json.Marshal(d)
+	if err != nil {
+		t.Fatalf("marshal joined: %v", err)
+	}
+	return signal.Envelope{Type: signal.TypeChannelJoined, TS: 1, Data: raw}
+}
+
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("%s: 5s 内未满足条件", what)
+}
+
+// pushServerHelloV2 在同一条连接上推 server.hello 作为处理屏障：WS 读循环
+// 保序，收到它即证明之前注入的帧已被处理（迟到的 joined 本身没有可观测副作用）。
+func pushServerHelloV2(t *testing.T, stub *lateJoinStub, s *Session) {
+	t.Helper()
+	stub.push(t, signal.Envelope{
+		Type: signal.TypeServerHello, TS: 1,
+		Data: json.RawMessage(`{"version":2,"session_id":"S1"}`),
+	})
+	waitUntil(t, "server.hello 屏障", func() bool { return s.ProtocolVersion() == 2 })
+}
+
+// newJoinedSession 装配可探测媒体启动的会话：BackendNull 管线真能 Start，
+// 误处理迟到 joined 会把 mediaStarted 置 true。
+func newJoinedSession(t *testing.T, stub *lateJoinStub, ev Events) *Session {
+	t.Helper()
+	s := NewSession(api.NewAPIClient(stub.wsURL()), "tok", "n", ev, nil)
+	s.ws = signal.NewClient(signal.Config{URL: stub.wsURL(), ReconnectMin: 20 * time.Millisecond})
+	t.Cleanup(s.ws.Close)
+	s.registerHandlers()
+	s.pipe = newNullPipeline(t)
+	s.mixer = audio.NewMixer(func([]int16) int { return 0 })
+	// remoteMgr 非 nil 才会真正 setupPeer：快速切房用例据 peerRef 断言旧房
+	// 迟到的 joined 没有触发 peer 重协商。
+	s.remoteMgr = audio.NewRemoteManager(audio.NewMixer(func([]int16) int { return 0 }), nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go s.ws.Run(ctx)
+	waitSignalConnected(t, s)
+	return s
+}
+
+// TestLateChannelJoinedAfterLeaveIgnored 退房后迟到的 channel.joined 必须整帧
+// 丢弃（#99）：不得把 InRoom 拉回 true、不得重建成员表、不得重启媒体。
+func TestLateChannelJoinedAfterLeaveIgnored(t *testing.T) {
+	stub := newLateJoinStub(t)
+	selfs := make(chan string, 4)
+	peerJoins := make(chan string, 8)
+	var activity atomic.Int32 // OnSelf/OnPeerJoin 任一回调
+	s := newJoinedSession(t, stub, Events{
+		OnSelf: func(id string) {
+			activity.Add(1)
+			selfs <- id
+		},
+		OnPeerJoin: func(uid, nickname, tag string, speaking, mute, deafen bool) {
+			activity.Add(1)
+			peerJoins <- uid
+		},
+	})
+
+	if err := s.JoinChannel("room1"); err != nil {
+		t.Fatalf("JoinChannel: %v", err)
+	}
+	if n := s.pendingJoinCount(); n != 1 {
+		t.Fatalf("join 后 pending = %d, want 1", n)
+	}
+	if err := s.LeaveChannel(); err != nil {
+		t.Fatalf("LeaveChannel: %v", err)
+	}
+	if s.InRoom() {
+		t.Fatal("LeaveChannel 后 InRoom 应为 false")
+	}
+
+	stub.push(t, joinedEnv(t, "room1", "self", "uA"))
+	pushServerHelloV2(t, stub, s) // 屏障：迟到的 joined 已处理
+
+	if s.InRoom() {
+		t.Fatal("迟到的 channel.joined 不得把房间态拉回 true（#99）")
+	}
+	if got := s.roomID.Load().(string); got != "" {
+		t.Fatalf("roomID = %q, want empty（退房后不得被迟到回执改写）", got)
+	}
+	if n := len(s.Members()); n != 0 {
+		t.Fatalf("members = %d, want 0（不得重建旧房成员表）", n)
+	}
+	if s.mediaStarted.Load() {
+		t.Fatal("迟到 joined 不得重启媒体（#99）")
+	}
+	if n := activity.Load(); n != 0 {
+		t.Fatalf("迟到 joined 不得发 OnSelf/OnPeerJoin，共 %d 次", n)
+	}
+}
+
+// TestLateChannelJoinedAfterSwitchIgnored 快速 A→B：#A 的迟到 joined 不改变
+// B 的成员/媒体，也不得触发 peer 重协商；B 自己的 joined 正常生效。
+func TestLateChannelJoinedAfterSwitchIgnored(t *testing.T) {
+	stub := newLateJoinStub(t)
+	selfs := make(chan string, 4)
+	peerJoins := make(chan string, 16)
+	s := newJoinedSession(t, stub, Events{
+		OnSelf: func(id string) { selfs <- id },
+		OnPeerJoin: func(uid, nickname, tag string, speaking, mute, deafen bool) {
+			peerJoins <- uid
+		},
+	})
+
+	if err := s.JoinChannel("roomA"); err != nil {
+		t.Fatalf("Join roomA: %v", err)
+	}
+	if err := s.JoinChannel("roomB"); err != nil {
+		t.Fatalf("Join roomB: %v", err)
+	}
+	if n := s.pendingJoinCount(); n != 2 {
+		t.Fatalf("pending = %d, want 2", n)
+	}
+
+	// A 的 joined 迟到：确认了 pending A，但 roomID 已指向 B，整帧忽略。
+	stub.push(t, joinedEnv(t, "roomA", "self", "uA"))
+	waitUntil(t, "A 的 pending 结算", func() bool { return s.pendingJoinCount() == 1 })
+	if got := s.roomID.Load().(string); got != "roomB" {
+		t.Fatalf("roomID = %q, want roomB（A 的迟到回执不得切回旧房）", got)
+	}
+	if n := len(s.Members()); n != 0 {
+		t.Fatalf("A 的迟到 joined 不得重建成员表, members = %d", n)
+	}
+	if s.mediaStarted.Load() {
+		t.Fatal("A 的迟到 joined 不得启动媒体（#99）")
+	}
+	if p := s.peerRef.Load(); p != nil {
+		t.Fatal("A 的迟到 joined 不得触发 peer 重协商（#99）")
+	}
+	select {
+	case uid := <-peerJoins:
+		t.Fatalf("A 的迟到 joined 不得发 OnPeerJoin（收到 %q）", uid)
+	default:
+	}
+	select {
+	case id := <-selfs:
+		t.Fatalf("A 的迟到 joined 不得发 OnSelf（收到 %q）", id)
+	default:
+	}
+
+	// B 的 joined 正常生效。
+	stub.push(t, joinedEnv(t, "roomB", "self", "uB", "self"))
+	select {
+	case id := <-selfs:
+		if id != "self" {
+			t.Fatalf("OnSelf = %q, want self", id)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("B 的 channel.joined 未生效（#99 回归）")
+	}
+	if !s.InRoom() {
+		t.Fatal("B 的 joined 后应在房内")
+	}
+	if got := s.roomID.Load().(string); got != "roomB" {
+		t.Fatalf("roomID = %q, want roomB", got)
+	}
+	if n := s.pendingJoinCount(); n != 0 {
+		t.Fatalf("B 的 joined 后 pending = %d, want 0", n)
+	}
+	if n := len(s.Members()); n != 2 {
+		t.Fatalf("B 的成员表 = %d, want 2", n)
+	}
+	if !s.mediaStarted.Load() {
+		t.Fatal("B 的 joined 应启动媒体")
+	}
+	// OnSelf 回调发生在 setupPeer 之前，这里等 peer 真正建起来。
+	waitUntil(t, "B 的 peer 建立", func() bool { return s.peerRef.Load() != nil })
+	// A 的成员绝不能混进 B 的成员表/回调。
+	waitUntil(t, "B 的成员广播", func() bool { return len(peerJoins) >= 2 })
+	for i := 0; i < 2; i++ {
+		if uid := <-peerJoins; uid == "uA" {
+			t.Fatal("旧房成员 uA 不得出现在 B 的 OnPeerJoin 中")
+		}
+	}
+}
+
+// TestChannelJoinedNormalAndBroadcastRebuild 正常入房与房内成员广播回归：
+// 无 pending 的广播帧在 roomID 匹配时仍按原逻辑重建成员表（#99 不能误伤）。
+func TestChannelJoinedNormalAndBroadcastRebuild(t *testing.T) {
+	stub := newLateJoinStub(t)
+	selfs := make(chan string, 4)
+	s := newJoinedSession(t, stub, Events{
+		OnSelf: func(id string) { selfs <- id },
+	})
+
+	if err := s.JoinChannel("room1"); err != nil {
+		t.Fatalf("JoinChannel: %v", err)
+	}
+	stub.push(t, joinedEnv(t, "room1", "self", "uA", "self"))
+	select {
+	case <-selfs:
+	case <-time.After(5 * time.Second):
+		t.Fatal("正常入房的 channel.joined 未生效")
+	}
+	if n := len(s.Members()); n != 2 {
+		t.Fatalf("入房成员 = %d, want 2", n)
+	}
+	if n := s.pendingJoinCount(); n != 0 {
+		t.Fatalf("入房后 pending = %d, want 0", n)
+	}
+
+	// 房内成员变化的全量广播（无 pending，roomID 匹配）：成员表照常重建。
+	stub.push(t, joinedEnv(t, "room1", "self", "uA", "uB", "self"))
+	waitUntil(t, "房内广播重建成员表", func() bool { return len(s.Members()) == 3 })
+	if got := s.roomID.Load().(string); got != "room1" {
+		t.Fatalf("广播后 roomID = %q, want room1", got)
+	}
+	if !s.mediaStarted.Load() {
+		t.Fatal("房内广播不得停掉已启动的媒体")
+	}
+}
