@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -40,6 +41,11 @@ var version = "dev"
 
 // 默认监听地址，可用环境变量 LITETALK_ADDR 覆盖
 const defaultAddr = ":8077"
+
+// acmeHealthAddr ACME 模式下的 loopback 探活地址：必须与 updater 默认的
+// health URL（http://127.0.0.1:8077/api/v1/healthz）保持一致，否则更新后
+// 的版本断言必然超时回滚。ACME 只开 443/80，故单独补这一路监听。
+const acmeHealthAddr = "127.0.0.1:8077"
 
 func main() {
 	// 启动序（§0.6）：1 解析 flag/env → 2 校验 → 3 Store+Migrate → 4 KV → 5 SFU
@@ -438,10 +444,16 @@ func startHTTP(cfg *config, mux http.Handler, stop context.CancelFunc) []*http.S
 		httpsSrv := newServer(cfg.addr, mux)
 		httpsSrv.TLSConfig = mgr.TLSConfig()
 		httpSrv := newServer(":80", mgr.HTTPHandler())
+		// ACME 部署不占 8077，但 updater 默认按 loopback 8077 断言版本（#101）：
+		// 单独起一个只暴露 healthz 的监听，不把完整管理 API 带到回环面。
+		healthSrv := newServer(acmeHealthAddr, healthOnlyHandler(version))
 		log.Printf("ACME: 单域 %s 自动签发（TLS-ALPN-01 + HTTP-01），证书缓存 %s", cfg.domain, cfg.acmeCache)
+		log.Printf("ACME: loopback health http://%s/api/v1/healthz", acmeHealthAddr)
 		listen("HTTPS "+cfg.addr, httpsSrv, func() error { return httpsSrv.ListenAndServeTLS("", "") }, true)
 		listen("HTTP :80", httpSrv, httpSrv.ListenAndServe, true)
-		return []*http.Server{httpsSrv, httpSrv}
+		// 端口冲突/无权限走上面统一的失败路径：打日志并 stop()，不静默吞掉。
+		listen("health "+acmeHealthAddr, healthSrv, healthSrv.ListenAndServe, false)
+		return []*http.Server{httpsSrv, httpSrv, healthSrv}
 	}
 
 	srv := newServer(cfg.addr, mux)
@@ -457,6 +469,19 @@ func startHTTP(cfg *config, mux http.Handler, stop context.CancelFunc) []*http.S
 	}
 	listen("HTTP "+cfg.addr, srv, srv.ListenAndServe, false)
 	return []*http.Server{srv}
+}
+
+// healthOnlyHandler ACME 模式的回环探活面：只提供 GET /api/v1/healthz。
+// 不复用完整 mux——8077 是给 updater 做版本断言的，不该把管理 API 暴露出去。
+// 响应直接复用生成物的 Healthz 形状（{status:"ok",version}），与主端点逐字一致。
+func healthOnlyHandler(version string) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/healthz", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := json.Marshal(api.Healthz{Status: api.HealthzStatusOk, Version: version})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	})
+	return mux
 }
 
 // isPermError 端口绑定权限不足（Linux 低段端口需 root / CAP_NET_BIND_SERVICE）。

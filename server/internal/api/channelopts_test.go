@@ -1,11 +1,14 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/OpenALC/LiteTalk/server/internal/store"
 )
 
 // #37 B1：频道密码/人数上限/子频道树的 REST 回归。
@@ -252,4 +255,70 @@ func TestChannelOptionsETag(t *testing.T) {
 		t.Fatal("has_password 变化应改变 ETag")
 	}
 	// 换密码值但 has_password 不变：ETag 可不变（不强制）。
+}
+
+// TestPatchChildChannelInvariants 子频道 PATCH 不得破坏父子同类型/同分类（#101 P2）：
+// 父频道有子频道时的 409 拦截不变；子频道自身向父看齐放行，单方面漂移拒绝且不落库。
+func TestPatchChildChannelInvariants(t *testing.T) {
+	w := newChannelOptsWorld(t)
+	rt := w.h
+	ctx := context.Background()
+
+	catA := asID(postJSON(t, rt, fmt.Sprintf("/api/v1/servers/%d/categories", w.serverID), w.owner,
+		map[string]string{"name": "甲"}, http.StatusCreated)["id"])
+	catB := asID(postJSON(t, rt, fmt.Sprintf("/api/v1/servers/%d/categories", w.serverID), w.owner,
+		map[string]string{"name": "乙"}, http.StatusCreated)["id"])
+
+	parent := w.createCh(t, map[string]any{"name": "父", "type": "voice", "category_id": fmt.Sprint(catA)})
+	parentID := asID(parent["id"])
+	child := w.createCh(t, map[string]any{"name": "子", "type": "voice", "parent_id": fmt.Sprint(parentID)})
+	childID := asID(child["id"])
+
+	patch := func(body map[string]any, want int) map[string]any {
+		t.Helper()
+		return doJSON(t, rt, http.MethodPatch, fmt.Sprintf("/api/v1/channels/%d", childID), w.owner, body, want)
+	}
+
+	// 改类型与父不同 → 400 bad_parent，库内仍是 voice。
+	if resp := patch(map[string]any{"type": "text"}, http.StatusBadRequest); resp["code"] != "bad_parent" {
+		t.Fatalf("子频道改类型应 bad_parent: %v", resp)
+	}
+	if got, err := w.mem.ChannelByID(ctx, childID); err != nil || got.Type != store.ChannelVoice {
+		t.Fatalf("拒绝后类型不应落库: %+v err=%v", got, err)
+	}
+
+	// 改分类与父不同（含显式清空）→ 400 bad_parent，库内分类仍是 catA。
+	if resp := patch(map[string]any{"category_id": fmt.Sprint(catB)}, http.StatusBadRequest); resp["code"] != "bad_parent" {
+		t.Fatalf("子频道改分类应 bad_parent: %v", resp)
+	}
+	if resp := patch(map[string]any{"category_id": nil}, http.StatusBadRequest); resp["code"] != "bad_parent" {
+		t.Fatalf("子频道清分类应 bad_parent: %v", resp)
+	}
+	if got, err := w.mem.ChannelByID(ctx, childID); err != nil || got.CategoryID == nil || *got.CategoryID != catA {
+		t.Fatalf("拒绝后分类不应落库: %+v err=%v", got, err)
+	}
+
+	// 与父一致的类型+分类：放行。
+	ok := patch(map[string]any{"type": "voice", "category_id": fmt.Sprint(catA)}, http.StatusOK)
+	if ok["type"] != "voice" || asID(ok["category_id"]) != catA {
+		t.Fatalf("与父一致的改动应放行: %v", ok)
+	}
+
+	// 父频道有子频道时改类型/分类仍 409（回归，不允许靠父侧漂移绕过不变量）。
+	if resp := doJSON(t, rt, http.MethodPatch, fmt.Sprintf("/api/v1/channels/%d", parentID), w.owner,
+		map[string]any{"type": "text"}, http.StatusConflict); resp["code"] != "channel_has_children" {
+		t.Fatalf("父频道改类型应 409: %v", resp)
+	}
+	if resp := doJSON(t, rt, http.MethodPatch, fmt.Sprintf("/api/v1/channels/%d", parentID), w.owner,
+		map[string]any{"category_id": fmt.Sprint(catB)}, http.StatusConflict); resp["code"] != "channel_has_children" {
+		t.Fatalf("父频道改分类应 409: %v", resp)
+	}
+
+	// 顶层频道不受影响（回归）：可自由改类型与分类。
+	top := w.createCh(t, map[string]any{"name": "顶层", "type": "voice"})
+	up := doJSON(t, rt, http.MethodPatch, fmt.Sprintf("/api/v1/channels/%d", asID(top["id"])), w.owner,
+		map[string]any{"type": "text", "category_id": fmt.Sprint(catB)}, http.StatusOK)
+	if up["type"] != "text" || asID(up["category_id"]) != catB {
+		t.Fatalf("顶层频道改类型/分类不应受限: %v", up)
+	}
 }
