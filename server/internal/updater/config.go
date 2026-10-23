@@ -29,6 +29,8 @@ const (
 
 	// MaxBodyBytes webhook 请求体上限：payload 只有几百字节，1MiB 足够且防放大。
 	MaxBodyBytes = 1 << 20
+	// MinSecretLen webhook secret 最小长度：与 JWT/TURN 同口径（32 字节随机值）。
+	MinSecretLen = 32
 	// MinFreeBytes 更新前要求的磁盘可用空间：覆盖新旧二进制 + 备份 + 下载临时文件。
 	MinFreeBytes = 200 << 20
 	// MaxExtractBytes 单个解包条目大小上限（正常二进制远小于此，防解包炸弹）。

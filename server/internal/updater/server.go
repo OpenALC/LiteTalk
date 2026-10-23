@@ -13,10 +13,24 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 )
+
+// 签名失败限流参数：1 分钟窗口内每 IP 最多 20 次失败。
+// 8088 直接对公网监听，暴力/慢速滥用会白白消耗 body 读与 HMAC 计算。
+const (
+	invalidWindowSize = time.Minute
+	invalidMaxPerIP   = 20
+)
+
+// invalidCounter 某客户端 IP 在当前窗口内的签名失败次数。
+type invalidCounter struct {
+	count int
+	start time.Time
+}
 
 // releaseEvent 只取需要的字段：action / tag / 预发布标记 / 仓库全名。
 type releaseEvent struct {
@@ -40,17 +54,33 @@ type Server struct {
 
 	mu   sync.Mutex
 	busy bool
+
+	// 签名失败限流：按客户端 IP 计数，防公网暴力/慢速滥用。
+	// 只在签名失败时写；成功请求不读不计，正常投递不会被误伤。
+	invalidMu sync.Mutex
+	invalid   map[string]invalidCounter
+	lastSweep time.Time
+	now       func() time.Time // 测试注入时钟；生产为 time.Now
 }
 
 // NewServer 构造 HTTP 面。secret 优先取 cfg.Secret，否则从 SecretFile 读。
 // 部署形态是 0640 root:<服务用户>：进程以服务用户运行必须能组读，other 位为 0。
-// secret 为空直接报错：无签名密钥时宁可不启动，也不开无鉴权入口。
+// secret 为空或短于 MinSecretLen 直接报错：无签名密钥/弱密钥时宁可不启动，也不开无鉴权入口。
+// 错误信息只含路径/长度，不回显 secret 内容。
 func NewServer(cfg Config, up *Updater, st *StateStore, logger *log.Logger) (*Server, error) {
 	if st == nil {
 		return nil, fmt.Errorf("状态存储为空")
 	}
 	secret := cfg.Secret
 	if len(secret) == 0 {
+		fi, err := os.Stat(cfg.SecretFile)
+		if err != nil {
+			return nil, fmt.Errorf("读 webhook secret 文件: %w", err)
+		}
+		// Windows 的 ACL 不映射到 Unix 权限位，权限断言只在 Unix 生效（部署目标是 Linux）。
+		if runtime.GOOS != "windows" && fi.Mode().Perm()&0o007 != 0 {
+			return nil, fmt.Errorf("webhook secret 文件 %s 权限 %04o 过宽：必须为 0640/0600，other 位不可读写", cfg.SecretFile, fi.Mode().Perm())
+		}
 		b, err := os.ReadFile(cfg.SecretFile)
 		if err != nil {
 			return nil, fmt.Errorf("读 webhook secret 文件: %w", err)
@@ -60,7 +90,15 @@ func NewServer(cfg Config, up *Updater, st *StateStore, logger *log.Logger) (*Se
 	if len(secret) == 0 {
 		return nil, fmt.Errorf("webhook secret 为空")
 	}
-	return &Server{cfg: cfg, up: up, st: st, log: logger, secret: secret}, nil
+	// 与 JWT/TURN 同口径：短 secret 可被离线暴力撞出 HMAC，拒绝启动。
+	if len(secret) < MinSecretLen {
+		return nil, fmt.Errorf("webhook secret 长度 %d 字节，不足 %d 字节（用 openssl rand -hex 32 生成）", len(secret), MinSecretLen)
+	}
+	return &Server{
+		cfg: cfg, up: up, st: st, log: logger, secret: secret,
+		invalid: make(map[string]invalidCounter),
+		now:     time.Now,
+	}, nil
 }
 
 func (s *Server) logf(format string, args ...any) {
@@ -124,6 +162,12 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !validSignature(s.secret, r.Header.Get("X-Hub-Signature-256"), body) {
+		ip := clientIP(r.RemoteAddr)
+		if !s.noteInvalid(ip) {
+			s.logf("webhook 拒绝：签名失败次数过多（限流）delivery=%s ip=%s", delivery, ip)
+			http.Error(w, "too many requests", http.StatusTooManyRequests)
+			return
+		}
 		s.logf("webhook 拒绝：签名无效 delivery=%s", delivery)
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
@@ -255,13 +299,45 @@ func validSignature(secret []byte, header string, body []byte) bool {
 	return hmac.Equal(mac.Sum(nil), want)
 }
 
-// isLoopback RemoteAddr 是否环回（/status 用）。
-func isLoopback(remoteAddr string) bool {
+// noteInvalid 记录一次签名失败，返回该 IP 是否仍在窗口配额内（false → 429）。
+// 窗口自然过期后重新计数；每个窗口最多全扫一次过期条目，防公网扫描把 map 撑爆。
+// 超限后计数停在阈值 +1，不随攻击量无界增长。
+func (s *Server) noteInvalid(ip string) bool {
+	now := s.now()
+	s.invalidMu.Lock()
+	defer s.invalidMu.Unlock()
+	if now.Sub(s.lastSweep) >= invalidWindowSize {
+		for k, w := range s.invalid {
+			if now.Sub(w.start) >= invalidWindowSize {
+				delete(s.invalid, k)
+			}
+		}
+		s.lastSweep = now
+	}
+	w := s.invalid[ip]
+	if w.start.IsZero() || now.Sub(w.start) >= invalidWindowSize {
+		w = invalidCounter{start: now}
+	}
+	if w.count <= invalidMaxPerIP {
+		w.count++
+	}
+	s.invalid[ip] = w
+	return w.count <= invalidMaxPerIP
+}
+
+// clientIP 从 RemoteAddr 取 host（失败时用原值）。
+// 不信任 X-Forwarded-For：8088 直接对公网监听，该头可伪造，按它限流等于没有限流。
+func clientIP(remoteAddr string) string {
 	host, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
-		host = remoteAddr
+		return remoteAddr
 	}
-	ip := net.ParseIP(host)
+	return host
+}
+
+// isLoopback RemoteAddr 是否环回（/status 用）。
+func isLoopback(remoteAddr string) bool {
+	ip := net.ParseIP(clientIP(remoteAddr))
 	return ip != nil && ip.IsLoopback()
 }
 
