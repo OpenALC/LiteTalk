@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
 
-const testSecret = "test-webhook-secret"
+// testSecret 36 字节（≥MinSecretLen），与生产 openssl rand -hex 32 同口径。
+const testSecret = "test-webhook-secret-0123456789abcdef"
 
 func releaseBody(tag string, prerelease bool) []byte {
 	pre := "false"
@@ -368,14 +371,114 @@ func TestNewServerRequiresSecret(t *testing.T) {
 		t.Fatal("secret 缺失应拒绝启动")
 	}
 	p := filepath.Join(t.TempDir(), "empty.secret")
-	writeFile(t, p, "  \n")
+	writeSecretFile(t, p, "  \n", 0o640)
 	cfg.SecretFile = p
 	if _, err := NewServer(cfg, nil, st, testLogger()); err == nil {
 		t.Fatal("空 secret 应拒绝启动")
 	}
-	// 直接注入 secret（测试/嵌入场景）可启动
-	cfg.Secret = []byte("inline-secret")
+	// 短 secret 与 JWT/TURN 同口径拒绝（16 字节 < 32）
+	cfg.Secret = []byte("short-16-bytes!!")
+	cfg.SecretFile = ""
+	if _, err := NewServer(cfg, nil, st, testLogger()); err == nil {
+		t.Fatal("短于 32 字节的 secret 应拒绝启动")
+	}
+	// 直接注入 ≥32 字节 secret（测试/嵌入场景）可启动
+	cfg.Secret = []byte(testSecret)
 	if _, err := NewServer(cfg, nil, st, testLogger()); err != nil {
 		t.Fatalf("注入 secret 应可启动: %v", err)
+	}
+}
+
+// TestNewServerSecretFilePermissions：secret 文件 other 位必须为 0（0640/0600）。
+// Windows ACL 不映射到 Unix 权限位，该平台只断言可启动；Linux CI 覆盖拒绝路径。
+func TestNewServerSecretFilePermissions(t *testing.T) {
+	st, err := OpenState(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	content := strings.Repeat("a", 64) // 64 hex 字符 = 32 字节，长度达标
+
+	wide := filepath.Join(dir, "wide.secret")
+	writeSecretFile(t, wide, content, 0o644)
+	cfg := DefaultConfig()
+	cfg.SecretFile = wide
+	_, err = NewServer(cfg, nil, st, testLogger())
+	if runtime.GOOS == "windows" {
+		if err != nil {
+			t.Fatalf("Windows 不做权限断言，0644 应可启动: %v", err)
+		}
+	} else if err == nil {
+		t.Fatal("0644 secret 文件（other 可读）应拒绝启动")
+	}
+
+	for _, mode := range []os.FileMode{0o640, 0o600} {
+		p := filepath.Join(dir, "ok-"+mode.String()+".secret")
+		writeSecretFile(t, p, content, mode)
+		cfg.SecretFile = p
+		if _, err := NewServer(cfg, nil, st, testLogger()); err != nil {
+			t.Fatalf("权限 %04o 的 secret 文件应可启动: %v", mode, err)
+		}
+	}
+}
+
+// writeSecretFile 写 secret 文件并强制权限（os.WriteFile 的结果会被 umask 削位）。
+func writeSecretFile(t *testing.T, path, content string, mode os.FileMode) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), mode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestWebhookInvalidSignatureRateLimit：同一 IP 1 分钟窗口内前 20 次 401、第 21 次 429；
+// 其他 IP 不受影响，正确签名不受影响，窗口过期后恢复。
+func TestWebhookInvalidSignatureRateLimit(t *testing.T) {
+	env := newWebhookEnv(t, nil)
+	clk := newFakeClock()
+	env.server.now = clk.Now
+	body := releaseBody("v1.1.0-alpha", true)
+
+	bad := func(ip string) int {
+		req := httptest.NewRequest(http.MethodPost, "/hooks/github-release", bytes.NewReader(body))
+		req.RemoteAddr = ip + ":4444"
+		req.Header.Set("X-GitHub-Event", "release")
+		req.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("00", 32))
+		rec := httptest.NewRecorder()
+		env.server.Handler().ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	for i := 1; i <= invalidMaxPerIP; i++ {
+		if code := bad("203.0.113.7"); code != http.StatusUnauthorized {
+			t.Fatalf("第 %d 次签名失败 = %d, want 401", i, code)
+		}
+	}
+	if code := bad("203.0.113.7"); code != http.StatusTooManyRequests {
+		t.Fatalf("第 %d 次签名失败 = %d, want 429", invalidMaxPerIP+1, code)
+	}
+	// 限流按 IP 隔离：另一个 IP 仍然 401
+	if code := bad("203.0.113.8"); code != http.StatusUnauthorized {
+		t.Fatalf("其他 IP 签名失败 = %d, want 401", code)
+	}
+
+	// 成功签名不受限流影响（ping 不触发更新）
+	req := httptest.NewRequest(http.MethodPost, "/hooks/github-release", bytes.NewReader([]byte(`{}`)))
+	req.RemoteAddr = "203.0.113.7:4444"
+	req.Header.Set("X-GitHub-Event", "ping")
+	req.Header.Set("X-GitHub-Delivery", "d-rl-ping")
+	req.Header.Set("X-Hub-Signature-256", "sha256="+hmacHex([]byte(testSecret), []byte(`{}`)))
+	rec := httptest.NewRecorder()
+	env.server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("限流 IP 上的正确签名 = %d, want 202", rec.Code)
+	}
+
+	// 窗口过后重新计数
+	clk.advance(invalidWindowSize)
+	if code := bad("203.0.113.7"); code != http.StatusUnauthorized {
+		t.Fatalf("窗口过期后 = %d, want 401", code)
 	}
 }

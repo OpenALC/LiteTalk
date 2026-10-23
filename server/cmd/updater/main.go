@@ -121,10 +121,15 @@ func runService(cfg updater.Config, logger *log.Logger) {
 		logger.Fatalf("初始化失败: %v", err)
 	}
 
+	// 公网明文入口的慢速攻击面收口：webhook body 上限 1MiB，30s 读写足够；
+	// 空闲连接 120s 回收，避免占着连接不走的慢速滥用。
 	httpSrv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	errCh := make(chan error, 1)
