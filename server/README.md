@@ -126,8 +126,8 @@ JWT 鉴权（loadtest 走 dev-token，仅限 `LITETALK_DEV_AUTH=1` 的测试实�
 可对公网生产实例直接拨测。
 
 ```bash
-# 对公网实例拨测（simple 模式服务端，自动注册两个探测账号）
-go run ./cmd/e2eprobe -addr 203.0.113.10:8077
+# 对公网 HTTPS 实例拨测（simple 模式服务端，自动注册两个探测账号）
+go run ./cmd/e2eprobe -addr litetalk.example.com -tls
 
 # 对本机服务端拨测（SFU 宣告 127.0.0.1，需放开环回候选）
 LITETALK_AUTH_MODE=simple go run ./cmd/server

@@ -5,8 +5,8 @@
 // 与 loadtest 的区别：走真实 JWT 鉴权（不需要 LITETALK_DEV_AUTH），
 // 用于验证公网部署的 REST/WS/UDP 全链路。一次性工具，用完即删。
 //
-//	go run ./cmd/e2eprobe -addr 203.0.113.10:8077
 //	go run ./cmd/e2eprobe -addr 127.0.0.1:8077 -loopback   # 本机服务端
+//	go run ./cmd/e2eprobe -addr litetalk.example.com -tls   # 域名 + HTTPS/WSS（反代/ACME）
 //	go run ./cmd/e2eprobe -addr 127.0.0.1:8077 -multi-device  # 多设备会话场景（踢线/共存/语音抢占）
 //	go run ./cmd/e2eprobe -addr 127.0.0.1:8077 -presence  # 在线状态场景（好友 online 随连断翻转）
 //	go run ./cmd/e2eprobe -addr 127.0.0.1:8077 -rejoin -loopback  # 重入房场景（离房再入房，B 须恢复收听）
@@ -36,8 +36,29 @@ const (
 	probeClientVersion  = "e2eprobe-dev"
 )
 
+// REST/WS 的 scheme 由 -tls 决定。一次性探测工具，用包级变量避免给每个
+// 辅助函数加参数；main 解析 flag 后立即设置，之后只读。
+var (
+	restScheme = "http"
+	wsScheme   = "ws"
+)
+
+// setSchemes 按 -tls 切换 REST/WS scheme。
+func setSchemes(tls bool) {
+	if tls {
+		restScheme, wsScheme = "https", "wss"
+		return
+	}
+	restScheme, wsScheme = "http", "ws"
+}
+
+func restURL(addr, path string) string { return restScheme + "://" + addr + path }
+
+func wsURL(addr, token string) string { return wsScheme + "://" + addr + "/ws?token=" + token }
+
 type config struct {
 	addr        string
+	tls         bool // -tls：REST 走 https、WS 走 wss（域名/反代部署）
 	users       int
 	duration    time.Duration
 	loopback    bool
@@ -56,7 +77,7 @@ func register(addr, nickname string) (email, token string, id int64, ice []ICESe
 
 	post := func(path string, body any) (int, []byte, error) {
 		raw, _ := json.Marshal(body)
-		req, err := http.NewRequest(http.MethodPost, "http://"+addr+path, bytes.NewReader(raw))
+		req, err := http.NewRequest(http.MethodPost, restURL(addr, path), bytes.NewReader(raw))
 		if err != nil {
 			return 0, nil, err
 		}
@@ -90,7 +111,7 @@ func register(addr, nickname string) (email, token string, id int64, ice []ICESe
 		return "", "", 0, nil, fmt.Errorf("token 解析失败: %s", b)
 	}
 
-	req, _ := http.NewRequest("POST", "http://"+addr+"/api/v1/rtc/credentials?token="+pair.AccessToken, nil)
+	req, _ := http.NewRequest("POST", restURL(addr, "/api/v1/rtc/credentials?token="+pair.AccessToken), nil)
 	req.Header.Set(clientVersionHeader, probeClientVersion)
 	cresp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -108,7 +129,8 @@ func register(addr, nickname string) (email, token string, id int64, ice []ICESe
 
 func main() {
 	cfg := &config{}
-	flag.StringVar(&cfg.addr, "addr", "203.0.113.10:8077", "服务端地址")
+	flag.StringVar(&cfg.addr, "addr", "127.0.0.1:8077", "服务端地址（host[:port]）")
+	flag.BoolVar(&cfg.tls, "tls", false, "使用 HTTPS/WSS（域名或前置反代 TLS）")
 	flag.IntVar(&cfg.users, "users", 2, "每房间人数（含自己）")
 	flag.DurationVar(&cfg.duration, "duration", 8*time.Second, "发包时长")
 	flag.BoolVar(&cfg.loopback, "loopback", false, "允许环回候选（测本机服务端时必开）")
@@ -118,6 +140,7 @@ func main() {
 	flag.BoolVar(&cfg.rejoin, "rejoin", false, "重入房场景：离房再入房，B 须恢复收听（#23）")
 	flag.BoolVar(&cfg.tcpOnly, "tcp", false, "禁 UDP 场景：客户端只启用 TCP 候选，验证 ICE-TCP 直连（#25）")
 	flag.Parse()
+	setSchemes(cfg.tls)
 	if cfg.users < 2 {
 		fmt.Fprintln(os.Stderr, "users ≥ 2")
 		os.Exit(2)

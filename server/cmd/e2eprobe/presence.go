@@ -35,7 +35,7 @@ func registerTagged(addr, nickname string) (*probePair, error) {
 	raw, _ := json.Marshal(map[string]string{
 		"nickname": nickname, "email": email, "password": "probe1234",
 	})
-	req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/api/v1/auth/register", bytes.NewReader(raw))
+	req, err := http.NewRequest(http.MethodPost, restURL(addr, "/api/v1/auth/register"), bytes.NewReader(raw))
 	if err != nil {
 		return nil, fmt.Errorf("register 请求: %w", err)
 	}
@@ -73,7 +73,7 @@ func restJSON(method, addr, path, token string, body any) (int, []byte, error) {
 		raw, _ := json.Marshal(body)
 		rdr = bytes.NewReader(raw)
 	}
-	req, err := http.NewRequest(method, "http://"+addr+path, rdr)
+	req, err := http.NewRequest(method, restURL(addr, path), rdr)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -168,7 +168,7 @@ func runPresence(ctx context.Context, cfg *config) int {
 
 	// A 连 WS = 上线。
 	conn, _, err := websocket.Dial(ctx,
-		fmt.Sprintf("ws://%s/ws?token=%s", cfg.addr, a.token), nil)
+		wsURL(cfg.addr, a.token), nil)
 	if err != nil {
 		fmt.Println("A WS 拨号失败:", err)
 		return 1
