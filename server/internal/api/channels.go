@@ -212,6 +212,27 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 			detail["parent_id"] = req.ParentID.Val
 		}
 	}
+	// 子频道自身改 type/category 也必须与父一致（#101 P2）：上方 409 只拦
+	// 「有子频道的父频道」，子频道此前可以单方面漂移出父的类型/分类，破坏
+	// 两级树的不变量。字段应用完成后统一核对最终值，避免半写。
+	// ParentID 被清空（提升顶层）时无父可校验；父频道自身要改 type/category
+	// 仍由 hasChildren 409 拦截。
+	if ch.ParentID != nil {
+		parent, err := s.store.ChannelByID(ctx, *ch.ParentID)
+		if err != nil {
+			return nil, s.writeStoreErr(ctx, err)
+		}
+		if parent.ServerID != ch.ServerID {
+			return nil, errf(http.StatusBadRequest, "bad_parent", "父频道不存在或不属于该服务器")
+		}
+		if parent.Type != ch.Type {
+			return nil, errf(http.StatusBadRequest, "bad_parent", "父子频道类型必须相同")
+		}
+		if (ch.CategoryID == nil) != (parent.CategoryID == nil) ||
+			(ch.CategoryID != nil && *ch.CategoryID != *parent.CategoryID) {
+			return nil, errf(http.StatusBadRequest, "bad_parent", "父子频道分类必须相同")
+		}
+	}
 	if err := s.store.UpdateChannel(ctx, ch); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
