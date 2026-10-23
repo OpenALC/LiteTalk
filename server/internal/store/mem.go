@@ -22,6 +22,8 @@ type Mem struct {
 	messages    map[int64]*Message
 	invites     map[string]*Invite
 	sessions    map[int64]map[string]*UserSession // userID → deviceType → session
+	// channelMembers 会话成员（迁移 0012，#38）：channelID → userID → 成员。
+	channelMembers map[int64]map[int64]*ChannelMember
 
 	roles       map[int64]*Role                                     // roleID → role（迁移 0010）
 	memberRoles map[int64]map[int64]map[int64]*MemberRoleAssignment // serverID → userID → roleID → 分配
@@ -41,20 +43,21 @@ type overwriteKey struct {
 // NewMem 创建内存存储。
 func NewMem() *Mem {
 	return &Mem{
-		users:       map[int64]*User{},
-		friendships: map[int64]*Friendship{},
-		servers:     map[int64]*Server{},
-		members:     map[int64]map[int64]*ServerMember{},
-		channels:    map[int64]*Channel{},
-		categories:  map[int64]*Category{},
-		messages:    map[int64]*Message{},
-		invites:     map[string]*Invite{},
-		sessions:    map[int64]map[string]*UserSession{},
-		roles:       map[int64]*Role{},
-		memberRoles: map[int64]map[int64]map[int64]*MemberRoleAssignment{},
-		overwrites:  map[overwriteKey]*ChannelOverwrite{},
-		auditLogs:   map[int64]*AuditLog{},
-		MemKV:       NewMemKV(),
+		users:          map[int64]*User{},
+		friendships:    map[int64]*Friendship{},
+		servers:        map[int64]*Server{},
+		members:        map[int64]map[int64]*ServerMember{},
+		channels:       map[int64]*Channel{},
+		categories:     map[int64]*Category{},
+		messages:       map[int64]*Message{},
+		invites:        map[string]*Invite{},
+		sessions:       map[int64]map[string]*UserSession{},
+		channelMembers: map[int64]map[int64]*ChannelMember{},
+		roles:          map[int64]*Role{},
+		memberRoles:    map[int64]map[int64]map[int64]*MemberRoleAssignment{},
+		overwrites:     map[overwriteKey]*ChannelOverwrite{},
+		auditLogs:      map[int64]*AuditLog{},
+		MemKV:          NewMemKV(),
 	}
 }
 
@@ -441,6 +444,9 @@ func (m *Mem) MembersOfServer(_ context.Context, serverID int64) ([]ServerMember
 // ---- channels ----
 
 func (m *Mem) CreateChannel(_ context.Context, c *Channel) error {
+	if err := normalizeServerChannel(c); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.servers[c.ServerID]; !ok {
@@ -469,7 +475,7 @@ func (m *Mem) ChannelsOfServer(_ context.Context, serverID int64) ([]Channel, er
 	defer m.mu.Unlock()
 	out := []Channel{}
 	for _, c := range m.channels {
-		if c.ServerID == serverID {
+		if c.ServerID == serverID && c.Scope == ChannelScopeServer {
 			out = append(out, *c)
 		}
 	}
@@ -490,7 +496,15 @@ func (m *Mem) UpdateChannel(_ context.Context, c *Channel) error {
 	if _, ok := m.channels[c.ID]; !ok {
 		return ErrNotFound
 	}
+	scope := normalizeChannelScope(c.Scope)
+	if scope != ChannelScopeServer && !isConversationScope(scope) {
+		return ErrForbidden
+	}
 	cp := *c
+	cp.Scope = scope
+	if scope == ChannelScopeServer {
+		cp.DMKey = ""
+	}
 	m.channels[c.ID] = &cp
 	return nil
 }
@@ -501,11 +515,12 @@ func (m *Mem) DeleteChannel(_ context.Context, id int64) error {
 	if _, ok := m.channels[id]; !ok {
 		return ErrNotFound
 	}
-	// 子频道行级联（#37）：消息/覆盖一并清，与 SQL 实现同语义。
+	// 子频道行级联（#37）：消息/覆盖/会话成员一并清，与 SQL 实现同语义。
 	for cid, c := range m.channels {
 		if c.ParentID != nil && *c.ParentID == id {
 			delete(m.channels, cid)
 			m.deleteOverwritesOfChannelLocked(cid)
+			delete(m.channelMembers, cid)
 			for mid, msg := range m.messages {
 				if msg.ChannelID == cid {
 					delete(m.messages, mid)
@@ -515,11 +530,152 @@ func (m *Mem) DeleteChannel(_ context.Context, id int64) error {
 	}
 	delete(m.channels, id)
 	m.deleteOverwritesOfChannelLocked(id)
+	delete(m.channelMembers, id)
 	for mid, msg := range m.messages {
 		if msg.ChannelID == id {
 			delete(m.messages, mid)
 		}
 	}
+	return nil
+}
+
+// ---- conversations（迁移 0012，#38 B1） ----
+
+func (m *Mem) CreateConversation(_ context.Context, c *Channel, memberIDs []int64) error {
+	ids, err := normalizeConversation(c, memberIDs)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if c.Scope == ChannelScopeDirect {
+		for _, x := range m.channels {
+			if x.Scope == ChannelScopeDirect && x.DMKey == c.DMKey {
+				return ErrConflict
+			}
+		}
+	}
+	c.ID = newID(c.ID)
+	now := time.Now()
+	c.CreatedAt = now
+	cp := *c
+	m.channels[c.ID] = &cp
+	members := make(map[int64]*ChannelMember, len(ids))
+	for i, uid := range ids {
+		members[uid] = &ChannelMember{
+			ChannelID: c.ID,
+			UserID:    uid,
+			Role:      conversationMemberRole(c.Scope, i),
+			JoinedAt:  now,
+		}
+	}
+	m.channelMembers[c.ID] = members
+	return nil
+}
+
+func (m *Mem) FindDirectChannel(_ context.Context, a, b int64) (*Channel, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := directKey(a, b)
+	for _, c := range m.channels {
+		if c.Scope == ChannelScopeDirect && c.DMKey == key {
+			cp := *c
+			return &cp, nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
+func (m *Mem) ListConversations(_ context.Context, userID int64) ([]Channel, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []Channel{}
+	for id, c := range m.channels {
+		if !isConversationScope(c.Scope) {
+			continue
+		}
+		if _, ok := m.channelMembers[id][userID]; !ok {
+			continue
+		}
+		out = append(out, *c)
+	}
+	// 与 SQL 的 ORDER BY created_at DESC, id DESC 对齐：map 遍历序随机，必须定序。
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.After(out[j].CreatedAt)
+		}
+		return out[i].ID > out[j].ID
+	})
+	return out, nil
+}
+
+func (m *Mem) ChannelMembers(_ context.Context, channelID int64) ([]ChannelMember, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []ChannelMember{}
+	for _, cm := range m.channelMembers[channelID] {
+		cp := *cm
+		if u, ok := m.users[cm.UserID]; ok {
+			cp.Nickname, cp.Tag = u.Nickname, u.Tag
+		}
+		out = append(out, cp)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].JoinedAt.Equal(out[j].JoinedAt) {
+			return out[i].JoinedAt.Before(out[j].JoinedAt)
+		}
+		return out[i].UserID < out[j].UserID
+	})
+	return out, nil
+}
+
+func (m *Mem) ChannelMember(_ context.Context, channelID, userID int64) (*ChannelMember, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cm, ok := m.channelMembers[channelID][userID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	cp := *cm
+	if u, ok := m.users[userID]; ok {
+		cp.Nickname, cp.Tag = u.Nickname, u.Tag
+	}
+	return &cp, nil
+}
+
+func (m *Mem) AddChannelMember(_ context.Context, channelID, userID int64, role ChannelMemberRole) error {
+	role, err := normalizeChannelMemberRole(role)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.channels[channelID]
+	if !ok {
+		return ErrNotFound
+	}
+	if !isConversationScope(c.Scope) {
+		return ErrForbidden
+	}
+	if m.channelMembers[channelID] == nil {
+		m.channelMembers[channelID] = map[int64]*ChannelMember{}
+	}
+	if _, exists := m.channelMembers[channelID][userID]; exists {
+		return ErrConflict
+	}
+	m.channelMembers[channelID][userID] = &ChannelMember{
+		ChannelID: channelID, UserID: userID, Role: role, JoinedAt: time.Now(),
+	}
+	return nil
+}
+
+func (m *Mem) RemoveChannelMember(_ context.Context, channelID, userID int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.channelMembers[channelID][userID]; !ok {
+		return ErrNotFound
+	}
+	delete(m.channelMembers[channelID], userID)
 	return nil
 }
 

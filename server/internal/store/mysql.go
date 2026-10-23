@@ -615,12 +615,15 @@ func (m *MySQL) MembersOfServer(ctx context.Context, serverID int64) ([]ServerMe
 // ---- channels ----
 
 func (m *MySQL) CreateChannel(ctx context.Context, c *Channel) error {
+	if err := normalizeServerChannel(c); err != nil {
+		return err
+	}
 	c.ID = newID(c.ID)
 	_, err := m.db.ExecContext(ctx,
-		`INSERT INTO channels (id, server_id, name, type, category_id, position, password_hash, user_limit, parent_id)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO channels (id, server_id, name, type, category_id, position, password_hash, user_limit, parent_id, scope, dm_key)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
 		c.ID, c.ServerID, c.Name, c.Type, c.CategoryID, c.Position,
-		c.PasswordHash, c.UserLimit, c.ParentID)
+		c.PasswordHash, c.UserLimit, c.ParentID, c.Scope)
 	if err != nil {
 		return err
 	}
@@ -628,25 +631,32 @@ func (m *MySQL) CreateChannel(ctx context.Context, c *Channel) error {
 		Scan(&c.CreatedAt)
 }
 
-const channelCols = `id, server_id, name, type, category_id, position, created_at, password_hash, user_limit, parent_id`
+const channelCols = `id, server_id, name, type, category_id, position, created_at, password_hash, user_limit, parent_id, scope, dm_key`
 
-// scanChannel 扫描一行频道（category_id/parent_id 可空）。
+// scanChannel 扫描一行频道（server_id/category_id/parent_id/dm_key 可空）。
 func scanChannel(rows interface{ Scan(...any) error }) (*Channel, error) {
 	var c Channel
-	var catID, parentID sql.NullInt64
-	err := rows.Scan(&c.ID, &c.ServerID, &c.Name, &c.Type, &catID, &c.Position, &c.CreatedAt,
-		&c.PasswordHash, &c.UserLimit, &parentID)
+	var serverID, catID, parentID sql.NullInt64
+	var dmKey sql.NullString
+	err := rows.Scan(&c.ID, &serverID, &c.Name, &c.Type, &catID, &c.Position, &c.CreatedAt,
+		&c.PasswordHash, &c.UserLimit, &parentID, &c.Scope, &dmKey)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	if serverID.Valid {
+		c.ServerID = serverID.Int64
+	}
 	if catID.Valid {
 		c.CategoryID = &catID.Int64
 	}
 	if parentID.Valid {
 		c.ParentID = &parentID.Int64
+	}
+	if dmKey.Valid {
+		c.DMKey = dmKey.String
 	}
 	return &c, nil
 }
@@ -658,7 +668,7 @@ func (m *MySQL) ChannelByID(ctx context.Context, id int64) (*Channel, error) {
 
 func (m *MySQL) ChannelsOfServer(ctx context.Context, serverID int64) ([]Channel, error) {
 	rows, err := m.db.QueryContext(ctx,
-		`SELECT `+channelCols+` FROM channels WHERE server_id = ? ORDER BY position, id`, serverID)
+		`SELECT `+channelCols+` FROM channels WHERE server_id = ? AND scope = 'server' ORDER BY position, id`, serverID)
 	if err != nil {
 		return nil, err
 	}
@@ -674,14 +684,22 @@ func (m *MySQL) ChannelsOfServer(ctx context.Context, serverID int64) ([]Channel
 	return out, rows.Err()
 }
 
-// UpdateChannel 全行写（#37 B1 起含 password_hash/user_limit/parent_id）：
-// 调用方必须先读再写，清除密码写空串、提升顶层写 NULL。
+// UpdateChannel 全行写（#37 B1 起含 password_hash/user_limit/parent_id；#38 起含
+// server_id/scope/dm_key）：调用方必须先读再写，清除密码写空串、提升顶层写 NULL；
+// 会话行 ServerID=0 写 NULL、DMKey 空串写 NULL，server 行强制清空 dm_key。
 func (m *MySQL) UpdateChannel(ctx context.Context, c *Channel) error {
+	scope := normalizeChannelScope(c.Scope)
+	dmKey := c.DMKey
+	if scope == ChannelScopeServer {
+		dmKey = ""
+	} else if !isConversationScope(scope) {
+		return ErrForbidden
+	}
 	res, err := m.db.ExecContext(ctx,
-		`UPDATE channels SET name = ?, type = ?, category_id = ?, position = ?,
-		 password_hash = ?, user_limit = ?, parent_id = ? WHERE id = ?`,
-		c.Name, c.Type, c.CategoryID, c.Position,
-		c.PasswordHash, c.UserLimit, c.ParentID, c.ID)
+		`UPDATE channels SET server_id = ?, name = ?, type = ?, category_id = ?, position = ?,
+		 password_hash = ?, user_limit = ?, parent_id = ?, scope = ?, dm_key = ? WHERE id = ?`,
+		nullID(c.ServerID), c.Name, c.Type, c.CategoryID, c.Position,
+		c.PasswordHash, c.UserLimit, c.ParentID, scope, nullString(dmKey), c.ID)
 	if err != nil {
 		return err
 	}
@@ -689,8 +707,8 @@ func (m *MySQL) UpdateChannel(ctx context.Context, c *Channel) error {
 }
 
 func (m *MySQL) DeleteChannel(ctx context.Context, id int64) error {
-	// 单事务：消息 + 频道覆盖 + 子频道行 + 频道一起删（#22/#35/#37）。
-	// 子频道与父同行级联（消息/覆盖一并）；IN 子查询指向 channels，
+	// 单事务：消息 + 频道覆盖 + 会话成员 + 子频道行 + 频道一起删（#22/#35/#37/#38）。
+	// 子频道与父同行级联（消息/覆盖/成员一并）；IN 子查询指向 channels，
 	// 不是被删的 messages/overwrites 自身，无 1093 限制。
 	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -707,6 +725,11 @@ func (m *MySQL) DeleteChannel(ctx context.Context, id int64) error {
 		   OR channel_id IN (SELECT id FROM channels WHERE parent_id = ?)`, id, id); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM channel_members WHERE channel_id = ?
+		   OR channel_id IN (SELECT id FROM channels WHERE parent_id = ?)`, id, id); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM channels WHERE parent_id = ?`, id); err != nil {
 		return err
 	}
@@ -718,6 +741,152 @@ func (m *MySQL) DeleteChannel(ctx context.Context, id int64) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// ---- conversations（迁移 0012，#38 B1） ----
+
+func (m *MySQL) CreateConversation(ctx context.Context, c *Channel, memberIDs []int64) error {
+	ids, err := normalizeConversation(c, memberIDs)
+	if err != nil {
+		return err
+	}
+	c.ID = newID(c.ID)
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO channels (id, server_id, name, type, category_id, position, password_hash, user_limit, parent_id, scope, dm_key)
+		 VALUES (?, NULL, ?, ?, NULL, ?, '', ?, NULL, ?, ?)`,
+		c.ID, c.Name, c.Type, c.Position, c.UserLimit, c.Scope, nullString(c.DMKey)); err != nil {
+		if isDup(err) {
+			return ErrConflict
+		}
+		return err
+	}
+	now := time.Now()
+	for i, uid := range ids {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO channel_members (channel_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)`,
+			c.ID, uid, conversationMemberRole(c.Scope, i), now); err != nil {
+			if isDup(err) {
+				return ErrConflict
+			}
+			return err
+		}
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT created_at FROM channels WHERE id = ?`, c.ID).
+		Scan(&c.CreatedAt); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (m *MySQL) FindDirectChannel(ctx context.Context, a, b int64) (*Channel, error) {
+	return scanChannel(m.db.QueryRowContext(ctx,
+		`SELECT `+channelCols+` FROM channels WHERE scope = 'direct' AND dm_key = ?`, directKey(a, b)))
+}
+
+func (m *MySQL) ListConversations(ctx context.Context, userID int64) ([]Channel, error) {
+	rows, err := m.db.QueryContext(ctx,
+		`SELECT `+channelCols+` FROM channels c
+		   JOIN channel_members cm ON cm.channel_id = c.id
+		  WHERE cm.user_id = ? AND c.scope IN ('direct','group')
+		  ORDER BY c.created_at DESC, c.id DESC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Channel{}
+	for rows.Next() {
+		c, err := scanChannel(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *c)
+	}
+	return out, rows.Err()
+}
+
+// channelMemberJoin 成员列表/单查共用；users 用 LEFT JOIN：成员行存在但用户已删时
+// 仍返回成员（昵称留空），与 Mem 实现一致。
+const channelMemberJoin = `SELECT cm.channel_id, cm.user_id, cm.role, cm.joined_at, u.nickname, u.tag
+	FROM channel_members cm LEFT JOIN users u ON u.id = cm.user_id`
+
+func scanChannelMember(rows interface{ Scan(...any) error }) (*ChannelMember, error) {
+	var cm ChannelMember
+	var nickname, tag sql.NullString
+	err := rows.Scan(&cm.ChannelID, &cm.UserID, &cm.Role, &cm.JoinedAt, &nickname, &tag)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if nickname.Valid {
+		cm.Nickname = nickname.String
+	}
+	if tag.Valid {
+		cm.Tag = tag.String
+	}
+	return &cm, nil
+}
+
+func (m *MySQL) ChannelMembers(ctx context.Context, channelID int64) ([]ChannelMember, error) {
+	rows, err := m.db.QueryContext(ctx,
+		channelMemberJoin+` WHERE cm.channel_id = ? ORDER BY cm.joined_at, cm.user_id`, channelID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ChannelMember{}
+	for rows.Next() {
+		cm, err := scanChannelMember(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *cm)
+	}
+	return out, rows.Err()
+}
+
+func (m *MySQL) ChannelMember(ctx context.Context, channelID, userID int64) (*ChannelMember, error) {
+	return scanChannelMember(m.db.QueryRowContext(ctx,
+		channelMemberJoin+` WHERE cm.channel_id = ? AND cm.user_id = ?`, channelID, userID))
+}
+
+func (m *MySQL) AddChannelMember(ctx context.Context, channelID, userID int64, role ChannelMemberRole) error {
+	role, err := normalizeChannelMemberRole(role)
+	if err != nil {
+		return err
+	}
+	var scope ChannelScope
+	if err := m.db.QueryRowContext(ctx, `SELECT scope FROM channels WHERE id = ?`, channelID).Scan(&scope); err != nil {
+		if err == sql.ErrNoRows {
+			return ErrNotFound
+		}
+		return err
+	}
+	if !isConversationScope(scope) {
+		return ErrForbidden
+	}
+	_, err = m.db.ExecContext(ctx,
+		`INSERT INTO channel_members (channel_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)`,
+		channelID, userID, role, time.Now())
+	if isDup(err) {
+		return ErrConflict
+	}
+	return err
+}
+
+func (m *MySQL) RemoveChannelMember(ctx context.Context, channelID, userID int64) error {
+	res, err := m.db.ExecContext(ctx,
+		`DELETE FROM channel_members WHERE channel_id = ? AND user_id = ?`, channelID, userID)
+	if err != nil {
+		return err
+	}
+	return checkAffected(res)
 }
 
 // ---- categories（v0.1.2 迁移 0003） ----
