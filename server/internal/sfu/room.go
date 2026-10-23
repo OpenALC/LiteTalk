@@ -23,8 +23,9 @@ type Room struct {
 	// 锁序固定为 s.mu → r.mu（acquireRoom / removeRoomIfEmpty 都按此顺序）。
 	joining int
 	// serverMuted 服务端强制闭麦状态（#36，受 mu 保护）：uid → 是否被闭麦。
-	// removePeer/teardownPeer 不清除——同房间重入/换连接经 newPeer 继承，
-	// 房间销毁才随 Room 一起消失。
+	// 语义是「房间实例级临时状态」，不是跨房间持久的管理状态：removePeer/teardownPeer
+	// 不清除（同房间重入/换连接经 newPeer 继承），但换频道、房间销毁（空房回收）或
+	// 服务重启都会随之清除，不写库、不跨房间延续。
 	serverMuted map[string]bool
 
 	// tickPeers 成员快照缓冲（复用免分配；仅 speakingLoop goroutine 访问）。
