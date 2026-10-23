@@ -113,6 +113,17 @@ func runConversationsContract(t *testing.T, st Store) {
 			t.Fatalf("非成员 ChannelMember 应 ErrNotFound，实际 %v", err)
 		}
 
+		// 直聊成员固定为双方：增删在 Store 层直接拒绝，不留给 API 兜底。
+		if err := st.AddChannelMember(ctx, conv.ID, outsider.ID, ChannelMemberMember); !errors.Is(err, ErrForbidden) {
+			t.Fatalf("direct AddChannelMember 应 ErrForbidden，实际 %v", err)
+		}
+		if err := st.RemoveChannelMember(ctx, conv.ID, a.ID); !errors.Is(err, ErrForbidden) {
+			t.Fatalf("direct RemoveChannelMember 应 ErrForbidden，实际 %v", err)
+		}
+		if got, err := st.ChannelMembers(ctx, conv.ID); err != nil || len(got) != 2 {
+			t.Fatalf("direct 成员不应被增删: %+v %v", got, err)
+		}
+
 		// 全行写保留会话身份：server_id 仍为 NULL（Go 0）、dm_key 不变。
 		got.Name = "私聊2"
 		if err := st.UpdateChannel(ctx, got); err != nil {
@@ -273,12 +284,18 @@ func runConversationsContract(t *testing.T, st Store) {
 			t.Fatalf("group 零成员应 ErrForbidden，实际 %v", err)
 		}
 
-		// channel_members 只属于会话：server 频道拒绝。
+		// channel_members 只属于 group：server/direct 频道拒绝增删。
 		if err := st.AddChannelMember(ctx, ch.ID, a.ID, ChannelMemberMember); !errors.Is(err, ErrForbidden) {
 			t.Fatalf("server 频道 AddChannelMember 应 ErrForbidden，实际 %v", err)
 		}
+		if err := st.RemoveChannelMember(ctx, ch.ID, a.ID); !errors.Is(err, ErrForbidden) {
+			t.Fatalf("server 频道 RemoveChannelMember 应 ErrForbidden，实际 %v", err)
+		}
 		if err := st.AddChannelMember(ctx, 999999, a.ID, ChannelMemberMember); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("不存在频道 AddChannelMember 应 ErrNotFound，实际 %v", err)
+		}
+		if err := st.RemoveChannelMember(ctx, 999999, a.ID); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("不存在频道 RemoveChannelMember 应 ErrNotFound，实际 %v", err)
 		}
 	})
 }
