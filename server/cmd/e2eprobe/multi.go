@@ -237,7 +237,7 @@ func restPost(addr, path, token string, body any) (int, []byte, error) {
 	if err != nil {
 		return 0, nil, err
 	}
-	req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/api/v1"+path, bytes.NewReader(raw))
+	req, err := http.NewRequest(http.MethodPost, restURL(addr, "/api/v1"+path), bytes.NewReader(raw))
 	if err != nil {
 		return 0, nil, err
 	}

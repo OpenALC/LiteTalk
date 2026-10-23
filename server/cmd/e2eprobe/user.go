@@ -144,7 +144,7 @@ func (u *probeUser) run(ctx context.Context, sendStart, sendStop <-chan struct{}
 func (u *probeUser) dial(ctx context.Context) error {
 	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	conn, _, err := websocket.Dial(dctx, fmt.Sprintf("ws://%s/ws?token=%s", u.cfg.addr, u.token), nil)
+	conn, _, err := websocket.Dial(dctx, wsURL(u.cfg.addr, u.token), nil)
 	if err != nil {
 		return fmt.Errorf("%s WS 拨号: %w", u.id, err)
 	}
