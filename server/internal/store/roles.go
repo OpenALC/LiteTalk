@@ -537,7 +537,9 @@ func dbOverwriteTargetOK(ctx context.Context, q sqlExecer, o *ChannelOverwrite) 
 		return ErrForbidden
 	}
 	var serverID int64
-	if err := q.QueryRowContext(ctx, `SELECT server_id FROM channels WHERE id = ?`, o.ChannelID).
+	// 只认 server 作用域：会话频道 server_id 为 NULL，直接 Scan 会报错，也该按不存在处理。
+	if err := q.QueryRowContext(ctx,
+		`SELECT server_id FROM channels WHERE id = ? AND scope = 'server'`, o.ChannelID).
 		Scan(&serverID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound

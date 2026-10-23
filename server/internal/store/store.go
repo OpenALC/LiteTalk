@@ -102,21 +102,55 @@ const (
 	ChannelVoice ChannelType = "voice"
 )
 
+// ChannelScope 频道作用域（迁移 0012，#38 B1）：
+// server = 服务器频道；direct/group = 私聊/群私聊，没有所属服务器。
+type ChannelScope string
+
+const (
+	ChannelScopeServer ChannelScope = "server"
+	ChannelScopeDirect ChannelScope = "direct"
+	ChannelScopeGroup  ChannelScope = "group"
+)
+
 // Channel 频道。category_id 指向分类表（迁移 0003），NULL = 未分类。
 type Channel struct {
-	ID         int64       `json:"id" db:"id"`
-	ServerID   int64       `json:"server_id" db:"server_id"`
-	Name       string      `json:"name" db:"name"`
-	Type       ChannelType `json:"type" db:"type"`
-	CategoryID *int64      `json:"category_id" db:"category_id"`
-	Position   int         `json:"position" db:"position"`
-	CreatedAt  time.Time   `json:"created_at" db:"created_at"`
+	ID int64 `json:"id" db:"id"`
+	// ServerID 所属服务器；0 表示无服务器（direct/group，DB 存 NULL）。
+	ServerID int64        `json:"server_id" db:"server_id"`
+	Name     string       `json:"name" db:"name"`
+	Type     ChannelType  `json:"type" db:"type"`
+	Scope    ChannelScope `json:"scope" db:"scope"`
+	// DMKey 私聊去重键 "<minUID>:<maxUID>"，只有 direct 有值（server/group 存 NULL）。
+	// 不对外：客户端用会话 ID 与成员列表识别私聊，键里只是双方 uid。
+	DMKey      string    `json:"-" db:"dm_key"`
+	CategoryID *int64    `json:"category_id" db:"category_id"`
+	Position   int       `json:"position" db:"position"`
+	CreatedAt  time.Time `json:"created_at" db:"created_at"`
 	// #37 B1 频道选项：密码（bcrypt）、人数上限（0=不限）、子频道父级（NULL=顶层）。
 	// PasswordHash 不出 JSON——wire 只暴露 has_password，明文/哈希都不回显。
 	// 更新是全行写：读到的 hash 必须原样写回，清除密码写空串。
 	ParentID     *int64 `json:"parent_id" db:"parent_id"`
 	UserLimit    int    `json:"user_limit" db:"user_limit"`
 	PasswordHash string `json:"-" db:"password_hash"`
+}
+
+// ChannelMemberRole 会话成员角色。owner 只用于 group（首个成员即创建者）。
+type ChannelMemberRole string
+
+const (
+	ChannelMemberOwner  ChannelMemberRole = "owner"
+	ChannelMemberMember ChannelMemberRole = "member"
+)
+
+// ChannelMember 会话成员（迁移 0012 channel_members 表）。
+// Nickname/Tag 供成员列表响应内联（与 ServerMember 同口径，SQL 侧 JOIN users）。
+type ChannelMember struct {
+	ChannelID int64             `json:"channel_id" db:"channel_id"`
+	UserID    int64             `json:"user_id" db:"user_id"`
+	Role      ChannelMemberRole `json:"role" db:"role"`
+	JoinedAt  time.Time         `json:"joined_at" db:"joined_at"`
+	Nickname  string            `json:"nickname,omitempty" db:"-"`
+	Tag       string            `json:"tag,omitempty" db:"-"`
 }
 
 // Category 频道分类（v0.1.2 迁移 0003）。空分类可持久化，删除可连带频道。
@@ -263,12 +297,37 @@ type Store interface {
 	MembersOfServer(ctx context.Context, serverID int64) ([]ServerMember, error)
 
 	// channels
+	// CreateChannel 只建服务器频道：scope 空串按 server 处理，非 server 或 server_id 为 0
+	// 返回 ErrForbidden。私聊/群私聊走 CreateConversation。
 	CreateChannel(ctx context.Context, c *Channel) error
 	ChannelByID(ctx context.Context, id int64) (*Channel, error)
+	// ChannelsOfServer 只返回该服的 server 作用域频道（不含 direct/group）。
 	ChannelsOfServer(ctx context.Context, serverID int64) ([]Channel, error)
+	// UpdateChannel 全行写；调用方必须读-改-写以保留 scope/dm_key，
+	// 私聊行写回时 ServerID=0 落 NULL、DMKey 空串落 NULL。
 	UpdateChannel(ctx context.Context, c *Channel) error
-	// DeleteChannel 同事务删消息、该频道覆盖与频道行。
+	// DeleteChannel 同事务删消息、该频道覆盖、会话成员与频道行。
 	DeleteChannel(ctx context.Context, id int64) error
+
+	// conversations（迁移 0012，#38 B1）：私聊/群私聊是 server_id NULL 的文字频道。
+	// CreateConversation 同一事务写频道行 + channel_members；direct 必须恰两个不同成员，
+	// 双方都是 member，dm_key 由成员 ID 规范化为 "<minUID>:<maxUID>"，重复创建返回 ErrConflict；
+	// group 至少一个成员，memberIDs[0] 视为创建者记 owner，其余 member。
+	// scope 非 direct/group 或成员数不合法返回 ErrForbidden。
+	CreateConversation(ctx context.Context, c *Channel, memberIDs []int64) error
+	// FindDirectChannel 按规范化 dm_key 找私聊；无命中 ErrNotFound。
+	FindDirectChannel(ctx context.Context, a, b int64) (*Channel, error)
+	// ListConversations 用户参与的 direct/group 会话，按创建时间、ID 倒序。
+	ListConversations(ctx context.Context, userID int64) ([]Channel, error)
+	// ChannelMembers 成员列表，按 joined_at、user_id 升序；频道不存在返回空列表。
+	ChannelMembers(ctx context.Context, channelID int64) ([]ChannelMember, error)
+	// ChannelMember 单个成员；非成员或频道不存在返回 ErrNotFound。
+	ChannelMember(ctx context.Context, channelID, userID int64) (*ChannelMember, error)
+	// AddChannelMember 只接受 direct/group 频道；role 空串按 member 处理，
+	// 非法角色或 server 频道返回 ErrForbidden，重复成员返回 ErrConflict。
+	AddChannelMember(ctx context.Context, channelID, userID int64, role ChannelMemberRole) error
+	// RemoveChannelMember 删除成员行；未命中返回 ErrNotFound。
+	RemoveChannelMember(ctx context.Context, channelID, userID int64) error
 
 	// categories（v0.1.2 迁移 0003）
 	CreateCategory(ctx context.Context, c *Category) error
