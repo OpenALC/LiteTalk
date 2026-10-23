@@ -12,6 +12,11 @@ import (
 
 // #36：服务端强制闭麦 REST。SFU 侧包级丢弃（track 不摘）由 Hub→SFU 完成，
 // 这里只做资源/权限/形态校验与审计。
+//
+// 语义边界（2026-10-23 用户确认降级）：serverMuted 是「房间实例级临时状态」——
+// 只存在于进程内 SFU Room 的内存里，随换频道/房间回收/服务重启清除，不落库、
+// 不跨房间延续，不是服务器成员级的管理状态（没有持久化的「该成员在本服被闭麦」）。
+// 后续若要跨房间持久闭麦，需要单独 issue 与数据库迁移。
 
 // SetServerMuted PUT /api/v1/channels/{id}/members/{user_id}/server-mute（需 MuteMembers）
 func (s *Server) SetServerMuted(ctx context.Context, request SetServerMutedRequestObject) (SetServerMutedResponseObject, error) {
