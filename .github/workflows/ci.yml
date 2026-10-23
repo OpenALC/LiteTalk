@@ -60,6 +60,11 @@ jobs:
         working-directory: server
     steps:
       - uses: actions/checkout@v4
+      # 部署脚本没有单元测试：至少让语法错误在检查阶段暴露。
+      # bash -n 只解析第一个文件（其余会被当作位置参数），必须逐个检查。
+      - name: 部署脚本语法检查
+        run: |
+          for f in deploy/install.sh deploy/update.sh; do bash -n "$f"; done
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
@@ -343,12 +348,18 @@ jobs:
             CGO_ENABLED=0 GOOS=linux GOARCH=$arch \
               go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
               -o ../dist/linux-$arch/litetalk-server ./cmd/server
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch \
+              go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
+              -o ../dist/linux-$arch/litetalk-updater ./cmd/updater
           done
       # 迁移已 embed 进二进制（migrations.FS），不再随包附带 migrations/ 目录
-      - name: 打包 tar.gz（仅二进制）
+      # tar 内成员：litetalk-server（路径不变）+ litetalk-updater + update.sh（#97 一键升级）
+      - name: 打包 tar.gz（二进制 + 更新器 + 升级脚本）
         run: |
           for arch in amd64 arm64; do
-            tar -C dist/linux-$arch -czf dist/litetalk-server-linux-$arch.tar.gz litetalk-server
+            cp server/deploy/update.sh dist/linux-$arch/update.sh
+            tar -C dist/linux-$arch -czf dist/litetalk-server-linux-$arch.tar.gz \
+              litetalk-server litetalk-updater update.sh
           done
       - uses: actions/upload-artifact@v4
         with:
@@ -463,6 +474,11 @@ jobs:
           nfpm package --config build/nfpm.yaml --packager deb --target dist/
           nfpm package --config build/nfpm.yaml --packager rpm --target dist/
           mv dist/*.rpm "dist/litetalk_${VERSION}_${ARCH}.rpm"
+          # GitHub 资产名会把 `~` 归一为 `.`，校验和必须使用上传安全的文件名（只改文件名，deb 内部 Debian 版本语义不动）
+          for f in dist/*.deb; do
+            want="dist/litetalk_${VERSION}_${ARCH}.deb"
+            [ "$f" = "$want" ] || mv "$f" "$want"
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: dist-client-linux-${{ matrix.arch }}
@@ -530,10 +546,83 @@ jobs:
       - name: 生成 SHA256SUMS
         working-directory: dist
         run: sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
-      - name: 发布 Release
+      - name: 创建 Release（draft，先传完资产）
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
           generate_release_notes: true
+          # 先建 draft：资产上传完成前不触发 published，更新器收到的第一个 published
+          # 事件就带完整资产（更新器仍保留 12×5s 晚到重试）。
+          draft: true
           # -alpha / -beta / -rc 标签标记为预发布
           prerelease: ${{ contains(github.ref_name, '-') }}
+      # 资产全部上传后再发布。本步失败则 Release 停留在 draft：需手工发布或重跑本 job；
+      # 已发布后重跑只会产生 edited 事件（更新器忽略），此时靠 Redeliver 或 SSH 兜底。
+      - name: 发布 Release（draft → published）
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --repo "$GITHUB_REPOSITORY"
+
+  # SSH 兜底（#97）：webhook 投递不稳时经 SSH 调服务器上的 update.sh --tag <tag>。
+  # DEPLOY_SSH_KEY / DEPLOY_HOST / DEPLOY_USER 任一缺失即跳过（不阻塞 release）；
+  # 本 job 在 release 之后运行且 continue-on-error，失败不影响发布结果。
+  deploy-ssh:
+    name: SSH 兜底触发服务器更新（可选）
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - name: 检查 DEPLOY_* secrets
+        id: chk
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          if [ -z "$DEPLOY_SSH_KEY" ] || [ -z "$DEPLOY_HOST" ] || [ -z "$DEPLOY_USER" ]; then
+            echo "DEPLOY_SSH_KEY / DEPLOY_HOST / DEPLOY_USER 不全，跳过 SSH 兜底"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: SSH 调用 update.sh --tag
+        if: steps.chk.outputs.skip == 'false'
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_UPDATE_PATH: ${{ vars.DEPLOY_UPDATE_PATH }}
+        run: |
+          # tag 与脚本路径都过白名单正则后才进远程命令，杜绝命令注入
+          if ! [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc))?$ ]]; then
+            echo "::error::tag 不符合版本规范: $GITHUB_REF_NAME"
+            exit 1
+          fi
+          script="${DEPLOY_UPDATE_PATH:-/www/wwwroot/LiteTalk/update.sh}"
+          if ! [[ "$script" =~ ^/[A-Za-z0-9/_.-]+$ ]]; then
+            echo "::error::DEPLOY_UPDATE_PATH 形态非法: $script"
+            exit 1
+          fi
+          # 预发布 tag 要 --allow-prerelease：tag 已被上面的正则锁成封闭字符集，
+          # 这里追加的是固定字面量，不构成注入面。
+          allow=""
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            allow=" --allow-prerelease"
+          fi
+          mkdir -p "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$HOME/.ssh/deploy_key"
+          chmod 600 "$HOME/.ssh/deploy_key"
+          set +e
+          ssh -i "$HOME/.ssh/deploy_key" \
+            -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            "bash '$script' --tag '$GITHUB_REF_NAME'$allow"
+          rc=$?
+          set -e
+          # 75 = 更新器跨进程锁被占用（webhook 已在跑同一次更新）：视为已覆盖，不算失败
+          if [ "$rc" -eq 75 ]; then
+            echo "::notice::服务器已有更新在运行，跳过 SSH 兜底"
+            exit 0
+          fi
+          exit "$rc"

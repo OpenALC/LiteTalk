@@ -1091,6 +1091,347 @@ paths:
           $ref: '#/components/responses/RateLimited'
         default:
           $ref: '#/components/responses/Internal'
+  /api/v1/servers/{id}/roles:
+    get:
+      operationId: listRoles
+      summary: 服务器角色列表（成员可读）
+      description: >
+        按 position、id 升序，含 builtin 与自定义角色。
+        code：路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
+      tags: [servers]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      responses:
+        '200':
+          description: 角色数组
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Role'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
+    post:
+      operationId: createRole
+      summary: 创建自定义角色（需 ManageRoles，#35 B4）
+      description: >
+        只允许自定义角色（builtin_key 固定为空）。层级防提权：非 owner 的
+        position 必须严格小于其最高角色 position，权限位必须是操作者权限的子集。
+        code：bad_name、bad_color、bad_position、bad_permissions、bad_request、
+        路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
+      tags: [servers]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRoleRequest'
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Role'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/roles/{id}:
+    patch:
+      operationId: updateRole
+      summary: 更新自定义角色（需 ManageRoles，builtin 403）
+      description: >
+        全量写 name/color/position/permissions（缺省字段沿用现值）；builtin 角色
+        改/伪造一律 403。层级防提权同创建。permissions 为十进制字符串，只允许低 15 位。
+        code：bad_name、bad_color、bad_position、bad_permissions、bad_request、
+        路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
+      tags: [servers]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateRoleRequest'
+      responses:
+        '200':
+          description: 更新后的角色
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Role'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
+    delete:
+      operationId: deleteRole
+      summary: 删除自定义角色（需 ManageRoles，builtin 403）
+      description: >
+        级联删除该角色的成员分配与以它为目标的频道覆盖。builtin 角色 403。
+        code：路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
+      tags: [servers]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      responses:
+        '200':
+          description: 已完成
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusOk'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/servers/{id}/members/{user_id}/roles:
+    put:
+      operationId: setMemberRoles
+      summary: 全量替换成员角色（需 ManageRoles，#35 B4）
+      description: >
+        @everyone 强制保留；服务器 owner 的 owner 角色强制保留（不能经此降级）；
+        owner builtin 不可分配（owner 身份只由 servers.owner_id 决定）。
+        层级防提权：目标角色（除 @everyone）的 position 必须严格小于操作者最高
+        角色 position，且权限位必须是操作者权限的子集；目标成员的最高角色 position
+        也不得大于等于操作者（同级/上级不可动，owner 操作者不受限）。
+        成功后 legacy role 投影同步。
+        code：bad_request、路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
+      tags: [servers]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+        - $ref: '#/components/parameters/UserIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetMemberRolesRequest'
+      responses:
+        '200':
+          description: 已完成
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusOk'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/channels/{id}/overwrites:
+    get:
+      operationId: listChannelOverwrites
+      summary: 频道覆盖列表（需 ManageChannels）
+      description: >
+        按 target_type、target_id 升序。
+        code：路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
+      tags: [channels]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      responses:
+        '200':
+          description: 覆盖数组
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ChannelOverwrite'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/channels/{id}/overwrites/{target_type}/{target_id}:
+    put:
+      operationId: setChannelOverwrite
+      summary: upsert 频道覆盖（需 ManageChannels，#35 B4）
+      description: >
+        target_type=role|member。allow/deny 为十进制字符串，只允许频道位
+        （ChannelPermissionMask，管理位属于角色）。目标必须与频道同服，否则 404。
+        code：bad_request、bad_permissions、路径参数不合法；401；403 forbidden；
+        404 not_found；5xx internal。
+      tags: [channels]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+        - $ref: '#/components/parameters/TargetTypePath'
+        - $ref: '#/components/parameters/TargetIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetOverwriteRequest'
+      responses:
+        '200':
+          description: 覆盖行（upsert 后）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChannelOverwrite'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
+    delete:
+      operationId: deleteChannelOverwrite
+      summary: 删除频道覆盖（需 ManageChannels，#35 B4）
+      description: >
+        code：路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
+      tags: [channels]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+        - $ref: '#/components/parameters/TargetTypePath'
+        - $ref: '#/components/parameters/TargetIDPath'
+      responses:
+        '200':
+          description: 已完成
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusOk'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/servers/{id}/audit-log:
+    get:
+      operationId: listAuditLog
+      summary: 审计日志倒序游标（需 ManageServer）
+      description: >
+        before=0 取最新一页；返回按 id 倒序（新→旧）。limit 1–50，越界 400。
+        code：bad_limit、bad_cursor、bad_request、路径参数不合法；401；
+        403 forbidden；404 not_found；5xx internal。
+      tags: [servers]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+        - name: before
+          in: query
+          required: false
+          description: 游标（上一页最旧一条的 id）；0/缺省取最新页
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          required: false
+          description: 每页条数（1–50）
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 50
+      responses:
+        '200':
+          description: 审计条目数组（新→旧）
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AuditLogEntry'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/channels/{id}/members/{user_id}/server-mute:
+    put:
+      operationId: setServerMuted
+      summary: 服务端强制闭麦/解禁（需 MuteMembers，#36）
+      description: >
+        服务端在 SFU 转发前丢弃目标的上行 RTP（track 保持挂载），目标不配合也无法
+        绕过；房间成员收到 voice.state{server_muted}。仅语音频道；不能对自己操作；
+        非 owner 只能对角色层级严格低于自己的成员操作（与角色管理同口径）。
+        code：bad_channel、bad_request、路径参数不合法；401；403 forbidden；
+        404 not_found（频道不存在、目标不是成员或不在该频道语音房）；5xx internal。
+      tags: [channels]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+        - $ref: '#/components/parameters/UserIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ServerMuteRequest'
+      responses:
+        '200':
+          description: 已生效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusOk'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
 components:
   securitySchemes:
     bearerAuth:
@@ -1104,6 +1445,32 @@ components:
       in: path
       required: true
       description: 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串）
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    UserIDPath:
+      name: user_id
+      in: path
+      required: true
+      description: 目标用户 ID 的十进制数字串（#35 B4）
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    TargetTypePath:
+      name: target_type
+      in: path
+      required: true
+      description: 频道覆盖的目标类型（#35 B4）
+      schema:
+        type: string
+        enum: [role, member]
+    TargetIDPath:
+      name: target_id
+      in: path
+      required: true
+      description: 覆盖目标（角色或成员）ID 的十进制数字串（#35 B4）
       schema:
         type: integer
         format: int64
@@ -1429,6 +1796,17 @@ components:
           type: string
           format: date-time
           x-go-type: Time
+        parent_id:
+          type: string
+          nullable: true
+          x-go-type: ID
+          description: 父频道 ID（#37 子频道树，仅语音频道）；null = 顶层。可选属性，服务端始终返回
+        has_password:
+          type: boolean
+          description: 是否设有频道密码（#37）；密码明文/哈希永不回显。可选属性，服务端始终返回
+        user_limit:
+          type: integer
+          description: 语音人数上限（#37）；0 = 不限。可选属性，服务端始终返回
     CategoryInfo:
       type: object
       title: CategoryInfo
@@ -1475,6 +1853,12 @@ components:
         online:
           type: boolean
           description: 在线态（presence:{uid} 存在即在线）；不依赖好友关系
+        role_ids:
+          type: array
+          description: 成员持有的角色 ID（含 @everyone；可选，旧响应缺省不回）
+          items:
+            type: string
+            x-go-type: ID
     Message:
       type: object
       title: Message
@@ -1533,6 +1917,10 @@ components:
       description: >
         好友条目。remark/group 仅发起方视角非空（被请求方恒空串）。
         user 为 PublicUser（无 email）。
+        channel_id/server_id 是对端当前语音房快照（#92 好友频道 presence），
+        两字段必须同时出现或同时缺省：仅 accepted 且在线、且查看者对该频道有
+        ViewChannel 权限时出现；无权限/查询故障时键缺省（不得泄露频道）。
+        载荷不含频道名。
       required: [id, status, incoming, remark, group, user]
       properties:
         id:
@@ -1554,6 +1942,16 @@ components:
           nullable: true
           allOf:
             - $ref: '#/components/schemas/PublicUser'
+        channel_id:
+          type: string
+          x-go-type: ID
+          description: >
+            对端当前语音频道 ID（#92，可选）；与 server_id 同现同缺。
+            仅 accepted 且对端在线、查看者对该频道有 ViewChannel 权限时出现。
+        server_id:
+          type: string
+          x-go-type: ID
+          description: channel_id 所属服务器 ID（#92，可选）；与 channel_id 同现同缺。
     ServerChannels:
       type: object
       title: ServerChannels
@@ -1781,6 +2179,18 @@ components:
           description: 0/缺省 = 未分类；请求侧数字与字符串双接受（#31）
         position:
           type: integer
+        password:
+          type: string
+          writeOnly: true
+          description: 频道密码（#37，1–72 字节，仅语音频道）；只写不读，响应只出 has_password
+        user_limit:
+          type: integer
+          description: 语音人数上限 0..100（#37，仅语音频道）；0 = 不限
+        parent_id:
+          type: string
+          nullable: true
+          x-go-type: ID
+          description: 父频道 ID（#37，仅语音频道、最多两级）；省略 category_id 时继承父分类
     PatchChannelRequest:
       type: object
       title: PatchChannelRequest
@@ -1788,7 +2198,9 @@ components:
       description: >
         JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name/type
         不可清，空值被校验拒 400；category_id 的 null = 移出分类；position 的
-        null 拒 400——「删除位置」无语义），值 = 设置。
+        null 拒 400——「删除位置」无语义），值 = 设置。#37：password 三态
+        （缺省不改、null/空串清除、非空设置）；user_limit 的 null 拒 400；
+        parent_id 的 null/0 = 提升顶层、值 = 设置父级。
       properties:
         name:
           type: string
@@ -1804,6 +2216,20 @@ components:
         position:
           type: integer
           nullable: true
+        password:
+          type: string
+          nullable: true
+          writeOnly: true
+          description: 缺省 = 不改；null/空串 = 清除；非空 = 设置（1–72 字节，仅语音频道）
+        user_limit:
+          type: integer
+          nullable: true
+          description: 0 = 不限；null 拒 400
+        parent_id:
+          type: string
+          nullable: true
+          x-go-type: ID
+          description: null/0 = 提升顶层；值 = 设置父级（仅语音频道、最多两级）
     CreateCategoryRequest:
       type: object
       title: CreateCategoryRequest
@@ -1839,3 +2265,160 @@ components:
         nonce:
           type: string
           description: 幂等键（#31，≤64 字符）；同频道同用户重复提交回读原消息（200）。缺省不去重。
+    Role:
+      type: object
+      title: Role
+      description: 服务器角色（#35 B4）。permissions 为十进制字符串（低 15 位位掩码）。ID 为十进制字符串（#31）。
+      required: [id, server_id, name, color, position, permissions, builtin, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          x-go-type: ID
+        server_id:
+          type: string
+          x-go-type: ID
+        name:
+          type: string
+        color:
+          type: string
+          description: '#RRGGBB'
+        position:
+          type: integer
+          description: 层级序（越大越高）；@everyone=0、admin=1、owner=2
+        permissions:
+          type: string
+          description: 十进制权限位串（只用低 15 位）
+        builtin:
+          type: boolean
+          description: 内置角色（@everyone/admin/owner）不可改删
+        created_at:
+          type: string
+          format: date-time
+          x-go-type: Time
+        updated_at:
+          type: string
+          format: date-time
+          x-go-type: Time
+    CreateRoleRequest:
+      type: object
+      title: CreateRoleRequest
+      required: [name, permissions]
+      properties:
+        name:
+          type: string
+          description: 1–32 字符
+        color:
+          type: string
+          description: '#RRGGBB；缺省回落主题主色'
+        position:
+          type: integer
+          description: 缺省 0；非 owner 必须严格小于其最高角色 position
+        permissions:
+          type: string
+          description: 十进制权限位串；只允许低 15 位，且是操作者权限的子集
+    UpdateRoleRequest:
+      type: object
+      title: UpdateRoleRequest
+      required: [name, permissions]
+      properties:
+        name:
+          type: string
+          description: 1–32 字符
+        color:
+          type: string
+          description: '#RRGGBB；缺省沿用现值'
+        position:
+          type: integer
+          description: 缺省沿用现值；非 owner 必须严格小于其最高角色 position
+        permissions:
+          type: string
+          description: 十进制权限位串；只允许低 15 位，且是操作者权限的子集
+    SetMemberRolesRequest:
+      type: object
+      title: SetMemberRolesRequest
+      required: [role_ids]
+      properties:
+        role_ids:
+          type: array
+          description: 全量替换（@everyone 强制保留；owner builtin 不可分配）
+          items:
+            type: string
+            x-go-type: ID
+    ChannelOverwrite:
+      type: object
+      title: ChannelOverwrite
+      description: 频道权限覆盖（#35 B4）。allow/deny 为十进制字符串，只含频道位。ID 为十进制字符串（#31）。
+      required: [channel_id, target_type, target_id, allow, deny, updated_at]
+      properties:
+        channel_id:
+          type: string
+          x-go-type: ID
+        target_type:
+          type: string
+          enum: [role, member]
+        target_id:
+          type: string
+          x-go-type: ID
+        allow:
+          type: string
+          description: 十进制权限位串（仅频道位）
+        deny:
+          type: string
+          description: 十进制权限位串（仅频道位）
+        updated_at:
+          type: string
+          format: date-time
+          x-go-type: Time
+    SetOverwriteRequest:
+      type: object
+      title: SetOverwriteRequest
+      required: [allow, deny]
+      properties:
+        allow:
+          type: string
+          description: 十进制权限位串；只允许 ChannelPermissionMask 内的位
+        deny:
+          type: string
+          description: 十进制权限位串；只允许 ChannelPermissionMask 内的位
+    AuditLogEntry:
+      type: object
+      title: AuditLogEntry
+      description: 审计条目（#35 B4）。detail 为变更字段的 JSON 字符串（不含隐私数据）。ID 为十进制字符串（#31）。
+      required: [id, server_id, actor_id, action, detail, created_at]
+      properties:
+        id:
+          type: string
+          x-go-type: ID
+        server_id:
+          type: string
+          x-go-type: ID
+        actor_id:
+          type: string
+          x-go-type: ID
+        action:
+          type: string
+          description: 动作名（如 role.create / channel.overwrite.set）
+        target_type:
+          type: string
+          description: 目标类型（server/channel/category/role/member/invite）
+        target_id:
+          type: string
+          x-go-type: ID
+        channel_id:
+          type: string
+          x-go-type: ID
+        detail:
+          type: string
+          description: 变更字段的 JSON 字符串
+        created_at:
+          type: string
+          format: date-time
+          x-go-type: Time
+    ServerMuteRequest:
+      type: object
+      title: ServerMuteRequest
+      required: [muted]
+      properties:
+        muted:
+          type: boolean
+          description: true=服务端强制闭麦；false=解禁恢复转发

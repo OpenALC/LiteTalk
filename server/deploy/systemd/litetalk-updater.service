@@ -1,0 +1,46 @@
+# 轻音 LiteTalk — 自动更新器 systemd 单元（#97）
+# 部署位置：/etc/systemd/system/litetalk-updater.service
+# 前置：/etc/litetalk-updater.env（0600 root:root，systemd 以 root 读取注入环境）
+# 与 webhook secret 文件（0640 root:www——本服务以 www 运行且自己读它）已就位，
+# 见 deploy/env/litetalk-updater.env.example 与 deploy/README.md「自动更新」。
+#
+# 监听 :8088 明文 HTTP：公网只需放行 webhook 路径；/status 仅接受环回来源
+#（本机 curl 或 SSH 端口转发）。不要在同机加反向代理指向 8088，否则来源恒为环回。
+[Unit]
+Description=LiteTalk Updater (GitHub release webhook auto-update)
+After=network-online.target litetalk.service
+Wants=network-online.target
+# 8088 被占用时进程会秒退：限流，避免 Restart=on-failure 打成重启风暴。
+# 这两项必须写在 [Unit]，写在 [Service] 会被 systemd 忽略。
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# 与主服务同用户（安装目录属主），不给 root 常驻
+User=www
+Group=www
+WorkingDirectory=/www/wwwroot/LiteTalk
+EnvironmentFile=/etc/litetalk-updater.env
+ExecStart=/www/wwwroot/LiteTalk/litetalk-updater
+
+# 8088 是普通端口，不需要 CAP_NET_BIND_SERVICE（443 归主服务内置 ACME）。
+# 不要加 NoNewPrivileges=true：它会禁掉 setuid 提权，sudo -n systemctl restart
+#（更新器重启主服务的唯一通道）将全部失败。最小权限由下面的 sudoers 保证：
+# www 只能 restart/is-active litetalk.service（见 deploy/sudoers/litetalk-updater）。
+
+# 基础加固：系统树只读，只放行安装目录与状态目录写入
+NoNewPrivileges=false
+ProtectSystem=full
+ReadWritePaths=/www/wwwroot/LiteTalk /var/lib/litetalk-updater
+PrivateTmp=true
+
+Restart=on-failure
+RestartSec=5
+
+# 日志走 journald：journalctl -u litetalk-updater -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

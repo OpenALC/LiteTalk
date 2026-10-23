@@ -42,13 +42,23 @@ export const useVoiceStore = defineStore('voice', () => {
   let pendingJoin: { id: string; seq: number } | null = null
   let joinSeq = 0
 
-  async function join(id: string) {
+  // lastJoinFailed 最近一次入房失败（#37 B2）：ChannelList 据 code
+  // （bad_password/forbidden）重新弹密码框——覆盖 hasPassword 过期的情况。
+  // 只留最后一次；消费方自行比对 channelId。
+  const lastJoinFailed = ref<{ channelId: string; code: string } | null>(null)
+
+  // join 入房（#37 B2）：带密码走 JoinChannelWithPassword，否则保持 JoinChannel。
+  async function join(id: string, password?: string) {
     const gen = generation
     const seq = ++joinSeq
     pendingJoin = { id, seq }
     // 先不写 channelId——JoinChannel 失败时不置位，守卫不会拦死重试（B1）
     try {
-      await goApp().JoinChannel(id)
+      if (password) {
+        await goApp().JoinChannelWithPassword(id, password)
+      } else {
+        await goApp().JoinChannel(id)
+      }
     } catch (e) {
       if (pendingJoin?.seq === seq) pendingJoin = null
       throw e
@@ -203,8 +213,10 @@ export const useVoiceStore = defineStore('voice', () => {
     // 「正在频道中」与延迟条随之消失。Go 侧对这条失败路径不再发 chat:error
     //（joinHandled=true 时 ErrorHandlerEx 直接返回），提示只能在这里弹。
     offs.push(eventsOn('voice:join_failed', (d) => {
-      const p = d as { channel_id?: string; message?: string } | null
+      const p = d as { channel_id?: string; code?: string; message?: string } | null
       const failedId = p?.channel_id
+      // #37 B2：先记失败（密码门的重试入口），再走房间态回滚。
+      if (failedId) lastJoinFailed.value = { channelId: failedId, code: p?.code ?? '' }
       if (pendingJoin) {
         // 有新的在飞 join 时，旧频道的迟到失败不能把它误伤。
         if (failedId && pendingJoin.id !== failedId) return
@@ -244,6 +256,7 @@ export const useVoiceStore = defineStore('voice', () => {
 
   return {
     channelId, members, muted, deafened, dualOff, latencyMs, connected, peerVolumes,
+    lastJoinFailed,
     selfId, setSelf, join, leave, resetRoom, resetAll, setMute, setDeafen, setPeerVolume,
     requestVoiceState, restoreFromGo, bindEvents, unbindEvents,
   }

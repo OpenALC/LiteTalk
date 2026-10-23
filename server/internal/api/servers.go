@@ -28,7 +28,11 @@ func validIcon(name, color string) bool {
 	if !allowedIcons[name] {
 		return false
 	}
-	// 简单校验 #RRGGBB。
+	return validIconColor(color)
+}
+
+// validIconColor 校验 #RRGGBB（角色/图标共用）。
+func validIconColor(color string) bool {
 	if len(color) != 7 || color[0] != '#' {
 		return false
 	}
@@ -89,35 +93,41 @@ func (s *Server) ListServers(ctx context.Context, request ListServersRequestObje
 	return ListServers200JSONResponse(serverViews(servers)), nil
 }
 
-// PatchServer PATCH /api/v1/servers/{id}（仅 owner/admin）
+// PatchServer PATCH /api/v1/servers/{id}（需 ManageServer，#35 B3）
 func (s *Server) PatchServer(ctx context.Context, request PatchServerRequestObject) (PatchServerResponseObject, error) {
 	if e := checkID(request.Id); e != nil {
+		return nil, e
+	}
+	c := currentUser(ctx)
+	// 资源→权限→body 的顺序（#35 B3）：无权者拿不到字段规则的形状反馈。
+	if e := s.requirePerm(ctx, request.Id, c.UserID, store.ManageServer); e != nil {
 		return nil, e
 	}
 	req := patchBody(request.JSONBody, request.ApplicationMergePatchPlusJSONBody)
 	if req == nil {
 		return nil, bodyMissing()
 	}
-	c := currentUser(ctx)
-	if e := s.requireRole(ctx, request.Id, c.UserID, store.RoleAdmin); e != nil {
-		return nil, e
-	}
 	srv, err := s.store.ServerByID(ctx, request.Id)
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
 	// Merge Patch（#31）：缺省不改，null = 清空（名称/图标不可清 → 校验拒 400）。
+	// 审计只记变更字段（#35 B4）。
+	detail := map[string]any{}
 	if req.Name.Set {
 		if !validServerName(req.Name.Val) {
 			return nil, errf(http.StatusBadRequest, "bad_name", "名称需为 2–32 个字符")
 		}
 		srv.Name = req.Name.Val
+		detail["name"] = req.Name.Val
 	}
 	if req.IconName.Set {
 		srv.IconName = req.IconName.Val
+		detail["icon_name"] = req.IconName.Val
 	}
 	if req.IconColor.Set {
 		srv.IconColor = req.IconColor.Val
+		detail["icon_color"] = req.IconColor.Val
 	}
 	if !validIcon(srv.IconName, srv.IconColor) {
 		return nil, errf(http.StatusBadRequest, "bad_icon", "图标或颜色不合法")
@@ -125,24 +135,34 @@ func (s *Server) PatchServer(ctx context.Context, request PatchServerRequestObje
 	if err := s.store.UpdateServer(ctx, srv); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
+	s.audit(ctx, store.AuditLog{
+		ServerID: request.Id, ActorID: c.UserID, Action: "server.update",
+		TargetType: "server", TargetID: ptrID(request.Id), Detail: auditDetail(detail),
+	})
 	return PatchServer200JSONResponse(serverView(srv)), nil
 }
 
-// DeleteServer DELETE /api/v1/servers/{id}（仅 owner）
+// DeleteServer DELETE /api/v1/servers/{id}（仅 owner）。
+// 不走 ManageServer：管理员只是「代管」，拆服权只属于服主（#35 B3 保持 owner-only）。
 func (s *Server) DeleteServer(ctx context.Context, request DeleteServerRequestObject) (DeleteServerResponseObject, error) {
 	if e := checkID(request.Id); e != nil {
 		return nil, e
 	}
 	c := currentUser(ctx)
-	// 仅 owner 可删（requireRole 的「不是成员 / 权限不足」文案区分保留）。
-	if e := s.requireRole(ctx, request.Id, c.UserID, store.RoleOwner); e != nil {
-		return nil, e
+	srv, err := s.store.ServerByID(ctx, request.Id)
+	if err != nil {
+		return nil, s.writeStoreErr(ctx, err)
+	}
+	if srv.OwnerID != c.UserID {
+		return nil, errf(http.StatusForbidden, "forbidden", "仅服主可删除服务器")
 	}
 	// 删前记下频道 ID，删后逐个踢出房间成员（#22）。
 	channels, _ := s.store.ChannelsOfServer(ctx, request.Id)
 	if err := s.store.DeleteServer(ctx, request.Id); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
+	// 服务器没了，权限快照同步作废（否则后续查询吃到陈旧成员/角色快照）。
+	s.authz.InvalidateServer(request.Id)
 	if s.hub != nil {
 		for _, ch := range channels {
 			s.hub.KickChannel(strconv.FormatInt(ch.ID, 10), "server_deleted")
@@ -182,6 +202,8 @@ func (s *Server) JoinServer(ctx context.Context, request JoinServerRequestObject
 				if e != nil {
 					return nil, s.writeStoreErr(ctx, e)
 				}
+				// 并发加入也算入服：快照里可能还是「非成员」，同步作废。
+				s.authz.InvalidateServer(inv.ServerID)
 				return JoinServer200JSONResponse(serverView(srv)), nil
 			}
 			return nil, errf(http.StatusConflict, "code_exhausted", "邀请码使用次数已达上限")
@@ -196,6 +218,8 @@ func (s *Server) JoinServer(ctx context.Context, request JoinServerRequestObject
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
+	// 入服改变成员/角色：权限快照立即作废，下一次请求即按新身份裁决。
+	s.authz.InvalidateServer(inv.ServerID)
 	return JoinServer200JSONResponse(serverView(srv)), nil
 }
 
@@ -206,8 +230,8 @@ func (s *Server) ListServerMembers(ctx context.Context, request ListServerMember
 	}
 	c := currentUser(ctx)
 	// 必须是成员才能看成员列表。
-	if _, err := s.store.Member(ctx, request.Id, c.UserID); err != nil {
-		return nil, errf(http.StatusForbidden, "forbidden", "不是服务器成员")
+	if e := s.requireMember(ctx, request.Id, c.UserID); e != nil {
+		return nil, e
 	}
 	members, err := s.store.MembersOfServer(ctx, request.Id)
 	if err != nil {
@@ -224,17 +248,18 @@ func (s *Server) ListServerMembers(ctx context.Context, request ListServerMember
 	return ListServerMembers200JSONResponse(view), nil
 }
 
-// CreateInvite POST /api/v1/servers/{id}/invites
+// CreateInvite POST /api/v1/servers/{id}/invites（需 ManageServer，#35 B3）
 func (s *Server) CreateInvite(ctx context.Context, request CreateInviteRequestObject) (CreateInviteResponseObject, error) {
 	if e := checkID(request.Id); e != nil {
 		return nil, e
 	}
+	c := currentUser(ctx)
+	// 资源→权限→body（#35 B3）。
+	if e := s.requirePerm(ctx, request.Id, c.UserID, store.ManageServer); e != nil {
+		return nil, e
+	}
 	if request.Body == nil {
 		return nil, bodyMissing()
-	}
-	c := currentUser(ctx)
-	if e := s.requireRole(ctx, request.Id, c.UserID, store.RoleAdmin); e != nil {
-		return nil, e
 	}
 	req := request.Body
 	// 邀请参数校验（#22）：max_uses 不可为负。
@@ -256,20 +281,77 @@ func (s *Server) CreateInvite(ctx context.Context, request CreateInviteRequestOb
 	if err := s.store.CreateInvite(ctx, inv); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
+	// 审计不记邀请码本身（凭据类，#35 B4）。
+	s.audit(ctx, store.AuditLog{
+		ServerID: request.Id, ActorID: c.UserID, Action: "invite.create",
+		Detail: auditDetail(map[string]any{"max_uses": inv.MaxUses, "expires_in": req.ExpiresIn}),
+	})
 	return CreateInvite201JSONResponse(inviteView(inv)), nil
 }
 
-// requireRole 校验成员角色；返回 nil 表示通过（错误文案区分「不是成员/权限不足」）。
-func (s *Server) requireRole(ctx context.Context, serverID, userID int64, min store.MemberRole) *apiErr {
-	mem, err := s.store.Member(ctx, serverID, userID)
-	if err != nil {
-		return errf(http.StatusForbidden, "forbidden", "不是服务器成员")
+// requirePerm 服务器级权限门（#35 B3）：资源不存在 404（CanServer 透传 ErrNotFound），
+// 非成员/权限不足 403，Store 故障 500——故障绝不伪装成 403。
+func (s *Server) requirePerm(ctx context.Context, serverID, userID int64, perm store.Permission) *apiErr {
+	if s.authz == nil {
+		return errf(http.StatusInternalServerError, "internal", "权限服务未就绪")
 	}
-	rank := map[store.MemberRole]int{store.RoleMember: 1, store.RoleAdmin: 2, store.RoleOwner: 3}
-	if rank[mem.Role] < rank[min] {
+	ok, err := s.authz.CanServer(ctx, userID, serverID, perm)
+	if err != nil {
+		return s.writeStoreErr(ctx, err)
+	}
+	if !ok {
 		return errf(http.StatusForbidden, "forbidden", "权限不足")
 	}
 	return nil
+}
+
+// requireMember 成员门（#35 B3）：服务器不存在 404，非成员 403，故障 500。
+func (s *Server) requireMember(ctx context.Context, serverID, userID int64) *apiErr {
+	if s.authz == nil {
+		return errf(http.StatusInternalServerError, "internal", "权限服务未就绪")
+	}
+	ok, err := s.authz.IsMember(ctx, userID, serverID)
+	if err != nil {
+		return s.writeStoreErr(ctx, err)
+	}
+	if !ok {
+		return errf(http.StatusForbidden, "forbidden", "不是服务器成员")
+	}
+	return nil
+}
+
+// requireChannelPerm 频道级权限门（#35 B3）：ch 由调用方先行解析（404 先于此发生）。
+func (s *Server) requireChannelPerm(ctx context.Context, ch *store.Channel, userID int64, perm store.Permission) *apiErr {
+	if s.authz == nil {
+		return errf(http.StatusInternalServerError, "internal", "权限服务未就绪")
+	}
+	ok, err := s.authz.CanInServer(ctx, userID, ch.ServerID, ch.ID, perm)
+	if err != nil {
+		return s.writeStoreErr(ctx, err)
+	}
+	if !ok {
+		return errf(http.StatusForbidden, "forbidden", "权限不足")
+	}
+	return nil
+}
+
+// visibleChannels 过滤出 uid 有 ViewChannel 的频道（#35 B3；categories 不过滤）。
+// 单频道判定故障直接上抛 500——静默丢频道会把可用性问题伪装成权限问题。
+func (s *Server) visibleChannels(ctx context.Context, uid, serverID int64, chans []store.Channel) ([]store.Channel, error) {
+	if s.authz == nil {
+		return nil, errf(http.StatusInternalServerError, "internal", "权限服务未就绪")
+	}
+	out := make([]store.Channel, 0, len(chans))
+	for _, ch := range chans {
+		ok, err := s.authz.CanInServer(ctx, uid, serverID, ch.ID, store.ViewChannel)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out = append(out, ch)
+		}
+	}
+	return out, nil
 }
 
 // randomCode 生成 n 字节随机 hex 邀请码。

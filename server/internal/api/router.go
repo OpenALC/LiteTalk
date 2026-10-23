@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/OpenALC/LiteTalk/server/internal/auth"
+	"github.com/OpenALC/LiteTalk/server/internal/authz"
 	"github.com/OpenALC/LiteTalk/server/internal/mailer"
 	"github.com/OpenALC/LiteTalk/server/internal/rtcapi"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
@@ -27,12 +28,23 @@ const (
 type Hub interface {
 	Kick(uid, dev, reason string)
 	KickChannel(channelID, reason string)
+	// SetServerMuted 服务端强制闭麦/解禁（#36）：目标不在该频道返回 signal.ErrNotInChannel。
+	SetServerMuted(channelID, userID string, muted bool) error
 }
 
 // PresenceReader 在线状态读取（#11）：presence:{uid} 存在 = 在线。
 // store.KV 满足；nil 时 user.online 恒 false。键格式与 signal 包手工同步。
 type PresenceReader interface {
 	Get(ctx context.Context, key string) (string, error)
+}
+
+// VoicePresence 好友频道 presence 反查（#92）：uid → 当前语音房。
+// *signal.Hub 满足（VoiceChannelOf）；窄接口单独注入，不塞进 Hub——
+// api.Hub 只管踢线，fakeHub 不必为好友快照补方法。
+type VoicePresence interface {
+	// VoiceChannelOf 返回 uid 当前语音房 ID 与所属服务器 ID（均为十进制字符串）。
+	// dev 内置房间 serverID 为 "0"（无 store 频道实体，调用方不带频道字段）。
+	VoiceChannelOf(uid string) (channelID, serverID string, ok bool)
 }
 
 // Server API 依赖集合。
@@ -49,7 +61,10 @@ type Server struct {
 	sess     *auth.SessionIndex // 多设备会话索引（v1.1.0 迁移 0004）
 	hub      Hub                // WS 信令 hub（登出/重置密码踢线；nil=不踢）
 	presence PresenceReader     // 在线状态（好友列表 user.online 用；nil=恒离线）
+	voice    VoicePresence      // 语音房反查（好友频道 presence 快照，#92；nil=不带频道字段）
 	selfHost bool               // 一键自托管形态（GET /api/v1/config 自描述，#26）
+	// authz 权限判定（#35 B3）：与 signal.Hub 共享同一实例，缓存失效才同步。
+	authz *authz.Authorizer
 	// bootstrapRequired 管理员邀请码是否未消费（#27 T4 接线；nil=恒 false）。
 	bootstrapRequired func() bool
 	// version 服务端构建版本（GET /api/v1/healthz 回显，#77）。
@@ -79,6 +94,9 @@ type Config struct {
 	Hub Hub
 	// Presence 在线状态读取（presence:{uid}，好友列表 user.online 填值用；nil=恒离线）。
 	Presence PresenceReader
+	// VoicePresence 语音房反查（好友频道 presence 快照，#92）；nil=好友条目不带频道字段。
+	// 生产传与 signal.Hub 同一实例（*signal.Hub 满足本接口）。
+	VoicePresence VoicePresence
 	// SelfHost 一键自托管形态（SQLite/进程内单机部署）：客户端显示自托管引导（#26）。
 	SelfHost bool
 	// BootstrapRequired 管理员邀请码是否尚未被消费；注册页提示「等待管理员邀请」。
@@ -90,6 +108,9 @@ type Config struct {
 	RTC rtcapi.Config
 	// RTCAuth 从访问令牌提取 uid（Bearer 或 ?token=，与信令一致）；nil 一律 401。
 	RTCAuth rtcapi.UserFromToken
+	// Authz 权限判定（#35 B3）。nil 时用 Store 自建默认实例（测试兼容）；
+	// 生产必须传入与 signal.Hub 共享的同一实例，否则写后失效不同步。
+	Authz *authz.Authorizer
 }
 
 // New 构造 API Server。
@@ -110,6 +131,11 @@ func New(cfg Config) *Server {
 	if ver == "" {
 		ver = "dev"
 	}
+	az := cfg.Authz
+	if az == nil && cfg.Store != nil {
+		// 测试/单用方场景自建；生产（main.go）注入与 Hub 共享的实例。
+		az = authz.New(cfg.Store, authz.Options{})
+	}
 	return &Server{
 		store:             cfg.Store,
 		jwt:               cfg.JWT,
@@ -123,7 +149,9 @@ func New(cfg Config) *Server {
 		sess:              cfg.Session,
 		hub:               cfg.Hub,
 		presence:          cfg.Presence,
+		voice:             cfg.VoicePresence,
 		selfHost:          cfg.SelfHost,
+		authz:             az,
 		bootstrapRequired: cfg.BootstrapRequired,
 		version:           ver,
 		rtcCfg:            cfg.RTC,

@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io/fs"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -317,5 +320,41 @@ func TestSelectKVFallbacks(t *testing.T) {
 	}
 	if _, _, err := selectKV("bogus", nil); err == nil {
 		t.Fatal("未知后端应报错")
+	}
+}
+
+// TestHealthOnlyHandler ACME 模式的回环健康面（#101 P1）：只提供
+// GET /api/v1/healthz，形状与主端点一致；其他路径 404，不暴露管理 API。
+func TestHealthOnlyHandler(t *testing.T) {
+	h := healthOnlyHandler("v9.9.9-alpha")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/healthz", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("healthz 状态码 = %d，want 200（body=%s）", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("Content-Type = %q，want application/json", ct)
+	}
+	var body struct {
+		Status  string `json:"status"`
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("healthz 不是合法 JSON: %v（body=%s）", err, rec.Body.String())
+	}
+	if body.Status != "ok" || body.Version != "v9.9.9-alpha" {
+		t.Fatalf("healthz 形状不符: %+v", body)
+	}
+
+	// 回环面只暴露 healthz：其余路径一律 404。
+	for _, path := range []string{"/api/v1/config", "/api/v1/users/me", "/ws", "/"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s 应 404，实际 %d", path, rec.Code)
+		}
 	}
 }

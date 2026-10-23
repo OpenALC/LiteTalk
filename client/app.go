@@ -1281,9 +1281,17 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 		OnVoiceTaken: func() {
 			a.emit("voice:taken", nil)
 		},
-		// 好友在线状态变化（presence.update，#11）：转给前端刷好友状态点。
-		OnPresenceUpdate: func(userID string, online bool) {
-			a.emit("presence:update", map[string]any{"user_id": userID, "online": online})
+		// 好友在线状态变化（presence.update，#11/#92）：转给前端刷好友状态点；
+		// 频道快照字段同现同缺，空串不发（键缺省，与服务端隐私口径一致）。
+		OnPresenceUpdate: func(userID string, online bool, channelID, serverID string) {
+			payload := map[string]any{"user_id": userID, "online": online}
+			if channelID != "" {
+				payload["channel_id"] = channelID
+			}
+			if serverID != "" {
+				payload["server_id"] = serverID
+			}
+			a.emit("presence:update", payload)
 		},
 		// 服务端优雅关闭（server.shutdown，#21）：前端提示「服务端已关闭」；
 		// 停止自动重连在 Session 侧已异步处理。
@@ -1411,6 +1419,18 @@ func (a *App) JoinChannel(channelID string) error {
 	return s.JoinChannel(channelID)
 }
 
+// JoinChannelWithPassword 带密码入房（#37）。密码由 Session 缓存供重连复用；
+// 不落盘、不进日志（桥接/前端 B2 再接 UI）。
+func (a *App) JoinChannelWithPassword(channelID, password string) error {
+	a.mu.Lock()
+	s := a.sess
+	a.mu.Unlock()
+	if s == nil {
+		return fmt.Errorf("not connected")
+	}
+	return s.JoinChannelWithPassword(channelID, password)
+}
+
 // LeaveChannel 离开语音频道。
 func (a *App) LeaveChannel() error {
 	a.mu.Lock()
@@ -1488,6 +1508,17 @@ func (a *App) CreateInviteCode(serverID string) (string, error) {
 // CreateChannel 新建频道（typ: text / voice；categoryID 空串/「0」= 不归类）。
 func (a *App) CreateChannel(serverID string, name, typ string, categoryID string) (*api.ChannelDTO, error) {
 	return a.api.CreateChannel(serverID, name, typ, categoryID)
+}
+
+// CreateSubchannel 建子频道（#37 B2）：类型继承父、分类由服务端随父。
+func (a *App) CreateSubchannel(serverID, name, typ, parentID string) (*api.ChannelDTO, error) {
+	return a.api.CreateSubchannel(serverID, name, typ, parentID)
+}
+
+// UpdateChannelOptions 更新频道选项（#37 B2）：parentID 空串不改/"0" 顶层；
+// userLimit <0 不改；password 空串不改，clearPassword 清除。
+func (a *App) UpdateChannelOptions(channelID, parentID string, userLimit int, password string, clearPassword bool) (*api.ChannelDTO, error) {
+	return a.api.UpdateChannelOptions(channelID, parentID, userLimit, password, clearPassword)
 }
 
 // RenameChannel 重命名频道（owner/admin）。

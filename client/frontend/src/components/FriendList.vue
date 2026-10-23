@@ -2,16 +2,18 @@
 // FriendList 好友栏（v0.1.2 批次③）：真实 REST 数据源（mock 已删）。
 // - 结构：待处理区（对方发来的请求，带接受）→ 按分组渲染（默认组「好友」），
 //   组内在线在前离线置灰；搜索过滤跨组。
-// - 右键：设置备注 / 移动分组 / 删除好友（删除二次确认）。
-// - 私聊仍为占位提示（服务端无私聊实体）；「加入TA的频道」因服务端无
-//   「好友所在频道」数据暂不显示（inChannel 恒 false）。在线点接真实
-//   presence（#11），两态：在线/离线。
+// - 右键：加入 TA 的频道 / 设置备注 / 移动分组 / 删除好友（删除二次确认）。
+// - 好友频道 presence（#92）：按 FriendEntry/presence:update 的 channel_id+
+//   server_id 精确定位（不按频道名跨服扫描）；无权限时服务端不下发 ID，只显示
+//   「在线」。目标频道带密码先弹密码框，取消不发请求。私聊仍为占位提示。
 import { computed, onMounted, ref } from 'vue'
 import {
   ChevronDown, MessageCircle, Search, UserPlus, AudioLines,
   Pencil, FolderInput, Trash2,
 } from 'lucide-vue-next'
-import { useFriendsStore, useServersStore, type Friend } from '../stores/data'
+import {
+  useFriendsStore, useServersStore, resolveFriendJoin, type Friend, type FriendJoin,
+} from '../stores/data'
 import { useVoiceStore } from '../stores/voice'
 import { useNotifyStore } from '../stores/notify'
 import ContextMenu, { type CtxItem } from './ContextMenu.vue'
@@ -68,36 +70,75 @@ function messageFriend() {
   notify.show('私聊即将上线')
 }
 
-// joinFriendChannel 按好友所在频道名跨服务器查找语音频道并加入。
-// 当前服务端无「好友所在频道」下发，inChannel 恒 false——按钮不渲染，函数保留待数据接通。
-async function joinFriendChannel(f: Friend) {
-  for (const s of servers.servers) {
-    const ch = s.channels.find((c) => c.type === 'voice' && c.name === f.sub)
-    if (ch) {
-      servers.selectServer(s.id)
-      servers.selectChannel(ch.id)
-      if (voice.channelId !== ch.id) {
-        try {
-          await voice.join(ch.id)
-        } catch (e) {
-          notify.fromErr(e, '加入频道失败')
-          return
-        }
-      }
-      notify.show(`已加入「${ch.name}」`)
-      return
-    }
-  }
-  notify.show('找不到TA所在的频道', true)
+// ---- 加入 TA 的频道（#92）----
+// joinState 该好友的可加入解析（悬浮按钮与右键菜单共用禁用判定/文案）。
+function joinState(f: Friend): FriendJoin {
+  return resolveFriendJoin(f, servers.servers, voice.channelId)
 }
 
-// ---- 好友右键菜单：备注 / 移动分组 / 删除（二次确认） ----
+// friendChanLabel 状态行：本地按 ID 解析到频道才显示频道名；否则回落
+// 在线/离线（无权限时服务端不下发 ID，绝不显示频道名）。
+function friendChanLabel(f: Friend): string {
+  if (!f.inChannel) return f.sub
+  const j = joinState(f)
+  return j.channelName ? `在「${j.channelName}」` : f.sub
+}
+
+// joinBtn 悬浮加入按钮的禁用态与提示。
+function joinBtn(f: Friend): { disabled: boolean; title: string } {
+  const j = joinState(f)
+  return j.ok ? { disabled: false, title: '加入TA的频道' } : { disabled: true, title: j.reason }
+}
+
+// 密码入房（#37 同款流程）：hasPassword 先弹密码框；取消不发请求。
+const pwdPrompt = ref<{ channelId: string } | null>(null)
+
+function joinVoice(id: string, password?: string) {
+  voice.join(id, password).catch((e) => notify.fromErr(e, '加入频道失败'))
+}
+
+// joinFriendChannel 加入好友所在语音频道：选中 server/channel 后 join。
+// 带密码的目标先弹密码框（PromptDialog secret、不 trim）；加入失败沿用
+// voice:join_failed 的现有提示，不绕过服务端校验。
+function joinFriendChannel(f: Friend) {
+  const j = joinState(f)
+  if (!j.ok) {
+    notify.show(j.reason, true)
+    return
+  }
+  servers.selectServer(j.serverId)
+  servers.selectChannel(j.channelId)
+  if (voice.channelId === j.channelId) return
+  if (j.hasPassword) {
+    pwdPrompt.value = { channelId: j.channelId }
+    return
+  }
+  joinVoice(j.channelId)
+}
+
+function onPwdConfirm(value: string) {
+  const p = pwdPrompt.value
+  pwdPrompt.value = null
+  if (!p) return
+  joinVoice(p.channelId, value)
+}
+
+// ---- 好友右键菜单：加入频道 / 备注 / 移动分组 / 删除（二次确认） ----
 const ctx = ref<{ x: number; y: number; friend: Friend } | null>(null)
 // 备注/分组仅「发起方向」可写（服务端 PATCH 403 守卫）。对方加我的好友
 // incoming=true，这两项禁用——否则点了必弹 403（review B1）。
 const ctxItems = computed<CtxItem[]>(() => {
-  const incoming = ctx.value?.friend.incoming ?? false
+  const f = ctx.value?.friend
+  const incoming = f?.incoming ?? false
+  const j = f ? joinState(f) : null
   return [
+    {
+      key: 'join',
+      label: '加入 TA 的频道',
+      icon: AudioLines,
+      disabled: j != null && !j.ok,
+      title: j && !j.ok ? j.reason : undefined,
+    },
     { key: 'remark', label: '设置备注', icon: Pencil, disabled: incoming },
     { key: 'move', label: '移动分组', icon: FolderInput, disabled: incoming },
     { key: 'delete', label: '删除好友', icon: Trash2, danger: true, confirm: true },
@@ -114,6 +155,10 @@ const prompt = ref<{ mode: 'remark' | 'move'; friend: Friend } | null>(null)
 function onCtxSelect(key: string) {
   const c = ctx.value
   if (!c) return
+  if (key === 'join') {
+    joinFriendChannel(c.friend)
+    return
+  }
   if (key === 'remark' || key === 'move') {
     prompt.value = { mode: key, friend: c.friend }
     return
@@ -196,11 +241,12 @@ async function acceptPending(id: string) {
               <span class="f-dot" :class="f.status" />
               <div class="f-info">
                 <div class="fn">{{ f.name }}</div>
-                <div class="fs" :class="{ 'in-chan': f.inChannel }">{{ f.sub }}</div>
+                <div class="fs" :class="{ 'in-chan': f.inChannel }">{{ friendChanLabel(f) }}</div>
               </div>
               <div class="f-act">
                 <button class="icon-btn" title="私聊" @click="messageFriend"><MessageCircle :size="14" /></button>
-                <button v-if="f.inChannel" class="icon-btn" title="加入TA的频道"
+                <button v-if="f.inChannel" class="icon-btn"
+                        :disabled="joinBtn(f).disabled" :title="joinBtn(f).title"
                         @click="joinFriendChannel(f)">
                   <AudioLines :size="14" />
                 </button>
@@ -223,6 +269,10 @@ async function acceptPending(id: string) {
                   :placeholder="prompt.mode === 'remark' ? '备注名称' : '分组名称'"
                   :initial="prompt.mode === 'remark' ? prompt.friend.remark : prompt.friend.group"
                   cta="确定" @confirm="onPromptConfirm" @close="prompt = null" />
+    <!-- 密码入房（#92，#37 同款）：secret 输入、不 trim；取消不发请求 -->
+    <PromptDialog v-if="pwdPrompt" title="输入频道密码" placeholder="频道密码" cta="加入"
+                  secret :trim="false"
+                  @confirm="onPwdConfirm" @close="pwdPrompt = null" />
     <!-- 右键菜单 -->
     <ContextMenu v-if="ctx" :x="ctx.x" :y="ctx.y" :items="ctxItems"
                  @select="onCtxSelect" @close="ctx = null" />
@@ -250,6 +300,9 @@ async function acceptPending(id: string) {
   transition: background 0.15s, color 0.15s;
 }
 .icon-btn:hover { background: rgba(79, 164, 243, 0.12); color: var(--brand-700); }
+/* 禁用（如已在同一频道）：不做 hover 高亮，提示走 title */
+.icon-btn:disabled { opacity: 0.45; cursor: default; }
+.icon-btn:disabled:hover { background: transparent; color: var(--ink-300); }
 /* 待处理区的「接受」按钮：常显的小号主按钮 */
 .icon-btn.accept {
   width: auto; height: 26px; padding: 0 12px;

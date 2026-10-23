@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	"github.com/OpenALC/LiteTalk/server/internal/acme"
 	"github.com/OpenALC/LiteTalk/server/internal/api"
 	"github.com/OpenALC/LiteTalk/server/internal/auth"
+	"github.com/OpenALC/LiteTalk/server/internal/authz"
 	"github.com/OpenALC/LiteTalk/server/internal/bootstrap"
 	"github.com/OpenALC/LiteTalk/server/internal/mailer"
 	"github.com/OpenALC/LiteTalk/server/internal/rtcapi"
@@ -39,6 +41,11 @@ var version = "dev"
 
 // 默认监听地址，可用环境变量 LITETALK_ADDR 覆盖
 const defaultAddr = ":8077"
+
+// acmeHealthAddr ACME 模式下的 loopback 探活地址：必须与 updater 默认的
+// health URL（http://127.0.0.1:8077/api/v1/healthz）保持一致，否则更新后
+// 的版本断言必然超时回滚。ACME 只开 443/80，故单独补这一路监听。
+const acmeHealthAddr = "127.0.0.1:8077"
 
 func main() {
 	// 启动序（§0.6）：1 解析 flag/env → 2 校验 → 3 Store+Migrate → 4 KV → 5 SFU
@@ -249,6 +256,9 @@ func main() {
 		}
 		log.Println("WS 鉴权: JWT")
 	}
+	// 权限判定唯一实例（#35 B3）：REST 与 WS 共用，写后失效（InvalidateServer）
+	// 才能同时作用于两侧的缓存——两个实例会各自缓存、互相看不到失效。
+	authzInst := authz.New(st, authz.Options{})
 	hub := signal.NewHub(sfuInst, authenticator, sessIndex, log.Default(), 0, signal.ChatDeps{
 		Store:     st,
 		Limits:    limits,
@@ -259,6 +269,7 @@ func main() {
 		OfferRate: envInt("LITETALK_OFFER_RATE", 60),
 		// 每会话事件环条数（#32）：断线续传窗口 = min(环容量, 30min 空闲 TTL)。
 		Backlog: cfg.gatewayBacklog,
+		Authz:   authzInst,
 	})
 	// LITETALK_PROTOCOL_MAX：服务端宣布的协议版本上限（#29 逃生阀）。
 	// 0/缺省 = 构建期 ProtocolVersionMax；调小可临时挡住过新的客户端区间。
@@ -342,6 +353,8 @@ func main() {
 		Hub: hub,
 		// 在线状态读取（presence:{uid}，好友列表 user.online 填值）。
 		Presence: kv,
+		// 语音房反查（好友频道 presence 快照，#92）：与踢线同一个 hub。
+		VoicePresence: hub,
 		// 自托管形态自描述（GET /api/v1/config，#26）：SQLite/进程内单机部署 = true，
 		// MySQL 全栈部署 = false。客户端据此显示自托管引导（邀请码等）。
 		SelfHost: pickStoreKind() != "mysql",
@@ -352,6 +365,8 @@ func main() {
 		Version: version,
 		RTC:     rtcCfg,
 		RTCAuth: rtcAuth,
+		// 权限判定与信令 hub 共用同一实例（#35 B3）。
+		Authz: authzInst,
 	})
 
 	mux := http.NewServeMux()
@@ -429,10 +444,16 @@ func startHTTP(cfg *config, mux http.Handler, stop context.CancelFunc) []*http.S
 		httpsSrv := newServer(cfg.addr, mux)
 		httpsSrv.TLSConfig = mgr.TLSConfig()
 		httpSrv := newServer(":80", mgr.HTTPHandler())
+		// ACME 部署不占 8077，但 updater 默认按 loopback 8077 断言版本（#101）：
+		// 单独起一个只暴露 healthz 的监听，不把完整管理 API 带到回环面。
+		healthSrv := newServer(acmeHealthAddr, healthOnlyHandler(version))
 		log.Printf("ACME: 单域 %s 自动签发（TLS-ALPN-01 + HTTP-01），证书缓存 %s", cfg.domain, cfg.acmeCache)
+		log.Printf("ACME: loopback health http://%s/api/v1/healthz", acmeHealthAddr)
 		listen("HTTPS "+cfg.addr, httpsSrv, func() error { return httpsSrv.ListenAndServeTLS("", "") }, true)
 		listen("HTTP :80", httpSrv, httpSrv.ListenAndServe, true)
-		return []*http.Server{httpsSrv, httpSrv}
+		// 端口冲突/无权限走上面统一的失败路径：打日志并 stop()，不静默吞掉。
+		listen("health "+acmeHealthAddr, healthSrv, healthSrv.ListenAndServe, false)
+		return []*http.Server{httpsSrv, httpSrv, healthSrv}
 	}
 
 	srv := newServer(cfg.addr, mux)
@@ -448,6 +469,25 @@ func startHTTP(cfg *config, mux http.Handler, stop context.CancelFunc) []*http.S
 	}
 	listen("HTTP "+cfg.addr, srv, srv.ListenAndServe, false)
 	return []*http.Server{srv}
+}
+
+// healthOnlyHandler ACME 模式的回环探活面：只提供 GET /api/v1/healthz。
+// 不复用完整 mux——8077 是给 updater 做版本断言的，不该把管理 API 暴露出去。
+// 响应直接复用生成物的 Healthz 形状（{status:"ok",version}），与主端点逐字一致。
+//
+// 这里刻意不经过 ServeMux：契约比对器（server/api/tests）把 server/ 下所有
+// HandleFunc 的 pattern 当作公开 REST 面，注册同一路径会被误判成重复路由；
+// 回环监听只是既有 healthz 操作的另一入口，不新增对外契约。
+func healthOnlyHandler(version string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if (r.Method != http.MethodGet && r.Method != http.MethodHead) || r.URL.Path != "/api/v1/healthz" {
+			http.NotFound(w, r)
+			return
+		}
+		body, _ := json.Marshal(api.Healthz{Status: api.HealthzStatusOk, Version: version})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	})
 }
 
 // isPermError 端口绑定权限不足（Linux 低段端口需 root / CAP_NET_BIND_SERVICE）。

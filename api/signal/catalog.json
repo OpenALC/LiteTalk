@@ -34,6 +34,7 @@
     { "go_name": "ErrCodeNotFound", "value": "not_found" },
     { "go_name": "ErrCodeRateLimited", "value": "rate_limited" },
     { "go_name": "ErrCodeQuotaExceeded", "value": "quota_exceeded" },
+    { "go_name": "ErrCodeBadPassword", "value": "bad_password" },
     {
       "go_name": "ErrCodeProtocolUnsupported",
       "value": "protocol_unsupported",

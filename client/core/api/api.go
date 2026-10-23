@@ -216,17 +216,21 @@ func IsAuthRejected(err error) bool {
 	return apiErr.Status == http.StatusUnauthorized || apiErr.Status == http.StatusForbidden
 }
 
-// IsTransientRefreshError 判断刷新失败是否值得退避重试：只有传输层错误
-// （网络中断、DNS、超时等）算瞬时。服务端明确应答的 *APIError（含 401/403）、
-// 会话被顶替（ErrSessionReplaced）、换服（errBaseChanged）与无刷新源
-// （ErrNoRefreshSource）都不可恢复——重试只会原地打转，必须按致命处理。
+// IsTransientRefreshError 判断刷新失败是否值得退避重试：传输层错误（网络中断、
+// DNS、超时等）与服务端临时故障（408 请求超时、429 限流、5xx）都算瞬时——
+// 服务端并未否认 refresh_token 本身，退避后可能自行恢复。只有服务端明确拒绝
+// 凭据（401/403 等其余 4xx）、会话被顶替（ErrSessionReplaced）、换服
+// （errBaseChanged）与无刷新源（ErrNoRefreshSource）才不可恢复，必须按致命
+// 处理——重试只会原地打转。
 func IsTransientRefreshError(err error) bool {
 	if err == nil {
 		return false
 	}
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
-		return false
+		return apiErr.Status == http.StatusRequestTimeout ||
+			apiErr.Status == http.StatusTooManyRequests ||
+			apiErr.Status >= http.StatusInternalServerError
 	}
 	return !errors.Is(err, ErrSessionReplaced) &&
 		!errors.Is(err, errBaseChanged) &&
@@ -813,6 +817,10 @@ type ChannelDTO struct {
 	CategoryID *ID       `json:"category_id"`
 	Position   int       `json:"position"`
 	CreatedAt  time.Time `json:"created_at"`
+	// #37 频道选项：父级（nil=顶层）、是否设密码（密码本体永不回显）、人数上限（0=不限）。
+	ParentID    *ID  `json:"parent_id"`
+	HasPassword bool `json:"has_password"`
+	UserLimit   int  `json:"user_limit"`
 }
 
 // ServerChannels GET /servers/{id}/channels 响应（categories + channels 两数组）。
@@ -951,6 +959,54 @@ func (c *APIClient) CreateChannel(serverID string, name, typ string, categoryID 
 	return &ch, nil
 }
 
+// CreateSubchannel 建子频道（#37 B2）：类型继承父、分类由服务端随父，
+// body 只带 name/type/parent_id。
+func (c *APIClient) CreateSubchannel(serverID, name, typ, parentID string) (*ChannelDTO, error) {
+	status, data, err := c.post(fmt.Sprintf("/servers/%s/channels", serverID),
+		map[string]any{"name": name, "type": typ, "parent_id": parentID}, true)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK && status != http.StatusCreated {
+		return nil, decodeError(status, data)
+	}
+	var ch ChannelDTO
+	if err := json.Unmarshal(data, &ch); err != nil {
+		return nil, fmt.Errorf("decode channel: %w", err)
+	}
+	return &ch, nil
+}
+
+// UpdateChannelOptions 更新频道选项（#37 B2）：只发送要改的字段——
+// parentID 空串不改 / "0" 提升顶层 / 其余设置父；userLimit <0 不改，>=0 设置；
+// password 空串不改，clearPassword 清除，非空设置。不触碰 name/type/position。
+func (c *APIClient) UpdateChannelOptions(channelID, parentID string, userLimit int, password string, clearPassword bool) (*ChannelDTO, error) {
+	body := map[string]any{}
+	if parentID != "" {
+		body["parent_id"] = parentID
+	}
+	if userLimit >= 0 {
+		body["user_limit"] = userLimit
+	}
+	if clearPassword {
+		body["password"] = nil
+	} else if password != "" {
+		body["password"] = password
+	}
+	status, data, err := c.patch(fmt.Sprintf("/channels/%s", channelID), body)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, decodeError(status, data)
+	}
+	var ch ChannelDTO
+	if err := json.Unmarshal(data, &ch); err != nil {
+		return nil, fmt.Errorf("decode channel: %w", err)
+	}
+	return &ch, nil
+}
+
 // RenameChannel 重命名频道（owner/admin）。
 func (c *APIClient) RenameChannel(id string, name string) error {
 	status, data, err := c.patch(fmt.Sprintf("/channels/%s", id), map[string]string{"name": name})
@@ -966,6 +1022,20 @@ func (c *APIClient) RenameChannel(id string, name string) error {
 // DeleteChannel 删除频道（owner/admin）。
 func (c *APIClient) DeleteChannel(id string) error {
 	status, data, err := c.del(fmt.Sprintf("/channels/%s", id))
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return decodeError(status, data)
+	}
+	return nil
+}
+
+// SetServerMuted 服务端强制闭麦/解禁（#36，需 MuteMembers）：目标不配合也生效；
+// 房间成员经 voice.state{server_muted} 获知状态。
+func (c *APIClient) SetServerMuted(channelID, userID string, muted bool) error {
+	status, data, err := c.put(fmt.Sprintf("/channels/%s/members/%s/server-mute", channelID, userID),
+		map[string]bool{"muted": muted})
 	if err != nil {
 		return err
 	}
@@ -1061,14 +1131,17 @@ func (c *APIClient) SendFriendRequest(target string) error {
 }
 
 // FriendDTO 好友条目（与服务端 friendView 对齐；Remark/Group 仅发起方视角非空）。
-// ID 为字符串 wire（#31）。
+// ID 为字符串 wire（#31）。ChannelID/ServerID 是对端当前语音房快照（#92）：
+// 两字段同现同缺，无查看权限/对端不在语音房时为空串（键缺省）。
 type FriendDTO struct {
-	ID       ID          `json:"id"`
-	Status   string      `json:"status"` // pending | accepted | blocked
-	Incoming bool        `json:"incoming"`
-	Remark   string      `json:"remark"`
-	Group    string      `json:"group"`
-	User     UserProfile `json:"user"`
+	ID        ID          `json:"id"`
+	Status    string      `json:"status"` // pending | accepted | blocked
+	Incoming  bool        `json:"incoming"`
+	Remark    string      `json:"remark"`
+	Group     string      `json:"group"`
+	User      UserProfile `json:"user"`
+	ChannelID string      `json:"channel_id"`
+	ServerID  string      `json:"server_id"`
 }
 
 // ListFriends 好友关系全量（含 pending；v0.1.2 替换前端 mock）。

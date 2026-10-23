@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/OpenALC/LiteTalk/server/internal/auth"
+	"github.com/OpenALC/LiteTalk/server/internal/authz"
 	"github.com/OpenALC/LiteTalk/server/internal/sfu"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
 	"github.com/coder/websocket"
@@ -48,6 +49,8 @@ type Hub struct {
 	limits    RateLimiter
 	dev       bool          // 开发模式：放行非数字的内置房间（生产必须为 false）
 	presence  PresenceStore // 在线状态（presence:{uid}，#11）；nil=不做 presence
+	// authz 权限判定（#35 B3）：与 api.Server 共享实例；nil 时权限门 fail-closed。
+	authz Authz
 
 	// 心跳参数（默认值见包常量；测试可缩短）
 	heartbeatEvery time.Duration
@@ -60,16 +63,24 @@ type Hub struct {
 	// 拒绝新连接，杜绝「广播之后仍有新 WS 接入」的窗口。
 	shuttingDown atomic.Bool
 
-	mu         sync.Mutex
-	rooms      map[string]*roomState
-	conns      map[connKey]*client // uid+"\x00"+dev → 当前连接（§0.8）
-	nextConnID uint64              // 连接标识自增（SFU peer 归属核对用）
+	mu    sync.Mutex
+	rooms map[string]*roomState
+	conns map[connKey]*client // uid+"\x00"+dev → 当前连接（§0.8）
+	// userRooms uid → 当前语音房 ID（#92 好友频道 presence 反查）。
+	// 只在成员真正写入 room.members[uid] 的同一临界区设置；leaveWorkLocked
+	// 核对 members[uid]==c 且映射值等于本次 roomID 才删除，旧连接迟到的
+	// cleanup 不得删新连接的映射。同受 h.mu 保护。
+	userRooms  map[string]string
+	nextConnID uint64 // 连接标识自增（SFU peer 归属核对用）
 
 	// presence 写入串行化（#11）：KV SET/DEL 与好友推送都在 h.mu 之外执行，
 	// 但必须按「当前连接事实」依次应用，否则旧连接的 DEL 可能落到新连接的
 	// SET 之后。锁序固定 presenceMu → h.mu，禁止反向获取。
 	presenceMu        sync.Mutex
 	presencePublished map[string]bool // uid → 本进程已发布/已推送的在线态
+	// presenceChanPublished 好友频道 presence 的去抖缓存（#92）：uid → 上次推送的
+	// 语音房状态。无键 = 尚未推过（离线边沿清空，重进同一频道必须重推）。
+	presenceChanPublished map[string]presenceChanState
 
 	// evlog 事件面每会话事件环（#32）：seq 分配与断线续传补发。
 	// 实现为进程内环形队列（单实例假设，见 gateway.go 头注释）。
@@ -93,9 +104,12 @@ func makeConnKey(uid, dev string) connKey { return connKey(uid + "\x00" + dev) }
 
 // roomState 信令层房间：成员表与语音状态（全内存态，M3 换成频道模型）。
 // members 按 uid 索引且同 uid 仅一个连接（多设备会话切换由 join 抢占完成）。
+// serverID 来自 ChannelByID（#92）；dev 内置房间无 store 实体为 0，好友频道
+// presence 据此不带频道字段。
 type roomState struct {
-	id      string
-	members map[string]*client // userID → client
+	id       string
+	serverID int64
+	members  map[string]*client // userID → client
 }
 
 // client 一条 WS 连接。
@@ -143,6 +157,15 @@ func (c *client) closeNow() {
 	_ = c.conn.CloseNow()
 }
 
+// Authz 频道权限判定（#35 B3，*authz.Authorizer 满足；测试可注入故障假实现）。
+// CanInServer 语义与 authz 包一致：非成员/无权限 (false, nil)，故障 (false, err)。
+type Authz interface {
+	CanInServer(ctx context.Context, uid, serverID, channelID int64, perm store.Permission) (bool, error)
+	// CanServer 服务器级判定（#37 密码旁路：Administrator/owner）。
+	CanServer(ctx context.Context, uid, serverID int64, perm store.Permission) (bool, error)
+	InvalidateServer(serverID int64)
+}
+
 // ChatDeps 聊天持久化与频控依赖（可零值：仅广播不落库、不限流）。
 type ChatDeps struct {
 	Store  ChatStore
@@ -159,6 +182,9 @@ type ChatDeps struct {
 	OfferRate int
 	// Backlog 每会话事件环条数（LITETALK_GATEWAY_BACKLOG，#32）；0 = 默认 256。
 	Backlog int
+	// Authz 权限判定（#35 B3）。nil 且 Store 是 store.Store 时自建默认实例（测试兼容）；
+	// 生产必须注入与 api 共享的同一实例，否则写后失效不同步。
+	Authz Authz
 }
 
 // NewHub 构造信令 hub。maxMembers <= 0 时取 SFU 的上限。
@@ -169,6 +195,14 @@ func NewHub(s *sfu.SFU, authn Authenticator, sess *auth.SessionIndex, logger *lo
 	}
 	if logger == nil {
 		logger = log.Default()
+	}
+	az := chat.Authz
+	if az == nil {
+		// 测试/单用方场景自建（#35 B3）：Store 是 store.Store 才能建；
+		// 生产（main.go）注入与 api 共享的实例。
+		if st, ok := chat.Store.(store.Store); ok {
+			az = authz.New(st, authz.Options{})
+		}
 	}
 	h := &Hub{
 		sfu:               s,
@@ -183,11 +217,13 @@ func NewHub(s *sfu.SFU, authn Authenticator, sess *auth.SessionIndex, logger *lo
 		maxConns:          chat.MaxConns,
 		joinRate:          chat.JoinRate,
 		offerRate:         chat.OfferRate,
+		authz:             az,
 		heartbeatEvery:    defaultHeartbeatEvery,
 		pongWait:          defaultPongWait,
 		readIdle:          defaultReadIdle,
 		rooms:             make(map[string]*roomState),
 		conns:             make(map[connKey]*client),
+		userRooms:         make(map[string]string),
 		evlog:             newMemEventLog(chat.Backlog),
 		presencePublished: make(map[string]bool),
 	}
@@ -511,6 +547,15 @@ func (h *Hub) KickChannel(channelID, reason string) {
 	for _, w := range pending {
 		h.finishLeave(w)
 	}
+	// 好友频道 presence（#92）：被真正摘除的 uid 逐个收口（离房后在线-only）。
+	synced := make(map[string]bool, len(removed))
+	for _, w := range pending {
+		if !w.removed || synced[w.c.userID] {
+			continue
+		}
+		synced[w.c.userID] = true
+		h.syncPresenceChannel(w.c.userID)
+	}
 	if reason != "" {
 		h.log.Printf("ws: 频道 %s 被移除（%s），%d 人已离房", channelID, reason, len(removed))
 	}
@@ -649,7 +694,7 @@ func (h *Hub) handleMessage(c *client, data []byte) {
 			h.sendError(c, code, msg)
 			return
 		}
-		h.joinRoom(c, d.ChannelID)
+		h.joinRoom(c, d.ChannelID, d.Password)
 	case TypeChannelLeave:
 		h.leaveRoom(c)
 	case TypeRTCOffer:
@@ -782,8 +827,10 @@ func (h *Hub) serverMax() int64 {
 }
 
 // authorizeChannelJoin 进房权限校验（P0 S1）：返回 (错误码, 消息)，code 为空即放行。
-// 数字频道要求存在、Type 为 voice、请求者是其所属服务器成员；
-// 非数字房间是 M2 内置房间（无 store 频道实体），仅 dev 模式放行。
+// 数字频道要求存在、Type 为 voice、请求者是其所属服务器成员，且有 ViewChannel+
+// ConnectVoice（#35 B3）；非数字房间是 M2 内置房间（无 store 频道实体），仅 dev 模式放行。
+// 权限检查放在既有检查之后，保持既有错误优先级：不存在→not_found、文本频道→forbidden、
+// 非成员→forbidden，然后才是权限不足。
 // 校验含 store 查询，调用方不得持有 hub.mu。
 func (h *Hub) authorizeChannelJoin(c *client, channelID string) (code, msg string) {
 	ctx := context.Background()
@@ -812,6 +859,13 @@ func (h *Hub) authorizeChannelJoin(c *client, channelID string) (code, msg strin
 	if err != nil {
 		return ErrCodeForbidden, "无权进入该频道"
 	}
+	// B3 权限：进语音房 = 看得见频道 + 允许连线；无权限 forbidden，故障 internal。
+	for _, perm := range []store.Permission{store.ViewChannel, store.ConnectVoice} {
+		code, msg := h.checkPerm(ctx, uid, ch.ServerID, chID, perm, "无权进入该频道")
+		if code != "" {
+			return code, msg
+		}
+	}
 	// 缓存 tag 到连接上（成员快照填充用；join 是低频路径，一次查询即可）
 	c.mu.Lock()
 	c.tag = mem.Tag
@@ -819,21 +873,117 @@ func (h *Hub) authorizeChannelJoin(c *client, channelID string) (code, msg strin
 	return "", ""
 }
 
+// checkPerm 单权限判定（#35 B3）：无权限 → (forbidden, msg)，查询故障 → (internal, …)，
+// 通过 → ("", "")。authz 未注入同样按 internal 拒绝（fail-closed，不做假放行）。
+func (h *Hub) checkPerm(ctx context.Context, uid, serverID, channelID int64, perm store.Permission, denyMsg string) (code, msg string) {
+	if h.authz == nil {
+		return ErrCodeInternal, "权限服务未就绪"
+	}
+	ok, err := h.authz.CanInServer(ctx, uid, serverID, channelID, perm)
+	if err != nil {
+		// 故障只记日志 + internal：不能把 500 伪装成 403。
+		h.log.Printf("ws: 权限查询失败（用户 %d 频道 %d）: %v", uid, channelID, err)
+		return ErrCodeInternal, "权限查询失败"
+	}
+	if !ok {
+		return ErrCodeForbidden, denyMsg
+	}
+	return "", ""
+}
+
 // joinRoom 登记成员并向全房间重发 channel.joined（成员全量，§5.3 无 peer_joined 消息，
 // 成员变化以全量下发，客户端做全量替换）。整个登记在一把 hub.mu 内原子完成。
-// 语音单处（§0.10）：同 uid 其他会话在任一语音房 → 先发 session.voice_taken、
-// 清其房间成员与 SFU peer，然后本连接进房。
-func (h *Hub) joinRoom(c *client, channelID string) {
+// #37 顺序（joinRoom 是密码/人数的唯一权威入口）：结构/权限 → 已在目标房 →
+// 密码（管理员旁路）→ 人数上限 → 离开旧房 → 登记。密码校验不持 hub.mu
+// （bcrypt 贵，不能让整个 hub 排队）；人数检查在 h.mu 内且先于离开旧房——
+// 满员被拒不得改变原房间成员关系。语音单处（§0.10）：同 uid 其他会话在任一
+// 语音房 → 先发 session.voice_taken、清其房间成员与 SFU peer，然后本连接进房
+// （自己另一设备已在目标房时走此路，容量检查对它放行顶替）。
+func (h *Hub) joinRoom(c *client, channelID, password string) {
 	// 兜底再校验一次：joinRoom 可能被 channel.join 之外的路径调用，权限不可绕。
 	if code, msg := h.authorizeChannelJoin(c, channelID); code != "" {
 		h.sendError(c, code, msg)
 		return
 	}
+	// 数字频道取频道行（密码/人数上限）；dev 内置房间无 store 实体，跳过两道门。
+	// authorize 已确认存在，此刻再查失败按 not_found（竞态删频道）。
+	var ch *store.Channel
+	if chID, err := strconv.ParseInt(channelID, 10, 64); err == nil && h.chatStore != nil {
+		c2, err := h.chatStore.ChannelByID(context.Background(), chID)
+		if err != nil {
+			h.sendError(c, ErrCodeNotFound, "频道不存在")
+			return
+		}
+		ch = c2
+	}
+	// roomState.serverID（#92）：dev 内置房间保持 0，好友频道 presence 不带字段。
+	var roomServerID int64
+	if ch != nil {
+		roomServerID = ch.ServerID
+	}
+	uid, uidErr := strconv.ParseInt(c.userID, 10, 64)
+
+	// 已在目标房（#37 顺序在密码之前：重发 join 不应被密码门拦）。
+	h.mu.Lock()
+	already := c.roomIDLocked() == channelID
+	h.mu.Unlock()
+	if already {
+		h.sendError(c, ErrCodeAlreadyInChan, "已在该频道中")
+		return
+	}
+
+	// 密码（#37）：频道未设密码时忽略携带值；管理员（Administrator/owner）旁路。
+	// 没带密码 → forbidden（老客户端安全回滚）；带错 → bad_password。
+	if ch != nil && ch.PasswordHash != "" {
+		if uidErr != nil {
+			h.sendError(c, ErrCodeForbidden, "无权进入该频道")
+			return
+		}
+		bypass := false
+		if h.authz != nil {
+			var aerr error
+			bypass, aerr = h.authz.CanServer(context.Background(), uid, ch.ServerID, store.Administrator)
+			if aerr != nil {
+				h.log.Printf("ws: 密码旁路查询失败（用户 %d 频道 %d）: %v", uid, ch.ID, aerr)
+				h.sendError(c, ErrCodeInternal, "权限查询失败")
+				return
+			}
+		}
+		if !bypass {
+			if password == "" {
+				h.sendError(c, ErrCodeForbidden, "该频道需要密码")
+				return
+			}
+			if !auth.CheckPassword(ch.PasswordHash, password) {
+				h.sendError(c, ErrCodeBadPassword, "频道密码错误")
+				return
+			}
+		}
+	}
+
 	h.mu.Lock()
 	if c.roomIDLocked() == channelID {
 		h.mu.Unlock()
 		h.sendError(c, ErrCodeAlreadyInChan, "已在该频道中")
 		return
+	}
+	// 人数上限（#37）：频道限与全局限取小；自己另一设备已在目标房可顶替腾位。
+	// 在离开旧房之前判（满员被拒不得改变原房间成员关系），且不留空房壳。
+	limit := h.maxPer
+	if ch != nil && ch.UserLimit > 0 && ch.UserLimit < limit {
+		limit = ch.UserLimit
+	}
+	if room := h.rooms[channelID]; room != nil {
+		occ := len(room.members)
+		if other := room.members[c.userID]; other != nil && other != c {
+			occ-- // 同 uid 另一设备在目标房：语音单处会顶替它，提前腾位
+		}
+		if occ >= limit {
+			h.mu.Unlock()
+			// 容量超限统一 quota_exceeded（§0.1.3），文案可区分。
+			h.sendError(c, ErrCodeQuotaExceeded, "语音房间已满")
+			return
+		}
 	}
 	var pending []leaveWork
 	// 先离开旧房（成员摘除在锁内，SFU 清理与广播在锁外执行）。
@@ -844,17 +994,8 @@ func (h *Hub) joinRoom(c *client, channelID string) {
 	}
 	room := h.rooms[channelID]
 	if room == nil {
-		room = &roomState{id: channelID, members: make(map[string]*client)}
+		room = &roomState{id: channelID, serverID: roomServerID, members: make(map[string]*client)}
 		h.rooms[channelID] = room
-	}
-	if len(room.members) >= h.maxPer {
-		h.mu.Unlock()
-		for _, w := range pending {
-			h.finishLeave(w)
-		}
-		// 容量超限统一 quota_exceeded（§0.1.3）。
-		h.sendError(c, ErrCodeQuotaExceeded, "语音房间已满")
-		return
 	}
 	// 语音单处：摘同 uid 其他会话（锁内），通知与 SFU 清理走 pending（锁外）。
 	var voiceTakens []*client
@@ -877,11 +1018,16 @@ func (h *Hub) joinRoom(c *client, channelID string) {
 	// 同房抢占会摘掉旧成员——若目标房因此被销毁则重建。
 	room = h.rooms[channelID]
 	if room == nil {
-		room = &roomState{id: channelID, members: make(map[string]*client)}
+		room = &roomState{id: channelID, serverID: roomServerID, members: make(map[string]*client)}
 		h.rooms[channelID] = room
 	}
 	room.members[c.userID] = c
 	c.setRoomID(channelID)
+	// 频道反查（#92）：与成员登记同一临界区写入，避免读侧看到「在房但无映射」。
+	if h.userRooms == nil {
+		h.userRooms = make(map[string]string)
+	}
+	h.userRooms[c.userID] = channelID
 	members := room.snapshotLocked()
 	h.mu.Unlock()
 
@@ -906,6 +1052,10 @@ func (h *Hub) joinRoom(c *client, channelID string) {
 			Self:      byUID[m.userID],
 		})
 	}
+	// 好友频道 presence（#92）：登记完成才是状态变化点。中途 leaveWork 不单独推，
+	// 否则切房会先推一条「无频道」再推目标房；失败路径都 return 在登记之前。
+	// 同 uid 被 voice_taken 的旧连接也是同一 uid 的状态迁移，由这里一次收口。
+	h.syncPresenceChannel(c.userID)
 }
 
 // leaveWork 一次离房的锁内计算结果：锁外执行 SFU 清理与广播。
@@ -917,7 +1067,8 @@ type leaveWork struct {
 }
 
 // leaveWorkLocked 离房（调用方须持 h.mu）：清本连接 roomID、身份核对后摘成员。
-// members[uid] 不是本连接（已被同账号新连接顶替）时不摘成员、不广播（§0.8 盲删防护）。
+// members[uid] 不是本连接（已被同账号新连接顶替）时不摘成员、不广播（§0.8 盲删防护）；
+// userRooms 同理——旧连接迟到的 cleanup 不得删掉新连接写入的映射（#92）。
 func (h *Hub) leaveWorkLocked(c *client) *leaveWork {
 	roomID := c.roomIDLocked()
 	if roomID == "" {
@@ -931,6 +1082,9 @@ func (h *Hub) leaveWorkLocked(c *client) *leaveWork {
 	}
 	if room.members[c.userID] == c {
 		delete(room.members, c.userID)
+		if h.userRooms[c.userID] == roomID {
+			delete(h.userRooms, c.userID)
+		}
 		w.removed = true
 	}
 	if len(room.members) == 0 {
@@ -957,12 +1111,15 @@ func (h *Hub) finishLeave(w leaveWork) {
 }
 
 // leaveRoom 离房：移除成员、SFU 归属清理、向剩余成员广播 channel.peer_left。
+// 离房成功后收口好友频道 presence（#92）；joinRoom 的中途离房不走本函数，
+// 状态变化由 join 成功后的那次 sync 一次收口（见 joinRoom 尾注）。
 func (h *Hub) leaveRoom(c *client) {
 	h.mu.Lock()
 	w := h.leaveWorkLocked(c)
 	h.mu.Unlock()
 	if w != nil {
 		h.finishLeave(*w)
+		h.syncPresenceChannel(c.userID)
 	}
 }
 
@@ -1010,10 +1167,13 @@ func (h *Hub) handleRTCCandidate(c *client, cand ICECandidateData) {
 // handleVoiceState 更新内存态成员表并向房间其他成员广播（服务端不校验）。
 // v2 客户端的 speaking 字段被忽略（#33 裁定 #5）：协议 2 起说话判定走 RFC 6464
 // 电平（voice.speaking），voice.state 只承载 mute/deafen；v1 客户端照旧全收全发。
+// server_muted 是服务端权威字段（#36）：上行携带一律忽略，只有 SetServerMuted
+// 的广播才带——否则任意客户端可伪造「被闭麦/已解禁」状态。
 func (h *Hub) handleVoiceState(c *client, d VoiceStateData) {
 	if c.protoVer.Load() >= 2 {
 		d.Speaking = nil
 	}
+	d.ServerMuted = nil
 	h.mu.Lock()
 	roomID := c.roomIDLocked()
 	c.mu.Lock()
@@ -1101,6 +1261,36 @@ func (h *Hub) handleVoiceRequestState(c *client, d VoiceRequestStateData) {
 	})
 }
 
+// SetServerMuted 服务端强制闭麦/解禁（#36）：SFU 包级丢弃（track 不摘）并向房间
+// 全体广播 voice.state{user_id, server_muted}（目标本人也收，用于状态显示）。
+// 目标不在该频道 → ErrNotInChannel（REST 层映射 404）。与 voice.request_state 的
+// 「请求」语义不同：这里不看目标是否配合，服务端直接生效。
+func (h *Hub) SetServerMuted(channelID, userID string, muted bool) error {
+	h.mu.Lock()
+	room := h.rooms[channelID]
+	if room == nil || room.members[userID] == nil {
+		h.mu.Unlock()
+		return ErrNotInChannel
+	}
+	// 快照成员后放锁再动 SFU/发下行：SFU 侧有自己的锁序（s.mu → r.mu），
+	// 持 h.mu 交叉调用会与 speakingLoop 的回调路径死锁（见 tickRooms 注释）。
+	targets := make([]*client, 0, len(room.members))
+	for _, m := range room.members {
+		targets = append(targets, m)
+	}
+	h.mu.Unlock()
+
+	if !h.sfu.SetServerMuted(channelID, userID, muted) {
+		return ErrNotInChannel
+	}
+	bcast := VoiceStateData{UserID: userID, ServerMuted: &muted}
+	for _, m := range targets {
+		h.sendJSON(m, TypeVoiceState, bcast)
+	}
+	h.log.Printf("ws: 频道 %s 成员 %s 服务端闭麦=%v（%d 人已通知）", channelID, userID, muted, len(targets))
+	return nil
+}
+
 // ---- Hub 带锁快照 ----
 
 // 以下访问器测试与生产共用：hub.rooms / hub.conns / room.members 只允许在持有 h.mu 时
@@ -1129,6 +1319,23 @@ func (h *Hub) roomMemberCount(channelID string) int {
 		return 0
 	}
 	return len(room.members)
+}
+
+// VoiceChannelOf 反查 uid 当前语音房（#92 好友频道 presence，api.VoicePresence 满足）。
+// serverID 为十进制字符串；dev 内置房间无 store 实体为 "0"，调用方据此不带频道字段。
+// 只读内存映射，不查 store、不读 presence KV。持 h.mu。
+func (h *Hub) VoiceChannelOf(uid string) (channelID, serverID string, ok bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	ch, ok := h.userRooms[uid]
+	if !ok {
+		return "", "", false
+	}
+	room, ok := h.rooms[ch]
+	if !ok {
+		return "", "", false // 映射与房间表不一致：防御性视为不在房
+	}
+	return ch, formatUID(room.serverID), true
 }
 
 // connByDevice 某 uid+dev 的当前连接（不在线 → nil）。持 h.mu。

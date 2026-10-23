@@ -556,6 +556,158 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/servers/{id}/roles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 服务器角色列表（成员可读）
+         * @description 按 position、id 升序，含 builtin 与自定义角色。 code：路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
+         */
+        get: operations["listRoles"];
+        put?: never;
+        /**
+         * 创建自定义角色（需 ManageRoles，#35 B4）
+         * @description 只允许自定义角色（builtin_key 固定为空）。层级防提权：非 owner 的 position 必须严格小于其最高角色 position，权限位必须是操作者权限的子集。 code：bad_name、bad_color、bad_position、bad_permissions、bad_request、 路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
+         */
+        post: operations["createRole"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/roles/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * 删除自定义角色（需 ManageRoles，builtin 403）
+         * @description 级联删除该角色的成员分配与以它为目标的频道覆盖。builtin 角色 403。 code：路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
+         */
+        delete: operations["deleteRole"];
+        options?: never;
+        head?: never;
+        /**
+         * 更新自定义角色（需 ManageRoles，builtin 403）
+         * @description 全量写 name/color/position/permissions（缺省字段沿用现值）；builtin 角色 改/伪造一律 403。层级防提权同创建。permissions 为十进制字符串，只允许低 15 位。 code：bad_name、bad_color、bad_position、bad_permissions、bad_request、 路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
+         */
+        patch: operations["updateRole"];
+        trace?: never;
+    };
+    "/api/v1/servers/{id}/members/{user_id}/roles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * 全量替换成员角色（需 ManageRoles，#35 B4）
+         * @description @everyone 强制保留；服务器 owner 的 owner 角色强制保留（不能经此降级）； owner builtin 不可分配（owner 身份只由 servers.owner_id 决定）。 层级防提权：目标角色（除 @everyone）的 position 必须严格小于操作者最高 角色 position，且权限位必须是操作者权限的子集；目标成员的最高角色 position 也不得大于等于操作者（同级/上级不可动，owner 操作者不受限）。 成功后 legacy role 投影同步。 code：bad_request、路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
+         */
+        put: operations["setMemberRoles"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/channels/{id}/overwrites": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 频道覆盖列表（需 ManageChannels）
+         * @description 按 target_type、target_id 升序。 code：路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
+         */
+        get: operations["listChannelOverwrites"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/channels/{id}/overwrites/{target_type}/{target_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * upsert 频道覆盖（需 ManageChannels，#35 B4）
+         * @description target_type=role|member。allow/deny 为十进制字符串，只允许频道位 （ChannelPermissionMask，管理位属于角色）。目标必须与频道同服，否则 404。 code：bad_request、bad_permissions、路径参数不合法；401；403 forbidden； 404 not_found；5xx internal。
+         */
+        put: operations["setChannelOverwrite"];
+        post?: never;
+        /**
+         * 删除频道覆盖（需 ManageChannels，#35 B4）
+         * @description code：路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
+         */
+        delete: operations["deleteChannelOverwrite"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/servers/{id}/audit-log": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 审计日志倒序游标（需 ManageServer）
+         * @description before=0 取最新一页；返回按 id 倒序（新→旧）。limit 1–50，越界 400。 code：bad_limit、bad_cursor、bad_request、路径参数不合法；401； 403 forbidden；404 not_found；5xx internal。
+         */
+        get: operations["listAuditLog"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/channels/{id}/members/{user_id}/server-mute": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * 服务端强制闭麦/解禁（需 MuteMembers，#36）
+         * @description 服务端在 SFU 转发前丢弃目标的上行 RTP（track 保持挂载），目标不配合也无法 绕过；房间成员收到 voice.state{server_muted}。仅语音频道；不能对自己操作； 非 owner 只能对角色层级严格低于自己的成员操作（与角色管理同口径）。 code：bad_channel、bad_request、路径参数不合法；401；403 forbidden； 404 not_found（频道不存在、目标不是成员或不在该频道语音房）；5xx internal。
+         */
+        put: operations["setServerMuted"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -730,6 +882,12 @@ export interface components {
             position: number;
             /** Format: date-time */
             created_at: string;
+            /** @description 父频道 ID（#37 子频道树，仅语音频道）；null = 顶层。可选属性，服务端始终返回 */
+            parent_id?: string | null;
+            /** @description 是否设有频道密码（#37）；密码明文/哈希永不回显。可选属性，服务端始终返回 */
+            has_password?: boolean;
+            /** @description 语音人数上限（#37）；0 = 不限。可选属性，服务端始终返回 */
+            user_limit?: number;
         };
         /**
          * CategoryInfo
@@ -758,6 +916,8 @@ export interface components {
             tag?: string;
             /** @description 在线态（presence:{uid} 存在即在线）；不依赖好友关系 */
             online: boolean;
+            /** @description 成员持有的角色 ID（含 @everyone；可选，旧响应缺省不回） */
+            role_ids?: string[];
         };
         /**
          * Message
@@ -791,7 +951,7 @@ export interface components {
         };
         /**
          * FriendEntry
-         * @description 好友条目。remark/group 仅发起方视角非空（被请求方恒空串）。 user 为 PublicUser（无 email）。
+         * @description 好友条目。remark/group 仅发起方视角非空（被请求方恒空串）。 user 为 PublicUser（无 email）。 channel_id/server_id 是对端当前语音房快照（#92 好友频道 presence）， 两字段必须同时出现或同时缺省：仅 accepted 且在线、且查看者对该频道有 ViewChannel 权限时出现；无权限/查询故障时键缺省（不得泄露频道）。 载荷不含频道名。
          */
         FriendEntry: {
             /** @description 关系行 ID（请求数） */
@@ -804,6 +964,10 @@ export interface components {
             group: string;
             /** @description 对端 PublicUser；对端查询失败时为 null（仅 accept/patch 极端情况） */
             user: components["schemas"]["PublicUser"] | null;
+            /** @description 对端当前语音频道 ID（#92，可选）；与 server_id 同现同缺。 仅 accepted 且对端在线、查看者对该频道有 ViewChannel 权限时出现。 */
+            channel_id?: string;
+            /** @description channel_id 所属服务器 ID（#92，可选）；与 channel_id 同现同缺。 */
+            server_id?: string;
         };
         /**
          * ServerChannels
@@ -945,10 +1109,16 @@ export interface components {
             /** @description 0/缺省 = 未分类；请求侧数字与字符串双接受（#31） */
             category_id?: string | null;
             position?: number;
+            /** @description 频道密码（#37，1–72 字节，仅语音频道）；只写不读，响应只出 has_password */
+            password?: string;
+            /** @description 语音人数上限 0..100（#37，仅语音频道）；0 = 不限 */
+            user_limit?: number;
+            /** @description 父频道 ID（#37，仅语音频道、最多两级）；省略 category_id 时继承父分类 */
+            parent_id?: string | null;
         };
         /**
          * PatchChannelRequest
-         * @description JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name/type 不可清，空值被校验拒 400；category_id 的 null = 移出分类；position 的 null 拒 400——「删除位置」无语义），值 = 设置。
+         * @description JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name/type 不可清，空值被校验拒 400；category_id 的 null = 移出分类；position 的 null 拒 400——「删除位置」无语义），值 = 设置。#37：password 三态 （缺省不改、null/空串清除、非空设置）；user_limit 的 null 拒 400； parent_id 的 null/0 = 提升顶层、值 = 设置父级。
          */
         PatchChannelRequest: {
             name?: string | null;
@@ -957,6 +1127,12 @@ export interface components {
             /** @description 0 = 显式移出分类；请求侧数字与字符串双接受（#31） */
             category_id?: string | null;
             position?: number | null;
+            /** @description 缺省 = 不改；null/空串 = 清除；非空 = 设置（1–72 字节，仅语音频道） */
+            password?: string | null;
+            /** @description 0 = 不限；null 拒 400 */
+            user_limit?: number | null;
+            /** @description null/0 = 提升顶层；值 = 设置父级（仅语音频道、最多两级） */
+            parent_id?: string | null;
         };
         /** CreateCategoryRequest */
         CreateCategoryRequest: {
@@ -978,6 +1154,101 @@ export interface components {
             content: string;
             /** @description 幂等键（#31，≤64 字符）；同频道同用户重复提交回读原消息（200）。缺省不去重。 */
             nonce?: string;
+        };
+        /**
+         * Role
+         * @description 服务器角色（#35 B4）。permissions 为十进制字符串（低 15 位位掩码）。ID 为十进制字符串（#31）。
+         */
+        Role: {
+            id: string;
+            server_id: string;
+            name: string;
+            /** @description #RRGGBB */
+            color: string;
+            /** @description 层级序（越大越高）；@everyone=0、admin=1、owner=2 */
+            position: number;
+            /** @description 十进制权限位串（只用低 15 位） */
+            permissions: string;
+            /** @description 内置角色（@everyone/admin/owner）不可改删 */
+            builtin: boolean;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        /** CreateRoleRequest */
+        CreateRoleRequest: {
+            /** @description 1–32 字符 */
+            name: string;
+            /** @description #RRGGBB；缺省回落主题主色 */
+            color?: string;
+            /** @description 缺省 0；非 owner 必须严格小于其最高角色 position */
+            position?: number;
+            /** @description 十进制权限位串；只允许低 15 位，且是操作者权限的子集 */
+            permissions: string;
+        };
+        /** UpdateRoleRequest */
+        UpdateRoleRequest: {
+            /** @description 1–32 字符 */
+            name: string;
+            /** @description #RRGGBB；缺省沿用现值 */
+            color?: string;
+            /** @description 缺省沿用现值；非 owner 必须严格小于其最高角色 position */
+            position?: number;
+            /** @description 十进制权限位串；只允许低 15 位，且是操作者权限的子集 */
+            permissions: string;
+        };
+        /** SetMemberRolesRequest */
+        SetMemberRolesRequest: {
+            /** @description 全量替换（@everyone 强制保留；owner builtin 不可分配） */
+            role_ids: string[];
+        };
+        /**
+         * ChannelOverwrite
+         * @description 频道权限覆盖（#35 B4）。allow/deny 为十进制字符串，只含频道位。ID 为十进制字符串（#31）。
+         */
+        ChannelOverwrite: {
+            channel_id: string;
+            /** @enum {string} */
+            target_type: "role" | "member";
+            target_id: string;
+            /** @description 十进制权限位串（仅频道位） */
+            allow: string;
+            /** @description 十进制权限位串（仅频道位） */
+            deny: string;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        /** SetOverwriteRequest */
+        SetOverwriteRequest: {
+            /** @description 十进制权限位串；只允许 ChannelPermissionMask 内的位 */
+            allow: string;
+            /** @description 十进制权限位串；只允许 ChannelPermissionMask 内的位 */
+            deny: string;
+        };
+        /**
+         * AuditLogEntry
+         * @description 审计条目（#35 B4）。detail 为变更字段的 JSON 字符串（不含隐私数据）。ID 为十进制字符串（#31）。
+         */
+        AuditLogEntry: {
+            id: string;
+            server_id: string;
+            actor_id: string;
+            /** @description 动作名（如 role.create / channel.overwrite.set） */
+            action: string;
+            /** @description 目标类型（server/channel/category/role/member/invite） */
+            target_type?: string;
+            target_id?: string;
+            channel_id?: string;
+            /** @description 变更字段的 JSON 字符串 */
+            detail: string;
+            /** Format: date-time */
+            created_at: string;
+        };
+        /** ServerMuteRequest */
+        ServerMuteRequest: {
+            /** @description true=服务端强制闭麦；false=解禁恢复转发 */
+            muted: boolean;
         };
     };
     responses: {
@@ -1084,6 +1355,12 @@ export interface components {
     parameters: {
         /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
         IDPath: number;
+        /** @description 目标用户 ID 的十进制数字串（#35 B4） */
+        UserIDPath: number;
+        /** @description 频道覆盖的目标类型（#35 B4） */
+        TargetTypePath: "role" | "member";
+        /** @description 覆盖目标（角色或成员）ID 的十进制数字串（#35 B4） */
+        TargetIDPath: number;
     };
     requestBodies: never;
     headers: never;
@@ -2084,6 +2361,323 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             429: components["responses"]["RateLimited"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    listRoles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 角色数组 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Role"][];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    createRole: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateRoleRequest"];
+            };
+        };
+        responses: {
+            /** @description 已创建 */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Role"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    deleteRole: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 已完成 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StatusOk"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    updateRole: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateRoleRequest"];
+            };
+        };
+        responses: {
+            /** @description 更新后的角色 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Role"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    setMemberRoles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+                /** @description 目标用户 ID 的十进制数字串（#35 B4） */
+                user_id: components["parameters"]["UserIDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetMemberRolesRequest"];
+            };
+        };
+        responses: {
+            /** @description 已完成 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StatusOk"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    listChannelOverwrites: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 覆盖数组 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelOverwrite"][];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    setChannelOverwrite: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+                /** @description 频道覆盖的目标类型（#35 B4） */
+                target_type: components["parameters"]["TargetTypePath"];
+                /** @description 覆盖目标（角色或成员）ID 的十进制数字串（#35 B4） */
+                target_id: components["parameters"]["TargetIDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetOverwriteRequest"];
+            };
+        };
+        responses: {
+            /** @description 覆盖行（upsert 后） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelOverwrite"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    deleteChannelOverwrite: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+                /** @description 频道覆盖的目标类型（#35 B4） */
+                target_type: components["parameters"]["TargetTypePath"];
+                /** @description 覆盖目标（角色或成员）ID 的十进制数字串（#35 B4） */
+                target_id: components["parameters"]["TargetIDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 已完成 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StatusOk"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    listAuditLog: {
+        parameters: {
+            query?: {
+                /** @description 游标（上一页最旧一条的 id）；0/缺省取最新页 */
+                before?: number;
+                /** @description 每页条数（1–50） */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 审计条目数组（新→旧） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuditLogEntry"][];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    setServerMuted: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+                /** @description 目标用户 ID 的十进制数字串（#35 B4） */
+                user_id: components["parameters"]["UserIDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ServerMuteRequest"];
+            };
+        };
+        responses: {
+            /** @description 已生效 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StatusOk"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             default: components["responses"]["Internal"];
         };
     };

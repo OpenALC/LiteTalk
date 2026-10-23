@@ -36,6 +36,24 @@ func (e ChannelInfoType) Valid() bool {
 	}
 }
 
+// Defines values for ChannelOverwriteTargetType.
+const (
+	ChannelOverwriteTargetTypeMember ChannelOverwriteTargetType = "member"
+	ChannelOverwriteTargetTypeRole   ChannelOverwriteTargetType = "role"
+)
+
+// Valid indicates whether the value is a known member of the ChannelOverwriteTargetType enum.
+func (e ChannelOverwriteTargetType) Valid() bool {
+	switch e {
+	case ChannelOverwriteTargetTypeMember:
+		return true
+	case ChannelOverwriteTargetTypeRole:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for CreateChannelRequestType.
 const (
 	CreateChannelRequestTypeText  CreateChannelRequestType = "text"
@@ -110,19 +128,19 @@ func (e HealthzStatus) Valid() bool {
 
 // Defines values for MemberInfoRole.
 const (
-	Admin  MemberInfoRole = "admin"
-	Member MemberInfoRole = "member"
-	Owner  MemberInfoRole = "owner"
+	MemberInfoRoleAdmin  MemberInfoRole = "admin"
+	MemberInfoRoleMember MemberInfoRole = "member"
+	MemberInfoRoleOwner  MemberInfoRole = "owner"
 )
 
 // Valid indicates whether the value is a known member of the MemberInfoRole enum.
 func (e MemberInfoRole) Valid() bool {
 	switch e {
-	case Admin:
+	case MemberInfoRoleAdmin:
 		return true
-	case Member:
+	case MemberInfoRoleMember:
 		return true
-	case Owner:
+	case MemberInfoRoleOwner:
 		return true
 	default:
 		return false
@@ -162,10 +180,82 @@ func (e StatusOkStatus) Valid() bool {
 	}
 }
 
+// Defines values for TargetTypePath.
+const (
+	TargetTypePathMember TargetTypePath = "member"
+	TargetTypePathRole   TargetTypePath = "role"
+)
+
+// Valid indicates whether the value is a known member of the TargetTypePath enum.
+func (e TargetTypePath) Valid() bool {
+	switch e {
+	case TargetTypePathMember:
+		return true
+	case TargetTypePathRole:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for DeleteChannelOverwriteParamsTargetType.
+const (
+	DeleteChannelOverwriteParamsTargetTypeMember DeleteChannelOverwriteParamsTargetType = "member"
+	DeleteChannelOverwriteParamsTargetTypeRole   DeleteChannelOverwriteParamsTargetType = "role"
+)
+
+// Valid indicates whether the value is a known member of the DeleteChannelOverwriteParamsTargetType enum.
+func (e DeleteChannelOverwriteParamsTargetType) Valid() bool {
+	switch e {
+	case DeleteChannelOverwriteParamsTargetTypeMember:
+		return true
+	case DeleteChannelOverwriteParamsTargetTypeRole:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for SetChannelOverwriteParamsTargetType.
+const (
+	SetChannelOverwriteParamsTargetTypeMember SetChannelOverwriteParamsTargetType = "member"
+	SetChannelOverwriteParamsTargetTypeRole   SetChannelOverwriteParamsTargetType = "role"
+)
+
+// Valid indicates whether the value is a known member of the SetChannelOverwriteParamsTargetType enum.
+func (e SetChannelOverwriteParamsTargetType) Valid() bool {
+	switch e {
+	case SetChannelOverwriteParamsTargetTypeMember:
+		return true
+	case SetChannelOverwriteParamsTargetTypeRole:
+		return true
+	default:
+		return false
+	}
+}
+
 // AddFriendRequest nickname 可写成「昵称#tag」整体；分开传则 tag 为 4 位。
 type AddFriendRequest struct {
 	Nickname string  `json:"nickname"`
 	Tag      *string `json:"tag,omitempty"`
+}
+
+// AuditLogEntry 审计条目（#35 B4）。detail 为变更字段的 JSON 字符串（不含隐私数据）。ID 为十进制字符串（#31）。
+type AuditLogEntry struct {
+	// Action 动作名（如 role.create / channel.overwrite.set）
+	Action    string `json:"action"`
+	ActorId   ID     `json:"actor_id"`
+	ChannelId *ID    `json:"channel_id,omitempty"`
+	CreatedAt Time   `json:"created_at"`
+
+	// Detail 变更字段的 JSON 字符串
+	Detail   string `json:"detail"`
+	Id       ID     `json:"id"`
+	ServerId ID     `json:"server_id"`
+	TargetId *ID    `json:"target_id,omitempty"`
+
+	// TargetType 目标类型（server/channel/category/role/member/invite）
+	TargetType *string `json:"target_type,omitempty"`
 }
 
 // CategoryInfo 频道分类。ID 为十进制字符串（#31）。
@@ -180,17 +270,42 @@ type CategoryInfo struct {
 // ChannelInfo 频道。ID 为十进制字符串（#31）。
 type ChannelInfo struct {
 	// CategoryId 分类归属；null = 未分类（请求侧 0 也表示未分类）
-	CategoryId *ID             `json:"category_id"`
-	CreatedAt  Time            `json:"created_at"`
-	Id         ID              `json:"id"`
-	Name       string          `json:"name"`
-	Position   int             `json:"position"`
-	ServerId   ID              `json:"server_id"`
-	Type       ChannelInfoType `json:"type"`
+	CategoryId *ID  `json:"category_id"`
+	CreatedAt  Time `json:"created_at"`
+
+	// HasPassword 是否设有频道密码（#37）；密码明文/哈希永不回显。可选属性，服务端始终返回
+	HasPassword *bool  `json:"has_password,omitempty"`
+	Id          ID     `json:"id"`
+	Name        string `json:"name"`
+
+	// ParentId 父频道 ID（#37 子频道树，仅语音频道）；null = 顶层。可选属性，服务端始终返回
+	ParentId *ID             `json:"parent_id,omitempty"`
+	Position int             `json:"position"`
+	ServerId ID              `json:"server_id"`
+	Type     ChannelInfoType `json:"type"`
+
+	// UserLimit 语音人数上限（#37）；0 = 不限。可选属性，服务端始终返回
+	UserLimit *int `json:"user_limit,omitempty"`
 }
 
 // ChannelInfoType defines model for ChannelInfo.Type.
 type ChannelInfoType string
+
+// ChannelOverwrite 频道权限覆盖（#35 B4）。allow/deny 为十进制字符串，只含频道位。ID 为十进制字符串（#31）。
+type ChannelOverwrite struct {
+	// Allow 十进制权限位串（仅频道位）
+	Allow     string `json:"allow"`
+	ChannelId ID     `json:"channel_id"`
+
+	// Deny 十进制权限位串（仅频道位）
+	Deny       string                     `json:"deny"`
+	TargetId   ID                         `json:"target_id"`
+	TargetType ChannelOverwriteTargetType `json:"target_type"`
+	UpdatedAt  Time                       `json:"updated_at"`
+}
+
+// ChannelOverwriteTargetType defines model for ChannelOverwrite.TargetType.
+type ChannelOverwriteTargetType string
 
 // CreateCategoryRequest defines model for CreateCategoryRequest.
 type CreateCategoryRequest struct {
@@ -204,9 +319,18 @@ type CreateChannelRequest struct {
 	CategoryId *ID `json:"category_id,omitempty"`
 
 	// Name 1–64 字符
-	Name     string                   `json:"name"`
+	Name string `json:"name"`
+
+	// ParentId 父频道 ID（#37，仅语音频道、最多两级）；省略 category_id 时继承父分类
+	ParentId *ID `json:"parent_id,omitempty"`
+
+	// Password 频道密码（#37，1–72 字节，仅语音频道）；只写不读，响应只出 has_password
+	Password *string                  `json:"password,omitempty"`
 	Position *int                     `json:"position,omitempty"`
 	Type     CreateChannelRequestType `json:"type"`
+
+	// UserLimit 语音人数上限 0..100（#37，仅语音频道）；0 = 不限
+	UserLimit *int `json:"user_limit,omitempty"`
 }
 
 // CreateChannelRequestType defines model for CreateChannelRequest.Type.
@@ -230,6 +354,21 @@ type CreateMessageRequest struct {
 	Nonce *string `json:"nonce,omitempty"`
 }
 
+// CreateRoleRequest defines model for CreateRoleRequest.
+type CreateRoleRequest struct {
+	// Color #RRGGBB；缺省回落主题主色
+	Color *string `json:"color,omitempty"`
+
+	// Name 1–32 字符
+	Name string `json:"name"`
+
+	// Permissions 十进制权限位串；只允许低 15 位，且是操作者权限的子集
+	Permissions string `json:"permissions"`
+
+	// Position 缺省 0；非 owner 必须严格小于其最高角色 position
+	Position *int `json:"position,omitempty"`
+}
+
 // CreateServerRequest defines model for CreateServerRequest.
 type CreateServerRequest struct {
 	// IconColor #RRGGBB；空 = #4FA4F3
@@ -251,16 +390,21 @@ type EmailCodeRequest struct {
 // EmailCodeRequestPurpose defines model for EmailCodeRequest.Purpose.
 type EmailCodeRequestPurpose string
 
-// FriendEntry 好友条目。remark/group 仅发起方视角非空（被请求方恒空串）。 user 为 PublicUser（无 email）。
+// FriendEntry 好友条目。remark/group 仅发起方视角非空（被请求方恒空串）。 user 为 PublicUser（无 email）。 channel_id/server_id 是对端当前语音房快照（#92 好友频道 presence）， 两字段必须同时出现或同时缺省：仅 accepted 且在线、且查看者对该频道有 ViewChannel 权限时出现；无权限/查询故障时键缺省（不得泄露频道）。 载荷不含频道名。
 type FriendEntry struct {
-	Group string `json:"group"`
+	// ChannelId 对端当前语音频道 ID（#92，可选）；与 server_id 同现同缺。 仅 accepted 且对端在线、查看者对该频道有 ViewChannel 权限时出现。
+	ChannelId *ID    `json:"channel_id,omitempty"`
+	Group     string `json:"group"`
 
 	// Id 关系行 ID（请求数）
 	Id ID `json:"id"`
 
 	// Incoming true = 对端发起（我是被请求方）
-	Incoming bool              `json:"incoming"`
-	Remark   string            `json:"remark"`
+	Incoming bool   `json:"incoming"`
+	Remark   string `json:"remark"`
+
+	// ServerId channel_id 所属服务器 ID（#92，可选）；与 channel_id 同现同缺。
+	ServerId *ID               `json:"server_id,omitempty"`
 	Status   FriendEntryStatus `json:"status"`
 
 	// User 对端 PublicUser；对端查询失败时为 null（仅 accept/patch 极端情况）
@@ -333,11 +477,14 @@ type MemberInfo struct {
 	Nickname *string `json:"nickname,omitempty"`
 
 	// Online 在线态（presence:{uid} 存在即在线）；不依赖好友关系
-	Online   bool           `json:"online"`
-	Role     MemberInfoRole `json:"role"`
-	ServerId ID             `json:"server_id"`
-	Tag      *string        `json:"tag,omitempty"`
-	UserId   ID             `json:"user_id"`
+	Online bool           `json:"online"`
+	Role   MemberInfoRole `json:"role"`
+
+	// RoleIds 成员持有的角色 ID（含 @everyone；可选，旧响应缺省不回）
+	RoleIds  *[]ID   `json:"role_ids,omitempty"`
+	ServerId ID      `json:"server_id"`
+	Tag      *string `json:"tag,omitempty"`
+	UserId   ID      `json:"user_id"`
 }
 
 // MemberInfoRole defines model for MemberInfo.Role.
@@ -367,7 +514,7 @@ type PasswordResetRequest struct {
 // PatchCategoryRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name 不可清， 空值被校验拒 400；position 的 null 拒 400），值 = 设置。 name 与 position 至少给一个。
 type PatchCategoryRequest = PatchCategoryBody
 
-// PatchChannelRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name/type 不可清，空值被校验拒 400；category_id 的 null = 移出分类；position 的 null 拒 400——「删除位置」无语义），值 = 设置。
+// PatchChannelRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name/type 不可清，空值被校验拒 400；category_id 的 null = 移出分类；position 的 null 拒 400——「删除位置」无语义），值 = 设置。#37：password 三态 （缺省不改、null/空串清除、非空设置）；user_limit 的 null 拒 400； parent_id 的 null/0 = 提升顶层、值 = 设置父级。
 type PatchChannelRequest = PatchChannelBody
 
 // PatchFriendRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null/空串 = 清除备注/ 移出分组，值 = 设置。仅发起方向可写。
@@ -439,6 +586,26 @@ type RegisterRequest struct {
 	Password string `json:"password"`
 }
 
+// Role 服务器角色（#35 B4）。permissions 为十进制字符串（低 15 位位掩码）。ID 为十进制字符串（#31）。
+type Role struct {
+	// Builtin 内置角色（@everyone/admin/owner）不可改删
+	Builtin bool `json:"builtin"`
+
+	// Color #RRGGBB
+	Color     string `json:"color"`
+	CreatedAt Time   `json:"created_at"`
+	Id        ID     `json:"id"`
+	Name      string `json:"name"`
+
+	// Permissions 十进制权限位串（只用低 15 位）
+	Permissions string `json:"permissions"`
+
+	// Position 层级序（越大越高）；@everyone=0、admin=1、owner=2
+	Position  int  `json:"position"`
+	ServerId  ID   `json:"server_id"`
+	UpdatedAt Time `json:"updated_at"`
+}
+
 // RtcCredentials TURN/STUN 短期凭证；iceServers 可直接填入 WebRTC 配置。
 type RtcCredentials struct {
 	// ExpiresAt 凭证过期时刻（unix 秒）
@@ -481,6 +648,27 @@ type ServerInfo struct {
 	OwnerId   ID     `json:"owner_id"`
 }
 
+// ServerMuteRequest defines model for ServerMuteRequest.
+type ServerMuteRequest struct {
+	// Muted true=服务端强制闭麦；false=解禁恢复转发
+	Muted bool `json:"muted"`
+}
+
+// SetMemberRolesRequest defines model for SetMemberRolesRequest.
+type SetMemberRolesRequest struct {
+	// RoleIds 全量替换（@everyone 强制保留；owner builtin 不可分配）
+	RoleIds []ID `json:"role_ids"`
+}
+
+// SetOverwriteRequest defines model for SetOverwriteRequest.
+type SetOverwriteRequest struct {
+	// Allow 十进制权限位串；只允许 ChannelPermissionMask 内的位
+	Allow string `json:"allow"`
+
+	// Deny 十进制权限位串；只允许 ChannelPermissionMask 内的位
+	Deny string `json:"deny"`
+}
+
 // StatusOk 删除/吊销类操作的固定成功体。
 type StatusOk struct {
 	Status StatusOkStatus `json:"status"`
@@ -521,6 +709,21 @@ type TokenPair struct {
 	User User `json:"user"`
 }
 
+// UpdateRoleRequest defines model for UpdateRoleRequest.
+type UpdateRoleRequest struct {
+	// Color #RRGGBB；缺省沿用现值
+	Color *string `json:"color,omitempty"`
+
+	// Name 1–32 字符
+	Name string `json:"name"`
+
+	// Permissions 十进制权限位串；只允许低 15 位，且是操作者权限的子集
+	Permissions string `json:"permissions"`
+
+	// Position 缺省沿用现值；非 owner 必须严格小于其最高角色 position
+	Position *int `json:"position,omitempty"`
+}
+
 // User 自响应用户（/users/me、登录/注册/游客/刷新），含 email。ID 为十进制字符串（#31）。
 type User struct {
 	CreatedAt     Time   `json:"created_at"`
@@ -540,6 +743,15 @@ type User struct {
 
 // IDPath defines model for IDPath.
 type IDPath = int64
+
+// TargetIDPath defines model for TargetIDPath.
+type TargetIDPath = int64
+
+// TargetTypePath defines model for TargetTypePath.
+type TargetTypePath string
+
+// UserIDPath defines model for UserIDPath.
+type UserIDPath = int64
 
 // BadRequest RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段 （RFC 9457 允许的扩展字段，至少保留一个版本）。
 type BadRequest = Problem
@@ -596,6 +808,21 @@ type ListMessagesParams struct {
 	Limit *int `form:"limit,omitempty" json:"limit,omitempty"`
 }
 
+// DeleteChannelOverwriteParamsTargetType defines parameters for DeleteChannelOverwrite.
+type DeleteChannelOverwriteParamsTargetType string
+
+// SetChannelOverwriteParamsTargetType defines parameters for SetChannelOverwrite.
+type SetChannelOverwriteParamsTargetType string
+
+// ListAuditLogParams defines parameters for ListAuditLog.
+type ListAuditLogParams struct {
+	// Before 游标（上一页最旧一条的 id）；0/缺省取最新页
+	Before *int64 `form:"before,omitempty" json:"before,omitempty"`
+
+	// Limit 每页条数（1–50）
+	Limit *int `form:"limit,omitempty" json:"limit,omitempty"`
+}
+
 // ListChannelsParams defines parameters for ListChannels.
 type ListChannelsParams struct {
 	// IfNoneMatch 上次响应的 ETag；命中回 304（#31 协商缓存）
@@ -641,8 +868,14 @@ type PatchChannelJSONRequestBody = PatchChannelRequest
 // PatchChannelApplicationMergePatchPlusJSONRequestBody defines body for PatchChannel for application/merge-patch+json ContentType.
 type PatchChannelApplicationMergePatchPlusJSONRequestBody = PatchChannelRequest
 
+// SetServerMutedJSONRequestBody defines body for SetServerMuted for application/json ContentType.
+type SetServerMutedJSONRequestBody = ServerMuteRequest
+
 // CreateMessageJSONRequestBody defines body for CreateMessage for application/json ContentType.
 type CreateMessageJSONRequestBody = CreateMessageRequest
+
+// SetChannelOverwriteJSONRequestBody defines body for SetChannelOverwrite for application/json ContentType.
+type SetChannelOverwriteJSONRequestBody = SetOverwriteRequest
 
 // CreateFriendRequestJSONRequestBody defines body for CreateFriendRequest for application/json ContentType.
 type CreateFriendRequestJSONRequestBody = AddFriendRequest
@@ -652,6 +885,9 @@ type PatchFriendJSONRequestBody = PatchFriendRequest
 
 // PatchFriendApplicationMergePatchPlusJSONRequestBody defines body for PatchFriend for application/merge-patch+json ContentType.
 type PatchFriendApplicationMergePatchPlusJSONRequestBody = PatchFriendRequest
+
+// UpdateRoleJSONRequestBody defines body for UpdateRole for application/json ContentType.
+type UpdateRoleJSONRequestBody = UpdateRoleRequest
 
 // CreateServerJSONRequestBody defines body for CreateServer for application/json ContentType.
 type CreateServerJSONRequestBody = CreateServerRequest
@@ -673,6 +909,12 @@ type CreateChannelJSONRequestBody = CreateChannelRequest
 
 // CreateInviteJSONRequestBody defines body for CreateInvite for application/json ContentType.
 type CreateInviteJSONRequestBody = CreateInviteRequest
+
+// SetMemberRolesJSONRequestBody defines body for SetMemberRoles for application/json ContentType.
+type SetMemberRolesJSONRequestBody = SetMemberRolesRequest
+
+// CreateRoleJSONRequestBody defines body for CreateRole for application/json ContentType.
+type CreateRoleJSONRequestBody = CreateRoleRequest
 
 // PatchMeJSONRequestBody defines body for PatchMe for application/json ContentType.
 type PatchMeJSONRequestBody = PatchMeRequest
@@ -715,12 +957,24 @@ type ServerInterface interface {
 	// PatchChannel 改频道（owner/admin）
 	// (PATCH /api/v1/channels/{id})
 	PatchChannel(w http.ResponseWriter, r *http.Request, id IDPath)
+	// SetServerMuted 服务端强制闭麦/解禁（需 MuteMembers，#36）
+	// (PUT /api/v1/channels/{id}/members/{user_id}/server-mute)
+	SetServerMuted(w http.ResponseWriter, r *http.Request, id IDPath, userId UserIDPath)
 	// ListMessages 消息分页（游标，倒序取页正序返回）
 	// (GET /api/v1/channels/{id}/messages)
 	ListMessages(w http.ResponseWriter, r *http.Request, id IDPath, params ListMessagesParams)
 	// CreateMessage 发送文字消息（≤2000 字 + 频控 20/分 + nonce 幂等）
 	// (POST /api/v1/channels/{id}/messages)
 	CreateMessage(w http.ResponseWriter, r *http.Request, id IDPath)
+	// ListChannelOverwrites 频道覆盖列表（需 ManageChannels）
+	// (GET /api/v1/channels/{id}/overwrites)
+	ListChannelOverwrites(w http.ResponseWriter, r *http.Request, id IDPath)
+	// DeleteChannelOverwrite 删除频道覆盖（需 ManageChannels，#35 B4）
+	// (DELETE /api/v1/channels/{id}/overwrites/{target_type}/{target_id})
+	DeleteChannelOverwrite(w http.ResponseWriter, r *http.Request, id IDPath, targetType DeleteChannelOverwriteParamsTargetType, targetId TargetIDPath)
+	// SetChannelOverwrite upsert 频道覆盖（需 ManageChannels，#35 B4）
+	// (PUT /api/v1/channels/{id}/overwrites/{target_type}/{target_id})
+	SetChannelOverwrite(w http.ResponseWriter, r *http.Request, id IDPath, targetType SetChannelOverwriteParamsTargetType, targetId TargetIDPath)
 	// GetConfig 服务端能力开关
 	// (GET /api/v1/config)
 	GetConfig(w http.ResponseWriter, r *http.Request)
@@ -742,6 +996,12 @@ type ServerInterface interface {
 	// GetHealthz 健康检查（部署探活）
 	// (GET /api/v1/healthz)
 	GetHealthz(w http.ResponseWriter, r *http.Request)
+	// DeleteRole 删除自定义角色（需 ManageRoles，builtin 403）
+	// (DELETE /api/v1/roles/{id})
+	DeleteRole(w http.ResponseWriter, r *http.Request, id IDPath)
+	// UpdateRole 更新自定义角色（需 ManageRoles，builtin 403）
+	// (PATCH /api/v1/roles/{id})
+	UpdateRole(w http.ResponseWriter, r *http.Request, id IDPath)
 	// PostRtcCredentials 签发 TURN 短期凭证
 	// (POST /api/v1/rtc/credentials)
 	PostRtcCredentials(w http.ResponseWriter, r *http.Request)
@@ -760,6 +1020,9 @@ type ServerInterface interface {
 	// PatchServer 改服务器名称/图标（owner/admin）
 	// (PATCH /api/v1/servers/{id})
 	PatchServer(w http.ResponseWriter, r *http.Request, id IDPath)
+	// ListAuditLog 审计日志倒序游标（需 ManageServer）
+	// (GET /api/v1/servers/{id}/audit-log)
+	ListAuditLog(w http.ResponseWriter, r *http.Request, id IDPath, params ListAuditLogParams)
 	// CreateCategory 创建分类（owner/admin）
 	// (POST /api/v1/servers/{id}/categories)
 	CreateCategory(w http.ResponseWriter, r *http.Request, id IDPath)
@@ -775,6 +1038,15 @@ type ServerInterface interface {
 	// ListServerMembers 服务器成员列表（成员可读）
 	// (GET /api/v1/servers/{id}/members)
 	ListServerMembers(w http.ResponseWriter, r *http.Request, id IDPath, params ListServerMembersParams)
+	// SetMemberRoles 全量替换成员角色（需 ManageRoles，#35 B4）
+	// (PUT /api/v1/servers/{id}/members/{user_id}/roles)
+	SetMemberRoles(w http.ResponseWriter, r *http.Request, id IDPath, userId UserIDPath)
+	// ListRoles 服务器角色列表（成员可读）
+	// (GET /api/v1/servers/{id}/roles)
+	ListRoles(w http.ResponseWriter, r *http.Request, id IDPath)
+	// CreateRole 创建自定义角色（需 ManageRoles，#35 B4）
+	// (POST /api/v1/servers/{id}/roles)
+	CreateRole(w http.ResponseWriter, r *http.Request, id IDPath)
 	// GetSync 事件续传失败后的聚合快照
 	// (GET /api/v1/sync)
 	GetSync(w http.ResponseWriter, r *http.Request)
@@ -1013,6 +1285,41 @@ func (siw *ServerInterfaceWrapper) PatchChannel(w http.ResponseWriter, r *http.R
 	handler.ServeHTTP(w, r)
 }
 
+// SetServerMuted operation middleware
+func (siw *ServerInterfaceWrapper) SetServerMuted(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "user_id" -------------
+	var userId UserIDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "user_id", r.PathValue("user_id"), &userId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "user_id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.SetServerMuted(w, r, id, userId)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 // ListMessages operation middleware
 func (siw *ServerInterfaceWrapper) ListMessages(w http.ResponseWriter, r *http.Request) {
 
@@ -1111,6 +1418,120 @@ func (siw *ServerInterfaceWrapper) CreateMessage(w http.ResponseWriter, r *http.
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.CreateMessage(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListChannelOverwrites operation middleware
+func (siw *ServerInterfaceWrapper) ListChannelOverwrites(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListChannelOverwrites(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// DeleteChannelOverwrite operation middleware
+func (siw *ServerInterfaceWrapper) DeleteChannelOverwrite(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "target_type" -------------
+	var targetType DeleteChannelOverwriteParamsTargetType
+
+	err = runtime.BindStyledParameterWithOptions("simple", "target_type", r.PathValue("target_type"), &targetType, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "target_type", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "target_id" -------------
+	var targetId TargetIDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "target_id", r.PathValue("target_id"), &targetId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "target_id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.DeleteChannelOverwrite(w, r, id, targetType, targetId)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// SetChannelOverwrite operation middleware
+func (siw *ServerInterfaceWrapper) SetChannelOverwrite(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "target_type" -------------
+	var targetType SetChannelOverwriteParamsTargetType
+
+	err = runtime.BindStyledParameterWithOptions("simple", "target_type", r.PathValue("target_type"), &targetType, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "target_type", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "target_id" -------------
+	var targetId TargetIDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "target_id", r.PathValue("target_id"), &targetId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "target_id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.SetChannelOverwrite(w, r, id, targetType, targetId)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -1254,6 +1675,58 @@ func (siw *ServerInterfaceWrapper) GetHealthz(w http.ResponseWriter, r *http.Req
 	handler.ServeHTTP(w, r)
 }
 
+// DeleteRole operation middleware
+func (siw *ServerInterfaceWrapper) DeleteRole(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.DeleteRole(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// UpdateRole operation middleware
+func (siw *ServerInterfaceWrapper) UpdateRole(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.UpdateRole(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 // PostRtcCredentials operation middleware
 func (siw *ServerInterfaceWrapper) PostRtcCredentials(w http.ResponseWriter, r *http.Request) {
 
@@ -1353,6 +1826,61 @@ func (siw *ServerInterfaceWrapper) PatchServer(w http.ResponseWriter, r *http.Re
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.PatchServer(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListAuditLog operation middleware
+func (siw *ServerInterfaceWrapper) ListAuditLog(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params ListAuditLogParams
+
+	// ------------- Optional query parameter "before" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "before", r.URL.Query(), &params.Before, runtime.BindQueryParameterOptions{Type: "integer", Format: "int64"})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "before"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "before", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "limit" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "limit", r.URL.Query(), &params.Limit, runtime.BindQueryParameterOptions{Type: "integer", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "limit"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "limit", Err: err})
+		}
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListAuditLog(w, r, id, params)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -1531,6 +2059,93 @@ func (siw *ServerInterfaceWrapper) ListServerMembers(w http.ResponseWriter, r *h
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.ListServerMembers(w, r, id, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// SetMemberRoles operation middleware
+func (siw *ServerInterfaceWrapper) SetMemberRoles(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "user_id" -------------
+	var userId UserIDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "user_id", r.PathValue("user_id"), &userId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "user_id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.SetMemberRoles(w, r, id, userId)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListRoles operation middleware
+func (siw *ServerInterfaceWrapper) ListRoles(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListRoles(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// CreateRole operation middleware
+func (siw *ServerInterfaceWrapper) CreateRole(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.CreateRole(w, r, id)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -1736,6 +2351,16 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodPatch+" "+options.BaseURL+"/api/v1/categories/{id}", wrapper.PatchCategory)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/channels/{id}/messages", wrapper.ListMessages)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/channels/{id}/messages", wrapper.CreateMessage)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/servers/{id}/roles", wrapper.ListRoles)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/servers/{id}/roles", wrapper.CreateRole)
+	m.HandleFunc(http.MethodDelete+" "+options.BaseURL+"/api/v1/roles/{id}", wrapper.DeleteRole)
+	m.HandleFunc(http.MethodPatch+" "+options.BaseURL+"/api/v1/roles/{id}", wrapper.UpdateRole)
+	m.HandleFunc(http.MethodPut+" "+options.BaseURL+"/api/v1/servers/{id}/members/{user_id}/roles", wrapper.SetMemberRoles)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/channels/{id}/overwrites", wrapper.ListChannelOverwrites)
+	m.HandleFunc(http.MethodDelete+" "+options.BaseURL+"/api/v1/channels/{id}/overwrites/{target_type}/{target_id}", wrapper.DeleteChannelOverwrite)
+	m.HandleFunc(http.MethodPut+" "+options.BaseURL+"/api/v1/channels/{id}/overwrites/{target_type}/{target_id}", wrapper.SetChannelOverwrite)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/servers/{id}/audit-log", wrapper.ListAuditLog)
+	m.HandleFunc(http.MethodPut+" "+options.BaseURL+"/api/v1/channels/{id}/members/{user_id}/server-mute", wrapper.SetServerMuted)
 
 	return m
 }
@@ -2900,6 +3525,111 @@ func (response PatchChanneldefaultApplicationProblemPlusJSONResponse) VisitPatch
 	return err
 }
 
+type SetServerMutedRequestObject struct {
+	Id     IDPath     `json:"id"`
+	UserId UserIDPath `json:"user_id"`
+	Body   *SetServerMutedJSONRequestBody
+}
+
+type SetServerMutedResponseObject interface {
+	VisitSetServerMutedResponse(w http.ResponseWriter) error
+}
+
+type SetServerMuted200JSONResponse StatusOk
+
+func (response SetServerMuted200JSONResponse) VisitSetServerMutedResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SetServerMuted400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response SetServerMuted400ApplicationProblemPlusJSONResponse) VisitSetServerMutedResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SetServerMuted401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response SetServerMuted401ApplicationProblemPlusJSONResponse) VisitSetServerMutedResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SetServerMuted403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response SetServerMuted403ApplicationProblemPlusJSONResponse) VisitSetServerMutedResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SetServerMuted404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response SetServerMuted404ApplicationProblemPlusJSONResponse) VisitSetServerMutedResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SetServerMuteddefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response SetServerMuteddefaultApplicationProblemPlusJSONResponse) VisitSetServerMutedResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
 type ListMessagesRequestObject struct {
 	Id     IDPath `json:"id"`
 	Params ListMessagesParams
@@ -3127,6 +3857,320 @@ type CreateMessagedefaultApplicationProblemPlusJSONResponse struct {
 }
 
 func (response CreateMessagedefaultApplicationProblemPlusJSONResponse) VisitCreateMessageResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListChannelOverwritesRequestObject struct {
+	Id IDPath `json:"id"`
+}
+
+type ListChannelOverwritesResponseObject interface {
+	VisitListChannelOverwritesResponse(w http.ResponseWriter) error
+}
+
+type ListChannelOverwrites200JSONResponse []ChannelOverwrite
+
+func (response ListChannelOverwrites200JSONResponse) VisitListChannelOverwritesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListChannelOverwrites400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response ListChannelOverwrites400ApplicationProblemPlusJSONResponse) VisitListChannelOverwritesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListChannelOverwrites401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response ListChannelOverwrites401ApplicationProblemPlusJSONResponse) VisitListChannelOverwritesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListChannelOverwrites403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response ListChannelOverwrites403ApplicationProblemPlusJSONResponse) VisitListChannelOverwritesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListChannelOverwrites404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response ListChannelOverwrites404ApplicationProblemPlusJSONResponse) VisitListChannelOverwritesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListChannelOverwritesdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response ListChannelOverwritesdefaultApplicationProblemPlusJSONResponse) VisitListChannelOverwritesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteChannelOverwriteRequestObject struct {
+	Id         IDPath                                 `json:"id"`
+	TargetType DeleteChannelOverwriteParamsTargetType `json:"target_type"`
+	TargetId   TargetIDPath                           `json:"target_id"`
+}
+
+type DeleteChannelOverwriteResponseObject interface {
+	VisitDeleteChannelOverwriteResponse(w http.ResponseWriter) error
+}
+
+type DeleteChannelOverwrite200JSONResponse StatusOk
+
+func (response DeleteChannelOverwrite200JSONResponse) VisitDeleteChannelOverwriteResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteChannelOverwrite400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteChannelOverwrite400ApplicationProblemPlusJSONResponse) VisitDeleteChannelOverwriteResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteChannelOverwrite401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteChannelOverwrite401ApplicationProblemPlusJSONResponse) VisitDeleteChannelOverwriteResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteChannelOverwrite403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteChannelOverwrite403ApplicationProblemPlusJSONResponse) VisitDeleteChannelOverwriteResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteChannelOverwrite404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteChannelOverwrite404ApplicationProblemPlusJSONResponse) VisitDeleteChannelOverwriteResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteChannelOverwritedefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response DeleteChannelOverwritedefaultApplicationProblemPlusJSONResponse) VisitDeleteChannelOverwriteResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SetChannelOverwriteRequestObject struct {
+	Id         IDPath                              `json:"id"`
+	TargetType SetChannelOverwriteParamsTargetType `json:"target_type"`
+	TargetId   TargetIDPath                        `json:"target_id"`
+	Body       *SetChannelOverwriteJSONRequestBody
+}
+
+type SetChannelOverwriteResponseObject interface {
+	VisitSetChannelOverwriteResponse(w http.ResponseWriter) error
+}
+
+type SetChannelOverwrite200JSONResponse ChannelOverwrite
+
+func (response SetChannelOverwrite200JSONResponse) VisitSetChannelOverwriteResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SetChannelOverwrite400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response SetChannelOverwrite400ApplicationProblemPlusJSONResponse) VisitSetChannelOverwriteResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SetChannelOverwrite401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response SetChannelOverwrite401ApplicationProblemPlusJSONResponse) VisitSetChannelOverwriteResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SetChannelOverwrite403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response SetChannelOverwrite403ApplicationProblemPlusJSONResponse) VisitSetChannelOverwriteResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SetChannelOverwrite404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response SetChannelOverwrite404ApplicationProblemPlusJSONResponse) VisitSetChannelOverwriteResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SetChannelOverwritedefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response SetChannelOverwritedefaultApplicationProblemPlusJSONResponse) VisitSetChannelOverwriteResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
@@ -3680,6 +4724,213 @@ func (response GetHealthz405ApplicationProblemPlusJSONResponse) VisitGetHealthzR
 	return err
 }
 
+type DeleteRoleRequestObject struct {
+	Id IDPath `json:"id"`
+}
+
+type DeleteRoleResponseObject interface {
+	VisitDeleteRoleResponse(w http.ResponseWriter) error
+}
+
+type DeleteRole200JSONResponse StatusOk
+
+func (response DeleteRole200JSONResponse) VisitDeleteRoleResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteRole400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteRole400ApplicationProblemPlusJSONResponse) VisitDeleteRoleResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteRole401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteRole401ApplicationProblemPlusJSONResponse) VisitDeleteRoleResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteRole403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteRole403ApplicationProblemPlusJSONResponse) VisitDeleteRoleResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteRole404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteRole404ApplicationProblemPlusJSONResponse) VisitDeleteRoleResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteRoledefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response DeleteRoledefaultApplicationProblemPlusJSONResponse) VisitDeleteRoleResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type UpdateRoleRequestObject struct {
+	Id   IDPath `json:"id"`
+	Body *UpdateRoleJSONRequestBody
+}
+
+type UpdateRoleResponseObject interface {
+	VisitUpdateRoleResponse(w http.ResponseWriter) error
+}
+
+type UpdateRole200JSONResponse Role
+
+func (response UpdateRole200JSONResponse) VisitUpdateRoleResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type UpdateRole400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response UpdateRole400ApplicationProblemPlusJSONResponse) VisitUpdateRoleResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type UpdateRole401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response UpdateRole401ApplicationProblemPlusJSONResponse) VisitUpdateRoleResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type UpdateRole403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response UpdateRole403ApplicationProblemPlusJSONResponse) VisitUpdateRoleResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type UpdateRole404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response UpdateRole404ApplicationProblemPlusJSONResponse) VisitUpdateRoleResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type UpdateRoledefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response UpdateRoledefaultApplicationProblemPlusJSONResponse) VisitUpdateRoleResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
 type PostRtcCredentialsRequestObject struct {
 }
 
@@ -4201,6 +5452,110 @@ func (response PatchServerdefaultApplicationProblemPlusJSONResponse) VisitPatchS
 	return err
 }
 
+type ListAuditLogRequestObject struct {
+	Id     IDPath `json:"id"`
+	Params ListAuditLogParams
+}
+
+type ListAuditLogResponseObject interface {
+	VisitListAuditLogResponse(w http.ResponseWriter) error
+}
+
+type ListAuditLog200JSONResponse []AuditLogEntry
+
+func (response ListAuditLog200JSONResponse) VisitListAuditLogResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListAuditLog400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response ListAuditLog400ApplicationProblemPlusJSONResponse) VisitListAuditLogResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListAuditLog401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response ListAuditLog401ApplicationProblemPlusJSONResponse) VisitListAuditLogResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListAuditLog403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response ListAuditLog403ApplicationProblemPlusJSONResponse) VisitListAuditLogResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListAuditLog404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response ListAuditLog404ApplicationProblemPlusJSONResponse) VisitListAuditLogResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListAuditLogdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response ListAuditLogdefaultApplicationProblemPlusJSONResponse) VisitListAuditLogResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
 type CreateCategoryRequestObject struct {
 	Id   IDPath `json:"id"`
 	Body *CreateCategoryJSONRequestBody
@@ -4657,6 +6012,318 @@ func (response ListServerMembersdefaultApplicationProblemPlusJSONResponse) Visit
 	return err
 }
 
+type SetMemberRolesRequestObject struct {
+	Id     IDPath     `json:"id"`
+	UserId UserIDPath `json:"user_id"`
+	Body   *SetMemberRolesJSONRequestBody
+}
+
+type SetMemberRolesResponseObject interface {
+	VisitSetMemberRolesResponse(w http.ResponseWriter) error
+}
+
+type SetMemberRoles200JSONResponse StatusOk
+
+func (response SetMemberRoles200JSONResponse) VisitSetMemberRolesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SetMemberRoles400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response SetMemberRoles400ApplicationProblemPlusJSONResponse) VisitSetMemberRolesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SetMemberRoles401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response SetMemberRoles401ApplicationProblemPlusJSONResponse) VisitSetMemberRolesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SetMemberRoles403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response SetMemberRoles403ApplicationProblemPlusJSONResponse) VisitSetMemberRolesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SetMemberRoles404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response SetMemberRoles404ApplicationProblemPlusJSONResponse) VisitSetMemberRolesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SetMemberRolesdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response SetMemberRolesdefaultApplicationProblemPlusJSONResponse) VisitSetMemberRolesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListRolesRequestObject struct {
+	Id IDPath `json:"id"`
+}
+
+type ListRolesResponseObject interface {
+	VisitListRolesResponse(w http.ResponseWriter) error
+}
+
+type ListRoles200JSONResponse []Role
+
+func (response ListRoles200JSONResponse) VisitListRolesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListRoles400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response ListRoles400ApplicationProblemPlusJSONResponse) VisitListRolesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListRoles401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response ListRoles401ApplicationProblemPlusJSONResponse) VisitListRolesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListRoles403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response ListRoles403ApplicationProblemPlusJSONResponse) VisitListRolesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListRoles404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response ListRoles404ApplicationProblemPlusJSONResponse) VisitListRolesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListRolesdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response ListRolesdefaultApplicationProblemPlusJSONResponse) VisitListRolesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateRoleRequestObject struct {
+	Id   IDPath `json:"id"`
+	Body *CreateRoleJSONRequestBody
+}
+
+type CreateRoleResponseObject interface {
+	VisitCreateRoleResponse(w http.ResponseWriter) error
+}
+
+type CreateRole201JSONResponse Role
+
+func (response CreateRole201JSONResponse) VisitCreateRoleResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(201)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateRole400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response CreateRole400ApplicationProblemPlusJSONResponse) VisitCreateRoleResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateRole401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response CreateRole401ApplicationProblemPlusJSONResponse) VisitCreateRoleResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateRole403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response CreateRole403ApplicationProblemPlusJSONResponse) VisitCreateRoleResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateRole404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response CreateRole404ApplicationProblemPlusJSONResponse) VisitCreateRoleResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateRoledefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response CreateRoledefaultApplicationProblemPlusJSONResponse) VisitCreateRoleResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
 type GetSyncRequestObject struct {
 }
 
@@ -4904,12 +6571,24 @@ type StrictServerInterface interface {
 	// PatchChannel 改频道（owner/admin）
 	// (PATCH /api/v1/channels/{id})
 	PatchChannel(ctx context.Context, request PatchChannelRequestObject) (PatchChannelResponseObject, error)
+	// SetServerMuted 服务端强制闭麦/解禁（需 MuteMembers，#36）
+	// (PUT /api/v1/channels/{id}/members/{user_id}/server-mute)
+	SetServerMuted(ctx context.Context, request SetServerMutedRequestObject) (SetServerMutedResponseObject, error)
 	// ListMessages 消息分页（游标，倒序取页正序返回）
 	// (GET /api/v1/channels/{id}/messages)
 	ListMessages(ctx context.Context, request ListMessagesRequestObject) (ListMessagesResponseObject, error)
 	// CreateMessage 发送文字消息（≤2000 字 + 频控 20/分 + nonce 幂等）
 	// (POST /api/v1/channels/{id}/messages)
 	CreateMessage(ctx context.Context, request CreateMessageRequestObject) (CreateMessageResponseObject, error)
+	// ListChannelOverwrites 频道覆盖列表（需 ManageChannels）
+	// (GET /api/v1/channels/{id}/overwrites)
+	ListChannelOverwrites(ctx context.Context, request ListChannelOverwritesRequestObject) (ListChannelOverwritesResponseObject, error)
+	// DeleteChannelOverwrite 删除频道覆盖（需 ManageChannels，#35 B4）
+	// (DELETE /api/v1/channels/{id}/overwrites/{target_type}/{target_id})
+	DeleteChannelOverwrite(ctx context.Context, request DeleteChannelOverwriteRequestObject) (DeleteChannelOverwriteResponseObject, error)
+	// SetChannelOverwrite upsert 频道覆盖（需 ManageChannels，#35 B4）
+	// (PUT /api/v1/channels/{id}/overwrites/{target_type}/{target_id})
+	SetChannelOverwrite(ctx context.Context, request SetChannelOverwriteRequestObject) (SetChannelOverwriteResponseObject, error)
 	// GetConfig 服务端能力开关
 	// (GET /api/v1/config)
 	GetConfig(ctx context.Context, request GetConfigRequestObject) (GetConfigResponseObject, error)
@@ -4931,6 +6610,12 @@ type StrictServerInterface interface {
 	// GetHealthz 健康检查（部署探活）
 	// (GET /api/v1/healthz)
 	GetHealthz(ctx context.Context, request GetHealthzRequestObject) (GetHealthzResponseObject, error)
+	// DeleteRole 删除自定义角色（需 ManageRoles，builtin 403）
+	// (DELETE /api/v1/roles/{id})
+	DeleteRole(ctx context.Context, request DeleteRoleRequestObject) (DeleteRoleResponseObject, error)
+	// UpdateRole 更新自定义角色（需 ManageRoles，builtin 403）
+	// (PATCH /api/v1/roles/{id})
+	UpdateRole(ctx context.Context, request UpdateRoleRequestObject) (UpdateRoleResponseObject, error)
 	// PostRtcCredentials 签发 TURN 短期凭证
 	// (POST /api/v1/rtc/credentials)
 	PostRtcCredentials(ctx context.Context, request PostRtcCredentialsRequestObject) (PostRtcCredentialsResponseObject, error)
@@ -4949,6 +6634,9 @@ type StrictServerInterface interface {
 	// PatchServer 改服务器名称/图标（owner/admin）
 	// (PATCH /api/v1/servers/{id})
 	PatchServer(ctx context.Context, request PatchServerRequestObject) (PatchServerResponseObject, error)
+	// ListAuditLog 审计日志倒序游标（需 ManageServer）
+	// (GET /api/v1/servers/{id}/audit-log)
+	ListAuditLog(ctx context.Context, request ListAuditLogRequestObject) (ListAuditLogResponseObject, error)
 	// CreateCategory 创建分类（owner/admin）
 	// (POST /api/v1/servers/{id}/categories)
 	CreateCategory(ctx context.Context, request CreateCategoryRequestObject) (CreateCategoryResponseObject, error)
@@ -4964,6 +6652,15 @@ type StrictServerInterface interface {
 	// ListServerMembers 服务器成员列表（成员可读）
 	// (GET /api/v1/servers/{id}/members)
 	ListServerMembers(ctx context.Context, request ListServerMembersRequestObject) (ListServerMembersResponseObject, error)
+	// SetMemberRoles 全量替换成员角色（需 ManageRoles，#35 B4）
+	// (PUT /api/v1/servers/{id}/members/{user_id}/roles)
+	SetMemberRoles(ctx context.Context, request SetMemberRolesRequestObject) (SetMemberRolesResponseObject, error)
+	// ListRoles 服务器角色列表（成员可读）
+	// (GET /api/v1/servers/{id}/roles)
+	ListRoles(ctx context.Context, request ListRolesRequestObject) (ListRolesResponseObject, error)
+	// CreateRole 创建自定义角色（需 ManageRoles，#35 B4）
+	// (POST /api/v1/servers/{id}/roles)
+	CreateRole(ctx context.Context, request CreateRoleRequestObject) (CreateRoleResponseObject, error)
 	// GetSync 事件续传失败后的聚合快照
 	// (GET /api/v1/sync)
 	GetSync(ctx context.Context, request GetSyncRequestObject) (GetSyncResponseObject, error)
@@ -5379,6 +7076,40 @@ func (sh *strictHandler) PatchChannel(w http.ResponseWriter, r *http.Request, id
 	}
 }
 
+// SetServerMuted operation middleware
+func (sh *strictHandler) SetServerMuted(w http.ResponseWriter, r *http.Request, id IDPath, userId UserIDPath) {
+	var request SetServerMutedRequestObject
+
+	request.Id = id
+	request.UserId = userId
+
+	var body SetServerMutedJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.SetServerMuted(ctx, request.(SetServerMutedRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "SetServerMuted")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(SetServerMutedResponseObject); ok {
+		if err := validResponse.VisitSetServerMutedResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
 // ListMessages operation middleware
 func (sh *strictHandler) ListMessages(w http.ResponseWriter, r *http.Request, id IDPath, params ListMessagesParams) {
 	var request ListMessagesRequestObject
@@ -5432,6 +7163,95 @@ func (sh *strictHandler) CreateMessage(w http.ResponseWriter, r *http.Request, i
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
 	} else if validResponse, ok := response.(CreateMessageResponseObject); ok {
 		if err := validResponse.VisitCreateMessageResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// ListChannelOverwrites operation middleware
+func (sh *strictHandler) ListChannelOverwrites(w http.ResponseWriter, r *http.Request, id IDPath) {
+	var request ListChannelOverwritesRequestObject
+
+	request.Id = id
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ListChannelOverwrites(ctx, request.(ListChannelOverwritesRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ListChannelOverwrites")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ListChannelOverwritesResponseObject); ok {
+		if err := validResponse.VisitListChannelOverwritesResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// DeleteChannelOverwrite operation middleware
+func (sh *strictHandler) DeleteChannelOverwrite(w http.ResponseWriter, r *http.Request, id IDPath, targetType DeleteChannelOverwriteParamsTargetType, targetId TargetIDPath) {
+	var request DeleteChannelOverwriteRequestObject
+
+	request.Id = id
+	request.TargetType = targetType
+	request.TargetId = targetId
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.DeleteChannelOverwrite(ctx, request.(DeleteChannelOverwriteRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "DeleteChannelOverwrite")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(DeleteChannelOverwriteResponseObject); ok {
+		if err := validResponse.VisitDeleteChannelOverwriteResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// SetChannelOverwrite operation middleware
+func (sh *strictHandler) SetChannelOverwrite(w http.ResponseWriter, r *http.Request, id IDPath, targetType SetChannelOverwriteParamsTargetType, targetId TargetIDPath) {
+	var request SetChannelOverwriteRequestObject
+
+	request.Id = id
+	request.TargetType = targetType
+	request.TargetId = targetId
+
+	var body SetChannelOverwriteJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.SetChannelOverwrite(ctx, request.(SetChannelOverwriteRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "SetChannelOverwrite")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(SetChannelOverwriteResponseObject); ok {
+		if err := validResponse.VisitSetChannelOverwriteResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {
@@ -5640,6 +7460,65 @@ func (sh *strictHandler) GetHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// DeleteRole operation middleware
+func (sh *strictHandler) DeleteRole(w http.ResponseWriter, r *http.Request, id IDPath) {
+	var request DeleteRoleRequestObject
+
+	request.Id = id
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.DeleteRole(ctx, request.(DeleteRoleRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "DeleteRole")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(DeleteRoleResponseObject); ok {
+		if err := validResponse.VisitDeleteRoleResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// UpdateRole operation middleware
+func (sh *strictHandler) UpdateRole(w http.ResponseWriter, r *http.Request, id IDPath) {
+	var request UpdateRoleRequestObject
+
+	request.Id = id
+
+	var body UpdateRoleJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.UpdateRole(ctx, request.(UpdateRoleRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "UpdateRole")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(UpdateRoleResponseObject); ok {
+		if err := validResponse.VisitUpdateRoleResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
 // PostRtcCredentials operation middleware
 func (sh *strictHandler) PostRtcCredentials(w http.ResponseWriter, r *http.Request) {
 	var request PostRtcCredentialsRequestObject
@@ -5822,6 +7701,33 @@ func (sh *strictHandler) PatchServer(w http.ResponseWriter, r *http.Request, id 
 	}
 }
 
+// ListAuditLog operation middleware
+func (sh *strictHandler) ListAuditLog(w http.ResponseWriter, r *http.Request, id IDPath, params ListAuditLogParams) {
+	var request ListAuditLogRequestObject
+
+	request.Id = id
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ListAuditLog(ctx, request.(ListAuditLogRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ListAuditLog")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ListAuditLogResponseObject); ok {
+		if err := validResponse.VisitListAuditLogResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
 // CreateCategory operation middleware
 func (sh *strictHandler) CreateCategory(w http.ResponseWriter, r *http.Request, id IDPath) {
 	var request CreateCategoryRequestObject
@@ -5968,6 +7874,99 @@ func (sh *strictHandler) ListServerMembers(w http.ResponseWriter, r *http.Reques
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
 	} else if validResponse, ok := response.(ListServerMembersResponseObject); ok {
 		if err := validResponse.VisitListServerMembersResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// SetMemberRoles operation middleware
+func (sh *strictHandler) SetMemberRoles(w http.ResponseWriter, r *http.Request, id IDPath, userId UserIDPath) {
+	var request SetMemberRolesRequestObject
+
+	request.Id = id
+	request.UserId = userId
+
+	var body SetMemberRolesJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.SetMemberRoles(ctx, request.(SetMemberRolesRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "SetMemberRoles")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(SetMemberRolesResponseObject); ok {
+		if err := validResponse.VisitSetMemberRolesResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// ListRoles operation middleware
+func (sh *strictHandler) ListRoles(w http.ResponseWriter, r *http.Request, id IDPath) {
+	var request ListRolesRequestObject
+
+	request.Id = id
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ListRoles(ctx, request.(ListRolesRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ListRoles")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ListRolesResponseObject); ok {
+		if err := validResponse.VisitListRolesResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// CreateRole operation middleware
+func (sh *strictHandler) CreateRole(w http.ResponseWriter, r *http.Request, id IDPath) {
+	var request CreateRoleRequestObject
+
+	request.Id = id
+
+	var body CreateRoleJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.CreateRole(ctx, request.(CreateRoleRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "CreateRole")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(CreateRoleResponseObject); ok {
+		if err := validResponse.VisitCreateRoleResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {

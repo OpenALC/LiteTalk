@@ -160,10 +160,15 @@ func (f *chatFixture) dial(token, name string) *wsClient {
 	return c
 }
 
-// awaitHello 读到 hello 为止，途中信封进 pending。超时 5s（与 recvUntil 一致）。
+// wsReadTimeout 测试夹具的读超时。CI -race 全量并行下负载高，调度延迟可让
+// 5s 的旧值偶发过期（表现为 TestJoinPasswordGate 等读超时 flake）；放宽到 15s
+// 只影响夹具超时，不改生产代码、不加 sleep。
+const wsReadTimeout = 15 * time.Second
+
+// awaitHello 读到 hello 为止，途中信封进 pending。超时与 recvUntil 一致。
 func (c *wsClient) awaitHello() {
 	c.t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(wsReadTimeout)
 	for time.Now().Before(deadline) {
 		env := c.readOne()
 		if env.Type == TypeHello {
@@ -172,7 +177,7 @@ func (c *wsClient) awaitHello() {
 		}
 		c.pending = append(c.pending, env)
 	}
-	c.t.Fatalf("awaitHello: 5s 内未收到 hello（user=%s）", c.user)
+	c.t.Fatalf("awaitHello: %v 内未收到 hello（user=%s）", wsReadTimeout, c.user)
 }
 
 func (c *wsClient) send(msgType string, data any) {
@@ -186,10 +191,10 @@ func (c *wsClient) send(msgType string, data any) {
 	}
 }
 
-// readOne 读一个信封（超时 5s）。awaitHello 与 recvUntil 共用。
+// readOne 读一个信封。awaitHello 与 recvUntil 共用。
 func (c *wsClient) readOne() Envelope {
 	c.t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), wsReadTimeout)
 	defer cancel()
 	_, data, err := c.conn.Read(ctx)
 	if err != nil {
@@ -202,11 +207,11 @@ func (c *wsClient) readOne() Envelope {
 	return env
 }
 
-// recvUntil 读到指定类型为止（跳过 hello/joined 等中间消息），超时 5s。
+// recvUntil 读到指定类型为止（跳过 hello/joined 等中间消息）。
 // 先排空 dial 预读进 pending 的信封，再读连接。
 func (c *wsClient) recvUntil(want string) Envelope {
 	c.t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(wsReadTimeout)
 	for time.Now().Before(deadline) {
 		var env Envelope
 		if len(c.pending) > 0 {
@@ -224,19 +229,17 @@ func (c *wsClient) recvUntil(want string) Envelope {
 
 // ---- 测试用例 ----
 
-// TestChatBroadcast 双客户端同房：A 发 chat.send → 双方收 chat.message（内容/用户正确），
-// 且消息落库可查。
+// TestChatBroadcast 文字频道：A 发 chat.send → 服务器成员收 chat.message（内容/用户正确），
+// 且消息落库可查。#35 B3 起语音频道拒收文字（bad_message），聊天场景走文字频道。
 func TestChatBroadcast(t *testing.T) {
 	f := newChatFixture(t)
-	chID := strconv.FormatInt(f.vch.ID, 10)
+	chID := strconv.FormatInt(f.ch.ID, 10)
 
 	a := f.dial("1", "alice")
 	b := f.dial("2", "bob")
-	a.send(TypeChannelJoin, ChannelJoinData{ChannelID: chID})
-	b.send(TypeChannelJoin, ChannelJoinData{ChannelID: chID})
-	// 各自吃掉 channel.joined（含对方加入后的第二份广播）。
-	a.recvUntil(TypeChannelJoined)
-	b.recvUntil(TypeChannelJoined)
+	for _, c := range []*wsClient{a, b} {
+		c.recvUntil(TypeHello)
+	}
 
 	a.send(TypeChatSend, ChatSendData{ChannelID: chID, Type: "text", Content: "你好 bob"})
 
@@ -261,7 +264,7 @@ func TestChatBroadcast(t *testing.T) {
 	}
 
 	// 落库可查。
-	msgs, err := f.st.MessagesBefore(context.Background(), f.vch.ID, 0, 10)
+	msgs, err := f.st.MessagesBefore(context.Background(), f.ch.ID, 0, 10)
 	if err != nil {
 		t.Fatalf("MessagesBefore: %v", err)
 	}
@@ -273,11 +276,10 @@ func TestChatBroadcast(t *testing.T) {
 // TestChatBadContent 超长（2001 字）与空内容拒收（bad_message）。
 func TestChatBadContent(t *testing.T) {
 	f := newChatFixture(t)
-	chID := strconv.FormatInt(f.vch.ID, 10)
+	chID := strconv.FormatInt(f.ch.ID, 10)
 
 	a := f.dial("1", "alice")
-	a.send(TypeChannelJoin, ChannelJoinData{ChannelID: chID})
-	a.recvUntil(TypeChannelJoined)
+	a.recvUntil(TypeHello)
 
 	over := strings.Repeat("字", 2001)
 	for _, content := range []string{"", over} {
@@ -293,7 +295,7 @@ func TestChatBadContent(t *testing.T) {
 	}
 
 	// 拒收后不落库。
-	msgs, err := f.st.MessagesBefore(context.Background(), f.vch.ID, 0, 10)
+	msgs, err := f.st.MessagesBefore(context.Background(), f.ch.ID, 0, 10)
 	if err != nil {
 		t.Fatalf("MessagesBefore: %v", err)
 	}
@@ -305,11 +307,10 @@ func TestChatBadContent(t *testing.T) {
 // TestChatRateLimit 20 条/分：第 21 条触发 rate_limited。
 func TestChatRateLimit(t *testing.T) {
 	f := newChatFixture(t)
-	chID := strconv.FormatInt(f.vch.ID, 10)
+	chID := strconv.FormatInt(f.ch.ID, 10)
 
 	a := f.dial("1", "alice")
-	a.send(TypeChannelJoin, ChannelJoinData{ChannelID: chID})
-	a.recvUntil(TypeChannelJoined)
+	a.recvUntil(TypeHello)
 
 	for i := 0; i < 20; i++ {
 		a.send(TypeChatSend, ChatSendData{ChannelID: chID, Type: "text", Content: "msg"})

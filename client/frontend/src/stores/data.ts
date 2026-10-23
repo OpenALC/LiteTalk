@@ -19,6 +19,10 @@ export interface Channel {
   locked?: boolean
   members?: number
   group: string
+  // #37 B2 频道选项：父频道（空 = 顶层）、是否设密码、语音人数上限（0 = 不限）。
+  parentId?: string
+  hasPassword?: boolean
+  userLimit?: number
 }
 
 export interface Server {
@@ -43,15 +47,97 @@ export interface Friend {
   // 在线态收敛为两态（#11，真实数据源 presence）：idle/busy 无数据源，不造状态。
   status: 'online' | 'offline'
   sub: string // 状态行文案（在线/离线）
-  inChannel?: boolean // 服务端暂无「好友所在频道」数据，恒 false（按钮隐藏）
+  // 好友频道 presence（#92）：channelId/serverId 同现同缺，来自 FriendEntry
+  // 快照或 presence:update 增量。无 View 权限/对端离线时服务端不下发，前端
+  // 不得展示或猜测频道名。inChannel 由两者同时存在推导，随字段一起写。
+  channelId?: string
+  serverId?: string
+  inChannel?: boolean
   group: string // 好友分组（显示值，空归「好友」默认组；提交时映射回空串）
   incoming: boolean // 对方发起=我接受的行。服务端 PATCH 仅发起方向可写——
   // incoming=true 时备注/分组项必须禁用（review B1：否则 100% 弹 403）。
 }
 
+// friendChanPair 频道快照字段归一（#92）：非法/缺失 ID 一律当无频道，不抛错。
+// 两字段必须同时合法（服务端同现同缺）；online=false 的调用方直接传空。
+function friendChanPair(channelId?: unknown, serverId?: unknown): { channelId?: string; serverId?: string } {
+  const ch = typeof channelId === 'string' && isRealID(channelId) ? channelId : ''
+  const sid = typeof serverId === 'string' && isRealID(serverId) ? serverId : ''
+  return ch && sid ? { channelId: ch, serverId: sid } : {}
+}
+
+// FriendJoin 好友频道加入解析结果（#92 纯函数，FriendList 消费）。
+// 可加入 → 带定位所需的 ID 与密码标志；禁用 → reason 为按钮/菜单禁用提示。
+// channelName 仅在本地按 ID 解析到频道时存在——无 ID 场景绝不返回频道名。
+export type FriendJoin =
+  | { ok: true; serverId: string; channelId: string; channelName: string; hasPassword: boolean }
+  | { ok: false; reason: string; channelName?: string }
+
+// resolveFriendJoin 按 serverId→channelId 精确定位好友所在语音频道（#92）。
+// 不按频道名跨服扫描（同名频道会选错服）；#37 频道树（parentId）不假设扁平，
+// 在 server.channels 全量按 id 查找即可。selfChannelId 为本端当前语音房（同房禁用）。
+export function resolveFriendJoin(
+  friend: Pick<Friend, 'status' | 'channelId' | 'serverId'>,
+  servers: Pick<Server, 'id' | 'channels'>[],
+  selfChannelId?: string,
+): FriendJoin {
+  if (friend.status !== 'online') return { ok: false, reason: 'TA 已离线' }
+  if (!friend.channelId || !friend.serverId) return { ok: false, reason: '无法加入 TA 的频道' }
+  const server = servers.find((s) => s.id === friend.serverId)
+  const channel = server?.channels.find((c) => c.id === friend.channelId && c.type === 'voice')
+  if (!server || !channel) return { ok: false, reason: '无法访问 TA 的频道' }
+  if (selfChannelId && selfChannelId === channel.id) {
+    return { ok: false, reason: '你们已在同一频道', channelName: channel.name }
+  }
+  return {
+    ok: true,
+    serverId: server.id,
+    channelId: channel.id,
+    channelName: channel.name,
+    hasPassword: !!channel.hasPassword,
+  }
+}
+
 // isRealID 判断是否为服务端实体 ID（纯数字）；groupsOf 合成的 chan: 分组不是实体。
 export function isRealID(id: string): boolean {
   return /^\d+$/.test(id)
+}
+
+// ChannelNode 频道树节点（#37 B2）：频道 + 其直接子频道（按输入顺序）。
+export interface ChannelNode {
+  ch: Channel
+  children: Channel[]
+}
+
+// channelTree 把一个分类内的频道排成两级树（#37 B2 纯函数）：
+// 根 = 无父 / 父不在本组（孤儿降级）/ 父自身带父（超两级的防御，不丢节点）；
+// 其余挂到父下。保持输入顺序（服务端 position,id），不按 Snowflake 数字排序。
+export function channelTree(channels: Channel[]): ChannelNode[] {
+  const raw = new Map(channels.map((c) => [c.id, c]))
+  const parentOf = (ch: Channel): string | undefined =>
+    ch.parentId && ch.parentId !== ch.id ? ch.parentId : undefined
+  const isRoot = (ch: Channel): boolean => {
+    const p = parentOf(ch)
+    if (!p || !raw.has(p)) return true // 无父 / 孤儿
+    const parent = raw.get(p)!
+    return !!parentOf(parent) // 父自身带父 → 本节点升根，不做成孙级
+  }
+  const roots: ChannelNode[] = []
+  const byId = new Map<string, ChannelNode>()
+  for (const ch of channels) {
+    if (isRoot(ch)) {
+      const node = { ch, children: [] as Channel[] }
+      roots.push(node)
+      byId.set(ch.id, node)
+    }
+  }
+  for (const ch of channels) {
+    const p = parentOf(ch)
+    if (!isRoot(ch) && p) {
+      byId.get(p)?.children.push(ch)
+    }
+  }
+  return roots
 }
 
 // catDropIndex 把拖拽落点换算成 reorderCategory 的插入序（#16）。落点语义是
@@ -238,6 +324,10 @@ export const useServersStore = defineStore('servers', () => {
       name: c.name,
       type: c.type,
       group: (c.category_id ? nameOf.get(c.category_id) : undefined) || UNCATEGORIZED,
+      // #37 B2：新字段映射，顺序沿用服务端（position,id）不重排。
+      parentId: c.parent_id == null || c.parent_id === '' ? undefined : String(c.parent_id),
+      hasPassword: !!c.has_password,
+      userLimit: typeof c.user_limit === 'number' ? c.user_limit : 0,
     }))
     extraGroups.value = {
       ...extraGroups.value,
@@ -341,6 +431,39 @@ export const useServersStore = defineStore('servers', () => {
     if (!ch) return
     await goApp().RenameChannel(chId, name)
     ch.name = name
+  }
+
+  // createSubchannel 建子频道（#37 B2）：类型继承父、分类由服务端随父；
+  // 成功后按返回 DTO 回填 parentId/hasPassword/userLimit。
+  async function createSubchannel(serverId: string, name: string, parentId: string) {
+    const s = findServer(serverId)
+    if (!s) return
+    const parent = s.channels.find((c) => c.id === parentId)
+    const typ = parent?.type ?? 'voice'
+    const c = await goApp().CreateSubchannel(serverId, name, typ, parentId)
+    s.channels.push({
+      id: String(c.id), name: c.name, type: typ,
+      group: parent?.group ?? UNCATEGORIZED,
+      parentId: String(c.parent_id ?? parentId),
+      hasPassword: !!c.has_password,
+      userLimit: c.user_limit ?? 0,
+    })
+  }
+
+  // updateChannelOptions 更新频道选项（#37 B2）：只发变更字段（bridge 侧同约定）；
+  // 成功后用返回 DTO 回填 parentId/hasPassword/userLimit。
+  async function updateChannelOptions(serverId: string, chId: string, parentId: string | null, userLimit: number, password: string, clearPassword: boolean) {
+    const s = findServer(serverId)
+    const ch = s?.channels.find((c) => c.id === chId)
+    if (!ch) return
+    // parentId null = 不改；'0' = 提升顶层；其余 = 设置父。
+    const p = parentId === null ? '' : parentId
+    const c = await goApp().UpdateChannelOptions(chId, p, userLimit, password, clearPassword)
+    if (c.parent_id == null || c.parent_id === '') ch.parentId = undefined
+    else ch.parentId = String(c.parent_id)
+    ch.hasPassword = !!c.has_password
+    ch.userLimit = typeof c.user_limit === 'number' ? c.user_limit : 0
+    // 挂父/换父后分类不变（服务端限父子同分类），group 无需重算。
   }
 
   // deleteChannel 删除频道（REST）。调用方负责先离开语音频道。
@@ -510,6 +633,7 @@ export const useServersStore = defineStore('servers', () => {
     selectServer, selectChannel, findServer,
     loadRemoteServers, createServer, joinServer, renameServer, removeServer,
     createChannel, renameChannel, deleteChannel,
+    createSubchannel, updateChannelOptions,
     extraGroups, groupsOf, createCategory, deleteCategory, renameCategory, reorderCategory,
     resetAll, bindEvents, unbindEvents,
   }
@@ -546,6 +670,8 @@ export const useFriendsStore = defineStore('friends', () => {
       }
       if (f.status !== 'accepted') continue
       const key: Friend['status'] = f.user.online ? 'online' : 'offline'
+      // 频道快照（#92）：仅 accepted 且在线时保留；离线即使带字段也不显示。
+      const chan = key === 'online' ? friendChanPair(f.channel_id, f.server_id) : {}
       const entry: Friend = {
         id: f.id,
         userId: f.user.id,
@@ -554,6 +680,8 @@ export const useFriendsStore = defineStore('friends', () => {
         remark: f.remark,
         status: key,
         sub: STATUS_TEXT[key],
+        ...chan,
+        inChannel: !!chan.channelId,
         group: f.group || '好友',
         incoming: f.incoming,
       }
@@ -566,19 +694,38 @@ export const useFriendsStore = defineStore('friends', () => {
     pending.value = pend
   }
 
-  // setPresence presence:update 增量刷新单个好友的在线态（#11）：组间移动并保持排序。
-  // 不在「来源组」= 状态已一致或本就不在好友列表，直接忽略（去抖）。
-  function setPresence(userId: string, isOnline: boolean) {
+  // setPresence presence:update 增量刷新单个好友（#11/#92）：全表按 userId查找，
+  // 在线态变化才跨组移动并保持排序；频道字段无论是否移组都要更新——已在线
+  // 好友切换频道时早退会把「换频道」事件丢掉（回归点）。online=false 或缺任一
+  // 频道字段即清空；非法 ID 当无频道，不抛错。
+  function setPresence(userId: string, isOnline: boolean, channelId?: unknown, serverId?: unknown) {
     const uid = String(userId)
-    const from = isOnline ? offline : online
-    const to = isOnline ? online : offline
-    const idx = from.value.findIndex((f) => f.userId === uid)
-    if (idx < 0) return
-    const [f] = from.value.splice(idx, 1)
-    f.status = isOnline ? 'online' : 'offline'
+    let list: Friend[] | undefined
+    let idx = -1
+    let f: Friend | undefined
+    for (const l of [online.value, offline.value]) {
+      const i = l.findIndex((x) => x.userId === uid)
+      if (i >= 0) {
+        list = l
+        idx = i
+        f = l[i]
+        break
+      }
+    }
+    if (!f || !list) return
+    const chan = isOnline ? friendChanPair(channelId, serverId) : {}
+    f.channelId = chan.channelId
+    f.serverId = chan.serverId
+    f.inChannel = !!chan.channelId
+    const want: Friend['status'] = isOnline ? 'online' : 'offline'
+    if (f.status !== want) {
+      f.status = want
+      list.splice(idx, 1)
+      const to = isOnline ? online.value : offline.value
+      to.push(f)
+      to.sort((a, b) => a.name.localeCompare(b.name, 'zh'))
+    }
     f.sub = STATUS_TEXT[f.status]
-    to.value.push(f)
-    to.value.sort((a, b) => a.name.localeCompare(b.name, 'zh'))
   }
 
   // sendRequest 发送好友请求（REST；target 形如 昵称#1234，服务端拆分）。
@@ -629,9 +776,11 @@ export const useFriendsStore = defineStore('friends', () => {
     if (offs.length) return // 幂等：重复绑定会叠监听
     offs.push(
       eventsOn('presence:update', (d) => {
-        const p = d as { user_id?: string; online?: boolean } | null
+        const p = d as
+          | { user_id?: string; online?: boolean; channel_id?: string; server_id?: string }
+          | null
         if (p?.user_id == null || typeof p.online !== 'boolean') return
-        setPresence(p.user_id, p.online)
+        setPresence(p.user_id, p.online, p.channel_id, p.server_id)
       }),
       // 续传失败（#78）：好友列表整体重拉——presence 增量之外，断线期间
       // 可能错过好友请求/接受/删除。

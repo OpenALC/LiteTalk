@@ -54,6 +54,7 @@ const (
 	ErrCodeNotFound            = "not_found"
 	ErrCodeRateLimited         = "rate_limited"
 	ErrCodeQuotaExceeded       = "quota_exceeded"
+	ErrCodeBadPassword         = "bad_password"
 	ErrCodeProtocolUnsupported = "protocol_unsupported"
 )
 
@@ -97,6 +98,7 @@ type UserBrief struct {
 // ChannelJoinData 加入语音频道。
 type ChannelJoinData struct {
 	ChannelID string `json:"channel_id"`
+	Password  string `json:"password,omitempty"` // 频道密码（#37，可选）；频道未设密码时忽略，设了则必须匹配（管理员可不带）
 }
 
 // ChannelJoinedData 房间成员全量。成员变化时向房间内每个成员重发全量（Self 为接收者本人的快照）。
@@ -167,11 +169,13 @@ type HelloData struct {
 	Presence map[string]any `json:"presence"`
 }
 
-// PresenceUpdateData 某用户在线状态变化。user_id 是状态变化的用户（不是接收者）；只推给与其互为已接受好友的在线连接，状态未变不发（去抖）。
+// PresenceUpdateData 某用户在线状态变化。user_id 是状态变化的用户（不是接收者）；只推给与其互为已接受好友的在线连接，状态未变不发（去抖）。channel_id/server_id 是该用户当前语音房（#92 好友频道 presence），两字段必须同时出现或同时缺省；接收者对该频道无 ViewChannel 权限时只推 online 载荷（不得泄露频道标识）。载荷不含频道名。
 type PresenceUpdateData struct {
-	UserID string `json:"user_id"`
-	Online bool   `json:"online"`
-	TS     int64  `json:"ts"`
+	UserID    string `json:"user_id"`
+	Online    bool   `json:"online"`
+	TS        int64  `json:"ts"`
+	ChannelID string `json:"channel_id,omitempty"` // 当前语音频道 ID（#92，可选）；与 server_id 同现同缺，不在语音房或接收者无查看权限时不出现
+	ServerID  string `json:"server_id,omitempty"`  // channel_id 所属服务器 ID（#92，可选）；与 channel_id 同现同缺
 }
 
 // RTCFailedData SFU 因 ICE 失败移除本端 PeerConnection。只发给该 peer 的连接；客户端收到后销毁本地 PC 并重新入房，其余成员走 channel.peer_left。
@@ -221,12 +225,13 @@ type VoiceSpeakingData struct {
 	Speaking  bool   `json:"speaking"`
 }
 
-// VoiceStateData 说话/静音/耳聋状态，字段均为可选增量（nil=本次未变）。上行 C→S 不带 user_id；下行广播由服务端补 user_id 标识来源。协议 2 起 speaking 由服务端按 RFC 6464 电平判定（v2 客户端停发 speaking），mute/deafen 仍走上行。
+// VoiceStateData 说话/静音/耳聋状态，字段均为可选增量（nil=本次未变）。上行 C→S 不带 user_id；下行广播由服务端补 user_id 标识来源。协议 2 起 speaking 由服务端按 RFC 6464 电平判定（v2 客户端停发 speaking），mute/deafen 仍走上行。server_muted 为服务端权威强制闭麦状态（#36）。
 type VoiceStateData struct {
-	UserID   string `json:"user_id,omitempty"` // 下行广播补；上行省略
-	Speaking *bool  `json:"speaking,omitempty"`
-	Mute     *bool  `json:"mute,omitempty"`
-	Deafen   *bool  `json:"deafen,omitempty"`
+	UserID      string `json:"user_id,omitempty"` // 下行广播补；上行省略
+	Speaking    *bool  `json:"speaking,omitempty"`
+	Mute        *bool  `json:"mute,omitempty"`
+	Deafen      *bool  `json:"deafen,omitempty"`
+	ServerMuted *bool  `json:"server_muted,omitempty"` // S2C 服务端权威强制闭麦状态（#36）；C2S 携带时服务端忽略
 }
 
 // VoiceStateRequestData 他人对你发出的闭麦/静音请求（voice.request_state 的定向投递）。

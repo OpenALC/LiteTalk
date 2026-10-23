@@ -1,0 +1,5 @@
+# 轻音 LiteTalk 自动更新器 sudoers（#97）
+# 部署位置：/etc/sudoers.d/litetalk-updater（chmod 440；改完 visudo -cf 校验）
+# 只放行更新器重启主服务所需的两条命令，再无其它提权面。
+# 注意：不要与 NoNewPrivileges=true 并用（setuid 提权被禁，sudo 会失败）。
+www ALL=(root) NOPASSWD: /usr/bin/systemctl restart litetalk.service, /usr/bin/systemctl is-active litetalk.service

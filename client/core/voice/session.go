@@ -28,7 +28,8 @@ import (
 )
 
 // KickReasonLoginExpired 本端专用被踢原因（不上 wire）：refresh_token 被服务端
-// 明确拒绝（401/403），access 已无法续期，只能回登录页重新认证。与
+// 明确拒绝（401/403），access 已无法续期，只能回登录页重新认证；或 ws.Run 因
+// 不可恢复的鉴权失败（ErrAuthFatal，如无刷新来源）退出时兜底上报。与
 // signal.KickReasonLoginElsewhere（异地登录）区分——后者是 wire 契约里的取值，
 // 本常量只经 OnKicked 传给 UI 决定横幅文案。
 const KickReasonLoginExpired = "login_expired"
@@ -65,9 +66,10 @@ type Events struct {
 	// 服务端已把本端摘出房间，本地按退房清理完毕。与 OnKicked 同样可能跑在
 	// ws 读循环 goroutine（会话 wg 内），实现侧不得同步 Close 会话。
 	OnVoiceTaken func()
-	// OnPresenceUpdate 好友在线状态变化（presence.update，#11）。
-	// 跑在 ws 读循环 goroutine，实现侧只做转发。
-	OnPresenceUpdate func(userID string, online bool)
+	// OnPresenceUpdate 好友在线状态变化（presence.update，#11/#92）。
+	// channelID/serverID 是该好友当前语音房（同现同缺，无查看权限或不在
+	// 语音房时为空串）。跑在 ws 读循环 goroutine，实现侧只做转发。
+	OnPresenceUpdate func(userID string, online bool, channelID, serverID string)
 	// OnServerShutdown 服务端优雅关闭（server.shutdown，#21）：停自动重连并提示。
 	// 与 OnKicked 同线程约定。
 	OnServerShutdown func(reason string)
@@ -169,6 +171,11 @@ type Session struct {
 	roomID            atomic.Value // string
 	muted             atomic.Bool
 	deafened          atomic.Bool
+	// kicked 被踢事件一次性去重（#98）：同一条不可恢复的鉴权失败可能先由
+	// OnAuthFailed 回调 handleKicked（401 被拒/会话顶替），ws.Run 返回
+	// ErrAuthFatal 时又被 Run goroutine 回调一次；重复事件会让 UI 重复弹
+	// 横幅/重复清理。首次生效、后续直接返回。
+	kicked atomic.Bool
 
 	// joinMu 串行化进房意图与 roomID 的复合变更（#91）。JoinChannel 乐观写
 	// roomID 供断线重连恢复，服务端拒收是异步 error 帧——没有关联 id，
@@ -181,6 +188,10 @@ type Session struct {
 	joinMu       sync.Mutex
 	pendingJoins []pendingJoin
 	joinSeq      uint64
+	// roomPassword 当前房的入房密码（#37，joinMu 保护）：用户发起 join 时覆盖
+	//（含空串）；重连/ICE 重建的 channel.join 从这里取。Leave/voice_taken/
+	// 进房失败回滚即清空。不落盘、不日志。
+	roomPassword string
 
 	// protoVer 服务端协商到的协议版本（#29）：0=尚未收到 server.hello（按 v1 行为）。
 	// v2 客户端据此停发 voice.state{speaking} 等版本相关行为（#33 接线）。
@@ -300,14 +311,16 @@ func (s *Session) Connect(serverURL string) {
 			return s.token.Load().(string), nil
 		},
 		// 握手 401（被顶替类已由 OnKicked 收口）：刷新一次 access 再重拨。
-		// 失败按原因分三类（#84 复审 4.1）：
-		//   - 传输层瞬时错误：返回 ErrAuthTransient，signal 层退避重试——网络
-		//     抖动不代表 refresh_token 失效，不能就此永久停连；
+		// 失败按原因分三类（#84 复审 4.1、#98）：
+		//   - 传输层错误与服务端临时故障（408/429/5xx）：返回 ErrAuthTransient，
+		//     signal 层退避重试——网络抖动或服务端过载不代表 refresh_token 失效，
+		//     不能就此永久停连；
 		//   - 服务端明确 401/403：refresh_token 已失效/被吊销，走被踢链路回
 		//     登录页，前端按 login_expired 提示「登录已过期」；
 		//   - ErrSessionReplaced：刷新窗口里发现会话被顶替，按异地登录处理。
 		// errBaseChanged / ErrNoRefreshSource 返回原错误 → 致命（换服流程已接管 /
-		// 根本没有刷新来源，重试只会原地打转）。
+		// 根本没有刷新来源）；Run 以 ErrAuthFatal 退出后由 Run goroutine 兜底
+		// 上报 login_expired，避免登录页一直卡在「信令连接中」。
 		OnAuthFailed: func(ctx context.Context) error {
 			err := s.api.RefreshAccess(ctx)
 			switch {
@@ -430,6 +443,12 @@ func (s *Session) Connect(serverURL string) {
 	go func() {
 		defer s.wg.Done()
 		if err := s.ws.Run(ctx); err != nil && err != context.Canceled {
+			// ErrAuthFatal：刷新被明确拒绝 / 无刷新来源 / 换服，Run 已停止重连。
+			// 必须上报被踢回登录页——否则前端停在「信令连接中」永远等不到结果。
+			// 已在 OnAuthFailed 里回调过的路径由 handleKicked 一次性去重（#98）。
+			if errors.Is(err, signal.ErrAuthFatal) {
+				s.handleKicked(KickReasonLoginExpired)
+			}
 			s.log.Printf("signal run: %v", err)
 		}
 	}()
@@ -447,7 +466,7 @@ func (s *Session) handleSignalConnect(c *signal.Client) {
 	// 不登记的话异步 error 只会弹 toast，本地仍留在「幽灵房间」里（#91）。
 	if room, _ := s.roomID.Load().(string); room != "" {
 		seq := s.beginJoin(room)
-		if err := c.Send(signal.TypeChannelJoin, signal.ChannelJoinData{ChannelID: room}); err != nil {
+		if err := c.Send(signal.TypeChannelJoin, signal.ChannelJoinData{ChannelID: room, Password: s.roomPasswordCached()}); err != nil {
 			// 保留 roomID 等下次重连再试（原有语义），只摘掉本次 pending，
 			// 避免后续无关 error 被误归属到这次失败的发送。
 			s.abortJoinSend(seq, false)
@@ -548,7 +567,17 @@ func (s *Session) registerHandlers() {
 			return
 		}
 		// 服务端回执：结算对应的 pending join（重复/广播帧不匹配则忽略）。
-		s.confirmJoin(d.ChannelID)
+		matched := s.confirmJoin(d.ChannelID)
+		// 迟到回执（#99）：退房后或快速切房时，旧房的 channel.joined 可能晚于
+		// 新的房间意图到达。roomID 已不指向该频道就整帧丢弃——不启动媒体、
+		// 不重建成员表、不发 OnSelf/OnPeerJoin、不触发 peer 重协商。startMedia
+		// 幂等只能防重复启动，防不住成员表被旧房数据覆盖。
+		if room, _ := s.roomID.Load().(string); room != d.ChannelID {
+			if matched {
+				s.log.Printf("session: 忽略迟到 channel.joined %s（当前房 %q，#99）", d.ChannelID, room)
+			}
+			return
+		}
 		s.startMedia() // 入房才启动采集/播放
 		s.mu.Lock()
 		s.members = make(map[string]PeerView, len(d.Members))
@@ -711,14 +740,14 @@ func (s *Session) registerHandlers() {
 			s.ev.OnVoiceTaken()
 		}
 	})
-	// presence.update：好友在线状态变化（#11），原样转给 UI 层。
+	// presence.update：好友在线状态变化（#11/#92），原样转给 UI 层。
 	s.ws.On(signal.TypePresenceUpdate, func(env signal.Envelope) {
 		var d signal.PresenceUpdateData
 		if env.Decode(&d) != nil || d.UserID == "" {
 			return
 		}
 		if s.ev.OnPresenceUpdate != nil {
-			s.ev.OnPresenceUpdate(d.UserID, d.Online)
+			s.ev.OnPresenceUpdate(d.UserID, d.Online, d.ChannelID, d.ServerID)
 		}
 	})
 	// server.shutdown：服务端优雅关闭（#21）。停掉 ws 自动重连并转给 UI 层提示。
@@ -772,7 +801,7 @@ func (s *Session) rebuildAfterICEFail(channelID string) {
 		// 重建入房同样登记 pending：重建被拒（频道已删/无权限）时按进房失败
 		// 回滚，而不是把幽灵房间留给下一次重连（#91）。
 		seq := s.beginJoin(room)
-		if err := s.ws.Send(signal.TypeChannelJoin, signal.ChannelJoinData{ChannelID: room}); err != nil {
+		if err := s.ws.Send(signal.TypeChannelJoin, signal.ChannelJoinData{ChannelID: room, Password: s.roomPasswordCached()}); err != nil {
 			s.abortJoinSend(seq, false)
 			s.log.Printf("session: ICE 失败重建 channel.join 发送失败: %v", err)
 		}
@@ -793,6 +822,7 @@ func (s *Session) leaveRoomLocal() {
 	// 退房后迟到的 error/joined 不得再回滚或恢复房间态，在途 join 一并作废。
 	s.pendingJoins = nil
 	s.roomID.Store("")
+	s.roomPassword = "" // #37：退房即清密码（voice_taken/进房失败回滚走这里）
 	s.teardownLocalRoomLocked()
 }
 
@@ -825,8 +855,13 @@ func (s *Session) clearRoomTables() {
 }
 
 // handleKicked 上报被踢原因（session.kicked 消息、WS close 4001、握手 401 的
-// session_replaced/session_replaced 头，三条路径的统一出口）。
+// session_replaced/session_replaced 头、Run 的 ErrAuthFatal 兜底，统一出口）。
+// 同一会话只上报一次（#98）：不可恢复的鉴权失败可能先经 OnAuthFailed 回调、
+// 再由 Run 退出兜底，重复事件会让 UI 重复弹横幅。
 func (s *Session) handleKicked(reason string) {
+	if !s.kicked.CompareAndSwap(false, true) {
+		return
+	}
 	if s.ev.OnKicked != nil {
 		s.ev.OnKicked(reason)
 	}
@@ -886,9 +921,16 @@ func (s *Session) setupPeer() {
 	}
 }
 
-// JoinChannel 加入语音频道。发送成功只代表请求已发出——服务端是否接纳是
-// 异步回执（channel.joined / error 帧），见 beginJoin/handleErrorFrame（#91）。
+// JoinChannel 加入语音频道（不带密码；带密码用 JoinChannelWithPassword）。
+// 发送成功只代表请求已发出——服务端是否接纳是异步回执（channel.joined /
+// error 帧），见 beginJoin/handleErrorFrame（#91）。
 func (s *Session) JoinChannel(channelID string) error {
+	return s.JoinChannelWithPassword(channelID, "")
+}
+
+// JoinChannelWithPassword 带密码入房（#37）。password 每次 join 覆盖缓存（含空串），
+// 重连/ICE 重建的 channel.join 从缓存取——缓存不落盘、不日志。
+func (s *Session) JoinChannelWithPassword(channelID, password string) error {
 	if s.ws == nil {
 		return fmt.Errorf("session not connected")
 	}
@@ -898,14 +940,30 @@ func (s *Session) JoinChannel(channelID string) error {
 	// 预取 ICE 凭证再进房：setupPeer 跑在 WS 读循环上，不能做网络 I/O（#13）。
 	// 这里是 Wails 绑定 goroutine，阻塞可接受；失败留空缓存，降级空 ICE 列表。
 	s.prefetchICE()
+	s.setRoomPassword(password)
 	seq := s.beginJoin(channelID)
-	if err := s.ws.Send(signal.TypeChannelJoin, signal.ChannelJoinData{ChannelID: channelID}); err != nil {
+	if err := s.ws.Send(signal.TypeChannelJoin, signal.ChannelJoinData{ChannelID: channelID, Password: password}); err != nil {
 		// roomID 先存是为断线重连恢复；发送失败必须回滚——否则重连后
 		// OnConnect 重发 join 造成「幽灵入房」。
 		s.abortJoinSend(seq, true)
 		return fmt.Errorf("join channel: %w", err)
 	}
 	return nil
+}
+
+// setRoomPassword 覆写入房密码缓存（#37）：仅用户主动 join 时调用；
+// 重连/ICE 重建只读不写。
+func (s *Session) setRoomPassword(pw string) {
+	s.joinMu.Lock()
+	s.roomPassword = pw
+	s.joinMu.Unlock()
+}
+
+// roomPasswordCached 读入房密码缓存（#37）：重连/ICE 重建的 channel.join 用。
+func (s *Session) roomPasswordCached() string {
+	s.joinMu.Lock()
+	defer s.joinMu.Unlock()
+	return s.roomPassword
 }
 
 // beginJoin 登记一次进房意图并乐观写 roomID（断线重连据此恢复）。返回的
@@ -948,12 +1006,14 @@ func (s *Session) abortJoinSend(seq uint64, rollbackRoom bool) {
 	if cur, _ := s.roomID.Load().(string); cur == ch {
 		// 不恢复到更早的 pending：发送失败时那些 join 也未必成功，等回执确认。
 		s.roomID.Store("")
+		s.roomPassword = "" // #37：发送失败回滚即清密码
 	}
 }
 
-// confirmJoin channel.joined 回执：摘掉对应的 pending join。仅当匹配到本端
-// 发出且未结算的请求时才认作回执——广播帧（成员变化重发全量）不改变状态。
-func (s *Session) confirmJoin(channelID string) {
+// confirmJoin channel.joined 回执：匹配到本端发出且未结算的请求时摘除并返回
+// true；广播帧（成员变化重发全量）与迟到帧不改变状态，返回 false——调用方
+// 据此区分「我方 join 的确认」与「房内广播」。
+func (s *Session) confirmJoin(channelID string) bool {
 	s.joinMu.Lock()
 	defer s.joinMu.Unlock()
 	for i := range s.pendingJoins {
@@ -966,8 +1026,9 @@ func (s *Session) confirmJoin(channelID string) {
 		if cur, _ := s.roomID.Load().(string); cur == "" {
 			s.roomID.Store(channelID)
 		}
-		return
+		return true
 	}
+	return false
 }
 
 // settlePendingJoin 结算最早一次未完成的 join（服务端同一连接按序处理上行，
@@ -990,6 +1051,7 @@ func (s *Session) settlePendingJoin(rollback bool) (channelID string, consumed, 
 		return head.channelID, true, false
 	}
 	s.roomID.Store("")
+	s.roomPassword = "" // #37：进房失败回滚即清密码
 	s.teardownLocalRoomLocked()
 	return head.channelID, true, true
 }
@@ -1001,6 +1063,7 @@ func (s *Session) LeaveChannel() error {
 	// 主动离开后迟到的 join 回执/错误不得再改状态：在途意图全部作废。
 	s.pendingJoins = nil
 	s.roomID.Store("")
+	s.roomPassword = "" // #37：主动退房清密码
 	// 与 voice_taken 共用同一条本地拆房路径：媒体、peer、远端链路、成员表与
 	// 状态表一起清；放在 joinMu 内，避免并发 JoinChannel 装上新 peer 后被误关。
 	s.teardownLocalRoomLocked()
@@ -1318,14 +1381,15 @@ func (s *Session) ChatHandler(fn func(channelID, msgID, userID, nickname, conten
 // resyncRecentMessages 单频道补拉的消息条数（最新 N 条，覆盖断线窗口）。
 const resyncRecentMessages = 50
 
-// applyFriendPresence 好友在线态回灌（状态型更新，幂等）。
+// applyFriendPresence 好友在线态回灌（状态型更新，幂等）；频道快照字段（#92）
+// 与在线态一起透传，UI 刷新好友所在语音房。
 func (s *Session) applyFriendPresence(friends []api.FriendDTO) {
 	if s.ev.OnPresenceUpdate == nil {
 		return
 	}
 	for _, f := range friends {
 		if f.Status == "accepted" {
-			s.ev.OnPresenceUpdate(f.User.ID.String(), f.User.Online)
+			s.ev.OnPresenceUpdate(f.User.ID.String(), f.User.Online, f.ChannelID, f.ServerID)
 		}
 	}
 }
@@ -1444,10 +1508,12 @@ func isJoinOnlyErrorCode(code string) bool {
 //   - quota_exceeded：进房满员（hub.joinRoom）之外，rtc.offer 的 SFU 容量
 //     上限（hub.handleRTCOffer，§0.1.3）与握手连接数上限也会返回——无 pending
 //     时必须继续走聊天错误回调，不能当 join-only 丢弃。
+//   - bad_password（#37）：频道密码错误，join 专属但走同一错误帧通道；
+//     归入共享码让 pending 非空时按进房失败回滚并触发 OnJoinFailed。
 func isJoinSharedErrorCode(code string) bool {
 	switch code {
 	case signal.ErrCodeForbidden, signal.ErrCodeBadMessage, signal.ErrCodeRateLimited,
-		signal.ErrCodeQuotaExceeded:
+		signal.ErrCodeQuotaExceeded, signal.ErrCodeBadPassword:
 		return true
 	}
 	return false

@@ -419,14 +419,31 @@ func (m *MySQL) DeleteFriendship(ctx context.Context, id int64) error {
 
 func (m *MySQL) CreateServer(ctx context.Context, s *Server) error {
 	s.ID = newID(s.ID)
-	_, err := m.db.ExecContext(ctx,
-		`INSERT INTO servers (id, name, owner_id, icon_name, icon_color) VALUES (?, ?, ?, ?, ?)`,
-		s.ID, s.Name, s.OwnerID, s.IconName, s.IconColor)
+	// server + 三条 builtin 角色同事务（#35）：缺任一条后续 AddMember/SetMemberRoles 会断不变量。
+	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	return m.db.QueryRowContext(ctx, `SELECT created_at FROM servers WHERE id = ?`, s.ID).
-		Scan(&s.CreatedAt)
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO servers (id, name, owner_id, icon_name, icon_color) VALUES (?, ?, ?, ?, ?)`,
+		s.ID, s.Name, s.OwnerID, s.IconName, s.IconColor); err != nil {
+		return err
+	}
+	for _, tpl := range BuiltinRoleTemplates {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO roles (id, server_id, name, color, position, permissions, builtin_key, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			newID(0), s.ID, tpl.Name, DefaultRoleColor, tpl.Position, int64(tpl.Permissions),
+			tpl.BuiltinKey, time.Now(), time.Now()); err != nil {
+			return err
+		}
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT created_at FROM servers WHERE id = ?`, s.ID).
+		Scan(&s.CreatedAt); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 const serverCols = `id, name, owner_id, icon_name, icon_color, created_at`
@@ -485,6 +502,11 @@ func (m *MySQL) DeleteServer(ctx context.Context, id int64) error {
 		`DELETE FROM messages WHERE channel_id IN (SELECT id FROM channels WHERE server_id = ?)`, id); err != nil {
 		return err
 	}
+	// 覆盖挂在频道上，必须赶在 channels 删除前清（#35）。
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM channel_overwrites WHERE channel_id IN (SELECT id FROM channels WHERE server_id = ?)`, id); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM channels WHERE server_id = ?`, id); err != nil {
 		return err
 	}
@@ -492,6 +514,15 @@ func (m *MySQL) DeleteServer(ctx context.Context, id int64) error {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM invites WHERE server_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM member_roles WHERE server_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM roles WHERE server_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM audit_log WHERE server_id = ?`, id); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM server_members WHERE server_id = ?`, id); err != nil {
@@ -508,28 +539,44 @@ func (m *MySQL) DeleteServer(ctx context.Context, id int64) error {
 }
 
 func (m *MySQL) AddMember(ctx context.Context, mem *ServerMember) error {
-	if mem.JoinedAt.IsZero() {
-		mem.JoinedAt = time.Now()
-	}
-	_, err := m.db.ExecContext(ctx,
-		`INSERT INTO server_members (server_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)`,
-		mem.ServerID, mem.UserID, mem.Role, mem.JoinedAt)
+	// 成员 + 默认角色同事务（#35）；冲突不写分配。
+	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
-		if isDup(err) {
-			return ErrConflict
-		}
 		return err
 	}
-	return nil
+	defer func() { _ = tx.Rollback() }()
+	if err := dbAddMemberWithDefaults(ctx, tx, mem, isDup); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (m *MySQL) RemoveMember(ctx context.Context, serverID, userID int64) error {
-	res, err := m.db.ExecContext(ctx,
+	// 成员行 + 其角色分配 + 该服内以该成员为目标的覆盖一起清（#35）。
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx,
 		`DELETE FROM server_members WHERE server_id = ? AND user_id = ?`, serverID, userID)
 	if err != nil {
 		return err
 	}
-	return checkAffected(res)
+	if err := checkAffected(res); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM member_roles WHERE server_id = ? AND user_id = ?`, serverID, userID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM channel_overwrites
+		  WHERE target_type = 'member' AND target_id = ?
+		    AND channel_id IN (SELECT id FROM channels WHERE server_id = ?)`, userID, serverID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 const memberJoin = `SELECT m.server_id, m.user_id, m.role, m.joined_at, u.nickname, u.tag
@@ -570,8 +617,10 @@ func (m *MySQL) MembersOfServer(ctx context.Context, serverID int64) ([]ServerMe
 func (m *MySQL) CreateChannel(ctx context.Context, c *Channel) error {
 	c.ID = newID(c.ID)
 	_, err := m.db.ExecContext(ctx,
-		`INSERT INTO channels (id, server_id, name, type, category_id, position) VALUES (?, ?, ?, ?, ?, ?)`,
-		c.ID, c.ServerID, c.Name, c.Type, c.CategoryID, c.Position)
+		`INSERT INTO channels (id, server_id, name, type, category_id, position, password_hash, user_limit, parent_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.ID, c.ServerID, c.Name, c.Type, c.CategoryID, c.Position,
+		c.PasswordHash, c.UserLimit, c.ParentID)
 	if err != nil {
 		return err
 	}
@@ -579,13 +628,14 @@ func (m *MySQL) CreateChannel(ctx context.Context, c *Channel) error {
 		Scan(&c.CreatedAt)
 }
 
-const channelCols = `id, server_id, name, type, category_id, position, created_at`
+const channelCols = `id, server_id, name, type, category_id, position, created_at, password_hash, user_limit, parent_id`
 
-// scanChannel 扫描一行频道（category_id 可空）。
+// scanChannel 扫描一行频道（category_id/parent_id 可空）。
 func scanChannel(rows interface{ Scan(...any) error }) (*Channel, error) {
 	var c Channel
-	var catID sql.NullInt64
-	err := rows.Scan(&c.ID, &c.ServerID, &c.Name, &c.Type, &catID, &c.Position, &c.CreatedAt)
+	var catID, parentID sql.NullInt64
+	err := rows.Scan(&c.ID, &c.ServerID, &c.Name, &c.Type, &catID, &c.Position, &c.CreatedAt,
+		&c.PasswordHash, &c.UserLimit, &parentID)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -594,6 +644,9 @@ func scanChannel(rows interface{ Scan(...any) error }) (*Channel, error) {
 	}
 	if catID.Valid {
 		c.CategoryID = &catID.Int64
+	}
+	if parentID.Valid {
+		c.ParentID = &parentID.Int64
 	}
 	return &c, nil
 }
@@ -621,10 +674,14 @@ func (m *MySQL) ChannelsOfServer(ctx context.Context, serverID int64) ([]Channel
 	return out, rows.Err()
 }
 
+// UpdateChannel 全行写（#37 B1 起含 password_hash/user_limit/parent_id）：
+// 调用方必须先读再写，清除密码写空串、提升顶层写 NULL。
 func (m *MySQL) UpdateChannel(ctx context.Context, c *Channel) error {
 	res, err := m.db.ExecContext(ctx,
-		`UPDATE channels SET name = ?, type = ?, category_id = ?, position = ? WHERE id = ?`,
-		c.Name, c.Type, c.CategoryID, c.Position, c.ID)
+		`UPDATE channels SET name = ?, type = ?, category_id = ?, position = ?,
+		 password_hash = ?, user_limit = ?, parent_id = ? WHERE id = ?`,
+		c.Name, c.Type, c.CategoryID, c.Position,
+		c.PasswordHash, c.UserLimit, c.ParentID, c.ID)
 	if err != nil {
 		return err
 	}
@@ -632,13 +689,25 @@ func (m *MySQL) UpdateChannel(ctx context.Context, c *Channel) error {
 }
 
 func (m *MySQL) DeleteChannel(ctx context.Context, id int64) error {
-	// 单事务：消息 + 频道一起删（#22）。
+	// 单事务：消息 + 频道覆盖 + 子频道行 + 频道一起删（#22/#35/#37）。
+	// 子频道与父同行级联（消息/覆盖一并）；IN 子查询指向 channels，
+	// 不是被删的 messages/overwrites 自身，无 1093 限制。
 	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE channel_id = ?`, id); err != nil {
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM messages WHERE channel_id = ?
+		   OR channel_id IN (SELECT id FROM channels WHERE parent_id = ?)`, id, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM channel_overwrites WHERE channel_id = ?
+		   OR channel_id IN (SELECT id FROM channels WHERE parent_id = ?)`, id, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM channels WHERE parent_id = ?`, id); err != nil {
 		return err
 	}
 	res, err := tx.ExecContext(ctx, `DELETE FROM channels WHERE id = ?`, id)
@@ -702,7 +771,8 @@ func (m *MySQL) CategoriesOfServer(ctx context.Context, serverID int64) ([]Categ
 	return out, rows.Err()
 }
 
-// DeleteCategoryWithChannels 单事务删除分类及其下全部频道（含各频道消息）。
+// DeleteCategoryWithChannels 单事务删除分类及其下全部频道（含各频道消息与覆盖）。
+// 子频道同分类（API 保证），但删除集按 parent_id 再兜一圈，防数据漂移漏行（#37）。
 // 调用方须先确认分类存在（checkAffected 在事务内同样生效）。
 func (m *MySQL) DeleteCategoryWithChannels(ctx context.Context, id int64) error {
 	tx, err := m.db.BeginTx(ctx, nil)
@@ -711,7 +781,24 @@ func (m *MySQL) DeleteCategoryWithChannels(ctx context.Context, id int64) error 
 	}
 	defer func() { _ = tx.Rollback() }()
 	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM messages WHERE channel_id IN (SELECT id FROM channels WHERE category_id = ?)`, id); err != nil {
+		`DELETE FROM messages WHERE channel_id IN (
+		   SELECT id FROM channels WHERE category_id = ?
+		   UNION
+		   SELECT id FROM channels WHERE parent_id IN (SELECT id FROM channels WHERE category_id = ?)
+		 )`, id, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM channel_overwrites WHERE channel_id IN (
+		   SELECT id FROM channels WHERE category_id = ?
+		   UNION
+		   SELECT id FROM channels WHERE parent_id IN (SELECT id FROM channels WHERE category_id = ?)
+		 )`, id, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM channels WHERE parent_id IN (
+		   SELECT id FROM (SELECT id FROM channels WHERE category_id = ?) t)`, id); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM channels WHERE category_id = ?`, id); err != nil {
@@ -1018,7 +1105,7 @@ func myInviteMiss(ctx context.Context, q interface {
 }
 
 // UseInviteAndAddMember 同一事务内消费邀请码并插入成员（#22）：成员冲突或
-// 插入失败时整体回滚，邀请码次数不增长。
+// 插入失败时整体回滚，邀请码次数不增长、默认角色分配不落库（#35）。
 func (m *MySQL) UseInviteAndAddMember(ctx context.Context, code string, userID int64, role MemberRole) (*ServerMember, error) {
 	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1047,6 +1134,9 @@ func (m *MySQL) UseInviteAndAddMember(ctx context.Context, code string, userID i
 		if isDup(err) {
 			return nil, ErrConflict
 		}
+		return nil, err
+	}
+	if err := dbAssignDefaultRoles(ctx, tx, mem.ServerID, mem.UserID, mem.Role, 0, mem.JoinedAt, isDup); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1099,6 +1189,90 @@ func (m *MySQL) DeleteAllUserSessions(ctx context.Context, userID int64) error {
 	return err
 }
 
+// ---- roles / member_roles / channel_overwrites / audit_log（迁移 0010，#35 B1） ----
+// 语义实现与 SQLite 共用 roles.go 的 db* 函数，这里只做方言接线。
+
+func (m *MySQL) ListRoles(ctx context.Context, serverID int64) ([]Role, error) {
+	return dbListRoles(ctx, m.db, serverID)
+}
+
+func (m *MySQL) RoleByID(ctx context.Context, id int64) (*Role, error) {
+	return dbRoleByID(ctx, m.db, id)
+}
+
+func (m *MySQL) CreateRole(ctx context.Context, r *Role) error {
+	return dbCreateRole(ctx, m.db, r, isDup)
+}
+
+func (m *MySQL) UpdateRole(ctx context.Context, r *Role) error {
+	return dbUpdateRole(ctx, m.db, r)
+}
+
+func (m *MySQL) DeleteRole(ctx context.Context, id int64) error {
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := dbDeleteRole(ctx, tx, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (m *MySQL) RolesOfMember(ctx context.Context, serverID, userID int64) ([]Role, error) {
+	return dbRolesOfMember(ctx, m.db, serverID, userID)
+}
+
+func (m *MySQL) SetMemberRoles(ctx context.Context, serverID, userID int64, roleIDs []int64, assignedBy int64) error {
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := dbSetMemberRoles(ctx, tx, serverID, userID, roleIDs, assignedBy); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (m *MySQL) RoleAssignmentsOfServer(ctx context.Context, serverID int64) ([]MemberRoleAssignment, error) {
+	return dbRoleAssignmentsOfServer(ctx, m.db, serverID)
+}
+
+func (m *MySQL) ChannelOverwrites(ctx context.Context, channelID int64) ([]ChannelOverwrite, error) {
+	return dbChannelOverwrites(ctx, m.db, channelID)
+}
+
+func (m *MySQL) ChannelOverwritesOfServer(ctx context.Context, serverID int64) ([]ChannelOverwrite, error) {
+	return dbChannelOverwritesOfServer(ctx, m.db, serverID)
+}
+
+func (m *MySQL) SetChannelOverwrite(ctx context.Context, o *ChannelOverwrite) error {
+	if err := dbOverwriteTargetOK(ctx, m.db, o); err != nil {
+		return err
+	}
+	o.UpdatedAt = time.Now()
+	_, err := m.db.ExecContext(ctx,
+		`INSERT INTO channel_overwrites (channel_id, target_type, target_id, allow, deny, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)
+		 ON DUPLICATE KEY UPDATE allow = VALUES(allow), deny = VALUES(deny), updated_at = VALUES(updated_at)`,
+		o.ChannelID, o.TargetType, o.TargetID, int64(o.Allow), int64(o.Deny), o.UpdatedAt)
+	return err
+}
+
+func (m *MySQL) DeleteChannelOverwrite(ctx context.Context, channelID int64, targetType OverwriteTargetType, targetID int64) error {
+	return dbDeleteChannelOverwrite(ctx, m.db, channelID, targetType, targetID)
+}
+
+func (m *MySQL) WriteAudit(ctx context.Context, a *AuditLog) error {
+	return dbWriteAudit(ctx, m.db, a, isDup)
+}
+
+func (m *MySQL) AuditLogBefore(ctx context.Context, serverID, beforeID int64, limit int) ([]AuditLog, error) {
+	return dbAuditLogBefore(ctx, m.db, serverID, beforeID, limit)
+}
+
 // ---- 工具 ----
 
 // isDup 判断 MySQL 唯一键冲突（1062）。
@@ -1116,3 +1290,6 @@ func checkAffected(res sql.Result) error {
 	}
 	return nil
 }
+
+// 编译期断言：MySQL 是 Store 的完整实现。
+var _ Store = (*MySQL)(nil)
