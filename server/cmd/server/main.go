@@ -474,14 +474,20 @@ func startHTTP(cfg *config, mux http.Handler, stop context.CancelFunc) []*http.S
 // healthOnlyHandler ACME 模式的回环探活面：只提供 GET /api/v1/healthz。
 // 不复用完整 mux——8077 是给 updater 做版本断言的，不该把管理 API 暴露出去。
 // 响应直接复用生成物的 Healthz 形状（{status:"ok",version}），与主端点逐字一致。
+//
+// 这里刻意不经过 ServeMux：契约比对器（server/api/tests）把 server/ 下所有
+// HandleFunc 的 pattern 当作公开 REST 面，注册同一路径会被误判成重复路由；
+// 回环监听只是既有 healthz 操作的另一入口，不新增对外契约。
 func healthOnlyHandler(version string) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/v1/healthz", func(w http.ResponseWriter, r *http.Request) {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if (r.Method != http.MethodGet && r.Method != http.MethodHead) || r.URL.Path != "/api/v1/healthz" {
+			http.NotFound(w, r)
+			return
+		}
 		body, _ := json.Marshal(api.Healthz{Status: api.HealthzStatusOk, Version: version})
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(body)
 	})
-	return mux
 }
 
 // isPermError 端口绑定权限不足（Linux 低段端口需 root / CAP_NET_BIND_SERVICE）。
