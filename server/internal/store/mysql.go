@@ -868,7 +868,7 @@ func (m *MySQL) AddChannelMember(ctx context.Context, channelID, userID int64, r
 		}
 		return err
 	}
-	if !isConversationScope(scope) {
+	if scope != ChannelScopeGroup {
 		return ErrForbidden
 	}
 	_, err = m.db.ExecContext(ctx,
@@ -881,6 +881,16 @@ func (m *MySQL) AddChannelMember(ctx context.Context, channelID, userID int64, r
 }
 
 func (m *MySQL) RemoveChannelMember(ctx context.Context, channelID, userID int64) error {
+	var scope ChannelScope
+	if err := m.db.QueryRowContext(ctx, `SELECT scope FROM channels WHERE id = ?`, channelID).Scan(&scope); err != nil {
+		if err == sql.ErrNoRows {
+			return ErrNotFound
+		}
+		return err
+	}
+	if scope != ChannelScopeGroup {
+		return ErrForbidden
+	}
 	res, err := m.db.ExecContext(ctx,
 		`DELETE FROM channel_members WHERE channel_id = ? AND user_id = ?`, channelID, userID)
 	if err != nil {

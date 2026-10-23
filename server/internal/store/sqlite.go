@@ -803,7 +803,7 @@ func (s *SQLite) AddChannelMember(ctx context.Context, channelID, userID int64, 
 		}
 		return err
 	}
-	if !isConversationScope(scope) {
+	if scope != ChannelScopeGroup {
 		return ErrForbidden
 	}
 	_, err = s.db.ExecContext(ctx,
@@ -816,6 +816,16 @@ func (s *SQLite) AddChannelMember(ctx context.Context, channelID, userID int64, 
 }
 
 func (s *SQLite) RemoveChannelMember(ctx context.Context, channelID, userID int64) error {
+	var scope ChannelScope
+	if err := s.db.QueryRowContext(ctx, `SELECT scope FROM channels WHERE id = ?`, channelID).Scan(&scope); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if scope != ChannelScopeGroup {
+		return ErrForbidden
+	}
 	res, err := s.db.ExecContext(ctx,
 		`DELETE FROM channel_members WHERE channel_id = ? AND user_id = ?`, channelID, userID)
 	if err != nil {

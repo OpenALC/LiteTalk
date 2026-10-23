@@ -654,7 +654,7 @@ func (m *Mem) AddChannelMember(_ context.Context, channelID, userID int64, role 
 	if !ok {
 		return ErrNotFound
 	}
-	if !isConversationScope(c.Scope) {
+	if c.Scope != ChannelScopeGroup {
 		return ErrForbidden
 	}
 	if m.channelMembers[channelID] == nil {
@@ -672,6 +672,13 @@ func (m *Mem) AddChannelMember(_ context.Context, channelID, userID int64, role 
 func (m *Mem) RemoveChannelMember(_ context.Context, channelID, userID int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	c, ok := m.channels[channelID]
+	if !ok {
+		return ErrNotFound
+	}
+	if c.Scope != ChannelScopeGroup {
+		return ErrForbidden
+	}
 	if _, ok := m.channelMembers[channelID][userID]; !ok {
 		return ErrNotFound
 	}

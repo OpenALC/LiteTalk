@@ -323,10 +323,12 @@ type Store interface {
 	ChannelMembers(ctx context.Context, channelID int64) ([]ChannelMember, error)
 	// ChannelMember 单个成员；非成员或频道不存在返回 ErrNotFound。
 	ChannelMember(ctx context.Context, channelID, userID int64) (*ChannelMember, error)
-	// AddChannelMember 只接受 direct/group 频道；role 空串按 member 处理，
-	// 非法角色或 server 频道返回 ErrForbidden，重复成员返回 ErrConflict。
+	// AddChannelMember 只接受 group 频道；role 空串按 member 处理，
+	// direct/server 频道或非法角色返回 ErrForbidden，重复成员返回 ErrConflict。
+	// direct 成员固定为双方，增删留给 B2 的 API 语义，不在 Store 放开。
 	AddChannelMember(ctx context.Context, channelID, userID int64, role ChannelMemberRole) error
-	// RemoveChannelMember 删除成员行；未命中返回 ErrNotFound。
+	// RemoveChannelMember 只接受 group 频道；direct/server 返回 ErrForbidden，
+	// 频道不存在或成员未命中返回 ErrNotFound。
 	RemoveChannelMember(ctx context.Context, channelID, userID int64) error
 
 	// categories（v0.1.2 迁移 0003）
