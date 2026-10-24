@@ -53,7 +53,9 @@ func TestVoiceSpeakingFanout(t *testing.T) {
 	if env := a.recvUntil(TypeChatMessage); env.Seq != seqOfChat(1) {
 		t.Fatalf("聊天 seq = %d, want %d（说话事件不应占环）", env.Seq, seqOfChat(1))
 	}
-	// 环内是 chat(1)+channel.unread(2)，无 voice.speaking。
+	// 环内是 chat(1)+channel.unread(2)，无 voice.speaking。chat.message 到达时
+	// unread 可能仍在查库（#40），等环到 seq 2 再断言。
+	waitRingSeq(t, f, "sa", seqOfChat(1)+1)
 	if got := f.hub.evlog.LatestSeq("sa"); got != seqOfChat(1)+1 {
 		t.Fatalf("环 latest_seq = %d, want %d（只含聊天与未读事件）", got, seqOfChat(1)+1)
 	}

@@ -226,6 +226,9 @@ func TestGatewayRingAccumulatesOffline(t *testing.T) {
 			t.Fatalf("发送者未收到广播: %s", env.Type)
 		}
 	}
+	// 发送者收到 chat.message 只代表消息事件已进环；该用户自己的 channel.unread
+	// 还要查库后再广播（#40），必须等环到达 2 chat + 2 unread = 4 再 Replay。
+	waitRingSeq(t, f, "sa", 4)
 
 	events, reason := f.hub.evlog.Replay("sa", 1)
 	if reason != "" {
@@ -252,10 +255,12 @@ func TestGatewayRingAccumulatesOffline(t *testing.T) {
 	// 同 sid 重连：环不重建、seq 续接（resume 的补发数据源）。
 	a2 := f.dial("1:desktop:sa", "alice-re")
 	b.send(TypeChatSend, ChatSendData{ChannelID: strconv.FormatInt(f.ch.ID, 10), Type: "text", Content: "after"})
-	// 收到广播即代表服务端已完成进环，再断言环内容（chat.send 是异步处理）。
+	// 收到 chat.message 不代表该用户的 channel.unread 已进环（#40 查库后广播），
+	// 等环到达第 3 次发送的 chat + unread（seq 6）再断言。
 	if env := a2.recvUntil(TypeChatMessage); env.Seq != seqOfChat(3) {
 		t.Fatalf("重连后实时投递 seq = %d, want %d", env.Seq, seqOfChat(3))
 	}
+	waitRingSeq(t, f, "sa", seqOfChat(3)+1)
 	events, reason = f.hub.evlog.Replay("sa", 1)
 	if reason != "" || len(events) != 6 || events[len(events)-1].Seq != seqOfChat(3)+1 {
 		t.Fatalf("重连后续接 = (%+v,%q)", events, reason)

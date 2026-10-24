@@ -67,6 +67,9 @@ func TestGatewayResumeUnknownSession(t *testing.T) {
 	if env := a.recvUntil(TypeChatMessage); env.Seq != seqOfChat(1) {
 		t.Fatalf("m1 seq = %d, want %d", env.Seq, seqOfChat(1))
 	}
+	// 收到 chat.message 不代表 channel.unread 已进环（#40 查库后广播）；等环到位
+	// 再断言 latest_seq，避免偶发读到只有 chat 的中间态。
+	waitRingSeq(t, f, "sa", seqOfChat(1)+1)
 
 	// 借别的会话读流：session_id 与连接自己的 sid 不符。latest_seq 仍取本连接的。
 	a.send(TypeGatewayResume, GatewayResumeData{SessionID: "sb", LastSeq: 0})
@@ -135,6 +138,8 @@ func TestGatewayResumeTrailing(t *testing.T) {
 	if env := a.recvUntil(TypeChatMessage); env.Seq != seqOfChat(1) {
 		t.Fatalf("m1 seq = %d, want %d", env.Seq, seqOfChat(1))
 	}
+	// 等 m1 的 channel.unread 也进环，确保 resume 时确实处于「追平」状态。
+	waitRingSeq(t, f, "sa", seqOfChat(1)+1)
 	// 已消费 m1 的 chat(seq=1) 与 unread(seq=2)，追平当前环。
 	a.send(TypeGatewayResume, GatewayResumeData{SessionID: "sa", LastSeq: 2})
 	// 无缺失：不补发。下一条实时事件 seq=3 即证明连接仍在正常流式。
