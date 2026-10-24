@@ -87,7 +87,12 @@ function openPreview(raw: string) {
 </template>
 
 <style scoped>
-.lp-root { display: block; }
+.lp-root {
+  display: block;
+  /* 零面积元素在部分浏览器不会触发 isIntersecting；1px 高度保证观察锚点可用，
+     卡片未出时不渲染内容，视觉上不占位。 */
+  min-height: 1px;
+}
 .lp-card {
   display: flex; align-items: stretch; gap: 10px;
   width: 100%; max-width: 420px;
