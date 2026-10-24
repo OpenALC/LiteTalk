@@ -1,4 +1,5 @@
 // 搜索面板纯函数（#42 B2）：频道标签、摘要高亮切片、时间格式化。
+// #42 B3：摘要走 Markdown 纯文本，标记不进入搜索结果。
 import { describe, expect, it } from 'vitest'
 import { channelLabel, excerptSegments, formatSearchTime, type ChannelLabelSource } from './search'
 
@@ -56,6 +57,17 @@ describe('excerptSegments', () => {
 
   it('查询词长于正文时不误切片', () => {
     expect(excerptSegments('短', '很长很长的查询词')).toEqual([{ text: '短', hit: false }])
+  })
+
+  it('摘要基于 Markdown 纯文本，不显示粗体/行内代码标记', () => {
+    const segs = excerptSegments('查看 **重点** 与 `code`', '重点')
+    expect(segs.map((s) => s.text).join('')).toBe('查看 重点 与 code')
+    expect(segs.filter((s) => s.hit).map((s) => s.text)).toEqual(['重点'])
+  })
+
+  it('围栏代码块与引用行去掉标记后进入摘要', () => {
+    const segs = excerptSegments('> 引用行\n```\nconst a = 1\n```', '')
+    expect(segs.map((s) => s.text).join('')).toBe('引用行 const a = 1')
   })
 })
 

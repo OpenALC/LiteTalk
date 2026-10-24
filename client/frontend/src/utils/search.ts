@@ -1,5 +1,7 @@
 // 搜索面板的纯函数（#42 B2）：频道标签解析、正文摘要与查询词高亮切片、
 // 结果时间格式化。全部只依赖入参，便于 vitest 直接覆盖。
+// #42 B3：摘要基于 Markdown 纯文本，避免结果显示 ** 等标记。
+import { plainTextMarkdown } from './markdown'
 
 // ChannelLabelSource 频道标签解析输入：会话侧用已解析的显示名（displayName），
 // 服务器频道侧保留服务器名以便拼「服务器名 / #频道名」。
@@ -30,15 +32,15 @@ export interface HighlightSegment {
 // SEARCH_EXCERPT_CHARS 摘要截断长度（约两行）。超出时追加省略号。
 const SEARCH_EXCERPT_CHARS = 120
 
-// excerptSegments 把正文折叠空白、截断后按查询词做大小写不敏感的切片高亮。
-// 用文本切片渲染（禁止 v-html）；大小写折叠改变长度（罕见 Unicode）时放弃
-// 高亮，保证切片下标不会错位。
+// excerptSegments 把正文转纯文本、折叠空白、截断后按查询词做大小写不敏感的
+// 切片高亮。用文本切片渲染（禁止 v-html）；大小写折叠改变长度（罕见 Unicode）
+// 时放弃高亮，保证切片下标不会错位。
 export function excerptSegments(
   content: string,
   query: string,
   max = SEARCH_EXCERPT_CHARS,
 ): HighlightSegment[] {
-  const flat = content.replace(/\s+/g, ' ').trim()
+  const flat = plainTextMarkdown(content).replace(/\s+/g, ' ').trim()
   if (!flat) return []
   const cut = flat.length > max ? flat.slice(0, max) + '…' : flat
   const needle = query.trim()

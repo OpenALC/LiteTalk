@@ -4,6 +4,7 @@
 // 不做本地乐观回显——服务端会把消息广播回发送者，本地再插一条即双显。
 // #39：右键菜单提供回复/编辑/删除；输入区支持回复条与 @提及候选。
 // #41：输入区附件按钮选择上传，待发送附件条与消息内图片/文件卡片渲染。
+// #42 B3：正文按 Markdown 子集结构化渲染（粗体/行内代码/围栏代码块/引用）。
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { CornerUpLeft, FileText, Paperclip, Pencil, Reply, Send, Trash2, X } from 'lucide-vue-next'
 import { goApp } from '../api/bridge'
@@ -12,6 +13,7 @@ import { useAuthStore } from '../stores/auth'
 import { isMessageDeleted, useChatStore } from '../stores/chat'
 import { useNotifyStore } from '../stores/notify'
 import { canSendMessage, formatFileSize, isImageAttachment } from '../utils/attachment'
+import { parseMarkdown, plainTextMarkdown, type Block, type InlineNode } from '../utils/markdown'
 import ContextMenu, { type CtxItem } from './ContextMenu.vue'
 
 const props = withDefaults(defineProps<{
@@ -120,19 +122,21 @@ function replyText(m: ChatMessage): string {
   return p.content === '' ? '附件' : excerpt(p.content)
 }
 
-// excerpt 截断摘要到一行（回复条/回复状态条共用）。
+// excerpt 截断摘要到一行（回复条/回复状态条共用）；先去掉 Markdown 标记，
+// 摘要里不再出现 ** 或反引号。
 function excerpt(s: string): string {
-  const t = s.replace(/\s+/g, ' ').trim()
+  const t = plainTextMarkdown(s).replace(/\s+/g, ' ').trim()
   return t.length > 60 ? t.slice(0, 60) + '…' : t
 }
 
-// segments 把正文按 @昵称 切片做轻量高亮；不使用 v-html。
-// 昵称限定为字母/数字/下划线/连字符，中文昵称也在 \p{L} 内。
-function segments(content: string): { text: string; mention: boolean }[] {
-  return content
-    .split(/(@[\p{L}\p{N}_-]+)/u)
-    .filter(Boolean)
-    .map((t) => ({ text: t, mention: t.startsWith('@') }))
+// markdownBlocks 解析消息正文为结构化块；渲染侧逐节点文本插值，禁止 v-html。
+function markdownBlocks(content: string): Block[] {
+  return parseMarkdown(content)
+}
+
+// blockNodes 引用/段落块的行内节点；代码块没有行内节点。
+function blockNodes(b: Block): InlineNode[] {
+  return b.type === 'code' ? [] : b.nodes
 }
 
 // ---- 右键菜单：回复（所有未删除消息）/ 编辑、删除（仅自己，删除二次确认）----
@@ -507,12 +511,21 @@ async function send() {
           </div>
         </div>
         <p v-else-if="isMessageDeleted(m)" class="m-text m-deleted">消息已删除</p>
-        <p v-else-if="m.content" class="m-text">
-          <template v-for="(seg, i) in segments(m.content)" :key="i">
-            <span v-if="seg.mention" class="m-mention">{{ seg.text }}</span>
-            <template v-else>{{ seg.text }}</template>
+        <!-- 正文（#42 B3）：Markdown 子集按结构化节点渲染，全部文本插值，无 v-html -->
+        <div v-else-if="m.content" class="m-text">
+          <template v-for="(b, bi) in markdownBlocks(m.content)" :key="bi">
+            <pre v-if="b.type === 'code'" class="m-code"><code>{{ b.text }}</code></pre>
+            <component :is="b.type === 'quote' ? 'blockquote' : 'p'" v-else
+                       :class="b.type === 'quote' ? 'm-quote' : 'm-para'">
+              <template v-for="(n, ni) in blockNodes(b)" :key="ni">
+                <span v-if="n.type === 'mention'" class="m-mention">{{ n.text }}</span>
+                <code v-else-if="n.type === 'code'" class="m-code-inline">{{ n.text }}</code>
+                <strong v-else-if="n.type === 'bold'">{{ n.text }}</strong>
+                <template v-else>{{ n.text }}</template>
+              </template>
+            </component>
           </template>
-        </p>
+        </div>
         <!-- 附件（#41）：图片用缩略图，其余显示文件卡片；软删消息只留墓碑。 -->
         <div v-if="!isMessageDeleted(m) && m.attachments?.length" class="m-atts">
           <template v-for="att in m.attachments" :key="att.id">
@@ -637,6 +650,39 @@ async function send() {
 .msg .m-text.m-deleted { color: var(--ink-300); }
 .msg.deleted .m-name { color: var(--ink-400); }
 .m-mention { color: var(--brand-700); font-weight: 500; }
+/* Markdown 块（#42 B3）：段落保持换行；引用浅底左框；代码块等宽横向滚动 */
+.m-text > * { margin: 0; }
+.m-text > * + * { margin-top: 6px; }
+.m-para { white-space: pre-wrap; }
+.m-quote {
+  padding: 2px 10px;
+  border-left: 3px solid var(--brand-200);
+  border-radius: 0 6px 6px 0;
+  background: rgba(79, 164, 243, 0.07);
+  color: var(--ink-600);
+  white-space: pre-wrap;
+}
+.m-code {
+  padding: 8px 10px;
+  background: var(--brand-50);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow-x: auto;
+  white-space: pre;
+  font-family: "Cascadia Mono", "Consolas", "Liberation Mono", ui-monospace, monospace;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--ink-900);
+}
+.m-code code { font: inherit; }
+.m-code-inline {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(79, 164, 243, 0.1);
+  font-family: "Cascadia Mono", "Consolas", "Liberation Mono", ui-monospace, monospace;
+  font-size: 0.92em;
+  color: var(--ink-900);
+}
 /* 消息附件（#41）：图片限宽高圆角，文件为卡片；动画只用 transform/opacity */
 .m-atts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
 .att-img {
