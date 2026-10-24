@@ -35,6 +35,9 @@ export LITETALK_TURN_SECRET="fuzz-turn-$(head -c 24 /dev/urandom | base64 | tr -
 export LITETALK_SFU_UDP=0  # 随机端口，不占 7845
 export LITETALK_SFU_TCP=0  # 不启 ICE-TCP
 export LITETALK_SFU_IP=127.0.0.1
+# #42：链接预览默认开启会按 fuzz 生成的 url 真发外网请求——契约测试不依赖外网，
+# 关掉后端点走 404 no_preview（契约内响应），抓取逻辑由 linkpreview 包单测覆盖。
+export LITETALK_LINK_PREVIEW=off
 
 echo "== 起临时服务端 127.0.0.1:${port}（数据目录 ${data}）"
 (cd server && go build -o "$data/server" ./cmd/server)
