@@ -12,10 +12,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"strings"
 
 	"github.com/oapi-codegen/runtime"
+	openapi_types "github.com/oapi-codegen/runtime/types"
 )
 
 // Defines values for ChannelInfoType.
@@ -298,6 +300,33 @@ type AddConversationMembersRequest struct {
 type AddFriendRequest struct {
 	Nickname string  `json:"nickname"`
 	Tag      *string `json:"tag,omitempty"`
+}
+
+// Attachment 附件元数据（#41）。二进制内容不在 JSON 中；url 与 thumbnail_url 是带下载 能力凭证（key）的相对路径（/api/v1/attachments/{id}?key=...），可直接放进 img 标签，不需要 Authorization。宽高仅图片非零；thumbnail_url 仅图片给出。
+type Attachment struct {
+	// ContentType 服务端嗅探出的内容类型（白名单内）
+	ContentType string `json:"content_type"`
+
+	// Filename 展示用文件名（已去除路径分隔符与控制字符）
+	Filename string `json:"filename"`
+
+	// Height 原图像素高（非图片为 0）
+	Height *int `json:"height,omitempty"`
+
+	// Id 附件 ID（十进制字符串）
+	Id string `json:"id"`
+
+	// Size 字节数
+	Size int64 `json:"size"`
+
+	// ThumbnailUrl 带能力 key 的缩略图路径；非图片或缩略图生成失败时不返回
+	ThumbnailUrl *string `json:"thumbnail_url,omitempty"`
+
+	// Url 带能力 key 的下载路径（相对路径）
+	Url string `json:"url"`
+
+	// Width 原图像素宽（非图片为 0）
+	Width *int `json:"width,omitempty"`
 }
 
 // AuditLogEntry 审计条目（#35 B4）。detail 为变更字段的 JSON 字符串（不含隐私数据）。ID 为十进制字符串（#31）。
@@ -928,6 +957,9 @@ type User struct {
 	UpdatedAt Time   `json:"updated_at"`
 }
 
+// AttachmentKeyQuery defines model for AttachmentKeyQuery.
+type AttachmentKeyQuery = string
+
 // IDPath defines model for IDPath.
 type IDPath = int64
 
@@ -970,11 +1002,32 @@ type NotFound = Problem
 // RateLimited RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段 （RFC 9457 允许的扩展字段，至少保留一个版本）。
 type RateLimited = Problem
 
+// TooLarge RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段 （RFC 9457 允许的扩展字段，至少保留一个版本）。
+type TooLarge = Problem
+
 // TurnUnavailable RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段 （RFC 9457 允许的扩展字段，至少保留一个版本）。
 type TurnUnavailable = Problem
 
 // Unauthorized RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段 （RFC 9457 允许的扩展字段，至少保留一个版本）。
 type Unauthorized = Problem
+
+// UploadAttachmentMultipartBody defines parameters for UploadAttachment.
+type UploadAttachmentMultipartBody struct {
+	// File 文件内容（唯一字段）
+	File openapi_types.File `json:"file"`
+}
+
+// DownloadAttachmentParams defines parameters for DownloadAttachment.
+type DownloadAttachmentParams struct {
+	// Key 附件下载能力凭证（上传响应 url 中的 256 位 hex）。缺参由生成层 400； 空值或不匹配一律 404，不区分「不存在」与「凭证错误」。
+	Key AttachmentKeyQuery `form:"key" json:"key"`
+}
+
+// DownloadAttachmentThumbnailParams defines parameters for DownloadAttachmentThumbnail.
+type DownloadAttachmentThumbnailParams struct {
+	// Key 附件下载能力凭证（上传响应 url 中的 256 位 hex）。缺参由生成层 400； 空值或不匹配一律 404，不区分「不存在」与「凭证错误」。
+	Key AttachmentKeyQuery `form:"key" json:"key"`
+}
 
 // DeleteCategoryParams defines parameters for DeleteCategory.
 type DeleteCategoryParams struct {
@@ -1024,6 +1077,9 @@ type ListServerMembersParams struct {
 	// IfNoneMatch 上次响应的 ETag；命中回 304
 	IfNoneMatch *string `json:"If-None-Match,omitempty"`
 }
+
+// UploadAttachmentMultipartRequestBody defines body for UploadAttachment for multipart/form-data ContentType.
+type UploadAttachmentMultipartRequestBody UploadAttachmentMultipartBody
 
 // SendEmailCodeJSONRequestBody defines body for SendEmailCode for application/json ContentType.
 type SendEmailCodeJSONRequestBody = EmailCodeRequest
@@ -1132,6 +1188,15 @@ type PatchMeApplicationMergePatchPlusJSONRequestBody = PatchMeRequest
 
 // ServerInterface represents all server handlers.
 type ServerInterface interface {
+	// UploadAttachment 上传附件（multipart，登录可传）
+	// (POST /api/v1/attachments)
+	UploadAttachment(w http.ResponseWriter, r *http.Request)
+	// DownloadAttachment 下载附件（能力 URL，免 Bearer）
+	// (GET /api/v1/attachments/{id})
+	DownloadAttachment(w http.ResponseWriter, r *http.Request, id IDPath, params DownloadAttachmentParams)
+	// DownloadAttachmentThumbnail 下载图片缩略图（能力 URL，免 Bearer）
+	// (GET /api/v1/attachments/{id}/thumbnail)
+	DownloadAttachmentThumbnail(w http.ResponseWriter, r *http.Request, id IDPath, params DownloadAttachmentThumbnailParams)
 	// SendEmailCode 发送邮箱验证码
 	// (POST /api/v1/auth/email-code)
 	SendEmailCode(w http.ResponseWriter, r *http.Request)
@@ -1313,6 +1378,104 @@ type ServerInterfaceWrapper struct {
 }
 
 type MiddlewareFunc func(http.Handler) http.Handler
+
+// UploadAttachment operation middleware
+func (siw *ServerInterfaceWrapper) UploadAttachment(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.UploadAttachment(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// DownloadAttachment operation middleware
+func (siw *ServerInterfaceWrapper) DownloadAttachment(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params DownloadAttachmentParams
+
+	// ------------- Required query parameter "key" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, true, "key", r.URL.Query(), &params.Key, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "key"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "key", Err: err})
+		}
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.DownloadAttachment(w, r, id, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// DownloadAttachmentThumbnail operation middleware
+func (siw *ServerInterfaceWrapper) DownloadAttachmentThumbnail(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params DownloadAttachmentThumbnailParams
+
+	// ------------- Required query parameter "key" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, true, "key", r.URL.Query(), &params.Key, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "key"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "key", Err: err})
+		}
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.DownloadAttachmentThumbnail(w, r, id, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
 
 // SendEmailCode operation middleware
 func (siw *ServerInterfaceWrapper) SendEmailCode(w http.ResponseWriter, r *http.Request) {
@@ -2959,6 +3122,9 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodPut+" "+options.BaseURL+"/api/v1/channels/{id}/overwrites/{target_type}/{target_id}", wrapper.SetChannelOverwrite)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/servers/{id}/audit-log", wrapper.ListAuditLog)
 	m.HandleFunc(http.MethodPut+" "+options.BaseURL+"/api/v1/channels/{id}/members/{user_id}/server-mute", wrapper.SetServerMuted)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/attachments", wrapper.UploadAttachment)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/attachments/{id}", wrapper.DownloadAttachment)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/attachments/{id}/thumbnail", wrapper.DownloadAttachmentThumbnail)
 
 	return m
 }
@@ -2981,9 +3147,302 @@ type NotFoundApplicationProblemPlusJSONResponse Problem
 
 type RateLimitedApplicationProblemPlusJSONResponse Problem
 
+type TooLargeApplicationProblemPlusJSONResponse Problem
+
 type TurnUnavailableApplicationProblemPlusJSONResponse Problem
 
 type UnauthorizedApplicationProblemPlusJSONResponse Problem
+
+type UploadAttachmentRequestObject struct {
+	Body *multipart.Reader
+}
+
+type UploadAttachmentResponseObject interface {
+	VisitUploadAttachmentResponse(w http.ResponseWriter) error
+}
+
+type UploadAttachment201JSONResponse Attachment
+
+func (response UploadAttachment201JSONResponse) VisitUploadAttachmentResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(201)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type UploadAttachment400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response UploadAttachment400ApplicationProblemPlusJSONResponse) VisitUploadAttachmentResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type UploadAttachment401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response UploadAttachment401ApplicationProblemPlusJSONResponse) VisitUploadAttachmentResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type UploadAttachment413ApplicationProblemPlusJSONResponse struct {
+	TooLargeApplicationProblemPlusJSONResponse
+}
+
+func (response UploadAttachment413ApplicationProblemPlusJSONResponse) VisitUploadAttachmentResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(413)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type UploadAttachment429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response UploadAttachment429ApplicationProblemPlusJSONResponse) VisitUploadAttachmentResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type UploadAttachmentdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response UploadAttachmentdefaultApplicationProblemPlusJSONResponse) VisitUploadAttachmentResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DownloadAttachmentRequestObject struct {
+	Id     IDPath `json:"id"`
+	Params DownloadAttachmentParams
+}
+
+type DownloadAttachmentResponseObject interface {
+	VisitDownloadAttachmentResponse(w http.ResponseWriter) error
+}
+
+type DownloadAttachment200ApplicationoctetStreamResponse struct {
+	Body          io.Reader
+	ContentLength int64
+}
+
+func (response DownloadAttachment200ApplicationoctetStreamResponse) VisitDownloadAttachmentResponse(w http.ResponseWriter) error {
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	if response.ContentLength != 0 {
+		w.Header().Set("Content-Length", fmt.Sprint(response.ContentLength))
+	}
+	w.WriteHeader(200)
+
+	if closer, ok := response.Body.(io.ReadCloser); ok {
+		defer closer.Close()
+	}
+	_, err := io.Copy(w, response.Body)
+	return err
+}
+
+type DownloadAttachment400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response DownloadAttachment400ApplicationProblemPlusJSONResponse) VisitDownloadAttachmentResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DownloadAttachment404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response DownloadAttachment404ApplicationProblemPlusJSONResponse) VisitDownloadAttachmentResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DownloadAttachment429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response DownloadAttachment429ApplicationProblemPlusJSONResponse) VisitDownloadAttachmentResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DownloadAttachmentdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response DownloadAttachmentdefaultApplicationProblemPlusJSONResponse) VisitDownloadAttachmentResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DownloadAttachmentThumbnailRequestObject struct {
+	Id     IDPath `json:"id"`
+	Params DownloadAttachmentThumbnailParams
+}
+
+type DownloadAttachmentThumbnailResponseObject interface {
+	VisitDownloadAttachmentThumbnailResponse(w http.ResponseWriter) error
+}
+
+type DownloadAttachmentThumbnail200ApplicationoctetStreamResponse struct {
+	Body          io.Reader
+	ContentLength int64
+}
+
+func (response DownloadAttachmentThumbnail200ApplicationoctetStreamResponse) VisitDownloadAttachmentThumbnailResponse(w http.ResponseWriter) error {
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	if response.ContentLength != 0 {
+		w.Header().Set("Content-Length", fmt.Sprint(response.ContentLength))
+	}
+	w.WriteHeader(200)
+
+	if closer, ok := response.Body.(io.ReadCloser); ok {
+		defer closer.Close()
+	}
+	_, err := io.Copy(w, response.Body)
+	return err
+}
+
+type DownloadAttachmentThumbnail400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response DownloadAttachmentThumbnail400ApplicationProblemPlusJSONResponse) VisitDownloadAttachmentThumbnailResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DownloadAttachmentThumbnail404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response DownloadAttachmentThumbnail404ApplicationProblemPlusJSONResponse) VisitDownloadAttachmentThumbnailResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DownloadAttachmentThumbnail429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response DownloadAttachmentThumbnail429ApplicationProblemPlusJSONResponse) VisitDownloadAttachmentThumbnailResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DownloadAttachmentThumbnaildefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response DownloadAttachmentThumbnaildefaultApplicationProblemPlusJSONResponse) VisitDownloadAttachmentThumbnailResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
 
 type SendEmailCodeRequestObject struct {
 	Body *SendEmailCodeJSONRequestBody
@@ -8460,6 +8919,15 @@ func (response PatchMedefaultApplicationProblemPlusJSONResponse) VisitPatchMeRes
 
 // StrictServerInterface represents all server handlers.
 type StrictServerInterface interface {
+	// UploadAttachment 上传附件（multipart，登录可传）
+	// (POST /api/v1/attachments)
+	UploadAttachment(ctx context.Context, request UploadAttachmentRequestObject) (UploadAttachmentResponseObject, error)
+	// DownloadAttachment 下载附件（能力 URL，免 Bearer）
+	// (GET /api/v1/attachments/{id})
+	DownloadAttachment(ctx context.Context, request DownloadAttachmentRequestObject) (DownloadAttachmentResponseObject, error)
+	// DownloadAttachmentThumbnail 下载图片缩略图（能力 URL，免 Bearer）
+	// (GET /api/v1/attachments/{id}/thumbnail)
+	DownloadAttachmentThumbnail(ctx context.Context, request DownloadAttachmentThumbnailRequestObject) (DownloadAttachmentThumbnailResponseObject, error)
 	// SendEmailCode 发送邮箱验证码
 	// (POST /api/v1/auth/email-code)
 	SendEmailCode(ctx context.Context, request SendEmailCodeRequestObject) (SendEmailCodeResponseObject, error)
@@ -8670,6 +9138,91 @@ type strictHandler struct {
 	ssi         StrictServerInterface
 	middlewares []StrictMiddlewareFunc
 	options     StrictHTTPServerOptions
+}
+
+// UploadAttachment operation middleware
+func (sh *strictHandler) UploadAttachment(w http.ResponseWriter, r *http.Request) {
+	var request UploadAttachmentRequestObject
+
+	if reader, err := r.MultipartReader(); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode multipart body: %w", err))
+		return
+	} else {
+		request.Body = reader
+	}
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.UploadAttachment(ctx, request.(UploadAttachmentRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "UploadAttachment")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(UploadAttachmentResponseObject); ok {
+		if err := validResponse.VisitUploadAttachmentResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// DownloadAttachment operation middleware
+func (sh *strictHandler) DownloadAttachment(w http.ResponseWriter, r *http.Request, id IDPath, params DownloadAttachmentParams) {
+	var request DownloadAttachmentRequestObject
+
+	request.Id = id
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.DownloadAttachment(ctx, request.(DownloadAttachmentRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "DownloadAttachment")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(DownloadAttachmentResponseObject); ok {
+		if err := validResponse.VisitDownloadAttachmentResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// DownloadAttachmentThumbnail operation middleware
+func (sh *strictHandler) DownloadAttachmentThumbnail(w http.ResponseWriter, r *http.Request, id IDPath, params DownloadAttachmentThumbnailParams) {
+	var request DownloadAttachmentThumbnailRequestObject
+
+	request.Id = id
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.DownloadAttachmentThumbnail(ctx, request.(DownloadAttachmentThumbnailRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "DownloadAttachmentThumbnail")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(DownloadAttachmentThumbnailResponseObject); ok {
+		if err := validResponse.VisitDownloadAttachmentThumbnailResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
 }
 
 // SendEmailCode operation middleware
@@ -10415,14 +10968,16 @@ func (sh *strictHandler) PatchMe(w http.ResponseWriter, r *http.Request) {
 // PublicRoutePatterns 免鉴权路由（openapi.yaml 中 security: [] 的操作）。
 // 由 openapigen 生成；未列出的路由一律要求 Bearer 鉴权。
 var PublicRoutePatterns = map[string]bool{
-	"GET /api/v1/config":               true,
-	"GET /api/v1/healthz":              true,
-	"POST /api/v1/auth/email-code":     true,
-	"POST /api/v1/auth/guest":          true,
-	"POST /api/v1/auth/login":          true,
-	"POST /api/v1/auth/logout":         true,
-	"POST /api/v1/auth/password/reset": true,
-	"POST /api/v1/auth/refresh":        true,
-	"POST /api/v1/auth/register":       true,
-	"POST /api/v1/rtc/credentials":     true,
+	"GET /api/v1/attachments/{id}":           true,
+	"GET /api/v1/attachments/{id}/thumbnail": true,
+	"GET /api/v1/config":                     true,
+	"GET /api/v1/healthz":                    true,
+	"POST /api/v1/auth/email-code":           true,
+	"POST /api/v1/auth/guest":                true,
+	"POST /api/v1/auth/login":                true,
+	"POST /api/v1/auth/logout":               true,
+	"POST /api/v1/auth/password/reset":       true,
+	"POST /api/v1/auth/refresh":              true,
+	"POST /api/v1/auth/register":             true,
+	"POST /api/v1/rtc/credentials":           true,
 }

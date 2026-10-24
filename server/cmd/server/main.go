@@ -24,8 +24,10 @@ import (
 
 	"github.com/OpenALC/LiteTalk/server/internal/acme"
 	"github.com/OpenALC/LiteTalk/server/internal/api"
+	"github.com/OpenALC/LiteTalk/server/internal/attachment"
 	"github.com/OpenALC/LiteTalk/server/internal/auth"
 	"github.com/OpenALC/LiteTalk/server/internal/authz"
+	"github.com/OpenALC/LiteTalk/server/internal/blob"
 	"github.com/OpenALC/LiteTalk/server/internal/bootstrap"
 	"github.com/OpenALC/LiteTalk/server/internal/mailer"
 	"github.com/OpenALC/LiteTalk/server/internal/rtcapi"
@@ -327,6 +329,15 @@ func main() {
 	}, log.Default())
 	log.Printf("发信通道: %s", mailName)
 
+	// 附件二进制存储（#41 B2）：local（默认，$DATA_DIR/uploads）或 S3 兼容对象存储。
+	// 只校验配置不探测连通性：S3 暂时不可达不应挡住整个服务启动。
+	blobStore, blobDriver, err := blob.New(cfg.upload, log.Default())
+	if err != nil {
+		log.Fatalf("附件存储不可用: %v", err)
+	}
+	log.Printf("附件存储: %s（单文件上限 %d MiB，图片单边上限 %d 像素）",
+		blobDriver, cfg.uploadMax>>20, serverUploadMaxDimension)
+
 	// Auth 模式：full（默认，验证码流程）/ simple（免验证码，私域部署从简）。
 	// 合法性已在 cfg.validate（步骤 2）把关。
 	authMode := cfg.authMode
@@ -367,6 +378,13 @@ func main() {
 		RTCAuth: rtcAuth,
 		// 权限判定与信令 hub 共用同一实例（#35 B3）。
 		Authz: authzInst,
+		// 附件存储与校验（#41 B2）：上传/下载端点；MaxDimension 显式收紧到 4096。
+		Blob: blobStore,
+		Upload: attachment.Config{
+			MaxBytes:     cfg.uploadMax,
+			MaxDimension: serverUploadMaxDimension,
+			AllowedTypes: cfg.uploadTypes,
+		},
 	})
 
 	mux := http.NewServeMux()

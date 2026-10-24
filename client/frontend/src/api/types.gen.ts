@@ -888,24 +888,94 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/attachments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 上传附件（multipart，登录可传）
+         * @description multipart/form-data 只接受单个 file 字段（其余字段 400 bad_request）； 类型以服务端内容嗅探为准，不信任 filename/content_type。允许 jpeg/png/gif/ webp/pdf/txt/zip（部署可配），图片单边不超过 4096 像素，并生成最长边 320 的 JPEG 缩略图。返回的 url/thumbnail_url 是带能力凭证 key 的相对路径， 可直接用于 img 标签。附件与消息的关联由消息发送接口以 attachment_ids 完成（#41 B3），本端点只负责上传。 code：bad_request、bad_type、bad_image、too_large；401 unauthorized； 429 rate_limited（每用户 30 次/分钟）；5xx internal / storage_error。
+         */
+        post: operations["uploadAttachment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/attachments/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 下载附件（能力 URL，免 Bearer）
+         * @description 免鉴权：凭证是查询参数 key（上传响应 url 中携带的 256 位 hex），可直接 用作 img 的 src。ID 与 key 不匹配、附件不存在、blob 丢失、或所属消息已 软删一律 404 not_found（不区分原因，不泄露存在性）；尚未被消息引用的附件 也可下载（上传者尚未发送）。响应头：Content-Type 为附件类型（仅限白名单， 否则 application/octet-stream）、Content-Disposition 图片 inline 其余 attachment（filename* 按 RFC 2231 转义）、Content-Length、 Cache-Control private, max-age=86400, immutable、 X-Content-Type-Options nosniff。 code：bad_request（路径 ID 非法）；404 not_found；429 rate_limited （按 IP 的失败扫描限流）；5xx internal。
+         */
+        get: operations["downloadAttachment"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/attachments/{id}/thumbnail": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 下载图片缩略图（能力 URL，免 Bearer）
+         * @description 与下载附件同一能力凭证口径（security 为空，query key 必填）；只对图片且 缩略图已生成的附件可用，否则 404 not_found。响应为 image/jpeg，其余头 与下载附件一致。 code：bad_request（路径 ID 非法）；404 not_found；429 rate_limited （按 IP 的失败扫描限流）；5xx internal。
+         */
+        get: operations["downloadAttachmentThumbnail"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
         /**
          * Attachment
-         * @description 附件元数据（#31 预留 schema 占位，实现移出本批另单跟踪）。 计划端点：POST /api/v1/attachments（multipart，登录可传）返回本结构， 消息体以 attachment_ids 引用；存储后端可插拔（本地磁盘 / S3 兼容）。 本批不实现端点，字段形状以实现落地时为准。
+         * @description 附件元数据（#41）。二进制内容不在 JSON 中；url 与 thumbnail_url 是带下载 能力凭证（key）的相对路径（/api/v1/attachments/{id}?key=...），可直接放进 img 标签，不需要 Authorization。宽高仅图片非零；thumbnail_url 仅图片给出。
          */
         Attachment: {
             /** @description 附件 ID（十进制字符串） */
             id: string;
+            /** @description 展示用文件名（已去除路径分隔符与控制字符） */
             filename: string;
             /**
              * Format: int64
              * @description 字节数
              */
             size: number;
+            /** @description 服务端嗅探出的内容类型（白名单内） */
             content_type: string;
+            /** @description 原图像素宽（非图片为 0） */
+            width?: number;
+            /** @description 原图像素高（非图片为 0） */
+            height?: number;
+            /** @description 带能力 key 的下载路径（相对路径） */
+            url: string;
+            /** @description 带能力 key 的缩略图路径；非图片或缩略图生成失败时不返回 */
+            thumbnail_url?: string;
         };
         /**
          * Problem
@@ -1627,6 +1697,15 @@ export interface components {
                 "application/problem+json": components["schemas"]["Problem"];
             };
         };
+        /** @description 请求体或上传文件超过大小上限（body.code：too_large）。 LITETALK_UPLOAD_MAX_BYTES 配置单附件上限（默认 10 MiB）。 */
+        TooLarge: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/problem+json": components["schemas"]["Problem"];
+            };
+        };
         /** @description 客户端版本过旧（body.code：client_too_old）。服务端要求请求头 X-LiteTalk-Client 不低于 1.5；缺失或更低版本的 /auth/* 请求被拒绝。 message 与 detail 同值，旧客户端可直接显示升级提示。 */
         ClientUpgradeRequired: {
             headers: {
@@ -1675,6 +1754,8 @@ export interface components {
         TargetTypePath: "role" | "member";
         /** @description 覆盖目标（角色或成员）ID 的十进制数字串（#35 B4） */
         TargetIDPath: number;
+        /** @description 附件下载能力凭证（上传响应 url 中的 256 位 hex）。缺参由生成层 400； 空值或不匹配一律 404，不区分「不存在」与「凭证错误」。 */
+        AttachmentKeyQuery: string;
     };
     requestBodies: never;
     headers: never;
@@ -3386,6 +3467,101 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    uploadAttachment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": {
+                    /**
+                     * Format: binary
+                     * @description 文件内容（唯一字段）
+                     */
+                    file: string;
+                };
+            };
+        };
+        responses: {
+            /** @description 上传成功；返回附件元数据与带能力凭证的下载路径 */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Attachment"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            413: components["responses"]["TooLarge"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    downloadAttachment: {
+        parameters: {
+            query: {
+                /** @description 附件下载能力凭证（上传响应 url 中的 256 位 hex）。缺参由生成层 400； 空值或不匹配一律 404，不区分「不存在」与「凭证错误」。 */
+                key: components["parameters"]["AttachmentKeyQuery"];
+            };
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 附件字节流（实际 Content-Type 为附件类型，见操作描述；此处按二进制声明） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    downloadAttachmentThumbnail: {
+        parameters: {
+            query: {
+                /** @description 附件下载能力凭证（上传响应 url 中的 256 位 hex）。缺参由生成层 400； 空值或不匹配一律 404，不区分「不存在」与「凭证错误」。 */
+                key: components["parameters"]["AttachmentKeyQuery"];
+            };
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description JPEG 缩略图（最长边 320，白底，quality 82） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
             default: components["responses"]["Internal"];
         };
     };

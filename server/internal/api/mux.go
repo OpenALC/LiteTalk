@@ -89,10 +89,23 @@ func clientVersionAccepted(header string) bool {
 	return major > minClientMajor || (major == minClientMajor && minor >= minClientMinor)
 }
 
-// limitBody 请求体 1MB 上限（与旧 decodeJSON 一致）；超限在解码报错里区分。
-func limitBody(next http.Handler) http.Handler {
+// defaultBodyLimit 普通 JSON 端点请求体上限（与旧 decodeJSON 一致，1 MiB）。
+const defaultBodyLimit int64 = 1 << 20
+
+// multipartOverhead 上传端点的 multipart 头/边界/其他字段余量。文件本身由
+// attachment.Process 按 MaxBytes 精确判定；这里的余量只为让超限文件走到 413
+// 而不是被 MaxBytesReader 在解析阶段直接掐断。
+const multipartOverhead int64 = 1 << 20
+
+// limitBody 请求体上限：默认 1 MiB；上传附件端点按配置的单文件上限 + multipart 余量。
+// 超限由读取方以 *http.MaxBytesError 暴露，requestErrorHandler 统一映射 413。
+func (s *Server) limitBody(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		limit := defaultBodyLimit
+		if r.Method == http.MethodPost && r.URL.Path == "/api/v1/attachments" {
+			limit = s.upload.MaxBytes + multipartOverhead
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -112,11 +125,17 @@ func (c contentTypeFixer) WriteHeader(code int) {
 }
 
 // requestErrorHandler 与旧 decodeJSON 逐字一致：超限 413 too_large，
-// 其余 400 bad_request「请求体不是合法 JSON」。
+// 其余 400 bad_request「请求体不是合法 JSON」；multipart 上传端点解码失败时
+// 用表单口径的提示，避免把「不是 multipart」说成「不是 JSON」。
 func (s *Server) requestErrorHandler(w http.ResponseWriter, r *http.Request, err error) {
 	var maxErr *http.MaxBytesError
 	if errors.As(err, &maxErr) {
 		writeErr(w, http.StatusRequestEntityTooLarge, "too_large", "请求体过大")
+		return
+	}
+	if r.URL.Path == "/api/v1/attachments" ||
+		strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "multipart/form-data") {
+		writeErr(w, http.StatusBadRequest, "bad_request", "请求体不是合法的 multipart 表单")
 		return
 	}
 	writeErr(w, http.StatusBadRequest, "bad_request", "请求体不是合法 JSON")

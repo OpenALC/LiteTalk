@@ -10,8 +10,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/OpenALC/LiteTalk/server/internal/attachment"
 	"github.com/OpenALC/LiteTalk/server/internal/auth"
 	"github.com/OpenALC/LiteTalk/server/internal/authz"
+	"github.com/OpenALC/LiteTalk/server/internal/blob"
 	"github.com/OpenALC/LiteTalk/server/internal/mailer"
 	"github.com/OpenALC/LiteTalk/server/internal/rtcapi"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
@@ -84,6 +86,10 @@ type Server struct {
 	rtcCfg rtcapi.Config
 	// rtcAuth 从访问令牌提取 uid；nil 时该端点一律 401（fail-closed）。
 	rtcAuth rtcapi.UserFromToken
+	// blob 附件二进制存储（#41 B2）：上传/下载端点用；nil 时附件端点 500（测试/降级）。
+	blob blob.Store
+	// upload 附件校验参数（MaxBytes/MaxDimension/AllowedTypes）；New 里补默认值。
+	upload attachment.Config
 }
 
 // Config 构造配置。
@@ -122,6 +128,12 @@ type Config struct {
 	// Authz 权限判定（#35 B3）。nil 时用 Store 自建默认实例（测试兼容）；
 	// 生产必须传入与 signal.Hub 共享的同一实例，否则写后失效不同步。
 	Authz *authz.Authorizer
+	// Blob 附件二进制存储（#41 B2）。生产由 cmd/server 按 LITETALK_UPLOAD_* 构造；
+	// nil 时上传/下载端点返回 500（测试未注入 blob 的旧用例不受影响）。
+	Blob blob.Store
+	// Upload 附件校验参数。MaxBytes<=0 回落 10 MiB；MaxDimension<=0 回落 4096
+	// （服务端显式收紧，包默认 8192 对解压炸弹风险偏高）；AllowedTypes 为空用默认白名单。
+	Upload attachment.Config
 }
 
 // New 构造 API Server。
@@ -167,7 +179,28 @@ func New(cfg Config) *Server {
 		version:           ver,
 		rtcCfg:            cfg.RTC,
 		rtcAuth:           cfg.RTCAuth,
+		blob:              cfg.Blob,
+		upload:            normalizeUploadConfig(cfg.Upload),
 	}
+}
+
+// serverDefaultMaxDimension 服务端图片单边上限（像素）。attachment 包默认 8192，
+// 服务端收紧到 4096：解码巨图的内存峰值与解压炸弹风险都随之下降。
+const serverDefaultMaxDimension = 4096
+
+// normalizeUploadConfig 补零值：单文件上限、图片单边上限与白名单都必须有值，
+// 否则 limitBody 会按 0 计算上传配额、下载白名单校验也会失效。
+func normalizeUploadConfig(cfg attachment.Config) attachment.Config {
+	if cfg.MaxBytes <= 0 {
+		cfg.MaxBytes = attachment.DefaultMaxBytes
+	}
+	if cfg.MaxDimension <= 0 {
+		cfg.MaxDimension = serverDefaultMaxDimension
+	}
+	if len(cfg.AllowedTypes) == 0 {
+		cfg.AllowedTypes = append([]string(nil), attachment.DefaultAllowedTypes...)
+	}
+	return cfg
 }
 
 // parseTrustedProxies 把 IP/CIDR 字符串列表解析成匹配网络；非法项跳过并记日志。
@@ -218,7 +251,7 @@ func (s *Server) Handler() http.Handler {
 	})
 	h := HandlerWithOptions(si, StdHTTPServerOptions{
 		BaseRouter:  &authMux{ServeMux: http.NewServeMux(), s: s},
-		Middlewares: []MiddlewareFunc{limitBody},
+		Middlewares: []MiddlewareFunc{s.limitBody},
 		ErrorHandlerFunc: func(w http.ResponseWriter, r *http.Request, err error) {
 			writeErr(w, http.StatusBadRequest, "bad_request", "路径参数不合法")
 		},

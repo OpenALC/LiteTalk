@@ -97,6 +97,11 @@ func Process(filename string, data []byte, cfg Config) (*Processed, error) {
 		return nil, fmt.Errorf("%w: 文件超过 %d 字节上限", ErrTooLarge, cfg.MaxBytes)
 	}
 	contentType := normalizeContentType(http.DetectContentType(data))
+	// DetectContentType 不识别 SVG，会把它归为 text/plain 混进默认白名单；
+	// SVG 可携带脚本，显式拒绝（与包文档「不含可执行 SVG/HTML」一致）。
+	if looksLikeSVG(data) {
+		return nil, fmt.Errorf("%w: SVG 不在白名单（可含脚本）", ErrBadType)
+	}
 	if !allowedType(contentType, cfg.AllowedTypes) {
 		return nil, fmt.Errorf("%w: 不支持的文件类型 %s", ErrBadType, contentType)
 	}
@@ -170,12 +175,31 @@ func allowedType(contentType string, allowed []string) bool {
 	return false
 }
 
+// isImageType 判断是否为支持生成缩略图的栅格图片类型。
 func isImageType(contentType string) bool {
 	switch contentType {
 	case "image/jpeg", "image/png", "image/gif", "image/webp":
 		return true
 	}
 	return false
+}
+
+// looksLikeSVG 识别开头的 SVG / XML-SVG 文本：去 BOM 与前导空白后以 <svg 开头，
+// 或 XML 声明后出现 <svg。只看前 1 KiB（真正的 SVG 根元素在最前面），
+// 避免把正文中提到 <svg 的普通文本误判。
+func looksLikeSVG(data []byte) bool {
+	head := bytes.TrimSpace(data)
+	if bytes.HasPrefix(head, []byte("\xef\xbb\xbf")) { // UTF-8 BOM
+		head = bytes.TrimSpace(head[3:])
+	}
+	if len(head) > 1024 {
+		head = head[:1024]
+	}
+	lower := bytes.ToLower(head)
+	if bytes.HasPrefix(lower, []byte("<svg")) {
+		return true
+	}
+	return bytes.HasPrefix(lower, []byte("<?xml")) && bytes.Contains(lower, []byte("<svg"))
 }
 
 // processImage 先用 DecodeConfig 拿尺寸（避免为超大图分配完整像素），再解码整图生成缩略图。

@@ -143,6 +143,10 @@ func TestProcessNonImage(t *testing.T) {
 			t.Fatalf("%s：非图片不应有缩略图/宽高: %dx%d %d bytes", wantType, p.Width, p.Height, len(p.Thumb))
 		}
 	}
+	// 正文中间提到 <svg 的普通文本不应按 SVG 拒绝（只检查开头）。
+	if p, err := Process("notes.txt", []byte("日志里提到 <svg> 标签\n"), Config{}); err != nil || p.ContentType != "text/plain" {
+		t.Fatalf("普通文本提到 SVG 应接受: %+v %v", p, err)
+	}
 }
 
 func TestProcessRejects(t *testing.T) {
@@ -158,6 +162,8 @@ func TestProcessRejects(t *testing.T) {
 		{"空文件", nil, Config{}, ErrBadType},
 		{"超大小", pngData, Config{MaxBytes: int64(len(pngData) - 1)}, ErrTooLarge},
 		{"白名单外 HTML", []byte("<!DOCTYPE html><html><body>hi</body></html>"), Config{}, ErrBadType},
+		{"SVG 裸根元素", []byte(`<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>`), Config{}, ErrBadType},
+		{"XML 声明的 SVG", []byte("<?xml version=\"1.0\"?>\n<svg xmlns=\"http://www.w3.org/2000/svg\"/>"), Config{}, ErrBadType},
 		{"损坏图片", corrupt, Config{}, ErrBadImage},
 		{"图片超出单边限制", pngData, Config{MaxDimension: 15}, ErrBadImage},
 		{"默认单边限制", encodePNG(t, DefaultMaxDimension+1, 1), Config{}, ErrBadImage},
