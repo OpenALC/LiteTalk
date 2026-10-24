@@ -1062,6 +1062,15 @@ type DeleteChannelOverwriteParamsTargetType string
 // SetChannelOverwriteParamsTargetType defines parameters for SetChannelOverwrite.
 type SetChannelOverwriteParamsTargetType string
 
+// SearchMessagesParams defines parameters for SearchMessages.
+type SearchMessagesParams struct {
+	// Q 搜索词（trim 后 1–100 字符；中文按子串匹配）
+	Q string `form:"q" json:"q"`
+
+	// Limit 条数上限（1–50，缺省 20；显式越界返回 400 bad_limit）
+	Limit *int `form:"limit,omitempty" json:"limit,omitempty"`
+}
+
 // ListAuditLogParams defines parameters for ListAuditLog.
 type ListAuditLogParams struct {
 	// Before 游标（上一页最旧一条的 id）；0/缺省取最新页
@@ -1319,6 +1328,9 @@ type ServerInterface interface {
 	// PostRtcCredentials 签发 TURN 短期凭证
 	// (POST /api/v1/rtc/credentials)
 	PostRtcCredentials(w http.ResponseWriter, r *http.Request)
+	// SearchMessages 搜索当前用户可见频道内的消息
+	// (GET /api/v1/search)
+	SearchMessages(w http.ResponseWriter, r *http.Request, params SearchMessagesParams)
 	// ListServers 我所在的服务器列表
 	// (GET /api/v1/servers)
 	ListServers(w http.ResponseWriter, r *http.Request)
@@ -2480,6 +2492,52 @@ func (siw *ServerInterfaceWrapper) PostRtcCredentials(w http.ResponseWriter, r *
 	handler.ServeHTTP(w, r)
 }
 
+// SearchMessages operation middleware
+func (siw *ServerInterfaceWrapper) SearchMessages(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params SearchMessagesParams
+
+	// ------------- Required query parameter "q" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, true, "q", r.URL.Query(), &params.Q, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "q"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "q", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "limit" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "limit", r.URL.Query(), &params.Limit, runtime.BindQueryParameterOptions{Type: "integer", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "limit"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "limit", Err: err})
+		}
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.SearchMessages(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 // ListServers operation middleware
 func (siw *ServerInterfaceWrapper) ListServers(w http.ResponseWriter, r *http.Request) {
 
@@ -3094,6 +3152,7 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/conversations/{id}/members", wrapper.AddConversationMembers)
 	m.HandleFunc(http.MethodDelete+" "+options.BaseURL+"/api/v1/conversations/{id}/members/{user_id}", wrapper.RemoveConversationMember)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/unreads", wrapper.ListUnreads)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/search", wrapper.SearchMessages)
 	m.HandleFunc(http.MethodPut+" "+options.BaseURL+"/api/v1/channels/{id}/read", wrapper.MarkChannelRead)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/sync", wrapper.GetSync)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/servers", wrapper.ListServers)
@@ -7332,6 +7391,93 @@ func (response PostRtcCredentials503ApplicationProblemPlusJSONResponse) VisitPos
 	return err
 }
 
+type SearchMessagesRequestObject struct {
+	Params SearchMessagesParams
+}
+
+type SearchMessagesResponseObject interface {
+	VisitSearchMessagesResponse(w http.ResponseWriter) error
+}
+
+type SearchMessages200JSONResponse []Message
+
+func (response SearchMessages200JSONResponse) VisitSearchMessagesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SearchMessages400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response SearchMessages400ApplicationProblemPlusJSONResponse) VisitSearchMessagesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SearchMessages401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response SearchMessages401ApplicationProblemPlusJSONResponse) VisitSearchMessagesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SearchMessages429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response SearchMessages429ApplicationProblemPlusJSONResponse) VisitSearchMessagesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SearchMessagesdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response SearchMessagesdefaultApplicationProblemPlusJSONResponse) VisitSearchMessagesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
 type ListServersRequestObject struct {
 }
 
@@ -9050,6 +9196,9 @@ type StrictServerInterface interface {
 	// PostRtcCredentials 签发 TURN 短期凭证
 	// (POST /api/v1/rtc/credentials)
 	PostRtcCredentials(ctx context.Context, request PostRtcCredentialsRequestObject) (PostRtcCredentialsResponseObject, error)
+	// SearchMessages 搜索当前用户可见频道内的消息
+	// (GET /api/v1/search)
+	SearchMessages(ctx context.Context, request SearchMessagesRequestObject) (SearchMessagesResponseObject, error)
 	// ListServers 我所在的服务器列表
 	// (GET /api/v1/servers)
 	ListServers(ctx context.Context, request ListServersRequestObject) (ListServersResponseObject, error)
@@ -10415,6 +10564,32 @@ func (sh *strictHandler) PostRtcCredentials(w http.ResponseWriter, r *http.Reque
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
 	} else if validResponse, ok := response.(PostRtcCredentialsResponseObject); ok {
 		if err := validResponse.VisitPostRtcCredentialsResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// SearchMessages operation middleware
+func (sh *strictHandler) SearchMessages(w http.ResponseWriter, r *http.Request, params SearchMessagesParams) {
+	var request SearchMessagesRequestObject
+
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.SearchMessages(ctx, request.(SearchMessagesRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "SearchMessages")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(SearchMessagesResponseObject); ok {
+		if err := validResponse.VisitSearchMessagesResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {

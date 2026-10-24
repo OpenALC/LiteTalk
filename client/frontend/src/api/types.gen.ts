@@ -404,6 +404,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 搜索当前用户可见频道内的消息
+         * @description #42：在全部可见文字频道（已加入服务器中 ViewChannel 可见的频道 + 当前用户 参与的 direct/group 会话）内按正文搜索，结果按相关度、其次消息 ID 倒序返回。 频道可见性由服务端逐频道复核，非成员会话与无权限频道不会出现在结果里。 只返回未软删消息；q trim 后须为 1–100 字符，否则 400 bad_query；缺 q 由 生成层先拒（400 bad_request）。limit 缺省 20、显式越界（0 或 >50）返回 400 bad_limit。空结果是 []，不是 null。频控 30 次/分/用户，超限 429 rate_limited。 code：bad_request（缺 q）、bad_query、bad_limit；401；429 rate_limited； 5xx internal。
+         */
+        get: operations["searchMessages"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/channels/{id}/read": {
         parameters: {
             query?: never;
@@ -2434,6 +2454,35 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    searchMessages: {
+        parameters: {
+            query: {
+                /** @description 搜索词（trim 后 1–100 字符；中文按子串匹配） */
+                q: string;
+                /** @description 条数上限（1–50，缺省 20；显式越界返回 400 bad_limit） */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 消息数组（相关度、ID 倒序；含附件/提及/回复预览；不含发送者邮箱） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Message"][];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimited"];
             default: components["responses"]["Internal"];
         };
     };

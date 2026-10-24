@@ -743,6 +743,55 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         default:
           $ref: '#/components/responses/Internal'
+  /api/v1/search:
+    get:
+      operationId: searchMessages
+      summary: 搜索当前用户可见频道内的消息
+      description: >
+        #42：在全部可见文字频道（已加入服务器中 ViewChannel 可见的频道 + 当前用户
+        参与的 direct/group 会话）内按正文搜索，结果按相关度、其次消息 ID 倒序返回。
+        频道可见性由服务端逐频道复核，非成员会话与无权限频道不会出现在结果里。
+        只返回未软删消息；q trim 后须为 1–100 字符，否则 400 bad_query；缺 q 由
+        生成层先拒（400 bad_request）。limit 缺省 20、显式越界（0 或 >50）返回
+        400 bad_limit。空结果是 []，不是 null。频控 30 次/分/用户，超限 429
+        rate_limited。
+        code：bad_request（缺 q）、bad_query、bad_limit；401；429 rate_limited；
+        5xx internal。
+      tags: [messages]
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: 搜索词（trim 后 1–100 字符；中文按子串匹配）
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 100
+        - name: limit
+          in: query
+          required: false
+          description: 条数上限（1–50，缺省 20；显式越界返回 400 bad_limit）
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+      responses:
+        '200':
+          description: 消息数组（相关度、ID 倒序；含附件/提及/回复预览；不含发送者邮箱）
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Message'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Internal'
   /api/v1/channels/{id}/read:
     put:
       operationId: markChannelRead
