@@ -1861,6 +1861,24 @@ func (a *App) ListMessages(channelID string, limit int) ([]ChatMessageView, erro
 	return out, nil
 }
 
+// SearchMessages 全局消息搜索（#42 B2）：跨服务器频道与会话，载荷与 ListMessages
+// 同口径（ts 毫秒字符串、附件 URL 已绝对化），前端可直接按 channel_id 定位。
+// 搜索词为空白时 APIClient 直接返回空结果；limit 由其夹到 [1,50]。
+func (a *App) SearchMessages(query string, limit int) ([]ChatMessageView, error) {
+	if a.api == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	msgs, err := a.api.SearchMessages(query, limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ChatMessageView, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, a.chatMessageView(m))
+	}
+	return out, nil
+}
+
 // GetMessage 单条消息（#39）：回复跳转与软删消息回读。不存在/不可见返回错误。
 func (a *App) GetMessage(channelID, messageID string) (*ChatMessageView, error) {
 	cid, err := strconv.ParseInt(channelID, 10, 64)
