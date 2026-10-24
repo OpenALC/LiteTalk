@@ -89,9 +89,40 @@ func (s *Server) ListMessages(ctx context.Context, request ListMessagesRequestOb
 // 消息发送频控：20 条/分钟/用户。
 const msgRateLimit = 20
 
+// maxMessageAttachments 单条消息最多携带的附件数（#41）。
+const maxMessageAttachments = 10
+
+// parseMessageAttachmentIDs 校验请求携带的 attachment_ids（#41）：最多 10 个、
+// 正整数、不可重复。格式问题在此拦下（400 bad_attachment）；附件是否存在、
+// 是否本人上传、是否已被引用由 store.CreateMessage 认领时判定。
+func parseMessageAttachmentIDs(raw *[]string) ([]int64, *apiErr) {
+	if raw == nil || len(*raw) == 0 {
+		return nil, nil
+	}
+	if len(*raw) > maxMessageAttachments {
+		return nil, errf(http.StatusBadRequest, "bad_attachment", "单条消息最多 10 个附件")
+	}
+	seen := make(map[int64]struct{}, len(*raw))
+	out := make([]int64, 0, len(*raw))
+	for _, v := range *raw {
+		id, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || id <= 0 {
+			return nil, errf(http.StatusBadRequest, "bad_attachment", "附件 ID 不合法")
+		}
+		if _, dup := seen[id]; dup {
+			return nil, errf(http.StatusBadRequest, "bad_attachment", "附件 ID 不可重复")
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out, nil
+}
+
 // CreateMessage POST /api/v1/channels/{id}/messages（≤2000 字 + 频控 + nonce 幂等，#31）
 // nonce 幂等：同频道同用户同 nonce 只落一条，重复提交回读原消息 200（弱网重试对账）。
 // 幂等判断先于频控：重试撞上配额时也必须拿回原消息，而不是 429（审查 P2）。
+// #41：attachment_ids 最多 10 个、正整数、不可重复；带附件时 content 允许为空串
+// （纯附件消息），没有附件时仍要求 1–2000 字符。
 func (s *Server) CreateMessage(ctx context.Context, request CreateMessageRequestObject) (CreateMessageResponseObject, error) {
 	if e := checkID(request.Id); e != nil {
 		return nil, e
@@ -124,9 +155,13 @@ func (s *Server) CreateMessage(ctx context.Context, request CreateMessageRequest
 			return nil, e
 		}
 	}
+	attachmentIDs, e := parseMessageAttachmentIDs(request.Body.AttachmentIds)
+	if e != nil {
+		return nil, e
+	}
 	content := request.Body.Content
-	if n := len([]rune(content)); n == 0 || n > 2000 {
-		return nil, errf(http.StatusBadRequest, "bad_content", "消息长度需为 1–2000 字符")
+	if n := len([]rune(content)); n > 2000 || (n == 0 && len(attachmentIDs) == 0) {
+		return nil, errf(http.StatusBadRequest, "bad_content", "消息长度需为 0–2000 字符（无附件时至少 1 字符）")
 	}
 	var nonce string
 	if request.Body.Nonce != nil {
@@ -162,14 +197,19 @@ func (s *Server) CreateMessage(ctx context.Context, request CreateMessageRequest
 		return nil, e
 	}
 	msg := &store.Message{
-		ChannelID: ch.ID,
-		UserID:    c.UserID,
-		Content:   content,
-		Nonce:     nonce,
-		ReplyTo:   replyTo,
-		Mentions:  mentions,
+		ChannelID:     ch.ID,
+		UserID:        c.UserID,
+		Content:       content,
+		Nonce:         nonce,
+		ReplyTo:       replyTo,
+		Mentions:      mentions,
+		AttachmentIDs: attachmentIDs,
 	}
 	if err := s.store.CreateMessage(ctx, msg); err != nil {
+		// 附件认领失败（不存在/非本人/已被引用）：整条消息回滚，400 而非 500。
+		if errors.Is(err, store.ErrAttachmentUnavailable) {
+			return nil, errf(http.StatusBadRequest, "bad_attachment", "附件不存在、非本人上传或已被引用")
+		}
 		// 撞 (channel_id, user_id, nonce) 唯一索引 = 幂等重放：回读原消息返回 200。
 		if nonce != "" && errors.Is(err, store.ErrConflict) {
 			orig, rerr := s.store.MessageByNonce(ctx, ch.ID, c.UserID, nonce)

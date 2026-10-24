@@ -114,8 +114,9 @@ func memberView(m *store.ServerMember, online bool) MemberInfo {
 }
 
 // messageView 消息 wire 视图（#39）：mentions 与回复目标由调用方批量装配后传入
-// （nil 表示无提及 / 目标不存在）。
-func messageView(m *store.Message, mentions []int64, reply *store.Message) Message {
+// （nil 表示无提及 / 目标不存在）。#41：attachments 由调用方批量加载后传入；
+// 软删消息即使库里仍有附件行也不下发。
+func messageView(m *store.Message, mentions []int64, reply *store.Message, attachments []store.Attachment) Message {
 	out := Message{
 		Id:        idOf(m.ID),
 		ChannelId: idOf(m.ChannelID),
@@ -156,6 +157,13 @@ func messageView(m *store.Message, mentions []int64, reply *store.Message) Messa
 	if reply != nil {
 		out.ReplyPreview = replyPreviewView(reply)
 	}
+	if m.DeletedAt == nil && len(attachments) > 0 {
+		list := make([]Attachment, 0, len(attachments))
+		for i := range attachments {
+			list = append(list, attachmentView(&attachments[i]))
+		}
+		out.Attachments = &list
+	}
 	return out
 }
 
@@ -175,15 +183,16 @@ func replyPreviewView(m *store.Message) *ReplyPreview {
 	}
 }
 
-// messageExtras 一批消息的 #39 附加字段：提及用户与回复目标。
+// messageExtras 一批消息的 #39/#41 附加字段：提及用户、回复目标与附件。
 type messageExtras struct {
-	mentions map[int64][]int64
-	replies  map[int64]*store.Message
+	mentions    map[int64][]int64
+	replies     map[int64]*store.Message
+	attachments map[int64][]store.Attachment
 }
 
-// loadMessageExtras 批量装配提及与回复目标：一次 MentionsOfMessages + 一次
-// MessagesByIDs，列表不做 N+1。回复目标不存在（历史脏数据）时该条不出
-// reply_preview，不阻断其它消息。
+// loadMessageExtras 批量装配提及、回复目标与附件：一次 MentionsOfMessages +
+// 一次 MessagesByIDs + 一次 AttachmentsByMessageIDs，列表不做 N+1。回复目标
+// 不存在（历史脏数据）时该条不出 reply_preview，不阻断其它消息。
 func (s *Server) loadMessageExtras(ctx context.Context, msgs []store.Message) (*messageExtras, *apiErr) {
 	ids := make([]int64, 0, len(msgs))
 	replyIDs := make([]int64, 0, len(msgs))
@@ -208,7 +217,11 @@ func (s *Server) loadMessageExtras(ctx context.Context, msgs []store.Message) (*
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	return &messageExtras{mentions: mentions, replies: replies}, nil
+	attachments, err := s.store.AttachmentsByMessageIDs(ctx, ids)
+	if err != nil {
+		return nil, s.writeStoreErr(ctx, err)
+	}
+	return &messageExtras{mentions: mentions, replies: replies, attachments: attachments}, nil
 }
 
 // view 单条转换（回复目标缺失时 reply_preview 缺省）。
@@ -217,7 +230,12 @@ func (x *messageExtras) view(m *store.Message) Message {
 	if m.ReplyTo != nil {
 		reply = x.replies[*m.ReplyTo]
 	}
-	return messageView(m, x.mentions[m.ID], reply)
+	// 软删消息不返回附件（附件行仍在库里，但随消息一起失效）。
+	var attachments []store.Attachment
+	if m.DeletedAt == nil {
+		attachments = x.attachments[m.ID]
+	}
+	return messageView(m, x.mentions[m.ID], reply, attachments)
 }
 
 // messageViews 批量转换（分页列表）。
