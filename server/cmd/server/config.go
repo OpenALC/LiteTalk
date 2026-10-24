@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -10,7 +11,11 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+
+	"github.com/OpenALC/LiteTalk/server/internal/attachment"
+	"github.com/OpenALC/LiteTalk/server/internal/blob"
 )
 
 // config 启动配置。只收 T3（#26）负责的面：TLS/域名/数据目录/主流程校验输入；
@@ -27,6 +32,12 @@ type config struct {
 	gatewayBacklog   int    // -gateway-backlog / LITETALK_GATEWAY_BACKLOG：每会话事件环条数（#32）
 	sfuActiveN       int    // -sfu-active-n / LITETALK_SFU_ACTIVE_N：活跃转发路数（#33，<=0 关闭门控）
 	sfuActiveHoldMS  int    // -sfu-active-hold-ms / LITETALK_SFU_ACTIVE_HOLD_MS：活跃源最少保持毫秒（#33）
+
+	// 附件存储与校验（#41 B2）。upload 里 Driver/Dir 与 S3 字段均由 LITETALK_* 解析；
+	// 单文件上限与白名单独立存放，供 api.Config 注入。
+	upload      blob.Config
+	uploadMax   int64    // LITETALK_UPLOAD_MAX_BYTES，默认 10 MiB，上限 100 MiB
+	uploadTypes []string // LITETALK_UPLOAD_ALLOWED_TYPES，空 = attachment 包默认白名单
 
 	// 校验输入（启动序步骤 2 集中把关；本批无对应 flag，仅 env）
 	jwtSecret     string
@@ -89,6 +100,32 @@ func loadConfig(args []string, output io.Writer) (*config, error) {
 	} else {
 		cfg.acmeCache = filepath.Join(cfg.dataDir, "autocert")
 	}
+	// 附件存储（#41 B2）：默认 local，写在数据目录下的 uploads/。
+	uploadMax, err := parseUploadMax(os.Getenv("LITETALK_UPLOAD_MAX_BYTES"))
+	if err != nil {
+		return nil, err
+	}
+	uploadTypes, err := parseUploadAllowedTypes(os.Getenv("LITETALK_UPLOAD_ALLOWED_TYPES"))
+	if err != nil {
+		return nil, err
+	}
+	uploadDir := strings.TrimSpace(os.Getenv("LITETALK_UPLOAD_DIR"))
+	if uploadDir == "" {
+		uploadDir = filepath.Join(cfg.dataDir, "uploads")
+	}
+	cfg.uploadMax = uploadMax
+	cfg.uploadTypes = uploadTypes
+	cfg.upload = blob.Config{
+		Driver:    strings.ToLower(envOr("LITETALK_UPLOAD_DRIVER", "local")),
+		Dir:       uploadDir,
+		Endpoint:  strings.TrimSpace(os.Getenv("LITETALK_S3_ENDPOINT")),
+		Bucket:    strings.TrimSpace(os.Getenv("LITETALK_S3_BUCKET")),
+		AccessKey: strings.TrimSpace(os.Getenv("LITETALK_S3_ACCESS_KEY")),
+		SecretKey: strings.TrimSpace(os.Getenv("LITETALK_S3_SECRET_KEY")),
+		Region:    strings.TrimSpace(os.Getenv("LITETALK_S3_REGION")),
+		UseSSL:    envBoolDefault("LITETALK_S3_USE_SSL", true),
+		PathStyle: envBoolDefault("LITETALK_S3_PATH_STYLE", false),
+	}
 	cfg.addr = envOr("LITETALK_ADDR", defaultAddr)
 	cfg.addrExplicit = os.Getenv("LITETALK_ADDR") != ""
 	// 触发条件（§0.5）：--domain 非空 且 未设 --behind-proxy。
@@ -104,6 +141,69 @@ func loadConfig(args []string, output io.Writer) (*config, error) {
 func envBool(key string) bool {
 	v := strings.TrimSpace(os.Getenv(key))
 	return v == "1" || strings.EqualFold(v, "true")
+}
+
+// envBoolDefault 带默认值的布尔解析：未设置时取 def，设置后按 envBool 口径（1/true 开）。
+func envBoolDefault(key string, def bool) bool {
+	if strings.TrimSpace(os.Getenv(key)) == "" {
+		return def
+	}
+	return envBool(key)
+}
+
+// maxUploadBytes 单附件上限的上限（100 MiB）。再大既不合适常驻内存解码，
+// 也让请求体配额失去意义。
+const maxUploadBytes int64 = 100 << 20
+
+// serverUploadMaxDimension 服务端图片单边上限（像素）。attachment 包默认 8192
+// 对解压炸弹风险偏高，服务端统一收紧到 4096（api.serverDefaultMaxDimension 同值，
+// 测试直接注入 api.Config 时也会按此收紧）。
+const serverUploadMaxDimension = 4096
+
+// parseUploadMax 解析 LITETALK_UPLOAD_MAX_BYTES：空/<=0 回落包默认 10 MiB，
+// 超过 100 MiB 或非整数直接报错（启动失败，避免带病运行）。
+func parseUploadMax(raw string) (int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return attachment.DefaultMaxBytes, nil
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("LITETALK_UPLOAD_MAX_BYTES 不是合法整数: %q", raw)
+	}
+	if n <= 0 {
+		return attachment.DefaultMaxBytes, nil
+	}
+	if n > maxUploadBytes {
+		return 0, fmt.Errorf("LITETALK_UPLOAD_MAX_BYTES 超过上限 %d 字节（100 MiB），实际 %d", maxUploadBytes, n)
+	}
+	return n, nil
+}
+
+// parseUploadAllowedTypes 解析逗号分隔的 MIME 白名单：空 = 包内默认；
+// 逐项小写去重，形如 type/subtype（允许带参数，比对时会去参数）。
+func parseUploadAllowedTypes(raw string) ([]string, error) {
+	parts := splitList(raw)
+	if len(parts) == 0 {
+		return nil, nil
+	}
+	out := make([]string, 0, len(parts))
+	seen := make(map[string]bool, len(parts))
+	for _, p := range parts {
+		mt := strings.ToLower(strings.TrimSpace(p))
+		if slash := strings.IndexByte(mt, '/'); slash <= 0 || slash == len(mt)-1 {
+			return nil, fmt.Errorf("LITETALK_UPLOAD_ALLOWED_TYPES 含非法 MIME 类型 %q（应形如 image/png）", p)
+		}
+		if strings.ContainsAny(mt, " \t") {
+			return nil, fmt.Errorf("LITETALK_UPLOAD_ALLOWED_TYPES 的 MIME 类型不能含空白: %q", p)
+		}
+		if seen[mt] {
+			continue
+		}
+		seen[mt] = true
+		out = append(out, mt)
+	}
+	return out, nil
 }
 
 // lookupIP 域名解析（测试可替换；生产 = net.LookupIP）。
@@ -161,6 +261,32 @@ func (c *config) validate(dev bool) error {
 	}
 	if c.authMode != "full" && c.authMode != "simple" {
 		return fmt.Errorf("LITETALK_AUTH_MODE 只支持 full / simple，实际为 %q", c.authMode)
+	}
+	// 附件存储（#41 B2）：driver 必须是 local/s3；s3 驱动缺必填项时不静默降级。
+	switch c.upload.Driver {
+	case "local":
+		if strings.TrimSpace(c.upload.Dir) == "" {
+			return errors.New("LITETALK_UPLOAD_DIR 不能为空（local 附件存储需要目录）")
+		}
+	case "s3":
+		var missing []string
+		if c.upload.Endpoint == "" {
+			missing = append(missing, "LITETALK_S3_ENDPOINT")
+		}
+		if c.upload.Bucket == "" {
+			missing = append(missing, "LITETALK_S3_BUCKET")
+		}
+		if c.upload.AccessKey == "" {
+			missing = append(missing, "LITETALK_S3_ACCESS_KEY")
+		}
+		if c.upload.SecretKey == "" {
+			missing = append(missing, "LITETALK_S3_SECRET_KEY")
+		}
+		if len(missing) > 0 {
+			return fmt.Errorf("LITETALK_UPLOAD_DRIVER=s3 缺少必填配置: %s", strings.Join(missing, "、"))
+		}
+	default:
+		return fmt.Errorf("LITETALK_UPLOAD_DRIVER 只支持 local / s3，实际为 %q", c.upload.Driver)
 	}
 	if c.domain != "" {
 		// 防止把 URL 或带路径/端口的值当域名传入，签发期才失败更难排查。
