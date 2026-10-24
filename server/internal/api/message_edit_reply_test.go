@@ -80,13 +80,59 @@ func assertMentions(t *testing.T, msg map[string]any, want ...int64) {
 	}
 }
 
-// newReplyWorld 建服 + 文本频道，返回频道 ID 与四个用户 ID（owner/admin/member/stranger）。
-func newReplyWorld(t *testing.T) (*permWorld, int64, int64, int64, int64) {
+// msgWorld 消息夹具：用户直写 Store（跳过注册的 bcrypt——CI 的 -race 下注册
+// 单次要约 3 秒，四个用户就会吃掉整个包的超时余量），服务器经真实 API 创建，
+// admin/member 直写成员后失效权限缓存（与权限矩阵夹具同口径）。
+type msgWorld struct {
+	srv        *Server
+	h          http.Handler
+	mem        *store.Mem
+	serverID   int64
+	owner      string
+	admin      string
+	member     string
+	stranger   string
+	ownerID    int64
+	adminID    int64
+	memberID   int64
+	strangerID int64
+}
+
+func newMsgWorld(t *testing.T) *msgWorld {
 	t.Helper()
-	w := newPermWorld(t)
+	srv, mem := newTestServer(t)
+	h := srv.Handler()
+	w := &msgWorld{srv: srv, h: h, mem: mem}
+	w.owner, w.ownerID = addUser(t, srv, mem, "mw-o@ex.com", "mwOwner")
+	w.admin, w.adminID = addUser(t, srv, mem, "mw-a@ex.com", "mwAdmin")
+	w.member, w.memberID = addUser(t, srv, mem, "mw-m@ex.com", "mwMember")
+	w.stranger, w.strangerID = addUser(t, srv, mem, "mw-x@ex.com", "mwStranger")
+	created := postJSON(t, h, "/api/v1/servers", w.owner,
+		map[string]string{"name": "消息测试服", "icon_name": "music", "icon_color": "#4FA4F3"},
+		http.StatusCreated)
+	w.serverID = asID(created["id"])
+	ctx := context.Background()
+	if err := mem.AddMember(ctx, &store.ServerMember{
+		ServerID: w.serverID, UserID: w.adminID, Role: store.RoleAdmin,
+	}); err != nil {
+		t.Fatalf("AddMember(admin): %v", err)
+	}
+	if err := mem.AddMember(ctx, &store.ServerMember{
+		ServerID: w.serverID, UserID: w.memberID, Role: store.RoleMember,
+	}); err != nil {
+		t.Fatalf("AddMember(member): %v", err)
+	}
+	srv.authz.InvalidateServer(w.serverID)
+	return w
+}
+
+// newReplyWorld 建服 + 文本频道，返回频道 ID 与 owner/admin/member 用户 ID。
+func newReplyWorld(t *testing.T) (*msgWorld, int64, int64, int64, int64) {
+	t.Helper()
+	w := newMsgWorld(t)
 	chID := asID(postJSON(t, w.h, fmt.Sprintf("/api/v1/servers/%d/channels", w.serverID), w.owner,
 		map[string]string{"name": "回复大厅", "type": "text"}, http.StatusCreated)["id"])
-	return w, chID, meID(t, w.h, w.owner), meID(t, w.h, w.admin), meID(t, w.h, w.member)
+	return w, chID, w.ownerID, w.adminID, w.memberID
 }
 
 // TestMessageReplyPreviewAndMentions 创建带 reply/mentions 的消息、列表/单条回读、
@@ -94,7 +140,7 @@ func newReplyWorld(t *testing.T) (*permWorld, int64, int64, int64, int64) {
 func TestMessageReplyPreviewAndMentions(t *testing.T) {
 	w, chID, ownerID, _, memberID := newReplyWorld(t)
 	h := w.h
-	strangerID := meID(t, h, w.stranger)
+	strangerID := w.strangerID
 
 	orig := sendMsg(t, h, w.owner, chID, "原消息")
 
@@ -114,7 +160,7 @@ func TestMessageReplyPreviewAndMentions(t *testing.T) {
 		t.Fatal("回复消息缺 reply_preview")
 	}
 	if asID(prev["id"]) != orig || asID(prev["user_id"]) != ownerID ||
-		prev["nickname"] != "pwOwner" || prev["content"] != "原消息" || prev["deleted"] != false {
+		prev["nickname"] != "mwOwner" || prev["content"] != "原消息" || prev["deleted"] != false {
 		t.Fatalf("reply_preview 不符: %v", prev)
 	}
 	assertMentions(t, resp, ownerID, memberID)
@@ -196,7 +242,7 @@ func TestMessageReplyPreviewAndMentions(t *testing.T) {
 func TestMessageEdit(t *testing.T) {
 	w, chID, ownerID, adminID, _ := newReplyWorld(t)
 	h := w.h
-	strangerID := meID(t, h, w.stranger)
+	strangerID := w.strangerID
 
 	msg := postJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/messages", chID), w.member,
 		map[string]any{"content": "原始内容", "mentions": uidList(ownerID)}, http.StatusCreated)
@@ -353,7 +399,7 @@ func TestMentionCandidatesServerChannel(t *testing.T) {
 	if len(list) != 3 {
 		t.Fatalf("候选应为 owner/admin/member 3 人，实际 %d: %v", len(list), list)
 	}
-	wantNames := []string{"pwAdmin", "pwMember", "pwOwner"}
+	wantNames := []string{"mwAdmin", "mwMember", "mwOwner"}
 	wantIDs := []int64{adminID, memberID, ownerID}
 	for i, raw := range list {
 		m := raw.(map[string]any)
