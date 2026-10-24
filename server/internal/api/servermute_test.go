@@ -24,6 +24,18 @@ type fakeHub struct {
 	kicks []string
 
 	convEvents []convEvent
+	msgEvents  []msgEvent
+}
+
+// msgEvent 一次 message.edited / message.deleted 广播的断言快照。
+type msgEvent struct {
+	kind      string // edited / deleted
+	uids      []string
+	channelID string
+	messageID string
+	content   string
+	editedAt  int64
+	mentions  []string
 }
 
 // convEvent 一次 conversation.changed 广播的断言快照。
@@ -58,6 +70,38 @@ func (f *fakeHub) convLog() []convEvent {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]convEvent(nil), f.convEvents...)
+}
+
+func (f *fakeHub) BroadcastMessageEdited(uids []string, channelID, messageID, content string, editedAt int64, mentions []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.msgEvents = append(f.msgEvents, msgEvent{
+		kind:      "edited",
+		uids:      append([]string(nil), uids...),
+		channelID: channelID,
+		messageID: messageID,
+		content:   content,
+		editedAt:  editedAt,
+		mentions:  append([]string(nil), mentions...),
+	})
+}
+
+func (f *fakeHub) BroadcastMessageDeleted(uids []string, channelID, messageID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.msgEvents = append(f.msgEvents, msgEvent{
+		kind:      "deleted",
+		uids:      append([]string(nil), uids...),
+		channelID: channelID,
+		messageID: messageID,
+	})
+}
+
+// msgLog 全部消息编辑/删除广播的快照。
+func (f *fakeHub) msgLog() []msgEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]msgEvent(nil), f.msgEvents...)
 }
 
 func (f *fakeHub) Kick(uid, dev, reason string) {}

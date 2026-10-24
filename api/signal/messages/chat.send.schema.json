@@ -22,6 +22,19 @@
       "x-go-omitempty": true,
       "maxLength": 64,
       "description": "客户端幂等键（#31，≤64 字符）：同频道同用户重复提交只落一条，重复请求回显原消息。缺省不去重（老客户端）。"
+    },
+    "reply_to": {
+      "type": "string",
+      "x-since": 2,
+      "x-go-omitempty": true,
+      "description": "回复目标消息 ID（#39）：必须与该消息同频道；目标已软删也允许。"
+    },
+    "mentions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "x-since": 2,
+      "x-go-omitempty": true,
+      "description": "@提及的用户 ID 列表（#39）：服务端去重并校验目标可见该频道；不合法整条拒收。"
     }
   },
   "required": ["channel_id", "type", "content"],

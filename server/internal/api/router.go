@@ -33,6 +33,11 @@ type Hub interface {
 	// BroadcastConversationChanged 会话变更通知（#38 B3）：uids 为十进制用户 ID，
 	// 动作见 signal.ConversationChangedData.Action。空列表不广播。
 	BroadcastConversationChanged(uids []string, conversationID, action string)
+	// BroadcastMessageEdited 消息编辑广播（#39）：uids 为十进制用户 ID（调用方已按
+	// 频道可见性过滤）；editedAt 为 Unix 毫秒。
+	BroadcastMessageEdited(uids []string, channelID, messageID, content string, editedAt int64, mentions []string)
+	// BroadcastMessageDeleted 消息软删除广播（#39）：目标口径同上。
+	BroadcastMessageDeleted(uids []string, channelID, messageID string)
 }
 
 // PresenceReader 在线状态读取（#11）：presence:{uid} 存在 = 在线。

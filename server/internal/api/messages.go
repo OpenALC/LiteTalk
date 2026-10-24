@@ -381,7 +381,16 @@ func (s *Server) EditMessage(ctx context.Context, request EditMessageRequestObje
 		msgEditRateLimit, time.Minute, "编辑过于频繁"); e != nil {
 		return nil, e
 	}
-	if err := s.store.UpdateMessageContent(ctx, msg.ID, content, mentions, time.Now()); err != nil {
+	// 广播目标先于写库算好：读取失败时不能已经改了库再回 500。
+	var recipients []string
+	if s.hub != nil {
+		recipients, e = s.messageRecipients(ctx, ch)
+		if e != nil {
+			return nil, e
+		}
+	}
+	now := time.Now()
+	if err := s.store.UpdateMessageContent(ctx, msg.ID, content, mentions, now); err != nil {
 		// 校验后并发被删除：与已删除同口径，不泄露内部时序。
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, errMessageDeleted()
@@ -391,6 +400,20 @@ func (s *Server) EditMessage(ctx context.Context, request EditMessageRequestObje
 	updated, err := s.store.MessageByID(ctx, msg.ID)
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
+	}
+	// 编辑广播（#39）：DB 提交成功后推给可见成员；提及取库里的最终值（排序确定），
+	// 不用请求入参。
+	if s.hub != nil {
+		latest, err := s.store.MentionsOfMessages(ctx, []int64{msg.ID})
+		if err != nil {
+			return nil, s.writeStoreErr(ctx, err)
+		}
+		editedAt := now.UnixMilli()
+		if updated.EditedAt != nil {
+			editedAt = updated.EditedAt.UnixMilli()
+		}
+		s.hub.BroadcastMessageEdited(recipients, strconv.FormatInt(ch.ID, 10),
+			strconv.FormatInt(msg.ID, 10), updated.Content, editedAt, formatUIDs(latest[msg.ID]))
 	}
 	v, e := s.messageViewFor(ctx, updated)
 	if e != nil {
@@ -448,13 +471,68 @@ func (s *Server) DeleteMessage(ctx context.Context, request DeleteMessageRequest
 		msgDeleteRateLimit, time.Minute, "删除过于频繁"); e != nil {
 		return nil, e
 	}
+	// 目标成员/可见性在软删前后不变，先算好再写库，避免写后失败回 500。
+	var recipients []string
+	if s.hub != nil {
+		recipients, e = s.messageRecipients(ctx, ch)
+		if e != nil {
+			return nil, e
+		}
+	}
 	if err := s.store.SoftDeleteMessage(ctx, msg.ID, time.Now()); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, errMessageDeleted()
 		}
 		return nil, s.writeStoreErr(ctx, err)
 	}
+	// 软删广播（#39）：客户端按 message_id 就地显示墓碑。
+	if s.hub != nil {
+		s.hub.BroadcastMessageDeleted(recipients, strconv.FormatInt(ch.ID, 10),
+			strconv.FormatInt(msg.ID, 10))
+	}
 	return DeleteMessage204Response{}, nil
+}
+
+// messageRecipients 消息事件广播目标（#39）：会话频道 = 全部成员；服务器频道 =
+// 对该频道有 ViewChannel 的成员（与 WS chat.message 广播同口径）。uid 为十进制字符串。
+func (s *Server) messageRecipients(ctx context.Context, ch *store.Channel) ([]string, *apiErr) {
+	if conversationScoped(ch) {
+		members, err := s.store.ChannelMembers(ctx, ch.ID)
+		if err != nil {
+			return nil, s.writeStoreErr(ctx, err)
+		}
+		return formatUIDs(conversationMemberIDs(members)), nil
+	}
+	if s.authz == nil {
+		return nil, errf(http.StatusInternalServerError, "internal", "权限服务未就绪")
+	}
+	members, err := s.store.MembersOfServer(ctx, ch.ServerID)
+	if err != nil {
+		return nil, s.writeStoreErr(ctx, err)
+	}
+	out := make([]string, 0, len(members))
+	for _, m := range members {
+		ok, err := s.authz.CanInServer(ctx, m.UserID, ch.ServerID, ch.ID, store.ViewChannel)
+		if err != nil {
+			return nil, s.writeStoreErr(ctx, err)
+		}
+		if ok {
+			out = append(out, strconv.FormatInt(m.UserID, 10))
+		}
+	}
+	return out, nil
+}
+
+// formatUIDs int64 uid → 十进制字符串（空列表返回 nil，wire 上 omitempty 省略）。
+func formatUIDs(ids []int64) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, strconv.FormatInt(id, 10))
+	}
+	return out
 }
 
 // ListMentionCandidates GET /api/v1/channels/{id}/mention-candidates（#39）

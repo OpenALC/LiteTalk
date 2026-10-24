@@ -5,6 +5,7 @@ package signal
 import (
 	"context"
 	"errors"
+	"sort"
 	"strconv"
 	"time"
 
@@ -16,6 +17,10 @@ type ChatStore interface {
 	CreateMessage(ctx context.Context, msg *store.Message) error
 	// MessageByNonce 幂等回读：按 (channel_id, user_id, nonce) 找原消息（#31）。
 	MessageByNonce(ctx context.Context, channelID, userID int64, nonce string) (*store.Message, error)
+	// MessageByID 单条回读（#39）：回复目标校验与预览取昵称；含软删行。
+	MessageByID(ctx context.Context, id int64) (*store.Message, error)
+	// MentionsOfMessages 批量读提及（#39）：幂等回显从库回填，不信任重放请求。
+	MentionsOfMessages(ctx context.Context, ids []int64) (map[int64][]int64, error)
 	ChannelByID(ctx context.Context, id int64) (*store.Channel, error)
 	Member(ctx context.Context, serverID, userID int64) (*store.ServerMember, error)
 	// MembersOfServer 全量成员（#32 事件面广播定向：成员的全部会话进环，
@@ -140,12 +145,45 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 		}
 	}
 
+	// 回复与提及（#39）：校验先于幂等回读——无效请求不能因 nonce 命中拿到原消息
+	// （与 REST CreateMessage 同口径）。内置房间没有消息实体，两个字段一律拒收，
+	// 避免静默丢弃。
+	var (
+		replyTo      *int64
+		replyPreview *ReplyPreview
+		mentionIDs   []int64
+	)
+	if !persist {
+		if d.ReplyTo != "" || len(d.Mentions) > 0 {
+			h.sendError(c, ErrCodeBadMessage, "内置房间不支持回复或提及")
+			return
+		}
+	} else {
+		var code, msg string
+		replyTo, replyPreview, code, msg = h.resolveChatReply(ctx, chID, d.ReplyTo)
+		if code != "" {
+			h.sendError(c, code, msg)
+			return
+		}
+		mentionIDs, code, msg = h.resolveChatMentions(ctx, chID, serverID, convMembers, d.Mentions)
+		if code != "" {
+			h.sendError(c, code, msg)
+			return
+		}
+	}
+
 	// 幂等判断先于频控：弱网重试撞上配额时也必须拿回原消息，而不是 rate_limited。
 	if persist && d.Nonce != "" {
 		orig, err := h.chatStore.MessageByNonce(ctx, chID, uid, d.Nonce)
 		switch {
 		case err == nil:
-			h.sendJSON(c, TypeChatMessage, chatMessageFromStore(orig, c))
+			out, rerr := h.chatMessageFromStore(ctx, orig, c)
+			if rerr != nil {
+				h.log.Printf("chat: 幂等回显补全失败: %v", rerr)
+				h.sendError(c, ErrCodeInternal, "消息保存失败")
+				return
+			}
+			h.sendJSON(c, TypeChatMessage, out)
 			return
 		case !errors.Is(err, store.ErrNotFound):
 			h.log.Printf("chat: nonce 幂等回读失败: %v", err)
@@ -169,13 +207,27 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 		User:      UserBrief{ID: c.userID, Nickname: c.username},
 		Nonce:     d.Nonce, // 仅发送方带 nonce 时回显（omitempty）
 	}
+	if replyTo != nil {
+		out.ReplyTo = strconv.FormatInt(*replyTo, 10)
+		out.ReplyPreview = replyPreview
+	}
+	out.Mentions = formatMentionIDs(mentionIDs)
 	if persist {
-		msg := &store.Message{ChannelID: chID, UserID: uid, Content: d.Content, Nonce: d.Nonce}
+		msg := &store.Message{
+			ChannelID: chID, UserID: uid, Content: d.Content, Nonce: d.Nonce,
+			ReplyTo: replyTo, Mentions: mentionIDs,
+		}
 		if err := h.chatStore.CreateMessage(ctx, msg); err != nil {
 			// 并发同 nonce：前一条已落库，回读原消息定向回显，不再广播。
 			if d.Nonce != "" && errors.Is(err, store.ErrConflict) {
 				if orig, rerr := h.chatStore.MessageByNonce(ctx, chID, uid, d.Nonce); rerr == nil {
-					h.sendJSON(c, TypeChatMessage, chatMessageFromStore(orig, c))
+					echo, cerr := h.chatMessageFromStore(ctx, orig, c)
+					if cerr != nil {
+						h.log.Printf("chat: 幂等回显补全失败: %v", cerr)
+						h.sendError(c, ErrCodeInternal, "消息保存失败")
+						return
+					}
+					h.sendJSON(c, TypeChatMessage, echo)
 					return
 				}
 			}
@@ -249,19 +301,55 @@ func hasChannelMember(members []store.ChannelMember, uid int64) bool {
 // 目标为相关成员 uid（十进制字符串，调用方已去重）。空列表直接返回。
 // 走事件面广播：在线连接实时投递，断线续传窗口内的会话进环补发。
 func (h *Hub) BroadcastConversationChanged(uids []string, conversationID, action string) {
-	if len(uids) == 0 {
+	targets := targetSet(uids)
+	if len(targets) == 0 {
 		return
 	}
+	h.broadcastEvent(targets, TypeConversationChanged, ConversationChangedData{
+		ConversationID: conversationID,
+		Action:         action,
+	})
+}
+
+// BroadcastMessageEdited 消息编辑广播（#39）：REST 编辑成功后调用，目标为该频道
+// 可见成员（uids 为十进制字符串，调用方已按 ViewChannel/会话成员过滤）。
+// 空列表直接返回；mentions 为空时不下发该字段。
+func (h *Hub) BroadcastMessageEdited(uids []string, channelID, messageID, content string, editedAt int64, mentions []string) {
+	targets := targetSet(uids)
+	if len(targets) == 0 {
+		return
+	}
+	h.broadcastEvent(targets, TypeMessageEdited, MessageEditedData{
+		ChannelID: channelID,
+		MessageID: messageID,
+		Content:   content,
+		EditedAt:  editedAt,
+		Mentions:  mentions,
+	})
+}
+
+// BroadcastMessageDeleted 消息软删除广播（#39）：REST 软删成功后调用，
+// 目标口径与 BroadcastMessageEdited 相同。
+func (h *Hub) BroadcastMessageDeleted(uids []string, channelID, messageID string) {
+	targets := targetSet(uids)
+	if len(targets) == 0 {
+		return
+	}
+	h.broadcastEvent(targets, TypeMessageDeleted, MessageDeletedData{
+		ChannelID: channelID,
+		MessageID: messageID,
+	})
+}
+
+// targetSet 广播目标去重（空 uid 丢弃）。
+func targetSet(uids []string) map[string]bool {
 	targets := make(map[string]bool, len(uids))
 	for _, uid := range uids {
 		if uid != "" {
 			targets[uid] = true
 		}
 	}
-	h.broadcastEvent(targets, TypeConversationChanged, ConversationChangedData{
-		ConversationID: conversationID,
-		Action:         action,
-	})
+	return targets
 }
 
 // permCheckQuiet 只要结果不翻译错误码（广播过滤用：失败=跳过该收件人）。
@@ -272,10 +360,99 @@ func (h *Hub) permCheckQuiet(ctx context.Context, uid, serverID, channelID int64
 	return h.authz.CanInServer(ctx, uid, serverID, channelID, perm)
 }
 
+// resolveChatReply 校验 chat.send 的 reply_to（#39）：必须是同频道内存在的消息；
+// 目标已软删也允许（预览 deleted=true）。不合法统一 bad_reply。
+func (h *Hub) resolveChatReply(ctx context.Context, chID int64, raw string) (*int64, *ReplyPreview, string, string) {
+	if raw == "" {
+		return nil, nil, "", ""
+	}
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || id <= 0 {
+		return nil, nil, ErrCodeBadReply, "回复目标不合法"
+	}
+	target, err := h.chatStore.MessageByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, nil, ErrCodeBadReply, "回复的消息不存在"
+		}
+		h.log.Printf("chat: 回复目标回读失败: %v", err)
+		return nil, nil, ErrCodeInternal, "消息发送失败"
+	}
+	if target.ChannelID != chID {
+		return nil, nil, ErrCodeBadReply, "不能回复其它频道的消息"
+	}
+	return &id, replyPreviewFromStore(target), "", ""
+}
+
+// resolveChatMentions 校验并归一 chat.send 的 mentions（#39）：去重、元素须为正 ID，
+// 每个用户必须可见该频道（会话频道看成员表，服务器频道要求 ViewChannel）。
+// 结果按 user_id 升序，保证广播与 REST 视图同序。任一不合法返回 bad_mention。
+func (h *Hub) resolveChatMentions(ctx context.Context, chID, serverID int64, convMembers []store.ChannelMember, raw []string) ([]int64, string, string) {
+	if len(raw) == 0 {
+		return nil, "", ""
+	}
+	seen := make(map[int64]struct{}, len(raw))
+	out := make([]int64, 0, len(raw))
+	for _, s := range raw {
+		uid, err := strconv.ParseInt(s, 10, 64)
+		if err != nil || uid <= 0 {
+			return nil, ErrCodeBadMention, "提及用户不合法"
+		}
+		if _, dup := seen[uid]; dup {
+			continue
+		}
+		seen[uid] = struct{}{}
+		var ok bool
+		if convMembers != nil {
+			ok = hasChannelMember(convMembers, uid)
+		} else {
+			ok, err = h.permCheckQuiet(ctx, uid, serverID, chID, store.ViewChannel)
+			if err != nil {
+				h.log.Printf("chat: 提及用户 %d 权限查询失败: %v", uid, err)
+				return nil, ErrCodeInternal, "消息发送失败"
+			}
+		}
+		if !ok {
+			return nil, ErrCodeBadMention, "提及用户不在该频道"
+		}
+		out = append(out, uid)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, "", ""
+}
+
+// replyPreviewFromStore 回复预览（#39）：软删目标只给跳转信息，正文清空。
+func replyPreviewFromStore(m *store.Message) *ReplyPreview {
+	content := m.Content
+	if m.DeletedAt != nil {
+		content = ""
+	}
+	return &ReplyPreview{
+		ID:       strconv.FormatInt(m.ID, 10),
+		UserID:   strconv.FormatInt(m.UserID, 10),
+		Nickname: m.SenderNickname,
+		Content:  content,
+		Deleted:  m.DeletedAt != nil,
+	}
+}
+
+// formatMentionIDs int64 uid → wire 字符串数组（空列表返回 nil，omitempty 省略）。
+func formatMentionIDs(ids []int64) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, formatUID(id))
+	}
+	return out
+}
+
 // chatMessageFromStore 把落库消息还原成 chat.message 载荷（幂等重放定向回显用）。
 // 身份取当前连接：回读按 (channel_id, user_id, nonce) 限定，原消息必属该用户。
-func chatMessageFromStore(m *store.Message, c *client) ChatMessageData {
-	return ChatMessageData{
+// 回复预览与提及同样从库回填——重放请求体不可信（客户端可能已改过字段）。
+func (h *Hub) chatMessageFromStore(ctx context.Context, m *store.Message, c *client) (ChatMessageData, error) {
+	out := ChatMessageData{
 		ID:        strconv.FormatInt(m.ID, 10),
 		ChannelID: strconv.FormatInt(m.ChannelID, 10),
 		Content:   m.Content,
@@ -283,4 +460,20 @@ func chatMessageFromStore(m *store.Message, c *client) ChatMessageData {
 		User:      UserBrief{ID: c.userID, Nickname: c.username},
 		Nonce:     m.Nonce,
 	}
+	if m.ReplyTo != nil {
+		out.ReplyTo = strconv.FormatInt(*m.ReplyTo, 10)
+		target, err := h.chatStore.MessageByID(ctx, *m.ReplyTo)
+		switch {
+		case err == nil:
+			out.ReplyPreview = replyPreviewFromStore(target)
+		case !errors.Is(err, store.ErrNotFound):
+			return out, err // 目标已不存在（历史脏数据）只缺预览，不阻断回显
+		}
+	}
+	mentions, err := h.chatStore.MentionsOfMessages(ctx, []int64{m.ID})
+	if err != nil {
+		return out, err
+	}
+	out.Mentions = formatMentionIDs(mentions[m.ID])
+	return out, nil
 }

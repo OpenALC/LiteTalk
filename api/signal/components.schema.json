@@ -46,6 +46,20 @@
       },
       "required": ["sdp"],
       "additionalProperties": false
+    },
+    "ReplyPreview": {
+      "title": "ReplyPreview",
+      "description": "回复消息的预览快照（#39）：只含跳转与展示所需字段；被引用消息已软删时 content 为空、deleted=true。",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "user_id": { "type": "string" },
+        "nickname": { "type": "string" },
+        "content": { "type": "string" },
+        "deleted": { "type": "boolean" }
+      },
+      "required": ["id", "user_id", "nickname", "content", "deleted"],
+      "additionalProperties": false
     }
   }
 }
