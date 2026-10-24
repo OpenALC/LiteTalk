@@ -186,13 +186,14 @@ function cancelReply() {
   nextTick(() => inputEl.value?.focus())
 }
 
-// ---- 回复跳转：当前桶找不到时经 GetMessage 回填，再滚动并短暂高亮 ----
+// ---- 回复/搜索跳转：当前桶找不到时经 GetMessage 回填，再滚动并短暂高亮 ----
 const flashId = ref('')
 let flashTimer: ReturnType<typeof setTimeout> | null = null
 
-async function jumpToReply(m: ChatMessage) {
-  const targetId = m.reply_to || m.reply_preview?.id || ''
-  if (!targetId) return
+// revealMessage 定位并高亮一条消息（回复跳转与跨频道搜索跳转共用）。
+// 返回是否滚动到了目标；目标不可读时静默 false，不打断阅读。
+async function revealMessage(targetId: string): Promise<boolean> {
+  if (!targetId) return false
   // 回填历史消息会改变列表长度；先解除贴底跟随，否则长度 watch 会把视图
   // 又拉回最新一条，跳转等于没发生。
   stick = false
@@ -201,18 +202,48 @@ async function jumpToReply(m: ChatMessage) {
       const fetched = await goApp().GetMessage(props.channelId, targetId)
       chat.mergeMessage(props.channelId, fetched)
     } catch {
-      return // 目标不可读（被清理/无权限）：静默，不打断阅读
+      return false // 目标不可读（被清理/无权限）：静默，不打断阅读
     }
   }
   await nextTick()
   const el = listEl.value?.querySelector<HTMLElement>(`#msg-${targetId}`)
-  if (!el) return
+  if (!el) return false
   el.scrollIntoView({ block: 'center' })
   onScroll() // 跳转后按实际位置重算是否贴底
   flashId.value = targetId
   if (flashTimer) clearTimeout(flashTimer)
   flashTimer = setTimeout(() => { flashId.value = '' }, 1600)
+  return true
 }
+
+async function jumpToReply(m: ChatMessage) {
+  const targetId = m.reply_to || m.reply_preview?.id || ''
+  if (!targetId) return
+  await revealMessage(targetId)
+}
+
+// 搜索跳转（#42 B2）：MainView 切到目标频道并补拉历史后写入 jumpTarget。
+// 这里再补一次 loadHistory（并发去重），目标仍不在桶里就单条回填。
+watch(() => chat.jumpTarget, async (t) => {
+  if (!t || t.channelId !== props.channelId) return
+  // 目标已在桶里（MainView 已补拉/实时消息刚到达）就不再重复请求历史。
+  if (!chat.messageById(t.channelId, t.messageId)) {
+    try {
+      await chat.loadHistory(t.channelId)
+    } catch {
+      // 静默：历史不可得时仍可经 GetMessage 单条回填
+    }
+  }
+  // 等待期间用户又切了频道：放弃这次跳转，请求也不留给别的频道。
+  if (t.channelId !== props.channelId) {
+    if (chat.jumpTarget === t) chat.clearJump()
+    return
+  }
+  await revealMessage(t.messageId)
+  // 无论是否定位成功都消费掉请求，切回频道时不重复跳转；期间若又点了同一条，
+  // jumpTarget 已是新对象，不能误清新请求。
+  if (chat.jumpTarget === t) chat.clearJump()
+}, { immediate: true })
 
 onBeforeUnmount(() => {
   if (flashTimer) clearTimeout(flashTimer)

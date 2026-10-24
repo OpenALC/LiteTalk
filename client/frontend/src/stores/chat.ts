@@ -145,6 +145,22 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
+  // jumpTarget 跨频道消息定位请求（#42 B2）：搜索面板选中结果后由 MainView 写入，
+  // 目标频道的 ChatPanel 消费（滚动 + 高亮）后 clearJump。seq 自增让重复点击同一
+  // 条消息也产生新对象，watch 不会因引用相同而跳过。
+  const jumpTarget = ref<{ channelId: string; messageId: string; seq: number } | null>(null)
+  let jumpSeq = 0
+
+  function requestJump(channelId: string, messageId: string) {
+    if (!channelId || !messageId) return
+    jumpSeq++
+    jumpTarget.value = { channelId, messageId, seq: jumpSeq }
+  }
+
+  function clearJump() {
+    jumpTarget.value = null
+  }
+
   // send 发送普通消息（无回复、无提及）。不做本地乐观回显——服务端会把
   // chat.message 广播回发送者本人（服务端 hub_test 已钉住该行为），本地再插
   // 一条就会双显（问题：发送一条出现两条）。失败抛错由调用方处理。
@@ -323,6 +339,7 @@ export const useChatStore = defineStore('chat', () => {
     mentionInflight.clear()
     historyInflight.clear()
     lastReportedByChannel.clear()
+    clearJump()
   }
 
   // unbindEvents 逐个注销本 store 注册的监听器。
@@ -335,6 +352,7 @@ export const useChatStore = defineStore('chat', () => {
     messagesFor, messageById, mergeMessage, send, sendWithMeta, sendWithAttachments,
     editMessage, deleteMessage, loadHistory, markRead,
     mentionCandidatesFor, loadMentionCandidates,
+    jumpTarget, requestJump, clearJump,
     bindEvents, unbindEvents, resetAll,
   }
 })

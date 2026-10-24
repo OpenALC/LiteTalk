@@ -13,15 +13,19 @@ import FriendList from '../components/FriendList.vue'
 import VoiceRoom from '../components/VoiceRoom.vue'
 import TextChat from '../components/TextChat.vue'
 import ConversationChat from '../components/ConversationChat.vue'
+import SearchDialog from '../components/SearchDialog.vue'
 import IntroView from './IntroView.vue'
 import { useVoiceStore } from '../stores/voice'
 import { useChatStore } from '../stores/chat'
 import { useAuthStore } from '../stores/auth'
 import { useConversationsStore } from '../stores/conversations'
 import { INTRO_ID, useFriendsStore, useServersStore } from '../stores/data'
+import { useNotifyStore } from '../stores/notify'
+import { useSearchStore } from '../stores/search'
 import { useUnreadsStore } from '../stores/unreads'
 import { useHotkeys } from '../composables/useHotkeys'
 import { eventsOn } from '../api/bridge'
+import type { ChatMessage } from '../api/types'
 
 const router = useRouter()
 const voice = useVoiceStore()
@@ -31,6 +35,8 @@ const conversations = useConversationsStore()
 const servers = useServersStore()
 const friends = useFriendsStore()
 const unreads = useUnreadsStore()
+const search = useSearchStore()
+const notify = useNotifyStore()
 
 const tab = ref<'voice' | 'chat'>('voice')
 const showFriends = ref(true)
@@ -52,14 +58,53 @@ useHotkeys(
       voice.setDeafen(allOff)
     },
     search: () => {
-      const el = document.querySelector<HTMLInputElement>('.f-search input')
-      el?.focus()
+      // #42 B2：Ctrl+K 打开全局消息搜索（好友搜索框仍可点击使用）。
+      search.openDialog()
     },
     // 设置已独立为路由页（v0.1.2）
     settings: () => router.push('/settings'),
   },
   hotkeysActive,
 )
+
+// onSearchSelect 搜索结果落地（#42 B2）：先按会话 ID 判定私聊/群聊，否则在
+// 本地服务器频道里定位；切到目标后补拉历史并请求 ChatPanel 滚动高亮。
+// 频道不在本地列表（已被移出/删除）时只提示一次，不做二次请求。
+async function onSearchSelect(m: ChatMessage) {
+  const channelId = m.channel_id
+  const conv = conversations.list.find((c) => c.id === channelId)
+  const server = conv
+    ? undefined
+    : servers.servers.find((s) => s.channels.some((c) => c.id === channelId))
+  if (!channelId || (!conv && !server)) {
+    notify.show('无法定位该消息', true)
+    search.close()
+    return
+  }
+  // 先关面板：下面的补拉是网络操作，遮罩不能一直挡着已切到的频道。
+  search.close()
+  if (conv) {
+    conversations.enterDM()
+    try {
+      await conversations.open(channelId)
+    } catch {
+      notify.show('无法定位该消息', true)
+      return
+    }
+  } else if (server) {
+    conversations.exitDM()
+    servers.selectServer(server.id)
+    servers.selectChannel(channelId)
+  }
+  tab.value = 'chat'
+  try {
+    // 历史可能超过 50 条：目标不在补拉窗口内时由 ChatPanel 单条回填。
+    await chat.loadHistory(channelId)
+  } catch {
+    // 静默：ChatPanel 挂载后还会补拉，失败时仍尝试单条回填。
+  }
+  chat.requestJump(channelId, m.id)
+}
 
 // auth:session：Go 侧重试连上/中途断线时翻提示条。
 // eventsOn 返回按监听器的取消函数，卸载时逐个注销（不按事件名整体 Off）。
@@ -170,6 +215,9 @@ onUnmounted(() => {
 
     <FriendList v-if="showFriends && !isIntro" />
   </div>
+
+  <!-- 全局消息搜索（#42 B2）：Ctrl+K 打开，选中结果后跨频道定位 -->
+  <SearchDialog v-if="search.open" @select="onSearchSelect" @close="search.close()" />
 </template>
 
 <style scoped>

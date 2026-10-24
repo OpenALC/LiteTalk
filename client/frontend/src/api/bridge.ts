@@ -72,6 +72,9 @@ type GoApp = {
   // ListMessages 频道最近消息（旧→新，limit 上限 50）。私聊/群聊的会话 ID
   // 即频道 ID；载荷与 chat:message 事件同口径，按 id 去重合并。
   ListMessages(channelID: string, limit: number): Promise<ChatMessage[]>
+  // SearchMessages 全局消息搜索（#42）：跨服务器频道与会话，只返回可见频道；
+  // 载荷与 ListMessages 同口径（含附件）；q 1–100、limit 1–50 默认 20。
+  SearchMessages(query: string, limit: number): Promise<ChatMessage[]>
   GetVoiceMembers(): Promise<PeerView[]>
   LogFromWeb(level: string, msg: string): Promise<void>
   // 服务器/频道/好友 REST CRUD（服务端已有端点；批次①接线）。
@@ -271,6 +274,8 @@ const mockApp: GoApp = {
   async ListMentionCandidates() { return [] },
   // 消息历史桩：浏览器开发环境无可联调数据。
   async ListMessages() { return [] },
+  // 搜索桩：浏览器开发环境无可联调数据。
+  async SearchMessages() { return [] },
   async GetVoiceMembers() { return [] },
   async GetVoiceState() { return { channel_id: '', muted: false, deafened: false } },
   async RequestVoiceState() {},
