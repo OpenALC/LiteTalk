@@ -586,6 +586,12 @@ type LogoutRequest struct {
 	RefreshToken string `json:"refresh_token"`
 }
 
+// MarkReadRequest defines model for MarkReadRequest.
+type MarkReadRequest struct {
+	// LastMessageId 最后已读消息 ID（#40）：必须存在且属于路径频道，否则 400 bad_read； 水位只前进，更旧的 ID 不会让计数回退。
+	LastMessageId ID `json:"last_message_id"`
+}
+
 // MemberInfo 服务器成员（内联昵称/tag，含在线态）。ID 为十进制字符串（#31）。
 type MemberInfo struct {
 	JoinedAt Time    `json:"joined_at"`
@@ -863,6 +869,33 @@ type TokenPair struct {
 	User User `json:"user"`
 }
 
+// UnreadChannel 单个频道的未读/提及计数（#40）。未读 = 水位之后、非本人、未软删的消息； 提及 = 其中 @ 当前用户的条数。计数为 0 的频道仍返回。
+type UnreadChannel struct {
+	ChannelId ID `json:"channel_id"`
+
+	// MentionCount 未读消息中提及当前用户的条数
+	MentionCount int `json:"mention_count"`
+
+	// UnreadCount 未读消息条数
+	UnreadCount int `json:"unread_count"`
+}
+
+// UnreadServer 服务器维度的未读/提及计数（#40）：只聚合该服务器下当前用户可见的文字 频道，不含 direct/group 会话。没有可见频道的服务器也返回 0 值项。
+type UnreadServer struct {
+	// MentionCount 服务器可见文字频道的未读提及总数
+	MentionCount int `json:"mention_count"`
+	ServerId     ID  `json:"server_id"`
+
+	// UnreadCount 服务器可见文字频道的未读总数
+	UnreadCount int `json:"unread_count"`
+}
+
+// Unreads 当前用户的未读快照（#40）：channels 覆盖全部可见频道（含 0 值项）， servers 覆盖全部已加入服务器（仅聚合服务器文字频道）。数组按 ID 升序， 空数组返回 [] 而非 null。
+type Unreads struct {
+	Channels []UnreadChannel `json:"channels"`
+	Servers  []UnreadServer  `json:"servers"`
+}
+
 // UpdateRoleRequest defines model for UpdateRoleRequest.
 type UpdateRoleRequest struct {
 	// Color #RRGGBB；缺省沿用现值
@@ -1037,6 +1070,9 @@ type EditMessageJSONRequestBody = EditMessageRequest
 // SetChannelOverwriteJSONRequestBody defines body for SetChannelOverwrite for application/json ContentType.
 type SetChannelOverwriteJSONRequestBody = SetOverwriteRequest
 
+// MarkChannelReadJSONRequestBody defines body for MarkChannelRead for application/json ContentType.
+type MarkChannelReadJSONRequestBody = MarkReadRequest
+
 // CreateConversationJSONRequestBody defines body for CreateConversation for application/json ContentType.
 type CreateConversationJSONRequestBody = CreateConversationRequest
 
@@ -1159,6 +1195,9 @@ type ServerInterface interface {
 	// SetChannelOverwrite upsert 频道覆盖（需 ManageChannels，#35 B4）
 	// (PUT /api/v1/channels/{id}/overwrites/{target_type}/{target_id})
 	SetChannelOverwrite(w http.ResponseWriter, r *http.Request, id IDPath, targetType SetChannelOverwriteParamsTargetType, targetId TargetIDPath)
+	// MarkChannelRead 标记频道已读（水位只前进）
+	// (PUT /api/v1/channels/{id}/read)
+	MarkChannelRead(w http.ResponseWriter, r *http.Request, id IDPath)
 	// GetConfig 服务端能力开关
 	// (GET /api/v1/config)
 	GetConfig(w http.ResponseWriter, r *http.Request)
@@ -1255,6 +1294,9 @@ type ServerInterface interface {
 	// GetSync 事件续传失败后的聚合快照
 	// (GET /api/v1/sync)
 	GetSync(w http.ResponseWriter, r *http.Request)
+	// ListUnreads 全部可见频道与服务器的未读/提及计数
+	// (GET /api/v1/unreads)
+	ListUnreads(w http.ResponseWriter, r *http.Request)
 	// GetMe 当前用户（自响应，含 email）
 	// (GET /api/v1/users/me)
 	GetMe(w http.ResponseWriter, r *http.Request)
@@ -1868,6 +1910,32 @@ func (siw *ServerInterfaceWrapper) SetChannelOverwrite(w http.ResponseWriter, r 
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.SetChannelOverwrite(w, r, id, targetType, targetId)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// MarkChannelRead operation middleware
+func (siw *ServerInterfaceWrapper) MarkChannelRead(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.MarkChannelRead(w, r, id)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -2672,6 +2740,20 @@ func (siw *ServerInterfaceWrapper) GetSync(w http.ResponseWriter, r *http.Reques
 	handler.ServeHTTP(w, r)
 }
 
+// ListUnreads operation middleware
+func (siw *ServerInterfaceWrapper) ListUnreads(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListUnreads(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 // GetMe operation middleware
 func (siw *ServerInterfaceWrapper) GetMe(w http.ResponseWriter, r *http.Request) {
 
@@ -2843,6 +2925,8 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodPatch+" "+options.BaseURL+"/api/v1/conversations/{id}", wrapper.PatchConversation)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/conversations/{id}/members", wrapper.AddConversationMembers)
 	m.HandleFunc(http.MethodDelete+" "+options.BaseURL+"/api/v1/conversations/{id}/members/{user_id}", wrapper.RemoveConversationMember)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/unreads", wrapper.ListUnreads)
+	m.HandleFunc(http.MethodPut+" "+options.BaseURL+"/api/v1/channels/{id}/read", wrapper.MarkChannelRead)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/sync", wrapper.GetSync)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/servers", wrapper.ListServers)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/servers", wrapper.CreateServer)
@@ -5127,6 +5211,110 @@ type SetChannelOverwritedefaultApplicationProblemPlusJSONResponse struct {
 }
 
 func (response SetChannelOverwritedefaultApplicationProblemPlusJSONResponse) VisitSetChannelOverwriteResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type MarkChannelReadRequestObject struct {
+	Id   IDPath `json:"id"`
+	Body *MarkChannelReadJSONRequestBody
+}
+
+type MarkChannelReadResponseObject interface {
+	VisitMarkChannelReadResponse(w http.ResponseWriter) error
+}
+
+type MarkChannelRead200JSONResponse UnreadChannel
+
+func (response MarkChannelRead200JSONResponse) VisitMarkChannelReadResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type MarkChannelRead400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response MarkChannelRead400ApplicationProblemPlusJSONResponse) VisitMarkChannelReadResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type MarkChannelRead401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response MarkChannelRead401ApplicationProblemPlusJSONResponse) VisitMarkChannelReadResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type MarkChannelRead403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response MarkChannelRead403ApplicationProblemPlusJSONResponse) VisitMarkChannelReadResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type MarkChannelRead404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response MarkChannelRead404ApplicationProblemPlusJSONResponse) VisitMarkChannelReadResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type MarkChannelReaddefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response MarkChannelReaddefaultApplicationProblemPlusJSONResponse) VisitMarkChannelReadResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
@@ -8058,6 +8246,60 @@ func (response GetSyncdefaultApplicationProblemPlusJSONResponse) VisitGetSyncRes
 	return err
 }
 
+type ListUnreadsRequestObject struct {
+}
+
+type ListUnreadsResponseObject interface {
+	VisitListUnreadsResponse(w http.ResponseWriter) error
+}
+
+type ListUnreads200JSONResponse Unreads
+
+func (response ListUnreads200JSONResponse) VisitListUnreadsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListUnreads401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response ListUnreads401ApplicationProblemPlusJSONResponse) VisitListUnreadsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListUnreadsdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response ListUnreadsdefaultApplicationProblemPlusJSONResponse) VisitListUnreadsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
 type GetMeRequestObject struct {
 }
 
@@ -8281,6 +8523,9 @@ type StrictServerInterface interface {
 	// SetChannelOverwrite upsert 频道覆盖（需 ManageChannels，#35 B4）
 	// (PUT /api/v1/channels/{id}/overwrites/{target_type}/{target_id})
 	SetChannelOverwrite(ctx context.Context, request SetChannelOverwriteRequestObject) (SetChannelOverwriteResponseObject, error)
+	// MarkChannelRead 标记频道已读（水位只前进）
+	// (PUT /api/v1/channels/{id}/read)
+	MarkChannelRead(ctx context.Context, request MarkChannelReadRequestObject) (MarkChannelReadResponseObject, error)
 	// GetConfig 服务端能力开关
 	// (GET /api/v1/config)
 	GetConfig(ctx context.Context, request GetConfigRequestObject) (GetConfigResponseObject, error)
@@ -8377,6 +8622,9 @@ type StrictServerInterface interface {
 	// GetSync 事件续传失败后的聚合快照
 	// (GET /api/v1/sync)
 	GetSync(ctx context.Context, request GetSyncRequestObject) (GetSyncResponseObject, error)
+	// ListUnreads 全部可见频道与服务器的未读/提及计数
+	// (GET /api/v1/unreads)
+	ListUnreads(ctx context.Context, request ListUnreadsRequestObject) (ListUnreadsResponseObject, error)
 	// GetMe 当前用户（自响应，含 email）
 	// (GET /api/v1/users/me)
 	GetMe(ctx context.Context, request GetMeRequestObject) (GetMeResponseObject, error)
@@ -9079,6 +9327,39 @@ func (sh *strictHandler) SetChannelOverwrite(w http.ResponseWriter, r *http.Requ
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
 	} else if validResponse, ok := response.(SetChannelOverwriteResponseObject); ok {
 		if err := validResponse.VisitSetChannelOverwriteResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// MarkChannelRead operation middleware
+func (sh *strictHandler) MarkChannelRead(w http.ResponseWriter, r *http.Request, id IDPath) {
+	var request MarkChannelReadRequestObject
+
+	request.Id = id
+
+	var body MarkChannelReadJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.MarkChannelRead(ctx, request.(MarkChannelReadRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "MarkChannelRead")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(MarkChannelReadResponseObject); ok {
+		if err := validResponse.VisitMarkChannelReadResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {
@@ -10031,6 +10312,30 @@ func (sh *strictHandler) GetSync(w http.ResponseWriter, r *http.Request) {
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
 	} else if validResponse, ok := response.(GetSyncResponseObject); ok {
 		if err := validResponse.VisitGetSyncResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// ListUnreads operation middleware
+func (sh *strictHandler) ListUnreads(w http.ResponseWriter, r *http.Request) {
+	var request ListUnreadsRequestObject
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ListUnreads(ctx, request.(ListUnreadsRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ListUnreads")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ListUnreadsResponseObject); ok {
+		if err := validResponse.VisitListUnreadsResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {

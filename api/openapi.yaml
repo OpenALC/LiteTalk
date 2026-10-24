@@ -718,6 +718,67 @@ paths:
           $ref: '#/components/responses/NotFound'
         default:
           $ref: '#/components/responses/Internal'
+  /api/v1/unreads:
+    get:
+      operationId: listUnreads
+      summary: 全部可见频道与服务器的未读/提及计数
+      description: >
+        #40：当前用户全部可见频道的未读/提及计数，以及仅按服务器文本频道聚合
+        的服务器计数。频道 = 已加入服务器中对该用户可见（ViewChannel）的文字
+        频道，加上当前用户参与的 direct/group 会话；自己的消息与已软删消息不计
+        未读，提及数只统计未读消息中 @ 当前用户的条数。channels/servers 都包含
+        0 值项，数组不为 null，并按 ID 升序稳定输出。服务器聚合不包含会话频道。
+        code：401；5xx internal。
+      tags: [messages]
+      responses:
+        '200':
+          description: 未读快照（channels/servers 含 0 值项，ID 升序）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Unreads'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/channels/{id}/read:
+    put:
+      operationId: markChannelRead
+      summary: 标记频道已读（水位只前进）
+      description: >
+        #40：把当前用户在该频道的已读水位推进到 last_message_id。水位只前进，
+        重复上报更旧的消息 ID 不会回退。last_message_id 必须存在且属于该频道，
+        否则 400 bad_read。会话频道非成员与频道不存在统一 404 not_found（不泄露
+        会话是否存在）；服务器频道无 ViewChannel 403 forbidden。成功返回更新后
+        的计数，并通过信令 channel.unread 推给当前用户的全部会话（多设备同步）。
+        code：bad_read、bad_request、路径参数不合法；401；403 forbidden；
+        404 not_found；5xx internal。
+      tags: [messages]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MarkReadRequest'
+      responses:
+        '200':
+          description: 更新后的频道未读/提及计数
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnreadChannel'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
   /api/v1/sync:
     get:
       operationId: getSync
@@ -2320,6 +2381,72 @@ components:
           type: string
         tag:
           type: string
+    UnreadChannel:
+      type: object
+      title: UnreadChannel
+      description: >
+        单个频道的未读/提及计数（#40）。未读 = 水位之后、非本人、未软删的消息；
+        提及 = 其中 @ 当前用户的条数。计数为 0 的频道仍返回。
+      required: [channel_id, unread_count, mention_count]
+      properties:
+        channel_id:
+          type: string
+          x-go-type: ID
+        unread_count:
+          type: integer
+          minimum: 0
+          description: 未读消息条数
+        mention_count:
+          type: integer
+          minimum: 0
+          description: 未读消息中提及当前用户的条数
+    UnreadServer:
+      type: object
+      title: UnreadServer
+      description: >
+        服务器维度的未读/提及计数（#40）：只聚合该服务器下当前用户可见的文字
+        频道，不含 direct/group 会话。没有可见频道的服务器也返回 0 值项。
+      required: [server_id, unread_count, mention_count]
+      properties:
+        server_id:
+          type: string
+          x-go-type: ID
+        unread_count:
+          type: integer
+          minimum: 0
+          description: 服务器可见文字频道的未读总数
+        mention_count:
+          type: integer
+          minimum: 0
+          description: 服务器可见文字频道的未读提及总数
+    Unreads:
+      type: object
+      title: Unreads
+      description: >
+        当前用户的未读快照（#40）：channels 覆盖全部可见频道（含 0 值项），
+        servers 覆盖全部已加入服务器（仅聚合服务器文字频道）。数组按 ID 升序，
+        空数组返回 [] 而非 null。
+      required: [channels, servers]
+      properties:
+        channels:
+          type: array
+          items:
+            $ref: '#/components/schemas/UnreadChannel'
+        servers:
+          type: array
+          items:
+            $ref: '#/components/schemas/UnreadServer'
+    MarkReadRequest:
+      type: object
+      title: MarkReadRequest
+      required: [last_message_id]
+      properties:
+        last_message_id:
+          type: string
+          x-go-type: ID
+          description: >
+            最后已读消息 ID（#40）：必须存在且属于路径频道，否则 400 bad_read；
+            水位只前进，更旧的 ID 不会让计数回退。
     Invite:
       type: object
       title: Invite

@@ -384,6 +384,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/unreads": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 全部可见频道与服务器的未读/提及计数
+         * @description #40：当前用户全部可见频道的未读/提及计数，以及仅按服务器文本频道聚合 的服务器计数。频道 = 已加入服务器中对该用户可见（ViewChannel）的文字 频道，加上当前用户参与的 direct/group 会话；自己的消息与已软删消息不计 未读，提及数只统计未读消息中 @ 当前用户的条数。channels/servers 都包含 0 值项，数组不为 null，并按 ID 升序稳定输出。服务器聚合不包含会话频道。 code：401；5xx internal。
+         */
+        get: operations["listUnreads"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/channels/{id}/read": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * 标记频道已读（水位只前进）
+         * @description #40：把当前用户在该频道的已读水位推进到 last_message_id。水位只前进， 重复上报更旧的消息 ID 不会回退。last_message_id 必须存在且属于该频道， 否则 400 bad_read。会话频道非成员与频道不存在统一 404 not_found（不泄露 会话是否存在）；服务器频道无 ViewChannel 403 forbidden。成功返回更新后 的计数，并通过信令 channel.unread 推给当前用户的全部会话（多设备同步）。 code：bad_read、bad_request、路径参数不合法；401；403 forbidden； 404 not_found；5xx internal。
+         */
+        put: operations["markChannelRead"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/sync": {
         parameters: {
             query?: never;
@@ -1112,6 +1152,41 @@ export interface components {
             user_id: string;
             nickname: string;
             tag: string;
+        };
+        /**
+         * UnreadChannel
+         * @description 单个频道的未读/提及计数（#40）。未读 = 水位之后、非本人、未软删的消息； 提及 = 其中 @ 当前用户的条数。计数为 0 的频道仍返回。
+         */
+        UnreadChannel: {
+            channel_id: string;
+            /** @description 未读消息条数 */
+            unread_count: number;
+            /** @description 未读消息中提及当前用户的条数 */
+            mention_count: number;
+        };
+        /**
+         * UnreadServer
+         * @description 服务器维度的未读/提及计数（#40）：只聚合该服务器下当前用户可见的文字 频道，不含 direct/group 会话。没有可见频道的服务器也返回 0 值项。
+         */
+        UnreadServer: {
+            server_id: string;
+            /** @description 服务器可见文字频道的未读总数 */
+            unread_count: number;
+            /** @description 服务器可见文字频道的未读提及总数 */
+            mention_count: number;
+        };
+        /**
+         * Unreads
+         * @description 当前用户的未读快照（#40）：channels 覆盖全部可见频道（含 0 值项）， servers 覆盖全部已加入服务器（仅聚合服务器文字频道）。数组按 ID 升序， 空数组返回 [] 而非 null。
+         */
+        Unreads: {
+            channels: components["schemas"]["UnreadChannel"][];
+            servers: components["schemas"]["UnreadServer"][];
+        };
+        /** MarkReadRequest */
+        MarkReadRequest: {
+            /** @description 最后已读消息 ID（#40）：必须存在且属于路径频道，否则 400 bad_read； 水位只前进，更旧的 ID 不会让计数回退。 */
+            last_message_id: string;
         };
         /**
          * Invite
@@ -2247,6 +2322,60 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    listUnreads: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 未读快照（channels/servers 含 0 值项，ID 升序） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Unreads"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    markChannelRead: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MarkReadRequest"];
+            };
+        };
+        responses: {
+            /** @description 更新后的频道未读/提及计数 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnreadChannel"];
+                };
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];

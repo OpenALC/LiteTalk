@@ -20,6 +20,7 @@ const (
 	TypeChannelJoined         = "channel.joined"          // S→C
 	TypeChannelLeave          = "channel.leave"           // C→S
 	TypeChannelPeerLeft       = "channel.peer_left"       // S→C
+	TypeChannelUnread         = "channel.unread"          // S→C · since 2
 	TypeChatMessage           = "chat.message"            // S→C
 	TypeChatSend              = "chat.send"               // C→S
 	TypeClientHello           = "client.hello"            // C→S · since 2
@@ -133,6 +134,13 @@ type ChannelLeaveData struct {
 type PeerLeftData struct {
 	ChannelID string `json:"channel_id"`
 	UserID    string `json:"user_id"`
+}
+
+// ChannelUnreadData 频道未读/提及计数事件（#40）。计数按接收者精确计算：同一事件只投递给该用户，客户端收到后整体覆盖本地该频道的计数。自己的消息不计未读；多设备读标记与断线续传都通过本事件同步。
+type ChannelUnreadData struct {
+	ChannelID    string `json:"channel_id"`
+	UnreadCount  int64  `json:"unread_count"`
+	MentionCount int64  `json:"mention_count"`
 }
 
 // ChatMessageData 文字消息广播。字段命名与 REST 消息 DTO 的统一由 #31 收敛，本 schema 先按 WS 现状定形。
