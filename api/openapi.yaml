@@ -1318,6 +1318,141 @@ paths:
           $ref: '#/components/responses/RateLimited'
         default:
           $ref: '#/components/responses/Internal'
+  /api/v1/channels/{id}/messages/{message_id}:
+    get:
+      operationId: getMessage
+      summary: 单条消息
+      description: >
+        #39：返回频道内一条消息。可见性沿用列表：会话（私聊/群聊）非成员 404
+        not_found（不泄露存在性），服务器频道无 ViewChannel 403 forbidden。
+        消息不存在或不属于路径频道 404 not_found。软删消息仍返回
+        （content 为空串、deleted_at 有值），供回复跳转。
+        code：bad_request、路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
+      tags: [messages]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+        - $ref: '#/components/parameters/MessageIDPath'
+      responses:
+        '200':
+          description: 消息（含 mentions/reply_preview；不含发送者邮箱）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
+    patch:
+      operationId: editMessage
+      summary: 编辑消息（仅作者）
+      description: >
+        #39：仅作者可编辑，非作者 403 forbidden。content 1–2000 字符，越界 400 bad_content。
+        mentions 缺省 = 保持原提及不变；给出 = 整体替换（空数组清除全部提及），
+        不合法 400 bad_mention。成功后写入 edited_at 并返回更新后的消息。
+        已删除的消息 404 message_deleted（重复编辑同口径）；消息不存在或不属于路径
+        频道 404 not_found。
+        频控 20 次/分/用户，超限 429 rate_limited。
+        code：bad_content、bad_mention、message_deleted、bad_request、路径参数不合法；
+        401；403 forbidden；404 not_found；429 rate_limited；5xx internal。
+      tags: [messages]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+        - $ref: '#/components/parameters/MessageIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EditMessageRequest'
+      responses:
+        '200':
+          description: 更新后的消息（edited_at 已置位）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Internal'
+    delete:
+      operationId: deleteMessage
+      summary: 删除消息（软删：作者或管理员）
+      description: >
+        #39：软删——置 deleted_at、清空正文，行保留供回复引用，返回 204。
+        作者可删自己的消息；服务器频道另有 ManageServer（管理员/服主）可删他人消息；
+        会话（私聊/群聊）仅作者可删，其它参与者 403 forbidden。
+        已删除的消息 404 message_deleted（重复删除同口径）；消息不存在或不属于路径
+        频道 404 not_found。
+        频控 20 次/分/用户，超限 429 rate_limited。
+        code：message_deleted、bad_request、路径参数不合法；401；403 forbidden；
+        404 not_found；429 rate_limited；5xx internal。
+      tags: [messages]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+        - $ref: '#/components/parameters/MessageIDPath'
+      responses:
+        '204':
+          description: 已删除（无响应体）
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/channels/{id}/mention-candidates:
+    get:
+      operationId: listMentionCandidates
+      summary: '@提及候选用户'
+      description: >
+        #39：返回可被 @ 的用户 {user_id, nickname, tag}，按 nickname、user_id
+        升序稳定排序，不含 email。服务器频道 = 该服对频道有 ViewChannel 的成员；
+        会话频道 = 会话成员。会话非成员 404 not_found（不泄露存在性）；服务器
+        频道无 ViewChannel 403 forbidden；空结果为 [] 而非 null。
+        code：bad_request、路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
+      tags: [messages]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      responses:
+        '200':
+          description: 提及候选数组（按 nickname、user_id 升序）
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/MentionCandidate'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
   /api/v1/servers/{id}/roles:
     get:
       operationId: listRoles
@@ -1681,6 +1816,15 @@ components:
       in: path
       required: true
       description: 目标用户 ID 的十进制数字串（#35 B4）
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    MessageIDPath:
+      name: message_id
+      in: path
+      required: true
+      description: 消息 ID 的十进制数字串（#39）
       schema:
         type: integer
         format: int64
@@ -2089,7 +2233,11 @@ components:
     Message:
       type: object
       title: Message
-      description: 文字频道消息（发送者昵称/tag 内联，不含邮箱）。ID 为十进制字符串（#31）。
+      description: >
+        文字频道消息（发送者昵称/tag 内联，不含邮箱）。ID 为十进制字符串（#31）。
+        #39：edited_at/deleted_at 为编辑/软删时间；reply_to 为回复目标 ID，
+        reply_preview 为跳转预览；mentions 为被 @ 的用户 ID（升序去重）。
+        软删消息 content 为空串、deleted_at 有值，仍出现在列表与单条响应里供回复引用。
       required: [id, channel_id, user_id, content, created_at]
       properties:
         id:
@@ -2113,6 +2261,64 @@ components:
         sender_nickname:
           type: string
         sender_tag:
+          type: string
+        edited_at:
+          type: string
+          format: date-time
+          x-go-type: Time
+          description: 首次编辑时间（#39）；未编辑时缺省
+        deleted_at:
+          type: string
+          format: date-time
+          x-go-type: Time
+          description: 软删时间（#39）；未删除时缺省
+        reply_to:
+          type: string
+          x-go-type: ID
+          description: 回复目标消息 ID（#39）；非回复消息缺省
+        reply_preview:
+          $ref: '#/components/schemas/ReplyPreview'
+        mentions:
+          type: array
+          description: 被 @ 的用户 ID（#39，升序去重）；无提及时缺省
+          items:
+            type: string
+            x-go-type: ID
+    ReplyPreview:
+      type: object
+      title: ReplyPreview
+      description: >
+        回复目标预览（#39）：只含跳转与展示所需字段，不含 email。目标已软删时
+        content 为空串、deleted=true；目标不存在（历史脏数据）时整个字段缺省。
+      required: [id, user_id, nickname, content, deleted]
+      properties:
+        id:
+          type: string
+          x-go-type: ID
+        user_id:
+          type: string
+          x-go-type: ID
+        nickname:
+          type: string
+          description: 目标消息发送者昵称（发送时快照，非当前昵称）
+        content:
+          type: string
+          description: 目标消息正文；已软删时为空串
+        deleted:
+          type: boolean
+          description: 目标消息是否已软删
+    MentionCandidate:
+      type: object
+      title: MentionCandidate
+      description: '@提及候选用户（#39）：只含昵称/tag，不含 email。'
+      required: [user_id, nickname, tag]
+      properties:
+        user_id:
+          type: string
+          x-go-type: ID
+        nickname:
+          type: string
+        tag:
           type: string
     Invite:
       type: object
@@ -2578,6 +2784,37 @@ components:
         nonce:
           type: string
           description: 幂等键（#31，≤64 字符）；同频道同用户重复提交回读原消息（200）。缺省不去重。
+        reply_to:
+          type: string
+          x-go-type: ID
+          description: >
+            回复目标消息 ID（#39）：必须属于同一频道且存在，否则 400 bad_reply；
+            目标已软删也允许（预览 deleted=true、content 为空）。
+        mentions:
+          type: array
+          description: >
+            @提及用户 ID（#39）：去重，元素须 > 0；每个用户必须是该频道可见成员，
+            否则 400 bad_mention。
+          items:
+            type: string
+            x-go-type: ID
+    EditMessageRequest:
+      type: object
+      title: EditMessageRequest
+      required: [content]
+      properties:
+        content:
+          type: string
+          description: 1–2000 字符
+        mentions:
+          type: array
+          description: >
+            @提及用户 ID（#39）：缺省 = 保持原提及不变；给出 = 整体替换，
+            空数组清除全部提及。去重，元素须 > 0；每个用户必须是该频道可见成员，
+            否则 400 bad_mention。
+          items:
+            type: string
+            x-go-type: ID
     Role:
       type: object
       title: Role

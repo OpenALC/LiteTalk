@@ -648,6 +648,54 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/channels/{id}/messages/{message_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 单条消息
+         * @description #39：返回频道内一条消息。可见性沿用列表：会话（私聊/群聊）非成员 404 not_found（不泄露存在性），服务器频道无 ViewChannel 403 forbidden。 消息不存在或不属于路径频道 404 not_found。软删消息仍返回 （content 为空串、deleted_at 有值），供回复跳转。 code：bad_request、路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
+         */
+        get: operations["getMessage"];
+        put?: never;
+        post?: never;
+        /**
+         * 删除消息（软删：作者或管理员）
+         * @description #39：软删——置 deleted_at、清空正文，行保留供回复引用，返回 204。 作者可删自己的消息；服务器频道另有 ManageServer（管理员/服主）可删他人消息； 会话（私聊/群聊）仅作者可删，其它参与者 403 forbidden。 已删除的消息 404 message_deleted（重复删除同口径）；消息不存在或不属于路径 频道 404 not_found。 频控 20 次/分/用户，超限 429 rate_limited。 code：message_deleted、bad_request、路径参数不合法；401；403 forbidden； 404 not_found；429 rate_limited；5xx internal。
+         */
+        delete: operations["deleteMessage"];
+        options?: never;
+        head?: never;
+        /**
+         * 编辑消息（仅作者）
+         * @description #39：仅作者可编辑，非作者 403 forbidden。content 1–2000 字符，越界 400 bad_content。 mentions 缺省 = 保持原提及不变；给出 = 整体替换（空数组清除全部提及）， 不合法 400 bad_mention。成功后写入 edited_at 并返回更新后的消息。 已删除的消息 404 message_deleted（重复编辑同口径）；消息不存在或不属于路径 频道 404 not_found。 频控 20 次/分/用户，超限 429 rate_limited。 code：bad_content、bad_mention、message_deleted、bad_request、路径参数不合法； 401；403 forbidden；404 not_found；429 rate_limited；5xx internal。
+         */
+        patch: operations["editMessage"];
+        trace?: never;
+    };
+    "/api/v1/channels/{id}/mention-candidates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * @提及候选用户
+         * @description #39：返回可被 @ 的用户 {user_id, nickname, tag}，按 nickname、user_id 升序稳定排序，不含 email。服务器频道 = 该服对频道有 ViewChannel 的成员； 会话频道 = 会话成员。会话非成员 404 not_found（不泄露存在性）；服务器 频道无 ViewChannel 403 forbidden；空结果为 [] 而非 null。 code：bad_request、路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
+         */
+        get: operations["listMentionCandidates"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/servers/{id}/roles": {
         parameters: {
             query?: never;
@@ -1013,7 +1061,7 @@ export interface components {
         };
         /**
          * Message
-         * @description 文字频道消息（发送者昵称/tag 内联，不含邮箱）。ID 为十进制字符串（#31）。
+         * @description 文字频道消息（发送者昵称/tag 内联，不含邮箱）。ID 为十进制字符串（#31）。 #39：edited_at/deleted_at 为编辑/软删时间；reply_to 为回复目标 ID， reply_preview 为跳转预览；mentions 为被 @ 的用户 ID（升序去重）。 软删消息 content 为空串、deleted_at 有值，仍出现在列表与单条响应里供回复引用。
          */
         Message: {
             id: string;
@@ -1026,6 +1074,44 @@ export interface components {
             created_at: string;
             sender_nickname?: string;
             sender_tag?: string;
+            /**
+             * Format: date-time
+             * @description 首次编辑时间（#39）；未编辑时缺省
+             */
+            edited_at?: string;
+            /**
+             * Format: date-time
+             * @description 软删时间（#39）；未删除时缺省
+             */
+            deleted_at?: string;
+            /** @description 回复目标消息 ID（#39）；非回复消息缺省 */
+            reply_to?: string;
+            reply_preview?: components["schemas"]["ReplyPreview"];
+            /** @description 被 @ 的用户 ID（#39，升序去重）；无提及时缺省 */
+            mentions?: string[];
+        };
+        /**
+         * ReplyPreview
+         * @description 回复目标预览（#39）：只含跳转与展示所需字段，不含 email。目标已软删时 content 为空串、deleted=true；目标不存在（历史脏数据）时整个字段缺省。
+         */
+        ReplyPreview: {
+            id: string;
+            user_id: string;
+            /** @description 目标消息发送者昵称（发送时快照，非当前昵称） */
+            nickname: string;
+            /** @description 目标消息正文；已软删时为空串 */
+            content: string;
+            /** @description 目标消息是否已软删 */
+            deleted: boolean;
+        };
+        /**
+         * MentionCandidate
+         * @description @提及候选用户（#39）：只含昵称/tag，不含 email。
+         */
+        MentionCandidate: {
+            user_id: string;
+            nickname: string;
+            tag: string;
         };
         /**
          * Invite
@@ -1294,6 +1380,17 @@ export interface components {
             content: string;
             /** @description 幂等键（#31，≤64 字符）；同频道同用户重复提交回读原消息（200）。缺省不去重。 */
             nonce?: string;
+            /** @description 回复目标消息 ID（#39）：必须属于同一频道且存在，否则 400 bad_reply； 目标已软删也允许（预览 deleted=true、content 为空）。 */
+            reply_to?: string;
+            /** @description @提及用户 ID（#39）：去重，元素须 > 0；每个用户必须是该频道可见成员， 否则 400 bad_mention。 */
+            mentions?: string[];
+        };
+        /** EditMessageRequest */
+        EditMessageRequest: {
+            /** @description 1–2000 字符 */
+            content: string;
+            /** @description @提及用户 ID（#39）：缺省 = 保持原提及不变；给出 = 整体替换， 空数组清除全部提及。去重，元素须 > 0；每个用户必须是该频道可见成员， 否则 400 bad_mention。 */
+            mentions?: string[];
         };
         /**
          * Role
@@ -1497,6 +1594,8 @@ export interface components {
         IDPath: number;
         /** @description 目标用户 ID 的十进制数字串（#35 B4） */
         UserIDPath: number;
+        /** @description 消息 ID 的十进制数字串（#39） */
+        MessageIDPath: number;
         /** @description 频道覆盖的目标类型（#35 B4） */
         TargetTypePath: "role" | "member";
         /** @description 覆盖目标（角色或成员）ID 的十进制数字串（#35 B4） */
@@ -2719,6 +2818,128 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             429: components["responses"]["RateLimited"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    getMessage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+                /** @description 消息 ID 的十进制数字串（#39） */
+                message_id: components["parameters"]["MessageIDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 消息（含 mentions/reply_preview；不含发送者邮箱） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Message"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    deleteMessage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+                /** @description 消息 ID 的十进制数字串（#39） */
+                message_id: components["parameters"]["MessageIDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 已删除（无响应体） */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    editMessage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+                /** @description 消息 ID 的十进制数字串（#39） */
+                message_id: components["parameters"]["MessageIDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EditMessageRequest"];
+            };
+        };
+        responses: {
+            /** @description 更新后的消息（edited_at 已置位） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Message"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    listMentionCandidates: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 提及候选数组（按 nickname、user_id 升序） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MentionCandidate"][];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             default: components["responses"]["Internal"];
         };
     };
