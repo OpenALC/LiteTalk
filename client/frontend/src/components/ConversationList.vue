@@ -11,6 +11,7 @@ import { useConversationsStore } from '../stores/conversations'
 import { useAuthStore } from '../stores/auth'
 import { useFriendsStore } from '../stores/data'
 import { useNotifyStore } from '../stores/notify'
+import { badgeText, unreadLabel, useUnreadsStore } from '../stores/unreads'
 import type { Conversation } from '../api/types'
 import ContextMenu, { type CtxItem } from './ContextMenu.vue'
 import GroupCreateDialog from './GroupCreateDialog.vue'
@@ -20,6 +21,7 @@ import PromptDialog from './PromptDialog.vue'
 const conversations = useConversationsStore()
 const auth = useAuthStore()
 const friends = useFriendsStore()
+const unreads = useUnreadsStore()
 const notify = useNotifyStore()
 
 const showCreate = ref(false)
@@ -130,9 +132,16 @@ async function onRenameConfirm(value: string) {
           <Users v-else :size="16" />
         </span>
         <span class="cv-info">
-          <span class="cv-name">{{ conversations.displayName(c) }}</span>
+          <span class="cv-name" :class="{ unread: unreads.channel(c.id).unread > 0 }">
+            {{ conversations.displayName(c) }}
+          </span>
           <span class="cv-sub">{{ subtitle(c) }}</span>
         </span>
+        <!-- 未读徽标（#40）：提及数优先，否则未读圆点 -->
+        <span v-if="unreads.channel(c.id).mentions > 0" class="cv-badge"
+              :title="unreadLabel(unreads.channel(c.id))">{{ badgeText(unreads.channel(c.id).mentions) }}</span>
+        <span v-else-if="unreads.channel(c.id).unread > 0" class="cv-dot"
+              :title="unreadLabel(unreads.channel(c.id))" />
       </button>
 
       <div v-if="!conversations.list.length" class="cv-empty">
@@ -189,6 +198,21 @@ async function onRenameConfirm(value: string) {
 .cv-name {
   font-size: 13.5px; font-weight: 600;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.cv-name.unread { color: var(--ink-900); }
+/* 未读徽标（#40）：提及数为主色胶囊白字，未读为小圆点 */
+.cv-badge {
+  flex: none;
+  min-width: 16px; height: 16px; padding: 0 4px;
+  border-radius: 8px;
+  background: var(--brand-500); color: var(--surface);
+  font-size: 10px; font-weight: 700; line-height: 16px;
+  text-align: center;
+}
+.cv-dot {
+  flex: none;
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--brand-500);
 }
 .cv-sub { font-size: 11.5px; color: var(--ink-400); }
 .cv-empty {

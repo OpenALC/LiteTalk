@@ -2,7 +2,7 @@
 // 浏览器独立开发（vite dev 无 Go 后端）时走 mock 桩，行为可联调 UI。
 // 原生环境判定：Go 在 webview 启动时注入 window._wails.flags（浏览器环境恒无）。
 import { Call, Events } from '@wailsio/runtime'
-import type { AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ChatMessage, ConnConfigView, ConnTestResult, Conversation, FriendDTO, HotkeySettings, MentionCandidate, PeerView, ServerChannels, ServerConfig, ServerDTO, UserProfile, VoiceStateView } from './types'
+import type { AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ChatMessage, ConnConfigView, ConnTestResult, Conversation, FriendDTO, HotkeySettings, MentionCandidate, PeerView, ServerChannels, ServerConfig, ServerDTO, UnreadChannel, Unreads, UserProfile, VoiceStateView } from './types'
 
 type GoApp = {
   GetVersion(): Promise<string>
@@ -107,6 +107,11 @@ type GoApp = {
   AddConversationMembers(id: string, userIDs: string[]): Promise<Conversation>
   // 最后一人退出时服务端删除会话（204），Go 侧返回 null。
   RemoveConversationMember(id: string, userID: string): Promise<Conversation | null>
+  // 未读与提及计数（#40）：ListUnreads 返回含 0 值项的快照（空数组非 null）；
+  // MarkChannelRead 上报已读水位并返回服务端重算后的计数。增量由 chat:unread
+  // 事件推送（覆盖语义，不能累加）。
+  ListUnreads(): Promise<Unreads>
+  MarkChannelRead(channelID: string, lastMessageID: string): Promise<UnreadChannel>
   // 介绍页/首页（v0.1.2：客户端级偏好，存 config.json）
   GetHomeServer(): Promise<string>
   SetHomeServer(id: string): Promise<void>
@@ -322,6 +327,11 @@ const mockApp: GoApp = {
   async DeleteConversation() {},
   async AddConversationMembers(id: string) { return mockConversation(id, 'group', '群聊') },
   async RemoveConversationMember(id: string) { return mockConversation(id, 'group', '群聊') },
+  // 未读计数桩：空快照/零值（浏览器开发环境无可联调数据）。
+  async ListUnreads() { return { channels: [], servers: [] } },
+  async MarkChannelRead(channelID: string) {
+    return { channel_id: channelID, unread_count: 0, mention_count: 0 }
+  },
   // 介绍页/首页桩：默认介绍页为首页、未隐藏。
   async GetHomeServer() { return '' },
   async SetHomeServer() {},

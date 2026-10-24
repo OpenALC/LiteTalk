@@ -7,6 +7,7 @@ import { useAuthStore } from './auth'
 import { useConversationsStore } from './conversations'
 import { useServersStore } from './data'
 import { useNotifyStore } from './notify'
+import { useUnreadsStore } from './unreads'
 
 // mergeHistory 历史补拉与实时消息的合并（#38 B4b）：按服务端消息 ID 去重，
 // 再按毫秒时间戳由旧到新排序（sort 稳定，同毫秒保持历史在前、实时在后的到达序）。
@@ -63,6 +64,16 @@ export const useChatStore = defineStore('chat', () => {
   // 触发一次加载检查，没有它就会打出一串重复请求。
   const mentionInflight = new Map<string, Promise<MentionCandidate[]>>()
 
+  // loadedChannels 已成功补拉过历史的频道：ChatPanel 与 ConversationChat 都
+  // 会在频道打开时调用 loadHistory，按频道记已加载 + 合并在飞请求保证只发一次。
+  // 失败不记（下次进入重试）；resetAll 清空。
+  const loadedChannels = new Set<string>()
+  const historyInflight = new Map<string, Promise<void>>()
+
+  // lastReportedByChannel 已上报已读水位的最后一条消息 ID（#40）：同一轮不
+  // 重复 PUT；服务端水位只前进，重复上报只是白耗请求。
+  const lastReportedByChannel = new Map<string, string>()
+
   // messagesFor 取某频道的消息列表（无记录返回空数组，不创建空桶）。
   // 在模板渲染期读取 messagesByChannel.value，响应式追踪成立。
   function messagesFor(channelId: string): ChatMessage[] {
@@ -83,17 +94,53 @@ export const useChatStore = defineStore('chat', () => {
     messagesByChannel.value = { ...messagesByChannel.value, [channelId]: next }
   }
 
-  // loadHistory 打开私聊/群聊时补拉最近历史（旧→新），与实时消息按 ID 合并。
-  // 私聊/群聊的会话 ID 就是频道 ID。失败上抛由调用方静默，不阻断实时消息。
-  async function loadHistory(channelId: string) {
-    if (!channelId) return
+  // loadHistory 打开频道/会话时补拉最近历史（旧→新），与实时消息按 ID 合并。
+  // 私聊/群聊的会话 ID 就是频道 ID。幂等：同频道已成功加载或正在加载时直接
+  // 复用，ChatPanel 与 ConversationChat 同时调用只发一次。失败上抛由调用方
+  // 静默，不阻断实时消息；失败不记已加载，下次进入会重试。
+  function loadHistory(channelId: string): Promise<void> {
+    if (!channelId) return Promise.resolve()
+    if (loadedChannels.has(channelId)) return Promise.resolve()
+    const inflight = historyInflight.get(channelId)
+    if (inflight) return inflight
     const gen = generation
-    const history = await goApp().ListMessages(channelId, 50)
-    if (gen !== generation) return
-    const merged = mergeHistory(history, messagesFor(channelId))
-    if (!merged.length) return
-    // 补拉期间可能有实时消息到达：以合并后的完整列表写回，不覆盖新消息。
-    messagesByChannel.value = { ...messagesByChannel.value, [channelId]: merged }
+    // then 链而非 async 包装：finally 必须晚于 historyInflight.set 执行，
+    // 否则同步完成的请求会在登记前就把自己从表里删掉。
+    let p: Promise<void>
+    p = goApp().ListMessages(channelId, 50)
+      .then((history) => {
+        if (gen !== generation) return
+        loadedChannels.add(channelId)
+        const merged = mergeHistory(history, messagesFor(channelId))
+        if (!merged.length) return
+        // 补拉期间可能有实时消息到达：以合并后的完整列表写回，不覆盖新消息。
+        messagesByChannel.value = { ...messagesByChannel.value, [channelId]: merged }
+      })
+      .finally(() => {
+        // 只清理自己这一笔：resetAll 后可能有新一代请求占用了同一个键。
+        if (historyInflight.get(channelId) === p) historyInflight.delete(channelId)
+      })
+    historyInflight.set(channelId, p)
+    return p
+  }
+
+  // markRead 上报频道已读到最新一条消息（#40）。取桶内排序后的最后一项；
+  // 无消息或与上次已上报 ID 相同则跳过。成功用返回计数覆盖 unreads store；
+  // 失败静默（切频道时自动上报，弹 toast 会刷屏；水位未推进，下条消息再试）。
+  async function markRead(channelId: string): Promise<void> {
+    const arr = messagesFor(channelId)
+    const last = arr.length ? arr[arr.length - 1] : undefined
+    if (!last?.id) return
+    if (lastReportedByChannel.get(channelId) === last.id) return
+    const gen = generation
+    try {
+      const res = await goApp().MarkChannelRead(channelId, last.id)
+      if (gen !== generation) return
+      lastReportedByChannel.set(channelId, last.id)
+      useUnreadsStore().setChannel(channelId, res.unread_count, res.mention_count)
+    } catch {
+      // 静默：下次消息到达或重新进入频道时再报。
+    }
   }
 
   // send 发送普通消息（无回复、无提及）。不做本地乐观回显——服务端会把
@@ -264,6 +311,9 @@ export const useChatStore = defineStore('chat', () => {
     messagesByChannel.value = {}
     mentionCandidatesByChannel.value = {}
     mentionInflight.clear()
+    loadedChannels.clear()
+    historyInflight.clear()
+    lastReportedByChannel.clear()
   }
 
   // unbindEvents 逐个注销本 store 注册的监听器。
@@ -274,7 +324,7 @@ export const useChatStore = defineStore('chat', () => {
   return {
     messagesByChannel, mentionCandidatesByChannel,
     messagesFor, messageById, mergeMessage, send, sendWithMeta,
-    editMessage, deleteMessage, loadHistory,
+    editMessage, deleteMessage, loadHistory, markRead,
     mentionCandidatesFor, loadMentionCandidates,
     bindEvents, unbindEvents, resetAll,
   }

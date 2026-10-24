@@ -49,7 +49,9 @@ watch(() => messages.value.length, () => {
 
 // 切换频道/会话时回到最新一条（历史补拉到达后由 length 变化再跟一次）。
 // 回复目标、编辑态与提及候选都属于上一个频道，必须一起清掉。
-watch(() => props.channelId, () => {
+// loadHistory 幂等（chat store 按频道记已加载 + 合并在飞请求）：文字频道与
+// 会话两条路径同时调用也只发一次。
+watch(() => props.channelId, (id) => {
   stick = true
   scrollToBottom()
   editingId.value = ''
@@ -58,7 +60,33 @@ watch(() => props.channelId, () => {
   pendingMentions.clear()
   closeMention()
   menu.value = null
+  chat.loadHistory(id).catch(() => {})
+}, { immediate: true })
+
+// ---- 已读上报（#40）：面板打开即代表该频道可见 ----
+// 最后一条消息变化后 debounce 上报：连续刷屏只发一次；切频道/卸载时清 timer。
+const lastMessageId = computed(() => {
+  const arr = messages.value
+  return arr.length ? arr[arr.length - 1].id : ''
 })
+
+let readTimer: ReturnType<typeof setTimeout> | null = null
+
+function clearReadTimer() {
+  if (readTimer) {
+    clearTimeout(readTimer)
+    readTimer = null
+  }
+}
+
+watch([() => props.channelId, lastMessageId], () => {
+  clearReadTimer()
+  if (!props.channelId || !lastMessageId.value) return
+  readTimer = setTimeout(() => {
+    readTimer = null
+    chat.markRead(props.channelId).catch(() => {})
+  }, 400)
+}, { immediate: true })
 
 // 挂载时桶里可能已有消息（切走再切回）：直接定位到最新一条。
 onMounted(() => {
@@ -181,6 +209,7 @@ async function jumpToReply(m: ChatMessage) {
 
 onBeforeUnmount(() => {
   if (flashTimer) clearTimeout(flashTimer)
+  clearReadTimer()
 })
 
 // ---- 编辑：正文替换为多行编辑框；提及集合保持原样（服务端整体替换）----

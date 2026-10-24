@@ -19,6 +19,7 @@ import { useChatStore } from '../stores/chat'
 import { useAuthStore } from '../stores/auth'
 import { useConversationsStore } from '../stores/conversations'
 import { INTRO_ID, useFriendsStore, useServersStore } from '../stores/data'
+import { useUnreadsStore } from '../stores/unreads'
 import { useHotkeys } from '../composables/useHotkeys'
 import { eventsOn } from '../api/bridge'
 
@@ -29,6 +30,7 @@ const auth = useAuthStore()
 const conversations = useConversationsStore()
 const servers = useServersStore()
 const friends = useFriendsStore()
+const unreads = useUnreadsStore()
 
 const tab = ref<'voice' | 'chat'>('voice')
 const showFriends = ref(true)
@@ -71,6 +73,8 @@ onMounted(() => {
   servers.bindEvents()
   friends.bindEvents()
   conversations.bindEvents()
+  // 未读计数（#40）：chat:unread 覆盖本地计数，data:resync 后重拉快照。
+  unreads.bindEvents()
   offAuthSession = eventsOn('auth:session', (d) => {
     auth.setSignalOk((d as { ok?: boolean }).ok !== false)
   })
@@ -86,6 +90,8 @@ onMounted(() => {
     servers.loadRemoteServers().catch(() => {})
     // 私信列表登录后预取：进入私信模式时不必等一次网络往返。失败静默。
     conversations.load().catch(() => {})
+    // 未读快照（#40）：登录后拉一次，含 0 值项；失败静默（徽标暂缺不阻断主界面）。
+    unreads.load().catch(() => {})
   }
 })
 
@@ -95,6 +101,7 @@ onUnmounted(() => {
   servers.unbindEvents()
   friends.unbindEvents()
   conversations.unbindEvents()
+  unreads.unbindEvents()
   offAuthSession()
 })
 </script>
