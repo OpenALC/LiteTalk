@@ -2,7 +2,7 @@
 // 浏览器独立开发（vite dev 无 Go 后端）时走 mock 桩，行为可联调 UI。
 // 原生环境判定：Go 在 webview 启动时注入 window._wails.flags（浏览器环境恒无）。
 import { Call, Events } from '@wailsio/runtime'
-import type { AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ChatMessage, ConnConfigView, ConnTestResult, Conversation, FriendDTO, HotkeySettings, PeerView, ServerChannels, ServerConfig, ServerDTO, UserProfile, VoiceStateView } from './types'
+import type { AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ChatMessage, ConnConfigView, ConnTestResult, Conversation, FriendDTO, HotkeySettings, MentionCandidate, PeerView, ServerChannels, ServerConfig, ServerDTO, UserProfile, VoiceStateView } from './types'
 
 type GoApp = {
   GetVersion(): Promise<string>
@@ -54,6 +54,15 @@ type GoApp = {
   // RequestVoiceState 「请求静音」：请目标闭麦/静音（对方接受后生效，无强制）。
   RequestVoiceState(channelID: string, targetID: string, mute: boolean, deafen: boolean): Promise<void>
   SendChat(channelID: string, content: string): Promise<void>
+  // 消息编辑/删除/回复/@提及（#39）：ID 一律十进制字符串，Go 侧校验非法 ID。
+  // SendChatWithMeta：replyTo 空串 = 普通消息；mentions 空数组 = 无提及。
+  // EditMessage：mentions 整体替换（空数组清除全部提及），返回更新后的消息。
+  // DeleteMessage 软删；GetMessage 用于回复跳转（软删消息仍返回）。
+  SendChatWithMeta(channelID: string, content: string, replyTo: string, mentions: string[]): Promise<void>
+  EditMessage(channelID: string, messageID: string, content: string, mentions: string[]): Promise<ChatMessage>
+  DeleteMessage(channelID: string, messageID: string): Promise<void>
+  GetMessage(channelID: string, messageID: string): Promise<ChatMessage>
+  ListMentionCandidates(channelID: string): Promise<MentionCandidate[]>
   // ListMessages 频道最近消息（旧→新，limit 上限 50）。私聊/群聊的会话 ID
   // 即频道 ID；载荷与 chat:message 事件同口径，按 id 去重合并。
   ListMessages(channelID: string, limit: number): Promise<ChatMessage[]>
@@ -229,6 +238,22 @@ const mockApp: GoApp = {
   async SetDeafen() {},
   async SetPeerVolume() {},
   async SendChat() {},
+  // #39 消息编辑/回复/提及桩：回显传入内容，供浏览器开发联调 UI。
+  async SendChatWithMeta() {},
+  async EditMessage(channelID: string, messageID: string, content: string, mentions: string[]) {
+    return {
+      id: messageID, channel_id: channelID, user_id: '1', nickname: 'dev',
+      content, ts: String(Date.now()), mentions,
+    }
+  },
+  async DeleteMessage() {},
+  async GetMessage(channelID: string, messageID: string) {
+    return {
+      id: messageID, channel_id: channelID, user_id: '1', nickname: 'dev',
+      content: '', ts: String(Date.now()),
+    }
+  },
+  async ListMentionCandidates() { return [] },
   // 消息历史桩：浏览器开发环境无可联调数据。
   async ListMessages() { return [] },
   async GetVoiceMembers() { return [] },

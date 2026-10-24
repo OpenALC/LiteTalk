@@ -25,6 +25,7 @@ import (
 	"github.com/OpenALC/LiteTalk/client/core/audio"
 	"github.com/OpenALC/LiteTalk/client/core/config"
 	"github.com/OpenALC/LiteTalk/client/core/hotkey"
+	"github.com/OpenALC/LiteTalk/client/core/signal"
 	"github.com/OpenALC/LiteTalk/client/core/voice"
 	"github.com/OpenALC/LiteTalk/client/desktop"
 	"github.com/OpenALC/LiteTalk/client/desktop/tray"
@@ -1301,6 +1302,25 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 				"conversation_id": conversationID, "action": action,
 			})
 		},
+		// 消息编辑/软删除广播（message.edited / message.deleted，#39）：前端按
+		// message_id 原地替换或显示墓碑。回调跑在 ws 读循环 goroutine，emit 不阻塞。
+		// edited_at 沿用桥接口径（Unix 毫秒字符串），与 chat:message 的 ts 一致。
+		OnMessageEdited: func(d signal.MessageEditedData) {
+			mentions := d.Mentions
+			if mentions == nil {
+				mentions = []string{}
+			}
+			a.emit("chat:edited", map[string]any{
+				"channel_id": d.ChannelID, "message_id": d.MessageID,
+				"content": d.Content, "edited_at": strconv.FormatInt(d.EditedAt, 10),
+				"mentions": mentions,
+			})
+		},
+		OnMessageDeleted: func(d signal.MessageDeletedData) {
+			a.emit("chat:deleted", map[string]string{
+				"channel_id": d.ChannelID, "message_id": d.MessageID,
+			})
+		},
 		// 服务端优雅关闭（server.shutdown，#21）：前端提示「服务端已关闭」；
 		// 停止自动重连在 Session 侧已异步处理。
 		OnServerShutdown: func(reason string) {
@@ -1343,11 +1363,29 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 			log.Printf("apply audio devices: %v", err)
 		}
 	}
-	sess.ChatHandler(func(channelID, msgID, userID, nick, content, ts, nonce string) {
-		a.emit("chat:message", map[string]string{
-			"id": msgID, "channel_id": channelID, "user_id": userID,
-			"nickname": nick, "content": content, "ts": ts, "nonce": nonce,
-		})
+	sess.ChatMessageHandler(func(d signal.ChatMessageData) {
+		// 旧字段（id/channel_id/user_id/nickname/content/ts/nonce）保持不变，
+		// #39 追加回复与提及；reply_to/reply_preview 缺省时不发键，前端按无回复处理。
+		mentions := d.Mentions
+		if mentions == nil {
+			mentions = []string{}
+		}
+		payload := map[string]any{
+			"id": d.ID, "channel_id": d.ChannelID, "user_id": d.User.ID,
+			"nickname": d.User.Nickname, "content": d.Content,
+			"ts": strconv.FormatInt(d.TS, 10), "nonce": d.Nonce,
+			"mentions": mentions,
+		}
+		if d.ReplyTo != "" {
+			payload["reply_to"] = d.ReplyTo
+		}
+		if p := d.ReplyPreview; p != nil {
+			payload["reply_preview"] = map[string]any{
+				"id": p.ID, "user_id": p.UserID, "nickname": p.Nickname,
+				"content": p.Content, "deleted": p.Deleted,
+			}
+		}
+		a.emit("chat:message", payload)
 	})
 	// 服务端 error 帧转发前端（B1：此前未订阅，服务端拒收时消息凭空消失）。
 	// 已归属进房路径的错误（#91）由 voice:join_failed 承载，这里跳过以免同一次
@@ -1638,13 +1676,67 @@ func (a *App) RemoveConversationMember(id, userID string) (*api.ConversationDTO,
 // ChatMessageView 消息桥接视图：与 chat:message 事件的载荷同口径（ts 为毫秒
 // 字符串、ID 均为十进制字符串），前端可把历史补拉与实时广播直接按 id 合并。
 // 私聊/群聊的会话 ID 即频道 ID，历史消息仍走 /channels/{id}/messages。
+// #39：EditedAt/DeletedAt 也是毫秒字符串；软删消息 Content 为空、DeletedAt 有值。
 type ChatMessageView struct {
-	ID        string `json:"id"`
-	ChannelID string `json:"channel_id"`
-	UserID    string `json:"user_id"`
-	Nickname  string `json:"nickname"`
-	Content   string `json:"content"`
-	TS        string `json:"ts"`
+	ID           string            `json:"id"`
+	ChannelID    string            `json:"channel_id"`
+	UserID       string            `json:"user_id"`
+	Nickname     string            `json:"nickname"`
+	Content      string            `json:"content"`
+	TS           string            `json:"ts"`
+	EditedAt     string            `json:"edited_at,omitempty"`
+	DeletedAt    string            `json:"deleted_at,omitempty"`
+	ReplyTo      string            `json:"reply_to,omitempty"`
+	ReplyPreview *ReplyPreviewView `json:"reply_preview,omitempty"`
+	Mentions     []string          `json:"mentions"`
+}
+
+// ReplyPreviewView 回复目标预览（与 REST ReplyPreview 同口径）。
+type ReplyPreviewView struct {
+	ID       string `json:"id"`
+	UserID   string `json:"user_id"`
+	Nickname string `json:"nickname"`
+	Content  string `json:"content"`
+	Deleted  bool   `json:"deleted"`
+}
+
+// MentionCandidateView @提及候选用户（不含 email）。
+type MentionCandidateView struct {
+	UserID   string `json:"user_id"`
+	Nickname string `json:"nickname"`
+	Tag      string `json:"tag"`
+}
+
+// chatMessageView REST 消息 → 桥接视图（ts/edited_at/deleted_at 统一毫秒字符串）。
+func chatMessageView(m api.MessageDTO) ChatMessageView {
+	v := ChatMessageView{
+		ID:        m.ID.String(),
+		ChannelID: m.ChannelID.String(),
+		UserID:    m.UserID.String(),
+		Nickname:  m.SenderNickname,
+		Content:   m.Content,
+		TS:        strconv.FormatInt(m.CreatedAt.UnixMilli(), 10),
+		Mentions:  make([]string, 0, len(m.Mentions)),
+	}
+	if m.EditedAt != nil {
+		v.EditedAt = strconv.FormatInt(m.EditedAt.UnixMilli(), 10)
+	}
+	if m.DeletedAt != nil {
+		v.DeletedAt = strconv.FormatInt(m.DeletedAt.UnixMilli(), 10)
+	}
+	if m.ReplyTo != nil {
+		v.ReplyTo = m.ReplyTo.String()
+	}
+	if p := m.ReplyPreview; p != nil {
+		v.ReplyPreview = &ReplyPreviewView{
+			ID: p.ID.String(), UserID: p.UserID.String(), Nickname: p.Nickname,
+			Content: p.Content, Deleted: p.Deleted,
+		}
+	}
+	for _, id := range m.Mentions {
+		v.Mentions = append(v.Mentions, id.String())
+	}
+	return v
 }
 
 // ListMessages 拉频道最近消息（旧→新，limit 由 APIClient 夹到 [1,50]）。
@@ -1663,13 +1755,87 @@ func (a *App) ListMessages(channelID string, limit int) ([]ChatMessageView, erro
 	}
 	out := make([]ChatMessageView, 0, len(msgs))
 	for _, m := range msgs {
-		out = append(out, ChatMessageView{
-			ID:        m.ID.String(),
-			ChannelID: m.ChannelID.String(),
-			UserID:    m.UserID.String(),
-			Nickname:  m.SenderNickname,
-			Content:   m.Content,
-			TS:        strconv.FormatInt(m.CreatedAt.UnixMilli(), 10),
+		out = append(out, chatMessageView(m))
+	}
+	return out, nil
+}
+
+// GetMessage 单条消息（#39）：回复跳转与软删消息回读。不存在/不可见返回错误。
+func (a *App) GetMessage(channelID, messageID string) (*ChatMessageView, error) {
+	cid, err := strconv.ParseInt(channelID, 10, 64)
+	if err != nil || cid <= 0 {
+		return nil, fmt.Errorf("invalid channel id")
+	}
+	mid, err := strconv.ParseInt(messageID, 10, 64)
+	if err != nil || mid <= 0 {
+		return nil, fmt.Errorf("invalid message id")
+	}
+	if a.api == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	m, err := a.api.GetMessage(cid, mid)
+	if err != nil {
+		return nil, err
+	}
+	v := chatMessageView(*m)
+	return &v, nil
+}
+
+// EditMessage 编辑消息（仅作者，#39）。mentions 整体替换：空数组 = 清除全部提及。
+func (a *App) EditMessage(channelID, messageID, content string, mentions []string) (*ChatMessageView, error) {
+	cid, err := strconv.ParseInt(channelID, 10, 64)
+	if err != nil || cid <= 0 {
+		return nil, fmt.Errorf("invalid channel id")
+	}
+	mid, err := strconv.ParseInt(messageID, 10, 64)
+	if err != nil || mid <= 0 {
+		return nil, fmt.Errorf("invalid message id")
+	}
+	if a.api == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	m, err := a.api.EditMessage(cid, mid, content, mentions)
+	if err != nil {
+		return nil, err
+	}
+	v := chatMessageView(*m)
+	return &v, nil
+}
+
+// DeleteMessage 软删除消息（作者或管理员，#39）。
+func (a *App) DeleteMessage(channelID, messageID string) error {
+	cid, err := strconv.ParseInt(channelID, 10, 64)
+	if err != nil || cid <= 0 {
+		return fmt.Errorf("invalid channel id")
+	}
+	mid, err := strconv.ParseInt(messageID, 10, 64)
+	if err != nil || mid <= 0 {
+		return fmt.Errorf("invalid message id")
+	}
+	if a.api == nil {
+		return fmt.Errorf("not connected")
+	}
+	return a.api.DeleteMessage(cid, mid)
+}
+
+// ListMentionCandidates @提及候选用户（#39）：服务器频道为可查看该频道的成员，
+// 会话频道为会话成员；按昵称升序。空结果为 []。
+func (a *App) ListMentionCandidates(channelID string) ([]MentionCandidateView, error) {
+	cid, err := strconv.ParseInt(channelID, 10, 64)
+	if err != nil || cid <= 0 {
+		return nil, fmt.Errorf("invalid channel id")
+	}
+	if a.api == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	cands, err := a.api.ListMentionCandidates(cid)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]MentionCandidateView, 0, len(cands))
+	for _, c := range cands {
+		out = append(out, MentionCandidateView{
+			UserID: c.UserID.String(), Nickname: c.Nickname, Tag: c.Tag,
 		})
 	}
 	return out, nil
@@ -1998,13 +2164,19 @@ func (a *App) GetHotkeyAvailability() bool {
 
 // SendChat 发送文字消息。
 func (a *App) SendChat(channelID, content string) error {
+	return a.SendChatWithMeta(channelID, content, "", nil)
+}
+
+// SendChatWithMeta 发送带回复与 @提及的消息（#39）：replyTo 空串 = 普通消息，
+// mentions 为空 = 无提及。断线时连同 nonce 入队，重连重放不丢字段。
+func (a *App) SendChatWithMeta(channelID, content, replyTo string, mentions []string) error {
 	a.mu.Lock()
 	s := a.sess
 	a.mu.Unlock()
 	if s == nil {
 		return fmt.Errorf("not connected")
 	}
-	return s.SendChat(channelID, content)
+	return s.SendChatWithMeta(channelID, content, replyTo, mentions)
 }
 
 // GetVoiceMembers 房间成员快照。

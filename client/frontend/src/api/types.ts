@@ -83,6 +83,14 @@ export interface ChatMessage {
   ts: string
   // nonce 发送方幂等键（#31，协议 v2；老服务端/REST 补拉不带）
   nonce?: string
+  // #39：编辑/软删时间为毫秒字符串；reply_to 为回复目标消息 ID；
+  // reply_preview 为跳转预览（目标已软删时 content 空、deleted=true）；
+  // mentions 为被 @ 的用户 ID（升序去重）。
+  edited_at?: string
+  deleted_at?: string
+  reply_to?: string
+  reply_preview?: ReplyPreview
+  mentions?: string[]
 }
 
 // ConnConfigView 当前生效的服务器地址与来源（设置页「连接」）。
