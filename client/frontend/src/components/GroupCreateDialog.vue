@@ -34,10 +34,18 @@ const candidates = computed<Friend[]>(() => {
   return out
 })
 
+// 群聊总人数上限 50（含创建者），因此最多邀请 49 人；超出的选择不生效，
+// 避免提交后在服务端才拿到 bad_members。
+const MAX_INVITES = 49
+
 function toggle(id: string) {
   const i = selected.value.indexOf(id)
-  if (i >= 0) selected.value.splice(i, 1)
-  else selected.value.push(id)
+  if (i >= 0) {
+    selected.value.splice(i, 1)
+    return
+  }
+  if (selected.value.length >= MAX_INVITES) return
+  selected.value.push(id)
 }
 
 async function submit() {

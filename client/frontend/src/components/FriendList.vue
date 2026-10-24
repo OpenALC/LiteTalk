@@ -113,6 +113,8 @@ function joinFriendChannel(f: Friend) {
     notify.show(j.reason, true)
     return
   }
+  // 私信模式下加入好友频道：先退出私信，否则舞台仍停在会话视图。
+  conversations.exitDM()
   servers.selectServer(j.serverId)
   servers.selectChannel(j.channelId)
   if (voice.channelId === j.channelId) return

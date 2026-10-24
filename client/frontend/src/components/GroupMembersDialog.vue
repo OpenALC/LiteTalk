@@ -47,10 +47,18 @@ const candidates = computed<Friend[]>(() => {
 })
 
 const selected = ref<string[]>([])
+// 群聊总人数上限 50（含 owner）：一次可添加的人数不超过剩余名额，避免提交后
+// 才被服务端 too_many_members 拒绝。
+const remaining = computed(() => (conv.value ? Math.max(0, 50 - conv.value.members.length) : 0))
+
 function toggle(id: string) {
   const i = selected.value.indexOf(id)
-  if (i >= 0) selected.value.splice(i, 1)
-  else selected.value.push(id)
+  if (i >= 0) {
+    selected.value.splice(i, 1)
+    return
+  }
+  if (selected.value.length >= remaining.value) return
+  selected.value.push(id)
 }
 
 const busy = ref(false)
