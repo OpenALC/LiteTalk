@@ -28,6 +28,8 @@ const (
 	TypeGatewayInvalidSession = "gateway.invalid_session" // S→C · since 2
 	TypeGatewayResume         = "gateway.resume"          // C→S · since 2
 	TypeHello                 = "hello"                   // S→C
+	TypeMessageDeleted        = "message.deleted"         // S→C · since 2
+	TypeMessageEdited         = "message.edited"          // S→C · since 2
 	TypePresenceUpdate        = "presence.update"         // S→C
 	TypeRTCAnswer             = "rtc.answer"              // 双向
 	TypeRTCFailed             = "rtc.failed"              // S→C
@@ -45,17 +47,21 @@ const (
 
 // 下行 error 消息的 code 取值（api/signal/catalog.json error_codes）。
 const (
-	ErrCodeBadMessage          = "bad_message"
-	ErrCodeNotInChannel        = "not_in_channel"
-	ErrCodeAlreadyInChan       = "already_in_channel"
-	ErrCodeRoomFull            = "room_full"
-	ErrCodeRTC                 = "rtc_error"
-	ErrCodeInternal            = "internal"
-	ErrCodeForbidden           = "forbidden"
-	ErrCodeNotFound            = "not_found"
-	ErrCodeRateLimited         = "rate_limited"
-	ErrCodeQuotaExceeded       = "quota_exceeded"
-	ErrCodeBadPassword         = "bad_password"
+	ErrCodeBadMessage    = "bad_message"
+	ErrCodeNotInChannel  = "not_in_channel"
+	ErrCodeAlreadyInChan = "already_in_channel"
+	ErrCodeRoomFull      = "room_full"
+	ErrCodeRTC           = "rtc_error"
+	ErrCodeInternal      = "internal"
+	ErrCodeForbidden     = "forbidden"
+	ErrCodeNotFound      = "not_found"
+	ErrCodeRateLimited   = "rate_limited"
+	ErrCodeQuotaExceeded = "quota_exceeded"
+	ErrCodeBadPassword   = "bad_password"
+	// ErrCodeBadReply 回复目标不合法（#39）：不存在、非正 ID 或跨频道
+	ErrCodeBadReply = "bad_reply"
+	// ErrCodeBadMention 提及目标不合法（#39）：非正 ID 或目标用户不可见该频道
+	ErrCodeBadMention          = "bad_mention"
 	ErrCodeProtocolUnsupported = "protocol_unsupported"
 )
 
@@ -83,6 +89,15 @@ type MemberInfo struct {
 	Deafen   bool   `json:"deafen"`
 	Speaking bool   `json:"speaking"`
 	Online   bool   `json:"online"` // 在线态（presence:{uid} 存在即在线），与 REST 成员视图同源
+}
+
+// ReplyPreview 回复消息的预览快照（#39）：只含跳转与展示所需字段；被引用消息已软删时 content 为空、deleted=true。
+type ReplyPreview struct {
+	ID       string `json:"id"`
+	UserID   string `json:"user_id"`
+	Nickname string `json:"nickname"`
+	Content  string `json:"content"`
+	Deleted  bool   `json:"deleted"`
 }
 
 // SDPData rtc.offer / rtc.answer 的载荷。
@@ -122,20 +137,25 @@ type PeerLeftData struct {
 
 // ChatMessageData 文字消息广播。字段命名与 REST 消息 DTO 的统一由 #31 收敛，本 schema 先按 WS 现状定形。
 type ChatMessageData struct {
-	ID        string    `json:"id"`
-	ChannelID string    `json:"channel_id"`
-	Content   string    `json:"content"`
-	TS        int64     `json:"ts"`
-	User      UserBrief `json:"user"`
-	Nonce     string    `json:"nonce,omitempty"` // 发送方 chat.send 携带的幂等键；仅发送方带 nonce 时回显（#31，协议 v2）。
+	ID           string        `json:"id"`
+	ChannelID    string        `json:"channel_id"`
+	Content      string        `json:"content"`
+	TS           int64         `json:"ts"`
+	User         UserBrief     `json:"user"`
+	Nonce        string        `json:"nonce,omitempty"`         // 发送方 chat.send 携带的幂等键；仅发送方带 nonce 时回显（#31，协议 v2）。
+	ReplyTo      string        `json:"reply_to,omitempty"`      // 回复目标消息 ID（#39）；非回复消息缺省。
+	ReplyPreview *ReplyPreview `json:"reply_preview,omitempty"` // 回复目标预览（#39）；目标已软删时 content 为空、deleted=true。
+	Mentions     []string      `json:"mentions,omitempty"`      // @提及的用户 ID 列表（#39），服务端去重后按升序下发。
 }
 
 // ChatSendData 向频道发一条文字消息。type 为消息种类，本期仅支持 text，其他值拒收。
 type ChatSendData struct {
-	ChannelID string `json:"channel_id"`
-	Type      string `json:"type"` // 消息种类，本期仅 text
-	Content   string `json:"content"`
-	Nonce     string `json:"nonce,omitempty"` // 客户端幂等键（#31，≤64 字符）：同频道同用户重复提交只落一条，重复请求回显原消息。缺省不去重（老客户端）。
+	ChannelID string   `json:"channel_id"`
+	Type      string   `json:"type"` // 消息种类，本期仅 text
+	Content   string   `json:"content"`
+	Nonce     string   `json:"nonce,omitempty"`    // 客户端幂等键（#31，≤64 字符）：同频道同用户重复提交只落一条，重复请求回显原消息。缺省不去重（老客户端）。
+	ReplyTo   string   `json:"reply_to,omitempty"` // 回复目标消息 ID（#39）：必须与该消息同频道；目标已软删也允许。
+	Mentions  []string `json:"mentions,omitempty"` // @提及的用户 ID 列表（#39）：服务端去重并校验目标可见该频道；不合法整条拒收。
 }
 
 // ClientHelloData 协议版本协商（#29）：WS 连上并鉴权后客户端立刻发送，声明可接受区间 [min,max]。老服务端不认识本消息会回 error{bad_message}，客户端须容忍（记日志、按 v1 继续，不重连风暴）。不发本消息按 v1 处理。
@@ -174,6 +194,21 @@ type HelloData struct {
 	Servers  []any          `json:"servers"`
 	Friends  []any          `json:"friends"`
 	Presence map[string]any `json:"presence"`
+}
+
+// MessageDeletedData 消息软删除广播（#39）：REST 删除成功后推给该频道可见成员，客户端按 message_id 就地显示墓碑；回复预览另行按需补拉。
+type MessageDeletedData struct {
+	ChannelID string `json:"channel_id"`
+	MessageID string `json:"message_id"`
+}
+
+// MessageEditedData 消息编辑广播（#39）：REST 编辑成功后推给该频道可见成员，客户端按 message_id 原地替换正文与提及。mentions 缺省表示无提及；空数组不会下发。
+type MessageEditedData struct {
+	ChannelID string   `json:"channel_id"`
+	MessageID string   `json:"message_id"`
+	Content   string   `json:"content"`
+	EditedAt  int64    `json:"edited_at"`          // 编辑时间（Unix 毫秒）
+	Mentions  []string `json:"mentions,omitempty"` // @提及的用户 ID 列表（服务端去重后按升序下发）
 }
 
 // PresenceUpdateData 某用户在线状态变化。user_id 是状态变化的用户（不是接收者）；只推给与其互为已接受好友的在线连接，状态未变不发（去抖）。channel_id/server_id 是该用户当前语音房（#92 好友频道 presence），两字段必须同时出现或同时缺省；接收者对该频道无 ViewChannel 权限时只推 online 载荷（不得泄露频道标识）。载荷不含频道名。

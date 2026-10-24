@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litetalk:signal:message.deleted",
+  "title": "MessageDeletedData",
+  "x-wire-type": "message.deleted",
+  "x-go-const": "TypeMessageDeleted",
+  "x-direction": "S2C",
+  "x-since": 2,
+  "x-namespace": "event",
+  "description": "消息软删除广播（#39）：REST 删除成功后推给该频道可见成员，客户端按 message_id 就地显示墓碑；回复预览另行按需补拉。",
+  "type": "object",
+  "properties": {
+    "channel_id": { "type": "string" },
+    "message_id": { "type": "string" }
+  },
+  "required": ["channel_id", "message_id"],
+  "additionalProperties": false
+}
