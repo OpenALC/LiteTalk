@@ -1635,6 +1635,46 @@ func (a *App) RemoveConversationMember(id, userID string) (*api.ConversationDTO,
 	return a.api.RemoveConversationMember(id, userID)
 }
 
+// ChatMessageView 消息桥接视图：与 chat:message 事件的载荷同口径（ts 为毫秒
+// 字符串、ID 均为十进制字符串），前端可把历史补拉与实时广播直接按 id 合并。
+// 私聊/群聊的会话 ID 即频道 ID，历史消息仍走 /channels/{id}/messages。
+type ChatMessageView struct {
+	ID        string `json:"id"`
+	ChannelID string `json:"channel_id"`
+	UserID    string `json:"user_id"`
+	Nickname  string `json:"nickname"`
+	Content   string `json:"content"`
+	TS        string `json:"ts"`
+}
+
+// ListMessages 拉频道最近消息（旧→新，limit 由 APIClient 夹到 [1,50]）。
+// 打开私聊/群聊时补历史；失败由调用方静默，不阻断实时消息。
+func (a *App) ListMessages(channelID string, limit int) ([]ChatMessageView, error) {
+	id, err := strconv.ParseInt(channelID, 10, 64)
+	if err != nil || id <= 0 {
+		return nil, fmt.Errorf("invalid channel id")
+	}
+	if a.api == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	msgs, err := a.api.ListMessages(id, limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ChatMessageView, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, ChatMessageView{
+			ID:        m.ID.String(),
+			ChannelID: m.ChannelID.String(),
+			UserID:    m.UserID.String(),
+			Nickname:  m.SenderNickname,
+			Content:   m.Content,
+			TS:        strconv.FormatInt(m.CreatedAt.UnixMilli(), 10),
+		})
+	}
+	return out, nil
+}
+
 // ---------- 请求静音（v0.1.2） ----------
 
 // RequestVoiceState 请求目标成员闭麦/静音（voice.request_state，定向转发）。

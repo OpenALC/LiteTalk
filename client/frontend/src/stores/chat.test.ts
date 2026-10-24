@@ -21,10 +21,13 @@ const mockEventsOn = vi.hoisted(() => {
     },
   }
 })
-vi.mock('../api/bridge', () => ({ goApp: () => ({}), eventsOn: mockEventsOn.on }))
+const mockGoApp = vi.hoisted(() => ({
+  ListMessages: vi.fn(),
+}))
+vi.mock('../api/bridge', () => ({ goApp: () => mockGoApp, eventsOn: mockEventsOn.on }))
 
 import type { ChatMessage } from '../api/types'
-import { useChatStore } from './chat'
+import { mergeHistory, useChatStore } from './chat'
 import { useNotifyStore } from './notify'
 
 const msg = (id: string, channelId = 'c1'): ChatMessage => ({
@@ -36,6 +39,7 @@ describe('chat store 复位', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
     mockEventsOn.reset()
+    mockGoApp.ListMessages.mockReset().mockResolvedValue([])
   })
 
   it('resetAll 清空全部频道缓存且幂等', () => {
@@ -129,5 +133,61 @@ describe('chat store 复位', () => {
     expect(mockEventsOn.handlers.get('chat:error')).toHaveLength(0)
     mockEventsOn.fire('chat:error', { code: 'forbidden', message: '无权向该频道发送消息' })
     expect(notify.visible).toBe(false)
+  })
+})
+
+describe('chat store 历史补拉（#38 B4b）', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    mockEventsOn.reset()
+    mockGoApp.ListMessages.mockReset().mockResolvedValue([])
+  })
+
+  const at = (id: string, ts: string, content = 'hi'): ChatMessage => ({
+    id, channel_id: 'c1', user_id: 'u1', nickname: '甲', content, ts,
+  })
+
+  it('mergeHistory 按 id 去重并按 ts 旧→新（同毫秒保留先到顺序）', () => {
+    const history = [at('1', '1000'), at('3', '3000'), at('4', '3000', 'same-ms')]
+    const live = [at('2', '2000'), at('3', '3000')]
+
+    const merged = mergeHistory(history, live)
+
+    expect(merged.map((m) => m.id)).toEqual(['1', '2', '3', '4'])
+    expect(merged.map((m) => m.content)).toEqual(['hi', 'hi', 'hi', 'same-ms'])
+  })
+
+  it('loadHistory 把历史并入当前桶，实时消息不丢', async () => {
+    const chat = useChatStore()
+    chat.messagesByChannel = { c1: [at('3', '3000', '实时')] }
+    mockGoApp.ListMessages.mockResolvedValue([at('1', '1000', '旧'), at('2', '2000', '中')])
+
+    await chat.loadHistory('c1')
+
+    expect(mockGoApp.ListMessages).toHaveBeenCalledWith('c1', 50)
+    expect(chat.messagesFor('c1').map((m) => m.id)).toEqual(['1', '2', '3'])
+    expect(chat.messagesFor('c1')[2].content).toBe('实时')
+  })
+
+  it('loadHistory 空结果不创建空桶；失败向上抛给调用方静默', async () => {
+    const chat = useChatStore()
+    await chat.loadHistory('c1')
+    expect(chat.messagesByChannel).toEqual({})
+
+    mockGoApp.ListMessages.mockRejectedValueOnce(new Error('boom'))
+    await expect(chat.loadHistory('c1')).rejects.toThrow('boom')
+  })
+
+  it('resetAll 后旧的补拉响应不写回（会话代次保护）', async () => {
+    const chat = useChatStore()
+    let resolve!: (v: ChatMessage[]) => void
+    mockGoApp.ListMessages.mockReturnValue(new Promise<ChatMessage[]>((r) => { resolve = r }))
+
+    const pending = chat.loadHistory('c1')
+    chat.resetAll()
+    resolve([at('1', '1000')])
+    await pending
+
+    expect(chat.messagesByChannel).toEqual({})
   })
 })

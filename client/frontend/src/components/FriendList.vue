@@ -5,7 +5,8 @@
 // - 右键：加入 TA 的频道 / 设置备注 / 移动分组 / 删除好友（删除二次确认）。
 // - 好友频道 presence（#92）：按 FriendEntry/presence:update 的 channel_id+
 //   server_id 精确定位（不按频道名跨服扫描）；无权限时服务端不下发 ID，只显示
-//   「在线」。目标频道带密码先弹密码框，取消不发请求。私聊仍为占位提示。
+//   「在线」。目标频道带密码先弹密码框，取消不发请求。私聊经 direct 会话进入
+//   私信模式（#38）。
 import { computed, onMounted, ref } from 'vue'
 import {
   ChevronDown, MessageCircle, Search, UserPlus, AudioLines,
@@ -15,6 +16,7 @@ import {
   useFriendsStore, useServersStore, resolveFriendJoin, type Friend, type FriendJoin,
 } from '../stores/data'
 import { useVoiceStore } from '../stores/voice'
+import { useConversationsStore } from '../stores/conversations'
 import { useNotifyStore } from '../stores/notify'
 import ContextMenu, { type CtxItem } from './ContextMenu.vue'
 import PromptDialog from './PromptDialog.vue'
@@ -22,6 +24,7 @@ import PromptDialog from './PromptDialog.vue'
 const friends = useFriendsStore()
 const servers = useServersStore()
 const voice = useVoiceStore()
+const conversations = useConversationsStore()
 const notify = useNotifyStore()
 const query = ref('')
 const closedGroups = ref<Record<string, boolean>>({})
@@ -65,9 +68,13 @@ async function onAddConfirm(target: string) {
   }
 }
 
-// ---- 私聊：服务端无私聊频道实体，占位提示（不假装已实现）----
-function messageFriend() {
-  notify.show('私聊即将上线')
+// ---- 私聊（#38）：服务端幂等创建/复用 direct 会话，成功后切到私信模式 ----
+async function messageFriend(f: Friend) {
+  try {
+    await conversations.openDirect(f.userId)
+  } catch (e) {
+    notify.fromErr(e, '发起私聊失败')
+  }
 }
 
 // ---- 加入 TA 的频道（#92）----
@@ -244,7 +251,7 @@ async function acceptPending(id: string) {
                 <div class="fs" :class="{ 'in-chan': f.inChannel }">{{ friendChanLabel(f) }}</div>
               </div>
               <div class="f-act">
-                <button class="icon-btn" title="私聊" @click="messageFriend"><MessageCircle :size="14" /></button>
+                <button class="icon-btn" title="私聊" @click="messageFriend(f)"><MessageCircle :size="14" /></button>
                 <button v-if="f.inChannel" class="icon-btn"
                         :disabled="joinBtn(f).disabled" :title="joinBtn(f).title"
                         @click="joinFriendChannel(f)">

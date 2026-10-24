@@ -8,13 +8,16 @@ import { AudioLines, MessageCircle, Users, WifiOff } from 'lucide-vue-next'
 import { useRouter } from 'vue-router'
 import ServerRail from '../components/ServerRail.vue'
 import ChannelList from '../components/ChannelList.vue'
+import ConversationList from '../components/ConversationList.vue'
 import FriendList from '../components/FriendList.vue'
 import VoiceRoom from '../components/VoiceRoom.vue'
 import TextChat from '../components/TextChat.vue'
+import ConversationChat from '../components/ConversationChat.vue'
 import IntroView from './IntroView.vue'
 import { useVoiceStore } from '../stores/voice'
 import { useChatStore } from '../stores/chat'
 import { useAuthStore } from '../stores/auth'
+import { useConversationsStore } from '../stores/conversations'
 import { INTRO_ID, useFriendsStore, useServersStore } from '../stores/data'
 import { useHotkeys } from '../composables/useHotkeys'
 import { eventsOn } from '../api/bridge'
@@ -23,15 +26,18 @@ const router = useRouter()
 const voice = useVoiceStore()
 const chat = useChatStore()
 const auth = useAuthStore()
+const conversations = useConversationsStore()
 const servers = useServersStore()
 const friends = useFriendsStore()
 
 const tab = ref<'voice' | 'chat'>('voice')
 const showFriends = ref(true)
 // 没有当前服务器（登录前/列表为空）时同样按介绍页处理：频道栏与舞台都依赖
-// currentServer 的字段，不能在列表为空时渲染。
+// currentServer 的字段，不能在列表为空时渲染。私信模式独立于服务器选择，
+// 此时必须压在介绍页之上（即使没有任何服务器）。
 const isIntro = computed(() =>
-  servers.currentServerId === INTRO_ID || !servers.currentServer)
+  !conversations.dmMode
+  && (servers.currentServerId === INTRO_ID || !servers.currentServer))
 
 const hotkeysActive = computed(() => true)
 useHotkeys(
@@ -64,6 +70,7 @@ onMounted(() => {
   // 必须在登录后立即生效，不能依赖 FriendList 是否展开（它是可隐藏的子组件）。
   servers.bindEvents()
   friends.bindEvents()
+  conversations.bindEvents()
   offAuthSession = eventsOn('auth:session', (d) => {
     auth.setSignalOk((d as { ok?: boolean }).ok !== false)
   })
@@ -77,6 +84,8 @@ onMounted(() => {
   // 失败静默：服务器列表不可用不阻断主界面。
   if (auth.loggedIn) {
     servers.loadRemoteServers().catch(() => {})
+    // 私信列表登录后预取：进入私信模式时不必等一次网络往返。失败静默。
+    conversations.load().catch(() => {})
   }
 })
 
@@ -85,6 +94,7 @@ onUnmounted(() => {
   chat.unbindEvents()
   servers.unbindEvents()
   friends.unbindEvents()
+  conversations.unbindEvents()
   offAuthSession()
 })
 </script>
@@ -100,11 +110,31 @@ onUnmounted(() => {
   </div>
   <div class="app">
     <ServerRail />
-    <ChannelList v-if="!isIntro" />
+    <ConversationList v-if="conversations.dmMode" />
+    <ChannelList v-else-if="!isIntro" />
 
     <main class="stage">
       <!-- 介绍页：无 stage-head 页签、无频道栏，品牌卡占满舞台 -->
       <IntroView v-if="isIntro" />
+
+      <!-- 私信模式：第二栏为会话列表，舞台只保留标题与好友栏开关 -->
+      <template v-else-if="conversations.dmMode">
+        <div class="stage-head">
+          <div class="dm-title">
+            <MessageCircle :size="15" />私信
+          </div>
+          <div class="stage-stats">
+            <button class="icon-btn" :class="{ on: showFriends }" title="好友列表"
+                    @click="showFriends = !showFriends">
+              <Users :size="17" />
+            </button>
+          </div>
+        </div>
+
+        <div class="stage-body">
+          <ConversationChat />
+        </div>
+      </template>
 
       <template v-else>
         <div class="stage-head">
@@ -187,6 +217,14 @@ onUnmounted(() => {
   background: var(--surface); color: var(--brand-700);
   box-shadow: var(--shadow-1);
 }
+/* 私信模式标题：与页签同高同字重，不提供切换（私信只有会话视图） */
+.dm-title {
+  display: flex; align-items: center; gap: 6px;
+  height: 32px; padding: 0 14px; border-radius: 8px;
+  background: var(--brand-50);
+  font-size: 13px; font-weight: 600; color: var(--brand-700);
+}
+.dm-title :deep(svg) { color: var(--brand-600); }
 .stage-stats {
   margin-left: auto;
   display: flex; align-items: center; gap: 16px;

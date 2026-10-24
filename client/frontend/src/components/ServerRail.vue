@@ -7,11 +7,12 @@
 import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import {
-  Plus, Home, MessagesSquare, Gamepad2, Music, Palette, BookOpen, Coffee, Mic,
+  Plus, Home, MessageCircle, MessagesSquare, Gamepad2, Music, Palette, BookOpen, Coffee, Mic,
   GraduationCap, Heart, Rocket, Camera, Dumbbell, Undo2, Settings,
   Link, FolderPlus, Pencil, Trash2,
 } from 'lucide-vue-next'
 import { INTRO_ID, useServersStore } from '../stores/data'
+import { useConversationsStore } from '../stores/conversations'
 import { useNotifyStore } from '../stores/notify'
 import { goApp } from '../api/bridge'
 import ServerDialog from './ServerDialog.vue'
@@ -19,8 +20,15 @@ import ContextMenu, { type CtxItem } from './ContextMenu.vue'
 import PromptDialog from './PromptDialog.vue'
 
 const store = useServersStore()
+const conversations = useConversationsStore()
 const notify = useNotifyStore()
 const router = useRouter()
+
+// selectServer 切回服务器视图：先退出私信模式，再恢复原服务器/频道选择。
+function selectServer(id: string) {
+  conversations.exitDM()
+  store.selectServer(id)
+}
 
 // Lucide 图标名 → 组件（静态注册，避免动态导入复杂度）。
 // 键集合与 server/internal/api/servers.go 的 allowedIcons 保持一致。
@@ -172,17 +180,25 @@ async function removeServer(id: string) {
   <nav class="rail">
     <!-- 介绍页入口（v0.1.2 首页体系；被删除时隐藏，底部可恢复） -->
     <div v-if="!store.introHidden" class="rail-item intro-item"
-         :class="{ on: store.currentServerId === INTRO_ID }" data-tip="介绍页">
-      <button class="ri-btn intro-btn" @click="store.selectServer(INTRO_ID)"
+         :class="{ on: !conversations.dmMode && store.currentServerId === INTRO_ID }" data-tip="介绍页">
+      <button class="ri-btn intro-btn" @click="selectServer(INTRO_ID)"
               @contextmenu.prevent="openIntroCtx">
         <Home :size="21" />
       </button>
     </div>
     <div class="rail-sep" />
 
+    <!-- 私信入口（#38 B4b）：进入私信模式；点任意服务器/介绍页退出 -->
+    <div class="rail-item" :class="{ on: conversations.dmMode }" data-tip="私信">
+      <button class="ri-btn" @click="conversations.enterDM()">
+        <MessageCircle :size="21" />
+      </button>
+    </div>
+    <div class="rail-sep" />
+
     <div v-for="s in currentIcons" :key="s.id" class="rail-item"
-         :class="{ on: s.id === store.currentServerId }" :data-tip="s.name">
-      <button class="ri-btn" @click="store.selectServer(s.id)"
+         :class="{ on: !conversations.dmMode && s.id === store.currentServerId }" :data-tip="s.name">
+      <button class="ri-btn" @click="selectServer(s.id)"
               @contextmenu.prevent="openCtx($event, s.id, s.name)">
         <component :is="s.iconComp" :size="21" />
       </button>

@@ -5,6 +5,22 @@ import type { ChatMessage } from '../api/types'
 import { cleanErrorText } from '../utils/errorText'
 import { useNotifyStore } from './notify'
 
+// mergeHistory 历史补拉与实时消息的合并（#38 B4b）：按服务端消息 ID 去重，
+// 再按毫秒时间戳由旧到新排序（sort 稳定，同毫秒保持历史在前、实时在后的到达序）。
+// 历史在前作为基线：断线期间错过的新消息由当前桶补齐。
+export function mergeHistory(history: ChatMessage[], live: ChatMessage[]): ChatMessage[] {
+  const seen = new Set<string>()
+  const out: ChatMessage[] = []
+  for (const m of [...history, ...live]) {
+    if (m.id) {
+      if (seen.has(m.id)) continue
+      seen.add(m.id)
+    }
+    out.push(m)
+  }
+  return out.sort((a, b) => (Number(a.ts) || 0) - (Number(b.ts) || 0))
+}
+
 // chat 文字聊天状态。消息按 channel_id 分桶存储——此前是单一扁平数组，
 // 切换频道后旧频道消息会被带到新频道（问题：聊天未隔离）。
 export const useChatStore = defineStore('chat', () => {
@@ -12,10 +28,27 @@ export const useChatStore = defineStore('chat', () => {
   // 用 ref 包一层保证深层替换触发渲染；每桶天然按到达顺序排列。
   const messagesByChannel = ref<Record<string, ChatMessage[]>>({})
 
+  // generation 会话代次：resetAll（登出/被踢/换号）递增，在飞的补拉响应
+  // 返回时若代次已变就丢弃——旧账号的消息不能写进新会话（#85 同款语义）。
+  let generation = 0
+
   // messagesFor 取某频道的消息列表（无记录返回空数组，不创建空桶）。
   // 在模板渲染期读取 messagesByChannel.value，响应式追踪成立。
   function messagesFor(channelId: string): ChatMessage[] {
     return messagesByChannel.value[channelId] ?? []
+  }
+
+  // loadHistory 打开私聊/群聊时补拉最近历史（旧→新），与实时消息按 ID 合并。
+  // 私聊/群聊的会话 ID 就是频道 ID。失败上抛由调用方静默，不阻断实时消息。
+  async function loadHistory(channelId: string) {
+    if (!channelId) return
+    const gen = generation
+    const history = await goApp().ListMessages(channelId, 50)
+    if (gen !== generation) return
+    const merged = mergeHistory(history, messagesFor(channelId))
+    if (!merged.length) return
+    // 补拉期间可能有实时消息到达：以合并后的完整列表写回，不覆盖新消息。
+    messagesByChannel.value = { ...messagesByChannel.value, [channelId]: merged }
   }
 
   // send 发送消息。不做本地乐观回显——服务端会把 chat.message 广播回
@@ -57,6 +90,7 @@ export const useChatStore = defineStore('chat', () => {
   // 不产生重复拉取，语义为「本地会话缓存」。幂等；不动事件订阅
   //（MainView 卸载时另由 unbindEvents 注销）。
   function resetAll() {
+    generation++
     messagesByChannel.value = {}
   }
 
@@ -65,5 +99,7 @@ export const useChatStore = defineStore('chat', () => {
     while (offs.length) offs.pop()!()
   }
 
-  return { messagesByChannel, messagesFor, send, bindEvents, unbindEvents, resetAll }
+  return {
+    messagesByChannel, messagesFor, send, loadHistory, bindEvents, unbindEvents, resetAll,
+  }
 })
