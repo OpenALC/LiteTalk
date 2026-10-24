@@ -1293,6 +1293,14 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 			}
 			a.emit("presence:update", payload)
 		},
+		// 私聊/群聊变更（conversation.changed，#38 B3）：只转发会话 ID 与动作，
+		// 前端按 ID 重新拉取（删除/退出按 action=deleted 从列表移除）。回调跑在
+		// ws 读循环 goroutine，emit 不阻塞。
+		OnConversationChanged: func(conversationID, action string) {
+			a.emit("conversation:changed", map[string]string{
+				"conversation_id": conversationID, "action": action,
+			})
+		},
 		// 服务端优雅关闭（server.shutdown，#21）：前端提示「服务端已关闭」；
 		// 停止自动重连在 Session 侧已异步处理。
 		OnServerShutdown: func(reason string) {
@@ -1580,6 +1588,51 @@ func (a *App) RemoveFriend(id string) error { return a.api.RemoveFriend(id) }
 // UpdateFriend 设置好友备注/分组（仅发起方向；空串清除）。
 func (a *App) UpdateFriend(id string, remark, group string) error {
 	return a.api.UpdateFriend(id, remark, group)
+}
+
+// ---------- 私聊/群私聊会话（#38 B4：REST 桥接） ----------
+// 以下方法直接代理 api.APIClient；ID 参数一律十进制字符串（#31）。
+// 变更通知走 conversation:changed 事件，前端据此重新拉取。
+
+// ListConversations 当前用户参与的私聊/群私聊（含成员）。
+func (a *App) ListConversations() ([]api.ConversationDTO, error) {
+	return a.api.ListConversations()
+}
+
+// CreateDirectConversation 创建私聊（已有则幂等返回原会话）。
+func (a *App) CreateDirectConversation(userID string) (*api.ConversationDTO, error) {
+	return a.api.CreateDirectConversation(userID)
+}
+
+// CreateGroupConversation 创建群私聊（name 可为空）。
+func (a *App) CreateGroupConversation(name string, userIDs []string) (*api.ConversationDTO, error) {
+	return a.api.CreateGroupConversation(name, userIDs)
+}
+
+// GetConversation 会话详情（仅参与者）。
+func (a *App) GetConversation(id string) (*api.ConversationDTO, error) {
+	return a.api.GetConversation(id)
+}
+
+// RenameConversation 群聊改名（仅 owner）。
+func (a *App) RenameConversation(id, name string) (*api.ConversationDTO, error) {
+	return a.api.RenameConversation(id, name)
+}
+
+// DeleteConversation 删除会话（direct 任一方；group 仅 owner）。
+func (a *App) DeleteConversation(id string) error {
+	return a.api.DeleteConversation(id)
+}
+
+// AddConversationMembers 群聊加人（仅 owner）。
+func (a *App) AddConversationMembers(id string, userIDs []string) (*api.ConversationDTO, error) {
+	return a.api.AddConversationMembers(id, userIDs)
+}
+
+// RemoveConversationMember 移除成员或退出群聊；最后一人退出时会话被删除，
+// 此时返回 nil（Wails 侧为 null）。
+func (a *App) RemoveConversationMember(id, userID string) (*api.ConversationDTO, error) {
+	return a.api.RemoveConversationMember(id, userID)
 }
 
 // ---------- 请求静音（v0.1.2） ----------

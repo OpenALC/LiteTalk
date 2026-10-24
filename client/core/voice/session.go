@@ -70,6 +70,11 @@ type Events struct {
 	// channelID/serverID 是该好友当前语音房（同现同缺，无查看权限或不在
 	// 语音房时为空串）。跑在 ws 读循环 goroutine，实现侧只做转发。
 	OnPresenceUpdate func(userID string, online bool, channelID, serverID string)
+	// OnConversationChanged 私聊/群聊会话变更（conversation.changed，#38 B3）：
+	// 只携带会话 ID 与 action（created/updated/member_added/member_removed/
+	// deleted），实现侧按 ID 重新拉取会话。跑在 ws 读循环 goroutine，实现侧
+	// 只做转发，不得阻塞、不得同步 Close 会话。
+	OnConversationChanged func(conversationID, action string)
 	// OnServerShutdown 服务端优雅关闭（server.shutdown，#21）：停自动重连并提示。
 	// 与 OnKicked 同线程约定。
 	OnServerShutdown func(reason string)
@@ -748,6 +753,18 @@ func (s *Session) registerHandlers() {
 		}
 		if s.ev.OnPresenceUpdate != nil {
 			s.ev.OnPresenceUpdate(d.UserID, d.Online, d.ChannelID, d.ServerID)
+		}
+	})
+	// conversation.changed：私聊/群聊变更（#38 B3）。只带会话 ID 与动作，成员
+	// 变化时新旧成员都会收到；删除/退出后 action=deleted，由 UI 从列表移除。
+	// 跑在 ws 读循环，不得阻塞（REST 重拉由 UI 侧异步做）。
+	s.ws.On(signal.TypeConversationChanged, func(env signal.Envelope) {
+		var d signal.ConversationChangedData
+		if env.Decode(&d) != nil || d.ConversationID == "" {
+			return
+		}
+		if s.ev.OnConversationChanged != nil {
+			s.ev.OnConversationChanged(d.ConversationID, d.Action)
 		}
 	})
 	// server.shutdown：服务端优雅关闭（#21）。停掉 ws 自动重连并转给 UI 层提示。
