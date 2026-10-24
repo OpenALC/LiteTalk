@@ -415,6 +415,8 @@ func (s *Server) EditMessage(ctx context.Context, request EditMessageRequestObje
 		s.hub.BroadcastMessageEdited(recipients, strconv.FormatInt(ch.ID, 10),
 			strconv.FormatInt(msg.ID, 10), updated.Content, editedAt, formatUIDs(latest[msg.ID]))
 	}
+	// 编辑可能改变提及，同一收件人列表重算并推送精确计数（#40）；失败只记日志。
+	s.broadcastUnreadAfterMessageChange(ctx, ch.ID, recipients)
 	v, e := s.messageViewFor(ctx, updated)
 	if e != nil {
 		return nil, e
@@ -490,6 +492,8 @@ func (s *Server) DeleteMessage(ctx context.Context, request DeleteMessageRequest
 		s.hub.BroadcastMessageDeleted(recipients, strconv.FormatInt(ch.ID, 10),
 			strconv.FormatInt(msg.ID, 10))
 	}
+	// 删除减少未读，同一收件人列表重算并推送计数（#40）；失败只记日志。
+	s.broadcastUnreadAfterMessageChange(ctx, ch.ID, recipients)
 	return DeleteMessage204Response{}, nil
 }
 

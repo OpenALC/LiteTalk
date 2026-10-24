@@ -38,6 +38,9 @@ type Hub interface {
 	BroadcastMessageEdited(uids []string, channelID, messageID, content string, editedAt int64, mentions []string)
 	// BroadcastMessageDeleted 消息软删除广播（#39）：目标口径同上。
 	BroadcastMessageDeleted(uids []string, channelID, messageID string)
+	// BroadcastChannelUnread 未读计数变更（#40）：counts 按十进制 uid 给每个
+	// 接收者自己的精确计数，只推给该用户（不进其他人的事件环）。空 map 不广播。
+	BroadcastChannelUnread(channelID string, counts map[string]store.Unread)
 }
 
 // PresenceReader 在线状态读取（#11）：presence:{uid} 存在 = 在线。

@@ -25,6 +25,13 @@ type fakeHub struct {
 
 	convEvents []convEvent
 	msgEvents  []msgEvent
+	unreads    []unreadEvent
+}
+
+// unreadEvent 一次 channel.unread 广播的断言快照（#40）。
+type unreadEvent struct {
+	channelID string
+	counts    map[string]store.Unread
 }
 
 // msgEvent 一次 message.edited / message.deleted 广播的断言快照。
@@ -102,6 +109,31 @@ func (f *fakeHub) msgLog() []msgEvent {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]msgEvent(nil), f.msgEvents...)
+}
+
+func (f *fakeHub) BroadcastChannelUnread(channelID string, counts map[string]store.Unread) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cp := make(map[string]store.Unread, len(counts))
+	for uid, u := range counts {
+		cp[uid] = u
+	}
+	f.unreads = append(f.unreads, unreadEvent{channelID: channelID, counts: cp})
+}
+
+// unreadLog 全部 channel.unread 广播的快照。
+func (f *fakeHub) unreadLog() []unreadEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]unreadEvent, 0, len(f.unreads))
+	for _, ev := range f.unreads {
+		cp := make(map[string]store.Unread, len(ev.counts))
+		for uid, u := range ev.counts {
+			cp[uid] = u
+		}
+		out = append(out, unreadEvent{channelID: ev.channelID, counts: cp})
+	}
+	return out
 }
 
 func (f *fakeHub) Kick(uid, dev, reason string) {}

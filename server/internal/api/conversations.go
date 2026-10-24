@@ -414,6 +414,8 @@ func (s *Server) AddConversationMembers(ctx context.Context, request AddConversa
 			}
 			return nil, s.writeStoreErr(ctx, err)
 		}
+		// 新成员以入群时的最新消息为已读水位，避免把历史全部看成未读（#40）。
+		s.ensureReadStateAtLatest(ctx, uid, ch.ID)
 	}
 	members, err := s.store.ChannelMembers(ctx, ch.ID)
 	if err != nil {
