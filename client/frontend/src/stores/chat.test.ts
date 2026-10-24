@@ -23,11 +23,20 @@ const mockEventsOn = vi.hoisted(() => {
 })
 const mockGoApp = vi.hoisted(() => ({
   ListMessages: vi.fn(),
+  // #39 消息编辑/删除/回复/提及桥接
+  SendChatWithMeta: vi.fn(),
+  EditMessage: vi.fn(),
+  DeleteMessage: vi.fn(),
+  GetMessage: vi.fn(),
+  ListMentionCandidates: vi.fn(),
 }))
 vi.mock('../api/bridge', () => ({ goApp: () => mockGoApp, eventsOn: mockEventsOn.on }))
 
-import type { ChatMessage } from '../api/types'
-import { mergeHistory, useChatStore } from './chat'
+import type { ChatMessage, Conversation, UserProfile } from '../api/types'
+import { isMessageDeleted, mergeHistory, useChatStore } from './chat'
+import { useAuthStore } from './auth'
+import { useConversationsStore } from './conversations'
+import { useServersStore } from './data'
 import { useNotifyStore } from './notify'
 
 const msg = (id: string, channelId = 'c1'): ChatMessage => ({
@@ -189,5 +198,228 @@ describe('chat store 历史补拉（#38 B4b）', () => {
     await pending
 
     expect(chat.messagesByChannel).toEqual({})
+  })
+})
+
+// #39：消息编辑/删除/回复/@提及的 store 行为。
+describe('chat store 消息编辑/删除/回复/提及（#39）', () => {
+  const baseMsg = (id: string, over: Partial<ChatMessage> = {}): ChatMessage => ({
+    id, channel_id: 'c1', user_id: 'u2', nickname: '甲', content: 'hi', ts: id,
+    ...over,
+  })
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    mockEventsOn.reset()
+    for (const fn of Object.values(mockGoApp)) fn.mockReset()
+  })
+
+  it('isMessageDeleted：deleted_at 或空正文都按墓碑（resync 回灌边界）', () => {
+    expect(isMessageDeleted({ content: '', deleted_at: '' })).toBe(true)
+    expect(isMessageDeleted({ content: 'hi', deleted_at: '1700000000000' })).toBe(true)
+    expect(isMessageDeleted({ content: 'hi' })).toBe(false)
+  })
+
+  it('sendWithMeta 透传回复与提及；send 保持空 meta 语义', async () => {
+    const chat = useChatStore()
+
+    await chat.sendWithMeta('c1', '你好', '9', ['u1'])
+    expect(mockGoApp.SendChatWithMeta).toHaveBeenCalledWith('c1', '你好', '9', ['u1'])
+
+    await chat.send('c1', '普通')
+    expect(mockGoApp.SendChatWithMeta).toHaveBeenLastCalledWith('c1', '普通', '', [])
+  })
+
+  it('editMessage 用返回值就地替换并按 id 去重', async () => {
+    const chat = useChatStore()
+    chat.messagesByChannel = { c1: [baseMsg('1'), baseMsg('2')] }
+    mockGoApp.EditMessage.mockResolvedValue(baseMsg('2', {
+      content: '改后', edited_at: '1700000000000', mentions: ['u1'],
+    }))
+
+    const updated = await chat.editMessage('c1', '2', '改后', ['u1'])
+
+    expect(mockGoApp.EditMessage).toHaveBeenCalledWith('c1', '2', '改后', ['u1'])
+    expect(updated.content).toBe('改后')
+    expect(chat.messagesFor('c1')).toHaveLength(2)
+    expect(chat.messageById('c1', '2')?.content).toBe('改后')
+    expect(chat.messageById('c1', '2')?.edited_at).toBe('1700000000000')
+    expect(chat.messageById('c1', '2')?.mentions).toEqual(['u1'])
+  })
+
+  it('deleteMessage 成功后本地立墓碑，chat:deleted 幂等且保留首次时间', async () => {
+    const chat = useChatStore()
+    chat.bindEvents()
+    chat.messagesByChannel = { c1: [baseMsg('1', { content: '原文' })] }
+    mockGoApp.DeleteMessage.mockResolvedValue(undefined)
+
+    await chat.deleteMessage('c1', '1')
+
+    expect(mockGoApp.DeleteMessage).toHaveBeenCalledWith('c1', '1')
+    const m = chat.messageById('c1', '1')!
+    expect(m.content).toBe('')
+    expect(m.deleted_at).toBeTruthy()
+    const stamp = m.deleted_at
+
+    mockEventsOn.fire('chat:deleted', { channel_id: 'c1', message_id: '1' })
+    expect(chat.messagesFor('c1')).toHaveLength(1)
+    expect(chat.messageById('c1', '1')?.deleted_at).toBe(stamp)
+    chat.unbindEvents()
+  })
+
+  it('chat:edited 更新内容/时间/提及；未知消息忽略且不入桶', () => {
+    const chat = useChatStore()
+    chat.bindEvents()
+    chat.messagesByChannel = { c1: [baseMsg('1', { mentions: ['u3'] })] }
+
+    mockEventsOn.fire('chat:edited', {
+      channel_id: 'c1', message_id: '1', content: '改后',
+      edited_at: '1700000000000', mentions: ['u1'],
+    })
+    expect(chat.messageById('c1', '1')?.content).toBe('改后')
+    expect(chat.messageById('c1', '1')?.edited_at).toBe('1700000000000')
+    expect(chat.messageById('c1', '1')?.mentions).toEqual(['u1'])
+
+    mockEventsOn.fire('chat:edited', {
+      channel_id: 'c1', message_id: '999', content: '幽灵', edited_at: '1', mentions: [],
+    })
+    expect(chat.messagesFor('c1')).toHaveLength(1)
+    expect(chat.messageById('c1', '999')).toBeUndefined()
+    chat.unbindEvents()
+  })
+
+  it('chat:deleted 置空正文保留墓碑；未知消息忽略', () => {
+    const chat = useChatStore()
+    chat.bindEvents()
+    chat.messagesByChannel = { c1: [baseMsg('1')] }
+
+    mockEventsOn.fire('chat:deleted', { channel_id: 'c1', message_id: '1' })
+    expect(chat.messageById('c1', '1')?.content).toBe('')
+    expect(chat.messageById('c1', '1')?.deleted_at).toBeTruthy()
+
+    mockEventsOn.fire('chat:deleted', { channel_id: 'c1', message_id: '404' })
+    expect(chat.messagesFor('c1')).toHaveLength(1)
+    chat.unbindEvents()
+  })
+
+  it('mergeMessage 按 id 覆盖旧副本并按 ts 旧→新排序', () => {
+    const chat = useChatStore()
+    chat.messagesByChannel = {
+      c1: [baseMsg('3', { ts: '3000' }), baseMsg('1', { ts: '1000' })],
+    }
+
+    chat.mergeMessage('c1', baseMsg('2', { ts: '2000' }))
+    expect(chat.messagesFor('c1').map((m) => m.id)).toEqual(['1', '2', '3'])
+
+    chat.mergeMessage('c1', baseMsg('1', { ts: '1000', content: '回填后' }))
+    expect(chat.messagesFor('c1')).toHaveLength(3)
+    expect(chat.messageById('c1', '1')?.content).toBe('回填后')
+  })
+
+  it('@自己时用 notify 提示频道名；自己发的/未提及/重复推送不提示', () => {
+    const chat = useChatStore()
+    const notify = useNotifyStore()
+    useAuthStore().user = { id: 'u1', nickname: '我' } as UserProfile
+    useServersStore().servers = [{
+      id: 's1', name: '服务器', icon: 'MessagesSquare',
+      channels: [{ id: 'c1', name: '闲聊', type: 'text', group: '未分类' }],
+    }]
+    chat.bindEvents()
+
+    mockEventsOn.fire('chat:message', baseMsg('1', { user_id: 'u2', mentions: ['u1'] }))
+    expect(notify.visible).toBe(true)
+    expect(notify.isError).toBe(false)
+    expect(notify.text).toBe('有人在 #闲聊 @了你')
+
+    // 同一条消息重推（ID 去重早退）不重复提醒
+    notify.visible = false
+    mockEventsOn.fire('chat:message', baseMsg('1', { user_id: 'u2', mentions: ['u1'] }))
+    expect(notify.visible).toBe(false)
+
+    // 自己发的消息即使 mentions 含自己也不提示
+    mockEventsOn.fire('chat:message', baseMsg('2', { user_id: 'u1', mentions: ['u1'] }))
+    expect(notify.visible).toBe(false)
+
+    // 未提及自己不提示
+    mockEventsOn.fire('chat:message', baseMsg('3', { user_id: 'u2', mentions: ['u9'] }))
+    expect(notify.visible).toBe(false)
+    chat.unbindEvents()
+  })
+
+  it('会话里被 @ 时用会话显示名提示', () => {
+    const chat = useChatStore()
+    const notify = useNotifyStore()
+    useAuthStore().user = { id: 'u1', nickname: '我' } as UserProfile
+    const conv: Conversation = {
+      id: 'd1', kind: 'direct', name: '',
+      members: [
+        { user_id: 'u1', nickname: '我', tag: '0001', role: 'member', joined_at: '2026-01-01T00:00:00Z' },
+        { user_id: 'u2', nickname: '乙', tag: '0002', role: 'member', joined_at: '2026-01-01T00:00:00Z' },
+      ],
+      created_at: '2026-01-01T00:00:00Z',
+    }
+    useConversationsStore().list = [conv]
+    chat.bindEvents()
+
+    mockEventsOn.fire('chat:message', baseMsg('5', {
+      channel_id: 'd1', user_id: 'u2', mentions: ['u1'],
+    }))
+
+    expect(notify.text).toBe('有人在「乙」@了你')
+    chat.unbindEvents()
+  })
+
+  it('loadMentionCandidates 按频道缓存，失败不缓存可重试', async () => {
+    const chat = useChatStore()
+    const cands = [{ user_id: 'u2', nickname: '乙', tag: '0002' }]
+    mockGoApp.ListMentionCandidates.mockResolvedValueOnce(cands)
+
+    expect(await chat.loadMentionCandidates('c1')).toEqual(cands)
+    expect(await chat.loadMentionCandidates('c1')).toEqual(cands)
+    expect(mockGoApp.ListMentionCandidates).toHaveBeenCalledTimes(1)
+    expect(chat.mentionCandidatesFor('c1')).toEqual(cands)
+
+    mockGoApp.ListMentionCandidates.mockRejectedValueOnce(new Error('boom'))
+    expect(await chat.loadMentionCandidates('c2')).toEqual([])
+    expect(chat.mentionCandidatesFor('c2')).toEqual([])
+
+    mockGoApp.ListMentionCandidates.mockResolvedValueOnce(cands)
+    expect(await chat.loadMentionCandidates('c2')).toEqual(cands)
+    expect(mockGoApp.ListMentionCandidates).toHaveBeenCalledTimes(3)
+  })
+
+  it('resetAll 同时清空提及候选缓存', async () => {
+    const chat = useChatStore()
+    mockGoApp.ListMentionCandidates.mockResolvedValueOnce([
+      { user_id: 'u2', nickname: '乙', tag: '0002' },
+    ])
+    await chat.loadMentionCandidates('c1')
+    expect(chat.mentionCandidatesFor('c1')).toHaveLength(1)
+
+    chat.resetAll()
+    expect(chat.mentionCandidatesFor('c1')).toEqual([])
+  })
+
+  it('mergeHistory 去重时保留 #39 新字段', () => {
+    const edited: ChatMessage = baseMsg('1', {
+      ts: '1000',
+      edited_at: '1700000000000',
+      reply_to: '9',
+      reply_preview: {
+        id: '9', user_id: 'u3', nickname: '丙', content: '原文', deleted: false,
+      },
+      mentions: ['u1'],
+    })
+
+    const merged = mergeHistory([edited], [baseMsg('1', { ts: '1000', content: '实时' })])
+
+    expect(merged).toHaveLength(1)
+    expect(merged[0]).toMatchObject({
+      content: 'hi',
+      edited_at: '1700000000000',
+      reply_to: '9',
+      mentions: ['u1'],
+    })
+    expect(merged[0].reply_preview?.nickname).toBe('丙')
   })
 })
