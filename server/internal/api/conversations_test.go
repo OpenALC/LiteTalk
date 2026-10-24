@@ -33,24 +33,34 @@ func newConvWorld(t *testing.T) *convWorld {
 	t.Helper()
 	srv, mem := newTestServer(t)
 	h := srv.Handler()
-	w := &convWorld{
-		t: t, srv: srv, h: h, mem: mem,
-		alice: mustReg(t, h, mem, "cv-a@ex.com", "cvAlice"),
-		bob:   mustReg(t, h, mem, "cv-b@ex.com", "cvBob"),
-		carol: mustReg(t, h, mem, "cv-c@ex.com", "cvCarol"),
-		dave:  mustReg(t, h, mem, "cv-d@ex.com", "cvDave"),
-		erin:  mustReg(t, h, mem, "cv-e@ex.com", "cvErin"),
-	}
-	w.aliceID = meID(t, h, w.alice)
-	w.bobID = meID(t, h, w.bob)
-	w.carolID = meID(t, h, w.carol)
-	w.daveID = meID(t, h, w.dave)
-	w.erinID = meID(t, h, w.erin)
+	w := &convWorld{t: t, srv: srv, h: h, mem: mem}
+	// 会话测试不验证注册链路，直写用户并签发令牌：注册的 bcrypt 在 CI -race
+	// 下很慢，几十次注册会把 internal/api 测试包顶到 10 分钟超时。
+	w.alice, w.aliceID = addUser(t, srv, mem, "cv-a@ex.com", "cvAlice")
+	w.bob, w.bobID = addUser(t, srv, mem, "cv-b@ex.com", "cvBob")
+	w.carol, w.carolID = addUser(t, srv, mem, "cv-c@ex.com", "cvCarol")
+	w.dave, w.daveID = addUser(t, srv, mem, "cv-d@ex.com", "cvDave")
+	w.erin, w.erinID = addUser(t, srv, mem, "cv-e@ex.com", "cvErin")
 	// alice 与 bob/carol/dave 已接受好友；erin 不是任何人的好友。
 	w.befriend(w.alice, w.bob)
 	w.befriend(w.alice, w.carol)
 	w.befriend(w.alice, w.dave)
 	return w
+}
+
+// addUser 直写用户并签发无 sid 的访问令牌（旧版令牌过渡期内有效），
+// 绕过注册接口的 bcrypt 开销。
+func addUser(t *testing.T, srv *Server, mem *store.Mem, email, nickname string) (string, int64) {
+	t.Helper()
+	u := &store.User{Email: email, Nickname: nickname, Tag: "0001", PasswordHash: "h"}
+	if err := mem.CreateUser(context.Background(), u); err != nil {
+		t.Fatalf("CreateUser(%s): %v", nickname, err)
+	}
+	tok, err := srv.jwt.SignAccess(u.ID, u.Nickname, u.Tag, "", "desktop")
+	if err != nil {
+		t.Fatalf("SignAccess(%s): %v", nickname, err)
+	}
+	return tok, u.ID
 }
 
 // befriend 走真实好友请求/接受路径。
@@ -361,8 +371,7 @@ func TestConversationMemberCapAndRateLimit(t *testing.T) {
 	}
 
 	// 创建频控 10 次/分/用户：新用户 11 次直聊，第 11 次 429。
-	rateTok := mustReg(t, h, w.mem, "cv-rate@ex.com", "cvRate")
-	rateID := meID(t, h, rateTok)
+	rateTok, rateID := addUser(t, w.srv, w.mem, "cv-rate@ex.com", "cvRate")
 	friends := seedFriends(t, w.mem, rateID, 11)
 	for i := 0; i < 10; i++ {
 		postJSON(t, h, "/api/v1/conversations", rateTok,
