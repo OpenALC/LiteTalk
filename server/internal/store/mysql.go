@@ -498,6 +498,13 @@ func (m *MySQL) DeleteServer(ctx context.Context, id int64) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// 提及没有外键，必须先于 messages 删除，否则留下孤儿行（#39）。
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM message_mentions WHERE message_id IN (
+		   SELECT id FROM messages WHERE channel_id IN
+		     (SELECT id FROM channels WHERE server_id = ?))`, id); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM messages WHERE channel_id IN (SELECT id FROM channels WHERE server_id = ?)`, id); err != nil {
 		return err
@@ -715,6 +722,13 @@ func (m *MySQL) DeleteChannel(ctx context.Context, id int64) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// 提及没有外键，必须先于 messages 删除（含子频道消息，#39）。
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM message_mentions WHERE message_id IN (
+		   SELECT id FROM messages WHERE channel_id = ?
+		      OR channel_id IN (SELECT id FROM channels WHERE parent_id = ?))`, id, id); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM messages WHERE channel_id = ?
 		   OR channel_id IN (SELECT id FROM channels WHERE parent_id = ?)`, id, id); err != nil {
@@ -1018,6 +1032,16 @@ func (m *MySQL) DeleteCategoryWithChannels(ctx context.Context, id int64) error 
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// 提及没有外键，必须先于 messages 删除（#39）。
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM message_mentions WHERE message_id IN (
+		   SELECT id FROM messages WHERE channel_id IN (
+		     SELECT id FROM channels WHERE category_id = ?
+		     UNION
+		     SELECT id FROM channels WHERE parent_id IN (SELECT id FROM channels WHERE category_id = ?)
+		   ))`, id, id); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM messages WHERE channel_id IN (
 		   SELECT id FROM channels WHERE category_id = ?
@@ -1138,28 +1162,40 @@ func (m *MySQL) ReorderCategories(ctx context.Context, serverID, id int64, posit
 
 // ---- messages ----
 
+// CreateMessage 同一事务写消息与 @提及（#39）：nonce 撞唯一索引时整体回滚，
+// 不会留下半条 message_mentions。空 nonce 落 NULL，唯一索引上不受约束。
 func (m *MySQL) CreateMessage(ctx context.Context, msg *Message) error {
 	msg.ID = newID(msg.ID)
-	// 空 nonce 落 NULL：唯一索引 (channel_id, user_id, nonce) 上 '' 会互相撞，NULL 不受约束。
 	var nonce any
 	if msg.Nonce != "" {
 		nonce = msg.Nonce
 	}
-	_, err := m.db.ExecContext(ctx,
-		`INSERT INTO messages (id, channel_id, user_id, content, nonce) VALUES (?, ?, ?, ?, ?)`,
-		msg.ID, msg.ChannelID, msg.UserID, msg.Content, nonce)
+	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO messages (id, channel_id, user_id, content, nonce, reply_to) VALUES (?, ?, ?, ?, ?, ?)`,
+		msg.ID, msg.ChannelID, msg.UserID, msg.Content, nonce, msg.ReplyTo); err != nil {
 		if isDup(err) {
 			return ErrConflict
 		}
 		return err
 	}
-	return m.db.QueryRowContext(ctx, `SELECT created_at FROM messages WHERE id = ?`, msg.ID).
-		Scan(&msg.CreatedAt)
+	if err := insertMessageMentions(ctx, tx, msg.ID, normalizeMentions(msg.Mentions)); err != nil {
+		return err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT created_at FROM messages WHERE id = ?`, msg.ID).
+		Scan(&msg.CreatedAt); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // messageCols 列清单（nonce 经 COALESCE 归一空串，免 sql.NullString）。
-const messageCols = `m.id, m.channel_id, m.user_id, m.content, COALESCE(m.nonce, ''), m.created_at`
+const messageCols = `m.id, m.channel_id, m.user_id, m.content, COALESCE(m.nonce, ''), m.created_at,
+	m.edited_at, m.deleted_at, m.reply_to`
 
 func (m *MySQL) MessagesBefore(ctx context.Context, channelID, beforeID int64, limit int) ([]Message, error) {
 	if limit <= 0 || limit > 50 {
@@ -1185,12 +1221,11 @@ func (m *MySQL) MessagesBefore(ctx context.Context, channelID, beforeID int64, l
 	// 倒序收集后反转为正序（旧→新）。
 	rev := []Message{}
 	for rows.Next() {
-		var msg Message
-		if err := rows.Scan(&msg.ID, &msg.ChannelID, &msg.UserID, &msg.Content, &msg.Nonce, &msg.CreatedAt,
-			&msg.SenderNickname, &msg.SenderTag); err != nil {
+		msg, err := scanMessage(rows, true)
+		if err != nil {
 			return nil, err
 		}
-		rev = append(rev, msg)
+		rev = append(rev, *msg)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -1226,12 +1261,11 @@ func (m *MySQL) MessagesAfter(ctx context.Context, channelID, afterID int64, lim
 	defer rows.Close()
 	out := []Message{}
 	for rows.Next() {
-		var msg Message
-		if err := rows.Scan(&msg.ID, &msg.ChannelID, &msg.UserID, &msg.Content, &msg.Nonce, &msg.CreatedAt,
-			&msg.SenderNickname, &msg.SenderTag); err != nil {
+		msg, err := scanMessage(rows, true)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, msg)
+		out = append(out, *msg)
 	}
 	return out, rows.Err()
 }
@@ -1242,16 +1276,131 @@ func (m *MySQL) MessageByNonce(ctx context.Context, channelID, userID int64, non
 		`SELECT `+messageCols+`, u.nickname, u.tag
 		 FROM messages m JOIN users u ON u.id = m.user_id
 		 WHERE m.channel_id = ? AND m.user_id = ? AND m.nonce = ?`, channelID, userID, nonce)
-	var msg Message
-	err := row.Scan(&msg.ID, &msg.ChannelID, &msg.UserID, &msg.Content, &msg.Nonce, &msg.CreatedAt,
-		&msg.SenderNickname, &msg.SenderTag)
+	msg, err := scanMessage(row, true)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
-	return &msg, nil
+	return msg, nil
+}
+
+// MessageByID 单条回读（#39，含软删行；发送者内联）。
+func (m *MySQL) MessageByID(ctx context.Context, id int64) (*Message, error) {
+	row := m.db.QueryRowContext(ctx,
+		`SELECT `+messageCols+`, u.nickname, u.tag
+		 FROM messages m JOIN users u ON u.id = m.user_id
+		 WHERE m.id = ?`, id)
+	msg, err := scanMessage(row, true)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return msg, nil
+}
+
+// MessagesByIDs 批量回读（#39 回复预览）：一条 IN 查询，含软删行；不存在的 id 不出现。
+func (m *MySQL) MessagesByIDs(ctx context.Context, ids []int64) (map[int64]*Message, error) {
+	out := map[int64]*Message{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := m.db.QueryContext(ctx,
+		`SELECT `+messageCols+`, u.nickname, u.tag
+		 FROM messages m JOIN users u ON u.id = m.user_id
+		 WHERE m.id IN (`+placeholders(len(ids))+`)`, int64Args(ids)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		msg, err := scanMessage(rows, true)
+		if err != nil {
+			return nil, err
+		}
+		out[msg.ID] = msg
+	}
+	return out, rows.Err()
+}
+
+// MentionsOfMessages 批量查询提及用户（#39），组内按 user_id 升序；
+// 没有提及的消息不出现，空入参不发 SQL。
+func (m *MySQL) MentionsOfMessages(ctx context.Context, ids []int64) (map[int64][]int64, error) {
+	out := map[int64][]int64{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := m.db.QueryContext(ctx,
+		`SELECT message_id, user_id FROM message_mentions
+		 WHERE message_id IN (`+placeholders(len(ids))+`)
+		 ORDER BY message_id, user_id`, int64Args(ids)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var mid, uid int64
+		if err := rows.Scan(&mid, &uid); err != nil {
+			return nil, err
+		}
+		out[mid] = append(out[mid], uid)
+	}
+	return out, rows.Err()
+}
+
+// UpdateMessageContent 同一事务更新正文与编辑时间并整体替换提及（#39）。
+// 软删行与不存在的 id 一律 ErrNotFound：墓碑不可再编辑。
+func (m *MySQL) UpdateMessageContent(ctx context.Context, id int64, content string, mentions []int64, editedAt time.Time) error {
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx,
+		`UPDATE messages SET content = ?, edited_at = ? WHERE id = ? AND deleted_at IS NULL`,
+		content, editedAt, id)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		// MySQL 未开 clientFoundRows：值全同也报 0 行。行存在即成功（与 Mem 对齐），
+		// 不存在或已软删才 ErrNotFound。
+		var one int
+		err := tx.QueryRowContext(ctx,
+			`SELECT 1 FROM messages WHERE id = ? AND deleted_at IS NULL`, id).Scan(&one)
+		if err == sql.ErrNoRows {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM message_mentions WHERE message_id = ?`, id); err != nil {
+		return err
+	}
+	if err := insertMessageMentions(ctx, tx, id, normalizeMentions(mentions)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// SoftDeleteMessage 软删（#39）：置 deleted_at、清空正文，行保留供回复引用。
+// 单条 UPDATE 自身原子；deleted_at IS NULL 条件让重复删除返回 ErrNotFound。
+func (m *MySQL) SoftDeleteMessage(ctx context.Context, id int64, deletedAt time.Time) error {
+	res, err := m.db.ExecContext(ctx,
+		`UPDATE messages SET deleted_at = ?, content = '' WHERE id = ? AND deleted_at IS NULL`,
+		deletedAt, id)
+	if err != nil {
+		return err
+	}
+	return checkAffected(res)
 }
 
 // ---- invites ----

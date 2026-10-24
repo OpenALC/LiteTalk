@@ -164,13 +164,20 @@ type Category struct {
 
 // Message 文字频道消息。
 // Nonce 客户端幂等键（#31）：空 = 不去重；(channel_id, user_id, nonce) 唯一索引见迁移 0007。
+// EditedAt/DeletedAt/ReplyTo 见迁移 0013（#39）；DeletedAt 非空表示软删，正文已清空。
+// Mentions 不是 messages 列（message_mentions 表）：列表与详情默认不填，调用方按需
+// 用 MentionsOfMessages 批量查。
 type Message struct {
-	ID        int64     `json:"id" db:"id"`
-	ChannelID int64     `json:"channel_id" db:"channel_id"`
-	UserID    int64     `json:"user_id" db:"user_id"`
-	Content   string    `json:"content" db:"content"`
-	Nonce     string    `json:"nonce,omitempty" db:"nonce"`
-	CreatedAt time.Time `json:"created_at" db:"created_at"`
+	ID        int64      `json:"id" db:"id"`
+	ChannelID int64      `json:"channel_id" db:"channel_id"`
+	UserID    int64      `json:"user_id" db:"user_id"`
+	Content   string     `json:"content" db:"content"`
+	Nonce     string     `json:"nonce,omitempty" db:"nonce"`
+	CreatedAt time.Time  `json:"created_at" db:"created_at"`
+	EditedAt  *time.Time `json:"edited_at,omitempty" db:"edited_at"`
+	DeletedAt *time.Time `json:"deleted_at,omitempty" db:"deleted_at"`
+	ReplyTo   *int64     `json:"reply_to,omitempty" db:"reply_to"`
+	Mentions  []int64    `json:"mentions,omitempty" db:"-"`
 	// Sender 内联发送者信息（列表响应用）。
 	SenderNickname string `json:"sender_nickname,omitempty" db:"-"`
 	SenderTag      string `json:"sender_tag,omitempty" db:"-"`
@@ -350,7 +357,8 @@ type Store interface {
 	ReorderCategories(ctx context.Context, serverID, id int64, position int) error
 
 	// messages
-	// CreateMessage 带 nonce 且撞唯一索引时返回 ErrConflict（调用方回读原消息）。
+	// CreateMessage 同一事务写消息与 @提及（去重后按 user_id 升序）；带 nonce 撞
+	// 唯一索引时整体回滚并返回 ErrConflict（调用方回读原消息，不得留下半条提及）。
 	CreateMessage(ctx context.Context, m *Message) error
 	// MessagesBefore 倒序分页：beforeID=0 取最新 limit 条（按 id 正序返回，旧→新）。
 	MessagesBefore(ctx context.Context, channelID, beforeID int64, limit int) ([]Message, error)
@@ -359,6 +367,20 @@ type Store interface {
 	MessagesAfter(ctx context.Context, channelID, afterID int64, limit int) ([]Message, error)
 	// MessageByNonce 幂等回读：按 (channel_id, user_id, nonce) 找原消息；无命中 ErrNotFound。
 	MessageByNonce(ctx context.Context, channelID, userID int64, nonce string) (*Message, error)
+	// MessageByID 单条回读（含软删行与发送者内联信息）；无命中 ErrNotFound。
+	MessageByID(ctx context.Context, id int64) (*Message, error)
+	// MessagesByIDs 批量回读（回复预览用），含软删行（正文已清空）；不存在的 id
+	// 不出现在结果里，空入参返回空 map。Mentions 不自动填，另用 MentionsOfMessages。
+	MessagesByIDs(ctx context.Context, ids []int64) (map[int64]*Message, error)
+	// MentionsOfMessages 批量查询提及用户，组内按 user_id 升序；没有提及的消息
+	// 不出现，空入参返回空 map。
+	MentionsOfMessages(ctx context.Context, ids []int64) (map[int64][]int64, error)
+	// UpdateMessageContent 同一事务更新正文/编辑时间并整体替换提及；软删或不存在
+	// 返回 ErrNotFound（作者权限由 API 层校验）。
+	UpdateMessageContent(ctx context.Context, id int64, content string, mentions []int64, editedAt time.Time) error
+	// SoftDeleteMessage 软删：置 deleted_at、清空正文，保留行供回复引用；已删除或
+	// 不存在返回 ErrNotFound（重复删除的幂等语义由 API 层决定）。
+	SoftDeleteMessage(ctx context.Context, id int64, deletedAt time.Time) error
 
 	// invites
 	CreateInvite(ctx context.Context, inv *Invite) error
