@@ -2,7 +2,7 @@
 // 浏览器独立开发（vite dev 无 Go 后端）时走 mock 桩，行为可联调 UI。
 // 原生环境判定：Go 在 webview 启动时注入 window._wails.flags（浏览器环境恒无）。
 import { Call, Events } from '@wailsio/runtime'
-import type { AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ConnConfigView, ConnTestResult, FriendDTO, HotkeySettings, PeerView, ServerChannels, ServerConfig, ServerDTO, UserProfile, VoiceStateView } from './types'
+import type { AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ConnConfigView, ConnTestResult, Conversation, FriendDTO, HotkeySettings, PeerView, ServerChannels, ServerConfig, ServerDTO, UserProfile, VoiceStateView } from './types'
 
 type GoApp = {
   GetVersion(): Promise<string>
@@ -84,6 +84,17 @@ type GoApp = {
   AcceptFriend(id: string): Promise<void>
   RemoveFriend(id: string): Promise<void>
   UpdateFriend(id: string, remark: string, group: string): Promise<void>
+  // 私聊/群私聊（#38 B4）：Go 桥直接代理 REST，ID 一律十进制字符串。
+  // 会话变更由 conversation:changed 事件通知，前端收到后重新拉取。
+  ListConversations(): Promise<Conversation[]>
+  CreateDirectConversation(userID: string): Promise<Conversation>
+  CreateGroupConversation(name: string, userIDs: string[]): Promise<Conversation>
+  GetConversation(id: string): Promise<Conversation>
+  RenameConversation(id: string, name: string): Promise<Conversation>
+  DeleteConversation(id: string): Promise<void>
+  AddConversationMembers(id: string, userIDs: string[]): Promise<Conversation>
+  // 最后一人退出时服务端删除会话（204），Go 侧返回 null。
+  RemoveConversationMember(id: string, userID: string): Promise<Conversation | null>
   // 介绍页/首页（v0.1.2：客户端级偏好，存 config.json）
   GetHomeServer(): Promise<string>
   SetHomeServer(id: string): Promise<void>
@@ -101,6 +112,19 @@ export interface SavedCredentials {
   email: string
   password: string
   saved: boolean
+}
+
+// mockConversation 浏览器开发用的会话桩：ID 为字符串，成员不含 email。
+function mockConversation(id: string, kind: Conversation['kind'], name: string): Conversation {
+  return {
+    id,
+    kind,
+    name,
+    members: [
+      { user_id: '1', nickname: 'dev', tag: '0001', role: 'owner', joined_at: '2026-01-01T00:00:00Z' },
+    ],
+    created_at: '2026-01-01T00:00:00Z',
+  }
 }
 
 declare global {
@@ -259,6 +283,15 @@ const mockApp: GoApp = {
   async AcceptFriend() {},
   async RemoveFriend() {},
   async UpdateFriend() {},
+  // 会话桩：列表为空，创建/读取返回占位会话（浏览器开发环境无可联调数据）。
+  async ListConversations() { return [] },
+  async CreateDirectConversation() { return mockConversation('1001', 'direct', '') },
+  async CreateGroupConversation(name: string) { return mockConversation('1002', 'group', name) },
+  async GetConversation(id: string) { return mockConversation(id, 'group', '群聊') },
+  async RenameConversation(id: string, name: string) { return mockConversation(id, 'group', name) },
+  async DeleteConversation() {},
+  async AddConversationMembers(id: string) { return mockConversation(id, 'group', '群聊') },
+  async RemoveConversationMember(id: string) { return mockConversation(id, 'group', '群聊') },
   // 介绍页/首页桩：默认介绍页为首页、未隐藏。
   async GetHomeServer() { return '' },
   async SetHomeServer() {},
