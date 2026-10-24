@@ -11,13 +11,24 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// bcryptCost 按安全要点 §8 固定 12。
-const bcryptCost = 12
+// bcryptCost 按安全要点 §8 固定 12。仅测试可经 SetBcryptCostForTest 临时降低。
+var bcryptCost = 12
+
+// SetBcryptCostForTest 仅供测试在 TestMain 中调用一次：把 bcrypt cost 压到
+// [bcrypt.MinCost, bcrypt.DefaultCost] 以缩短注册/登录夹具耗时；越界值忽略。
+// 生产代码不得调用，运行期并发修改会与 HashPassword 形成数据竞争。
+func SetBcryptCostForTest(cost int) {
+	if cost < bcrypt.MinCost || cost > bcrypt.DefaultCost {
+		return
+	}
+	bcryptCost = cost
+}
 
 // dummyHash 固定 bcrypt 哈希：游客/空哈希路径也走一次完整比较，消除空哈希早退的时序差（#22）。
+// 故意保持 cost 12，不随测试降本——等时语义要按生产开销验证。
 var dummyHash = []byte("$2a$12$UlbcvL1zfCj4bH0TrfoIaeFN9ykOog8EHv4Wx8rjYAnXGdDakbU.6")
 
-// HashPassword bcrypt(12) 哈希。
+// HashPassword 按 bcryptCost 哈希（生产为 12）。
 func HashPassword(plain string) (string, error) {
 	b, err := bcrypt.GenerateFromPassword([]byte(plain), bcryptCost)
 	return string(b), err
