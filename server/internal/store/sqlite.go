@@ -1088,10 +1088,15 @@ func (s *SQLite) ReorderCategories(ctx context.Context, serverID, id int64, posi
 
 // ---- messages ----
 
-// CreateMessage 同一事务写消息与 @提及（#39）：nonce 撞唯一索引时整体回滚，
-// 不会留下半条 message_mentions。空 nonce 落 NULL，唯一索引上不受约束。
+// CreateMessage 同一事务写消息、@提及（#39）并认领附件（#41）：nonce 撞唯一索引
+// 或附件认领失败时整体回滚，不会留下半条 message_mentions / 半认领的附件。
+// 空 nonce 落 NULL，唯一索引上不受约束。
 func (s *SQLite) CreateMessage(ctx context.Context, msg *Message) error {
 	msg.ID = newID(msg.ID)
+	claimIDs, err := normalizeClaimIDs(msg.AttachmentIDs)
+	if err != nil {
+		return err
+	}
 	var nonce any
 	if msg.Nonce != "" {
 		nonce = msg.Nonce
@@ -1110,6 +1115,9 @@ func (s *SQLite) CreateMessage(ctx context.Context, msg *Message) error {
 		return err
 	}
 	if err := insertMessageMentions(ctx, tx, msg.ID, normalizeMentions(msg.Mentions)); err != nil {
+		return err
+	}
+	if err := claimAttachments(ctx, tx, msg.ID, msg.UserID, claimIDs); err != nil {
 		return err
 	}
 	if err := tx.QueryRowContext(ctx, `SELECT created_at FROM messages WHERE id = ?`, msg.ID).
@@ -1326,6 +1334,80 @@ func (s *SQLite) SoftDeleteMessage(ctx context.Context, id int64, deletedAt time
 		return err
 	}
 	return checkAffected(res)
+}
+
+// ---- attachments（迁移 0015，#41 B1） ----
+
+// CreateAttachment 写附件元数据；ID 未预置时取 Snowflake，created_at 回读数据库默认值。
+func (s *SQLite) CreateAttachment(ctx context.Context, a *Attachment) error {
+	if err := prepareAttachment(a); err != nil {
+		return err
+	}
+	a.ID = newID(a.ID)
+	var messageID any
+	if a.MessageID != 0 {
+		messageID = a.MessageID
+	}
+	if _, err := s.db.ExecContext(ctx, attachmentInsertSQL,
+		a.ID, a.UploaderID, messageID, a.Filename, a.ContentType, a.Size,
+		a.Width, a.Height, a.StorageKey, a.ThumbKey, a.AccessKey, a.SHA256); err != nil {
+		if isDupSQLite(err) {
+			return ErrConflict
+		}
+		return err
+	}
+	return s.db.QueryRowContext(ctx,
+		`SELECT created_at FROM attachments WHERE id = ?`, a.ID).Scan(&a.CreatedAt)
+}
+
+// AttachmentByID 无命中 ErrNotFound。
+func (s *SQLite) AttachmentByID(ctx context.Context, id int64) (*Attachment, error) {
+	a, err := scanAttachment(s.db.QueryRowContext(ctx,
+		`SELECT `+attachmentCols+` FROM attachments WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
+// AttachmentByAccessKey 按下载能力凭证查找；无命中 ErrNotFound。
+func (s *SQLite) AttachmentByAccessKey(ctx context.Context, accessKey string) (*Attachment, error) {
+	a, err := scanAttachment(s.db.QueryRowContext(ctx,
+		`SELECT `+attachmentCols+` FROM attachments WHERE access_key = ?`, accessKey))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
+// AttachmentsByMessageIDs 批量分组，组内按 id 升序；未认领与不存在的消息不出现。
+func (s *SQLite) AttachmentsByMessageIDs(ctx context.Context, messageIDs []int64) (map[int64][]Attachment, error) {
+	out := make(map[int64][]Attachment, len(messageIDs))
+	if len(messageIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+attachmentCols+` FROM attachments
+		  WHERE message_id IN (`+placeholders(len(messageIDs))+`) ORDER BY id ASC`,
+		int64Args(messageIDs)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		a, err := scanAttachment(rows)
+		if err != nil {
+			return nil, err
+		}
+		out[a.MessageID] = append(out[a.MessageID], *a)
+	}
+	return out, rows.Err()
 }
 
 // ---- read_states（迁移 0014，#40 B1） ----

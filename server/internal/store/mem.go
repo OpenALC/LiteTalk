@@ -30,6 +30,8 @@ type Mem struct {
 	channelMembers map[int64]map[int64]*ChannelMember
 	// readStates 已读水位（迁移 0014，#40）：userID → channelID → 最后已读消息 id。
 	readStates map[int64]map[int64]int64
+	// attachments 附件元数据（迁移 0015，#41）：attachmentID → 行。
+	attachments map[int64]*Attachment
 
 	roles       map[int64]*Role                                     // roleID → role（迁移 0010）
 	memberRoles map[int64]map[int64]map[int64]*MemberRoleAssignment // serverID → userID → roleID → 分配
@@ -61,6 +63,7 @@ func NewMem() *Mem {
 		sessions:       map[int64]map[string]*UserSession{},
 		channelMembers: map[int64]map[int64]*ChannelMember{},
 		readStates:     map[int64]map[int64]int64{},
+		attachments:    map[int64]*Attachment{},
 		roles:          map[int64]*Role{},
 		memberRoles:    map[int64]map[int64]map[int64]*MemberRoleAssignment{},
 		overwrites:     map[overwriteKey]*ChannelOverwrite{},
@@ -899,6 +902,10 @@ func (m *Mem) CreateMessage(_ context.Context, msg *Message) error {
 	if _, ok := m.channels[msg.ChannelID]; !ok {
 		return ErrNotFound
 	}
+	claimIDs, err := normalizeClaimIDs(msg.AttachmentIDs)
+	if err != nil {
+		return err
+	}
 	// nonce 幂等：同频道同用户同 nonce 只留一条（唯一索引语义，空 nonce 不去重）。
 	// 冲突检查先于任何写入，等价于 SQL 实现的事务回滚（不会残留提及）。
 	if msg.Nonce != "" {
@@ -908,14 +915,26 @@ func (m *Mem) CreateMessage(_ context.Context, msg *Message) error {
 			}
 		}
 	}
+	// 附件认领同样先校验后写入：任一附件不存在/非本人/已引用就整体不生效。
+	for _, id := range claimIDs {
+		a, ok := m.attachments[id]
+		if !ok || a.UploaderID != msg.UserID || a.MessageID != 0 {
+			return errAttachmentClaim(id)
+		}
+	}
 	msg.ID = newID(msg.ID)
 	msg.CreatedAt = time.Now()
 	cp := *msg
-	// Mentions 是独立表的投影，不能随消息结构一起存（读取不得自动回填）。
+	// Mentions/AttachmentIDs 是独立表/关联列的投影，不能随消息结构一起存
+	// （读取不得自动回填）。
 	cp.Mentions = nil
+	cp.AttachmentIDs = nil
 	m.messages[msg.ID] = &cp
 	if mentions := normalizeMentions(msg.Mentions); len(mentions) > 0 {
 		m.mentions[msg.ID] = mentions
+	}
+	for _, id := range claimIDs {
+		m.attachments[id].MessageID = msg.ID
 	}
 	return nil
 }
@@ -1095,6 +1114,82 @@ func (m *Mem) SoftDeleteMessage(_ context.Context, id int64, deletedAt time.Time
 	msg.DeletedAt = &deleted
 	msg.Content = ""
 	return nil
+}
+
+// ---- attachments（迁移 0015，#41 B1） ----
+
+// CreateAttachment 写附件元数据；ID 未预置时取 Snowflake。
+func (m *Mem) CreateAttachment(_ context.Context, a *Attachment) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := prepareAttachment(a); err != nil {
+		return err
+	}
+	a.ID = newID(a.ID)
+	if _, ok := m.attachments[a.ID]; ok {
+		return ErrConflict
+	}
+	for _, x := range m.attachments {
+		if x.AccessKey == a.AccessKey {
+			return ErrConflict
+		}
+	}
+	a.CreatedAt = time.Now()
+	cp := *a
+	m.attachments[a.ID] = &cp
+	return nil
+}
+
+// AttachmentByID 无命中 ErrNotFound。
+func (m *Mem) AttachmentByID(_ context.Context, id int64) (*Attachment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.attachments[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	cp := *a
+	return &cp, nil
+}
+
+// AttachmentByAccessKey 按下载能力凭证查找；无命中 ErrNotFound。
+func (m *Mem) AttachmentByAccessKey(_ context.Context, accessKey string) (*Attachment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, a := range m.attachments {
+		if a.AccessKey == accessKey {
+			cp := *a
+			return &cp, nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
+// AttachmentsByMessageIDs 批量分组，组内按 id 升序；未认领（MessageID=0）与不存在的
+// 消息不出现（SQL 侧 NULL 不匹配 IN，这里同样跳过）。
+func (m *Mem) AttachmentsByMessageIDs(_ context.Context, messageIDs []int64) (map[int64][]Attachment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[int64][]Attachment, len(messageIDs))
+	if len(messageIDs) == 0 {
+		return out, nil
+	}
+	want := make(map[int64]struct{}, len(messageIDs))
+	for _, id := range messageIDs {
+		want[id] = struct{}{}
+	}
+	for _, a := range m.attachments {
+		if a.MessageID == 0 {
+			continue
+		}
+		if _, ok := want[a.MessageID]; ok {
+			out[a.MessageID] = append(out[a.MessageID], *a)
+		}
+	}
+	for id := range out {
+		sort.Slice(out[id], func(i, j int) bool { return out[id][i].ID < out[id][j].ID })
+	}
+	return out, nil
 }
 
 // ---- read_states（迁移 0014，#40 B1） ----

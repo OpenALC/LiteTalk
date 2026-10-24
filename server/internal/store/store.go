@@ -17,6 +17,11 @@ var (
 	ErrConflict  = errors.New("conflict")
 	ErrForbidden = errors.New("forbidden")
 	ErrExpired   = errors.New("expired")
+
+	// ErrAttachmentUnavailable 附件认领失败（#41 B1）：附件不存在、上传者不是消息作者、
+	// 已被其他消息引用，或请求里含重复/非法 ID。统一成同一错误，避免向调用方泄露
+	// 「附件是否存在 / 属于谁」；CreateMessage 认领失败时整条消息回滚，不留半条数据。
+	ErrAttachmentUnavailable = errors.New("attachment unavailable")
 )
 
 // newID 新行主键（#31）：调用方未预置时取 Snowflake，显式赋值优先（测试夹具用）。
@@ -178,9 +183,32 @@ type Message struct {
 	DeletedAt *time.Time `json:"deleted_at,omitempty" db:"deleted_at"`
 	ReplyTo   *int64     `json:"reply_to,omitempty" db:"reply_to"`
 	Mentions  []int64    `json:"mentions,omitempty" db:"-"`
+	// AttachmentIDs 发送时随消息认领的附件（#41 B1）：只在 CreateMessage 事务内消费，
+	// 不落消息行、读取不回填，附件归属查 AttachmentsByMessageIDs。
+	AttachmentIDs []int64 `json:"attachment_ids,omitempty" db:"-"`
 	// Sender 内联发送者信息（列表响应用）。
 	SenderNickname string `json:"sender_nickname,omitempty" db:"-"`
 	SenderTag      string `json:"sender_tag,omitempty" db:"-"`
+}
+
+// Attachment 消息附件元数据（迁移 0015，#41 B1）。二进制内容在 blob，不在库里。
+// MessageID 为 0 表示尚未被消息引用（message_id NULL）；一条附件只能属于一条消息。
+// StorageKey/ThumbKey 是 blob 内的不透明键，AccessKey 是下载能力凭证，三者都不对外
+// JSON 序列化（API 层按需显式输出）；宽高非图片为 0。
+type Attachment struct {
+	ID          int64     `json:"id" db:"id"`
+	UploaderID  int64     `json:"uploader_id" db:"uploader_id"`
+	MessageID   int64     `json:"message_id,omitempty" db:"message_id"`
+	Filename    string    `json:"filename" db:"filename"`
+	ContentType string    `json:"content_type" db:"content_type"`
+	Size        int64     `json:"size" db:"size"`
+	Width       int       `json:"width" db:"width"`
+	Height      int       `json:"height" db:"height"`
+	StorageKey  string    `json:"-" db:"storage_key"`
+	ThumbKey    string    `json:"-" db:"thumb_key"`
+	AccessKey   string    `json:"-" db:"access_key"`
+	SHA256      string    `json:"-" db:"sha256"`
+	CreatedAt   time.Time `json:"created_at" db:"created_at"`
 }
 
 // Unread 某用户在某频道的未读数与未读提及数（#40 B1）。
@@ -363,8 +391,10 @@ type Store interface {
 	ReorderCategories(ctx context.Context, serverID, id int64, position int) error
 
 	// messages
-	// CreateMessage 同一事务写消息与 @提及（去重后按 user_id 升序）；带 nonce 撞
-	// 唯一索引时整体回滚并返回 ErrConflict（调用方回读原消息，不得留下半条提及）。
+	// CreateMessage 同一事务写消息、@提及（去重后按 user_id 升序）并认领 AttachmentIDs；
+	// 带 nonce 撞唯一索引时整体回滚并返回 ErrConflict（调用方回读原消息，不得留下半条提及）。
+	// 认领要求附件为 m.UserID 上传且尚未被引用，任一不满足（含重复/非法 ID）返回
+	// ErrAttachmentUnavailable 并回滚整条消息；AttachmentIDs 为空时完全跳过。
 	CreateMessage(ctx context.Context, m *Message) error
 	// MessagesBefore 倒序分页：beforeID=0 取最新 limit 条（按 id 正序返回，旧→新）。
 	MessagesBefore(ctx context.Context, channelID, beforeID int64, limit int) ([]Message, error)
@@ -387,6 +417,19 @@ type Store interface {
 	// SoftDeleteMessage 软删：置 deleted_at、清空正文，保留行供回复引用；已删除或
 	// 不存在返回 ErrNotFound（重复删除的幂等语义由 API 层决定）。
 	SoftDeleteMessage(ctx context.Context, id int64, deletedAt time.Time) error
+
+	// attachments（迁移 0015，#41 B1）
+	// CreateAttachment 写入附件元数据；ID 未预置时取 Snowflake，回填 CreatedAt。
+	// UploaderID 为 0 返回 ErrForbidden；id 或 access_key 重复返回 ErrConflict。
+	// MessageID 为 0 落 NULL（未认领）；正常流程由 CreateMessage 在事务内认领。
+	CreateAttachment(ctx context.Context, a *Attachment) error
+	// AttachmentByID 无命中 ErrNotFound。
+	AttachmentByID(ctx context.Context, id int64) (*Attachment, error)
+	// AttachmentByAccessKey 按下载能力凭证查找；无命中 ErrNotFound。
+	AttachmentByAccessKey(ctx context.Context, accessKey string) (*Attachment, error)
+	// AttachmentsByMessageIDs 批量按消息分组，组内按 id 升序；未认领附件与不存在的
+	// 消息不出现（与 MentionsOfMessages 同口径），空入参返回空 map。
+	AttachmentsByMessageIDs(ctx context.Context, messageIDs []int64) (map[int64][]Attachment, error)
 
 	// read_states（迁移 0014，#40 B1）：每用户每频道一条「最后已读消息 id」水位。
 	// 未读 = 频道中 id 大于水位、非本人、未软删的消息；提及 = 其中提及该用户的条数。
