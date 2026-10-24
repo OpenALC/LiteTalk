@@ -48,7 +48,14 @@ func resolveJWTSecret(explicit, dataDir string, dev bool) (secret string, genera
 		return secret, false, nil
 	}
 	if !errors.Is(err, fs.ErrNotExist) {
-		return "", false, err
+		// 文件已存在但暂时为空/半截/校验失败：并发首启的败者可能撞上胜者
+		// 「O_EXCL 已建文件、尚未写完内容」的窗口，按重试窗口等内容就绪。
+		// 持久化的弱密钥/损坏文件与真正的权限、IO 错误在重试耗尽后原样返回。
+		secret, rerr := readJWTSecretRetry(path)
+		if rerr != nil {
+			return "", false, rerr
+		}
+		return secret, false, nil
 	}
 
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
@@ -62,19 +69,12 @@ func resolveJWTSecret(explicit, dataDir string, dev bool) (secret string, genera
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		if errors.Is(err, fs.ErrExist) {
-			// 并发首启的败者：复用胜者写入的密钥。胜者可能刚建好文件还没写完，
-			// 短暂重试到内容完整（含「长度不足」这类半截写入的校验失败）。
-			for i := 0; i < jwtSecretReadRetries; i++ {
-				if i > 0 {
-					time.Sleep(jwtSecretReadInterval)
-				}
-				if secret, rerr := readJWTSecretFile(path); rerr == nil {
-					return secret, false, nil
-				} else {
-					err = rerr
-				}
+			// 并发首启的败者：复用胜者写入的密钥，同样要等半截内容写完整。
+			secret, rerr := readJWTSecretRetry(path)
+			if rerr != nil {
+				return "", false, rerr
 			}
-			return "", false, err
+			return secret, false, nil
 		}
 		return "", false, fmt.Errorf("写入 %s 失败: %w", path, err)
 	}
@@ -94,6 +94,25 @@ func resolveJWTSecret(explicit, dataDir string, dev bool) (secret string, genera
 		return "", false, fmt.Errorf("写入 %s 失败: %w", path, err)
 	}
 	return secret, true, nil
+}
+
+// readJWTSecretRetry 在并发首启窗口内等待密钥文件内容就绪：
+// 胜者用 O_EXCL 建好文件后还要 chmod、写入、关闭，败者首次读取可能看到空文件或半截内容。
+// 每次读取失败后按 jwtSecretReadInterval 重试，总等待上限
+// jwtSecretReadRetries*jwtSecretReadInterval（5s）；返回最后一次错误。
+func readJWTSecretRetry(path string) (string, error) {
+	var lastErr error
+	for i := 0; i < jwtSecretReadRetries; i++ {
+		if i > 0 {
+			time.Sleep(jwtSecretReadInterval)
+		}
+		secret, err := readJWTSecretFile(path)
+		if err == nil {
+			return secret, nil
+		}
+		lastErr = err
+	}
+	return "", lastErr
 }
 
 // readJWTSecretFile 读取并校验持久化密钥；文件缺失返回 fs.ErrNotExist。
