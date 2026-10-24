@@ -2,22 +2,41 @@ package sfu
 
 import (
 	"net"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/pion/webrtc/v4"
 )
 
-// freePort 先占一个空闲 TCP 端口再释放，返回端口号供 UDP/TCP 同号绑定用。
+// freePort 选出一个 TCP 与 UDP 都能绑定的端口，供 UDP/TCP 同号绑定用。
+// 只探测 TCP 会留下 TOCTOU 缺口：监听关闭后没有 TIME_WAIT，并行包（turn 的
+// 同款 helper）可能拿到同一端口，而 TCP 空闲不代表 UDP 空闲。做法是保持
+// TCP :0 候选监听的同时试绑 UDP 同号，两者都成功才释放返回；失败换下一个，
+// 尝试次数耗尽则报错。
 func freePort(t *testing.T) int {
 	t.Helper()
-	ln, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4zero, Port: 0})
-	if err != nil {
-		t.Fatal(err)
+	const maxAttempts = 20
+	var lastErr error
+	for i := 0; i < maxAttempts; i++ {
+		ln, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4zero, Port: 0})
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		port := ln.Addr().(*net.TCPAddr).Port
+		pc, err := net.ListenPacket("udp4", net.JoinHostPort("0.0.0.0", strconv.Itoa(port)))
+		if err != nil {
+			_ = ln.Close()
+			lastErr = err
+			continue
+		}
+		_ = pc.Close()
+		_ = ln.Close()
+		return port
 	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	_ = ln.Close()
-	return port
+	t.Fatalf("连续 %d 次未找到 TCP/UDP 均可绑定的端口，最后一次错误: %v", maxAttempts, lastErr)
+	return 0
 }
 
 // TestTCPPortSameNumber UDP 与 TCP 同号并存：这是「单端口复用不冲突」的直接验收
