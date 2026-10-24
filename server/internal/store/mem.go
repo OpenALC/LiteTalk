@@ -20,8 +20,11 @@ type Mem struct {
 	channels    map[int64]*Channel
 	categories  map[int64]*Category
 	messages    map[int64]*Message
-	invites     map[string]*Invite
-	sessions    map[int64]map[string]*UserSession // userID → deviceType → session
+	// mentions 消息 @提及（迁移 0013，#39）：messageID → 去重升序的 userID。
+	// 不从 Message.Mentions 自动回填，读取走 MentionsOfMessages。
+	mentions map[int64][]int64
+	invites  map[string]*Invite
+	sessions map[int64]map[string]*UserSession // userID → deviceType → session
 	// channelMembers 会话成员（迁移 0012，#38）：channelID → userID → 成员。
 	channelMembers map[int64]map[int64]*ChannelMember
 
@@ -50,6 +53,7 @@ func NewMem() *Mem {
 		channels:       map[int64]*Channel{},
 		categories:     map[int64]*Category{},
 		messages:       map[int64]*Message{},
+		mentions:       map[int64][]int64{},
 		invites:        map[string]*Invite{},
 		sessions:       map[int64]map[string]*UserSession{},
 		channelMembers: map[int64]map[int64]*ChannelMember{},
@@ -334,6 +338,7 @@ func (m *Mem) DeleteServer(_ context.Context, id int64) error {
 			for mid, msg := range m.messages {
 				if msg.ChannelID == cid {
 					delete(m.messages, mid)
+					delete(m.mentions, mid)
 				}
 			}
 		}
@@ -524,6 +529,7 @@ func (m *Mem) DeleteChannel(_ context.Context, id int64) error {
 			for mid, msg := range m.messages {
 				if msg.ChannelID == cid {
 					delete(m.messages, mid)
+					delete(m.mentions, mid)
 				}
 			}
 		}
@@ -534,6 +540,7 @@ func (m *Mem) DeleteChannel(_ context.Context, id int64) error {
 	for mid, msg := range m.messages {
 		if msg.ChannelID == id {
 			delete(m.messages, mid)
+			delete(m.mentions, mid)
 		}
 	}
 	return nil
@@ -814,6 +821,7 @@ func (m *Mem) DeleteCategoryWithChannels(_ context.Context, id int64) error {
 		for mid, msg := range m.messages {
 			if msg.ChannelID == cid {
 				delete(m.messages, mid)
+				delete(m.mentions, mid)
 			}
 		}
 	}
@@ -888,6 +896,7 @@ func (m *Mem) CreateMessage(_ context.Context, msg *Message) error {
 		return ErrNotFound
 	}
 	// nonce 幂等：同频道同用户同 nonce 只留一条（唯一索引语义，空 nonce 不去重）。
+	// 冲突检查先于任何写入，等价于 SQL 实现的事务回滚（不会残留提及）。
 	if msg.Nonce != "" {
 		for _, x := range m.messages {
 			if x.ChannelID == msg.ChannelID && x.UserID == msg.UserID && x.Nonce == msg.Nonce {
@@ -898,7 +907,12 @@ func (m *Mem) CreateMessage(_ context.Context, msg *Message) error {
 	msg.ID = newID(msg.ID)
 	msg.CreatedAt = time.Now()
 	cp := *msg
+	// Mentions 是独立表的投影，不能随消息结构一起存（读取不得自动回填）。
+	cp.Mentions = nil
 	m.messages[msg.ID] = &cp
+	if mentions := normalizeMentions(msg.Mentions); len(mentions) > 0 {
+		m.mentions[msg.ID] = mentions
+	}
 	return nil
 }
 
@@ -998,6 +1012,85 @@ func (m *Mem) MessageByNonce(_ context.Context, channelID, userID int64, nonce s
 		}
 	}
 	return nil, ErrNotFound
+}
+
+// messageCopyLocked 返回消息副本并补发送者内联信息（调用方须持锁）。
+func (m *Mem) messageCopyLocked(msg *Message) *Message {
+	cp := *msg
+	if u, ok := m.users[cp.UserID]; ok {
+		cp.SenderNickname, cp.SenderTag = u.Nickname, u.Tag
+	}
+	return &cp
+}
+
+// MessageByID 单条回读（#39，含软删行；发送者内联）。
+func (m *Mem) MessageByID(_ context.Context, id int64) (*Message, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	msg, ok := m.messages[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return m.messageCopyLocked(msg), nil
+}
+
+// MessagesByIDs 批量回读（#39）：含软删行，不存在的 id 不出现。
+func (m *Mem) MessagesByIDs(_ context.Context, ids []int64) (map[int64]*Message, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := map[int64]*Message{}
+	for _, id := range ids {
+		if msg, ok := m.messages[id]; ok {
+			out[id] = m.messageCopyLocked(msg)
+		}
+	}
+	return out, nil
+}
+
+// MentionsOfMessages 批量查询提及用户（#39）；没有提及的消息不出现。
+func (m *Mem) MentionsOfMessages(_ context.Context, ids []int64) (map[int64][]int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := map[int64][]int64{}
+	for _, id := range ids {
+		if list, ok := m.mentions[id]; ok && len(list) > 0 {
+			out[id] = append([]int64(nil), list...)
+		}
+	}
+	return out, nil
+}
+
+// UpdateMessageContent 更新正文/编辑时间并整体替换提及（#39）；软删或不存在 ErrNotFound。
+func (m *Mem) UpdateMessageContent(_ context.Context, id int64, content string, mentions []int64, editedAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	msg, ok := m.messages[id]
+	if !ok || msg.DeletedAt != nil {
+		return ErrNotFound
+	}
+	msg.Content = content
+	edited := editedAt
+	msg.EditedAt = &edited
+	if norm := normalizeMentions(mentions); len(norm) > 0 {
+		m.mentions[id] = norm
+	} else {
+		delete(m.mentions, id)
+	}
+	return nil
+}
+
+// SoftDeleteMessage 软删（#39）：置 deleted_at、清空正文，行保留供回复引用。
+func (m *Mem) SoftDeleteMessage(_ context.Context, id int64, deletedAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	msg, ok := m.messages[id]
+	if !ok || msg.DeletedAt != nil {
+		return ErrNotFound
+	}
+	deleted := deletedAt
+	msg.DeletedAt = &deleted
+	msg.Content = ""
+	return nil
 }
 
 // ---- invites ----
