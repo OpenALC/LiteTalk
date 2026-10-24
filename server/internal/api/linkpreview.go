@@ -35,7 +35,8 @@ const (
 // GetLinkPreview GET /api/v1/link-preview?url=（#42 B4）
 func (s *Server) GetLinkPreview(ctx context.Context, request GetLinkPreviewRequestObject) (GetLinkPreviewResponseObject, error) {
 	// 功能关闭：不构造抓取器，也不消耗频控/缓存，任何请求统一 404。
-	if s.linkPreview == nil {
+	// 没有 KV 时同样按关闭处理（缓存是本功能的一部分，生产 main 恒注入）。
+	if s.linkPreview == nil || s.kv == nil {
 		return nil, errf(http.StatusNotFound, "no_preview", "无法获取链接预览")
 	}
 	raw := strings.TrimSpace(request.Params.Url)
@@ -68,8 +69,8 @@ func (s *Server) GetLinkPreview(ctx context.Context, request GetLinkPreviewReque
 			return nil, errf(http.StatusInternalServerError, "internal", "服务器内部错误")
 		}
 	}
-	if raw, err := json.Marshal(p); err == nil {
-		s.putLinkPreviewCache(ctx, key, string(raw), linkPreviewPositiveTTL)
+	if encoded, err := json.Marshal(p); err == nil {
+		s.putLinkPreviewCache(ctx, key, string(encoded), linkPreviewPositiveTTL)
 	} else {
 		s.log.Printf("[linkpreview] 缓存序列化失败: %v", err)
 	}

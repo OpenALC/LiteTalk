@@ -97,7 +97,7 @@ type Server struct {
 	blob blob.Store
 	// upload 附件校验参数（MaxBytes/MaxDimension/AllowedTypes）；New 里补默认值。
 	upload attachment.Config
-	// kv 共享键值存储（链接预览缓存，#42 B4）；nil 时跳过缓存直接抓取。
+	// kv 共享键值存储（链接预览缓存，#42 B4）；nil 时链接预览按不可用处理。
 	kv store.KV
 	// linkPreview 链接预览抓取器（nil=功能关闭，端点统一 404 no_preview）。
 	linkPreview LinkPreviewFetcher
@@ -145,8 +145,8 @@ type Config struct {
 	// Upload 附件校验参数。MaxBytes<=0 回落 10 MiB；MaxDimension<=0 回落 4096
 	// （服务端显式收紧，包默认 8192 对解压炸弹风险偏高）；AllowedTypes 为空用默认白名单。
 	Upload attachment.Config
-	// KV 共享键值存储（链接预览缓存，#42 B4）。nil 时缓存整体关闭（fail-open，
-	// 仍可抓取）；缓存读写故障同样跳过缓存继续抓取。
+	// KV 共享键值存储（链接预览缓存，#42 B4）。nil 时链接预览按不可用处理
+	// （端点 404 no_preview）；缓存读写故障则 fail-open，跳过缓存继续抓取。
 	KV store.KV
 	// LinkPreview 链接预览抓取器（#42 B4）。生产由 cmd/server 按
 	// LITETALK_LINK_PREVIEW* 构造；nil = 功能关闭，端点一律 404 no_preview。

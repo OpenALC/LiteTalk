@@ -153,6 +153,20 @@ func TestLinkPreviewDisabled(t *testing.T) {
 	}
 }
 
+func TestLinkPreviewWithoutKV(t *testing.T) {
+	srv, mem := newTestServer(t)
+	token, _ := addUser(t, srv, mem, "lp-nokv@example.com", "lpNoKV")
+	fetcher := &fakePreviewFetcher{preview: &linkpreview.Preview{URL: "https://example.com/", Title: "t"}}
+	srv.linkPreview = fetcher // KV 保持 nil：缓存是功能的一部分，按不可用处理。
+	body, _ := getJSON(t, srv.Handler(), linkPreviewPath("https://example.com/"), token, http.StatusNotFound).(map[string]any)
+	if body["code"] != "no_preview" {
+		t.Fatalf("KV 未注入时 code = %v，期望 no_preview", body["code"])
+	}
+	if fetcher.callCount() != 0 {
+		t.Fatalf("KV 未注入时不应抓取，实际 %d 次", fetcher.callCount())
+	}
+}
+
 func TestLinkPreviewInvalidURL(t *testing.T) {
 	_, h, token, fetcher := newLinkPreviewWorld(t)
 	long := "https://example.com/" + strings.Repeat("a", linkpreview.MaxURLLength)
