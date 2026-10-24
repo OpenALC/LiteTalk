@@ -138,9 +138,25 @@ func (g *gwClient) expectChat(wantSeq int64, wantContent string) {
 	}
 }
 
-// TestGatewayIntegrationResumeAfterDisconnect 场景 1：在线收 1..2 → 断线期间
-// 产生 3..4 → 同 sid 重连 → server.hello 带 session_id → Tracker resume{last_seq:2}
-// → 补发 3,4 按序投递 → 实时事件 5 续流。
+// waitTrackerSeq 等 Gate 把收件人自己的 channel.unread 也投递完。chat.message
+// 与 channel.unread 是两次下行，expectChat 返回时后者可能还在路上（#40）。
+func waitTrackerSeq(t *testing.T, tr *gateway.Tracker, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for tr.LastSeq() < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("Tracker 基准未到 %d（当前 %d）", want, tr.LastSeq())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := tr.LastSeq(); got != want {
+		t.Fatalf("Tracker 基准 = %d, want %d", got, want)
+	}
+}
+
+// TestGatewayIntegrationResumeAfterDisconnect 场景 1：在线收 1..4（每条 chat 后
+// 跟一条 channel.unread）→ 断线期间产生 5..8 → 同 sid 重连 → server.hello 带
+// session_id → Tracker resume{last_seq:4} → 补发 5..8 按序投递 → 实时事件 9 续流。
 func TestGatewayIntegrationResumeAfterDisconnect(t *testing.T) {
 	f := newChatFixture(t)
 	chID := strconv.FormatInt(f.ch.ID, 10)
@@ -153,34 +169,30 @@ func TestGatewayIntegrationResumeAfterDisconnect(t *testing.T) {
 		t.Fatalf("首次 resume = %+v, want {sa 0}", r)
 	}
 	bobSend(t, b, chID, "m1")
-	a1.expectChat(1, "m1")
+	a1.expectChat(seqOfChat(1), "m1")
 	bobSend(t, b, chID, "m2")
-	a1.expectChat(2, "m2")
-	if got := tr.LastSeq(); got != 2 {
-		t.Fatalf("在线基准 = %d, want 2", got)
-	}
+	a1.expectChat(seqOfChat(2), "m2")
+	waitTrackerSeq(t, tr, seqOfChat(2)+1)
 
 	a1.stop()
 	waitOffline(t, f, "1")
 
-	// 断线期间的事件进环（会话窗口内）。
+	// 断线期间的事件进环（会话窗口内），每次发送各占 chat + unread 两个 seq。
 	bobSend(t, b, chID, "m3")
 	bobSend(t, b, chID, "m4")
 
 	// 同 sid 重连：server.hello.session_id 命中 Tracker 记录的会话。
 	a2 := startGatewayClient(t, f, "1:desktop:sa", tr)
-	if r := a2.waitResume(); r.SessionID != "sa" || r.LastSeq != 2 {
-		t.Fatalf("重连 resume = %+v, want {sa 2}", r)
+	if r := a2.waitResume(); r.SessionID != "sa" || r.LastSeq != seqOfChat(2)+1 {
+		t.Fatalf("重连 resume = %+v, want {sa %d}", r, seqOfChat(2)+1)
 	}
-	a2.expectChat(3, "m3")
-	a2.expectChat(4, "m4")
-	if got := tr.LastSeq(); got != 4 {
-		t.Fatalf("补发后基准 = %d, want 4", got)
-	}
+	a2.expectChat(seqOfChat(3), "m3")
+	a2.expectChat(seqOfChat(4), "m4")
+	waitTrackerSeq(t, tr, seqOfChat(4)+1)
 
 	// 补发完毕后实时事件继续流式。
 	bobSend(t, b, chID, "m5")
-	a2.expectChat(5, "m5")
+	a2.expectChat(seqOfChat(5), "m5")
 }
 
 // TestGatewayIntegrationServerRestart 场景 2：服务端重启（新 Hub/新环），客户端
@@ -195,12 +207,10 @@ func TestGatewayIntegrationServerRestart(t *testing.T) {
 	a1 := startGatewayClient(t, f1, "1:desktop:sa", tr)
 	a1.waitResume()
 	bobSend(t, b1, ch1, "old1")
-	a1.expectChat(1, "old1")
+	a1.expectChat(seqOfChat(1), "old1")
 	bobSend(t, b1, ch1, "old2")
-	a1.expectChat(2, "old2")
-	if got := tr.LastSeq(); got != 2 {
-		t.Fatalf("重启前基准 = %d, want 2", got)
-	}
+	a1.expectChat(seqOfChat(2), "old2")
+	waitTrackerSeq(t, tr, seqOfChat(2)+1)
 	a1.stop()
 	waitOffline(t, f1, "1")
 
@@ -219,8 +229,8 @@ func TestGatewayIntegrationServerRestart(t *testing.T) {
 	})
 
 	a2 := startGatewayClient(t, f2, "1:desktop:sa", tr)
-	if r := a2.waitResume(); r.SessionID != "sa" || r.LastSeq != 2 {
-		t.Fatalf("重启后 resume = %+v, want {sa 2}（客户端仍拿旧基准）", r)
+	if r := a2.waitResume(); r.SessionID != "sa" || r.LastSeq != seqOfChat(2)+1 {
+		t.Fatalf("重启后 resume = %+v, want {sa %d}（客户端仍拿旧基准）", r, seqOfChat(2)+1)
 	}
 	select {
 	case reason := <-resync:
@@ -236,12 +246,10 @@ func TestGatewayIntegrationServerRestart(t *testing.T) {
 
 	// 新环从 1 重计：Tracker 已对齐基准，事件必须能投递。
 	bobSend(t, b2, ch2, "new1")
-	a2.expectChat(1, "new1")
-	if got := tr.LastSeq(); got != 1 {
-		t.Fatalf("重启后新基准 = %d, want 1", got)
-	}
+	a2.expectChat(seqOfChat(1), "new1")
+	waitTrackerSeq(t, tr, seqOfChat(1)+1)
 	bobSend(t, b2, ch2, "new2")
-	a2.expectChat(2, "new2")
+	a2.expectChat(seqOfChat(2), "new2")
 }
 
 // TestGatewayIntegrationFreshTrackerReplaysRing 场景 3：客户端 Tracker 全新
@@ -269,10 +277,8 @@ func TestGatewayIntegrationFreshTrackerReplaysRing(t *testing.T) {
 	if r := a.waitResume(); r.SessionID != "sa" || r.LastSeq != 0 {
 		t.Fatalf("首次 resume = %+v, want {sa 0}", r)
 	}
-	a.expectChat(1, "r1")
-	a.expectChat(2, "r2")
-	a.expectChat(3, "r3")
-	if got := tr.LastSeq(); got != 3 {
-		t.Fatalf("补发后基准 = %d, want 3", got)
-	}
+	a.expectChat(seqOfChat(1), "r1")
+	a.expectChat(seqOfChat(2), "r2")
+	a.expectChat(seqOfChat(3), "r3")
+	waitTrackerSeq(t, tr, seqOfChat(3)+1)
 }

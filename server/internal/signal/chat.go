@@ -28,6 +28,9 @@ type ChatStore interface {
 	MembersOfServer(ctx context.Context, serverID int64) ([]store.ServerMember, error)
 	// ChannelMembers 会话成员（#38）：私聊/群聊的可见性与广播范围都以成员表为准。
 	ChannelMembers(ctx context.Context, channelID int64) ([]store.ChannelMember, error)
+	// UnreadCountsForUsers 单频道多用户未读/提及计数（#40）：chat.message 广播后
+	// 给每个收件人推自己的 channel.unread。store.Store 满足。
+	UnreadCountsForUsers(ctx context.Context, channelID int64, userIDs []int64) (map[int64]store.Unread, error)
 }
 
 // RateLimiter 发送频控接口（auth.RateLimit 满足；nil 时不限流）。
@@ -280,6 +283,42 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 		h.mu.Unlock()
 	}
 	h.broadcastEvent(uids, TypeChatMessage, out)
+	// 未读计数（#40）：消息事件之后给每个收件人推自己的精确计数。失败只记日志，
+	// 不影响已经广播/落库的消息。
+	if persist {
+		h.broadcastChatUnread(ctx, chID, uids)
+	}
+}
+
+// broadcastChatUnread 计算并推送 chat.send 落库后各收件人的未读/提及计数。
+// uids 是 chat.message 的实际收件人集合（十进制字符串），发送者也在内；计数
+// 由 store 按「水位之后、非本人、未软删」统一计算，调用方不自行加减。
+func (h *Hub) broadcastChatUnread(ctx context.Context, channelID int64, uids map[string]bool) {
+	if h.chatStore == nil || len(uids) == 0 {
+		return
+	}
+	ids := make([]int64, 0, len(uids))
+	for raw := range uids {
+		uid, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || uid <= 0 {
+			continue
+		}
+		ids = append(ids, uid)
+	}
+	if len(ids) == 0 {
+		return
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	counts, err := h.chatStore.UnreadCountsForUsers(ctx, channelID, ids)
+	if err != nil {
+		h.log.Printf("chat: 计算频道 %d 未读计数失败: %v", channelID, err)
+		return
+	}
+	wire := make(map[string]store.Unread, len(counts))
+	for uid, u := range counts {
+		wire[formatUID(uid)] = u
+	}
+	h.BroadcastChannelUnread(strconv.FormatInt(channelID, 10), wire)
 }
 
 // isConversationChannel 是否私聊/群聊频道（#38）：无服务器、成员表定义权限。
@@ -339,6 +378,25 @@ func (h *Hub) BroadcastMessageDeleted(uids []string, channelID, messageID string
 		ChannelID: channelID,
 		MessageID: messageID,
 	})
+}
+
+// BroadcastChannelUnread 未读/提及计数广播（#40）：counts 按十进制 uid 携带
+// 各接收者自己的精确计数，逐用户走事件面（在线实时 + 断线续传环）。不能合并成
+// 一次群发——同一条消息对不同用户的已读水位不同，计数也不同。空 map 不广播。
+func (h *Hub) BroadcastChannelUnread(channelID string, counts map[string]store.Unread) {
+	if channelID == "" || len(counts) == 0 {
+		return
+	}
+	for uid, u := range counts {
+		if uid == "" {
+			continue
+		}
+		h.broadcastEvent(map[string]bool{uid: true}, TypeChannelUnread, ChannelUnreadData{
+			ChannelID:    channelID,
+			UnreadCount:  int64(u.UnreadCount),
+			MentionCount: int64(u.MentionCount),
+		})
+	}
 }
 
 // targetSet 广播目标去重（空 uid 丢弃）。

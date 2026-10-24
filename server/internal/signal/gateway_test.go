@@ -195,8 +195,8 @@ func TestChatMessageCarriesSeq(t *testing.T) {
 		}
 	}
 	b.send(TypeChatSend, ChatSendData{ChannelID: strconv.FormatInt(f.ch.ID, 10), Type: "text", Content: "hi2"})
-	if env := a.recvUntil(TypeChatMessage); env.Seq != 2 {
-		t.Fatalf("第二条 seq = %d, want 2", env.Seq)
+	if env := a.recvUntil(TypeChatMessage); env.Seq != seqOfChat(2) {
+		t.Fatalf("第二条 seq = %d, want %d", env.Seq, seqOfChat(2))
 	}
 }
 
@@ -231,11 +231,21 @@ func TestGatewayRingAccumulatesOffline(t *testing.T) {
 	if reason != "" {
 		t.Fatalf("离线会话 Replay = %q, want \"\"", reason)
 	}
-	if len(events) != 2 || events[0].Seq != 1 || events[1].Seq != 2 {
-		t.Fatalf("离线环 = %+v, want 2 条 seq 1,2", events)
+	// 每次发送产生两条事件：chat.message + 该用户自己的 channel.unread（#40）。
+	if len(events) != 4 {
+		t.Fatalf("离线环 = %+v, want 4 条（2 次 chat + 2 次 unread）", events)
+	}
+	var chats []Event
+	for _, ev := range events {
+		if ev.Type == TypeChatMessage {
+			chats = append(chats, ev)
+		}
+	}
+	if len(chats) != 2 || chats[0].Seq != seqOfChat(1) || chats[1].Seq != seqOfChat(2) {
+		t.Fatalf("离线环 chat = %+v, want seq %d,%d", chats, seqOfChat(1), seqOfChat(2))
 	}
 	var msg ChatMessageData
-	if err := json.Unmarshal(events[0].Payload, &msg); err != nil || msg.Content != "missed" {
+	if err := json.Unmarshal(chats[0].Payload, &msg); err != nil || msg.Content != "missed" {
 		t.Fatalf("环内载荷 = %+v (%v)", msg, err)
 	}
 
@@ -243,11 +253,11 @@ func TestGatewayRingAccumulatesOffline(t *testing.T) {
 	a2 := f.dial("1:desktop:sa", "alice-re")
 	b.send(TypeChatSend, ChatSendData{ChannelID: strconv.FormatInt(f.ch.ID, 10), Type: "text", Content: "after"})
 	// 收到广播即代表服务端已完成进环，再断言环内容（chat.send 是异步处理）。
-	if env := a2.recvUntil(TypeChatMessage); env.Seq != 3 {
-		t.Fatalf("重连后实时投递 seq = %d, want 3", env.Seq)
+	if env := a2.recvUntil(TypeChatMessage); env.Seq != seqOfChat(3) {
+		t.Fatalf("重连后实时投递 seq = %d, want %d", env.Seq, seqOfChat(3))
 	}
 	events, reason = f.hub.evlog.Replay("sa", 1)
-	if reason != "" || len(events) != 3 || events[2].Seq != 3 {
+	if reason != "" || len(events) != 6 || events[len(events)-1].Seq != seqOfChat(3)+1 {
 		t.Fatalf("重连后续接 = (%+v,%q)", events, reason)
 	}
 }
