@@ -3,6 +3,7 @@ import { computed, ref } from 'vue'
 import { eventsOn, goApp } from '../api/bridge'
 import type { ServerConfig, UserProfile } from '../api/types'
 import { useChatStore } from './chat'
+import { useConversationsStore } from './conversations'
 import { useFriendsStore, useServersStore } from './data'
 import { useNotifyStore } from './notify'
 import { useVoiceStore } from './voice'
@@ -17,6 +18,7 @@ function resetSessionStores() {
     () => useFriendsStore().resetAll(),
     () => useVoiceStore().resetAll(),
     () => useChatStore().resetAll(),
+    () => useConversationsStore().resetAll(),
   ]
   for (const reset of resets) {
     try {

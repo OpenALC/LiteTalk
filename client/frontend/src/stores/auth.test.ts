@@ -38,6 +38,7 @@ vi.mock('../router', () => ({ default: mockRouter }))
 import type { AuthResult, UserProfile } from '../api/types'
 import { kickedBannerText, useAuthStore } from './auth'
 import { useChatStore } from './chat'
+import { useConversationsStore } from './conversations'
 import { useFriendsStore, useServersStore } from './data'
 import { useNotifyStore } from './notify'
 import { useVoiceStore } from './voice'
@@ -241,6 +242,17 @@ describe('auth store 业务 store 复位（#85）', () => {
         content: 'hi', ts: '2026-01-01T00:00:00Z',
       }],
     }
+
+    const conversations = useConversationsStore()
+    conversations.list = [{
+      id: '500', kind: 'direct', name: '', created_at: '2026-01-01T00:00:00Z',
+      members: [{
+        user_id: '10', nickname: '好友甲', tag: '0001',
+        role: 'member', joined_at: '2026-01-01T00:00:00Z',
+      }],
+    }]
+    conversations.currentId = '500'
+    conversations.dmMode = true
   }
 
   function expectCleared() {
@@ -268,6 +280,11 @@ describe('auth store 业务 store 复位（#85）', () => {
     expect(voice.selfId()).toBe('')
 
     expect(useChatStore().messagesByChannel).toEqual({})
+
+    const conversations = useConversationsStore()
+    expect(conversations.list).toEqual([])
+    expect(conversations.currentId).toBe('')
+    expect(conversations.dmMode).toBe(false)
   }
 
   it('主动登出清空 servers/friends/voice/chat', async () => {

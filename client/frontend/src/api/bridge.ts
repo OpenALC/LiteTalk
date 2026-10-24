@@ -2,7 +2,7 @@
 // 浏览器独立开发（vite dev 无 Go 后端）时走 mock 桩，行为可联调 UI。
 // 原生环境判定：Go 在 webview 启动时注入 window._wails.flags（浏览器环境恒无）。
 import { Call, Events } from '@wailsio/runtime'
-import type { AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ConnConfigView, ConnTestResult, Conversation, FriendDTO, HotkeySettings, PeerView, ServerChannels, ServerConfig, ServerDTO, UserProfile, VoiceStateView } from './types'
+import type { AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ChatMessage, ConnConfigView, ConnTestResult, Conversation, FriendDTO, HotkeySettings, PeerView, ServerChannels, ServerConfig, ServerDTO, UserProfile, VoiceStateView } from './types'
 
 type GoApp = {
   GetVersion(): Promise<string>
@@ -54,6 +54,9 @@ type GoApp = {
   // RequestVoiceState 「请求静音」：请目标闭麦/静音（对方接受后生效，无强制）。
   RequestVoiceState(channelID: string, targetID: string, mute: boolean, deafen: boolean): Promise<void>
   SendChat(channelID: string, content: string): Promise<void>
+  // ListMessages 频道最近消息（旧→新，limit 上限 50）。私聊/群聊的会话 ID
+  // 即频道 ID；载荷与 chat:message 事件同口径，按 id 去重合并。
+  ListMessages(channelID: string, limit: number): Promise<ChatMessage[]>
   GetVoiceMembers(): Promise<PeerView[]>
   LogFromWeb(level: string, msg: string): Promise<void>
   // 服务器/频道/好友 REST CRUD（服务端已有端点；批次①接线）。
@@ -226,6 +229,8 @@ const mockApp: GoApp = {
   async SetDeafen() {},
   async SetPeerVolume() {},
   async SendChat() {},
+  // 消息历史桩：浏览器开发环境无可联调数据。
+  async ListMessages() { return [] },
   async GetVoiceMembers() { return [] },
   async GetVoiceState() { return { channel_id: '', muted: false, deafened: false } },
   async RequestVoiceState() {},
