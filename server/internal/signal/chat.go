@@ -31,6 +31,9 @@ type ChatStore interface {
 	// UnreadCountsForUsers 单频道多用户未读/提及计数（#40）：chat.message 广播后
 	// 给每个收件人推自己的 channel.unread。store.Store 满足。
 	UnreadCountsForUsers(ctx context.Context, channelID int64, userIDs []int64) (map[int64]store.Unread, error)
+	// AttachmentsByMessageIDs 批量读消息附件（#41）：chat.message 载荷与 nonce
+	// 幂等回显都从库回填，不信任重放请求。store.Store 满足。
+	AttachmentsByMessageIDs(ctx context.Context, messageIDs []int64) (map[int64][]store.Attachment, error)
 }
 
 // RateLimiter 发送频控接口（auth.RateLimit 满足；nil 时不限流）。
@@ -40,10 +43,11 @@ type RateLimiter interface {
 
 // 聊天发送限制：2000 字、20 条/分（key 与 REST messages 共用 msg: 前缀，用户级统一配额）。
 const (
-	chatMaxRunes   = 2000
-	chatMaxNonce   = 64
-	chatRateLimit  = 20
-	chatRateWindow = time.Minute
+	chatMaxRunes       = 2000
+	chatMaxNonce       = 64
+	chatMaxAttachments = 10
+	chatRateLimit      = 20
+	chatRateWindow     = time.Minute
 )
 
 // handleChatSend 文字消息发送：内容/类型/长度校验 → 权限 → 幂等 → 频控 → 落库 → 广播。
@@ -69,8 +73,14 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 		h.sendError(c, ErrCodeBadMessage, "chat.send 仅支持 type=text")
 		return
 	}
-	if n := len([]rune(d.Content)); n == 0 || n > chatMaxRunes {
-		h.sendError(c, ErrCodeBadMessage, "消息长度需为 1–2000 字符")
+	// 附件（#41）：格式校验先于内容长度——纯附件消息允许空 content。
+	attachmentIDs, attachCode, attachMsg := resolveChatAttachmentIDs(d.AttachmentIDS)
+	if attachCode != "" {
+		h.sendError(c, attachCode, attachMsg)
+		return
+	}
+	if n := len([]rune(d.Content)); n > chatMaxRunes || (n == 0 && len(attachmentIDs) == 0) {
+		h.sendError(c, ErrCodeBadMessage, "消息长度需为 0–2000 字符（无附件时至少 1 字符）")
 		return
 	}
 	if len(d.Nonce) > chatMaxNonce {
@@ -161,6 +171,10 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 			h.sendError(c, ErrCodeBadMessage, "内置房间不支持回复或提及")
 			return
 		}
+		if len(attachmentIDs) > 0 {
+			h.sendError(c, ErrCodeBadAttachment, "内置房间不支持附件")
+			return
+		}
 	} else {
 		var code, msg string
 		replyTo, replyPreview, code, msg = h.resolveChatReply(ctx, chID, d.ReplyTo)
@@ -218,9 +232,14 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 	if persist {
 		msg := &store.Message{
 			ChannelID: chID, UserID: uid, Content: d.Content, Nonce: d.Nonce,
-			ReplyTo: replyTo, Mentions: mentionIDs,
+			ReplyTo: replyTo, Mentions: mentionIDs, AttachmentIDs: attachmentIDs,
 		}
 		if err := h.chatStore.CreateMessage(ctx, msg); err != nil {
+			// 附件认领失败（不存在/非本人/已被引用）：整条消息回滚。
+			if errors.Is(err, store.ErrAttachmentUnavailable) {
+				h.sendError(c, ErrCodeBadAttachment, "附件不存在、非本人上传或已被引用")
+				return
+			}
 			// 并发同 nonce：前一条已落库，回读原消息定向回显，不再广播。
 			if d.Nonce != "" && errors.Is(err, store.ErrConflict) {
 				if orig, rerr := h.chatStore.MessageByNonce(ctx, chID, uid, d.Nonce); rerr == nil {
@@ -239,6 +258,8 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 		}
 		out.ID = strconv.FormatInt(msg.ID, 10)
 		out.TS = msg.CreatedAt.UnixMilli()
+		// 附件视图是增强信息：读取失败只记日志，消息照常广播。
+		out.Attachments = h.attachmentInfos(ctx, msg.ID)
 	} else {
 		// dev 房间（无 store 频道）：仅广播，id 用时间戳占位。
 		out.ID = strconv.FormatInt(out.TS, 10)
@@ -479,6 +500,81 @@ func (h *Hub) resolveChatMentions(ctx context.Context, chID, serverID int64, con
 	return out, "", ""
 }
 
+// resolveChatAttachmentIDs 校验 chat.send 的 attachment_ids（#41）：最多 10 个、
+// 正整数、不可重复。格式问题在此拦下（bad_attachment）；附件是否存在、是否本人
+// 上传、是否已被引用由 CreateMessage 认领时判定（同样映射 bad_attachment）。
+func resolveChatAttachmentIDs(raw []string) ([]int64, string, string) {
+	if len(raw) == 0 {
+		return nil, "", ""
+	}
+	if len(raw) > chatMaxAttachments {
+		return nil, ErrCodeBadAttachment, "单条消息最多 10 个附件"
+	}
+	seen := make(map[int64]struct{}, len(raw))
+	out := make([]int64, 0, len(raw))
+	for _, s := range raw {
+		id, err := strconv.ParseInt(s, 10, 64)
+		if err != nil || id <= 0 {
+			return nil, ErrCodeBadAttachment, "附件 ID 不合法"
+		}
+		if _, dup := seen[id]; dup {
+			return nil, ErrCodeBadAttachment, "附件 ID 不可重复"
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out, "", ""
+}
+
+// attachmentInfos 读取单条消息的附件并转 wire 结构（#41）。失败只记日志返回 nil：
+// 附件是增强信息，不能因为一次读失败把已落库的消息拖成发送失败。
+func (h *Hub) attachmentInfos(ctx context.Context, messageID int64) []AttachmentInfo {
+	if h.chatStore == nil {
+		return nil
+	}
+	byMessage, err := h.chatStore.AttachmentsByMessageIDs(ctx, []int64{messageID})
+	if err != nil {
+		h.log.Printf("chat: 读取消息 %d 的附件失败: %v", messageID, err)
+		return nil
+	}
+	list := byMessage[messageID]
+	if len(list) == 0 {
+		return nil
+	}
+	out := make([]AttachmentInfo, 0, len(list))
+	for i := range list {
+		out = append(out, attachmentInfoFromStore(&list[i]))
+	}
+	return out
+}
+
+// attachmentInfoFromStore 库内附件 → wire 结构，字段与 REST Attachment 同口径。
+func attachmentInfoFromStore(a *store.Attachment) AttachmentInfo {
+	info := AttachmentInfo{
+		ID:          strconv.FormatInt(a.ID, 10),
+		Filename:    a.Filename,
+		Size:        a.Size,
+		ContentType: a.ContentType,
+		Width:       int64(a.Width),
+		Height:      int64(a.Height),
+		URL:         attachmentURL(a.ID, a.AccessKey),
+	}
+	if a.ThumbKey != "" {
+		info.ThumbnailURL = attachmentThumbnailURL(a.ID, a.AccessKey)
+	}
+	return info
+}
+
+// attachmentURL / attachmentThumbnailURL 与 api 包同名函数同口径（两包互不依赖，
+// 手工同步：#41 能力 URL 路径 + key 查询参数）。
+func attachmentURL(id int64, accessKey string) string {
+	return "/api/v1/attachments/" + strconv.FormatInt(id, 10) + "?key=" + accessKey
+}
+
+func attachmentThumbnailURL(id int64, accessKey string) string {
+	return "/api/v1/attachments/" + strconv.FormatInt(id, 10) + "/thumbnail?key=" + accessKey
+}
+
 // replyPreviewFromStore 回复预览（#39）：软删目标只给跳转信息，正文清空。
 func replyPreviewFromStore(m *store.Message) *ReplyPreview {
 	content := m.Content
@@ -533,5 +629,9 @@ func (h *Hub) chatMessageFromStore(ctx context.Context, m *store.Message, c *cli
 		return out, err
 	}
 	out.Mentions = formatMentionIDs(mentions[m.ID])
+	// 附件同样从库回填；软删消息不暴露附件（与 REST 视图同口径）。
+	if m.DeletedAt == nil {
+		out.Attachments = h.attachmentInfos(ctx, m.ID)
+	}
 	return out, nil
 }
