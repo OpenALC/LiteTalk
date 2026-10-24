@@ -54,6 +54,42 @@ func (e ChannelOverwriteTargetType) Valid() bool {
 	}
 }
 
+// Defines values for ConversationKind.
+const (
+	ConversationKindDirect ConversationKind = "direct"
+	ConversationKindGroup  ConversationKind = "group"
+)
+
+// Valid indicates whether the value is a known member of the ConversationKind enum.
+func (e ConversationKind) Valid() bool {
+	switch e {
+	case ConversationKindDirect:
+		return true
+	case ConversationKindGroup:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ConversationMemberRole.
+const (
+	ConversationMemberRoleMember ConversationMemberRole = "member"
+	ConversationMemberRoleOwner  ConversationMemberRole = "owner"
+)
+
+// Valid indicates whether the value is a known member of the ConversationMemberRole enum.
+func (e ConversationMemberRole) Valid() bool {
+	switch e {
+	case ConversationMemberRoleMember:
+		return true
+	case ConversationMemberRoleOwner:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for CreateChannelRequestType.
 const (
 	CreateChannelRequestTypeText  CreateChannelRequestType = "text"
@@ -66,6 +102,24 @@ func (e CreateChannelRequestType) Valid() bool {
 	case CreateChannelRequestTypeText:
 		return true
 	case CreateChannelRequestTypeVoice:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for CreateConversationRequestKind.
+const (
+	CreateConversationRequestKindDirect CreateConversationRequestKind = "direct"
+	CreateConversationRequestKindGroup  CreateConversationRequestKind = "group"
+)
+
+// Valid indicates whether the value is a known member of the CreateConversationRequestKind enum.
+func (e CreateConversationRequestKind) Valid() bool {
+	switch e {
+	case CreateConversationRequestKindDirect:
+		return true
+	case CreateConversationRequestKindGroup:
 		return true
 	default:
 		return false
@@ -234,6 +288,12 @@ func (e SetChannelOverwriteParamsTargetType) Valid() bool {
 	}
 }
 
+// AddConversationMembersRequest defines model for AddConversationMembersRequest.
+type AddConversationMembersRequest struct {
+	// UserIds 要添加的用户 ID（至少 1 个；添加后总人数不得超过 50）
+	UserIds []ID `json:"user_ids"`
+}
+
 // AddFriendRequest nickname 可写成「昵称#tag」整体；分开传则 tag 为 4 位。
 type AddFriendRequest struct {
 	Nickname string  `json:"nickname"`
@@ -307,6 +367,32 @@ type ChannelOverwrite struct {
 // ChannelOverwriteTargetType defines model for ChannelOverwrite.TargetType.
 type ChannelOverwriteTargetType string
 
+// Conversation 私聊/群私聊会话（#38 B2，无服务器频道）。kind=direct 时 name 无意义， 可能为空串；成员只含昵称/tag，不含 email。ID 为十进制字符串。
+type Conversation struct {
+	CreatedAt Time                 `json:"created_at"`
+	Id        ID                   `json:"id"`
+	Kind      ConversationKind     `json:"kind"`
+	Members   []ConversationMember `json:"members"`
+
+	// Name 群聊名；direct 忽略（可能为空串）
+	Name string `json:"name"`
+}
+
+// ConversationKind defines model for Conversation.Kind.
+type ConversationKind string
+
+// ConversationMember 会话成员（内联昵称/tag，不含 email）。owner 只用于 group，direct 双方都是 member。
+type ConversationMember struct {
+	JoinedAt Time                   `json:"joined_at"`
+	Nickname string                 `json:"nickname"`
+	Role     ConversationMemberRole `json:"role"`
+	Tag      string                 `json:"tag"`
+	UserId   ID                     `json:"user_id"`
+}
+
+// ConversationMemberRole defines model for ConversationMember.Role.
+type ConversationMemberRole string
+
 // CreateCategoryRequest defines model for CreateCategoryRequest.
 type CreateCategoryRequest struct {
 	// Name 1–32 字符
@@ -335,6 +421,20 @@ type CreateChannelRequest struct {
 
 // CreateChannelRequestType defines model for CreateChannelRequest.Type.
 type CreateChannelRequestType string
+
+// CreateConversationRequest defines model for CreateConversationRequest.
+type CreateConversationRequest struct {
+	Kind CreateConversationRequestKind `json:"kind"`
+
+	// Name 群聊名称（可选；给出时 1–64 字符，direct 忽略）
+	Name *string `json:"name,omitempty"`
+
+	// UserIds 被邀请用户 ID（不含创建者）。direct 恰好 1 个；group 2–49 个 （总人数含创建者 3–50）。不得重复、不得为 0。
+	UserIds []ID `json:"user_ids"`
+}
+
+// CreateConversationRequestKind defines model for CreateConversationRequest.Kind.
+type CreateConversationRequestKind string
 
 // CreateInviteRequest 请求体仍需为 JSON 对象；两字段缺省按 0 处理。
 type CreateInviteRequest struct {
@@ -516,6 +616,9 @@ type PatchCategoryRequest = PatchCategoryBody
 
 // PatchChannelRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name/type 不可清，空值被校验拒 400；category_id 的 null = 移出分类；position 的 null 拒 400——「删除位置」无语义），值 = 设置。#37：password 三态 （缺省不改、null/空串清除、非空设置）；user_limit 的 null 拒 400； parent_id 的 null/0 = 提升顶层、值 = 设置父级。
 type PatchChannelRequest = PatchChannelBody
+
+// PatchConversationRequest JSON Merge Patch（RFC 7396）：缺省 = 不改；name 为 1–64 字符， null/空串被校验拒 400。仅 group owner 可写。
+type PatchConversationRequest = PatchConversationBody
 
 // PatchFriendRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null/空串 = 清除备注/ 移出分组，值 = 设置。仅发起方向可写。
 type PatchFriendRequest = PatchFriendBody
@@ -877,6 +980,18 @@ type CreateMessageJSONRequestBody = CreateMessageRequest
 // SetChannelOverwriteJSONRequestBody defines body for SetChannelOverwrite for application/json ContentType.
 type SetChannelOverwriteJSONRequestBody = SetOverwriteRequest
 
+// CreateConversationJSONRequestBody defines body for CreateConversation for application/json ContentType.
+type CreateConversationJSONRequestBody = CreateConversationRequest
+
+// PatchConversationJSONRequestBody defines body for PatchConversation for application/json ContentType.
+type PatchConversationJSONRequestBody = PatchConversationRequest
+
+// PatchConversationApplicationMergePatchPlusJSONRequestBody defines body for PatchConversation for application/merge-patch+json ContentType.
+type PatchConversationApplicationMergePatchPlusJSONRequestBody = PatchConversationRequest
+
+// AddConversationMembersJSONRequestBody defines body for AddConversationMembers for application/json ContentType.
+type AddConversationMembersJSONRequestBody = AddConversationMembersRequest
+
 // CreateFriendRequestJSONRequestBody defines body for CreateFriendRequest for application/json ContentType.
 type CreateFriendRequestJSONRequestBody = AddFriendRequest
 
@@ -978,6 +1093,27 @@ type ServerInterface interface {
 	// GetConfig 服务端能力开关
 	// (GET /api/v1/config)
 	GetConfig(w http.ResponseWriter, r *http.Request)
+	// ListConversations 我的私聊/群私聊列表
+	// (GET /api/v1/conversations)
+	ListConversations(w http.ResponseWriter, r *http.Request)
+	// CreateConversation 创建私聊/群私聊
+	// (POST /api/v1/conversations)
+	CreateConversation(w http.ResponseWriter, r *http.Request)
+	// DeleteConversation 删除会话（direct 任一方；group 仅 owner）
+	// (DELETE /api/v1/conversations/{id})
+	DeleteConversation(w http.ResponseWriter, r *http.Request, id IDPath)
+	// GetConversation 会话详情（仅参与者）
+	// (GET /api/v1/conversations/{id})
+	GetConversation(w http.ResponseWriter, r *http.Request, id IDPath)
+	// PatchConversation 群聊改名（仅 owner）
+	// (PATCH /api/v1/conversations/{id})
+	PatchConversation(w http.ResponseWriter, r *http.Request, id IDPath)
+	// AddConversationMembers 群聊加人（仅 owner）
+	// (POST /api/v1/conversations/{id}/members)
+	AddConversationMembers(w http.ResponseWriter, r *http.Request, id IDPath)
+	// RemoveConversationMember 移除/退出群聊成员
+	// (DELETE /api/v1/conversations/{id}/members/{user_id})
+	RemoveConversationMember(w http.ResponseWriter, r *http.Request, id IDPath, userId UserIDPath)
 	// ListFriends 好友与好友请求列表
 	// (GET /api/v1/friends)
 	ListFriends(w http.ResponseWriter, r *http.Request)
@@ -1546,6 +1682,173 @@ func (siw *ServerInterfaceWrapper) GetConfig(w http.ResponseWriter, r *http.Requ
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.GetConfig(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListConversations operation middleware
+func (siw *ServerInterfaceWrapper) ListConversations(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListConversations(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// CreateConversation operation middleware
+func (siw *ServerInterfaceWrapper) CreateConversation(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.CreateConversation(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// DeleteConversation operation middleware
+func (siw *ServerInterfaceWrapper) DeleteConversation(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.DeleteConversation(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetConversation operation middleware
+func (siw *ServerInterfaceWrapper) GetConversation(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetConversation(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// PatchConversation operation middleware
+func (siw *ServerInterfaceWrapper) PatchConversation(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.PatchConversation(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// AddConversationMembers operation middleware
+func (siw *ServerInterfaceWrapper) AddConversationMembers(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.AddConversationMembers(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// RemoveConversationMember operation middleware
+func (siw *ServerInterfaceWrapper) RemoveConversationMember(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "user_id" -------------
+	var userId UserIDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "user_id", r.PathValue("user_id"), &userId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "user_id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.RemoveConversationMember(w, r, id, userId)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -2333,6 +2636,13 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/friends/requests", wrapper.CreateFriendRequest)
 	m.HandleFunc(http.MethodDelete+" "+options.BaseURL+"/api/v1/friends/{id}", wrapper.DeleteFriend)
 	m.HandleFunc(http.MethodPatch+" "+options.BaseURL+"/api/v1/friends/{id}", wrapper.PatchFriend)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/conversations", wrapper.ListConversations)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/conversations", wrapper.CreateConversation)
+	m.HandleFunc(http.MethodDelete+" "+options.BaseURL+"/api/v1/conversations/{id}", wrapper.DeleteConversation)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/conversations/{id}", wrapper.GetConversation)
+	m.HandleFunc(http.MethodPatch+" "+options.BaseURL+"/api/v1/conversations/{id}", wrapper.PatchConversation)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/conversations/{id}/members", wrapper.AddConversationMembers)
+	m.HandleFunc(http.MethodDelete+" "+options.BaseURL+"/api/v1/conversations/{id}/members/{user_id}", wrapper.RemoveConversationMember)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/sync", wrapper.GetSync)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/servers", wrapper.ListServers)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/servers", wrapper.CreateServer)
@@ -4199,6 +4509,730 @@ func (response GetConfig200JSONResponse) VisitGetConfigResponse(w http.ResponseW
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListConversationsRequestObject struct {
+}
+
+type ListConversationsResponseObject interface {
+	VisitListConversationsResponse(w http.ResponseWriter) error
+}
+
+type ListConversations200JSONResponse []Conversation
+
+func (response ListConversations200JSONResponse) VisitListConversationsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListConversations401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response ListConversations401ApplicationProblemPlusJSONResponse) VisitListConversationsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListConversationsdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response ListConversationsdefaultApplicationProblemPlusJSONResponse) VisitListConversationsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateConversationRequestObject struct {
+	Body *CreateConversationJSONRequestBody
+}
+
+type CreateConversationResponseObject interface {
+	VisitCreateConversationResponse(w http.ResponseWriter) error
+}
+
+type CreateConversation200JSONResponse Conversation
+
+func (response CreateConversation200JSONResponse) VisitCreateConversationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateConversation201JSONResponse Conversation
+
+func (response CreateConversation201JSONResponse) VisitCreateConversationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(201)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateConversation400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response CreateConversation400ApplicationProblemPlusJSONResponse) VisitCreateConversationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateConversation401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response CreateConversation401ApplicationProblemPlusJSONResponse) VisitCreateConversationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateConversation403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response CreateConversation403ApplicationProblemPlusJSONResponse) VisitCreateConversationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateConversation429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response CreateConversation429ApplicationProblemPlusJSONResponse) VisitCreateConversationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateConversationdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response CreateConversationdefaultApplicationProblemPlusJSONResponse) VisitCreateConversationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteConversationRequestObject struct {
+	Id IDPath `json:"id"`
+}
+
+type DeleteConversationResponseObject interface {
+	VisitDeleteConversationResponse(w http.ResponseWriter) error
+}
+
+type DeleteConversation204Response struct {
+}
+
+func (response DeleteConversation204Response) VisitDeleteConversationResponse(w http.ResponseWriter) error {
+	w.WriteHeader(204)
+	return nil
+}
+
+type DeleteConversation400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteConversation400ApplicationProblemPlusJSONResponse) VisitDeleteConversationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteConversation401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteConversation401ApplicationProblemPlusJSONResponse) VisitDeleteConversationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteConversation403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteConversation403ApplicationProblemPlusJSONResponse) VisitDeleteConversationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteConversation404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteConversation404ApplicationProblemPlusJSONResponse) VisitDeleteConversationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteConversationdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response DeleteConversationdefaultApplicationProblemPlusJSONResponse) VisitDeleteConversationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetConversationRequestObject struct {
+	Id IDPath `json:"id"`
+}
+
+type GetConversationResponseObject interface {
+	VisitGetConversationResponse(w http.ResponseWriter) error
+}
+
+type GetConversation200JSONResponse Conversation
+
+func (response GetConversation200JSONResponse) VisitGetConversationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetConversation400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response GetConversation400ApplicationProblemPlusJSONResponse) VisitGetConversationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetConversation401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response GetConversation401ApplicationProblemPlusJSONResponse) VisitGetConversationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetConversation404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response GetConversation404ApplicationProblemPlusJSONResponse) VisitGetConversationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetConversationdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response GetConversationdefaultApplicationProblemPlusJSONResponse) VisitGetConversationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchConversationRequestObject struct {
+	Id                                IDPath `json:"id"`
+	JSONBody                          *PatchConversationJSONRequestBody
+	ApplicationMergePatchPlusJSONBody *PatchConversationApplicationMergePatchPlusJSONRequestBody
+}
+
+type PatchConversationResponseObject interface {
+	VisitPatchConversationResponse(w http.ResponseWriter) error
+}
+
+type PatchConversation200JSONResponse Conversation
+
+func (response PatchConversation200JSONResponse) VisitPatchConversationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchConversation400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response PatchConversation400ApplicationProblemPlusJSONResponse) VisitPatchConversationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchConversation401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response PatchConversation401ApplicationProblemPlusJSONResponse) VisitPatchConversationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchConversation403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response PatchConversation403ApplicationProblemPlusJSONResponse) VisitPatchConversationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchConversation404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response PatchConversation404ApplicationProblemPlusJSONResponse) VisitPatchConversationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchConversation429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response PatchConversation429ApplicationProblemPlusJSONResponse) VisitPatchConversationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchConversationdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response PatchConversationdefaultApplicationProblemPlusJSONResponse) VisitPatchConversationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type AddConversationMembersRequestObject struct {
+	Id   IDPath `json:"id"`
+	Body *AddConversationMembersJSONRequestBody
+}
+
+type AddConversationMembersResponseObject interface {
+	VisitAddConversationMembersResponse(w http.ResponseWriter) error
+}
+
+type AddConversationMembers200JSONResponse Conversation
+
+func (response AddConversationMembers200JSONResponse) VisitAddConversationMembersResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type AddConversationMembers400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response AddConversationMembers400ApplicationProblemPlusJSONResponse) VisitAddConversationMembersResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type AddConversationMembers401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response AddConversationMembers401ApplicationProblemPlusJSONResponse) VisitAddConversationMembersResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type AddConversationMembers403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response AddConversationMembers403ApplicationProblemPlusJSONResponse) VisitAddConversationMembersResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type AddConversationMembers404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response AddConversationMembers404ApplicationProblemPlusJSONResponse) VisitAddConversationMembersResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type AddConversationMembers409ApplicationProblemPlusJSONResponse struct {
+	ConflictApplicationProblemPlusJSONResponse
+}
+
+func (response AddConversationMembers409ApplicationProblemPlusJSONResponse) VisitAddConversationMembersResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(409)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type AddConversationMembers429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response AddConversationMembers429ApplicationProblemPlusJSONResponse) VisitAddConversationMembersResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type AddConversationMembersdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response AddConversationMembersdefaultApplicationProblemPlusJSONResponse) VisitAddConversationMembersResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RemoveConversationMemberRequestObject struct {
+	Id     IDPath     `json:"id"`
+	UserId UserIDPath `json:"user_id"`
+}
+
+type RemoveConversationMemberResponseObject interface {
+	VisitRemoveConversationMemberResponse(w http.ResponseWriter) error
+}
+
+type RemoveConversationMember200JSONResponse Conversation
+
+func (response RemoveConversationMember200JSONResponse) VisitRemoveConversationMemberResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RemoveConversationMember204Response struct {
+}
+
+func (response RemoveConversationMember204Response) VisitRemoveConversationMemberResponse(w http.ResponseWriter) error {
+	w.WriteHeader(204)
+	return nil
+}
+
+type RemoveConversationMember400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response RemoveConversationMember400ApplicationProblemPlusJSONResponse) VisitRemoveConversationMemberResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RemoveConversationMember401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response RemoveConversationMember401ApplicationProblemPlusJSONResponse) VisitRemoveConversationMemberResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RemoveConversationMember403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response RemoveConversationMember403ApplicationProblemPlusJSONResponse) VisitRemoveConversationMemberResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RemoveConversationMember404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response RemoveConversationMember404ApplicationProblemPlusJSONResponse) VisitRemoveConversationMemberResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RemoveConversationMemberdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response RemoveConversationMemberdefaultApplicationProblemPlusJSONResponse) VisitRemoveConversationMemberResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
 	_, err := buf.WriteTo(w)
 	return err
 }
@@ -6592,6 +7626,27 @@ type StrictServerInterface interface {
 	// GetConfig 服务端能力开关
 	// (GET /api/v1/config)
 	GetConfig(ctx context.Context, request GetConfigRequestObject) (GetConfigResponseObject, error)
+	// ListConversations 我的私聊/群私聊列表
+	// (GET /api/v1/conversations)
+	ListConversations(ctx context.Context, request ListConversationsRequestObject) (ListConversationsResponseObject, error)
+	// CreateConversation 创建私聊/群私聊
+	// (POST /api/v1/conversations)
+	CreateConversation(ctx context.Context, request CreateConversationRequestObject) (CreateConversationResponseObject, error)
+	// DeleteConversation 删除会话（direct 任一方；group 仅 owner）
+	// (DELETE /api/v1/conversations/{id})
+	DeleteConversation(ctx context.Context, request DeleteConversationRequestObject) (DeleteConversationResponseObject, error)
+	// GetConversation 会话详情（仅参与者）
+	// (GET /api/v1/conversations/{id})
+	GetConversation(ctx context.Context, request GetConversationRequestObject) (GetConversationResponseObject, error)
+	// PatchConversation 群聊改名（仅 owner）
+	// (PATCH /api/v1/conversations/{id})
+	PatchConversation(ctx context.Context, request PatchConversationRequestObject) (PatchConversationResponseObject, error)
+	// AddConversationMembers 群聊加人（仅 owner）
+	// (POST /api/v1/conversations/{id}/members)
+	AddConversationMembers(ctx context.Context, request AddConversationMembersRequestObject) (AddConversationMembersResponseObject, error)
+	// RemoveConversationMember 移除/退出群聊成员
+	// (DELETE /api/v1/conversations/{id}/members/{user_id})
+	RemoveConversationMember(ctx context.Context, request RemoveConversationMemberRequestObject) (RemoveConversationMemberResponseObject, error)
 	// ListFriends 好友与好友请求列表
 	// (GET /api/v1/friends)
 	ListFriends(ctx context.Context, request ListFriendsRequestObject) (ListFriendsResponseObject, error)
@@ -7276,6 +8331,219 @@ func (sh *strictHandler) GetConfig(w http.ResponseWriter, r *http.Request) {
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
 	} else if validResponse, ok := response.(GetConfigResponseObject); ok {
 		if err := validResponse.VisitGetConfigResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// ListConversations operation middleware
+func (sh *strictHandler) ListConversations(w http.ResponseWriter, r *http.Request) {
+	var request ListConversationsRequestObject
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ListConversations(ctx, request.(ListConversationsRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ListConversations")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ListConversationsResponseObject); ok {
+		if err := validResponse.VisitListConversationsResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// CreateConversation operation middleware
+func (sh *strictHandler) CreateConversation(w http.ResponseWriter, r *http.Request) {
+	var request CreateConversationRequestObject
+
+	var body CreateConversationJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.CreateConversation(ctx, request.(CreateConversationRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "CreateConversation")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(CreateConversationResponseObject); ok {
+		if err := validResponse.VisitCreateConversationResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// DeleteConversation operation middleware
+func (sh *strictHandler) DeleteConversation(w http.ResponseWriter, r *http.Request, id IDPath) {
+	var request DeleteConversationRequestObject
+
+	request.Id = id
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.DeleteConversation(ctx, request.(DeleteConversationRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "DeleteConversation")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(DeleteConversationResponseObject); ok {
+		if err := validResponse.VisitDeleteConversationResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// GetConversation operation middleware
+func (sh *strictHandler) GetConversation(w http.ResponseWriter, r *http.Request, id IDPath) {
+	var request GetConversationRequestObject
+
+	request.Id = id
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.GetConversation(ctx, request.(GetConversationRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "GetConversation")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(GetConversationResponseObject); ok {
+		if err := validResponse.VisitGetConversationResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// PatchConversation operation middleware
+func (sh *strictHandler) PatchConversation(w http.ResponseWriter, r *http.Request, id IDPath) {
+	var request PatchConversationRequestObject
+
+	request.Id = id
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+
+		var body PatchConversationJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.JSONBody = &body
+
+	}
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/merge-patch+json") {
+
+		var body PatchConversationApplicationMergePatchPlusJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.ApplicationMergePatchPlusJSONBody = &body
+
+	}
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.PatchConversation(ctx, request.(PatchConversationRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "PatchConversation")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(PatchConversationResponseObject); ok {
+		if err := validResponse.VisitPatchConversationResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// AddConversationMembers operation middleware
+func (sh *strictHandler) AddConversationMembers(w http.ResponseWriter, r *http.Request, id IDPath) {
+	var request AddConversationMembersRequestObject
+
+	request.Id = id
+
+	var body AddConversationMembersJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.AddConversationMembers(ctx, request.(AddConversationMembersRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "AddConversationMembers")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(AddConversationMembersResponseObject); ok {
+		if err := validResponse.VisitAddConversationMembersResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// RemoveConversationMember operation middleware
+func (sh *strictHandler) RemoveConversationMember(w http.ResponseWriter, r *http.Request, id IDPath, userId UserIDPath) {
+	var request RemoveConversationMemberRequestObject
+
+	request.Id = id
+	request.UserId = userId
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.RemoveConversationMember(ctx, request.(RemoveConversationMemberRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "RemoveConversationMember")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(RemoveConversationMemberResponseObject); ok {
+		if err := validResponse.VisitRemoveConversationMemberResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {

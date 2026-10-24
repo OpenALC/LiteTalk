@@ -32,6 +32,10 @@ func (s *Server) SetServerMuted(ctx context.Context, request SetServerMutedReque
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
+	// 会话频道没有服务器管理语境，不能走闭麦端点（#38 B2）。
+	if e := serverChannelOnly(ch); e != nil {
+		return nil, e
+	}
 	if e := s.requirePerm(ctx, ch.ServerID, c.UserID, store.MuteMembers); e != nil {
 		return nil, e
 	}

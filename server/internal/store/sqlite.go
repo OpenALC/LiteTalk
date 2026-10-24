@@ -791,6 +791,57 @@ func (s *SQLite) ChannelMember(ctx context.Context, channelID, userID int64) (*C
 		sqChannelMemberJoin+` WHERE cm.channel_id = ? AND cm.user_id = ?`, channelID, userID))
 }
 
+// ChannelMembersOfChannels 批量成员（#38 B2）：一条 IN 查询，组内排序与
+// ChannelMembers 一致；空入参直接返回空 map，不发 SQL。
+func (s *SQLite) ChannelMembersOfChannels(ctx context.Context, channelIDs []int64) (map[int64][]ChannelMember, error) {
+	out := map[int64][]ChannelMember{}
+	if len(channelIDs) == 0 {
+		return out, nil
+	}
+	args := make([]any, len(channelIDs))
+	for i, id := range channelIDs {
+		args[i] = id
+	}
+	rows, err := s.db.QueryContext(ctx,
+		sqChannelMemberJoin+` WHERE cm.channel_id IN (`+placeholders(len(args))+`)
+		 ORDER BY cm.channel_id, cm.joined_at, cm.user_id`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		cm, err := scanChannelMemberLite(rows)
+		if err != nil {
+			return nil, err
+		}
+		out[cm.ChannelID] = append(out[cm.ChannelID], *cm)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLite) SetChannelMemberRole(ctx context.Context, channelID, userID int64, role ChannelMemberRole) error {
+	role, err := normalizeChannelMemberRole(role)
+	if err != nil {
+		return err
+	}
+	var scope ChannelScope
+	if err := s.db.QueryRowContext(ctx, `SELECT scope FROM channels WHERE id = ?`, channelID).Scan(&scope); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if scope != ChannelScopeGroup {
+		return ErrForbidden
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE channel_members SET role = ? WHERE channel_id = ? AND user_id = ?`, role, channelID, userID)
+	if err != nil {
+		return err
+	}
+	return checkAffected(res)
+}
+
 func (s *SQLite) AddChannelMember(ctx context.Context, channelID, userID int64, role ChannelMemberRole) error {
 	role, err := normalizeChannelMemberRole(role)
 	if err != nil {

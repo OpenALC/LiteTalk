@@ -40,6 +40,9 @@ func (s *Server) ListChannelOverwrites(ctx context.Context, request ListChannelO
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
+	if e := serverChannelOnly(ch); e != nil {
+		return nil, e
+	}
 	if e := s.requireManageInOwnerServer(ctx, ch.ServerID, c.UserID, store.ManageChannels); e != nil {
 		return nil, e
 	}
@@ -66,6 +69,9 @@ func (s *Server) SetChannelOverwrite(ctx context.Context, request SetChannelOver
 	ch, err := s.store.ChannelByID(ctx, request.Id)
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
+	}
+	if e := serverChannelOnly(ch); e != nil {
+		return nil, e
 	}
 	if e := s.requireManageInOwnerServer(ctx, ch.ServerID, c.UserID, store.ManageChannels); e != nil {
 		return nil, e
@@ -121,6 +127,9 @@ func (s *Server) DeleteChannelOverwrite(ctx context.Context, request DeleteChann
 	ch, err := s.store.ChannelByID(ctx, request.Id)
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
+	}
+	if e := serverChannelOnly(ch); e != nil {
+		return nil, e
 	}
 	if e := s.requireManageInOwnerServer(ctx, ch.ServerID, c.UserID, store.ManageChannels); e != nil {
 		return nil, e

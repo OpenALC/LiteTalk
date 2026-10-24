@@ -614,19 +614,46 @@ func (m *Mem) ChannelMembers(_ context.Context, channelID int64) ([]ChannelMembe
 	defer m.mu.Unlock()
 	out := []ChannelMember{}
 	for _, cm := range m.channelMembers[channelID] {
-		cp := *cm
-		if u, ok := m.users[cm.UserID]; ok {
-			cp.Nickname, cp.Tag = u.Nickname, u.Tag
-		}
-		out = append(out, cp)
+		out = append(out, m.channelMemberCopyLocked(cm))
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if !out[i].JoinedAt.Equal(out[j].JoinedAt) {
-			return out[i].JoinedAt.Before(out[j].JoinedAt)
-		}
-		return out[i].UserID < out[j].UserID
-	})
+	sortChannelMembers(out)
 	return out, nil
+}
+
+// ChannelMembersOfChannels 批量成员（#38 B2）：按 channel_id 分组，组内排序与
+// ChannelMembers 一致；没有任何成员的频道不出现在结果里。
+func (m *Mem) ChannelMembersOfChannels(_ context.Context, channelIDs []int64) (map[int64][]ChannelMember, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[int64][]ChannelMember, len(channelIDs))
+	for _, id := range channelIDs {
+		for _, cm := range m.channelMembers[id] {
+			out[id] = append(out[id], m.channelMemberCopyLocked(cm))
+		}
+	}
+	for id := range out {
+		sortChannelMembers(out[id])
+	}
+	return out, nil
+}
+
+// channelMemberCopyLocked 复制成员行并内联用户昵称/tag（调用方持 m.mu）。
+func (m *Mem) channelMemberCopyLocked(cm *ChannelMember) ChannelMember {
+	cp := *cm
+	if u, ok := m.users[cm.UserID]; ok {
+		cp.Nickname, cp.Tag = u.Nickname, u.Tag
+	}
+	return cp
+}
+
+// sortChannelMembers 与 SQL 的 ORDER BY joined_at, user_id 对齐。
+func sortChannelMembers(list []ChannelMember) {
+	sort.Slice(list, func(i, j int) bool {
+		if !list[i].JoinedAt.Equal(list[j].JoinedAt) {
+			return list[i].JoinedAt.Before(list[j].JoinedAt)
+		}
+		return list[i].UserID < list[j].UserID
+	})
 }
 
 func (m *Mem) ChannelMember(_ context.Context, channelID, userID int64) (*ChannelMember, error) {
@@ -636,11 +663,30 @@ func (m *Mem) ChannelMember(_ context.Context, channelID, userID int64) (*Channe
 	if !ok {
 		return nil, ErrNotFound
 	}
-	cp := *cm
-	if u, ok := m.users[userID]; ok {
-		cp.Nickname, cp.Tag = u.Nickname, u.Tag
-	}
+	cp := m.channelMemberCopyLocked(cm)
 	return &cp, nil
+}
+
+func (m *Mem) SetChannelMemberRole(_ context.Context, channelID, userID int64, role ChannelMemberRole) error {
+	role, err := normalizeChannelMemberRole(role)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.channels[channelID]
+	if !ok {
+		return ErrNotFound
+	}
+	if c.Scope != ChannelScopeGroup {
+		return ErrForbidden
+	}
+	cm, ok := m.channelMembers[channelID][userID]
+	if !ok {
+		return ErrNotFound
+	}
+	cm.Role = role
+	return nil
 }
 
 func (m *Mem) AddChannelMember(_ context.Context, channelID, userID int64, role ChannelMemberRole) error {

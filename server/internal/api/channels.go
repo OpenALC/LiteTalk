@@ -112,6 +112,10 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
+	// 会话作用域不能借服务器频道管理端点修改（#38 B2）。
+	if e := serverChannelOnly(ch); e != nil {
+		return nil, e
+	}
 	if e := s.requirePerm(ctx, ch.ServerID, c.UserID, store.ManageChannels); e != nil {
 		return nil, e
 	}
@@ -254,6 +258,10 @@ func (s *Server) DeleteChannel(ctx context.Context, request DeleteChannelRequest
 	ch, err := s.store.ChannelByID(ctx, request.Id)
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
+	}
+	// 会话作用域不能借服务器频道管理端点删除（#38 B2）。
+	if e := serverChannelOnly(ch); e != nil {
+		return nil, e
 	}
 	if e := s.requirePerm(ctx, ch.ServerID, c.UserID, store.ManageChannels); e != nil {
 		return nil, e
