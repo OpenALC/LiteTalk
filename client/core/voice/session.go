@@ -82,6 +82,11 @@ type Events struct {
 	// OnMessageDeleted 消息软删除广播（message.deleted，#39）：实现侧按
 	// message_id 就地显示墓碑。与 OnMessageEdited 同线程约定。
 	OnMessageDeleted func(d signal.MessageDeletedData)
+	// OnChannelUnread 频道未读/提及计数变化（channel.unread，#40）。服务端按
+	// 接收者精确计算，同一事件只投递给该用户；实现侧必须整体覆盖本地该频道的
+	// 计数，不能累加——自己的消息不计未读，多设备读标记与断线续传都靠它同步。
+	// 跑在 ws 读循环 goroutine，实现侧只做转发，不得阻塞、不得同步 Close 会话。
+	OnChannelUnread func(d signal.ChannelUnreadData)
 	// OnServerShutdown 服务端优雅关闭（server.shutdown，#21）：停自动重连并提示。
 	// 与 OnKicked 同线程约定。
 	OnServerShutdown func(reason string)
@@ -797,6 +802,18 @@ func (s *Session) registerHandlers() {
 		}
 		if s.ev.OnMessageDeleted != nil {
 			s.ev.OnMessageDeleted(d)
+		}
+	})
+	// channel.unread：按接收者精确计算的未读/提及计数（#40）。事件是覆盖语义，
+	// 前端收到后整体替换该频道的计数；空 channel_id 的坏包不回调。跑在 ws 读
+	// 循环，只转发，不得阻塞。
+	s.ws.On(signal.TypeChannelUnread, func(env signal.Envelope) {
+		var d signal.ChannelUnreadData
+		if env.Decode(&d) != nil || d.ChannelID == "" {
+			return
+		}
+		if s.ev.OnChannelUnread != nil {
+			s.ev.OnChannelUnread(d)
 		}
 	})
 	// server.shutdown：服务端优雅关闭（#21）。停掉 ws 自动重连并转给 UI 层提示。

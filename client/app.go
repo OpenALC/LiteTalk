@@ -1321,6 +1321,14 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 				"channel_id": d.ChannelID, "message_id": d.MessageID,
 			})
 		},
+		// 频道未读/提及计数（channel.unread，#40）：服务端按接收者精确计算，
+		// 前端收到后整体覆盖本地计数（覆盖而非累加）。回调跑在 ws 读循环
+		// goroutine，emit 不阻塞。
+		OnChannelUnread: func(d signal.ChannelUnreadData) {
+			a.emit("chat:unread", map[string]any{
+				"channel_id": d.ChannelID, "unread_count": d.UnreadCount, "mention_count": d.MentionCount,
+			})
+		},
 		// 服务端优雅关闭（server.shutdown，#21）：前端提示「服务端已关闭」；
 		// 停止自动重连在 Session 侧已异步处理。
 		OnServerShutdown: func(reason string) {
@@ -1671,6 +1679,38 @@ func (a *App) AddConversationMembers(id string, userIDs []string) (*api.Conversa
 // 此时返回 nil（Wails 侧为 null）。
 func (a *App) RemoveConversationMember(id, userID string) (*api.ConversationDTO, error) {
 	return a.api.RemoveConversationMember(id, userID)
+}
+
+// ---------- 未读与提及计数（#40） ----------
+// 快照与已读上报直接代理 api.APIClient；计数变化由 chat:unread 事件推送，
+// 前端必须整体覆盖（服务端按接收者精确计算）。Wails 绑定不返回指针：
+// nil 归一为空结构，前端不必处理 null。
+
+// ListUnreads 当前用户的未读快照（含 0 值项；空数组为 []）。
+func (a *App) ListUnreads() (api.UnreadsDTO, error) {
+	out, err := a.api.ListUnreads()
+	if err != nil {
+		return api.UnreadsDTO{}, err
+	}
+	if out == nil {
+		return api.UnreadsDTO{
+			Channels: []api.UnreadChannelDTO{},
+			Servers:  []api.UnreadServerDTO{},
+		}, nil
+	}
+	return *out, nil
+}
+
+// MarkChannelRead 上报频道已读到 lastMessageID，返回服务端重算后的计数。
+func (a *App) MarkChannelRead(channelID, lastMessageID string) (api.UnreadChannelDTO, error) {
+	out, err := a.api.MarkChannelRead(channelID, lastMessageID)
+	if err != nil {
+		return api.UnreadChannelDTO{}, err
+	}
+	if out == nil {
+		return api.UnreadChannelDTO{}, nil
+	}
+	return *out, nil
 }
 
 // ChatMessageView 消息桥接视图：与 chat:message 事件的载荷同口径（ts 为毫秒
