@@ -76,6 +76,14 @@ func TestSearchMigrationSQLite(t *testing.T) {
 	assertSearchIDs(t, searchIDs(t, m, []int64{chID}, "升级前关键词", 20))
 	assertSearchIDs(t, searchIDs(t, m, []int64{chID}, "完全换了正文", 20), 6001)
 
+	// 索引缺项（例如绕过 store 直写 messages）不应让后续编辑失败：
+	// 直接 DELETE 索引项对不存在的 rowid 是 no-op，编辑后重新写入正确词项。
+	insertLegacyMessage(t, m, 6002, chID, u.ID, "绕过索引的正文")
+	if err := m.UpdateMessageContent(ctx, 6002, "补回索引的正文", nil, time.Now()); err != nil {
+		t.Fatalf("索引缺项时编辑不应失败: %v", err)
+	}
+	assertSearchIDs(t, searchIDs(t, m, []int64{chID}, "补回索引的正文", 20), 6002)
+
 	// 软删 → 索引项移除。
 	if err := m.SoftDeleteMessage(ctx, created.ID, time.Now()); err != nil {
 		t.Fatalf("SoftDeleteMessage: %v", err)

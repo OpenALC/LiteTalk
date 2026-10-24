@@ -51,15 +51,12 @@ func ftsInsertMessage(ctx context.Context, tx *sql.Tx, id int64, content string)
 	return err
 }
 
-// ftsDeleteMessage 用 FTS5 的 delete 命令移除旧词项。必须显式给出旧正文：
-// 消息行可能已被清空（软删）或改写（编辑），普通 DELETE 读不回要删的词项。
-func ftsDeleteMessage(ctx context.Context, tx *sql.Tx, id int64, oldContent string) error {
-	if oldContent == "" {
-		return nil // 空正文没有词项，索引里也不会有可命中的内容
-	}
-	_, err := tx.ExecContext(ctx,
-		`INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', ?, ?)`,
-		id, oldContent)
+// ftsDeleteMessage 在调用方事务内删除一条 FTS 索引项。必须在改写/清空 messages
+// 正文之前调用：FTS5 外部内容表的 DELETE 靠 content 表当前行反推词项，调用方
+// 先删索引、再改正文。直接 DELETE 对不存在的 rowid 是 no-op，不会像
+// INSERT…('delete',…) 那样在索引缺项时报「database disk image is malformed」。
+func ftsDeleteMessage(ctx context.Context, tx *sql.Tx, id int64) error {
+	_, err := tx.ExecContext(ctx, `DELETE FROM messages_fts WHERE rowid = ?`, id)
 	return err
 }
 

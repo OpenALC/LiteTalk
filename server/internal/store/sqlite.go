@@ -1321,14 +1321,18 @@ func (s *SQLite) UpdateMessageContent(ctx context.Context, id int64, content str
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	// 先读旧正文：FTS5 外部内容表的 delete 命令需要旧词项，改完就取不到了。
-	var oldContent string
+	// 存在性与墓碑判定先于写：软删行与不存在的 id 一律 ErrNotFound。
+	var one int
 	err = tx.QueryRowContext(ctx,
-		`SELECT content FROM messages WHERE id = ? AND deleted_at IS NULL`, id).Scan(&oldContent)
+		`SELECT 1 FROM messages WHERE id = ? AND deleted_at IS NULL`, id).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
 	if err != nil {
+		return err
+	}
+	// 索引项必须在改正文前删（外部内容表按当前正文反推词项），改完再写新词项。
+	if err := ftsDeleteMessage(ctx, tx, id); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -1336,13 +1340,8 @@ func (s *SQLite) UpdateMessageContent(ctx context.Context, id int64, content str
 		content, editedAt, id); err != nil {
 		return err
 	}
-	if oldContent != content {
-		if err := ftsDeleteMessage(ctx, tx, id, oldContent); err != nil {
-			return err
-		}
-		if err := ftsInsertMessage(ctx, tx, id, content); err != nil {
-			return err
-		}
+	if err := ftsInsertMessage(ctx, tx, id, content); err != nil {
+		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM message_mentions WHERE message_id = ?`, id); err != nil {
 		return err
@@ -1361,21 +1360,22 @@ func (s *SQLite) SoftDeleteMessage(ctx context.Context, id int64, deletedAt time
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	var oldContent string
+	var one int
 	err = tx.QueryRowContext(ctx,
-		`SELECT content FROM messages WHERE id = ? AND deleted_at IS NULL`, id).Scan(&oldContent)
+		`SELECT 1 FROM messages WHERE id = ? AND deleted_at IS NULL`, id).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
 	if err != nil {
 		return err
 	}
+	// 先删索引项再清正文：FTS5 外部内容表按当前正文反推词项。
+	if err := ftsDeleteMessage(ctx, tx, id); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE messages SET deleted_at = ?, content = '' WHERE id = ? AND deleted_at IS NULL`,
 		deletedAt, id); err != nil {
-		return err
-	}
-	if err := ftsDeleteMessage(ctx, tx, id, oldContent); err != nil {
 		return err
 	}
 	return tx.Commit()
