@@ -15,6 +15,7 @@ import { useNotifyStore } from '../stores/notify'
 import { canSendMessage, formatFileSize, isImageAttachment } from '../utils/attachment'
 import { parseMarkdown, plainTextMarkdown, type Block, type InlineNode } from '../utils/markdown'
 import ContextMenu, { type CtxItem } from './ContextMenu.vue'
+import LinkPreviewCard from './LinkPreviewCard.vue'
 
 const props = withDefaults(defineProps<{
   channelId: string
@@ -540,6 +541,9 @@ async function send() {
             </button>
           </template>
         </div>
+        <!-- 链接预览（#42 B4）：正文/附件之后，未软删消息才渲染；组件自行
+             提取首个链接并进入视口后才请求，无链接/无预览时不占位。 -->
+        <LinkPreviewCard v-if="!isMessageDeleted(m)" :content="m.content" />
       </div>
       <div v-if="channelId && !messages.length" class="chat-empty">还没有消息</div>
     </div>

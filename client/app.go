@@ -1879,6 +1879,15 @@ func (a *App) SearchMessages(query string, limit int) ([]ChatMessageView, error)
 	return out, nil
 }
 
+// GetLinkPreview 链接预览（#42 B4）：服务端抓取 + 缓存，客户端只渲染。
+// 无预览（服务端 404 no_preview / 功能关闭）返回 (nil, nil)，前端据此静默隐藏。
+func (a *App) GetLinkPreview(rawURL string) (*api.LinkPreviewDTO, error) {
+	if a.api == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	return a.api.GetLinkPreview(rawURL)
+}
+
 // GetMessage 单条消息（#39）：回复跳转与软删消息回读。不存在/不可见返回错误。
 func (a *App) GetMessage(channelID, messageID string) (*ChatMessageView, error) {
 	cid, err := strconv.ParseInt(channelID, 10, 64)

@@ -6,6 +6,7 @@ import { useChatStore } from './chat'
 import { useConversationsStore } from './conversations'
 import { useFriendsStore, useServersStore } from './data'
 import { useNotifyStore } from './notify'
+import { usePreviewStore } from './previews'
 import { useSearchStore } from './search'
 import { useUnreadsStore } from './unreads'
 import { useVoiceStore } from './voice'
@@ -23,6 +24,7 @@ function resetSessionStores() {
     () => useConversationsStore().resetAll(),
     () => useUnreadsStore().resetAll(),
     () => useSearchStore().resetAll(),
+    () => usePreviewStore().resetAll(),
   ]
   for (const reset of resets) {
     try {

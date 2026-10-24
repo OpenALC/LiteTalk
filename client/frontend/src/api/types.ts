@@ -44,6 +44,8 @@ export type AddConversationMembersRequest = components['schemas']['AddConversati
 export type Unreads = components['schemas']['Unreads']
 export type UnreadChannel = components['schemas']['UnreadChannel']
 export type UnreadServer = components['schemas']['UnreadServer']
+// #42 B4：链接预览（服务端抓取并清洗；image_url 为绝对地址，客户端直接加载）。
+export type LinkPreview = components['schemas']['LinkPreview']
 
 // ---- 桥接层兼容名（组件/stores 既有命名）----
 // Wails 绑定经 Go state 包中转：字段与契约同源，个别桥接补充字段见注释。

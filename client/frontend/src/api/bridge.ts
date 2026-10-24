@@ -2,7 +2,7 @@
 // 浏览器独立开发（vite dev 无 Go 后端）时走 mock 桩，行为可联调 UI。
 // 原生环境判定：Go 在 webview 启动时注入 window._wails.flags（浏览器环境恒无）。
 import { Call, Events } from '@wailsio/runtime'
-import type { AttachmentView, AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ChatMessage, ConnConfigView, ConnTestResult, Conversation, FriendDTO, HotkeySettings, MentionCandidate, PeerView, ServerChannels, ServerConfig, ServerDTO, UnreadChannel, Unreads, UserProfile, VoiceStateView } from './types'
+import type { AttachmentView, AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ChatMessage, ConnConfigView, ConnTestResult, Conversation, FriendDTO, HotkeySettings, LinkPreview, MentionCandidate, PeerView, ServerChannels, ServerConfig, ServerDTO, UnreadChannel, Unreads, UserProfile, VoiceStateView } from './types'
 
 type GoApp = {
   GetVersion(): Promise<string>
@@ -75,6 +75,8 @@ type GoApp = {
   // SearchMessages 全局消息搜索（#42）：跨服务器频道与会话，只返回可见频道；
   // 载荷与 ListMessages 同口径（含附件）；q 1–100、limit 1–50 默认 20。
   SearchMessages(query: string, limit: number): Promise<ChatMessage[]>
+  // GetLinkPreview 链接预览（#42 B4）：服务端抓取 + 缓存；无预览/功能关闭返回 null。
+  GetLinkPreview(url: string): Promise<LinkPreview | null>
   GetVoiceMembers(): Promise<PeerView[]>
   LogFromWeb(level: string, msg: string): Promise<void>
   // 服务器/频道/好友 REST CRUD（服务端已有端点；批次①接线）。
@@ -276,6 +278,8 @@ const mockApp: GoApp = {
   async ListMessages() { return [] },
   // 搜索桩：浏览器开发环境无可联调数据。
   async SearchMessages() { return [] },
+  // 链接预览桩：浏览器开发不发外网抓取，统一按「无预览」隐藏卡片。
+  async GetLinkPreview() { return null },
   async GetVoiceMembers() { return [] },
   async GetVoiceState() { return { channel_id: '', muted: false, deafened: false } },
   async RequestVoiceState() {},
