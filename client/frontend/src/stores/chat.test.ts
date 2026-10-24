@@ -557,3 +557,40 @@ describe('chat store 已读上报（#40）', () => {
     expect(mockGoApp.MarkChannelRead).toHaveBeenCalledTimes(2)
   })
 })
+
+// #42 B2：跨频道消息定位请求（SearchDialog 选中结果 → MainView 写入 → ChatPanel 消费）。
+describe('chat store 跨频道定位（#42 B2）', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+  })
+
+  it('requestJump 记录目标并自增 seq，重复点击同一条也是新值', () => {
+    const chat = useChatStore()
+
+    chat.requestJump('c1', 'm1')
+    const first = chat.jumpTarget
+    expect(first).toEqual({ channelId: 'c1', messageId: 'm1', seq: 1 })
+
+    chat.requestJump('c1', 'm1')
+    expect(chat.jumpTarget).toEqual({ channelId: 'c1', messageId: 'm1', seq: 2 })
+    expect(chat.jumpTarget).not.toBe(first) // 引用变化才能触发 watch
+  })
+
+  it('空 channelId / messageId 不产生请求', () => {
+    const chat = useChatStore()
+    chat.requestJump('', 'm1')
+    chat.requestJump('c1', '')
+    expect(chat.jumpTarget).toBeNull()
+  })
+
+  it('clearJump 清空；resetAll 一并清空', () => {
+    const chat = useChatStore()
+    chat.requestJump('c1', 'm1')
+    chat.clearJump()
+    expect(chat.jumpTarget).toBeNull()
+
+    chat.requestJump('c1', 'm2')
+    chat.resetAll()
+    expect(chat.jumpTarget).toBeNull()
+  })
+})
