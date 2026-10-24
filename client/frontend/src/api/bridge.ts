@@ -2,7 +2,7 @@
 // 浏览器独立开发（vite dev 无 Go 后端）时走 mock 桩，行为可联调 UI。
 // 原生环境判定：Go 在 webview 启动时注入 window._wails.flags（浏览器环境恒无）。
 import { Call, Events } from '@wailsio/runtime'
-import type { AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ChatMessage, ConnConfigView, ConnTestResult, Conversation, FriendDTO, HotkeySettings, MentionCandidate, PeerView, ServerChannels, ServerConfig, ServerDTO, UnreadChannel, Unreads, UserProfile, VoiceStateView } from './types'
+import type { AttachmentView, AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ChatMessage, ConnConfigView, ConnTestResult, Conversation, FriendDTO, HotkeySettings, MentionCandidate, PeerView, ServerChannels, ServerConfig, ServerDTO, UnreadChannel, Unreads, UserProfile, VoiceStateView } from './types'
 
 type GoApp = {
   GetVersion(): Promise<string>
@@ -59,6 +59,12 @@ type GoApp = {
   // EditMessage：mentions 整体替换（空数组清除全部提及），返回更新后的消息。
   // DeleteMessage 软删；GetMessage 用于回复跳转（软删消息仍返回）。
   SendChatWithMeta(channelID: string, content: string, replyTo: string, mentions: string[]): Promise<void>
+  // 附件与图片（#41）：PickAndUploadAttachments 打开系统文件选择器并上传，
+  // 返回绝对 url 的附件元数据（取消返回空数组）；SendChatWithAttachments 发送
+  // 纯附件消息（content 可为空串）；OpenAttachment 用系统浏览器打开 http(s) 附件。
+  PickAndUploadAttachments(): Promise<AttachmentView[]>
+  SendChatWithAttachments(channelID: string, content: string, replyTo: string, mentions: string[], attachmentIDs: string[]): Promise<void>
+  OpenAttachment(url: string): Promise<void>
   EditMessage(channelID: string, messageID: string, content: string, mentions: string[]): Promise<ChatMessage>
   DeleteMessage(channelID: string, messageID: string): Promise<void>
   GetMessage(channelID: string, messageID: string): Promise<ChatMessage>
@@ -245,6 +251,10 @@ const mockApp: GoApp = {
   async SendChat() {},
   // #39 消息编辑/回复/提及桩：回显传入内容，供浏览器开发联调 UI。
   async SendChatWithMeta() {},
+  // #41 附件桩：浏览器开发没有原生文件选择器，返回空数组；发送/打开为空操作。
+  async PickAndUploadAttachments() { return [] },
+  async SendChatWithAttachments() {},
+  async OpenAttachment() {},
   async EditMessage(channelID: string, messageID: string, content: string, mentions: string[]) {
     return {
       id: messageID, channel_id: channelID, user_id: '1', nickname: 'dev',

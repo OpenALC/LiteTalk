@@ -27,9 +27,13 @@ export function mergeHistory(history: ChatMessage[], live: ChatMessage[]): ChatM
 }
 
 // isMessageDeleted 墓碑判定（#39）：deleted_at 有值即软删；resync 回灌的软删
-// 消息可能只带空正文而没有 deleted_at，同样按墓碑显示（服务端正常消息禁止空正文）。
-export function isMessageDeleted(m: Pick<ChatMessage, 'content' | 'deleted_at'>): boolean {
-  return !!m.deleted_at || m.content === ''
+// 消息可能只带空正文而没有 deleted_at，同样按墓碑显示——但 #41 的纯附件消息
+// 正文也是空串，带附件时不能误判为墓碑。
+export function isMessageDeleted(
+  m: { content: string; deleted_at?: string; attachments?: ChatMessage['attachments'] },
+): boolean {
+  if (m.deleted_at) return true
+  return m.content === '' && !m.attachments?.length
 }
 
 // mentionNotice 被 @ 时的提示文案（#39）：服务器频道显示频道名，会话回退到
@@ -149,9 +153,17 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   // sendWithMeta 发送带回复与 @提及的消息（#39）：replyTo 空串 = 普通消息，
-  // mentions 空数组 = 无提及。服务端同样广播回发送者，因此不在本地插入。
+  // mentions 空数组 = 无提及。委托 sendWithAttachments（无附件）。
   async function sendWithMeta(channelId: string, content: string, replyTo = '', mentions: string[] = []) {
-    await goApp().SendChatWithMeta(channelId, content, replyTo, mentions)
+    await sendWithAttachments(channelId, content, replyTo, mentions, [])
+  }
+
+  // sendWithAttachments 发送带附件的消息（#41）：content 可为空串（纯附件消息），
+  // attachmentIds 为已上传附件的 ID 列表。服务端同样广播回发送者，不做本地插入。
+  async function sendWithAttachments(
+    channelId: string, content: string, replyTo = '', mentions: string[] = [], attachmentIds: string[] = [],
+  ) {
+    await goApp().SendChatWithAttachments(channelId, content, replyTo, mentions, attachmentIds)
   }
 
   // editMessage 编辑消息（仅作者，#39）。mentions 整体替换：调用方传原消息的
@@ -320,7 +332,7 @@ export const useChatStore = defineStore('chat', () => {
 
   return {
     messagesByChannel, mentionCandidatesByChannel,
-    messagesFor, messageById, mergeMessage, send, sendWithMeta,
+    messagesFor, messageById, mergeMessage, send, sendWithMeta, sendWithAttachments,
     editMessage, deleteMessage, loadHistory, markRead,
     mentionCandidatesFor, loadMentionCandidates,
     bindEvents, unbindEvents, resetAll,

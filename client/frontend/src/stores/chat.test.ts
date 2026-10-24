@@ -25,6 +25,8 @@ const mockGoApp = vi.hoisted(() => ({
   ListMessages: vi.fn(),
   // #39 消息编辑/删除/回复/提及桥接
   SendChatWithMeta: vi.fn(),
+  // #41 附件消息发送
+  SendChatWithAttachments: vi.fn(),
   EditMessage: vi.fn(),
   DeleteMessage: vi.fn(),
   GetMessage: vi.fn(),
@@ -242,20 +244,48 @@ describe('chat store 消息编辑/删除/回复/提及（#39）', () => {
     for (const fn of Object.values(mockGoApp)) fn.mockReset()
   })
 
-  it('isMessageDeleted：deleted_at 或空正文都按墓碑（resync 回灌边界）', () => {
+  it('isMessageDeleted：deleted_at 或空正文都按墓碑（resync 回灌边界）；纯附件消息例外', () => {
     expect(isMessageDeleted({ content: '', deleted_at: '' })).toBe(true)
     expect(isMessageDeleted({ content: 'hi', deleted_at: '1700000000000' })).toBe(true)
     expect(isMessageDeleted({ content: 'hi' })).toBe(false)
+    // #41 纯附件消息正文为空，但不是墓碑。
+    expect(isMessageDeleted({
+      content: '',
+      attachments: [{
+        id: '501', filename: 'a.png', size: 1, content_type: 'image/png',
+        width: 1, height: 1, url: '/api/v1/attachments/501?key=k',
+      }],
+    })).toBe(false)
+    // 已软删的消息即使仍带附件数据也按墓碑。
+    expect(isMessageDeleted({
+      content: '',
+      deleted_at: '1700000000000',
+      attachments: [{
+        id: '501', filename: 'a.png', size: 1, content_type: 'image/png',
+        width: 1, height: 1, url: '/api/v1/attachments/501?key=k',
+      }],
+    })).toBe(true)
   })
 
   it('sendWithMeta 透传回复与提及；send 保持空 meta 语义', async () => {
     const chat = useChatStore()
 
     await chat.sendWithMeta('c1', '你好', '9', ['u1'])
-    expect(mockGoApp.SendChatWithMeta).toHaveBeenCalledWith('c1', '你好', '9', ['u1'])
+    expect(mockGoApp.SendChatWithAttachments).toHaveBeenCalledWith('c1', '你好', '9', ['u1'], [])
 
     await chat.send('c1', '普通')
-    expect(mockGoApp.SendChatWithMeta).toHaveBeenLastCalledWith('c1', '普通', '', [])
+    expect(mockGoApp.SendChatWithAttachments).toHaveBeenLastCalledWith('c1', '普通', '', [], [])
+  })
+
+  // #41：纯附件消息 content 为空串，附件 ID 按选择顺序透传。
+  it('sendWithAttachments 透传附件 ID，正文可为空', async () => {
+    const chat = useChatStore()
+
+    await chat.sendWithAttachments('c1', '', '', [], ['501', '502'])
+    expect(mockGoApp.SendChatWithAttachments).toHaveBeenCalledWith('c1', '', '', [], ['501', '502'])
+
+    await chat.sendWithAttachments('c1', '看图', '9', ['u1'], ['501'])
+    expect(mockGoApp.SendChatWithAttachments).toHaveBeenLastCalledWith('c1', '看图', '9', ['u1'], ['501'])
   })
 
   it('editMessage 用返回值就地替换并按 id 去重', async () => {

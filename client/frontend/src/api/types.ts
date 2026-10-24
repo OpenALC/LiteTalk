@@ -76,6 +76,19 @@ export interface PeerView {
   deafen: boolean
 }
 
+// AttachmentView 消息附件（#41，与 Go 侧 ChatMessageView.Attachments 同口径）。
+// url/thumbnail_url 已由 Go 桥拼成绝对地址，可直接用作 img src 或交给 OpenAttachment。
+export interface AttachmentView {
+  id: string
+  filename: string
+  size: number
+  content_type: string
+  width: number
+  height: number
+  url: string
+  thumbnail_url?: string
+}
+
 // ChatMessage 语音房聊天（WS chat.message 桥接视图；与 REST Message 不同源，
 // 三方漂移在 #31 统一）。
 export interface ChatMessage {
@@ -95,6 +108,8 @@ export interface ChatMessage {
   reply_to?: string
   reply_preview?: ReplyPreview
   mentions?: string[]
+  // #41 附件（无附件或软删消息缺省）；纯附件消息 content 为空串。
+  attachments?: AttachmentView[]
 }
 
 // ConnConfigView 当前生效的服务器地址与来源（设置页「连接」）。

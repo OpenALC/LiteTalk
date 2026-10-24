@@ -3,13 +3,15 @@
 // 文字频道（TextChat）与私聊/群聊（ConversationChat）共用，避免复制样式。
 // 不做本地乐观回显——服务端会把消息广播回发送者，本地再插一条即双显。
 // #39：右键菜单提供回复/编辑/删除；输入区支持回复条与 @提及候选。
+// #41：输入区附件按钮选择上传，待发送附件条与消息内图片/文件卡片渲染。
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { CornerUpLeft, Pencil, Reply, Send, Trash2, X } from 'lucide-vue-next'
+import { CornerUpLeft, FileText, Paperclip, Pencil, Reply, Send, Trash2, X } from 'lucide-vue-next'
 import { goApp } from '../api/bridge'
-import type { ChatMessage, MentionCandidate } from '../api/types'
+import type { AttachmentView, ChatMessage, MentionCandidate } from '../api/types'
 import { useAuthStore } from '../stores/auth'
 import { isMessageDeleted, useChatStore } from '../stores/chat'
 import { useNotifyStore } from '../stores/notify'
+import { canSendMessage, formatFileSize, isImageAttachment } from '../utils/attachment'
 import ContextMenu, { type CtxItem } from './ContextMenu.vue'
 
 const props = withDefaults(defineProps<{
@@ -48,7 +50,7 @@ watch(() => messages.value.length, () => {
 })
 
 // 切换频道/会话时回到最新一条（历史补拉到达后由 length 变化再跟一次）。
-// 回复目标、编辑态与提及候选都属于上一个频道，必须一起清掉。
+// 回复目标、编辑态、提及候选与待发送附件都属于上一个频道，必须一起清掉。
 // loadHistory 不做「已加载」缓存：每次切到该频道都重新补拉（断线窗口可能
 // 错过新消息），同频道在飞请求合并——文字频道与会话两条路径同时调用只发一次。
 watch(() => props.channelId, (id) => {
@@ -58,6 +60,7 @@ watch(() => props.channelId, (id) => {
   editText.value = ''
   replyToId.value = ''
   pendingMentions.clear()
+  pendingAttachments.value = []
   closeMention()
   menu.value = null
   chat.loadHistory(id).catch(() => {})
@@ -108,11 +111,13 @@ function isOwn(m: ChatMessage): boolean {
   return !!auth.user?.id && m.user_id === auth.user.id
 }
 
-// replyText 回复条里的被引用内容：软删/空正文统一显示「消息已删除」。
+// replyText 回复条里的被引用内容：软删/空正文统一显示「消息已删除」；
+// 未删除但正文为空说明目标是纯附件消息（#41），显示「附件」。
 function replyText(m: ChatMessage): string {
   const p = m.reply_preview
   if (!p) return '原消息不可用'
-  return p.deleted || p.content === '' ? '消息已删除' : excerpt(p.content)
+  if (p.deleted) return '消息已删除'
+  return p.content === '' ? '附件' : excerpt(p.content)
 }
 
 // excerpt 截断摘要到一行（回复条/回复状态条共用）。
@@ -164,7 +169,9 @@ const replyMsg = computed(() => (replyToId.value ? chat.messageById(props.channe
 const composerReplyText = computed(() => {
   const m = replyMsg.value
   if (!m) return '回复的消息不可用'
-  return isMessageDeleted(m) ? '消息已删除' : excerpt(m.content)
+  if (isMessageDeleted(m)) return '消息已删除'
+  // 纯附件消息正文为空（#41）：显示附件提示，不显示空白回复条。
+  return m.content === '' ? '附件' : excerpt(m.content)
 })
 
 function startReply(m: ChatMessage) {
@@ -271,6 +278,43 @@ async function removeMessage(m: ChatMessage) {
   }
 }
 
+// ---- 附件（#41）：选择上传 → 待发送附件条 → 随消息发送 ----
+// 与服务端 chat.send/REST 的上限一致；上传中的按钮禁用，避免重复弹选择器。
+const MAX_PENDING_ATTACHMENTS = 10
+const pendingAttachments = ref<AttachmentView[]>([])
+const uploading = ref(false)
+
+// 正文为空但有待发送附件也允许发送（纯附件消息）。
+const canSend = computed(() => !!props.channelId && canSendMessage(text.value, pendingAttachments.value.length))
+
+async function pickAttachments() {
+  if (uploading.value || pendingAttachments.value.length >= MAX_PENDING_ATTACHMENTS) return
+  const channel = props.channelId
+  uploading.value = true
+  try {
+    const picked = await goApp().PickAndUploadAttachments()
+    // 上传期间切了频道：结果只属于上一个频道，丢弃而不是落到新频道。
+    if (channel !== props.channelId) return
+    if (!picked?.length) return
+    const room = MAX_PENDING_ATTACHMENTS - pendingAttachments.value.length
+    pendingAttachments.value = [...pendingAttachments.value, ...picked.slice(0, room)]
+    if (picked.length > room) notify.show(`最多 ${MAX_PENDING_ATTACHMENTS} 个附件`, true)
+  } catch (e) {
+    notify.fromErr(e, '附件上传失败')
+  } finally {
+    uploading.value = false
+  }
+}
+
+function removeAttachment(id: string) {
+  pendingAttachments.value = pendingAttachments.value.filter((a) => a.id !== id)
+}
+
+function openAttachment(url: string) {
+  if (!url) return
+  goApp().OpenAttachment(url).catch((e) => notify.fromErr(e, '打开附件失败'))
+}
+
 // ---- @提及：光标前的 @片段触发候选下拉；选中后记录 user_id，发送时按正文过滤 ----
 const inputEl = ref<HTMLInputElement | null>(null)
 const mentionOpen = ref(false)
@@ -375,19 +419,21 @@ function onComposerKeydown(e: KeyboardEvent) {
 
 async function send() {
   const v = text.value.trim()
-  if (!v || !props.channelId) return
+  if (!canSend.value) return
   // 只带仍在正文中出现的提及（选中后又删掉的不算）。
   const mentions = [...pendingMentions.entries()]
     .filter(([, nickname]) => v.includes('@' + nickname))
     .map(([userId]) => userId)
+  const attachmentIds = pendingAttachments.value.map((a) => a.id)
   try {
-    await chat.sendWithMeta(props.channelId, v, replyToId.value, mentions)
+    await chat.sendWithAttachments(props.channelId, v, replyToId.value, mentions, attachmentIds)
     text.value = ''
     replyToId.value = ''
     pendingMentions.clear()
+    pendingAttachments.value = []
     closeMention()
   } catch {
-    // 发送失败保留输入/回复/提及，服务端 error 事件另行提示。
+    // 发送失败保留输入/回复/提及/待发附件，服务端 error 事件另行提示。
   }
 }
 </script>
@@ -430,12 +476,26 @@ async function send() {
           </div>
         </div>
         <p v-else-if="isMessageDeleted(m)" class="m-text m-deleted">消息已删除</p>
-        <p v-else class="m-text">
+        <p v-else-if="m.content" class="m-text">
           <template v-for="(seg, i) in segments(m.content)" :key="i">
             <span v-if="seg.mention" class="m-mention">{{ seg.text }}</span>
             <template v-else>{{ seg.text }}</template>
           </template>
         </p>
+        <!-- 附件（#41）：图片用缩略图，其余显示文件卡片；软删消息只留墓碑。 -->
+        <div v-if="!isMessageDeleted(m) && m.attachments?.length" class="m-atts">
+          <template v-for="att in m.attachments" :key="att.id">
+            <button v-if="isImageAttachment(att)" class="att-img" :title="att.filename"
+                    @click="openAttachment(att.url)">
+              <img :src="att.thumbnail_url || att.url" :alt="att.filename" loading="lazy" />
+            </button>
+            <button v-else class="att-file" :title="att.filename" @click="openAttachment(att.url)">
+              <FileText :size="16" class="af-icon" />
+              <span class="af-name">{{ att.filename }}</span>
+              <span class="af-size">{{ formatFileSize(att.size) }}</span>
+            </button>
+          </template>
+        </div>
       </div>
       <div v-if="channelId && !messages.length" class="chat-empty">还没有消息</div>
     </div>
@@ -448,7 +508,27 @@ async function send() {
         <span class="rs-text">{{ composerReplyText }}</span>
         <button class="rs-close" title="取消回复" @click="cancelReply"><X :size="14" /></button>
       </div>
+      <!-- 待发送附件条（#41）：图片显示缩略图，文件显示图标/名称/大小，可逐项移除。 -->
+      <div v-if="pendingAttachments.length || uploading" class="pending-atts">
+        <span v-if="uploading" class="upload-status">上传中…</span>
+        <div v-for="att in pendingAttachments" :key="att.id" class="pending-item">
+          <img v-if="isImageAttachment(att)" class="pa-thumb" :src="att.thumbnail_url || att.url"
+               :alt="att.filename" />
+          <FileText v-else :size="14" class="pa-icon" />
+          <span class="pa-name">{{ att.filename }}</span>
+          <span class="pa-size">{{ formatFileSize(att.size) }}</span>
+          <button class="pa-remove" title="移除附件" @click="removeAttachment(att.id)">
+            <X :size="12" />
+          </button>
+        </div>
+      </div>
       <div class="c-row">
+        <button class="attach-btn"
+                :title="pendingAttachments.length >= MAX_PENDING_ATTACHMENTS ? '最多 10 个附件' : '添加附件'"
+                :disabled="uploading || pendingAttachments.length >= MAX_PENDING_ATTACHMENTS"
+                @click="pickAttachments">
+          <Paperclip :size="17" />
+        </button>
         <div class="c-input">
           <input ref="inputEl"
                  v-model="text"
@@ -467,7 +547,7 @@ async function send() {
             </button>
           </div>
         </div>
-        <button class="send-btn" title="发送" @click="send"><Send :size="17" /></button>
+        <button class="send-btn" title="发送" :disabled="!canSend" @click="send"><Send :size="17" /></button>
       </div>
     </div>
 
@@ -526,6 +606,35 @@ async function send() {
 .msg .m-text.m-deleted { color: var(--ink-300); }
 .msg.deleted .m-name { color: var(--ink-400); }
 .m-mention { color: var(--brand-700); font-weight: 500; }
+/* 消息附件（#41）：图片限宽高圆角，文件为卡片；动画只用 transform/opacity */
+.m-atts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+.att-img {
+  padding: 0; overflow: hidden; line-height: 0;
+  border: 1px solid var(--line); border-radius: 10px;
+  transition: opacity 0.15s, transform 0.1s var(--ease);
+}
+.att-img:hover { opacity: 0.92; }
+.att-img:active { transform: scale(0.985); }
+.att-img img {
+  display: block; width: auto; height: auto;
+  max-width: 260px; max-height: 220px;
+  object-fit: cover;
+}
+.att-file {
+  display: flex; align-items: center; gap: 8px;
+  max-width: 280px; padding: 8px 10px;
+  background: var(--surface);
+  border: 1px solid var(--line); border-radius: 9px;
+  color: var(--ink-600); text-align: left;
+  transition: background 0.15s, border-color 0.15s;
+}
+.att-file:hover { background: var(--brand-50); border-color: var(--brand-200); }
+.af-icon { flex: none; color: var(--brand-600); }
+.af-name {
+  font-size: 12.5px; font-weight: 500;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.af-size { flex: none; font-size: 11px; color: var(--ink-300); }
 /* 回复预览条：细边 + 浅底，点击跳转 */
 .m-reply {
   display: flex; align-items: center; gap: 5px;
@@ -593,6 +702,45 @@ async function send() {
   transition: background 0.15s, color 0.15s;
 }
 .rs-close:hover { background: rgba(79, 164, 243, 0.12); color: var(--ink-900); }
+/* 待发送附件条（#41）：横向可换行，每项带移除按钮 */
+.pending-atts {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  padding: 8px 10px; border-radius: 10px;
+  background: rgba(79, 164, 243, 0.06);
+}
+.upload-status { font-size: 12px; color: var(--ink-400); }
+.pending-item {
+  display: flex; align-items: center; gap: 6px;
+  max-width: 260px; padding: 4px 6px 4px 8px;
+  background: var(--surface);
+  border: 1px solid var(--line); border-radius: 8px;
+}
+.pa-thumb { width: 24px; height: 24px; flex: none; border-radius: 5px; object-fit: cover; }
+.pa-icon { flex: none; color: var(--brand-600); }
+.pa-name {
+  font-size: 12px; color: var(--ink-600);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pa-size { flex: none; font-size: 11px; color: var(--ink-300); }
+.pa-remove {
+  width: 18px; height: 18px; flex: none;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 5px; color: var(--ink-300);
+  transition: background 0.15s, color 0.15s;
+}
+.pa-remove:hover { background: rgba(79, 164, 243, 0.12); color: var(--ink-900); }
+.attach-btn {
+  width: 42px; height: 42px; flex: none;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--surface); color: var(--ink-400);
+  border: 1.5px solid var(--brand-200); border-radius: 12px;
+  transition: background 0.15s, color 0.15s, border-color 0.15s, transform 0.1s var(--ease);
+}
+.attach-btn:hover:not(:disabled) {
+  background: var(--brand-50); color: var(--brand-600); border-color: var(--brand-500);
+}
+.attach-btn:active:not(:disabled) { transform: scale(0.95); }
+.attach-btn:disabled { opacity: 0.5; cursor: default; }
 .c-row { display: flex; gap: 10px; }
 .composer .c-input {
   position: relative;
@@ -637,6 +785,7 @@ async function send() {
   transition: background 0.2s, transform 0.1s var(--ease);
   box-shadow: 0 4px 12px rgba(79, 164, 243, 0.3);
 }
-.send-btn:hover { background: var(--brand-600); }
-.send-btn:active { transform: scale(0.93); }
+.send-btn:hover:not(:disabled) { background: var(--brand-600); }
+.send-btn:active:not(:disabled) { transform: scale(0.93); }
+.send-btn:disabled { opacity: 0.5; cursor: default; box-shadow: none; }
 </style>
