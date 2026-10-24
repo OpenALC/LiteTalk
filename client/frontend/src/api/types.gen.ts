@@ -424,6 +424,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/link-preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 抓取链接预览
+         * @description #42：服务端抓取目标网页的 OpenGraph / <title> / description 元数据，返回 标题、描述、站点名与可选图片。抓取受 SSRF 防护约束：只允许 http/https， 拒绝 userinfo 与私网/回环/链路本地/CGNAT/云元数据地址（DNS 在拨号时解析并 逐 IP 校验，防重绑定）；重定向最多 3 跳且逐跳复核。默认 5s 超时、512 KiB 响应上限（LITETALK_LINK_PREVIEW_TIMEOUT_MS / _MAX_BYTES 可调并夹取区间）。 结果按 URL 缓存（有预览 24h、无预览 1h），每用户 30 次/分，超限 429 rate_limited。LITETALK_LINK_PREVIEW=off 时不构造抓取器，端点统一 404 no_preview。code：bad_request（缺 url）、bad_url（地址非法/超长或被 SSRF 防护拒绝）、no_preview（非 HTML/无元数据/抓取失败）、401；429 rate_limited； 5xx internal。
+         */
+        get: operations["getLinkPreview"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/channels/{id}/read": {
         parameters: {
             query?: never;
@@ -1221,6 +1241,22 @@ export interface components {
             mentions?: string[];
             /** @description 消息附件元数据（#41，按附件 ID 升序）；无附件或消息已软删时缺省。 url/thumbnail_url 为带能力 key 的相对路径，可直接放进 img 标签。 */
             attachments?: components["schemas"]["Attachment"][];
+        };
+        /**
+         * LinkPreview
+         * @description 链接预览（#42 B4）。url 为跟随重定向后的最终页面地址；文本已折叠空白、 去除控制字符并按 rune 截断（title 200 / description 500 / site_name 100）。 image_url 为绝对地址，仅 http(s) 且通过地址校验时给出；图片由客户端直接 加载，服务端不代理、不抓取。
+         */
+        LinkPreview: {
+            /** @description 最终页面地址（跟随重定向后） */
+            url: string;
+            /** @description 标题（OG 优先，回退 <title>、站点名或 host） */
+            title: string;
+            /** @description 描述（OG 优先，回退 meta[name=description]）；无则缺省 */
+            description?: string;
+            /** @description 站点名（og:site_name）；无则缺省 */
+            site_name?: string;
+            /** @description 预览图片绝对地址（og:image 优先，回退 twitter:image）；无则缺省 */
+            image_url?: string;
         };
         /**
          * ReplyPreview
@@ -2482,6 +2518,34 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    getLinkPreview: {
+        parameters: {
+            query: {
+                /** @description 目标页面地址（http/https，1–2048 字符） */
+                url: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 链接预览（文本已清洗；image_url 为绝对地址） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LinkPreview"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
             429: components["responses"]["RateLimited"];
             default: components["responses"]["Internal"];
         };

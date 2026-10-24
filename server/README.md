@@ -150,6 +150,24 @@ curl -X POST "http://127.0.0.1:8077/api/v1/rtc/credentials?token=dev-alice"
 - 下载 URL 里的 `key` 是 256 位随机能力凭证：拿到 URL 的人即可下载，转发聊天记录
   等于转发访问权；消息软删是唯一的主动失效方式（附件内容不可覆盖）。
 
+## 链接预览（#42）
+
+`GET /api/v1/link-preview?url=` 由服务端抓取网页的 OpenGraph / `<title>` /
+`meta[name=description]` 元数据，返回标题、描述、站点名与可选图片（`image_url`）。
+抓取有 SSRF 防护：只允许 http/https、拒绝 userinfo 与私网/回环/链路本地/CGNAT/
+云元数据地址，DNS 在实际拨号时解析并逐 IP 校验（防重绑定），重定向最多 3 跳且
+逐跳复核，禁用环境代理。结果按 URL 缓存在现有 KV（有预览 24h、无预览 1h），
+每用户 30 次/分。
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `LITETALK_LINK_PREVIEW` | `on` | `off`/`0`/`false` 关闭；关闭时端点统一 404 `no_preview` |
+| `LITETALK_LINK_PREVIEW_TIMEOUT_MS` | `5000` | 单次抓取超时，夹取 1000–15000 |
+| `LITETALK_LINK_PREVIEW_MAX_BYTES` | `524288`（512 KiB） | 响应字节上限，夹取 64 KiB–2 MiB |
+
+图片只把校验过的绝对地址交给客户端直接加载，服务端不代理、不抓取图片。
+部署在只有内网出口的环境时，需要放行到公网的 HTTPS 出站访问。
+
 ## 端到端拨测（部署验证）
 
 `cmd/e2eprobe` 以真实客户端身份走完整链路：REST 注册/登录 → 取 TURN/STUN 凭证

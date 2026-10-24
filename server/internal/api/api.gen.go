@@ -606,6 +606,24 @@ type JoinServerRequest struct {
 	Code string `json:"code"`
 }
 
+// LinkPreview 链接预览（#42 B4）。url 为跟随重定向后的最终页面地址；文本已折叠空白、 去除控制字符并按 rune 截断（title 200 / description 500 / site_name 100）。 image_url 为绝对地址，仅 http(s) 且通过地址校验时给出；图片由客户端直接 加载，服务端不代理、不抓取。
+type LinkPreview struct {
+	// Description 描述（OG 优先，回退 meta[name=description]）；无则缺省
+	Description *string `json:"description,omitempty"`
+
+	// ImageUrl 预览图片绝对地址（og:image 优先，回退 twitter:image）；无则缺省
+	ImageUrl *string `json:"image_url,omitempty"`
+
+	// SiteName 站点名（og:site_name）；无则缺省
+	SiteName *string `json:"site_name,omitempty"`
+
+	// Title 标题（OG 优先，回退 <title>、站点名或 host）
+	Title string `json:"title"`
+
+	// Url 最终页面地址（跟随重定向后）
+	Url string `json:"url"`
+}
+
 // LoginRequest defines model for LoginRequest.
 type LoginRequest struct {
 	Device   *string `json:"device,omitempty"`
@@ -1062,6 +1080,12 @@ type DeleteChannelOverwriteParamsTargetType string
 // SetChannelOverwriteParamsTargetType defines parameters for SetChannelOverwrite.
 type SetChannelOverwriteParamsTargetType string
 
+// GetLinkPreviewParams defines parameters for GetLinkPreview.
+type GetLinkPreviewParams struct {
+	// Url 目标页面地址（http/https，1–2048 字符）
+	Url string `form:"url" json:"url"`
+}
+
 // SearchMessagesParams defines parameters for SearchMessages.
 type SearchMessagesParams struct {
 	// Q 搜索词（trim 后 1–100 字符；中文按子串匹配）
@@ -1319,6 +1343,9 @@ type ServerInterface interface {
 	// GetHealthz 健康检查（部署探活）
 	// (GET /api/v1/healthz)
 	GetHealthz(w http.ResponseWriter, r *http.Request)
+	// GetLinkPreview 抓取链接预览
+	// (GET /api/v1/link-preview)
+	GetLinkPreview(w http.ResponseWriter, r *http.Request, params GetLinkPreviewParams)
 	// DeleteRole 删除自定义角色（需 ManageRoles，builtin 403）
 	// (DELETE /api/v1/roles/{id})
 	DeleteRole(w http.ResponseWriter, r *http.Request, id IDPath)
@@ -2426,6 +2453,39 @@ func (siw *ServerInterfaceWrapper) GetHealthz(w http.ResponseWriter, r *http.Req
 	handler.ServeHTTP(w, r)
 }
 
+// GetLinkPreview operation middleware
+func (siw *ServerInterfaceWrapper) GetLinkPreview(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params GetLinkPreviewParams
+
+	// ------------- Required query parameter "url" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, true, "url", r.URL.Query(), &params.Url, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "url"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "url", Err: err})
+		}
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetLinkPreview(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 // DeleteRole operation middleware
 func (siw *ServerInterfaceWrapper) DeleteRole(w http.ResponseWriter, r *http.Request) {
 
@@ -3153,6 +3213,7 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodDelete+" "+options.BaseURL+"/api/v1/conversations/{id}/members/{user_id}", wrapper.RemoveConversationMember)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/unreads", wrapper.ListUnreads)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/search", wrapper.SearchMessages)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/link-preview", wrapper.GetLinkPreview)
 	m.HandleFunc(http.MethodPut+" "+options.BaseURL+"/api/v1/channels/{id}/read", wrapper.MarkChannelRead)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/sync", wrapper.GetSync)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/servers", wrapper.ListServers)
@@ -7115,6 +7176,109 @@ func (response GetHealthz405ApplicationProblemPlusJSONResponse) VisitGetHealthzR
 	return err
 }
 
+type GetLinkPreviewRequestObject struct {
+	Params GetLinkPreviewParams
+}
+
+type GetLinkPreviewResponseObject interface {
+	VisitGetLinkPreviewResponse(w http.ResponseWriter) error
+}
+
+type GetLinkPreview200JSONResponse LinkPreview
+
+func (response GetLinkPreview200JSONResponse) VisitGetLinkPreviewResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetLinkPreview400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response GetLinkPreview400ApplicationProblemPlusJSONResponse) VisitGetLinkPreviewResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetLinkPreview401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response GetLinkPreview401ApplicationProblemPlusJSONResponse) VisitGetLinkPreviewResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetLinkPreview404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response GetLinkPreview404ApplicationProblemPlusJSONResponse) VisitGetLinkPreviewResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetLinkPreview429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response GetLinkPreview429ApplicationProblemPlusJSONResponse) VisitGetLinkPreviewResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetLinkPreviewdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response GetLinkPreviewdefaultApplicationProblemPlusJSONResponse) VisitGetLinkPreviewResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
 type DeleteRoleRequestObject struct {
 	Id IDPath `json:"id"`
 }
@@ -9187,6 +9351,9 @@ type StrictServerInterface interface {
 	// GetHealthz 健康检查（部署探活）
 	// (GET /api/v1/healthz)
 	GetHealthz(ctx context.Context, request GetHealthzRequestObject) (GetHealthzResponseObject, error)
+	// GetLinkPreview 抓取链接预览
+	// (GET /api/v1/link-preview)
+	GetLinkPreview(ctx context.Context, request GetLinkPreviewRequestObject) (GetLinkPreviewResponseObject, error)
 	// DeleteRole 删除自定义角色（需 ManageRoles，builtin 403）
 	// (DELETE /api/v1/roles/{id})
 	DeleteRole(ctx context.Context, request DeleteRoleRequestObject) (DeleteRoleResponseObject, error)
@@ -10481,6 +10648,32 @@ func (sh *strictHandler) GetHealthz(w http.ResponseWriter, r *http.Request) {
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
 	} else if validResponse, ok := response.(GetHealthzResponseObject); ok {
 		if err := validResponse.VisitGetHealthzResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// GetLinkPreview operation middleware
+func (sh *strictHandler) GetLinkPreview(w http.ResponseWriter, r *http.Request, params GetLinkPreviewParams) {
+	var request GetLinkPreviewRequestObject
+
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.GetLinkPreview(ctx, request.(GetLinkPreviewRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "GetLinkPreview")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(GetLinkPreviewResponseObject); ok {
+		if err := validResponse.VisitGetLinkPreviewResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {

@@ -14,6 +14,7 @@ import (
 	"github.com/OpenALC/LiteTalk/server/internal/auth"
 	"github.com/OpenALC/LiteTalk/server/internal/authz"
 	"github.com/OpenALC/LiteTalk/server/internal/blob"
+	"github.com/OpenALC/LiteTalk/server/internal/linkpreview"
 	"github.com/OpenALC/LiteTalk/server/internal/mailer"
 	"github.com/OpenALC/LiteTalk/server/internal/rtcapi"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
@@ -60,6 +61,12 @@ type VoicePresence interface {
 	VoiceChannelOf(uid string) (channelID, serverID string, ok bool)
 }
 
+// LinkPreviewFetcher 链接预览抓取器（#42 B4）。生产传 *linkpreview.Fetcher，
+// 测试注入桩。nil = 功能关闭：GET /api/v1/link-preview 一律 404 no_preview。
+type LinkPreviewFetcher interface {
+	Fetch(ctx context.Context, rawURL string) (*linkpreview.Preview, error)
+}
+
 // Server API 依赖集合。
 type Server struct {
 	store    store.Store
@@ -90,6 +97,10 @@ type Server struct {
 	blob blob.Store
 	// upload 附件校验参数（MaxBytes/MaxDimension/AllowedTypes）；New 里补默认值。
 	upload attachment.Config
+	// kv 共享键值存储（链接预览缓存，#42 B4）；nil 时跳过缓存直接抓取。
+	kv store.KV
+	// linkPreview 链接预览抓取器（nil=功能关闭，端点统一 404 no_preview）。
+	linkPreview LinkPreviewFetcher
 }
 
 // Config 构造配置。
@@ -134,6 +145,12 @@ type Config struct {
 	// Upload 附件校验参数。MaxBytes<=0 回落 10 MiB；MaxDimension<=0 回落 4096
 	// （服务端显式收紧，包默认 8192 对解压炸弹风险偏高）；AllowedTypes 为空用默认白名单。
 	Upload attachment.Config
+	// KV 共享键值存储（链接预览缓存，#42 B4）。nil 时缓存整体关闭（fail-open，
+	// 仍可抓取）；缓存读写故障同样跳过缓存继续抓取。
+	KV store.KV
+	// LinkPreview 链接预览抓取器（#42 B4）。生产由 cmd/server 按
+	// LITETALK_LINK_PREVIEW* 构造；nil = 功能关闭，端点一律 404 no_preview。
+	LinkPreview LinkPreviewFetcher
 }
 
 // New 构造 API Server。
@@ -181,6 +198,8 @@ func New(cfg Config) *Server {
 		rtcAuth:           cfg.RTCAuth,
 		blob:              cfg.Blob,
 		upload:            normalizeUploadConfig(cfg.Upload),
+		kv:                cfg.KV,
+		linkPreview:       cfg.LinkPreview,
 	}
 }
 

@@ -29,6 +29,7 @@ import (
 	"github.com/OpenALC/LiteTalk/server/internal/authz"
 	"github.com/OpenALC/LiteTalk/server/internal/blob"
 	"github.com/OpenALC/LiteTalk/server/internal/bootstrap"
+	"github.com/OpenALC/LiteTalk/server/internal/linkpreview"
 	"github.com/OpenALC/LiteTalk/server/internal/mailer"
 	"github.com/OpenALC/LiteTalk/server/internal/rtcapi"
 	"github.com/OpenALC/LiteTalk/server/internal/sfu"
@@ -345,6 +346,9 @@ func main() {
 		log.Println("Auth 模式: simple（注册/找回免验证码，仅建议私域部署）")
 	}
 
+	// 链接预览（#42 B4）：关闭时为 nil，端点统一 404 no_preview；缓存复用现有 KV。
+	linkPreview := linkPreviewFromEnv(log.Default())
+
 	// REST API（§5.4 全量）
 	apiSrv := api.New(api.Config{
 		Store:    st,
@@ -385,6 +389,9 @@ func main() {
 			MaxDimension: serverUploadMaxDimension,
 			AllowedTypes: cfg.uploadTypes,
 		},
+		// 链接预览（#42 B4）：KV 缓存 + 抓取器；关闭时 LinkPreview=nil。
+		KV:          kv,
+		LinkPreview: linkPreview,
 	})
 
 	mux := http.NewServeMux()
@@ -670,6 +677,40 @@ func envInt(key string, def int) int {
 		log.Fatalf("%s 不是合法整数: %q", key, v)
 	}
 	return n
+}
+
+// linkPreviewFromEnv 按环境变量构造链接预览抓取器（#42 B4）。
+// LITETALK_LINK_PREVIEW 默认开；off/0/false 关闭（返回 nil，端点统一 404）。
+// 超时与响应上限夹到安全区间：误配既不能把抓取拖到连接耗尽，也不能让单次
+// 响应吃爆内存。所有取值都有安全默认，非法整数直接拒绝启动（envInt）。
+func linkPreviewFromEnv(lg *log.Logger) *linkpreview.Fetcher {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("LITETALK_LINK_PREVIEW"))) {
+	case "off", "0", "false":
+		lg.Println("链接预览: 关闭（LITETALK_LINK_PREVIEW），/api/v1/link-preview 返回 404")
+		return nil
+	}
+	const (
+		minTimeout = time.Second
+		maxTimeout = 15 * time.Second
+		minBytes   = int64(64 << 10)
+		maxBytes   = int64(2 << 20)
+	)
+	timeout := time.Duration(envInt("LITETALK_LINK_PREVIEW_TIMEOUT_MS", 5000)) * time.Millisecond
+	if timeout < minTimeout {
+		timeout = minTimeout
+	}
+	if timeout > maxTimeout {
+		timeout = maxTimeout
+	}
+	limit := int64(envInt("LITETALK_LINK_PREVIEW_MAX_BYTES", 512<<10))
+	if limit < minBytes {
+		limit = minBytes
+	}
+	if limit > maxBytes {
+		limit = maxBytes
+	}
+	lg.Printf("链接预览: 开启（超时 %s，响应上限 %d KiB）", timeout, limit>>10)
+	return linkpreview.New(linkpreview.Config{Timeout: timeout, MaxBytes: limit})
 }
 
 func splitList(s string) []string {

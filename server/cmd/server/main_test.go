@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"io/fs"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +16,38 @@ import (
 
 	"github.com/OpenALC/LiteTalk/server/internal/store"
 )
+
+// TestLinkPreviewFromEnv 链接预览开关（#42 B4）：默认开；off/0/false 关闭时
+// 返回 nil（端点统一 404）；区间夹取不应触发 envInt 的非法值退出。
+func TestLinkPreviewFromEnv(t *testing.T) {
+	lg := log.New(io.Discard, "", 0)
+	for _, off := range []string{"off", "0", "false", "OFF", " False "} {
+		t.Setenv("LITETALK_LINK_PREVIEW", off)
+		if f := linkPreviewFromEnv(lg); f != nil {
+			t.Fatalf("LITETALK_LINK_PREVIEW=%q 应关闭功能", off)
+		}
+	}
+	for _, on := range []string{"", "on", "1", "true"} {
+		t.Setenv("LITETALK_LINK_PREVIEW", on)
+		t.Setenv("LITETALK_LINK_PREVIEW_TIMEOUT_MS", "")
+		t.Setenv("LITETALK_LINK_PREVIEW_MAX_BYTES", "")
+		if f := linkPreviewFromEnv(lg); f == nil {
+			t.Fatalf("LITETALK_LINK_PREVIEW=%q 应开启功能", on)
+		}
+	}
+	// 越界值夹取后仍能构造（不 panic、不退出）。
+	t.Setenv("LITETALK_LINK_PREVIEW", "on")
+	t.Setenv("LITETALK_LINK_PREVIEW_TIMEOUT_MS", "10")
+	t.Setenv("LITETALK_LINK_PREVIEW_MAX_BYTES", "1")
+	if f := linkPreviewFromEnv(lg); f == nil {
+		t.Fatal("越界配置应夹取而非关闭功能")
+	}
+	t.Setenv("LITETALK_LINK_PREVIEW_TIMEOUT_MS", "999999")
+	t.Setenv("LITETALK_LINK_PREVIEW_MAX_BYTES", "999999999")
+	if f := linkPreviewFromEnv(lg); f == nil {
+		t.Fatal("越界配置应夹取而非关闭功能")
+	}
+}
 
 // TestResolveCredentialURLs 下发给客户端的 TURN/STUN URL（#13 P2）：
 // 显式配置优先；内置 TURN 启用回填 host；关闭时只有 dev 允许 loopback 回落，
