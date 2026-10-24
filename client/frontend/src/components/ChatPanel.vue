@@ -49,8 +49,8 @@ watch(() => messages.value.length, () => {
 
 // 切换频道/会话时回到最新一条（历史补拉到达后由 length 变化再跟一次）。
 // 回复目标、编辑态与提及候选都属于上一个频道，必须一起清掉。
-// loadHistory 幂等（chat store 按频道记已加载 + 合并在飞请求）：文字频道与
-// 会话两条路径同时调用也只发一次。
+// loadHistory 不做「已加载」缓存：每次切到该频道都重新补拉（断线窗口可能
+// 错过新消息），同频道在飞请求合并——文字频道与会话两条路径同时调用只发一次。
 watch(() => props.channelId, (id) => {
   stick = true
   scrollToBottom()

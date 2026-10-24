@@ -186,15 +186,19 @@ describe('chat store 历史补拉（#38 B4b）', () => {
     await chat.loadHistory('c1')
     expect(chat.messagesByChannel).toEqual({})
 
-    // c1 已成功加载过（幂等短路），失败路径换一个频道验证。
+    // 没有「已加载」短路：同一频道第一次失败后再次打开会重试。
     mockGoApp.ListMessages.mockRejectedValueOnce(new Error('boom'))
-    await expect(chat.loadHistory('c2')).rejects.toThrow('boom')
+    await expect(chat.loadHistory('c1')).rejects.toThrow('boom')
+
+    mockGoApp.ListMessages.mockResolvedValueOnce([at('1', '1000')])
+    await chat.loadHistory('c1')
+    expect(chat.messagesFor('c1').map((m) => m.id)).toEqual(['1'])
   })
 
-  it('loadHistory 幂等：已加载频道不再请求，并发调用只发一次', async () => {
+  it('loadHistory 并发调用只发一次；完成后再次调用重新拉取并合并', async () => {
     const chat = useChatStore()
     let resolve!: (v: ChatMessage[]) => void
-    mockGoApp.ListMessages.mockReturnValue(new Promise<ChatMessage[]>((r) => { resolve = r }))
+    mockGoApp.ListMessages.mockReturnValueOnce(new Promise<ChatMessage[]>((r) => { resolve = r }))
 
     const p1 = chat.loadHistory('c1')
     const p2 = chat.loadHistory('c1')
@@ -204,9 +208,11 @@ describe('chat store 历史补拉（#38 B4b）', () => {
     await Promise.all([p1, p2])
     expect(chat.messagesFor('c1').map((m) => m.id)).toEqual(['1'])
 
-    // 已成功加载：再次调用直接短路，不产生第二次请求。
+    // 再次打开必须重新请求（断线窗口可能已错过新消息），结果按旧→新合并。
+    mockGoApp.ListMessages.mockResolvedValueOnce([at('2', '2000')])
     await chat.loadHistory('c1')
-    expect(mockGoApp.ListMessages).toHaveBeenCalledTimes(1)
+    expect(mockGoApp.ListMessages).toHaveBeenCalledTimes(2)
+    expect(chat.messagesFor('c1').map((m) => m.id)).toEqual(['1', '2'])
   })
 
   it('resetAll 后旧的补拉响应不写回（会话代次保护）', async () => {

@@ -64,10 +64,10 @@ export const useChatStore = defineStore('chat', () => {
   // 触发一次加载检查，没有它就会打出一串重复请求。
   const mentionInflight = new Map<string, Promise<MentionCandidate[]>>()
 
-  // loadedChannels 已成功补拉过历史的频道：ChatPanel 与 ConversationChat 都
-  // 会在频道打开时调用 loadHistory，按频道记已加载 + 合并在飞请求保证只发一次。
-  // 失败不记（下次进入重试）；resetAll 清空。
-  const loadedChannels = new Set<string>()
+  // historyInflight 合并同频道的并发补拉：ChatPanel 与 ConversationChat 同时
+  // 打开同一频道时只发一次。不做「已加载」永久短路——gateway.invalid_session
+  // 的补拉只覆盖 to seenChans（本会话收过实时消息的频道），只经 loadHistory
+  // 打开过的频道若在断线期间有新消息，再次打开必须重新拉取才能补齐。
   const historyInflight = new Map<string, Promise<void>>()
 
   // lastReportedByChannel 已上报已读水位的最后一条消息 ID（#40）：同一轮不
@@ -95,12 +95,11 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   // loadHistory 打开频道/会话时补拉最近历史（旧→新），与实时消息按 ID 合并。
-  // 私聊/群聊的会话 ID 就是频道 ID。幂等：同频道已成功加载或正在加载时直接
-  // 复用，ChatPanel 与 ConversationChat 同时调用只发一次。失败上抛由调用方
-  // 静默，不阻断实时消息；失败不记已加载，下次进入会重试。
+  // 私聊/群聊的会话 ID 就是频道 ID。每次调用都重新拉取（断线窗口可能已有
+  // 新消息），同频道在飞时复用同一个 Promise，避免 ChatPanel 与
+  // ConversationChat 同时打开时重复请求。失败上抛由调用方静默，不阻断实时消息。
   function loadHistory(channelId: string): Promise<void> {
     if (!channelId) return Promise.resolve()
-    if (loadedChannels.has(channelId)) return Promise.resolve()
     const inflight = historyInflight.get(channelId)
     if (inflight) return inflight
     const gen = generation
@@ -110,7 +109,6 @@ export const useChatStore = defineStore('chat', () => {
     p = goApp().ListMessages(channelId, 50)
       .then((history) => {
         if (gen !== generation) return
-        loadedChannels.add(channelId)
         const merged = mergeHistory(history, messagesFor(channelId))
         if (!merged.length) return
         // 补拉期间可能有实时消息到达：以合并后的完整列表写回，不覆盖新消息。
@@ -311,7 +309,6 @@ export const useChatStore = defineStore('chat', () => {
     messagesByChannel.value = {}
     mentionCandidatesByChannel.value = {}
     mentionInflight.clear()
-    loadedChannels.clear()
     historyInflight.clear()
     lastReportedByChannel.clear()
   }
