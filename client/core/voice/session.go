@@ -1319,6 +1319,13 @@ func (s *Session) SendChat(channelID, content string) error {
 // SendChatWithMeta 发送带回复与 @提及的消息（#39）。replyTo 空串 = 普通消息；
 // mentions 为空 = 无提及。两者与 nonce 一起入离线队列，重连重放不丢字段。
 func (s *Session) SendChatWithMeta(channelID, content, replyTo string, mentions []string) error {
+	return s.SendChatWithAttachments(channelID, content, replyTo, mentions, nil)
+}
+
+// SendChatWithAttachments 发送带附件 ID 的消息（#41）。content 可为空串
+// （纯附件消息）；attachmentIDs 与回复/提及一样随 nonce 入离线队列，重连
+// 重发原样带回——否则弱网下附件消息会掉附件。
+func (s *Session) SendChatWithAttachments(channelID, content, replyTo string, mentions, attachmentIDs []string) error {
 	if s.ws == nil || s.ws.Closed() {
 		return fmt.Errorf("session not connected")
 	}
@@ -1331,14 +1338,18 @@ func (s *Session) SendChatWithMeta(channelID, content, replyTo string, mentions 
 	if len(s.pendingChats) >= maxPendingChats {
 		return fmt.Errorf("离线消息队列已满（%d 条），请等连接恢复后重试", maxPendingChats)
 	}
-	// 复制 mentions：调用方可能复用切片，入队后内容必须以调用时的快照为准。
+	// 复制 mentions/attachmentIDs：调用方可能复用切片，入队后内容必须以调用时的快照为准。
 	var ms []string
 	if len(mentions) > 0 {
 		ms = append([]string(nil), mentions...)
 	}
+	var as []string
+	if len(attachmentIDs) > 0 {
+		as = append([]string(nil), attachmentIDs...)
+	}
 	s.pendingChats = append(s.pendingChats, pendingChat{
 		channelID: channelID, content: content, nonce: nonce,
-		replyTo: replyTo, mentions: ms,
+		replyTo: replyTo, mentions: ms, attachmentIDs: as,
 	})
 	s.flushPendingChatsLocked()
 	return nil
@@ -1349,11 +1360,12 @@ const maxPendingChats = 64
 
 // pendingChat 一条待发消息。nonce 在用户发送时生成一次，重试不换。
 type pendingChat struct {
-	channelID string
-	content   string
-	nonce     string
-	replyTo   string   // #39 回复目标消息 ID（空 = 非回复）
-	mentions  []string // #39 被 @ 的用户 ID
+	channelID     string
+	content       string
+	nonce         string
+	replyTo       string   // #39 回复目标消息 ID（空 = 非回复）
+	mentions      []string // #39 被 @ 的用户 ID
+	attachmentIDs []string // #41 随消息发送的附件 ID（重连重发必须保留）
 }
 
 // flushPendingChats 重连后重发积压消息（OnConnect 在 ws 读循环上调用）。
@@ -1380,6 +1392,7 @@ func (s *Session) sendChatFrame(item pendingChat) error {
 	d := signal.ChatSendData{
 		ChannelID: item.channelID, Type: "text", Content: item.content,
 		ReplyTo: item.replyTo, Mentions: item.mentions,
+		AttachmentIDS: item.attachmentIDs,
 	}
 	if s.ProtocolVersion() >= 2 {
 		d.Nonce = item.nonce
@@ -1481,7 +1494,7 @@ func (s *Session) handleChatMessage(env signal.Envelope) {
 }
 
 // chatMessageDataFromDTO REST 消息 → chat.message 载荷（#32/#78 补拉回灌用）：
-// 与实时广播同口径，保留回复目标、预览与提及。
+// 与实时广播同口径，保留回复目标、预览、提及与附件。
 func chatMessageDataFromDTO(m api.MessageDTO) signal.ChatMessageData {
 	d := signal.ChatMessageData{
 		ID:        m.ID.String(),
@@ -1501,6 +1514,16 @@ func chatMessageDataFromDTO(m api.MessageDTO) signal.ChatMessageData {
 	}
 	for _, id := range m.Mentions {
 		d.Mentions = append(d.Mentions, id.String())
+	}
+	// #41：软删消息不下发附件；附件保持服务端相对 url，由 app 层拼基址。
+	if m.DeletedAt == nil && m.Attachments != nil {
+		for _, a := range *m.Attachments {
+			d.Attachments = append(d.Attachments, signal.AttachmentInfo{
+				ID: a.ID.String(), Filename: a.Filename, Size: a.Size,
+				ContentType: a.ContentType, Width: int64(a.Width), Height: int64(a.Height),
+				URL: a.URL, ThumbnailURL: a.ThumbnailURL,
+			})
+		}
 	}
 	return d
 }

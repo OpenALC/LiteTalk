@@ -1393,6 +1393,10 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 				"content": p.Content, "deleted": p.Deleted,
 			}
 		}
+		// #41：无附件时不发键，前端按无附件处理；相对 url 在这里拼成绝对地址。
+		if len(d.Attachments) > 0 {
+			payload["attachments"] = a.attachmentViewsFromSignal(d.Attachments)
+		}
 		a.emit("chat:message", payload)
 	})
 	// 服务端 error 帧转发前端（B1：此前未订阅，服务端拒收时消息凭空消失）。
@@ -1729,6 +1733,21 @@ type ChatMessageView struct {
 	ReplyTo      string            `json:"reply_to,omitempty"`
 	ReplyPreview *ReplyPreviewView `json:"reply_preview,omitempty"`
 	Mentions     []string          `json:"mentions"`
+	// Attachments 消息附件（#41）：无附件或软删消息时缺省，前端按可选处理。
+	Attachments []AttachmentView `json:"attachments,omitempty"`
+}
+
+// AttachmentView 附件桥接视图（与 api.AttachmentDTO 同口径）。url/thumbnail_url
+// 已由 chatMessageView / chat.message 载荷拼成绝对地址，前端可直接作 img src。
+type AttachmentView struct {
+	ID           string `json:"id"`
+	Filename     string `json:"filename"`
+	Size         int64  `json:"size"`
+	ContentType  string `json:"content_type"`
+	Width        int    `json:"width"`
+	Height       int    `json:"height"`
+	URL          string `json:"url"`
+	ThumbnailURL string `json:"thumbnail_url,omitempty"`
 }
 
 // ReplyPreviewView 回复目标预览（与 REST ReplyPreview 同口径）。
@@ -1747,8 +1766,9 @@ type MentionCandidateView struct {
 	Tag      string `json:"tag"`
 }
 
-// chatMessageView REST 消息 → 桥接视图（ts/edited_at/deleted_at 统一毫秒字符串）。
-func chatMessageView(m api.MessageDTO) ChatMessageView {
+// chatMessageView REST 消息 → 桥接视图（ts/edited_at/deleted_at 统一毫秒字符串；
+// 附件相对 url 拼成当前基址的绝对地址，前端可直接加载）。
+func (a *App) chatMessageView(m api.MessageDTO) ChatMessageView {
 	v := ChatMessageView{
 		ID:        m.ID.String(),
 		ChannelID: m.ChannelID.String(),
@@ -1776,7 +1796,48 @@ func chatMessageView(m api.MessageDTO) ChatMessageView {
 	for _, id := range m.Mentions {
 		v.Mentions = append(v.Mentions, id.String())
 	}
+	// 软删消息不下发附件（服务端已省略，这里再兜一层，避免墓碑后仍渲染图片）。
+	if m.DeletedAt == nil && m.Attachments != nil {
+		v.Attachments = a.attachmentViews(*m.Attachments)
+	}
 	return v
+}
+
+// attachmentViews api 附件列表 → 桥接视图，相对 url 统一拼基址。
+// api 未初始化（测试/启动早期）时保留相对地址，不 panic。
+func (a *App) attachmentViews(list []api.AttachmentDTO) []AttachmentView {
+	out := make([]AttachmentView, 0, len(list))
+	for _, at := range list {
+		out = append(out, AttachmentView{
+			ID: at.ID.String(), Filename: at.Filename, Size: at.Size,
+			ContentType: at.ContentType, Width: at.Width, Height: at.Height,
+			URL:          a.resolveAttachmentURL(at.URL),
+			ThumbnailURL: a.resolveAttachmentURL(at.ThumbnailURL),
+		})
+	}
+	return out
+}
+
+// attachmentViewsFromSignal WS chat.message 的附件载荷 → 桥接视图。
+func (a *App) attachmentViewsFromSignal(list []signal.AttachmentInfo) []AttachmentView {
+	out := make([]AttachmentView, 0, len(list))
+	for _, at := range list {
+		out = append(out, AttachmentView{
+			ID: at.ID, Filename: at.Filename, Size: at.Size,
+			ContentType: at.ContentType, Width: int(at.Width), Height: int(at.Height),
+			URL:          a.resolveAttachmentURL(at.URL),
+			ThumbnailURL: a.resolveAttachmentURL(at.ThumbnailURL),
+		})
+	}
+	return out
+}
+
+// resolveAttachmentURL 相对能力 URL → 绝对地址；空串原样返回。
+func (a *App) resolveAttachmentURL(rel string) string {
+	if rel == "" || a.api == nil {
+		return rel
+	}
+	return a.api.ResolveURL(rel)
 }
 
 // ListMessages 拉频道最近消息（旧→新，limit 由 APIClient 夹到 [1,50]）。
@@ -1795,7 +1856,7 @@ func (a *App) ListMessages(channelID string, limit int) ([]ChatMessageView, erro
 	}
 	out := make([]ChatMessageView, 0, len(msgs))
 	for _, m := range msgs {
-		out = append(out, chatMessageView(m))
+		out = append(out, a.chatMessageView(m))
 	}
 	return out, nil
 }
@@ -1817,7 +1878,7 @@ func (a *App) GetMessage(channelID, messageID string) (*ChatMessageView, error) 
 	if err != nil {
 		return nil, err
 	}
-	v := chatMessageView(*m)
+	v := a.chatMessageView(*m)
 	return &v, nil
 }
 
@@ -1838,7 +1899,7 @@ func (a *App) EditMessage(channelID, messageID, content string, mentions []strin
 	if err != nil {
 		return nil, err
 	}
-	v := chatMessageView(*m)
+	v := a.chatMessageView(*m)
 	return &v, nil
 }
 
@@ -2210,13 +2271,111 @@ func (a *App) SendChat(channelID, content string) error {
 // SendChatWithMeta 发送带回复与 @提及的消息（#39）：replyTo 空串 = 普通消息，
 // mentions 为空 = 无提及。断线时连同 nonce 入队，重连重放不丢字段。
 func (a *App) SendChatWithMeta(channelID, content, replyTo string, mentions []string) error {
+	return a.SendChatWithAttachments(channelID, content, replyTo, mentions, nil)
+}
+
+// SendChatWithAttachments 发送带附件 ID 的消息（#41）：content 可为空（纯附件
+// 消息）；未连接时与 SendChat 同口径报错。附件 ID 随离线队列重放。
+func (a *App) SendChatWithAttachments(channelID, content, replyTo string, mentions, attachmentIDs []string) error {
 	a.mu.Lock()
 	s := a.sess
 	a.mu.Unlock()
 	if s == nil {
 		return fmt.Errorf("not connected")
 	}
-	return s.SendChatWithMeta(channelID, content, replyTo, mentions)
+	return s.SendChatWithAttachments(channelID, content, replyTo, mentions, attachmentIDs)
+}
+
+// 附件选择的上限（与服务端一致）与本地读入上限。服务端真实限制是 10MiB，
+// 这里放宽到 50MiB 只为在 os.ReadFile 之前拦住误选的超大文件。
+const (
+	maxAttachmentsPerMessage = 10
+	maxAttachmentReadBytes   = 50 << 20
+)
+
+// PickAndUploadAttachments 打开系统文件选择器，逐个上传附件并返回绝对 URL 的
+// 元数据。取消返回空切片；超过 10 个或单文件超过 50MiB 在读取前直接报错。
+func (a *App) PickAndUploadAttachments() ([]api.AttachmentDTO, error) {
+	if a.wails == nil {
+		return nil, fmt.Errorf("文件选择不可用：桌面环境未就绪")
+	}
+	if a.api == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	paths, err := a.wails.Dialog.OpenFile().
+		SetTitle("选择附件").
+		AddFilter("图片", "*.png;*.jpg;*.jpeg;*.gif;*.webp").
+		AddFilter("文档", "*.pdf;*.txt;*.zip").
+		PromptForMultipleSelection()
+	if err != nil {
+		return nil, fmt.Errorf("打开文件选择器失败: %w", err)
+	}
+	return a.uploadAttachmentPaths(paths)
+}
+
+// uploadAttachmentPaths 校验并上传已选中的本地文件（从对话框逻辑拆出便于测试）。
+func (a *App) uploadAttachmentPaths(paths []string) ([]api.AttachmentDTO, error) {
+	if a.api == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	files := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if strings.TrimSpace(p) != "" {
+			files = append(files, p)
+		}
+	}
+	// 取消选择：原生对话框返回空列表。
+	if len(files) == 0 {
+		return []api.AttachmentDTO{}, nil
+	}
+	if len(files) > maxAttachmentsPerMessage {
+		return nil, fmt.Errorf("一次最多选择 %d 个附件", maxAttachmentsPerMessage)
+	}
+	// 先整体校验再逐个上传：避免部分文件已上传后才发现某个超限。
+	for _, p := range files {
+		info, err := os.Stat(p)
+		if err != nil {
+			return nil, fmt.Errorf("读取附件失败: %w", err)
+		}
+		if info.IsDir() {
+			return nil, fmt.Errorf("不能上传文件夹")
+		}
+		if info.Size() > maxAttachmentReadBytes {
+			return nil, fmt.Errorf("附件 %s 超过 50MiB", filepath.Base(p))
+		}
+	}
+	out := make([]api.AttachmentDTO, 0, len(files))
+	for _, p := range files {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil, fmt.Errorf("读取附件失败: %w", err)
+		}
+		att, err := a.api.UploadAttachment(filepath.Base(p), data)
+		if err != nil {
+			return nil, err
+		}
+		// 服务端返回相对能力 URL，立即拼成绝对地址交给前端。
+		att.URL = a.api.ResolveURL(att.URL)
+		att.ThumbnailURL = a.api.ResolveURL(att.ThumbnailURL)
+		out = append(out, *att)
+	}
+	return out, nil
+}
+
+// OpenAttachment 用系统默认浏览器打开附件（仅 http/https，拒绝 file/javascript
+// 等本地或脚本 scheme）。url 必须是 chatMessageView 产出过的绝对地址。
+func (a *App) OpenAttachment(rawURL string) error {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("附件地址无效")
+	}
+	if !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") {
+		return fmt.Errorf("仅支持打开 http/https 附件")
+	}
+	if a.wails == nil {
+		return fmt.Errorf("浏览器不可用：桌面环境未就绪")
+	}
+	return a.wails.Browser.OpenURL(u.String())
 }
 
 // GetVoiceMembers 房间成员快照。
