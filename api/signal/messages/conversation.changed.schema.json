@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litetalk:signal:conversation.changed",
+  "title": "ConversationChangedData",
+  "x-wire-type": "conversation.changed",
+  "x-go-const": "TypeConversationChanged",
+  "x-direction": "S2C",
+  "x-since": 2,
+  "x-namespace": "event",
+  "description": "会话（私聊/群聊）变更通知，只携带会话 ID 与动作；客户端收到后按 conversation_id 重新拉取会话。成员变化时相关的新旧成员都会收到；删除/退出后会话不复存在，客户端据此从列表移除。",
+  "type": "object",
+  "properties": {
+    "conversation_id": { "type": "string" },
+    "action": {
+      "type": "string",
+      "enum": ["created", "updated", "member_added", "member_removed", "deleted"],
+      "description": "created=新建会话；updated=改名；member_added=加入新成员；member_removed=移除成员或成员退出；deleted=解散或最后一人退出"
+    }
+  },
+  "required": ["conversation_id", "action"],
+  "additionalProperties": false
+}

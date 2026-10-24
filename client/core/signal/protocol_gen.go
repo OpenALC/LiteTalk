@@ -23,6 +23,7 @@ const (
 	TypeChatMessage           = "chat.message"            // S→C
 	TypeChatSend              = "chat.send"               // C→S
 	TypeClientHello           = "client.hello"            // C→S · since 2
+	TypeConversationChanged   = "conversation.changed"    // S→C · since 2
 	TypeError                 = "error"                   // S→C
 	TypeGatewayInvalidSession = "gateway.invalid_session" // S→C · since 2
 	TypeGatewayResume         = "gateway.resume"          // C→S · since 2
@@ -141,6 +142,12 @@ type ChatSendData struct {
 type ClientHelloData struct {
 	Min int64 `json:"min"` // 可接受的最低协议版本
 	Max int64 `json:"max"` // 可接受的最高协议版本
+}
+
+// ConversationChangedData 会话（私聊/群聊）变更通知，只携带会话 ID 与动作；客户端收到后按 conversation_id 重新拉取会话。成员变化时相关的新旧成员都会收到；删除/退出后会话不复存在，客户端据此从列表移除。
+type ConversationChangedData struct {
+	ConversationID string `json:"conversation_id"`
+	Action         string `json:"action"` // created=新建会话；updated=改名；member_added=加入新成员；member_removed=移除成员或成员退出；deleted=解散或最后一人退出
 }
 
 // ErrorData 下行错误。code 取值见 catalog.json error_codes。

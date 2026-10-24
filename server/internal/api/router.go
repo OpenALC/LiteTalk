@@ -30,6 +30,9 @@ type Hub interface {
 	KickChannel(channelID, reason string)
 	// SetServerMuted 服务端强制闭麦/解禁（#36）：目标不在该频道返回 signal.ErrNotInChannel。
 	SetServerMuted(channelID, userID string, muted bool) error
+	// BroadcastConversationChanged 会话变更通知（#38 B3）：uids 为十进制用户 ID，
+	// 动作见 signal.ConversationChangedData.Action。空列表不广播。
+	BroadcastConversationChanged(uids []string, conversationID, action string)
 }
 
 // PresenceReader 在线状态读取（#11）：presence:{uid} 存在 = 在线。

@@ -26,6 +26,15 @@ const (
 	maxGroupMembers = 50
 )
 
+// 会话变更动作（#38 B3，与 api/signal conversation.changed 的 action 取值对齐）。
+const (
+	conversationActionCreated       = "created"
+	conversationActionUpdated       = "updated"
+	conversationActionMemberAdded   = "member_added"
+	conversationActionMemberRemoved = "member_removed"
+	conversationActionDeleted       = "deleted"
+)
+
 // conversationScoped 是否私聊/群私聊频道。
 func conversationScoped(ch *store.Channel) bool {
 	return ch.Scope == store.ChannelScopeDirect || ch.Scope == store.ChannelScopeGroup
@@ -83,6 +92,34 @@ func (s *Server) loadConversationView(ctx context.Context, ch *store.Channel) (C
 		return Conversation{}, s.writeStoreErr(ctx, err)
 	}
 	return conversationView(ch, members), nil
+}
+
+// conversationMemberIDs 提取成员 uid（广播目标用）。
+func conversationMemberIDs(members []store.ChannelMember) []int64 {
+	out := make([]int64, 0, len(members))
+	for i := range members {
+		out = append(out, members[i].UserID)
+	}
+	return out
+}
+
+// broadcastConversation 会话变更通知（#38 B3）：DB 提交成功后调用，uid 转十进制
+// 字符串并去重；hub 未接线（测试/过渡）或列表为空时跳过。
+func (s *Server) broadcastConversation(uids []int64, conversationID int64, action string) {
+	if s.hub == nil || len(uids) == 0 {
+		return
+	}
+	seen := make(map[string]struct{}, len(uids))
+	out := make([]string, 0, len(uids))
+	for _, uid := range uids {
+		id := strconv.FormatInt(uid, 10)
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	s.hub.BroadcastConversationChanged(out, strconv.FormatInt(conversationID, 10), action)
 }
 
 // acceptedFriends 双方是否为已接受好友。反向行由 Store 归一为同一行；
@@ -224,11 +261,13 @@ func (s *Server) CreateConversation(ctx context.Context, request CreateConversat
 		}
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	v, e := s.loadConversationView(ctx, ch)
-	if e != nil {
-		return nil, e
+	members, err := s.store.ChannelMembers(ctx, ch.ID)
+	if err != nil {
+		return nil, s.writeStoreErr(ctx, err)
 	}
-	return CreateConversation201JSONResponse(v), nil
+	// 幂等命中已有会话的 200 路径不广播，只有真正新建时通知全部成员（#38 B3）。
+	s.broadcastConversation(conversationMemberIDs(members), ch.ID, conversationActionCreated)
+	return CreateConversation201JSONResponse(conversationView(ch, members)), nil
 }
 
 // GetConversation GET /api/v1/conversations/{id}（仅参与者）
@@ -279,11 +318,13 @@ func (s *Server) PatchConversation(ctx context.Context, request PatchConversatio
 	if err := s.store.UpdateChannel(ctx, ch); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	v, e := s.loadConversationView(ctx, ch)
-	if e != nil {
-		return nil, e
+	members, err := s.store.ChannelMembers(ctx, ch.ID)
+	if err != nil {
+		return nil, s.writeStoreErr(ctx, err)
 	}
-	return PatchConversation200JSONResponse(v), nil
+	// 改名通知当前全部成员（#38 B3）；客户端按 conversation_id 重拉会话。
+	s.broadcastConversation(conversationMemberIDs(members), ch.ID, conversationActionUpdated)
+	return PatchConversation200JSONResponse(conversationView(ch, members)), nil
 }
 
 // DeleteConversation DELETE /api/v1/conversations/{id}
@@ -299,9 +340,15 @@ func (s *Server) DeleteConversation(ctx context.Context, request DeleteConversat
 	if ch.Scope == store.ChannelScopeGroup && cm.Role != store.ChannelMemberOwner {
 		return nil, errf(http.StatusForbidden, "forbidden", "仅群主可解散群聊")
 	}
+	// 删除前取成员：删完行就没了，事件必须覆盖双方/全群（#38 B3）。
+	members, err := s.store.ChannelMembers(ctx, ch.ID)
+	if err != nil {
+		return nil, s.writeStoreErr(ctx, err)
+	}
 	if err := s.store.DeleteChannel(ctx, ch.ID); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
+	s.broadcastConversation(conversationMemberIDs(members), ch.ID, conversationActionDeleted)
 	return DeleteConversation204Response{}, nil
 }
 
@@ -368,11 +415,13 @@ func (s *Server) AddConversationMembers(ctx context.Context, request AddConversa
 			return nil, s.writeStoreErr(ctx, err)
 		}
 	}
-	v, e := s.loadConversationView(ctx, ch)
-	if e != nil {
-		return nil, e
+	members, err := s.store.ChannelMembers(ctx, ch.ID)
+	if err != nil {
+		return nil, s.writeStoreErr(ctx, err)
 	}
-	return AddConversationMembers200JSONResponse(v), nil
+	// 加人通知加入后的全部成员（含新成员，新成员据此拉会话，#38 B3）。
+	s.broadcastConversation(conversationMemberIDs(members), ch.ID, conversationActionMemberAdded)
+	return AddConversationMembers200JSONResponse(conversationView(ch, members)), nil
 }
 
 // RemoveConversationMember DELETE /api/v1/conversations/{id}/members/{user_id}
@@ -408,22 +457,30 @@ func (s *Server) RemoveConversationMember(ctx context.Context, request RemoveCon
 	}
 	// owner 退出：先转让给最早加入的剩余成员（无剩余则删会话），再移除自己。
 	if selfLeave && self.Role == store.ChannelMemberOwner {
+		// 删会话前留成员快照：最后一人退出时按 deleted 通知原成员。
+		before, err := s.store.ChannelMembers(ctx, ch.ID)
+		if err != nil {
+			return nil, s.writeStoreErr(ctx, err)
+		}
 		deleted, e := s.transferOwnerBeforeLeave(ctx, ch, c.UserID)
 		if e != nil {
 			return nil, e
 		}
 		if deleted {
+			s.broadcastConversation(conversationMemberIDs(before), ch.ID, conversationActionDeleted)
 			return RemoveConversationMember204Response{}, nil
 		}
 	}
 	if err := s.store.RemoveChannelMember(ctx, ch.ID, targetID); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	v, e := s.loadConversationView(ctx, ch)
-	if e != nil {
-		return nil, e
+	members, err := s.store.ChannelMembers(ctx, ch.ID)
+	if err != nil {
+		return nil, s.writeStoreErr(ctx, err)
 	}
-	return RemoveConversationMember200JSONResponse(v), nil
+	// 剩余成员 + 被移除/退出的用户都收 member_removed（#38 B3）。
+	s.broadcastConversation(append(conversationMemberIDs(members), targetID), ch.ID, conversationActionMemberRemoved)
+	return RemoveConversationMember200JSONResponse(conversationView(ch, members)), nil
 }
 
 // transferOwnerBeforeLeave 把 owner 转给最早加入的剩余成员；没有剩余成员时
