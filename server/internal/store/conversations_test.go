@@ -234,6 +234,61 @@ func runConversationsContract(t *testing.T, st Store) {
 		}
 	})
 
+	t.Run("批量成员与角色转让", func(t *testing.T) {
+		us := convUsers(t, st, 4)
+		a, b, c, d := us[0], us[1], us[2], us[3]
+
+		group := &Channel{Scope: ChannelScopeGroup, Name: "批量群"}
+		if err := st.CreateConversation(ctx, group, []int64{a.ID, b.ID, c.ID}); err != nil {
+			t.Fatalf("CreateConversation(group): %v", err)
+		}
+		direct := &Channel{Scope: ChannelScopeDirect}
+		if err := st.CreateConversation(ctx, direct, []int64{a.ID, d.ID}); err != nil {
+			t.Fatalf("CreateConversation(direct): %v", err)
+		}
+
+		// 批量成员：按频道分组、组内 joined_at/user_id 升序，不存在的频道不出现。
+		got, err := st.ChannelMembersOfChannels(ctx, []int64{group.ID, direct.ID, 999999})
+		if err != nil {
+			t.Fatalf("ChannelMembersOfChannels: %v", err)
+		}
+		if len(got) != 2 || len(got[group.ID]) != 3 || len(got[direct.ID]) != 2 {
+			t.Fatalf("批量成员分组不符: %+v", got)
+		}
+		if _, ok := got[999999]; ok {
+			t.Fatalf("不存在的频道不应出现: %+v", got)
+		}
+		wantMember(t, got[group.ID], a, ChannelMemberOwner)
+		wantMember(t, got[group.ID], b, ChannelMemberMember)
+		wantMember(t, got[direct.ID], d, ChannelMemberMember)
+		if gotGroup, err := st.ChannelMembers(ctx, group.ID); err != nil || len(gotGroup) != 3 {
+			t.Fatalf("ChannelMembers 与批量结果不一致: %+v %v", gotGroup, err)
+		}
+		if empty, err := st.ChannelMembersOfChannels(ctx, nil); err != nil || len(empty) != 0 {
+			t.Fatalf("空入参应返回空 map: %+v %v", empty, err)
+		}
+
+		// 角色转让：group 成员可升 owner，读回生效。
+		if err := st.SetChannelMemberRole(ctx, group.ID, b.ID, ChannelMemberOwner); err != nil {
+			t.Fatalf("SetChannelMemberRole: %v", err)
+		}
+		if cm, err := st.ChannelMember(ctx, group.ID, b.ID); err != nil || cm.Role != ChannelMemberOwner {
+			t.Fatalf("角色未更新: %+v %v", cm, err)
+		}
+		if err := st.SetChannelMemberRole(ctx, group.ID, 999999, ChannelMemberMember); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("成员不存在应 ErrNotFound，实际 %v", err)
+		}
+		if err := st.SetChannelMemberRole(ctx, group.ID, b.ID, ChannelMemberRole("admin")); !errors.Is(err, ErrForbidden) {
+			t.Fatalf("非法角色应 ErrForbidden，实际 %v", err)
+		}
+		if err := st.SetChannelMemberRole(ctx, direct.ID, a.ID, ChannelMemberOwner); !errors.Is(err, ErrForbidden) {
+			t.Fatalf("direct 改角色应 ErrForbidden，实际 %v", err)
+		}
+		if err := st.SetChannelMemberRole(ctx, 999999, a.ID, ChannelMemberMember); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("频道不存在应 ErrNotFound，实际 %v", err)
+		}
+	})
+
 	t.Run("server 频道回归与构造器边界", func(t *testing.T) {
 		us := convUsers(t, st, 3)
 		a, b := us[0], us[1]
@@ -290,6 +345,9 @@ func runConversationsContract(t *testing.T, st Store) {
 		}
 		if err := st.RemoveChannelMember(ctx, ch.ID, a.ID); !errors.Is(err, ErrForbidden) {
 			t.Fatalf("server 频道 RemoveChannelMember 应 ErrForbidden，实际 %v", err)
+		}
+		if err := st.SetChannelMemberRole(ctx, ch.ID, a.ID, ChannelMemberMember); !errors.Is(err, ErrForbidden) {
+			t.Fatalf("server 频道 SetChannelMemberRole 应 ErrForbidden，实际 %v", err)
 		}
 		if err := st.AddChannelMember(ctx, 999999, a.ID, ChannelMemberMember); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("不存在频道 AddChannelMember 应 ErrNotFound，实际 %v", err)

@@ -110,3 +110,14 @@ func (b *PatchCategoryBody) UnmarshalJSON(data []byte) error {
 		"name": &b.Name, "position": &b.Position,
 	})
 }
+
+// PatchConversationBody PATCH /conversations/{id} 合并补丁体（name，#38 B2）。
+// 缺省不改；null/空串在 handler 里按必填字段校验拒 400，不做「清空」语义。
+type PatchConversationBody struct {
+	Name OptString
+}
+
+// UnmarshalJSON 三态解码。
+func (b *PatchConversationBody) UnmarshalJSON(data []byte) error {
+	return decodeMergePatch(data, map[string]mergeField{"name": &b.Name})
+}

@@ -23,8 +23,16 @@ func (s *Server) ListMessages(ctx context.Context, request ListMessagesRequestOb
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	// 有 ViewChannel 才能读频道消息（#35 B3；成员身份包含在权限判定里）。
-	if e := s.requireChannelPerm(ctx, ch, c.UserID, store.ViewChannel); e != nil {
+	// 会话频道（#38 B2）：成员即拥有 View，跳过服务器 authz；非成员按 404
+	// 处理，不泄露会话是否存在。服务器频道仍走权限门（#35 B3）。
+	if conversationScoped(ch) {
+		if _, err := s.store.ChannelMember(ctx, ch.ID, c.UserID); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return nil, errf(http.StatusNotFound, "not_found", "资源不存在")
+			}
+			return nil, s.writeStoreErr(ctx, err)
+		}
+	} else if e := s.requireChannelPerm(ctx, ch, c.UserID, store.ViewChannel); e != nil {
 		return nil, e
 	}
 	// 游标互斥：before（含旧别名 before_id）优先于 after。
@@ -92,11 +100,21 @@ func (s *Server) CreateMessage(ctx context.Context, request CreateMessageRequest
 		return nil, errf(http.StatusBadRequest, "bad_channel", "只能向文字频道发消息")
 	}
 	// VIEW+SEND 双门（#35 B3），且在 nonce 幂等回读之前——无权者连回显都拿不到。
-	if e := s.requireChannelPerm(ctx, ch, c.UserID, store.ViewChannel); e != nil {
-		return nil, e
-	}
-	if e := s.requireChannelPerm(ctx, ch, c.UserID, store.SendMessages); e != nil {
-		return nil, e
+	// 会话频道（#38 B2）：成员同时拥有 View/Send，跳过服务器 authz；非成员 404。
+	if conversationScoped(ch) {
+		if _, err := s.store.ChannelMember(ctx, ch.ID, c.UserID); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return nil, errf(http.StatusNotFound, "not_found", "资源不存在")
+			}
+			return nil, s.writeStoreErr(ctx, err)
+		}
+	} else {
+		if e := s.requireChannelPerm(ctx, ch, c.UserID, store.ViewChannel); e != nil {
+			return nil, e
+		}
+		if e := s.requireChannelPerm(ctx, ch, c.UserID, store.SendMessages); e != nil {
+			return nil, e
+		}
 	}
 	content := request.Body.Content
 	if n := len([]rune(content)); n == 0 || n > 2000 {

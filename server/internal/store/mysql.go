@@ -856,6 +856,65 @@ func (m *MySQL) ChannelMember(ctx context.Context, channelID, userID int64) (*Ch
 		channelMemberJoin+` WHERE cm.channel_id = ? AND cm.user_id = ?`, channelID, userID))
 }
 
+// ChannelMembersOfChannels 批量成员（#38 B2）：一条 IN 查询，组内排序与
+// ChannelMembers 一致；空入参直接返回空 map，不发 SQL。
+func (m *MySQL) ChannelMembersOfChannels(ctx context.Context, channelIDs []int64) (map[int64][]ChannelMember, error) {
+	out := map[int64][]ChannelMember{}
+	if len(channelIDs) == 0 {
+		return out, nil
+	}
+	args := make([]any, len(channelIDs))
+	for i, id := range channelIDs {
+		args[i] = id
+	}
+	rows, err := m.db.QueryContext(ctx,
+		channelMemberJoin+` WHERE cm.channel_id IN (`+placeholders(len(args))+`)
+		 ORDER BY cm.channel_id, cm.joined_at, cm.user_id`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		cm, err := scanChannelMember(rows)
+		if err != nil {
+			return nil, err
+		}
+		out[cm.ChannelID] = append(out[cm.ChannelID], *cm)
+	}
+	return out, rows.Err()
+}
+
+// placeholders 生成 SQL 的 ?,?,? 序列（调用方保证 n > 0）。
+func placeholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
+func (m *MySQL) SetChannelMemberRole(ctx context.Context, channelID, userID int64, role ChannelMemberRole) error {
+	role, err := normalizeChannelMemberRole(role)
+	if err != nil {
+		return err
+	}
+	var scope ChannelScope
+	if err := m.db.QueryRowContext(ctx, `SELECT scope FROM channels WHERE id = ?`, channelID).Scan(&scope); err != nil {
+		if err == sql.ErrNoRows {
+			return ErrNotFound
+		}
+		return err
+	}
+	if scope != ChannelScopeGroup {
+		return ErrForbidden
+	}
+	res, err := m.db.ExecContext(ctx,
+		`UPDATE channel_members SET role = ? WHERE channel_id = ? AND user_id = ?`, role, channelID, userID)
+	if err != nil {
+		return err
+	}
+	return checkAffected(res)
+}
+
 func (m *MySQL) AddChannelMember(ctx context.Context, channelID, userID int64, role ChannelMemberRole) error {
 	role, err := normalizeChannelMemberRole(role)
 	if err != nil {

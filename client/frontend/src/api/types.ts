@@ -30,6 +30,12 @@ export type SetMemberRolesRequest = components['schemas']['SetMemberRolesRequest
 export type ChannelOverwrite = components['schemas']['ChannelOverwrite']
 export type SetOverwriteRequest = components['schemas']['SetOverwriteRequest']
 export type AuditLogEntry = components['schemas']['AuditLogEntry']
+// #38 B2：私聊/群私聊会话（无服务器频道；消息仍走 channel_id）。
+export type Conversation = components['schemas']['Conversation']
+export type ConversationMember = components['schemas']['ConversationMember']
+export type CreateConversationRequest = components['schemas']['CreateConversationRequest']
+export type PatchConversationRequest = components['schemas']['PatchConversationRequest']
+export type AddConversationMembersRequest = components['schemas']['AddConversationMembersRequest']
 
 // ---- 桥接层兼容名（组件/stores 既有命名）----
 // Wails 绑定经 Go state 包中转：字段与契约同源，个别桥接补充字段见注释。

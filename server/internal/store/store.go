@@ -321,8 +321,14 @@ type Store interface {
 	ListConversations(ctx context.Context, userID int64) ([]Channel, error)
 	// ChannelMembers 成员列表，按 joined_at、user_id 升序；频道不存在返回空列表。
 	ChannelMembers(ctx context.Context, channelID int64) ([]ChannelMember, error)
+	// ChannelMembersOfChannels 批量成员列表（#38 B2，GET /conversations 用），
+	// 按 channel_id 分组，组内 joined_at、user_id 升序；不存在的频道不出现。
+	ChannelMembersOfChannels(ctx context.Context, channelIDs []int64) (map[int64][]ChannelMember, error)
 	// ChannelMember 单个成员；非成员或频道不存在返回 ErrNotFound。
 	ChannelMember(ctx context.Context, channelID, userID int64) (*ChannelMember, error)
+	// SetChannelMemberRole 改成员角色（#38 B2 owner 转让用）。只接受 group 频道；
+	// direct/server 或非法角色返回 ErrForbidden，频道/成员不存在返回 ErrNotFound。
+	SetChannelMemberRole(ctx context.Context, channelID, userID int64, role ChannelMemberRole) error
 	// AddChannelMember 只接受 group 频道；role 空串按 member 处理，
 	// direct/server 频道或非法角色返回 ErrForbidden，重复成员返回 ErrConflict。
 	// direct 成员固定为双方，增删留给 B2 的 API 语义，不在 Store 放开。

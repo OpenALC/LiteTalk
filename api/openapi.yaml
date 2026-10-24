@@ -32,6 +32,8 @@ tags:
     description: 当前用户
   - name: friends
     description: 好友与好友请求
+  - name: conversations
+    description: 私聊与群私聊（无服务器频道；消息走 /channels/{id}/messages）
   - name: servers
     description: 服务器、成员与邀请
   - name: channels
@@ -481,6 +483,231 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/FriendEntry'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/conversations:
+    get:
+      operationId: listConversations
+      summary: 我的私聊/群私聊列表
+      description: >
+        返回当前用户参与的 direct/group 会话，按 created_at 倒序；每项内联成员
+        （成员只含昵称/tag，不含 email）。空结果为 [] 而非 null。
+        code：401；5xx internal。
+      tags: [conversations]
+      responses:
+        '200':
+          description: 会话数组（created_at 倒序）
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Conversation'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        default:
+          $ref: '#/components/responses/Internal'
+    post:
+      operationId: createConversation
+      summary: 创建私聊/群私聊
+      description: >
+        kind=direct：user_ids 恰好 1 人（不含创建者），双方必须是已接受好友；
+        同一对用户已有 direct 会话时幂等返回原会话（200），新建返回 201。
+        kind=group：user_ids 2–49 人（总人数 3–50），创建者必须是每个被邀请者的
+        已接受好友，创建者记 owner；name 可空，给出时为 1–64 字符。
+        user_ids 不得包含创建者、不得重复、不得为 0。
+        code：bad_kind、bad_members、bad_name、bad_request、too_large、路径参数不合法；
+        401；403 not_friend；429 rate_limited（10 次/分/用户）；5xx internal。
+      tags: [conversations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateConversationRequest'
+      responses:
+        '200':
+          description: 已存在同一对用户的 direct 会话（幂等命中，原会话）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Conversation'
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Conversation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/conversations/{id}:
+    get:
+      operationId: getConversation
+      summary: 会话详情（仅参与者）
+      description: >
+        仅参与者可读；非参与者与不存在一样返回 404 not_found，不泄露会话是否存在。
+        code：bad_request、路径参数不合法；401；404 not_found；5xx internal。
+      tags: [conversations]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      responses:
+        '200':
+          description: 会话（含成员）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Conversation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
+    patch:
+      operationId: patchConversation
+      summary: 群聊改名（仅 owner）
+      description: >
+        group 仅 owner 可改，name 为 1–64 字符；direct 返回 400 not_group
+        （私聊没有名字语义）。非参与者 404 not_found。
+        code：bad_name、not_group、bad_request、too_large、路径参数不合法；401；
+        403 forbidden；404 not_found；429 rate_limited（10 次/分/用户）；5xx internal。
+      tags: [conversations]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/PatchConversationRequest'
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchConversationRequest'
+      responses:
+        '200':
+          description: 更新后的会话
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Conversation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Internal'
+    delete:
+      operationId: deleteConversation
+      summary: 删除会话（direct 任一方；group 仅 owner）
+      description: >
+        硬删除：会话行、channel_members 与消息一并删除（direct 双方都消失）。
+        group 非 owner 返回 403 forbidden；非参与者与不存在一样返回 404 not_found，
+        不泄露会话是否存在。
+        code：bad_request、路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
+      tags: [conversations]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      responses:
+        '204':
+          description: 已删除（无响应体）
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/conversations/{id}/members:
+    post:
+      operationId: addConversationMembers
+      summary: 群聊加人（仅 owner）
+      description: >
+        仅 group；owner 只能添加自己的已接受好友；添加后总人数（含创建者）不得超过 50。
+        user_ids 不得重复、不得为 0、不得包含自己、不得已是成员。
+        code：not_group、bad_members、too_many_members、bad_request、too_large、
+        路径参数不合法；401；403 forbidden / not_friend；404 not_found；
+        409 conflict（并发重复添加）；429 rate_limited（20 次/分/用户）；5xx internal。
+      tags: [conversations]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddConversationMembersRequest'
+      responses:
+        '200':
+          description: 更新后的会话（含新成员）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Conversation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/conversations/{id}/members/{user_id}:
+    delete:
+      operationId: removeConversationMember
+      summary: 移除/退出群聊成员
+      description: >
+        仅 group。owner 可移除任意成员或自己退出，普通成员只能移除自己（leave）；
+        owner 退出时把 owner 转给最早加入的剩余成员；最后一人退出时会话随之删除。
+        非成员或目标不存在返回 404 not_found；非 owner 移除他人 403 forbidden；
+        direct 返回 400 not_group（删除私聊用 DELETE /conversations/{id}）。
+        code：not_group、bad_request、路径参数不合法；401；403 forbidden；
+        404 not_found；5xx internal。
+      tags: [conversations]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+        - $ref: '#/components/parameters/UserIDPath'
+      responses:
+        '200':
+          description: 更新后的会话（owner 转让后 role 已更新）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Conversation'
+        '204':
+          description: 最后一名成员已退出，会话被删除（无响应体）
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -1952,6 +2179,92 @@ components:
           type: string
           x-go-type: ID
           description: channel_id 所属服务器 ID（#92，可选）；与 channel_id 同现同缺。
+    Conversation:
+      type: object
+      title: Conversation
+      description: >
+        私聊/群私聊会话（#38 B2，无服务器频道）。kind=direct 时 name 无意义，
+        可能为空串；成员只含昵称/tag，不含 email。ID 为十进制字符串。
+      required: [id, kind, name, members, created_at]
+      properties:
+        id:
+          type: string
+          x-go-type: ID
+        kind:
+          type: string
+          enum: [direct, group]
+        name:
+          type: string
+          description: 群聊名；direct 忽略（可能为空串）
+        members:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConversationMember'
+        created_at:
+          type: string
+          format: date-time
+          x-go-type: Time
+    ConversationMember:
+      type: object
+      title: ConversationMember
+      description: 会话成员（内联昵称/tag，不含 email）。owner 只用于 group，direct 双方都是 member。
+      required: [user_id, nickname, tag, role, joined_at]
+      properties:
+        user_id:
+          type: string
+          x-go-type: ID
+        nickname:
+          type: string
+        tag:
+          type: string
+        role:
+          type: string
+          enum: [owner, member]
+        joined_at:
+          type: string
+          format: date-time
+          x-go-type: Time
+    CreateConversationRequest:
+      type: object
+      title: CreateConversationRequest
+      required: [kind, user_ids]
+      properties:
+        kind:
+          type: string
+          enum: [direct, group]
+        user_ids:
+          type: array
+          description: >
+            被邀请用户 ID（不含创建者）。direct 恰好 1 个；group 2–49 个
+            （总人数含创建者 3–50）。不得重复、不得为 0。
+          items:
+            type: string
+            x-go-type: ID
+        name:
+          type: string
+          description: 群聊名称（可选；给出时 1–64 字符，direct 忽略）
+    PatchConversationRequest:
+      type: object
+      title: PatchConversationRequest
+      x-go-type: PatchConversationBody
+      description: >
+        JSON Merge Patch（RFC 7396）：缺省 = 不改；name 为 1–64 字符，
+        null/空串被校验拒 400。仅 group owner 可写。
+      properties:
+        name:
+          type: string
+          nullable: true
+    AddConversationMembersRequest:
+      type: object
+      title: AddConversationMembersRequest
+      required: [user_ids]
+      properties:
+        user_ids:
+          type: array
+          description: 要添加的用户 ID（至少 1 个；添加后总人数不得超过 50）
+          items:
+            type: string
+            x-go-type: ID
     ServerChannels:
       type: object
       title: ServerChannels
