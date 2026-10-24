@@ -2,7 +2,7 @@
 // ChatPanel 聊天视图公共壳：头部（图标/标题/副标题/操作）+ 消息列表 + 输入发送。
 // 文字频道（TextChat）与私聊/群聊（ConversationChat）共用，避免复制样式。
 // 不做本地乐观回显——服务端会把消息广播回发送者，本地再插一条即双显。
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { Send } from 'lucide-vue-next'
 import { useChatStore } from '../stores/chat'
 
@@ -42,6 +42,11 @@ watch(() => messages.value.length, () => {
 // 切换频道/会话时回到最新一条（历史补拉到达后由 length 变化再跟一次）。
 watch(() => props.channelId, () => {
   stick = true
+  scrollToBottom()
+})
+
+// 挂载时桶里可能已有消息（切走再切回）：直接定位到最新一条。
+onMounted(() => {
   scrollToBottom()
 })
 
