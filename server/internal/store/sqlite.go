@@ -439,6 +439,13 @@ func (s *SQLite) DeleteServer(ctx context.Context, id int64) error {
 		     (SELECT id FROM channels WHERE server_id = ?))`, id); err != nil {
 		return err
 	}
+	// 全文索引项先于 messages 删除（#42）：外部内容表还能读到正文，直接删能清掉词项。
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM messages_fts WHERE rowid IN (
+		   SELECT id FROM messages WHERE channel_id IN
+		     (SELECT id FROM channels WHERE server_id = ?))`, id); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM messages WHERE channel_id IN (SELECT id FROM channels WHERE server_id = ?)`, id); err != nil {
 		return err
@@ -660,6 +667,13 @@ func (s *SQLite) DeleteChannel(ctx context.Context, id int64) error {
 	// 提及没有外键，必须先于 messages 删除（含子频道消息，#39）。
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM message_mentions WHERE message_id IN (
+		   SELECT id FROM messages WHERE channel_id = ?
+		      OR channel_id IN (SELECT id FROM channels WHERE parent_id = ?))`, id, id); err != nil {
+		return err
+	}
+	// 全文索引项先于 messages 删除（#42，含子频道）。
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM messages_fts WHERE rowid IN (
 		   SELECT id FROM messages WHERE channel_id = ?
 		      OR channel_id IN (SELECT id FROM channels WHERE parent_id = ?))`, id, id); err != nil {
 		return err
@@ -969,6 +983,16 @@ func (s *SQLite) DeleteCategoryWithChannels(ctx context.Context, id int64) error
 		   ))`, id, id); err != nil {
 		return err
 	}
+	// 全文索引项先于 messages 删除（#42，分类下全部频道与子频道）。
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM messages_fts WHERE rowid IN (
+		   SELECT id FROM messages WHERE channel_id IN (
+		     SELECT id FROM channels WHERE category_id = ?
+		     UNION
+		     SELECT id FROM channels WHERE parent_id IN (SELECT id FROM channels WHERE category_id = ?)
+		   ))`, id, id); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM messages WHERE channel_id IN (
 		   SELECT id FROM channels WHERE category_id = ?
@@ -1112,6 +1136,10 @@ func (s *SQLite) CreateMessage(ctx context.Context, msg *Message) error {
 		if isDupSQLite(err) {
 			return ErrConflict
 		}
+		return err
+	}
+	// 全文索引与消息同事务写入（0016；SQLite 不用触发器，见迁移注释）。
+	if err := ftsInsertMessage(ctx, tx, msg.ID, msg.Content); err != nil {
 		return err
 	}
 	if err := insertMessageMentions(ctx, tx, msg.ID, normalizeMentions(msg.Mentions)); err != nil {
@@ -1285,33 +1313,34 @@ func (s *SQLite) MentionsOfMessages(ctx context.Context, ids []int64) (map[int64
 	return out, rows.Err()
 }
 
-// UpdateMessageContent 同一事务更新正文与编辑时间并整体替换提及（#39）。
-// 软删行与不存在的 id 一律 ErrNotFound：墓碑不可再编辑。
+// UpdateMessageContent 同一事务更新正文/编辑时间、整体替换提及（#39）并同步
+// 全文索引（#42）。软删行与不存在的 id 一律 ErrNotFound：墓碑不可再编辑。
 func (s *SQLite) UpdateMessageContent(ctx context.Context, id int64, content string, mentions []int64, editedAt time.Time) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	res, err := tx.ExecContext(ctx,
+	// 先读旧正文：FTS5 外部内容表的 delete 命令需要旧词项，改完就取不到了。
+	var oldContent string
+	err = tx.QueryRowContext(ctx,
+		`SELECT content FROM messages WHERE id = ? AND deleted_at IS NULL`, id).Scan(&oldContent)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
 		`UPDATE messages SET content = ?, edited_at = ? WHERE id = ? AND deleted_at IS NULL`,
-		content, editedAt, id)
-	if err != nil {
+		content, editedAt, id); err != nil {
 		return err
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		// 与 MySQL/Mem 对齐：值全同不误报 404，只有行不存在或已软删才 ErrNotFound。
-		var one int
-		err := tx.QueryRowContext(ctx,
-			`SELECT 1 FROM messages WHERE id = ? AND deleted_at IS NULL`, id).Scan(&one)
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrNotFound
+	if oldContent != content {
+		if err := ftsDeleteMessage(ctx, tx, id, oldContent); err != nil {
+			return err
 		}
-		if err != nil {
+		if err := ftsInsertMessage(ctx, tx, id, content); err != nil {
 			return err
 		}
 	}
@@ -1324,16 +1353,32 @@ func (s *SQLite) UpdateMessageContent(ctx context.Context, id int64, content str
 	return tx.Commit()
 }
 
-// SoftDeleteMessage 软删（#39）：置 deleted_at、清空正文，行保留供回复引用。
-// 单条 UPDATE 自身原子；deleted_at IS NULL 条件让重复删除返回 ErrNotFound。
+// SoftDeleteMessage 软删（#39）：置 deleted_at、清空正文，行保留供回复引用；
+// 同事务移除全文索引项（#42）。deleted_at IS NULL 条件让重复删除返回 ErrNotFound。
 func (s *SQLite) SoftDeleteMessage(ctx context.Context, id int64, deletedAt time.Time) error {
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE messages SET deleted_at = ?, content = '' WHERE id = ? AND deleted_at IS NULL`,
-		deletedAt, id)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	return checkAffected(res)
+	defer func() { _ = tx.Rollback() }()
+	var oldContent string
+	err = tx.QueryRowContext(ctx,
+		`SELECT content FROM messages WHERE id = ? AND deleted_at IS NULL`, id).Scan(&oldContent)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE messages SET deleted_at = ?, content = '' WHERE id = ? AND deleted_at IS NULL`,
+		deletedAt, id); err != nil {
+		return err
+	}
+	if err := ftsDeleteMessage(ctx, tx, id, oldContent); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ---- attachments（迁移 0015，#41 B1） ----

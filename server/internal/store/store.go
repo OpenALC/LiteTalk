@@ -417,6 +417,13 @@ type Store interface {
 	// SoftDeleteMessage 软删：置 deleted_at、清空正文，保留行供回复引用；已删除或
 	// 不存在返回 ErrNotFound（重复删除的幂等语义由 API 层决定）。
 	SoftDeleteMessage(ctx context.Context, id int64, deletedAt time.Time) error
+	// SearchMessages 在给定频道集合内按正文搜索（#42 B1）。只返回未软删的消息，
+	// 排序为相关度优先、同分按消息 ID 倒序；limit 夹到 [1,50]。
+	// channelIDs 为空或 query trim 后为空返回空结果（不报错）。SQLite/MySQL 对
+	// 过短的查询（SQLite <3 字符、MySQL <2 字符）回退 LIKE；Mem 一律做
+	// 大小写不敏感的子串匹配，不计算相关度（同分口径即 ID 倒序）。
+	// 频道可见性由调用方负责，store 只按传入的 channelIDs 过滤。
+	SearchMessages(ctx context.Context, channelIDs []int64, query string, limit int) ([]Message, error)
 
 	// attachments（迁移 0015，#41 B1）
 	// CreateAttachment 写入附件元数据；ID 未预置时取 Snowflake，回填 CreatedAt。

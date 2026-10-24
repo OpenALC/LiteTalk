@@ -291,9 +291,10 @@ func TestSQLiteKVMigrationRoundTrip(t *testing.T) {
 	}
 	assertKVTable(t, sq, true)
 
-	// 0006_kv 之上可能已有更新迁移（当前 0007_message_nonce_channel）；
+	// 0006_kv 之上可能已有更新迁移（当前 0016_message_search）；
 	// 逐个回滚到 kv 表消失，避免测试绑定“kv 永远是最后一版”。
-	for i := 0; i < 10 && kvTableExists(t, sq); i++ {
+	// 上限留足余量：新增迁移不需要再改这里。
+	for i := 0; i < 30 && kvTableExists(t, sq); i++ {
 		if err := sq.RollbackLast(ctx, migFS); err != nil {
 			t.Fatalf("回滚到 0006_kv 失败: %v", err)
 		}
