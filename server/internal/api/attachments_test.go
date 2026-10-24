@@ -196,6 +196,8 @@ func TestAttachmentUploadDownload(t *testing.T) {
 	}
 	if cd := dl.Header().Get("Content-Disposition"); !strings.HasPrefix(cd, "inline;") {
 		t.Fatalf("图片应 inline，实际 %q", cd)
+	} else if !strings.Contains(cd, "filename*=utf-8''") {
+		t.Fatalf("中文文件名应按 RFC 2231 转义，实际 %q", cd)
 	}
 	if cc := dl.Header().Get("Cache-Control"); cc != downloadCacheControl {
 		t.Fatalf("Cache-Control=%q", cc)
