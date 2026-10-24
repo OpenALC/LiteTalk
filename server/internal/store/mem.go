@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -27,6 +28,8 @@ type Mem struct {
 	sessions map[int64]map[string]*UserSession // userID → deviceType → session
 	// channelMembers 会话成员（迁移 0012，#38）：channelID → userID → 成员。
 	channelMembers map[int64]map[int64]*ChannelMember
+	// readStates 已读水位（迁移 0014，#40）：userID → channelID → 最后已读消息 id。
+	readStates map[int64]map[int64]int64
 
 	roles       map[int64]*Role                                     // roleID → role（迁移 0010）
 	memberRoles map[int64]map[int64]map[int64]*MemberRoleAssignment // serverID → userID → roleID → 分配
@@ -57,6 +60,7 @@ func NewMem() *Mem {
 		invites:        map[string]*Invite{},
 		sessions:       map[int64]map[string]*UserSession{},
 		channelMembers: map[int64]map[int64]*ChannelMember{},
+		readStates:     map[int64]map[int64]int64{},
 		roles:          map[int64]*Role{},
 		memberRoles:    map[int64]map[int64]map[int64]*MemberRoleAssignment{},
 		overwrites:     map[overwriteKey]*ChannelOverwrite{},
@@ -1091,6 +1095,88 @@ func (m *Mem) SoftDeleteMessage(_ context.Context, id int64, deletedAt time.Time
 	msg.DeletedAt = &deleted
 	msg.Content = ""
 	return nil
+}
+
+// ---- read_states（迁移 0014，#40 B1） ----
+
+// ReadState 返回该用户在该频道的已读水位；无记录 ErrNotFound。
+func (m *Mem) ReadState(_ context.Context, userID, channelID int64) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	last, ok := m.readStates[userID][channelID]
+	if !ok {
+		return 0, ErrNotFound
+	}
+	return last, nil
+}
+
+// SetReadState 只前进：新值不大于旧值时保持原水位（多设备乱序上报）。
+func (m *Mem) SetReadState(_ context.Context, userID, channelID, messageID int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ch := m.readStates[userID]
+	if ch == nil {
+		ch = map[int64]int64{}
+		m.readStates[userID] = ch
+	}
+	if old, ok := ch[channelID]; !ok || messageID > old {
+		ch[channelID] = messageID
+	}
+	return nil
+}
+
+// EnsureReadState 仅补缺失行；已有水位绝不覆盖。
+func (m *Mem) EnsureReadState(_ context.Context, userID, channelID, messageID int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ch := m.readStates[userID]
+	if ch == nil {
+		ch = map[int64]int64{}
+		m.readStates[userID] = ch
+	}
+	if _, ok := ch[channelID]; !ok {
+		ch[channelID] = messageID
+	}
+	return nil
+}
+
+// UnreadCounts 单用户多频道批量统计；请求项全部出现在结果里（0 值项保留）。
+func (m *Mem) UnreadCounts(_ context.Context, userID int64, channelIDs []int64) (map[int64]Unread, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[int64]Unread, len(channelIDs))
+	for _, channelID := range channelIDs {
+		out[channelID] = m.unreadLocked(userID, channelID)
+	}
+	return out, nil
+}
+
+// UnreadCountsForUsers 单频道多用户批量统计；没有 read_states 行的用户按水位 0 计。
+func (m *Mem) UnreadCountsForUsers(_ context.Context, channelID int64, userIDs []int64) (map[int64]Unread, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[int64]Unread, len(userIDs))
+	for _, userID := range userIDs {
+		out[userID] = m.unreadLocked(userID, channelID)
+	}
+	return out, nil
+}
+
+// unreadLocked 计算未读/提及（调用方须持锁）：水位之后、非本人、未软删的消息；
+// 提及数再从中筛 message_mentions。无 read_states 行时 nil map 取零即水位 0。
+func (m *Mem) unreadLocked(userID, channelID int64) Unread {
+	last := m.readStates[userID][channelID]
+	var out Unread
+	for _, msg := range m.messages {
+		if msg.ChannelID != channelID || msg.ID <= last || msg.UserID == userID || msg.DeletedAt != nil {
+			continue
+		}
+		out.UnreadCount++
+		if slices.Contains(m.mentions[msg.ID], userID) {
+			out.MentionCount++
+		}
+	}
+	return out
 }
 
 // ---- invites ----

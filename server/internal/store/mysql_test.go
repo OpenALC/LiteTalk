@@ -40,7 +40,7 @@ func TestMySQLMigrateAndCRUD(t *testing.T) {
 	// 清理历史。必须覆盖每条迁移建过的表（否则跨运行不幂等：上一轮留下的表会让
 	// 下一轮 CREATE TABLE 直接 1050）——新增迁移建表要同步这张清单。
 	for _, tbl := range []string{
-		"invites", "messages", "message_mentions", "channel_members", "channels", "categories", "server_members",
+		"read_states", "invites", "messages", "message_mentions", "channel_members", "channels", "categories", "server_members",
 		"servers", "friendships", "users", "user_sessions", "kv", "schema_migrations",
 		"audit_log", "channel_overwrites", "member_roles", "roles",
 	} {

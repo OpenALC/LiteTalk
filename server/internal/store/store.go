@@ -183,6 +183,12 @@ type Message struct {
 	SenderTag      string `json:"sender_tag,omitempty" db:"-"`
 }
 
+// Unread 某用户在某频道的未读数与未读提及数（#40 B1）。
+type Unread struct {
+	UnreadCount  int `json:"unread_count"`
+	MentionCount int `json:"mention_count"`
+}
+
 // Invite 邀请码。
 type Invite struct {
 	Code      string     `json:"code" db:"code"`
@@ -381,6 +387,21 @@ type Store interface {
 	// SoftDeleteMessage 软删：置 deleted_at、清空正文，保留行供回复引用；已删除或
 	// 不存在返回 ErrNotFound（重复删除的幂等语义由 API 层决定）。
 	SoftDeleteMessage(ctx context.Context, id int64, deletedAt time.Time) error
+
+	// read_states（迁移 0014，#40 B1）：每用户每频道一条「最后已读消息 id」水位。
+	// 未读 = 频道中 id 大于水位、非本人、未软删的消息；提及 = 其中提及该用户的条数。
+	// 没有 read_states 行的用户按水位 0 计（升级前历史已由迁移回填，见 0014）。
+	// ReadState 无记录返回 ErrNotFound。
+	ReadState(ctx context.Context, userID, channelID int64) (int64, error)
+	// SetReadState 原子 upsert 取 max(旧, 新)：多设备乱序上报只前进不回退。
+	SetReadState(ctx context.Context, userID, channelID, messageID int64) error
+	// EnsureReadState 仅在无记录时插入，绝不覆盖已有水位（升级回填/首次进入用）。
+	EnsureReadState(ctx context.Context, userID, channelID, messageID int64) error
+	// UnreadCounts 单用户多频道批量统计；空入参返回空 map。频道无消息也保留 0 值项。
+	UnreadCounts(ctx context.Context, userID int64, channelIDs []int64) (map[int64]Unread, error)
+	// UnreadCountsForUsers 单频道多用户批量统计（成员列表用）；没有 read_states
+	// 行的用户按水位 0 计，空入参返回空 map。
+	UnreadCountsForUsers(ctx context.Context, channelID int64, userIDs []int64) (map[int64]Unread, error)
 
 	// invites
 	CreateInvite(ctx context.Context, inv *Invite) error

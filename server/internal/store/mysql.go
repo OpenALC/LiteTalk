@@ -1403,6 +1403,109 @@ func (m *MySQL) SoftDeleteMessage(ctx context.Context, id int64, deletedAt time.
 	return checkAffected(res)
 }
 
+// ---- read_states（迁移 0014，#40 B1） ----
+
+// ReadState 返回该用户在该频道的已读水位；无记录 ErrNotFound。
+func (m *MySQL) ReadState(ctx context.Context, userID, channelID int64) (int64, error) {
+	var last int64
+	err := m.db.QueryRowContext(ctx,
+		`SELECT last_read_message_id FROM read_states WHERE user_id = ? AND channel_id = ?`,
+		userID, channelID).Scan(&last)
+	if err == sql.ErrNoRows {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, err
+	}
+	return last, nil
+}
+
+// SetReadState 原子 upsert 并取 max：多设备乱序上报不会把水位拉回去。
+func (m *MySQL) SetReadState(ctx context.Context, userID, channelID, messageID int64) error {
+	_, err := m.db.ExecContext(ctx,
+		`INSERT INTO read_states (user_id, channel_id, last_read_message_id) VALUES (?, ?, ?)
+		 ON DUPLICATE KEY UPDATE
+		     last_read_message_id = GREATEST(read_states.last_read_message_id, VALUES(last_read_message_id))`,
+		userID, channelID, messageID)
+	return err
+}
+
+// EnsureReadState 仅补缺失行；已有水位绝不覆盖。
+func (m *MySQL) EnsureReadState(ctx context.Context, userID, channelID, messageID int64) error {
+	_, err := m.db.ExecContext(ctx,
+		`INSERT IGNORE INTO read_states (user_id, channel_id, last_read_message_id) VALUES (?, ?, ?)`,
+		userID, channelID, messageID)
+	return err
+}
+
+// UnreadCounts 一条查询统计单用户在多个频道的未读/提及数；请求项全部出现在
+// 结果里（无消息或已读完为 0）。参数顺序：频道 id 列表 → userID 三次（水位
+// 关联、排除本人、提及关联）。
+func (m *MySQL) UnreadCounts(ctx context.Context, userID int64, channelIDs []int64) (map[int64]Unread, error) {
+	out := map[int64]Unread{}
+	if len(channelIDs) == 0 {
+		return out, nil
+	}
+	args := append(int64Args(channelIDs), userID, userID, userID)
+	rows, err := m.db.QueryContext(ctx,
+		`SELECT t.channel_id, COUNT(msg.id), COUNT(mm.message_id)
+		   FROM `+derivedUnion("channel_id", len(channelIDs))+` t
+		   LEFT JOIN read_states rs ON rs.channel_id = t.channel_id AND rs.user_id = ?
+		   LEFT JOIN messages msg ON msg.channel_id = t.channel_id
+		        AND msg.id > COALESCE(rs.last_read_message_id, 0)
+		        AND msg.user_id <> ?
+		        AND msg.deleted_at IS NULL
+		   LEFT JOIN message_mentions mm ON mm.message_id = msg.id AND mm.user_id = ?
+		  GROUP BY t.channel_id`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var channelID int64
+		var u Unread
+		if err := rows.Scan(&channelID, &u.UnreadCount, &u.MentionCount); err != nil {
+			return nil, err
+		}
+		out[channelID] = u
+	}
+	return out, rows.Err()
+}
+
+// UnreadCountsForUsers 一条查询统计某频道内多个用户的未读/提及数；没有
+// read_states 行的用户按水位 0 计（其全部历史消息都算未读）。
+// 参数顺序：用户 id 列表 → channelID 两次（水位关联、消息过滤）。
+func (m *MySQL) UnreadCountsForUsers(ctx context.Context, channelID int64, userIDs []int64) (map[int64]Unread, error) {
+	out := map[int64]Unread{}
+	if len(userIDs) == 0 {
+		return out, nil
+	}
+	args := append(int64Args(userIDs), channelID, channelID)
+	rows, err := m.db.QueryContext(ctx,
+		`SELECT t.user_id, COUNT(msg.id), COUNT(mm.message_id)
+		   FROM `+derivedUnion("user_id", len(userIDs))+` t
+		   LEFT JOIN read_states rs ON rs.user_id = t.user_id AND rs.channel_id = ?
+		   LEFT JOIN messages msg ON msg.channel_id = ?
+		        AND msg.id > COALESCE(rs.last_read_message_id, 0)
+		        AND msg.user_id <> t.user_id
+		        AND msg.deleted_at IS NULL
+		   LEFT JOIN message_mentions mm ON mm.message_id = msg.id AND mm.user_id = t.user_id
+		  GROUP BY t.user_id`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var userID int64
+		var u Unread
+		if err := rows.Scan(&userID, &u.UnreadCount, &u.MentionCount); err != nil {
+			return nil, err
+		}
+		out[userID] = u
+	}
+	return out, rows.Err()
+}
+
 // ---- invites ----
 
 func (m *MySQL) CreateInvite(ctx context.Context, inv *Invite) error {
