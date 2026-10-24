@@ -29,6 +29,8 @@ const mockGoApp = vi.hoisted(() => ({
   DeleteMessage: vi.fn(),
   GetMessage: vi.fn(),
   ListMentionCandidates: vi.fn(),
+  // #40 已读上报
+  MarkChannelRead: vi.fn(),
 }))
 vi.mock('../api/bridge', () => ({ goApp: () => mockGoApp, eventsOn: mockEventsOn.on }))
 
@@ -38,6 +40,7 @@ import { useAuthStore } from './auth'
 import { useConversationsStore } from './conversations'
 import { useServersStore } from './data'
 import { useNotifyStore } from './notify'
+import { useUnreadsStore } from './unreads'
 
 const msg = (id: string, channelId = 'c1'): ChatMessage => ({
   id, channel_id: channelId, user_id: 'u1', nickname: '甲', content: 'hi',
@@ -183,8 +186,27 @@ describe('chat store 历史补拉（#38 B4b）', () => {
     await chat.loadHistory('c1')
     expect(chat.messagesByChannel).toEqual({})
 
+    // c1 已成功加载过（幂等短路），失败路径换一个频道验证。
     mockGoApp.ListMessages.mockRejectedValueOnce(new Error('boom'))
-    await expect(chat.loadHistory('c1')).rejects.toThrow('boom')
+    await expect(chat.loadHistory('c2')).rejects.toThrow('boom')
+  })
+
+  it('loadHistory 幂等：已加载频道不再请求，并发调用只发一次', async () => {
+    const chat = useChatStore()
+    let resolve!: (v: ChatMessage[]) => void
+    mockGoApp.ListMessages.mockReturnValue(new Promise<ChatMessage[]>((r) => { resolve = r }))
+
+    const p1 = chat.loadHistory('c1')
+    const p2 = chat.loadHistory('c1')
+    expect(mockGoApp.ListMessages).toHaveBeenCalledTimes(1)
+
+    resolve([at('1', '1000')])
+    await Promise.all([p1, p2])
+    expect(chat.messagesFor('c1').map((m) => m.id)).toEqual(['1'])
+
+    // 已成功加载：再次调用直接短路，不产生第二次请求。
+    await chat.loadHistory('c1')
+    expect(mockGoApp.ListMessages).toHaveBeenCalledTimes(1)
   })
 
   it('resetAll 后旧的补拉响应不写回（会话代次保护）', async () => {
@@ -421,5 +443,81 @@ describe('chat store 消息编辑/删除/回复/提及（#39）', () => {
       mentions: ['u1'],
     })
     expect(merged[0].reply_preview?.nickname).toBe('丙')
+  })
+})
+
+// #40：已读上报（打开频道/会话时把最新一条消息标记为已读）。
+describe('chat store 已读上报（#40）', () => {
+  const m = (id: string, ts: string): ChatMessage => ({
+    id, channel_id: 'c1', user_id: 'u1', nickname: '甲', content: 'hi', ts,
+  })
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    mockEventsOn.reset()
+    for (const fn of Object.values(mockGoApp)) fn.mockReset()
+    mockGoApp.MarkChannelRead.mockResolvedValue({
+      channel_id: 'c1', unread_count: 0, mention_count: 0,
+    })
+  })
+
+  it('只在最新消息 ID 变化时上报', async () => {
+    const chat = useChatStore()
+    chat.messagesByChannel = { c1: [m('1', '1000'), m('2', '2000')] }
+
+    await chat.markRead('c1')
+    expect(mockGoApp.MarkChannelRead).toHaveBeenCalledWith('c1', '2')
+
+    // 同一条最新消息重复触发（重渲染/重复 watch）不重复请求。
+    await chat.markRead('c1')
+    expect(mockGoApp.MarkChannelRead).toHaveBeenCalledTimes(1)
+
+    chat.messagesByChannel = { c1: [m('1', '1000'), m('2', '2000'), m('3', '3000')] }
+    await chat.markRead('c1')
+    expect(mockGoApp.MarkChannelRead).toHaveBeenCalledTimes(2)
+    expect(mockGoApp.MarkChannelRead).toHaveBeenLastCalledWith('c1', '3')
+  })
+
+  it('无消息不上报', async () => {
+    const chat = useChatStore()
+    await chat.markRead('c1')
+    expect(mockGoApp.MarkChannelRead).not.toHaveBeenCalled()
+  })
+
+  it('成功后用返回计数覆盖 unreads store', async () => {
+    const chat = useChatStore()
+    const unreads = useUnreadsStore()
+    unreads.channels = { c1: { unread: 5, mentions: 2 } }
+    chat.messagesByChannel = { c1: [m('9', '9000')] }
+    mockGoApp.MarkChannelRead.mockResolvedValue({
+      channel_id: 'c1', unread_count: 0, mention_count: 0,
+    })
+
+    await chat.markRead('c1')
+
+    expect(unreads.channel('c1')).toEqual({ unread: 0, mentions: 0 })
+  })
+
+  it('失败静默且不记录已上报：下次触发重试', async () => {
+    const chat = useChatStore()
+    chat.messagesByChannel = { c1: [m('1', '1000')] }
+    mockGoApp.MarkChannelRead.mockRejectedValueOnce(new Error('boom'))
+
+    await expect(chat.markRead('c1')).resolves.toBeUndefined()
+    await chat.markRead('c1')
+
+    expect(mockGoApp.MarkChannelRead).toHaveBeenCalledTimes(2)
+  })
+
+  it('resetAll 清空已上报记录，重新登录后同一条消息可再上报', async () => {
+    const chat = useChatStore()
+    chat.messagesByChannel = { c1: [m('1', '1000')] }
+    await chat.markRead('c1')
+    expect(mockGoApp.MarkChannelRead).toHaveBeenCalledTimes(1)
+
+    chat.resetAll()
+    chat.messagesByChannel = { c1: [m('1', '1000')] }
+    await chat.markRead('c1')
+    expect(mockGoApp.MarkChannelRead).toHaveBeenCalledTimes(2)
   })
 })
