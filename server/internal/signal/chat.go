@@ -21,6 +21,8 @@ type ChatStore interface {
 	// MembersOfServer 全量成员（#32 事件面广播定向：成员的全部会话进环，
 	// 不再只推在线连接——断线续传窗口内的会话要能补发）。
 	MembersOfServer(ctx context.Context, serverID int64) ([]store.ServerMember, error)
+	// ChannelMembers 会话成员（#38）：私聊/群聊的可见性与广播范围都以成员表为准。
+	ChannelMembers(ctx context.Context, channelID int64) ([]store.ChannelMember, error)
 }
 
 // RateLimiter 发送频控接口（auth.RateLimit 满足；nil 时不限流）。
@@ -39,7 +41,9 @@ const (
 // handleChatSend 文字消息发送：内容/类型/长度校验 → 权限 → 幂等 → 频控 → 落库 → 广播。
 // 广播范围（#32 事件面 + #35 B3 过滤）：该频道所属服务器**有 ViewChannel 的成员会话**——
 // 在线实时投递，断线续传窗口内的进事件环补发；无权限成员两路都不收。
-// dev 内置房间回退为房内广播。文字消息只进文字频道（语音频道 bad_message，#35 B3）。
+// 私聊/群聊频道（#38）以 channel_members 为唯一权限口径：成员即可见可发，广播目标
+// 即全部成员（含发送者），不查服务器权限。dev 内置房间回退为房内广播。
+// 文字消息只进文字频道（语音频道 bad_message，#35 B3）。
 //
 // nonce 幂等（#31）：同频道同用户同 nonce 只落一条、只广播一次；重复请求把原消息
 // 定向回显给发起者（不进事件环、不再打扰其他成员），弱网重试据此对账。
@@ -68,36 +72,66 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 	ctx := context.Background()
 
 	// 权限二选一：当前在该房间（M2 dev 房间场景）；
-	// 或 channel_id 为数字频道且本人是该频道所属服务器成员（文字频道场景）。
+	// 或 channel_id 为数字频道且本人有该频道的发送资格（服务器文字频道 / 会话成员）。
 	inRoom := c.roomIDLocked() == d.ChannelID
 	var (
 		chID, uid int64
 		serverID  int64
 		persist   bool // 有 store 频道实体：落库 + 幂等 + 事件面广播
+		// convMembers 非 nil = 私聊/群聊频道：成员表同时是发送资格与广播范围，
+		// 跳过服务器 authz（成员即拥有 View/Send）。
+		convMembers []store.ChannelMember
 	)
 	if id, err := strconv.ParseInt(d.ChannelID, 10, 64); err == nil && h.chatStore != nil {
 		if ch, err := h.chatStore.ChannelByID(ctx, id); err == nil {
-			serverID = ch.ServerID
-			if u, err := strconv.ParseInt(c.userID, 10, 64); err == nil {
-				if _, err := h.chatStore.Member(ctx, ch.ServerID, u); err == nil {
-					chID, uid, persist = id, u, true
-					// 频道类型检查（#35 B3）：文字消息只进文字频道，语音频道 bad_message。
-					// 放在成员判定之后——非成员统一 forbidden，不泄露频道类型。
-					if ch.Type != store.ChannelText {
-						h.sendError(c, ErrCodeBadMessage, "语音频道不支持文字消息")
-						return
+			u, uerr := strconv.ParseInt(c.userID, 10, 64)
+			if isConversationChannel(ch) {
+				// 会话频道（#38）：非成员与非会话一律 not_found，不泄露会话是否存在。
+				if uerr != nil {
+					h.sendError(c, ErrCodeNotFound, "会话不存在")
+					return
+				}
+				members, merr := h.chatStore.ChannelMembers(ctx, id)
+				if merr != nil {
+					h.log.Printf("chat: 查会话 %d 成员失败: %v", id, merr)
+					h.sendError(c, ErrCodeInternal, "消息发送失败")
+					return
+				}
+				if !hasChannelMember(members, u) {
+					h.sendError(c, ErrCodeNotFound, "会话不存在")
+					return
+				}
+				// 类型检查放在成员判定之后——非成员统一 not_found，不泄露频道类型。
+				if ch.Type != store.ChannelText {
+					h.sendError(c, ErrCodeBadMessage, "会话不支持文字消息")
+					return
+				}
+				chID, uid, persist, convMembers = id, u, true, members
+			} else {
+				serverID = ch.ServerID
+				if uerr == nil {
+					if _, err := h.chatStore.Member(ctx, ch.ServerID, u); err == nil {
+						chID, uid, persist = id, u, true
+						// 频道类型检查（#35 B3）：文字消息只进文字频道，语音频道 bad_message。
+						// 放在成员判定之后——非成员统一 forbidden，不泄露频道类型。
+						if ch.Type != store.ChannelText {
+							h.sendError(c, ErrCodeBadMessage, "语音频道不支持文字消息")
+							return
+						}
 					}
 				}
 			}
 		}
 	}
+	// dev 内置房间（无 store 实体）才走 inRoom；真实会话频道已在上面判定，
+	// 非成员不会被房间归属绕过。
 	if !inRoom && !persist {
 		h.sendError(c, ErrCodeForbidden, "无权向该频道发送消息")
 		return
 	}
-	// B3 权限：store 频道需 ViewChannel+SendMessages（在幂等回读之前）；
-	// dev 内置房间维持原语义（无频道实体，进房即可见）。
-	if persist {
+	// B3 权限：store 服务器频道需 ViewChannel+SendMessages（在幂等回读之前）；
+	// 会话频道成员即拥有权限；dev 内置房间维持原语义（无频道实体，进房即可见）。
+	if persist && convMembers == nil {
 		for _, perm := range []store.Permission{store.ViewChannel, store.SendMessages} {
 			if code, msg := h.checkPerm(ctx, uid, serverID, chID, perm, "无权向该频道发送消息"); code != "" {
 				h.sendError(c, code, msg)
@@ -155,12 +189,18 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 		out.ID = strconv.FormatInt(out.TS, 10)
 	}
 
-	// 广播（#32 事件面）：store 频道 → 该服务器有 ViewChannel 的成员会话（逐收件人
-	// 过滤（#35 B3）：无权限者不进事件环、不收实时投递，单个收件人查询失败只记日志
-	// 跳过——不能把整条消息拖成 500）；dev 房间 → 房内成员。
+	// 广播（#32 事件面）：会话频道 → 全部成员（含发送者，成员表即权限表）；
+	// 服务器频道 → 该服务器有 ViewChannel 的成员会话（逐收件人过滤（#35 B3）：
+	// 无权限者不进事件环、不收实时投递，单个收件人查询失败只记日志跳过——
+	// 不能把整条消息拖成 500）；dev 房间 → 房内成员。
 	// 发送者恒在目标内（前端以广播替换本地回显，不另做回执）。
 	uids := map[string]bool{c.userID: true}
-	if persist {
+	switch {
+	case convMembers != nil:
+		for _, m := range convMembers {
+			uids[formatUID(m.UserID)] = true
+		}
+	case persist:
 		members, err := h.chatStore.MembersOfServer(ctx, serverID)
 		if err != nil {
 			h.log.Printf("chat: 查服务器 %d 成员失败: %v", serverID, err)
@@ -178,7 +218,7 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 				uids[formatUID(m.UserID)] = true
 			}
 		}
-	} else {
+	default:
 		h.mu.Lock()
 		if room := h.rooms[d.ChannelID]; room != nil {
 			for _, m := range room.members {
@@ -188,6 +228,40 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 		h.mu.Unlock()
 	}
 	h.broadcastEvent(uids, TypeChatMessage, out)
+}
+
+// isConversationChannel 是否私聊/群聊频道（#38）：无服务器、成员表定义权限。
+func isConversationChannel(ch *store.Channel) bool {
+	return ch.Scope == store.ChannelScopeDirect || ch.Scope == store.ChannelScopeGroup
+}
+
+// hasChannelMember 会话成员表是否包含 uid。
+func hasChannelMember(members []store.ChannelMember, uid int64) bool {
+	for _, m := range members {
+		if m.UserID == uid {
+			return true
+		}
+	}
+	return false
+}
+
+// BroadcastConversationChanged 会话变更通知（#38 B3）：REST 在 DB 提交成功后调用，
+// 目标为相关成员 uid（十进制字符串，调用方已去重）。空列表直接返回。
+// 走事件面广播：在线连接实时投递，断线续传窗口内的会话进环补发。
+func (h *Hub) BroadcastConversationChanged(uids []string, conversationID, action string) {
+	if len(uids) == 0 {
+		return
+	}
+	targets := make(map[string]bool, len(uids))
+	for _, uid := range uids {
+		if uid != "" {
+			targets[uid] = true
+		}
+	}
+	h.broadcastEvent(targets, TypeConversationChanged, ConversationChangedData{
+		ConversationID: conversationID,
+		Action:         action,
+	})
 }
 
 // permCheckQuiet 只要结果不翻译错误码（广播过滤用：失败=跳过该收件人）。

@@ -16,12 +16,48 @@ import (
 // #36 服务端强制闭麦 REST：权限门、频道形态、自我操作、目标不在房与审计。
 
 // fakeHub 记录 SetServerMuted 调用；按 "channelID|userID" 模拟目标不在房。
-// KickChannel 也记录（#37 删频道/分类的踢房断言）。
+// KickChannel 也记录（#37 删频道/分类的踢房断言）；会话变更通知同样记录（#38 B3）。
 type fakeHub struct {
 	mu    sync.Mutex
 	calls []string
 	notIn map[string]bool
 	kicks []string
+
+	convEvents []convEvent
+}
+
+// convEvent 一次 conversation.changed 广播的断言快照。
+type convEvent struct {
+	uids   []string
+	id     string
+	action string
+}
+
+func (f *fakeHub) BroadcastConversationChanged(uids []string, conversationID, action string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.convEvents = append(f.convEvents, convEvent{
+		uids:   append([]string(nil), uids...),
+		id:     conversationID,
+		action: action,
+	})
+}
+
+// lastConvEvent 最近一次会话变更通知（无则 ok=false）。
+func (f *fakeHub) lastConvEvent() (convEvent, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.convEvents) == 0 {
+		return convEvent{}, false
+	}
+	return f.convEvents[len(f.convEvents)-1], true
+}
+
+// convLog 全部会话变更通知的快照。
+func (f *fakeHub) convLog() []convEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]convEvent(nil), f.convEvents...)
 }
 
 func (f *fakeHub) Kick(uid, dev, reason string) {}

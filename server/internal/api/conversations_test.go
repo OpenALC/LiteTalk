@@ -417,3 +417,97 @@ func manyIDs(n int) []string {
 	}
 	return out
 }
+
+// wantConvEvent 断言最近一次 conversation.changed：会话 ID、动作与目标 uid 集合
+// （顺序不敏感，且不得重复）。
+func wantConvEvent(t *testing.T, hub *fakeHub, convID int64, action string, uids ...int64) {
+	t.Helper()
+	ev, ok := hub.lastConvEvent()
+	if !ok {
+		t.Fatalf("未收到 %s 会话变更通知", action)
+	}
+	if ev.id != strconv.FormatInt(convID, 10) || ev.action != action {
+		t.Fatalf("会话变更通知不符: id=%s action=%s，期望 id=%d action=%s",
+			ev.id, ev.action, convID, action)
+	}
+	got := make(map[string]bool, len(ev.uids))
+	for _, uid := range ev.uids {
+		got[uid] = true
+	}
+	if len(got) != len(ev.uids) {
+		t.Fatalf("%s 通知目标重复: %v", action, ev.uids)
+	}
+	want := make(map[string]bool, len(uids))
+	for _, uid := range uids {
+		want[strconv.FormatInt(uid, 10)] = true
+	}
+	if len(got) != len(want) {
+		t.Fatalf("%s 通知目标 = %v，期望 %v", action, ev.uids, uids)
+	}
+	for uid := range want {
+		if !got[uid] {
+			t.Fatalf("%s 通知缺少成员 %s: %v", action, uid, ev.uids)
+		}
+	}
+}
+
+// TestConversationChangeEvents REST 变更 → conversation.changed（#38 B3）：
+// 创建/改名/加人/移除/退出/删除的目标范围与动作，direct 幂等命中不广播。
+func TestConversationChangeEvents(t *testing.T) {
+	w := newConvWorld(t)
+	hub := &fakeHub{notIn: map[string]bool{}}
+	w.srv.hub = hub
+
+	// 建群（alice + bob + carol）：created 通知全部成员。
+	group := postJSON(t, w.h, "/api/v1/conversations", w.alice, map[string]any{
+		"kind": "group", "name": "事件群", "user_ids": uidList(w.bobID, w.carolID),
+	}, http.StatusCreated)
+	gid := asID(group["id"])
+	wantConvEvent(t, hub, gid, "created", w.aliceID, w.bobID, w.carolID)
+
+	// 改名：updated 通知当前全部成员。
+	doJSON(t, w.h, http.MethodPatch, fmt.Sprintf("/api/v1/conversations/%d", gid), w.alice,
+		map[string]any{"name": "改名群"}, http.StatusOK)
+	wantConvEvent(t, hub, gid, "updated", w.aliceID, w.bobID, w.carolID)
+
+	// 加 dave：member_added 通知加入后的全部成员（含新成员）。
+	postJSON(t, w.h, fmt.Sprintf("/api/v1/conversations/%d/members", gid), w.alice,
+		map[string]any{"user_ids": uidList(w.daveID)}, http.StatusOK)
+	wantConvEvent(t, hub, gid, "member_added", w.aliceID, w.bobID, w.carolID, w.daveID)
+
+	// 移除 dave：member_removed 通知剩余成员 + 被移除者。
+	doJSON(t, w.h, http.MethodDelete, fmt.Sprintf("/api/v1/conversations/%d/members/%d", gid, w.daveID),
+		w.alice, nil, http.StatusOK)
+	wantConvEvent(t, hub, gid, "member_removed", w.aliceID, w.bobID, w.carolID, w.daveID)
+
+	// direct：created 通知双方；幂等命中不产生新通知。
+	direct := postJSON(t, w.h, "/api/v1/conversations", w.alice,
+		map[string]any{"kind": "direct", "user_ids": uidList(w.bobID)}, http.StatusCreated)
+	did := asID(direct["id"])
+	wantConvEvent(t, hub, did, "created", w.aliceID, w.bobID)
+	before := len(hub.convLog())
+	postJSON(t, w.h, "/api/v1/conversations", w.bob,
+		map[string]any{"kind": "direct", "user_ids": uidList(w.aliceID)}, http.StatusOK)
+	if got := len(hub.convLog()); got != before {
+		t.Fatalf("direct 幂等命中不应广播，事件数 %d → %d", before, got)
+	}
+
+	// 删除 direct：deleted 通知双方（删除前取成员）。
+	doJSON(t, w.h, http.MethodDelete, fmt.Sprintf("/api/v1/conversations/%d", did), w.bob, nil, http.StatusNoContent)
+	wantConvEvent(t, hub, did, "deleted", w.aliceID, w.bobID)
+
+	// 群主退出转让：member_removed 通知剩余成员 + 退出者。
+	doJSON(t, w.h, http.MethodDelete, fmt.Sprintf("/api/v1/conversations/%d/members/%d", gid, w.aliceID),
+		w.alice, nil, http.StatusOK)
+	wantConvEvent(t, hub, gid, "member_removed", w.aliceID, w.bobID, w.carolID)
+
+	// 新群主 bob 退出：转让给 carol，仍为 member_removed。
+	doJSON(t, w.h, http.MethodDelete, fmt.Sprintf("/api/v1/conversations/%d/members/%d", gid, w.bobID),
+		w.bob, nil, http.StatusOK)
+	wantConvEvent(t, hub, gid, "member_removed", w.bobID, w.carolID)
+
+	// 最后一人退出即删会话：deleted 通知原成员。
+	doJSON(t, w.h, http.MethodDelete, fmt.Sprintf("/api/v1/conversations/%d/members/%d", gid, w.carolID),
+		w.carol, nil, http.StatusNoContent)
+	wantConvEvent(t, hub, gid, "deleted", w.carolID)
+}
