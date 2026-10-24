@@ -148,7 +148,46 @@ func (f *Fetcher) Fetch(ctx context.Context, rawURL string) (*Preview, error) {
 	if resp.Request != nil && resp.Request.URL != nil {
 		pageURL = resp.Request.URL
 	}
-	return parseHTML(pageURL, body)
+	p, err := parseHTML(pageURL, body)
+	if err != nil {
+		return nil, err
+	}
+	// 图片地址最终复核：服务端从不抓图片，但绝不能把指向内网的 URL 交给
+	// 客户端 webview 加载。字面量 IP 已由 validateURL 拦截，域名型地址在这里
+	// 解析并逐 IP 校验；任何失败都清空图片而不是让整条预览失败。
+	// 残余风险：客户端加载图片时会自行再解析一次 DNS，服务端无法钉住那次
+	// 解析结果（DNS 重绑定）；这里挡住的是「服务端明知是私网仍返回」的情况。
+	if p.ImageURL != "" && !f.imageURLAllowed(ctx, p.ImageURL) {
+		p.ImageURL = ""
+	}
+	return p, nil
+}
+
+// imageURLAllowed 判断图片地址是否可以交给客户端加载：scheme/userinfo/host
+// 复用 validateURL；字面量 IP 直接用黑名单判定，域名通过注入的 lookupIP 解析，
+// 任一解析结果被禁或解析失败都拒绝。
+func (f *Fetcher) imageURLAllowed(ctx context.Context, raw string) bool {
+	u, err := validateURL(raw)
+	if err != nil {
+		return false
+	}
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	if i := strings.LastIndexByte(host, '%'); i >= 0 {
+		host = host[:i]
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return !isBlockedIP(ip)
+	}
+	ips, err := f.lookupIP(ctx, host)
+	if err != nil || len(ips) == 0 {
+		return false
+	}
+	for _, ipAddr := range ips {
+		if isBlockedIP(ipAddr.IP) {
+			return false
+		}
+	}
+	return true
 }
 
 // isHTMLContentType 只接受 text/html 与 application/xhtml+xml（忽略 charset 等参数）。
@@ -166,8 +205,8 @@ func isHTMLContentType(ct string) bool {
 }
 
 // resolveImageURL 把页面里的图片地址解析为绝对 URL，并复用 validateURL 的
-// scheme/userinfo/字面量 IP 校验（域名解析校验交给加载图片的客户端；服务端
-// 从不抓取图片，避免把预览接口变成图片代理）。
+// scheme/userinfo/字面量 IP 校验。域名解析校验不在这里做（保持 parseHTML 为
+// 纯函数、离线可测），由 Fetch 返回前统一经 imageURLAllowed 处理。
 func resolveImageURL(page *url.URL, raw string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {

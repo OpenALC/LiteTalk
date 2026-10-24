@@ -72,6 +72,10 @@ var blockedNets = mustCIDRs(
 	"240.0.0.0/4",     // 保留（含 255.255.255.255 广播）
 	"::/128",          // 未指定
 	"::1/128",         // IPv6 回环
+	"::/96",           // IPv4-compatible（已废弃；攻击者可借网关折算到私网 IPv4）
+	"64:ff9b::/96",    // NAT64 well-known prefix（内嵌 IPv4，可折算）
+	"64:ff9b:1::/48",  // NAT64 local-use
+	"2002::/16",       // 6to4（内嵌 IPv4，可折算）
 	"fc00::/7",        // IPv6 ULA
 	"fe80::/10",       // IPv6 链路本地
 	"ff00::/8",        // IPv6 组播

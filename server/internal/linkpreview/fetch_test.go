@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -36,6 +37,8 @@ func fakeResponse(t *testing.T, status int, contentType, body string) http.Round
 
 func TestFetchSuccess(t *testing.T) {
 	f := New(Config{Timeout: time.Second, MaxBytes: 32 << 10})
+	// 页面走 fake RoundTripper；图片域名的 DNS 校验走注入的 lookup（公网）。
+	f.lookupIP = fakeLookup("93.184.216.34")
 	body := `<html><head>
 		<title>页面标题</title>
 		<meta property="og:description" content="页面描述">
@@ -160,6 +163,55 @@ func TestFetchRedirectToPrivateBlocked(t *testing.T) {
 	})
 	if _, err := f.Fetch(context.Background(), "https://example.com/"); !errors.Is(err, ErrBlocked) {
 		t.Fatalf("错误 = %v，期望 ErrBlocked", err)
+	}
+}
+
+func TestFetchValidatesImageHost(t *testing.T) {
+	const body = `<html><head><title>标题</title>
+		<meta property="og:image" content="https://images.example.com/a.png"></head></html>`
+	lookupErr := errors.New("dns down")
+	cases := []struct {
+		name   string
+		lookup func(context.Context, string) ([]net.IPAddr, error)
+		want   string
+	}{
+		{"解析到私网清空", fakeLookup("10.0.0.5"), ""},
+		{"多记录含私网清空", fakeLookup("93.184.216.34", "10.0.0.5"), ""},
+		{"解析到公网保留", fakeLookup("93.184.216.34"), "https://images.example.com/a.png"},
+		{"解析失败清空", func(context.Context, string) ([]net.IPAddr, error) { return nil, lookupErr }, ""},
+		{"解析为空清空", func(context.Context, string) ([]net.IPAddr, error) { return nil, nil }, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := New(Config{Timeout: time.Second})
+			f.lookupIP = tc.lookup
+			f.client.Transport = fakeResponse(t, http.StatusOK, "text/html", body)
+			p, err := f.Fetch(context.Background(), "https://example.com/page")
+			if err != nil {
+				t.Fatalf("Fetch: %v", err)
+			}
+			if p.ImageURL != tc.want {
+				t.Fatalf("ImageURL = %q，期望 %q", p.ImageURL, tc.want)
+			}
+		})
+	}
+}
+
+func TestFetchImageHostLookupUsesImageHost(t *testing.T) {
+	const body = `<html><head><title>标题</title>
+		<meta property="og:image" content="https://images.example.com/a.png"></head></html>`
+	f := New(Config{Timeout: time.Second})
+	var gotHost string
+	f.lookupIP = func(_ context.Context, host string) ([]net.IPAddr, error) {
+		gotHost = host
+		return []net.IPAddr{{IP: net.ParseIP("93.184.216.34")}}, nil
+	}
+	f.client.Transport = fakeResponse(t, http.StatusOK, "text/html", body)
+	if _, err := f.Fetch(context.Background(), "https://example.com/page"); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if gotHost != "images.example.com" {
+		t.Fatalf("图片校验解析了 %q，期望 images.example.com", gotHost)
 	}
 }
 

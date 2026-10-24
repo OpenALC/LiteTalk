@@ -59,6 +59,17 @@ func TestIsBlockedIP(t *testing.T) {
 		{"::ffff:10.0.0.1", true},
 		{"::ffff:169.254.169.254", true},
 		{"::ffff:8.8.8.8", false},
+		// 可折算到 IPv4 的过渡/转换地址段：整段拒绝
+		{"::10.0.0.1", true},            // IPv4-compatible（::/96）
+		{"::169.254.169.254", true},     // IPv4-compatible 云元数据
+		{"::8.8.8.8", true},             // IPv4-compatible 整段拒绝
+		{"64:ff9b::10.0.0.1", true},     // NAT64 well-known
+		{"64:ff9b::a00:1", true},        // NAT64 十六进制写法
+		{"64:ff9b::8.8.8.8", true},      // NAT64 整段拒绝
+		{"64:ff9b:1::a00:1", true},      // NAT64 local-use
+		{"2002:a00:1::", true},          // 6to4 内嵌 10.0.0.1
+		{"2002:808:808::1", true},       // 6to4 整段拒绝
+		{"2001:4860:4860::8844", false}, // 公网 IPv6 不受影响
 	}
 	for _, tc := range tests {
 		ip := net.ParseIP(tc.ip)
