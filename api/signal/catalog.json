@@ -48,6 +48,12 @@
       "comment": "提及目标不合法（#39）：非正 ID 或目标用户不可见该频道"
     },
     {
+      "go_name": "ErrCodeBadAttachment",
+      "value": "bad_attachment",
+      "since": 2,
+      "comment": "附件不合法（#41）：不存在、非本人上传、已被引用或超过 10 个"
+    },
+    {
       "go_name": "ErrCodeProtocolUnsupported",
       "value": "protocol_unsupported",
       "since": 2

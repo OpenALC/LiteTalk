@@ -476,7 +476,10 @@ type CreateInviteRequest struct {
 
 // CreateMessageRequest defines model for CreateMessageRequest.
 type CreateMessageRequest struct {
-	// Content 1–2000 字符
+	// AttachmentIds 随消息发送的附件 ID（#41）：最多 10 个、元素为正整数（十进制字符串）且 不可重复；只能引用本人上传且尚未被其它消息认领的附件。不能解析、超限、 重复、附件不存在、非本人上传或已被引用一律 400 bad_attachment。 给出附件时 content 可为空串。
+	AttachmentIds *[]string `json:"attachment_ids,omitempty"`
+
+	// Content 0–2000 字符。带 attachment_ids 时允许空串（纯附件消息）； 没有附件时至少 1 个字符，否则 400 bad_content。
 	Content string `json:"content"`
 
 	// Mentions @提及用户 ID（#39）：去重，元素须 > 0；每个用户必须是该频道可见成员， 否则 400 bad_mention。
@@ -647,11 +650,13 @@ type MentionCandidate struct {
 	UserId   ID     `json:"user_id"`
 }
 
-// Message 文字频道消息（发送者昵称/tag 内联，不含邮箱）。ID 为十进制字符串（#31）。 #39：edited_at/deleted_at 为编辑/软删时间；reply_to 为回复目标 ID， reply_preview 为跳转预览；mentions 为被 @ 的用户 ID（升序去重）。 软删消息 content 为空串、deleted_at 有值，仍出现在列表与单条响应里供回复引用。
+// Message 文字频道消息（发送者昵称/tag 内联，不含邮箱）。ID 为十进制字符串（#31）。 #39：edited_at/deleted_at 为编辑/软删时间；reply_to 为回复目标 ID， reply_preview 为跳转预览；mentions 为被 @ 的用户 ID（升序去重）。 软删消息 content 为空串、deleted_at 有值，仍出现在列表与单条响应里供回复引用， 但不返回 attachments（即使附件行仍在库里）。 #41：attachments 为消息携带的附件元数据（按附件 ID 升序）；有附件时 content 允许为空串（纯附件消息），没有附件时 content 至少 1 个字符。
 type Message struct {
-	ChannelId ID     `json:"channel_id"`
-	Content   string `json:"content"`
-	CreatedAt Time   `json:"created_at"`
+	// Attachments 消息附件元数据（#41，按附件 ID 升序）；无附件或消息已软删时缺省。 url/thumbnail_url 为带能力 key 的相对路径，可直接放进 img 标签。
+	Attachments *[]Attachment `json:"attachments,omitempty"`
+	ChannelId   ID            `json:"channel_id"`
+	Content     string        `json:"content"`
+	CreatedAt   Time          `json:"created_at"`
 
 	// DeletedAt 软删时间（#39）；未删除时缺省
 	DeletedAt *Time `json:"deleted_at,omitempty"`

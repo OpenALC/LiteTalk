@@ -41,6 +41,13 @@
       "x-since": 2,
       "x-go-omitempty": true,
       "description": "@提及的用户 ID 列表（#39），服务端去重后按升序下发。"
+    },
+    "attachments": {
+      "type": "array",
+      "items": { "$ref": "components.schema.json#/$defs/AttachmentInfo" },
+      "x-since": 2,
+      "x-go-omitempty": true,
+      "description": "消息附件（#41），按附件 ID 升序；无附件时缺省。纯附件消息 content 为空串。"
     }
   },
   "required": ["id", "channel_id", "content", "ts", "user"],

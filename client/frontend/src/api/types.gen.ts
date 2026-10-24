@@ -679,7 +679,7 @@ export interface paths {
         put?: never;
         /**
          * 发送文字消息（≤2000 字 + 频控 20/分 + nonce 幂等）
-         * @description 仅文字频道。nonce（#31）：客户端生成的幂等键（≤64 字符），服务端按 (channel_id, user_id, nonce) 去重；重复提交回读原消息返回 200（原消息体）， 新消息返回 201。幂等命中先于频控判断，不消耗配额。不带 nonce 不去重。 code：bad_channel、bad_content、bad_nonce、bad_request、too_large、 路径参数不合法；401；403 forbidden；404 not_found；429 rate_limited； 5xx internal。
+         * @description 仅文字频道。nonce（#31）：客户端生成的幂等键（≤64 字符），服务端按 (channel_id, user_id, nonce) 去重；重复提交回读原消息返回 200（原消息体）， 新消息返回 201。幂等命中先于频控判断，不消耗配额。不带 nonce 不去重。 attachment_ids（#41）：最多 10 个、不可重复，只能引用本人上传且未被其它消息 认领的附件；格式不合法或认领失败返回 400 bad_attachment。带附件时 content 可为空串（纯附件消息），没有附件时仍须 1–2000 字符（否则 400 bad_content）。 code：bad_attachment、bad_channel、bad_content、bad_nonce、bad_request、 too_large、路径参数不合法；401；403 forbidden；404 not_found；429 rate_limited； 5xx internal。
          */
         post: operations["createMessage"];
         delete?: never;
@@ -697,7 +697,7 @@ export interface paths {
         };
         /**
          * 单条消息
-         * @description #39：返回频道内一条消息。可见性沿用列表：会话（私聊/群聊）非成员 404 not_found（不泄露存在性），服务器频道无 ViewChannel 403 forbidden。 消息不存在或不属于路径频道 404 not_found。软删消息仍返回 （content 为空串、deleted_at 有值），供回复跳转。 code：bad_request、路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
+         * @description #39：返回频道内一条消息。可见性沿用列表：会话（私聊/群聊）非成员 404 not_found（不泄露存在性），服务器频道无 ViewChannel 403 forbidden。 消息不存在或不属于路径频道 404 not_found。软删消息仍返回 （content 为空串、deleted_at 有值），供回复跳转；#41：软删消息不返回 attachments（即使附件行仍在库里）。 code：bad_request、路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
          */
         get: operations["getMessage"];
         put?: never;
@@ -1171,7 +1171,7 @@ export interface components {
         };
         /**
          * Message
-         * @description 文字频道消息（发送者昵称/tag 内联，不含邮箱）。ID 为十进制字符串（#31）。 #39：edited_at/deleted_at 为编辑/软删时间；reply_to 为回复目标 ID， reply_preview 为跳转预览；mentions 为被 @ 的用户 ID（升序去重）。 软删消息 content 为空串、deleted_at 有值，仍出现在列表与单条响应里供回复引用。
+         * @description 文字频道消息（发送者昵称/tag 内联，不含邮箱）。ID 为十进制字符串（#31）。 #39：edited_at/deleted_at 为编辑/软删时间；reply_to 为回复目标 ID， reply_preview 为跳转预览；mentions 为被 @ 的用户 ID（升序去重）。 软删消息 content 为空串、deleted_at 有值，仍出现在列表与单条响应里供回复引用， 但不返回 attachments（即使附件行仍在库里）。 #41：attachments 为消息携带的附件元数据（按附件 ID 升序）；有附件时 content 允许为空串（纯附件消息），没有附件时 content 至少 1 个字符。
          */
         Message: {
             id: string;
@@ -1199,6 +1199,8 @@ export interface components {
             reply_preview?: components["schemas"]["ReplyPreview"];
             /** @description 被 @ 的用户 ID（#39，升序去重）；无提及时缺省 */
             mentions?: string[];
+            /** @description 消息附件元数据（#41，按附件 ID 升序）；无附件或消息已软删时缺省。 url/thumbnail_url 为带能力 key 的相对路径，可直接放进 img 标签。 */
+            attachments?: components["schemas"]["Attachment"][];
         };
         /**
          * ReplyPreview
@@ -1521,7 +1523,7 @@ export interface components {
         };
         /** CreateMessageRequest */
         CreateMessageRequest: {
-            /** @description 1–2000 字符 */
+            /** @description 0–2000 字符。带 attachment_ids 时允许空串（纯附件消息）； 没有附件时至少 1 个字符，否则 400 bad_content。 */
             content: string;
             /** @description 幂等键（#31，≤64 字符）；同频道同用户重复提交回读原消息（200）。缺省不去重。 */
             nonce?: string;
@@ -1529,6 +1531,8 @@ export interface components {
             reply_to?: string;
             /** @description @提及用户 ID（#39）：去重，元素须 > 0；每个用户必须是该频道可见成员， 否则 400 bad_mention。 */
             mentions?: string[];
+            /** @description 随消息发送的附件 ID（#41）：最多 10 个、元素为正整数（十进制字符串）且 不可重复；只能引用本人上传且尚未被其它消息认领的附件。不能解析、超限、 重复、附件不存在、非本人上传或已被引用一律 400 bad_attachment。 给出附件时 content 可为空串。 */
+            attachment_ids?: string[];
         };
         /** EditMessageRequest */
         EditMessageRequest: {
@@ -2973,7 +2977,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description 消息数组（旧→新正序；不含发送者邮箱） */
+            /** @description 消息数组（旧→新正序；不含发送者邮箱；软删消息不含 attachments） */
             200: {
                 headers: {
                     [name: string]: unknown;

@@ -62,7 +62,9 @@ const (
 	// ErrCodeBadReply 回复目标不合法（#39）：不存在、非正 ID 或跨频道
 	ErrCodeBadReply = "bad_reply"
 	// ErrCodeBadMention 提及目标不合法（#39）：非正 ID 或目标用户不可见该频道
-	ErrCodeBadMention          = "bad_mention"
+	ErrCodeBadMention = "bad_mention"
+	// ErrCodeBadAttachment 附件不合法（#41）：不存在、非本人上传、已被引用或超过 10 个
+	ErrCodeBadAttachment       = "bad_attachment"
 	ErrCodeProtocolUnsupported = "protocol_unsupported"
 )
 
@@ -80,6 +82,18 @@ const (
 const KickReasonLoginElsewhere = "login_elsewhere"
 
 // ---- 共享类型与各消息 data 结构（api/signal/components + messages） ----
+
+// AttachmentInfo 消息附件元数据（#41）。url/thumbnail_url 是带能力 key 的相对路径（/api/v1/attachments/{id}?key=...），客户端自行拼服务端基址；不需要 Authorization。
+type AttachmentInfo struct {
+	ID           string `json:"id"`
+	Filename     string `json:"filename"`
+	Size         int64  `json:"size"`
+	ContentType  string `json:"content_type"`
+	Width        int64  `json:"width"`  // 原图像素宽；非图片为 0
+	Height       int64  `json:"height"` // 原图像素高；非图片为 0
+	URL          string `json:"url"`
+	ThumbnailURL string `json:"thumbnail_url,omitempty"` // 带能力 key 的缩略图相对路径；非图片或未生成缩略图时缺省
+}
 
 // MemberInfo 房间成员快照（含语音状态，供晚加入者拿到当前状态）。
 type MemberInfo struct {
@@ -145,25 +159,27 @@ type ChannelUnreadData struct {
 
 // ChatMessageData 文字消息广播。字段命名与 REST 消息 DTO 的统一由 #31 收敛，本 schema 先按 WS 现状定形。
 type ChatMessageData struct {
-	ID           string        `json:"id"`
-	ChannelID    string        `json:"channel_id"`
-	Content      string        `json:"content"`
-	TS           int64         `json:"ts"`
-	User         UserBrief     `json:"user"`
-	Nonce        string        `json:"nonce,omitempty"`         // 发送方 chat.send 携带的幂等键；仅发送方带 nonce 时回显（#31，协议 v2）。
-	ReplyTo      string        `json:"reply_to,omitempty"`      // 回复目标消息 ID（#39）；非回复消息缺省。
-	ReplyPreview *ReplyPreview `json:"reply_preview,omitempty"` // 回复目标预览（#39）；目标已软删时 content 为空、deleted=true。
-	Mentions     []string      `json:"mentions,omitempty"`      // @提及的用户 ID 列表（#39），服务端去重后按升序下发。
+	ID           string           `json:"id"`
+	ChannelID    string           `json:"channel_id"`
+	Content      string           `json:"content"`
+	TS           int64            `json:"ts"`
+	User         UserBrief        `json:"user"`
+	Nonce        string           `json:"nonce,omitempty"`         // 发送方 chat.send 携带的幂等键；仅发送方带 nonce 时回显（#31，协议 v2）。
+	ReplyTo      string           `json:"reply_to,omitempty"`      // 回复目标消息 ID（#39）；非回复消息缺省。
+	ReplyPreview *ReplyPreview    `json:"reply_preview,omitempty"` // 回复目标预览（#39）；目标已软删时 content 为空、deleted=true。
+	Mentions     []string         `json:"mentions,omitempty"`      // @提及的用户 ID 列表（#39），服务端去重后按升序下发。
+	Attachments  []AttachmentInfo `json:"attachments,omitempty"`   // 消息附件（#41），按附件 ID 升序；无附件时缺省。纯附件消息 content 为空串。
 }
 
-// ChatSendData 向频道发一条文字消息。type 为消息种类，本期仅支持 text，其他值拒收。
+// ChatSendData 向频道发一条文字消息。type 为消息种类，本期仅支持 text，其他值拒收。带 attachment_ids 时 content 可为空串（纯附件消息）；没有附件时 content 仍须 1–2000 字符。
 type ChatSendData struct {
-	ChannelID string   `json:"channel_id"`
-	Type      string   `json:"type"` // 消息种类，本期仅 text
-	Content   string   `json:"content"`
-	Nonce     string   `json:"nonce,omitempty"`    // 客户端幂等键（#31，≤64 字符）：同频道同用户重复提交只落一条，重复请求回显原消息。缺省不去重（老客户端）。
-	ReplyTo   string   `json:"reply_to,omitempty"` // 回复目标消息 ID（#39）：必须与该消息同频道；目标已软删也允许。
-	Mentions  []string `json:"mentions,omitempty"` // @提及的用户 ID 列表（#39）：服务端去重并校验目标可见该频道；不合法整条拒收。
+	ChannelID     string   `json:"channel_id"`
+	Type          string   `json:"type"`                     // 消息种类，本期仅 text
+	Content       string   `json:"content"`                  // 消息正文（≤2000 字符）；带 attachment_ids 时可为空串（纯附件消息）
+	Nonce         string   `json:"nonce,omitempty"`          // 客户端幂等键（#31，≤64 字符）：同频道同用户重复提交只落一条，重复请求回显原消息。缺省不去重（老客户端）。
+	ReplyTo       string   `json:"reply_to,omitempty"`       // 回复目标消息 ID（#39）：必须与该消息同频道；目标已软删也允许。
+	Mentions      []string `json:"mentions,omitempty"`       // @提及的用户 ID 列表（#39）：服务端去重并校验目标可见该频道；不合法整条拒收。
+	AttachmentIDS []string `json:"attachment_ids,omitempty"` // 随消息发送的附件 ID 列表（#41，最多 10 个，不可重复）：只能引用本人上传且尚未被其它消息认领的附件。附件不存在、非本人上传、已被引用或格式不合法时整条拒收（bad_attachment）。
 }
 
 // ClientHelloData 协议版本协商（#29）：WS 连上并鉴权后客户端立刻发送，声明可接受区间 [min,max]。老服务端不认识本消息会回 error{bad_message}，客户端须容忍（记日志、按 v1 继续，不重连风暴）。不发本消息按 v1 处理。
