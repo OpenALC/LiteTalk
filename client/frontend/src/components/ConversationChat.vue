@@ -21,7 +21,9 @@ const subtitle = computed(() => {
 })
 const showMembers = ref(false)
 
-watch(() => conv.value?.id, (id) => {
+watch(() => conv.value?.id, (id, prev) => {
+  // 切换会话时关掉上一个会话的成员弹层，避免弹层内容跟着变成新会话。
+  if (prev && id !== prev) showMembers.value = false
   if (id) chat.loadHistory(id).catch(() => {})
 }, { immediate: true })
 </script>
