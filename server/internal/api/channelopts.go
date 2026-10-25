@@ -17,6 +17,14 @@ const channelPasswordMaxBytes = 72
 // userLimitMax 频道人数上限硬顶（0 = 不限）。
 const userLimitMax = 100
 
+// #46 频道音质：码率上限区间（0 = 跟随客户端用户设置）与合法帧长。
+const (
+	channelBitrateMin = 8
+	channelBitrateMax = 128
+	channelFrameMS10  = 10
+	channelFrameMS20  = 20
+)
+
 // hashChannelPassword 密码 → bcrypt（cost 复用 auth 的 12）；空串返回空串（无密码）。
 func hashChannelPassword(plain string) (string, error) {
 	if plain == "" {
@@ -54,6 +62,43 @@ func checkUserLimit(limit int, chType store.ChannelType) *apiErr {
 		return errf(http.StatusBadRequest, "bad_channel_option", "人数上限须为 0–100")
 	}
 	return nil
+}
+
+// checkChannelBitrate 码率上限仅语音频道：0 = 不限制，否则 8–128 kbps。
+// text 频道只接受 0（API 层随后会把两字段归零，保证「text 恒 0/0」）。
+func checkChannelBitrate(kbps int, chType store.ChannelType) *apiErr {
+	if chType != store.ChannelVoice {
+		if kbps != 0 {
+			return errf(http.StatusBadRequest, "bad_channel_option", "只有语音频道可以设置码率上限")
+		}
+		return nil
+	}
+	if kbps != 0 && (kbps < channelBitrateMin || kbps > channelBitrateMax) {
+		return errf(http.StatusBadRequest, "bad_channel_option", "码率上限须为 0 或 8–128 kbps")
+	}
+	return nil
+}
+
+// checkChannelFrameMS 帧长仅语音频道：0 = 默认 20ms，10/20 = 指定。
+func checkChannelFrameMS(ms int, chType store.ChannelType) *apiErr {
+	if chType != store.ChannelVoice {
+		if ms != 0 {
+			return errf(http.StatusBadRequest, "bad_channel_option", "只有语音频道可以设置帧长")
+		}
+		return nil
+	}
+	if ms != 0 && ms != channelFrameMS10 && ms != channelFrameMS20 {
+		return errf(http.StatusBadRequest, "bad_channel_option", "帧长须为 0、10 或 20 毫秒")
+	}
+	return nil
+}
+
+// normalizeChannelAudio text 频道音质恒为 0/0（类型从 voice 改成 text 时清掉旧值）。
+func normalizeChannelAudio(ch *store.Channel) {
+	if ch.Type != store.ChannelVoice {
+		ch.AudioBitrateKbps = 0
+		ch.AudioFrameMS = 0
+	}
 }
 
 // channelChildren 收集某频道的直接子频道（#37：不新增 Store 方法，走 ChannelsOfServer 过滤）。

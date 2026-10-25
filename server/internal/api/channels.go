@@ -45,6 +45,17 @@ func (s *Server) CreateChannel(ctx context.Context, request CreateChannelRequest
 			return nil, e
 		}
 	}
+	// #46 音质选项：仅语音频道可设非零值；text 的 0 值会被 normalizeChannelAudio 归一。
+	if req.AudioBitrateKbps != nil {
+		if e := checkChannelBitrate(*req.AudioBitrateKbps, chType); e != nil {
+			return nil, e
+		}
+	}
+	if req.AudioFrameMs != nil {
+		if e := checkChannelFrameMS(*req.AudioFrameMs, chType); e != nil {
+			return nil, e
+		}
+	}
 	// 分类归属校验（与 PATCH 同规则）：存在且属于本服务器，防止跨服挂载/悬空 id。
 	// 0 = 显式无分类，落库前归一成 NULL——否则 0 与 NULL 两种「无分类」并存，
 	// 而 PATCH 那侧一律落 NULL（见 PatchChannel）。
@@ -83,19 +94,27 @@ func (s *Server) CreateChannel(ctx context.Context, request CreateChannelRequest
 	if req.UserLimit != nil {
 		ch.UserLimit = *req.UserLimit
 	}
+	if req.AudioBitrateKbps != nil {
+		ch.AudioBitrateKbps = *req.AudioBitrateKbps
+	}
+	if req.AudioFrameMs != nil {
+		ch.AudioFrameMS = *req.AudioFrameMs
+	}
+	normalizeChannelAudio(ch)
 	if parentID != 0 {
 		ch.ParentID = &parentID
 	}
 	if err := s.store.CreateChannel(ctx, ch); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	// 审计只记 has_password/user_limit/parent_id（#37）：密码明文与哈希都不进 detail。
+	// 审计只记 has_password/user_limit/parent_id/音质（#37/#46）：密码明文与哈希都不进 detail。
 	s.audit(ctx, store.AuditLog{
 		ServerID: request.Id, ActorID: c.UserID, Action: "channel.create",
 		TargetType: "channel", TargetID: ptrID(ch.ID), ChannelID: ptrID(ch.ID),
 		Detail: auditDetail(map[string]any{
 			"name": ch.Name, "type": string(ch.Type),
 			"has_password": hash != "", "user_limit": ch.UserLimit, "parent_id": parentID,
+			"audio_bitrate_kbps": ch.AudioBitrateKbps, "audio_frame_ms": ch.AudioFrameMS,
 		}),
 	})
 	return CreateChannel201JSONResponse(channelView(ch)), nil
@@ -201,6 +220,28 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 		ch.UserLimit = req.UserLimit.Val
 		detail["user_limit"] = req.UserLimit.Val
 	}
+	// #46 音质三态：缺省不改、0 = 清零（跟随设置/默认帧长）、null 拒 400。
+	// 校验用上方定稿的频道类型：同一次 PATCH 改成 text 时非零音质会被拒。
+	if req.AudioBitrateKbps.Set {
+		if req.AudioBitrateKbps.Clearing() {
+			return nil, errf(http.StatusBadRequest, "bad_channel_option", "audio_bitrate_kbps 不可清除，0 表示不限制")
+		}
+		if e := checkChannelBitrate(req.AudioBitrateKbps.Val, ch.Type); e != nil {
+			return nil, e
+		}
+		ch.AudioBitrateKbps = req.AudioBitrateKbps.Val
+		detail["audio_bitrate_kbps"] = req.AudioBitrateKbps.Val
+	}
+	if req.AudioFrameMs.Set {
+		if req.AudioFrameMs.Clearing() {
+			return nil, errf(http.StatusBadRequest, "bad_channel_option", "audio_frame_ms 不可清除，0 表示默认 20ms")
+		}
+		if e := checkChannelFrameMS(req.AudioFrameMs.Val, ch.Type); e != nil {
+			return nil, e
+		}
+		ch.AudioFrameMS = req.AudioFrameMs.Val
+		detail["audio_frame_ms"] = req.AudioFrameMs.Val
+	}
 	if req.ParentID.Set {
 		if req.ParentID.Clearing() || req.ParentID.Val == 0 {
 			ch.ParentID = nil // 提升顶层
@@ -216,6 +257,8 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 			detail["parent_id"] = req.ParentID.Val
 		}
 	}
+	// 类型改成 text 时清掉旧音质（text 恒 0/0）；校验已在各字段应用时按最终类型完成。
+	normalizeChannelAudio(ch)
 	// 子频道自身改 type/category 也必须与父一致（#101 P2）：上方 409 只拦
 	// 「有子频道的父频道」，子频道此前可以单方面漂移出父的类型/分类，破坏
 	// 两级树的不变量。字段应用完成后统一核对最终值，避免半写。

@@ -62,17 +62,22 @@ func serverView(sv *store.Server) ServerInfo {
 func channelView(c *store.Channel) ChannelInfo {
 	// #37：has_password/user_limit 恒回（指针置位），password 哈希本身永不出；
 	// parent_id 顶层为 nil（omitempty 缺省省略，语义等价 null）。
+	// #46：音质两字段同样恒回，0 表示跟随/默认。
 	hasPassword := c.PasswordHash != ""
 	limit := c.UserLimit
+	bitrate := c.AudioBitrateKbps
+	frameMS := c.AudioFrameMS
 	out := ChannelInfo{
-		Id:          idOf(c.ID),
-		ServerId:    idOf(c.ServerID),
-		Name:        c.Name,
-		Type:        ChannelInfoType(c.Type),
-		Position:    c.Position,
-		CreatedAt:   timeOf(c.CreatedAt),
-		HasPassword: &hasPassword,
-		UserLimit:   &limit,
+		Id:               idOf(c.ID),
+		ServerId:         idOf(c.ServerID),
+		Name:             c.Name,
+		Type:             ChannelInfoType(c.Type),
+		Position:         c.Position,
+		CreatedAt:        timeOf(c.CreatedAt),
+		HasPassword:      &hasPassword,
+		UserLimit:        &limit,
+		AudioBitrateKbps: &bitrate,
+		AudioFrameMs:     &frameMS,
 	}
 	if c.CategoryID != nil {
 		out.CategoryId = idPtr(*c.CategoryID)
