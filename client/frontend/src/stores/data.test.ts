@@ -601,9 +601,9 @@ describe('加入/创建服务器后加载频道', () => {
 
     expect(mockGoApp.JoinServerByCode).toHaveBeenCalledWith('invite-code')
     expect(mockGoApp.ListChannels).toHaveBeenCalledWith('41')
-    // #37 B2 起 Channel 带 parentId/hasPassword/userLimit（服务端未给 = 默认值）。
+    // #37 B2 起 Channel 带 parentId/hasPassword/userLimit；#46 起带音质（服务端未给 = 默认值）。
     expect(s.findServer('41')!.channels).toEqual([
-      { id: '4101', name: '大厅', type: 'voice', group: '甲组', parentId: undefined, hasPassword: false, userLimit: 0 },
+      { id: '4101', name: '大厅', type: 'voice', group: '甲组', parentId: undefined, hasPassword: false, userLimit: 0, audioBitrateKbps: 0, audioFrameMs: 0 },
     ])
     expect(s.extraGroups['41'].map((g) => g.name)).toEqual(['甲组'])
     expect(s.currentServerId).toBe('41')

@@ -12,6 +12,17 @@ import { useNotifyStore } from './notify'
 
 export const UNCATEGORIZED = '未分类'
 
+// #46 频道音质选项：与服务端同口径（0 = 跟随用户设置/默认 20ms）。
+// 下拉选项之外的非法值一律回落 0，避免把服务端会 400 的值发出去。
+export const AUDIO_BITRATE_CHOICES = [0, 16, 24, 32, 48, 64, 96, 128] as const
+export const AUDIO_FRAME_CHOICES = [0, 10] as const
+
+export function normalizeChannelAudioOptions(bitrateKbps: number, frameMS: number): { bitrateKbps: number; frameMS: number } {
+  const bitrate = (AUDIO_BITRATE_CHOICES as readonly number[]).includes(bitrateKbps) ? bitrateKbps : 0
+  const frame = frameMS === 10 ? 10 : 0
+  return { bitrateKbps: bitrate, frameMS: frame }
+}
+
 export interface Channel {
   id: string
   name: string
@@ -23,6 +34,9 @@ export interface Channel {
   parentId?: string
   hasPassword?: boolean
   userLimit?: number
+  // #46 音质（仅 voice）：码率上限 kbps（0 = 跟随用户设置）、帧长（0 = 默认 20ms）。
+  audioBitrateKbps?: number
+  audioFrameMs?: number
 }
 
 export interface Server {
@@ -328,6 +342,8 @@ export const useServersStore = defineStore('servers', () => {
       parentId: c.parent_id == null || c.parent_id === '' ? undefined : String(c.parent_id),
       hasPassword: !!c.has_password,
       userLimit: typeof c.user_limit === 'number' ? c.user_limit : 0,
+      audioBitrateKbps: typeof c.audio_bitrate_kbps === 'number' ? c.audio_bitrate_kbps : 0,
+      audioFrameMs: typeof c.audio_frame_ms === 'number' ? c.audio_frame_ms : 0,
     }))
     extraGroups.value = {
       ...extraGroups.value,
@@ -447,22 +463,26 @@ export const useServersStore = defineStore('servers', () => {
       parentId: String(c.parent_id ?? parentId),
       hasPassword: !!c.has_password,
       userLimit: c.user_limit ?? 0,
+      audioBitrateKbps: c.audio_bitrate_kbps ?? 0,
+      audioFrameMs: c.audio_frame_ms ?? 0,
     })
   }
 
-  // updateChannelOptions 更新频道选项（#37 B2）：只发变更字段（bridge 侧同约定）；
-  // 成功后用返回 DTO 回填 parentId/hasPassword/userLimit。
-  async function updateChannelOptions(serverId: string, chId: string, parentId: string | null, userLimit: number, password: string, clearPassword: boolean) {
+  // updateChannelOptions 更新频道选项（#37 B2、#46）：只发变更字段（bridge 侧同约定）；
+  // 成功后用返回 DTO 回填 parentId/hasPassword/userLimit/音质。
+  async function updateChannelOptions(serverId: string, chId: string, parentId: string | null, userLimit: number, audioBitrateKbps: number, audioFrameMs: number, password: string, clearPassword: boolean) {
     const s = findServer(serverId)
     const ch = s?.channels.find((c) => c.id === chId)
     if (!ch) return
     // parentId null = 不改；'0' = 提升顶层；其余 = 设置父。
     const p = parentId === null ? '' : parentId
-    const c = await goApp().UpdateChannelOptions(chId, p, userLimit, password, clearPassword)
+    const c = await goApp().UpdateChannelOptions(chId, p, userLimit, audioBitrateKbps, audioFrameMs, password, clearPassword)
     if (c.parent_id == null || c.parent_id === '') ch.parentId = undefined
     else ch.parentId = String(c.parent_id)
     ch.hasPassword = !!c.has_password
     ch.userLimit = typeof c.user_limit === 'number' ? c.user_limit : 0
+    ch.audioBitrateKbps = c.audio_bitrate_kbps ?? 0
+    ch.audioFrameMs = c.audio_frame_ms ?? 0
     // 挂父/换父后分类不变（服务端限父子同分类），group 无需重算。
   }
 

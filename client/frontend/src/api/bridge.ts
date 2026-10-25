@@ -90,10 +90,11 @@ type GoApp = {
   CreateInviteCode(serverID: string): Promise<string>
   // categoryID 空串/「0」= 不归类（#72 新建即归组，不用等重启对账）。
   CreateChannel(serverID: string, name: string, typ: string, categoryID: string): Promise<ChannelDTO>
-  // 频道选项（#37 B2）：子频道（类型随父）与选项更新（parentID ""=不改/"0"=顶层；
-  // userLimit <0 不改；password 空串不改，clearPassword 清除）。
+  // 频道选项（#37 B2、#46）：子频道（类型随父）与选项更新（parentID ""=不改/"0"=顶层；
+  // userLimit <0 不改；audioBitrateKbps/audioFrameMs <0 不改，0 = 跟随设置/默认帧长；
+  // password 空串不改，clearPassword 清除）。
   CreateSubchannel(serverID: string, name: string, typ: string, parentID: string): Promise<ChannelDTO>
-  UpdateChannelOptions(channelID: string, parentID: string, userLimit: number, password: string, clearPassword: boolean): Promise<ChannelDTO>
+  UpdateChannelOptions(channelID: string, parentID: string, userLimit: number, audioBitrateKbps: number, audioFrameMs: number, password: string, clearPassword: boolean): Promise<ChannelDTO>
   RenameChannel(id: string, name: string): Promise<void>
   DeleteChannel(id: string): Promise<void>
   CreateCategory(serverID: string, name: string): Promise<CategoryDTO>
