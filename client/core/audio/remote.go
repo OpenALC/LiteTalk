@@ -184,6 +184,7 @@ func (rm *RemoteManager) SetFrameMS(ms int) error {
 	rm.mu.Lock()
 	for _, rp := range rm.peers {
 		rp.frameMS.Store(int32(ms))
+		_ = rp.jb.SetFrameMS(ms) // 帧长同时决定抖动估计的 transit 基准与预填目标
 	}
 	rm.mu.Unlock()
 	return nil
@@ -229,6 +230,7 @@ func (rm *RemoteManager) HandleTrack(track *webrtc.TrackRemote, _ *webrtc.RTPRec
 		done:  make(chan struct{}),
 	}
 	rp.frameMS.Store(rm.frameMS.Load())
+	_ = rp.jb.SetFrameMS(int(rm.frameMS.Load())) // 抖动估计/预填目标按频道帧长换算
 
 	rm.mu.Lock()
 	if old, ok := rm.peers[peerID]; ok {

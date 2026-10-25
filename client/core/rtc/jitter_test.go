@@ -282,9 +282,10 @@ func TestJitterAdaptiveTarget(t *testing.T) {
 		}
 	}
 	st := jb.Stats()
-	if st.TargetPackets <= jitterMinTarget {
+	minTarget := jitterMinMS / JitterFrameMS
+	if st.TargetPackets <= minTarget {
 		t.Fatalf("TargetPackets = %d, want > %d under 80ms jitter (jitterMs=%.1f)",
-			st.TargetPackets, jitterMinTarget, st.JitterMs)
+			st.TargetPackets, minTarget, st.JitterMs)
 	}
 	t.Logf("jitterMs=%.1f target=%d packets (%dms)", st.JitterMs, st.TargetPackets, st.TargetPackets*JitterFrameMS)
 }
@@ -308,6 +309,44 @@ func TestJitterSteadyPlayout(t *testing.T) {
 		if next := 5006 + i; next < 5050 {
 			pushAt(jb, uint16(next), jitterBase.Add(time.Duration(next)*JitterFrameMS*time.Millisecond))
 		}
+	}
+}
+
+// TestJitterFrameMS10 10ms 帧长（#46）：transit 按 10ms 计算（等间隔到达不产生
+// 虚假抖动），预填目标按 60ms 换算成 6 包；非法帧长拒绝。
+func TestJitterFrameMS10(t *testing.T) {
+	jb := NewJitterBuffer()
+	if err := jb.SetFrameMS(10); err != nil {
+		t.Fatalf("SetFrameMS(10): %v", err)
+	}
+	if err := jb.SetFrameMS(15); err == nil {
+		t.Fatal("非法帧长应报错")
+	}
+	for i := 0; i < 6; i++ {
+		seq := uint16(200 + i)
+		at := jitterBase.Add(time.Duration(i) * 10 * time.Millisecond)
+		jb.Push(seq, []byte{byte(seq)}, at)
+	}
+	st := jb.Stats()
+	if st.TargetPackets != 6 {
+		t.Fatalf("10ms 目标深度 = %d 包, want 6（60ms）", st.TargetPackets)
+	}
+	if st.JitterMs > 1 {
+		t.Fatalf("等间隔 10ms 到达的抖动估计 = %.2fms，不应出现虚假抖动", st.JitterMs)
+	}
+	out := make([]byte, JitterMaxPayload)
+	for i := 0; i < 6; i++ {
+		if n, lost, ok := jb.Pop(out); !ok || lost || n != 1 {
+			t.Fatalf("第 %d 拍 Pop = n%d lost=%v ok=%v，预填应已满", i, n, lost, ok)
+		}
+	}
+
+	// 切回 20ms：目标深度回落 3 包，transit 基准重置（不把切换当抖动尖峰）。
+	if err := jb.SetFrameMS(20); err != nil {
+		t.Fatal(err)
+	}
+	if got := jb.Stats().TargetPackets; got != 3 {
+		t.Fatalf("切回 20ms 后目标深度 = %d, want 3", got)
 	}
 }
 

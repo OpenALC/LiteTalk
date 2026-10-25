@@ -1,6 +1,7 @@
 package rtc
 
 import (
+	"fmt"
 	"math"
 	"sync"
 	"time"
@@ -8,15 +9,16 @@ import (
 
 // jitter buffer 常量。
 const (
-	// JitterFrameMS 每包媒体时长（Opus 20ms 帧）。
+	// JitterFrameMS 默认每包媒体时长（Opus 20ms 帧）。10ms 频道用 SetFrameMS
+	// 切换（#46）：预填目标与抖动估计都按实际帧长换算。
 	JitterFrameMS = 20
-	// 环形槽位数：32 槽 × 20ms = 640ms 容量。
+	// 环形槽位数：32 槽 × 20ms = 640ms 容量（10ms 时 320ms，仍高于 120ms 上限）。
 	jitterSlots = 32
 	// JitterMaxPayload 单槽载荷缓冲上限（20ms Opus 远小于此）。
 	JitterMaxPayload = 1500
-	// 自适应窗口：60ms（3 包）～120ms（6 包）。
-	jitterMinTarget = 3
-	jitterMaxTarget = 6
+	// 自适应窗口：60ms～120ms（按帧长换算成包数：#46）。
+	jitterMinMS = 60
+	jitterMaxMS = 120
 	// 前向跳变超过该值视为流重启，清空重定基。
 	jitterResetJump = 1000
 )
@@ -38,11 +40,11 @@ type JitterStats struct {
 // JitterBuffer 是 per-peer 的 RTP 抖动缓冲：按 seq 排序、60–120ms 自适应
 // 预填窗口、丢包标记（供 PLC）、重复/迟到丢弃。
 //
-// 线程模型：Push（网络读 goroutine）与 Pop（20ms 消费 goroutine）经互斥锁
+// 线程模型：Push（网络读 goroutine）与 Pop（10/20ms 消费 goroutine）经互斥锁
 // 并发安全；热路径全部使用预分配槽位，零堆分配。
 //
-// 使用节奏：消费者每 20ms 调一次 Pop；ok=false 表示预填中/断流静默（本拍
-// 不出帧），lost=true 表示该帧判定丢失（调用方应 PLC）。
+// 使用节奏：消费者按当前帧长（20ms 或 10ms，#46）调 Pop；ok=false 表示预填中/
+// 断流静默（本拍不出帧），lost=true 表示该帧判定丢失（调用方应 PLC）。
 type JitterBuffer struct {
 	mu sync.Mutex
 
@@ -57,11 +59,12 @@ type JitterBuffer struct {
 	nextPop uint64 // 下一个应弹出的扩展序号
 	starved int    // 连续断流拍数
 
-	lastTransit float64 // 上一包 transit（到达时刻 - seq*20ms，ms）
+	frameMS     int     // 当前包时长（10/20ms，#46）
+	lastTransit float64 // 上一包 transit（到达时刻 - seq×frameMS，ms）
 	hasTransit  bool
 	jitterMs    float64 // RFC3550 风格抖动估计
 
-	targetPackets int // 当前自适应目标深度
+	targetPackets int // 当前自适应目标深度（包）
 
 	// 统计（锁内更新，Stats 锁内读）
 	received    uint64
@@ -81,7 +84,32 @@ type jitterSlot struct {
 
 // NewJitterBuffer 创建抖动缓冲（初始目标深度 60ms）。
 func NewJitterBuffer() *JitterBuffer {
-	return &JitterBuffer{targetPackets: jitterMinTarget}
+	return &JitterBuffer{frameMS: JitterFrameMS, targetPackets: jitterMinMS / JitterFrameMS}
+}
+
+// SetFrameMS 切换每包媒体时长（10/20ms，#46 频道配置）。切换时清掉 transit
+// 基准，避免帧长变化被误判成一次抖动尖峰；目标深度按新帧长重算。
+func (b *JitterBuffer) SetFrameMS(ms int) error {
+	if ms != 10 && ms != 20 {
+		return fmt.Errorf("rtc: jitter 帧长非法: %d（只支持 10/20ms）", ms)
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.frameMS == ms {
+		return nil
+	}
+	b.frameMS = ms
+	b.hasTransit = false
+	b.adaptTargetLocked()
+	return nil
+}
+
+// frameMSValue 当前包时长（零值按默认 20ms，测试可直接构造 JitterBuffer）。
+func (b *JitterBuffer) frameMSValue() int {
+	if b.frameMS == 10 {
+		return 10
+	}
+	return JitterFrameMS
 }
 
 // Push 推入一个 RTP 包（seq 为 RTP 序号，payload 为载荷，arrival 为到达时刻）。
@@ -256,9 +284,9 @@ func (b *JitterBuffer) resetLocked(ext uint64) {
 }
 
 // updateJitterLocked 按 RFC3550 风格更新到达抖动估计：
-// transit = 到达时刻 - seq×20ms；J += (|Δtransit| - J)/16。
+// transit = 到达时刻 - seq×frameMS；J += (|Δtransit| - J)/16。
 func (b *JitterBuffer) updateJitterLocked(ext uint64, arrival time.Time) {
-	transit := float64(arrival.UnixMilli()) - float64(ext)*JitterFrameMS
+	transit := float64(arrival.UnixMilli()) - float64(ext)*float64(b.frameMSValue())
 	if b.hasTransit {
 		d := math.Abs(transit - b.lastTransit)
 		b.jitterMs += (d - b.jitterMs) / 16
@@ -267,15 +295,21 @@ func (b *JitterBuffer) updateJitterLocked(ext uint64, arrival time.Time) {
 	b.hasTransit = true
 }
 
-// adaptTargetLocked 按抖动估计调整目标深度：基础 60ms，抖动每 ~20ms 加深一包，
-// 封顶 120ms。
+// adaptTargetLocked 按抖动估计调整目标深度：基础 60ms，抖动每满一个帧长加深
+// 一包，封顶 120ms。10ms 频道对应 6～12 包（#46）。
 func (b *JitterBuffer) adaptTargetLocked() {
-	t := jitterMinTarget + int(b.jitterMs/JitterFrameMS+0.5)
-	if t < jitterMinTarget {
-		t = jitterMinTarget
+	frame := b.frameMSValue()
+	minP := jitterMinMS / frame
+	if minP < 1 {
+		minP = 1
 	}
-	if t > jitterMaxTarget {
-		t = jitterMaxTarget
+	maxP := jitterMaxMS / frame
+	t := minP + int(b.jitterMs/float64(frame)+0.5)
+	if t < minP {
+		t = minP
+	}
+	if t > maxP {
+		t = maxP
 	}
 	b.targetPackets = t
 }

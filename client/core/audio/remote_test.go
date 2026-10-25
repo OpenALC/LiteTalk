@@ -334,26 +334,33 @@ func TestRemoteDecode10ms(t *testing.T) {
 	m, _ := newTestMixer()
 	rp := newTestRemotePeer(t, "a", m)
 	rp.frameMS.Store(FrameMS10)
+	if err := rp.jb.SetFrameMS(FrameMS10); err != nil {
+		t.Fatal(err)
+	}
 	if got := rp.frameSamples(); got != FrameSize {
 		t.Fatalf("frameSamples = %d, want %d", got, FrameSize)
 	}
-	pkts := encode10msPackets(t, 3)
-	for i := 0; i < 3; i++ {
-		rp.jb.Push(uint16(100+i), pkts[i], remoteArrival(100+i))
+	pkts := encode10msPackets(t, 6)
+	// 10ms 到达间隔（与帧长一致），避免抖动估计被测试夹具放大。
+	arrival10 := func(seq int) time.Time {
+		return remoteArrivalBase.Add(time.Duration(seq) * 10 * time.Millisecond)
 	}
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 6; i++ {
+		rp.jb.Push(uint16(100+i), pkts[i], arrival10(100+i))
+	}
+	for i := 0; i < 7; i++ {
 		rp.decodeOnce()
 	}
-	if got := rp.Stats.FramesPopped.Load(); got != 3 {
-		t.Fatalf("FramesPopped = %d, want 3", got)
+	if got := rp.Stats.FramesPopped.Load(); got != 6 {
+		t.Fatalf("FramesPopped = %d, want 6", got)
 	}
 	if got := rp.Stats.PLCFrames.Load(); got != 1 {
 		t.Fatalf("PLCFrames = %d, want 1", got)
 	}
-	if got := rp.input.WrittenSamples.Load(); got != 4*FrameSize {
-		t.Fatalf("WrittenSamples = %d, want %d", got, 4*FrameSize)
+	if got := rp.input.WrittenSamples.Load(); got != 7*FrameSize {
+		t.Fatalf("WrittenSamples = %d, want %d", got, 7*FrameSize)
 	}
-	buf := make([]int16, 3*FrameSize)
+	buf := make([]int16, 6*FrameSize)
 	if n := rp.input.ring.Read(buf); n != len(buf) {
 		t.Fatalf("ring read %d, want %d", n, len(buf))
 	}
