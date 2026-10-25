@@ -47,8 +47,8 @@ func TestChannelOptionsWire(t *testing.T) {
 		t.Fatalf("CreateSubchannel body: %s", last.body)
 	}
 
-	// 只带 user_limit：body 不得出现 password/parent_id。
-	if _, err := c.UpdateChannelOptions("5", "", 7, "", false); err != nil {
+	// 只带 user_limit：body 不得出现 password/parent_id/音质。
+	if _, err := c.UpdateChannelOptions("5", "", 7, -1, -1, "", false); err != nil {
 		t.Fatalf("UpdateChannelOptions: %v", err)
 	}
 	var patch map[string]any
@@ -61,7 +61,7 @@ func TestChannelOptionsWire(t *testing.T) {
 
 	// 清密码 + 提升顶层：password 为 JSON null，parent_id="0"；userLimit -1 不发。
 	// map 解码会合并旧键，每次用新 map。
-	if _, err := c.UpdateChannelOptions("5", "0", -1, "", true); err != nil {
+	if _, err := c.UpdateChannelOptions("5", "0", -1, -1, -1, "", true); err != nil {
 		t.Fatalf("UpdateChannelOptions(清密码): %v", err)
 	}
 	patch = nil
@@ -73,7 +73,7 @@ func TestChannelOptionsWire(t *testing.T) {
 	}
 
 	// 设密码 + 不动父：无 parent_id 键。
-	if _, err := c.UpdateChannelOptions("5", "", -1, "pw", false); err != nil {
+	if _, err := c.UpdateChannelOptions("5", "", -1, -1, -1, "pw", false); err != nil {
 		t.Fatalf("UpdateChannelOptions(设密码): %v", err)
 	}
 	patch = nil
@@ -82,5 +82,27 @@ func TestChannelOptionsWire(t *testing.T) {
 	}
 	if len(patch) != 1 || patch["password"] != "pw" {
 		t.Fatalf("设密码 body: %s", last.body)
+	}
+
+	// #46 音质：0 是有效值（跟随设置/默认帧长），必须显式发送；-1 不发。
+	if _, err := c.UpdateChannelOptions("5", "", -1, 16, 10, "", false); err != nil {
+		t.Fatalf("UpdateChannelOptions(音质): %v", err)
+	}
+	patch = nil
+	if err := json.Unmarshal([]byte(last.body), &patch); err != nil {
+		t.Fatal(err)
+	}
+	if len(patch) != 2 || patch["audio_bitrate_kbps"] != float64(16) || patch["audio_frame_ms"] != float64(10) {
+		t.Fatalf("音质 body: %s", last.body)
+	}
+	if _, err := c.UpdateChannelOptions("5", "", -1, 0, 0, "", false); err != nil {
+		t.Fatalf("UpdateChannelOptions(音质清零): %v", err)
+	}
+	patch = nil
+	if err := json.Unmarshal([]byte(last.body), &patch); err != nil {
+		t.Fatal(err)
+	}
+	if len(patch) != 2 || patch["audio_bitrate_kbps"] != float64(0) || patch["audio_frame_ms"] != float64(0) {
+		t.Fatalf("音质清零必须显式发 0: %s", last.body)
 	}
 }

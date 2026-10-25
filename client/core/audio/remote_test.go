@@ -299,6 +299,87 @@ func TestRemoteDecodeError(t *testing.T) {
 	}
 }
 
+// encode10msPackets 编码 n 个 10ms（480 采样）的 440Hz 正弦 Opus 包（#46）。
+func encode10msPackets(t testing.TB, n int) [][]byte {
+	t.Helper()
+	enc, err := codec.NewEncoder(SampleRate, 1, codec.AppVoIP)
+	if err != nil {
+		t.Fatalf("new encoder: %v", err)
+	}
+	defer enc.Close()
+	if err := enc.SetBitrate(32000); err != nil {
+		t.Fatalf("set bitrate: %v", err)
+	}
+	pcm := make([]int16, FrameSize)
+	buf := make([]byte, 4000)
+	var phase float64
+	out := make([][]byte, 0, n)
+	for i := 0; i < n; i++ {
+		for j := range pcm {
+			phase += 2 * math.Pi * 440 / SampleRate
+			pcm[j] = int16(12000 * math.Sin(phase))
+		}
+		m, err := enc.Encode(pcm, buf)
+		if err != nil {
+			t.Fatalf("encode %d: %v", i, err)
+		}
+		out = append(out, append([]byte(nil), buf[:m]...))
+	}
+	return out
+}
+
+// TestRemoteDecode10ms 10ms 频道（#46）：正常帧解码 480 采样，PLC 同样合成
+// 480 采样（不能沿用上一包的 960），写出总量按 480/拍累计。
+func TestRemoteDecode10ms(t *testing.T) {
+	m, _ := newTestMixer()
+	rp := newTestRemotePeer(t, "a", m)
+	rp.frameMS.Store(FrameMS10)
+	if got := rp.frameSamples(); got != FrameSize {
+		t.Fatalf("frameSamples = %d, want %d", got, FrameSize)
+	}
+	pkts := encode10msPackets(t, 3)
+	for i := 0; i < 3; i++ {
+		rp.jb.Push(uint16(100+i), pkts[i], remoteArrival(100+i))
+	}
+	for i := 0; i < 4; i++ {
+		rp.decodeOnce()
+	}
+	if got := rp.Stats.FramesPopped.Load(); got != 3 {
+		t.Fatalf("FramesPopped = %d, want 3", got)
+	}
+	if got := rp.Stats.PLCFrames.Load(); got != 1 {
+		t.Fatalf("PLCFrames = %d, want 1", got)
+	}
+	if got := rp.input.WrittenSamples.Load(); got != 4*FrameSize {
+		t.Fatalf("WrittenSamples = %d, want %d", got, 4*FrameSize)
+	}
+	buf := make([]int16, 3*FrameSize)
+	if n := rp.input.ring.Read(buf); n != len(buf) {
+		t.Fatalf("ring read %d, want %d", n, len(buf))
+	}
+	if r := rmsInt16(buf); r < 1000 {
+		t.Fatalf("decoded RMS %.0f too low", r)
+	}
+}
+
+// TestRemoteManagerFrameMS 管理器帧长写入与热切换；非法值拒绝。
+func TestRemoteManagerFrameMS(t *testing.T) {
+	m, _ := newTestMixer()
+	rm := NewRemoteManager(m, nil)
+	if got := rm.FrameMS(); got != FrameMS20 {
+		t.Fatalf("默认帧长 = %d, want %d", got, FrameMS20)
+	}
+	if err := rm.SetFrameMS(FrameMS10); err != nil || rm.FrameMS() != FrameMS10 {
+		t.Fatalf("SetFrameMS(10): %v, got %d", err, rm.FrameMS())
+	}
+	if err := rm.SetFrameMS(15); err == nil {
+		t.Fatal("非法帧长应报错")
+	}
+	if got := rm.FrameMS(); got != FrameMS10 {
+		t.Fatalf("非法值不应改变帧长: %d", got)
+	}
+}
+
 // TestRemoteLinkStats 诊断快照（#95）：抖动统计、链路计数与混音输入环占用
 // 与解码路径一致；未知 peer 返回 false。
 func TestRemoteLinkStats(t *testing.T) {

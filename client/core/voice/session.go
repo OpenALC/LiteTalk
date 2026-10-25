@@ -181,6 +181,14 @@ type Session struct {
 	// 积压旧状态无意义），由专用 goroutine 消费发送（音频回调禁止直发网络）。
 	voiceSend    chan signal.VoiceStateData
 	mediaStarted atomic.Bool // 采集/播放是否已启动（入房才启动，按需点亮麦克风）
+
+	// #46 频道音质配置：audioCfgMu 串行化「用户设置 + 当前频道上限/帧长」的
+	// 读取与应用（ApplyAudio 在 Wails 绑定线程、channel.audio 在 WS 读循环）。
+	// 生效码率 = min(用户设置, 频道上限>0)；帧长只由频道配置决定，默认 20ms。
+	audioCfgMu      sync.Mutex
+	userBitrateKbps int // 最近一次用户设置（已解析默认值，入房不受频道上限影响）
+	chanBitrateKbps int // 当前频道码率上限，0 = 跟随用户设置
+	chanFrameMS     int // 当前频道帧长，10/20
 	// mediaFailReported 媒体启动失败是否已上报（#80）：同一故障周期只提示一次，
 	// 重入房仍会真实重试但不再重复弹 toast；启动成功后复位，下次故障可再报。
 	mediaFailReported atomic.Bool
@@ -270,6 +278,9 @@ func NewSession(api *api.APIClient, token, nickname string, ev Events, logger *l
 		seenChans: make(map[string]bool),
 		voiceSend: make(chan signal.VoiceStateData, 1),
 		gw:        gateway.New(),
+		// 入房前的默认音质：与 audio.DefaultOpusConfig 的 32kbps、20ms 一致。
+		userBitrateKbps: 32,
+		chanFrameMS:     20,
 	}
 	s.token.Store(token)
 	s.roomID.Store("")
@@ -596,6 +607,17 @@ func (s *Session) registerHandlers() {
 			}
 			return
 		}
+		// #46 频道音质：joined 是入房的权威配置（0 = 跟随设置/默认 20ms）。
+		// 旧服务端不带字段时按 0/0 处理，行为与升级前一致。必须在 startMedia
+		// 与 setupPeer 之前应用，首个上行包就使用正确帧长。
+		bitrate, frameMS := 0, 0
+		if d.AudioBitrateKbps != nil {
+			bitrate = int(*d.AudioBitrateKbps)
+		}
+		if d.AudioFrameMs != nil {
+			frameMS = int(*d.AudioFrameMs)
+		}
+		s.setChannelAudio(bitrate, frameMS)
 		s.startMedia() // 入房才启动采集/播放
 		s.mu.Lock()
 		s.members = make(map[string]PeerView, len(d.Members))
@@ -633,6 +655,18 @@ func (s *Session) registerHandlers() {
 				Deafen: signal.Bool(s.deafened.Load()),
 			})
 		}
+	})
+	// channel.audio 音质热更新（#46）：只对当前房间生效；其他频道（例如管理员
+	// 在别处改了配置）忽略，等入房时的 channel.joined 拿权威值。
+	s.ws.On(signal.TypeChannelAudio, func(env signal.Envelope) {
+		var d signal.ChannelAudioData
+		if env.Decode(&d) != nil || d.ChannelID == "" {
+			return
+		}
+		if room, _ := s.roomID.Load().(string); room != d.ChannelID {
+			return
+		}
+		s.setChannelAudio(int(d.AudioBitrateKbps), int(d.AudioFrameMs))
 	})
 	s.ws.On(signal.TypeRTCOffer, func(env signal.Envelope) {
 		var d signal.SDPData
@@ -905,6 +939,8 @@ func (s *Session) teardownLocalRoomLocked() {
 	if s.mixer != nil {
 		s.mixer.SetDeafen(false)
 	}
+	// #46：离开频道即取消码率上限、帧长回默认，恢复用户自己的设置。
+	s.resetChannelAudio()
 	s.clearRoomTables()
 }
 
@@ -981,6 +1017,11 @@ func (s *Session) setupPeer() {
 	// 新 peer 默认不静音：必须同步本地静音态，否则重连后出现
 	//「UI 显示已闭麦但声音照传」。deafen 是混音器总线层的口，无 peer 级对应。
 	peer.SetMuted(s.muted.Load())
+	// #46：上行 RTP 时戳步进必须匹配频道帧长（10ms=480/20ms=960）。此时
+	// channel.joined 已应用频道配置；下行远端链路也已同步同一帧长。
+	if err := peer.SetFrameMS(s.currentFrameMS()); err != nil {
+		s.log.Printf("peer frame size: %v", err)
+	}
 	s.peerRef.Store(peer)
 	if err := peer.Offer(); err != nil {
 		s.log.Printf("offer: %v", err)
@@ -1193,20 +1234,99 @@ func (s *Session) RestartDevices(captureID, playbackID string) error {
 	return s.pipe.RestartDevices(captureID, playbackID)
 }
 
+// effectiveBitrateKbps 频道上限与用户设置取小（#46）：上限 0 = 跟随用户设置。
+// 纯函数便于单测；用户设置已被 ResolveOpusConfig 兜底为正数。
+func effectiveBitrateKbps(user, cap int) int {
+	if cap > 0 && cap < user {
+		return cap
+	}
+	return user
+}
+
+// normalizeChannelFrameMS 频道下发的帧长归一：只认 10，其余（含 0/20/非法值）
+// 一律默认 20ms——旧服务端缺省字段与显式默认走同一条路径。
+func normalizeChannelFrameMS(ms int) int {
+	if ms == audio.FrameMS10 {
+		return audio.FrameMS10
+	}
+	return audio.FrameMS20
+}
+
+// setChannelAudio 应用当前频道音质配置（#46）。只改码率/帧长，不碰用户其他
+// 音频设置；离开频道时用 resetChannelAudio 恢复用户码率与 20ms 帧长。
+func (s *Session) setChannelAudio(bitrateKbps, frameMS int) {
+	s.audioCfgMu.Lock()
+	defer s.audioCfgMu.Unlock()
+	s.chanBitrateKbps = bitrateKbps
+	s.chanFrameMS = normalizeChannelFrameMS(frameMS)
+	if err := s.applyChannelAudioLocked(); err != nil {
+		s.log.Printf("session: 应用频道音质失败: %v", err)
+	}
+}
+
+// resetChannelAudio 离开房间后恢复用户设置（码率上限取消、帧长回 20ms）。
+func (s *Session) resetChannelAudio() {
+	s.audioCfgMu.Lock()
+	defer s.audioCfgMu.Unlock()
+	s.chanBitrateKbps = 0
+	s.chanFrameMS = audio.FrameMS20
+	if err := s.applyChannelAudioLocked(); err != nil {
+		s.log.Printf("session: 恢复用户音质失败: %v", err)
+	}
+}
+
+// currentFrameMS 当前生效帧长（建 peer 前读取）。
+func (s *Session) currentFrameMS() int {
+	s.audioCfgMu.Lock()
+	defer s.audioCfgMu.Unlock()
+	return normalizeChannelFrameMS(s.chanFrameMS)
+}
+
+// applyChannelAudioLocked 把生效码率/帧长刷到管线、上行 peer 与下行远端链路。
+// 调用方须持 audioCfgMu；pipe 为 nil（音频降级）时只需维护状态。
+func (s *Session) applyChannelAudioLocked() error {
+	if s.pipe == nil {
+		return nil
+	}
+	var firstErr error
+	if err := s.pipe.SetOpusBitrate(effectiveBitrateKbps(s.userBitrateKbps, s.chanBitrateKbps)); err != nil {
+		firstErr = fmt.Errorf("bitrate: %w", err)
+	}
+	frameMS := normalizeChannelFrameMS(s.chanFrameMS)
+	if err := s.pipe.SetFrameMS(frameMS); err != nil && firstErr == nil {
+		firstErr = fmt.Errorf("frame: %w", err)
+	}
+	if p := s.peerRef.Load(); p != nil {
+		if err := p.SetFrameMS(frameMS); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("peer frame: %w", err)
+		}
+	}
+	if s.remoteMgr != nil {
+		if err := s.remoteMgr.SetFrameMS(frameMS); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("remote frame: %w", err)
+		}
+	}
+	return firstErr
+}
+
 // ApplyAudio 把运行时音频设置热应用到媒体管线（通话中可调，未 Connect 时空操作）。
 // Opus 参数经 ResolveOpusConfig 回落默认；逐项应用，返回首个错误（不中断）。
 // v0.1.2 扩展：复杂度/降噪强度/AGC/扬声器总音量（mixer master gain）。
 // v1.1 扩展：前置增益（原子热生效）/输入声道模式（热重启采集流）。
+// #46：用户码率设置只存原始值，实际生效值再与当前频道上限取小；频道帧长不受
+// 用户设置影响。
 func (s *Session) ApplyAudio(rs audio.RuntimeSettings) error {
 	if s.pipe == nil {
 		return nil
 	}
 	rs.Opus = audio.ResolveOpusConfig(rs.Opus)
+	s.audioCfgMu.Lock()
+	s.userBitrateKbps = rs.Opus.BitrateKbps
+	s.audioCfgMu.Unlock()
 	steps := []struct {
 		name string
 		fn   func() error
 	}{
-		{"bitrate", func() error { return s.pipe.SetOpusBitrate(rs.Opus.BitrateKbps) }},
 		{"vbr", func() error { return s.pipe.SetOpusVBR(*rs.Opus.VBR) }},
 		{"dtx", func() error { return s.pipe.SetOpusDTX(*rs.Opus.DTX) }},
 		{"fec", func() error { return s.pipe.SetOpusFEC(*rs.Opus.FEC) }},
@@ -1236,6 +1356,13 @@ func (s *Session) ApplyAudio(rs audio.RuntimeSettings) error {
 		s.mixer.SetMasterGain(rs.PlaybackGain)
 	}
 	s.pipe.SetVADSensitivity(rs.VADSens)
+	// 码率与帧长统一走频道合并逻辑：用户调码率时若在受上限约束的房内，
+	// 实际值不得越过频道上限。
+	s.audioCfgMu.Lock()
+	if err := s.applyChannelAudioLocked(); err != nil && firstErr == nil {
+		firstErr = fmt.Errorf("audio channel: %w", err)
+	}
+	s.audioCfgMu.Unlock()
 	return firstErr
 }
 

@@ -14,6 +14,10 @@ const (
 	SampleRate    = 48000
 	FrameSize     = 480 // RNNoise 帧：10ms @ 48k
 	OpusFrameSize = 960 // Opus 帧：20ms = 2 个 RNNoise 帧
+
+	// 频道可配置的 Opus 帧长（#46）：0 在配置层归一成默认 20ms。
+	FrameMS10 = 10
+	FrameMS20 = 20
 )
 
 // 前置增益 dB 值域（0.25×~16×）。越界在 setter 报错、构造时收敛。

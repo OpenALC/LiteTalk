@@ -466,3 +466,30 @@ func TestPeerPendingICE(t *testing.T) {
 		t.Fatalf("pending ICE = %d, want 1", queued)
 	}
 }
+
+// TestSetFrameMSRTPTimestampStep 帧长 → RTP 时戳步进（#46）：20ms=960、10ms=480；
+// 非法值拒绝且不改当前步进。
+func TestSetFrameMSRTPTimestampStep(t *testing.T) {
+	p := &Peer{}
+	if err := p.SetFrameMS(10); err != nil {
+		t.Fatalf("SetFrameMS(10): %v", err)
+	}
+	if got := p.tsStep.Load(); got != 480 {
+		t.Fatalf("10ms 时戳步进 = %d, want 480", got)
+	}
+	if err := p.SetFrameMS(20); err != nil {
+		t.Fatalf("SetFrameMS(20): %v", err)
+	}
+	if got := p.tsStep.Load(); got != rtpTimestampStep {
+		t.Fatalf("20ms 时戳步进 = %d, want %d", got, rtpTimestampStep)
+	}
+	if err := p.SetFrameMS(15); err == nil {
+		t.Fatal("非法帧长应报错")
+	}
+	if got := p.tsStep.Load(); got != rtpTimestampStep {
+		t.Fatalf("非法值不应改变步进: %d", got)
+	}
+	if got := timestampStepForMS(10); got != 480 {
+		t.Fatalf("timestampStepForMS(10) = %d, want 480", got)
+	}
+}

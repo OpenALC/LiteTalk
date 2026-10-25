@@ -593,3 +593,68 @@ func TestOpusConfigResolve(t *testing.T) {
 		t.Fatalf("ResolveOpusConfig 应保留显式值: %+v", r)
 	}
 }
+
+// TestFrameMS10 10ms 帧长（#46）：每个 10ms 帧单独编码，包数 = 帧数，
+// 解码返回 480 采样；切回 20ms 恢复两帧一包。
+func TestFrameMS10(t *testing.T) {
+	var packets [][]byte
+	p := newLoopbackPipeline(t, func(c *PipelineConfig) {
+		c.Loopback = false
+		c.DSP.Denoise = false
+		c.OnPacket = func(pkt []byte) {
+			packets = append(packets, append([]byte(nil), pkt...))
+		}
+	})
+	if got := p.FrameMS(); got != FrameMS20 {
+		t.Fatalf("默认帧长 = %d, want %d", got, FrameMS20)
+	}
+	if err := p.SetFrameMS(FrameMS10); err != nil {
+		t.Fatalf("SetFrameMS(10): %v", err)
+	}
+	if err := p.SetFrameMS(15); err == nil {
+		t.Fatal("非法帧长应报错")
+	}
+
+	in := make([]int16, FrameSize)
+	var phase float64
+	var rng uint32 = 0x77
+	for f := 0; f < 4; f++ {
+		sineNoiseFrame(in, &phase, 12000, 2000, &rng)
+		if err := p.ProcessPCM(in); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(packets) != 4 {
+		t.Fatalf("10ms 模式包数 = %d, want 4", len(packets))
+	}
+	dec, err := codec.NewDecoder(SampleRate, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Close()
+	out := make([]int16, OpusFrameSize)
+	for i, pkt := range packets {
+		m, err := dec.Decode(pkt, out, false)
+		if err != nil {
+			t.Fatalf("decode packet %d: %v", i, err)
+		}
+		if m != FrameSize {
+			t.Fatalf("10ms 包解码 %d 采样, want %d", m, FrameSize)
+		}
+	}
+
+	// 切回 20ms：再喂 4 个 10ms 帧应得到 2 个包。
+	if err := p.SetFrameMS(FrameMS20); err != nil {
+		t.Fatalf("SetFrameMS(20): %v", err)
+	}
+	before := len(packets)
+	for f := 0; f < 4; f++ {
+		sineNoiseFrame(in, &phase, 12000, 2000, &rng)
+		if err := p.ProcessPCM(in); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := len(packets) - before; got != 2 {
+		t.Fatalf("切回 20ms 后包数 = %d, want 2", got)
+	}
+}

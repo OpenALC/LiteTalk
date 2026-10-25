@@ -139,6 +139,10 @@ type remotePeer struct {
 
 	Stats RemoteStats
 
+	// frameMS 当前频道 Opus 帧长（10/20ms，#46）：决定弹帧节拍与 PLC 合成长度。
+	// 由 RemoteManager.SetFrameMS 统一写入（同一语音频道配置一致）。
+	frameMS atomic.Int32
+
 	// 预分配热路径缓冲（仅解码循环使用）
 	payloadBuf [rtc.JitterMaxPayload]byte
 	fecBuf     [rtc.JitterMaxPayload]byte // 丢帧瞬间的后继包副本（FEC 用）
@@ -151,6 +155,10 @@ type RemoteManager struct {
 	mixer *Mixer
 	log   *log.Logger
 
+	// frameMS 当前频道帧长（10/20ms，#46）。新接入的远端轨继承此值；
+	// 热切换时同步写入全部在管远端。
+	frameMS atomic.Int32
+
 	mu    sync.Mutex
 	peers map[string]*remotePeer
 }
@@ -160,8 +168,29 @@ func NewRemoteManager(m *Mixer, logger *log.Logger) *RemoteManager {
 	if logger == nil {
 		logger = log.New(nopWriter{}, "", 0)
 	}
-	return &RemoteManager{mixer: m, log: logger, peers: make(map[string]*remotePeer)}
+	rm := &RemoteManager{mixer: m, log: logger, peers: make(map[string]*remotePeer)}
+	rm.frameMS.Store(FrameMS20)
+	return rm
 }
+
+// SetFrameMS 热切换下行帧长（10/20ms，#46 频道配置）：后续弹帧节拍与 PLC
+// 帧长随之改变。切换不重置抖动缓冲——已缓冲的旧帧按包内时长解码，过渡期
+// 最多一拍的节拍偏差。
+func (rm *RemoteManager) SetFrameMS(ms int) error {
+	if ms != FrameMS10 && ms != FrameMS20 {
+		return fmt.Errorf("帧长非法: %d（只支持 10/20ms）", ms)
+	}
+	rm.frameMS.Store(int32(ms))
+	rm.mu.Lock()
+	for _, rp := range rm.peers {
+		rp.frameMS.Store(int32(ms))
+	}
+	rm.mu.Unlock()
+	return nil
+}
+
+// FrameMS 当前下行帧长（10/20ms）。
+func (rm *RemoteManager) FrameMS() int { return int(rm.frameMS.Load()) }
 
 // identifyPeer 从下行轨识别说话成员（与信令 user_id 对齐，供 StateTable/
 // peer_left 对账）：服务端约定 TrackID="audio-<user_id>"、StreamID=
@@ -199,6 +228,7 @@ func (rm *RemoteManager) HandleTrack(track *webrtc.TrackRemote, _ *webrtc.RTPRec
 		dec:   dec,
 		done:  make(chan struct{}),
 	}
+	rp.frameMS.Store(rm.frameMS.Load())
 
 	rm.mu.Lock()
 	if old, ok := rm.peers[peerID]; ok {
@@ -346,25 +376,44 @@ func (rp *remotePeer) readLoop(rm *RemoteManager) {
 	}
 }
 
-// decodeLoop 20ms 节拍驱动 decodeOnce。
+// decodeLoop 按当前帧长驱动 decodeOnce（20ms 或 10ms，可热切换）。
 func (rp *remotePeer) decodeLoop() {
 	defer rp.wg.Done()
-	tick := time.NewTicker(JitterPopInterval)
-	defer tick.Stop()
+	timer := time.NewTimer(rp.popInterval())
+	defer timer.Stop()
 	for {
 		select {
 		case <-rp.done:
 			return
-		case <-tick.C:
+		case <-timer.C:
 		}
 		rp.decodeOnce()
+		timer.Reset(rp.popInterval())
 	}
+}
+
+// frameMSValue 当前帧长（零值按默认 20ms，测试可直接构造 remotePeer）。
+func (rp *remotePeer) frameMSValue() int {
+	if int(rp.frameMS.Load()) == FrameMS10 {
+		return FrameMS10
+	}
+	return FrameMS20
+}
+
+// popInterval 弹帧节拍 = 当前帧长。
+func (rp *remotePeer) popInterval() time.Duration {
+	return time.Duration(rp.frameMSValue()) * time.Millisecond
+}
+
+// frameSamples 当前帧长的 48kHz 采样数（10ms=480，20ms=960）。
+func (rp *remotePeer) frameSamples() int {
+	return rp.frameMSValue() * SampleRate / 1000
 }
 
 // decodeOnce 单拍：到点 pop → 解码/丢帧补偿 → 写该 peer 的混音输入环。
 // 丢帧时若后继包已在 jitter 槽内，先用它的带内 FEC 恢复丢失帧（不消费后继，
 // 也不做常驻 +1 包 lookahead，稳态延迟不变）；连续丢包/后继未到/后继是 DTX
-// 心跳包时回落 PLC。
+// 心跳包时回落 PLC。PLC 按当前帧长合成（10ms=480、20ms=960，#46）。
 // 热路径零分配（预分配 payloadBuf/fecBuf/pcm）；测试可同步调用。
 func (rp *remotePeer) decodeOnce() {
 	n, lost, ok := rp.jb.Pop(rp.payloadBuf[:])
@@ -380,7 +429,7 @@ func (rp *remotePeer) decodeOnce() {
 				return
 			}
 		}
-		m, err := rp.dec.Decode(nil, rp.pcm[:], false) // PLC
+		m, err := rp.dec.Decode(nil, rp.pcm[:rp.frameSamples()], false) // PLC：按当前帧长合成
 		if err != nil {
 			rp.Stats.DecodeErrors.Add(1)
 			return
@@ -398,7 +447,7 @@ func (rp *remotePeer) decodeOnce() {
 	rp.input.Write(rp.pcm[:m])
 }
 
-// JitterPopInterval 抖动缓冲弹出节拍（与 Opus 帧长一致）。
+// JitterPopInterval 默认抖动缓冲弹出节拍（20ms 帧长；10ms 频道按配置动态计算）。
 const JitterPopInterval = 20 * time.Millisecond
 
 type nopWriter struct{}

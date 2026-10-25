@@ -111,7 +111,7 @@ type Stats struct {
 	CaptureSamples    atomic.Uint64 // 实际写入采集环的采样数
 	CaptureDropped    atomic.Uint64 // 采集环满丢弃的采样数
 	FramesProcessed   atomic.Uint64 // 过 DSP 的 10ms 帧数
-	PacketsEncoded    atomic.Uint64 // 编码出的 Opus 包数（20ms）
+	PacketsEncoded    atomic.Uint64 // 编码出的 Opus 包数（当前帧长 10/20ms）
 	PacketsDecoded    atomic.Uint64 // 回环解码的包数
 	BytesEncoded      atomic.Uint64 // 编码总字节数
 	EncodeErrors      atomic.Uint64
@@ -121,7 +121,7 @@ type Stats struct {
 	PlaybackUnderruns atomic.Uint64 // 播放欠载次数（补静音）
 	PlaybackDropped   atomic.Uint64 // 播放环满丢弃的采样数
 	SpeakingChanges   atomic.Uint64 // 说话状态翻转次数
-	PTTDropped        atomic.Uint64 // 按键说话发送门拦下的包数（20ms）
+	PTTDropped        atomic.Uint64 // 按键说话发送门拦下的包数（10/20ms 按当前帧长）
 	LatencyCount      atomic.Uint64 // 延迟测量样本数
 	LatencySumUS      atomic.Uint64 // 延迟累计（微秒）
 	LatencyMaxUS      atomic.Uint64 // 延迟峰值（微秒）
@@ -187,8 +187,9 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	}
 }
 
-// Pipeline 音频管线：采集 → (10ms 帧) DSP → (2 帧拼 20ms) Opus 编码 →
-// 回环模式本地解码 → 播放。M2 时编码结果改经 OnPacket 送 RTP。
+// Pipeline 音频管线：采集 → (10ms 帧) DSP → Opus 编码（默认 2 帧拼 20ms，
+// 频道配置 10ms 时逐帧编码，见 SetFrameMS）→ 回环模式本地解码 → 播放。
+// M2 时编码结果改经 OnPacket 送 RTP。
 //
 // 使用方式：
 //   - 常规：NewPipeline → Start → Stop/Close；
@@ -221,6 +222,10 @@ type Pipeline struct {
 	// 恒放行。原子指针：处理 goroutine 每帧 Load，SetSendGate 可在任意
 	// goroutine 调用（值对象长期存活，跨会话复用不会泄漏）。
 	sendGate atomic.Pointer[hotkey.Gate]
+
+	// frameMS Opus 帧长（10/20，默认 20；#46 频道配置热切换）。处理 goroutine
+	// 每帧 Load；切换时丢弃尚未拼满的半帧，最多损失一个旧帧。
+	frameMS atomic.Int32
 
 	done    chan struct{}
 	wg      sync.WaitGroup
@@ -256,6 +261,7 @@ func NewPipeline(cfg PipelineConfig) (*Pipeline, error) {
 		done:     make(chan struct{}),
 		nullRNG:  0x1EAF1234,
 	}
+	p.frameMS.Store(FrameMS20) // 默认 20ms；频道配置在入房后热切换
 	if cfg.InputMode > InputModeMix {
 		cfg.InputMode = InputModeAuto
 		p.cfg.InputMode = InputModeAuto
@@ -632,6 +638,20 @@ func (p *Pipeline) AudioLevel() uint8 { return p.dsp.AudioLevel() }
 // 可在会话建立时注入一次、长期复用；热路径只做一次原子指针 Load。
 func (p *Pipeline) SetSendGate(g *hotkey.Gate) { p.sendGate.Store(g) }
 
+// SetFrameMS 热切换 Opus 帧长（10/20ms，#46 频道配置）。处理 goroutine 下一帧
+// 生效；从 20 切到 10 时尚未拼满的半帧被丢弃（最多一个 10ms 帧的短暂空隙）。
+// 编码缓冲仍按最大帧（960）预分配，热路径不因切换分配内存。
+func (p *Pipeline) SetFrameMS(ms int) error {
+	if ms != FrameMS10 && ms != FrameMS20 {
+		return fmt.Errorf("帧长非法: %d（只支持 10/20ms）", ms)
+	}
+	p.frameMS.Store(int32(ms))
+	return nil
+}
+
+// FrameMS 当前生效的 Opus 帧长（10/20ms）。
+func (p *Pipeline) FrameMS() int { return int(p.frameMS.Load()) }
+
 // ReadPlayback 从播放环读出解码后的采样（测试/null 汇用），返回采样数。
 func (p *Pipeline) ReadPlayback(out []int16) int { return p.playRing.Read(out) }
 
@@ -727,10 +747,13 @@ func (p *Pipeline) synthFrame(dst []int16) {
 	}
 }
 
-// processFrame 单个 10ms 帧的核心链路：DSP → 拼 20ms → 编码 → 发包门 →
-// 回环解码 → 播放环。全部使用预分配缓冲，零堆分配。仅处理 goroutine 调用。
+// processFrame 单个 10ms 帧的核心链路：DSP → 按当前帧长拼帧 → 编码 → 发包门 →
+// 回环解码 → 播放环。20ms 模式拼 2 个 10ms 帧，10ms 模式逐帧编码（#46）。
+// 全部使用预分配缓冲，零堆分配。仅处理 goroutine 调用。
 func (p *Pipeline) processFrame(frame []int16) {
-	if p.opusHalf == 0 {
+	frameMS := p.FrameMS()
+	// 10ms 每帧独立；20ms 以首半帧进入管线的时间作为延迟测量起点。
+	if frameMS == FrameMS10 || p.opusHalf == 0 {
 		p.frameStart = time.Now()
 	}
 	if _, err := p.dsp.Process(p.dspOut[:], frame); err != nil {
@@ -739,17 +762,26 @@ func (p *Pipeline) processFrame(frame []int16) {
 	}
 	p.stats.FramesProcessed.Add(1)
 
-	copy(p.opusFrame[p.opusHalf*FrameSize:(p.opusHalf+1)*FrameSize], p.dspOut[:])
-	p.opusHalf++
-	if p.opusHalf < 2 {
-		return
+	// samples 指向本次要编码的 PCM：10ms 直接引用 DSP 输出（无需拷贝），
+	// 20ms 攒满两帧后引用预分配的 opusFrame。
+	var samples []int16
+	if frameMS == FrameMS10 {
+		p.opusHalf = 0 // 切换瞬间丢弃旧模式残留的半帧
+		samples = p.dspOut[:FrameSize]
+	} else {
+		copy(p.opusFrame[p.opusHalf*FrameSize:(p.opusHalf+1)*FrameSize], p.dspOut[:])
+		p.opusHalf++
+		if p.opusHalf < 2 {
+			return
+		}
+		p.opusHalf = 0
+		samples = p.opusFrame[:OpusFrameSize]
 	}
-	p.opusHalf = 0
 
 	n, err := func() (int, error) {
 		p.encMu.Lock()
 		defer p.encMu.Unlock()
-		return p.enc.Encode(p.opusFrame[:], p.pktBuf[:])
+		return p.enc.Encode(samples, p.pktBuf[:])
 	}()
 	if err != nil {
 		p.stats.EncodeErrors.Add(1)

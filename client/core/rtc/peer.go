@@ -23,8 +23,12 @@ const OpusPayloadType = 111
 // opusSDPFmtpLine Opus fmtp：10ms 最小帧长 + 带内 FEC（与服务端一致）。
 const opusSDPFmtpLine = "minptime=10;useinbandfec=1"
 
-// rtpTimestampStep 20ms Opus 帧的 RTP 时戳步进（48kHz × 0.02s）。
+// rtpTimestampStep 默认 20ms Opus 帧的 RTP 时戳步进（48kHz × 0.02s）。
+// 10ms 频道帧长用 SetFrameMS 改成 480（#46）。
 const rtpTimestampStep = 960
+
+// timestampStepForMS 帧长 → RTP 时戳步进（48kHz 采样率）。
+func timestampStepForMS(ms int) uint32 { return uint32(ms * 48) }
 
 // DTXPayloadMax 是 Opus DTX 静音心跳包的最大长度（1~2 字节，仅 TOC/极短载荷）。
 // 发送端照常发送以保持 RTP 时间线连续（接收端 jitter 不判空洞、不重预填）；
@@ -102,6 +106,10 @@ type Peer struct {
 	levelFn       func() uint8
 
 	muted atomic.Bool
+
+	// tsStep 每包 RTP 时戳步进（#46）：默认 960（20ms），10ms 频道为 480。
+	// SendOpus 在管线 goroutine 读取；SetFrameMS 可在任意 goroutine 调用。
+	tsStep atomic.Uint32
 
 	remoteMu      sync.Mutex
 	remoteDescSet bool
@@ -188,6 +196,7 @@ func NewPeer(cfg PeerConfig) (*Peer, error) {
 	}
 
 	p := &Peer{pc: pc, sendTrack: track, sender: sender, cb: cfg.Callbacks, log: cfg.Logger, levelFn: cfg.LevelFn}
+	p.tsStep.Store(rtpTimestampStep)
 
 	// 随机 SSRC / 起始序号与时戳（RFC3550 推荐）。
 	var rnd [8]byte
@@ -354,8 +363,9 @@ func audioLevelExtID(exts []webrtc.RTPHeaderExtensionParameter) (uint8, bool) {
 	return 0, false
 }
 
-// SendOpus 把一个 Opus 包打包为 RTP 发出（seq 自增 1，时戳步进 960）。
-// 用户主动静音时整包丢弃（MutedDropped 计数，恢复后重新预填）。
+// SendOpus 把一个 Opus 包打包为 RTP 发出（seq 自增 1，时戳按当前帧长步进，
+// 默认 960 = 20ms，10ms 频道为 480）。用户主动静音时整包丢弃（MutedDropped
+// 计数，恢复后重新预填）。
 // Opus DTX 在静音期产出的 1~2 字节心跳包照常发送：RTP seq/时戳时间线连续，
 // 对端 jitter 看到的是正常到达的空帧（libopus 解码 DTX 包得到对应长度的
 // 静音），不会判空洞、不会 2×target 后重回预填——此前丢弃心跳包导致每次
@@ -371,7 +381,11 @@ func (p *Peer) SendOpus(payload []byte) error {
 	}
 	p.sendMu.Lock()
 	p.pkt.SequenceNumber++
-	p.pkt.Timestamp += rtpTimestampStep
+	step := p.tsStep.Load()
+	if step == 0 {
+		step = rtpTimestampStep
+	}
+	p.pkt.Timestamp += step
 	p.pkt.Payload = payload
 	// RFC 6464 电平（#33）：只改写预分配的 levelExt[0]，零分配。
 	if p.levelAttached {
@@ -392,6 +406,16 @@ func (p *Peer) SendOpus(payload []byte) error {
 
 // SetMuted 设置本地静音（停止上行发包）。
 func (p *Peer) SetMuted(m bool) { p.muted.Store(m) }
+
+// SetFrameMS 设置上行 Opus 帧长（10/20ms，#46 频道配置）：决定 RTP 时戳步进。
+// 切换帧长时序列不中断，下一包按新步进推进；接收端按频道配置的帧长弹帧。
+func (p *Peer) SetFrameMS(ms int) error {
+	if ms != 10 && ms != 20 {
+		return fmt.Errorf("rtc: 帧长非法: %d（只支持 10/20ms）", ms)
+	}
+	p.tsStep.Store(timestampStepForMS(ms))
+	return nil
+}
 
 // Muted 当前本地静音状态。
 func (p *Peer) Muted() bool { return p.muted.Load() }
