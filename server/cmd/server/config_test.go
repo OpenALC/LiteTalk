@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/OpenALC/LiteTalk/server/internal/blob"
 )
@@ -21,6 +22,8 @@ func clearConfigEnv(t *testing.T) {
 		"LITETALK_SFU_IP", "LITETALK_AUTH_MODE", "LITETALK_GATEWAY_BACKLOG",
 		"LITETALK_UPLOAD_DRIVER", "LITETALK_UPLOAD_DIR", "LITETALK_UPLOAD_MAX_BYTES",
 		"LITETALK_UPLOAD_ALLOWED_TYPES",
+		"LITETALK_ATTACHMENT_GC", "LITETALK_ATTACHMENT_GC_INTERVAL",
+		"LITETALK_ATTACHMENT_GC_UNCLAIMED_TTL", "LITETALK_ATTACHMENT_GC_BATCH",
 		"LITETALK_S3_ENDPOINT", "LITETALK_S3_BUCKET", "LITETALK_S3_ACCESS_KEY",
 		"LITETALK_S3_SECRET_KEY", "LITETALK_S3_REGION", "LITETALK_S3_USE_SSL",
 		"LITETALK_S3_PATH_STYLE",
@@ -153,6 +156,80 @@ func TestLoadConfigUpload(t *testing.T) {
 	t.Setenv("LITETALK_UPLOAD_ALLOWED_TYPES", "not-a-mime")
 	if _, err := loadConfig(nil, io.Discard); err == nil || !strings.Contains(err.Error(), "LITETALK_UPLOAD_ALLOWED_TYPES") {
 		t.Fatalf("非法 MIME 应报错，实际 %v", err)
+	}
+}
+
+// TestLoadConfigAttachmentGC 附件回收配置（#41 P2）：默认开启、可关闭、越界夹取、
+// 非法时长/整数拒绝启动。
+func TestLoadConfigAttachmentGC(t *testing.T) {
+	clearConfigEnv(t)
+
+	cfg, err := loadConfig(nil, io.Discard)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	gc := cfg.attachmentGC
+	if !gc.Enabled || gc.Interval != time.Hour || gc.UnclaimedTTL != 24*time.Hour || gc.Batch != 200 {
+		t.Fatalf("默认回收配置不符: %+v", gc)
+	}
+
+	for _, off := range []string{"off", "0", "false", "OFF", " False "} {
+		t.Setenv("LITETALK_ATTACHMENT_GC", off)
+		cfg, err = loadConfig(nil, io.Discard)
+		if err != nil {
+			t.Fatalf("loadConfig(%q): %v", off, err)
+		}
+		if cfg.attachmentGC.Enabled {
+			t.Fatalf("LITETALK_ATTACHMENT_GC=%q 应关闭回收", off)
+		}
+	}
+	// 非关闭值按开启处理（与链接预览开关同口径）。
+	for _, on := range []string{"on", "1", "true", "yes"} {
+		t.Setenv("LITETALK_ATTACHMENT_GC", on)
+		cfg, err = loadConfig(nil, io.Discard)
+		if err != nil || !cfg.attachmentGC.Enabled {
+			t.Fatalf("LITETALK_ATTACHMENT_GC=%q 应开启: %v", on, err)
+		}
+	}
+
+	// 越界夹取。
+	t.Setenv("LITETALK_ATTACHMENT_GC", "")
+	t.Setenv("LITETALK_ATTACHMENT_GC_INTERVAL", "1m")
+	t.Setenv("LITETALK_ATTACHMENT_GC_UNCLAIMED_TTL", "10m")
+	t.Setenv("LITETALK_ATTACHMENT_GC_BATCH", "0")
+	cfg, err = loadConfig(nil, io.Discard)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.attachmentGC.Interval != 5*time.Minute ||
+		cfg.attachmentGC.UnclaimedTTL != time.Hour ||
+		cfg.attachmentGC.Batch != 1 {
+		t.Fatalf("下界夹取不符: %+v", cfg.attachmentGC)
+	}
+
+	t.Setenv("LITETALK_ATTACHMENT_GC_INTERVAL", "48h")
+	t.Setenv("LITETALK_ATTACHMENT_GC_UNCLAIMED_TTL", "720h")
+	t.Setenv("LITETALK_ATTACHMENT_GC_BATCH", "9999")
+	cfg, err = loadConfig(nil, io.Discard)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.attachmentGC.Interval != 24*time.Hour ||
+		cfg.attachmentGC.UnclaimedTTL != 7*24*time.Hour ||
+		cfg.attachmentGC.Batch != 500 {
+		t.Fatalf("上界夹取不符: %+v", cfg.attachmentGC)
+	}
+
+	// 非法值拒绝启动（即使开关关闭也保持配置可判定）。
+	t.Setenv("LITETALK_ATTACHMENT_GC", "off")
+	t.Setenv("LITETALK_ATTACHMENT_GC_INTERVAL", "1h30")
+	if _, err := loadConfig(nil, io.Discard); err == nil || !strings.Contains(err.Error(), "LITETALK_ATTACHMENT_GC_INTERVAL") {
+		t.Fatalf("非法时长应报错，实际 %v", err)
+	}
+	t.Setenv("LITETALK_ATTACHMENT_GC_INTERVAL", "")
+	t.Setenv("LITETALK_ATTACHMENT_GC_BATCH", "10.5")
+	if _, err := loadConfig(nil, io.Discard); err == nil || !strings.Contains(err.Error(), "LITETALK_ATTACHMENT_GC_BATCH") {
+		t.Fatalf("非法批大小应报错，实际 %v", err)
 	}
 }
 

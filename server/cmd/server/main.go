@@ -405,6 +405,24 @@ func main() {
 	ctx, stop := ossignal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// 附件生命周期回收（#41 P2）：未认领超期、消息已硬删、消息已软删的孤儿。
+	// 用同一个优雅关闭 ctx；Run 在后台 goroutine 里先扫一轮，不阻塞启动。
+	if gcCfg := cfg.attachmentGC; gcCfg.Enabled {
+		attGC := &attachment.GC{
+			Store:        st,
+			Blob:         blobStore,
+			UnclaimedTTL: gcCfg.UnclaimedTTL,
+			Interval:     gcCfg.Interval,
+			Batch:        gcCfg.Batch,
+			Log:          log.Default(),
+		}
+		log.Printf("附件回收: 开启（间隔 %s，未认领 TTL %s，每批 %d）",
+			gcCfg.Interval, gcCfg.UnclaimedTTL, gcCfg.Batch)
+		go attGC.Run(ctx)
+	} else {
+		log.Println("附件回收: 关闭（LITETALK_ATTACHMENT_GC）")
+	}
+
 	// ---- 起 HTTP（§0.6 步骤 9）：ACME TLS + :80 挑战，或纯 HTTP ----
 	servers := startHTTP(cfg, mux, stop)
 	log.Printf("litetalk server %s 监听 %s（SFU UDP %d / ICE-TCP %d，TURN %d）",

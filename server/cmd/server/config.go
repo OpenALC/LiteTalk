@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/OpenALC/LiteTalk/server/internal/attachment"
 	"github.com/OpenALC/LiteTalk/server/internal/blob"
@@ -38,6 +39,9 @@ type config struct {
 	upload      blob.Config
 	uploadMax   int64    // LITETALK_UPLOAD_MAX_BYTES，默认 10 MiB，上限 100 MiB
 	uploadTypes []string // LITETALK_UPLOAD_ALLOWED_TYPES，空 = attachment 包默认白名单
+
+	// 附件生命周期回收（#41 P2）。默认开启；值在 loadConfig 里夹到安全区间。
+	attachmentGC attachmentGCConfig
 
 	// 校验输入（启动序步骤 2 集中把关；本批无对应 flag，仅 env）
 	jwtSecret     string
@@ -126,6 +130,12 @@ func loadConfig(args []string, output io.Writer) (*config, error) {
 		UseSSL:    envBoolDefault("LITETALK_S3_USE_SSL", true),
 		PathStyle: envBoolDefault("LITETALK_S3_PATH_STYLE", false),
 	}
+	// 附件回收（#41 P2）：非法时长/整数直接拒绝启动，越界值夹到安全区间。
+	gcCfg, err := parseAttachmentGC()
+	if err != nil {
+		return nil, err
+	}
+	cfg.attachmentGC = gcCfg
 	cfg.addr = envOr("LITETALK_ADDR", defaultAddr)
 	cfg.addrExplicit = os.Getenv("LITETALK_ADDR") != ""
 	// 触发条件（§0.5）：--domain 非空 且 未设 --behind-proxy。
@@ -204,6 +214,97 @@ func parseUploadAllowedTypes(raw string) ([]string, error) {
 		out = append(out, mt)
 	}
 	return out, nil
+}
+
+// 附件回收参数的安全区间：扫描太密会反复扫表，未认领 TTL 太短会误删
+// 「上传后正在发送」的附件。Batch 上限与 store 的查询夹取一致。
+const (
+	gcMinInterval     = 5 * time.Minute
+	gcMaxInterval     = 24 * time.Hour
+	gcMinUnclaimedTTL = time.Hour
+	gcMaxUnclaimedTTL = 7 * 24 * time.Hour
+	gcMinBatch        = 1
+)
+
+// attachmentGCConfig 后台附件回收的启动参数（#41 P2）。
+type attachmentGCConfig struct {
+	Enabled      bool
+	Interval     time.Duration
+	UnclaimedTTL time.Duration
+	Batch        int
+}
+
+// parseAttachmentGC 解析 LITETALK_ATTACHMENT_GC*：
+//   - 开关默认开，off/0/false 关闭（与 LITETALK_LINK_PREVIEW 同口径）；
+//   - 时长非法直接报错，越界夹到区间；整数非法报错，越界夹取。
+//
+// 开关关闭时仍解析其余变量：配置始终可判定，避免「关掉后残留脏值、
+// 再打开时才启动失败」。
+func parseAttachmentGC() (attachmentGCConfig, error) {
+	cfg := attachmentGCConfig{
+		Enabled:      true,
+		Interval:     attachment.DefaultGCInterval,
+		UnclaimedTTL: attachment.DefaultGCUnclaimedTTL,
+		Batch:        attachment.DefaultGCBatch,
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("LITETALK_ATTACHMENT_GC"))) {
+	case "off", "0", "false":
+		cfg.Enabled = false
+	}
+	var err error
+	cfg.Interval, err = parseGCDuration("LITETALK_ATTACHMENT_GC_INTERVAL",
+		os.Getenv("LITETALK_ATTACHMENT_GC_INTERVAL"), cfg.Interval, gcMinInterval, gcMaxInterval)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.UnclaimedTTL, err = parseGCDuration("LITETALK_ATTACHMENT_GC_UNCLAIMED_TTL",
+		os.Getenv("LITETALK_ATTACHMENT_GC_UNCLAIMED_TTL"), cfg.UnclaimedTTL, gcMinUnclaimedTTL, gcMaxUnclaimedTTL)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.Batch, err = parseGCBatch(os.Getenv("LITETALK_ATTACHMENT_GC_BATCH"))
+	if err != nil {
+		return cfg, err
+	}
+	return cfg, nil
+}
+
+// parseGCDuration 空串取默认值；非法时长报错；越界夹取。
+func parseGCDuration(key, raw string, def, min, max time.Duration) (time.Duration, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s 不是合法时长: %q（例 30m、1h）", key, raw)
+	}
+	if d < min {
+		return min, nil
+	}
+	if d > max {
+		return max, nil
+	}
+	return d, nil
+}
+
+// parseGCBatch 空串取默认值；非法整数报错；夹到 [gcMinBatch, MaxGCBatch]。
+func parseGCBatch(raw string) (int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return attachment.DefaultGCBatch, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("LITETALK_ATTACHMENT_GC_BATCH 不是合法整数: %q", raw)
+	}
+	if n < gcMinBatch {
+		return gcMinBatch, nil
+	}
+	if n > attachment.MaxGCBatch {
+		return attachment.MaxGCBatch, nil
+	}
+	return n, nil
 }
 
 // lookupIP 域名解析（测试可替换；生产 = net.LookupIP）。

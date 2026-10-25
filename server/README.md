@@ -124,12 +124,23 @@ curl -X POST "http://127.0.0.1:8077/api/v1/rtc/credentials?token=dev-alice"
 下载走能力 URL（`/api/v1/attachments/{id}?key=...`，免 Bearer，可直接用于 `<img>`）；
 消息软删后附件随之 404。图片会生成最长边 320 的 JPEG 缩略图（`/thumbnail`）。
 
+后台回收（默认开启）每小时扫描三类孤儿：未认领超过 24h 的上传、消息已硬删
+（频道/分类/服务器/会话删除后消息行消失）、消息已软删的附件。每行先删 blob，
+storage 与缩略图都成功（不存在视为成功）后才删元数据行；失败保留行，下一轮重试。
+
+> **实例/用户级附件配额仍未实现，属于后续项。** 当前只有上传频控（30 次/分/用户），
+> 单账号仍可在限流内持续上传，磁盘占用没有硬上限。
+
 | 环境变量 | 默认 | 说明 |
 |---|---|---|
 | `LITETALK_UPLOAD_DRIVER` | `local` | `local` 或 `s3`；非法值启动失败 |
 | `LITETALK_UPLOAD_DIR` | `$LITETALK_DATA_DIR/uploads` | local 驱动的落盘目录（Docker 的 `/data` 卷已覆盖） |
 | `LITETALK_UPLOAD_MAX_BYTES` | `10485760`（10 MiB） | 单附件上限；`<=0` 回落默认，超过 100 MiB 启动失败 |
 | `LITETALK_UPLOAD_ALLOWED_TYPES` | 见下 | 逗号分隔 MIME 白名单；空 = 默认 |
+| `LITETALK_ATTACHMENT_GC` | `on` | `off`/`0`/`false` 关闭后台回收 |
+| `LITETALK_ATTACHMENT_GC_INTERVAL` | `1h` | 扫描间隔，夹取 5m–24h |
+| `LITETALK_ATTACHMENT_GC_UNCLAIMED_TTL` | `24h` | 未认领附件保留时长，夹取 1h–7d |
+| `LITETALK_ATTACHMENT_GC_BATCH` | `200` | 每批处理行数，夹取 1–500 |
 | `LITETALK_S3_ENDPOINT` / `_BUCKET` / `_ACCESS_KEY` / `_SECRET_KEY` | — | `driver=s3` 时必填 |
 | `LITETALK_S3_REGION` | 空 | 留空由 SDK 推断（AWS 建议显式给） |
 | `LITETALK_S3_USE_SSL` | `1` | 设为 `0` 才走明文（内网 MinIO 等） |
@@ -148,7 +159,8 @@ curl -X POST "http://127.0.0.1:8077/api/v1/rtc/credentials?token=dev-alice"
   Bucket 不属于该账号、Region 不匹配），或 MinIO 没开路径风格。服务启动只校验配置、
   不探测连通性，第一次上传才会暴露——先看服务端日志里的 `[blob]`/`[500]` 行。
 - 下载 URL 里的 `key` 是 256 位随机能力凭证：拿到 URL 的人即可下载，转发聊天记录
-  等于转发访问权；消息软删是唯一的主动失效方式（附件内容不可覆盖）。
+  等于转发访问权；消息软删是唯一的主动失效方式（附件内容不可覆盖，后台回收随后删除
+  行与对象）。能力 URL 没有过期时间，移出群成员/退出群也不会撤销已获得的 URL。
 
 ## 链接预览（#42）
 
