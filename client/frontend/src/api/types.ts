@@ -17,6 +17,10 @@ export type ChannelInfo = components['schemas']['ChannelInfo']
 export type CategoryInfo = components['schemas']['CategoryInfo']
 export type MemberInfo = components['schemas']['MemberInfo']
 export type Message = components['schemas']['Message']
+// #39：消息编辑/删除/回复/@提及的契约类型。
+export type ReplyPreview = components['schemas']['ReplyPreview']
+export type EditMessageRequest = components['schemas']['EditMessageRequest']
+export type MentionCandidate = components['schemas']['MentionCandidate']
 export type Invite = components['schemas']['Invite']
 export type FriendEntry = components['schemas']['FriendEntry']
 export type ServerChannels = components['schemas']['ServerChannels']
@@ -30,6 +34,18 @@ export type SetMemberRolesRequest = components['schemas']['SetMemberRolesRequest
 export type ChannelOverwrite = components['schemas']['ChannelOverwrite']
 export type SetOverwriteRequest = components['schemas']['SetOverwriteRequest']
 export type AuditLogEntry = components['schemas']['AuditLogEntry']
+// #38 B2：私聊/群私聊会话（无服务器频道；消息仍走 channel_id）。
+export type Conversation = components['schemas']['Conversation']
+export type ConversationMember = components['schemas']['ConversationMember']
+export type CreateConversationRequest = components['schemas']['CreateConversationRequest']
+export type PatchConversationRequest = components['schemas']['PatchConversationRequest']
+export type AddConversationMembersRequest = components['schemas']['AddConversationMembersRequest']
+// #40：未读与提及计数（快照含 0 值项；channel.unread 事件为覆盖语义）。
+export type Unreads = components['schemas']['Unreads']
+export type UnreadChannel = components['schemas']['UnreadChannel']
+export type UnreadServer = components['schemas']['UnreadServer']
+// #42 B4：链接预览（服务端抓取并清洗；image_url 为绝对地址，客户端直接加载）。
+export type LinkPreview = components['schemas']['LinkPreview']
 
 // ---- 桥接层兼容名（组件/stores 既有命名）----
 // Wails 绑定经 Go state 包中转：字段与契约同源，个别桥接补充字段见注释。
@@ -62,6 +78,19 @@ export interface PeerView {
   deafen: boolean
 }
 
+// AttachmentView 消息附件（#41，与 Go 侧 ChatMessageView.Attachments 同口径）。
+// url/thumbnail_url 已由 Go 桥拼成绝对地址，可直接用作 img src 或交给 OpenAttachment。
+export interface AttachmentView {
+  id: string
+  filename: string
+  size: number
+  content_type: string
+  width: number
+  height: number
+  url: string
+  thumbnail_url?: string
+}
+
 // ChatMessage 语音房聊天（WS chat.message 桥接视图；与 REST Message 不同源，
 // 三方漂移在 #31 统一）。
 export interface ChatMessage {
@@ -73,6 +102,16 @@ export interface ChatMessage {
   ts: string
   // nonce 发送方幂等键（#31，协议 v2；老服务端/REST 补拉不带）
   nonce?: string
+  // #39：编辑/软删时间为毫秒字符串；reply_to 为回复目标消息 ID；
+  // reply_preview 为跳转预览（目标已软删时 content 空、deleted=true）；
+  // mentions 为被 @ 的用户 ID（升序去重）。
+  edited_at?: string
+  deleted_at?: string
+  reply_to?: string
+  reply_preview?: ReplyPreview
+  mentions?: string[]
+  // #41 附件（无附件或软删消息缺省）；纯附件消息 content 为空串。
+  attachments?: AttachmentView[]
 }
 
 // ConnConfigView 当前生效的服务器地址与来源（设置页「连接」）。

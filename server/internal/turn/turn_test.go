@@ -4,9 +4,12 @@ import (
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -21,16 +24,89 @@ func signREST(secret, username string) string {
 	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
 }
 
-// freePort 先占空闲 TCP 端口再释放，供 UDP/TCP 同号绑定用。
+// freePort 选出一个 TCP 与 UDP 都能绑定的端口，供 UDP/TCP 同号绑定用。
+// 只探测 TCP 不够：监听关闭后没有 TIME_WAIT，内核会把同一个临时端口再分给
+// 并行跑的其他包（sfu 的 relay 用例也用同款 helper），而 TCP 空闲不代表 UDP
+// 空闲，New 同号绑定时就会 bind: address already in use。做法是先拿 TCP :0
+// 候选，保持该 TCP 监听的同时试绑 UDP 同号，两者都成功才释放返回；失败的
+// 候选换下一个，尝试次数耗尽则报错，不返回未经双重验证的端口。
 func freePort(t *testing.T) int {
 	t.Helper()
-	ln, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4zero, Port: 0})
-	if err != nil {
-		t.Fatal(err)
+	const maxAttempts = 20
+	var lastErr error
+	for i := 0; i < maxAttempts; i++ {
+		ln, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4zero, Port: 0})
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		port := ln.Addr().(*net.TCPAddr).Port
+		pc, err := net.ListenPacket("udp4", net.JoinHostPort("0.0.0.0", strconv.Itoa(port)))
+		if err != nil {
+			_ = ln.Close()
+			lastErr = err
+			continue
+		}
+		_ = pc.Close()
+		_ = ln.Close()
+		return port
 	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	_ = ln.Close()
-	return port
+	t.Fatalf("连续 %d 次未找到 TCP/UDP 均可绑定的端口，最后一次错误: %v", maxAttempts, lastErr)
+	return 0
+}
+
+// isAddrInUse 判断监听失败是否只是端口被抢占（TOCTOU），只有这类错误值得
+// 换端口重试。Linux/macOS 报文为 "address already in use"，Windows 为
+// "Only one usage of each socket address"。
+func isAddrInUse(err error) bool {
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "address already in use") ||
+		strings.Contains(msg, "Only one usage of each socket address")
+}
+
+// newTestServer 用空闲同号端口启动 UDP+TCP 内置 TURN，返回实例与实际端口。
+// tcpOnly=true 时只开 TCP（UDPPort=0，禁 UDP 网络用例）。
+func newTestServer(t *testing.T, tcpOnly bool) (*Server, int) {
+	t.Helper()
+	return newTestServerConfig(t, testConfig(0, 0), tcpOnly)
+}
+
+// newTestServerConfig 同 newTestServer，允许调用方先覆盖配额等配置；端口字段
+// 由 helper 按 freePort 结果填充。
+//
+// freePort 释放探测 socket 到 New 真正绑定之间仍有 TOCTOU 窗口，并行包的
+// UDP/TCP 绑定可能恰好落在同一端口。此处只对端口占用换端口重试，其它错误
+// （配置非法、pion 启动失败）立即失败——不能靠吞错放宽同号并存的断言。
+func newTestServerConfig(t *testing.T, cfg Config, tcpOnly bool) (*Server, int) {
+	t.Helper()
+	const maxAttempts = 10
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		port := freePort(t)
+		c := cfg
+		c.TCPPort = port
+		if tcpOnly {
+			c.UDPPort = 0
+		} else {
+			c.UDPPort = port
+		}
+		srv, err := New(c)
+		if err == nil {
+			if lastErr != nil {
+				t.Logf("内置 TURN 第 %d 次尝试在端口 %d 启动成功（前次失败: %v）", attempt, port, lastErr)
+			}
+			return srv, port
+		}
+		if !isAddrInUse(err) {
+			t.Fatalf("内置 TURN 启动失败（非端口占用，不重试）: %v", err)
+		}
+		lastErr = err
+	}
+	t.Fatalf("内置 TURN 连续 %d 次启动失败，最后一次错误: %v", maxAttempts, lastErr)
+	return nil, 0
 }
 
 func testConfig(udpPort, tcpPort int) Config {
@@ -47,11 +123,7 @@ func testConfig(udpPort, tcpPort int) Config {
 
 // TestServerListeners UDP+TCP 同号并存（#25「单端口复用不冲突」的 TURN 侧验收）。
 func TestServerListeners(t *testing.T) {
-	port := freePort(t)
-	srv, err := New(testConfig(port, port))
-	if err != nil {
-		t.Fatalf("UDP/TCP 同号 %d 启动失败: %v", port, err)
-	}
+	srv, port := newTestServer(t, false)
 	defer func() { _ = srv.Close() }()
 
 	if srv.UDPAddr() == nil {
@@ -60,7 +132,7 @@ func TestServerListeners(t *testing.T) {
 	if srv.TCPAddr() == nil {
 		t.Fatal("TCP 监听未建立")
 	}
-	t.Logf("UDP %s / TCP %s 并存 OK", srv.UDPAddr(), srv.TCPAddr())
+	t.Logf("UDP %s / TCP %s 同号 %d 并存 OK", srv.UDPAddr(), srv.TCPAddr(), port)
 }
 
 // TestServerRejectsEmpty 配置缺 Secret / RelayIP / 全零端口必须报错，不静默起。
@@ -141,11 +213,7 @@ func allocateUDP(t *testing.T, port int, secret, uid string) net.PacketConn {
 
 // TestAllocateUDP REST 短期凭证与内置 TURN 互通：签发端点同款 HMAC 可直接 Allocate。
 func TestAllocateUDP(t *testing.T) {
-	port := freePort(t)
-	srv, err := New(testConfig(port, port))
-	if err != nil {
-		t.Fatal(err)
-	}
+	srv, port := newTestServer(t, false)
 	defer func() { _ = srv.Close() }()
 	allocateUDP(t, port, "test-secret-0123456789", "42")
 }
@@ -204,11 +272,7 @@ func TestPeerIPPolicy(t *testing.T) {
 // TestRelayToLoopbackDenied 合法凭证只应换来中继端口，不能借中继访问 127.0.0.1
 // （#25 P0：实测可打穿本机 Redis/MySQL）。分配本身必须仍成功。
 func TestRelayToLoopbackDenied(t *testing.T) {
-	port := freePort(t)
-	srv, err := New(testConfig(port, port))
-	if err != nil {
-		t.Fatal(err)
-	}
+	srv, port := newTestServer(t, false)
 	defer func() { _ = srv.Close() }()
 
 	relay := allocateUDP(t, port, "test-secret-0123456789", "46")
@@ -222,12 +286,8 @@ func TestRelayToLoopbackDenied(t *testing.T) {
 // TestAllocationQuotaPerUID 同一 uid 第 5 个并发 allocation 必须失败（486），
 // 换一个 uid 仍可分配（#25 P1：单凭证刷爆中继端口 = 对所有人拒绝服务）。
 func TestAllocationQuotaPerUID(t *testing.T) {
-	port := freePort(t)
-	cfg := testConfig(port, port)
-	srv, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	cfg := testConfig(0, 0)
+	srv, port := newTestServerConfig(t, cfg, false)
 	defer func() { _ = srv.Close() }()
 
 	for i := 0; i < DefaultMaxAllocationsPerUID; i++ {
@@ -318,14 +378,10 @@ func TestAllocationQuotaCustomLimits(t *testing.T) {
 // TestAllocationQuotaConfig 自定义 Config 上限贯通到真实 TURN 服务：
 // MaxPerUID=2、MaxPerIP=3 时同 uid 第 3 个被拒，换 uid 后第 4 个按 IP 层被拒。
 func TestAllocationQuotaConfig(t *testing.T) {
-	port := freePort(t)
-	cfg := testConfig(port, port)
+	cfg := testConfig(0, 0)
 	cfg.MaxPerUID = 2
 	cfg.MaxPerIP = 3
-	srv, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	srv, port := newTestServerConfig(t, cfg, false)
 	defer func() { _ = srv.Close() }()
 
 	for i := 0; i < cfg.MaxPerUID; i++ {
@@ -396,12 +452,8 @@ func allocateTCP(t *testing.T, port int, secret, uid string) {
 // TestAllocateTCPOnly 禁 UDP 场景（#25 核心）：TURN 只听 TCP，客户端零 UDP，
 // 必须能经 TCP 3478 完成 Allocate 拿到中继。
 func TestAllocateTCPOnly(t *testing.T) {
-	port := freePort(t)
-	cfg := testConfig(0, port) // UDP=0 不听
-	srv, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	cfg := testConfig(0, 0)
+	srv, port := newTestServerConfig(t, cfg, true)
 	defer func() { _ = srv.Close() }()
 	if srv.UDPAddr() != nil {
 		t.Fatal("UDPPort=0 不应建立 UDP 监听")
@@ -411,11 +463,7 @@ func TestAllocateTCPOnly(t *testing.T) {
 
 // TestAllocateTCPDual 双栈监听下 TCP 通道同样可用（TURN UDP+TCP 并存互不干扰）。
 func TestAllocateTCPDual(t *testing.T) {
-	port := freePort(t)
-	srv, err := New(testConfig(port, port))
-	if err != nil {
-		t.Fatal(err)
-	}
+	srv, port := newTestServer(t, false)
 	defer func() { _ = srv.Close() }()
 	allocateTCP(t, port, "test-secret-0123456789", "44")
 }
@@ -467,12 +515,8 @@ func newTCPConnector(t *testing.T, port int, secret, uid string) func(peer net.A
 // TestConnectTCPToLoopbackDenied RFC6062 CONNECT 同样受 PermissionHandler 约束
 // （#25 P0）：TCP 中继不能连到 127.0.0.1 上的内部 TCP 服务。
 func TestConnectTCPToLoopbackDenied(t *testing.T) {
-	port := freePort(t)
-	cfg := testConfig(0, port)
-	srv, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	cfg := testConfig(0, 0)
+	srv, port := newTestServerConfig(t, cfg, true)
 	defer func() { _ = srv.Close() }()
 
 	connect := newTCPConnector(t, port, cfg.Secret, "47")
@@ -486,12 +530,8 @@ func TestConnectTCPToLoopbackDenied(t *testing.T) {
 // TestExpiredCredentialRejected 过期的 REST 凭证必须被拒（LongTermTURNRESTAuthHandler
 // 的时间窗语义，防止凭证永久有效）。
 func TestExpiredCredentialRejected(t *testing.T) {
-	port := freePort(t)
-	cfg := testConfig(0, port)
-	srv, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	cfg := testConfig(0, 0)
+	srv, port := newTestServerConfig(t, cfg, true)
 	defer func() { _ = srv.Close() }()
 
 	username, credential := restCredential(cfg.Secret, "45", -time.Minute) // 已过期

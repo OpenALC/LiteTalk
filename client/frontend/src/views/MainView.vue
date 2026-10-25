@@ -8,30 +8,44 @@ import { AudioLines, MessageCircle, Users, WifiOff } from 'lucide-vue-next'
 import { useRouter } from 'vue-router'
 import ServerRail from '../components/ServerRail.vue'
 import ChannelList from '../components/ChannelList.vue'
+import ConversationList from '../components/ConversationList.vue'
 import FriendList from '../components/FriendList.vue'
 import VoiceRoom from '../components/VoiceRoom.vue'
 import TextChat from '../components/TextChat.vue'
+import ConversationChat from '../components/ConversationChat.vue'
+import SearchDialog from '../components/SearchDialog.vue'
 import IntroView from './IntroView.vue'
 import { useVoiceStore } from '../stores/voice'
 import { useChatStore } from '../stores/chat'
 import { useAuthStore } from '../stores/auth'
+import { useConversationsStore } from '../stores/conversations'
 import { INTRO_ID, useFriendsStore, useServersStore } from '../stores/data'
+import { useNotifyStore } from '../stores/notify'
+import { useSearchStore } from '../stores/search'
+import { useUnreadsStore } from '../stores/unreads'
 import { useHotkeys } from '../composables/useHotkeys'
 import { eventsOn } from '../api/bridge'
+import type { ChatMessage } from '../api/types'
 
 const router = useRouter()
 const voice = useVoiceStore()
 const chat = useChatStore()
 const auth = useAuthStore()
+const conversations = useConversationsStore()
 const servers = useServersStore()
 const friends = useFriendsStore()
+const unreads = useUnreadsStore()
+const search = useSearchStore()
+const notify = useNotifyStore()
 
 const tab = ref<'voice' | 'chat'>('voice')
 const showFriends = ref(true)
 // 没有当前服务器（登录前/列表为空）时同样按介绍页处理：频道栏与舞台都依赖
-// currentServer 的字段，不能在列表为空时渲染。
+// currentServer 的字段，不能在列表为空时渲染。私信模式独立于服务器选择，
+// 此时必须压在介绍页之上（即使没有任何服务器）。
 const isIntro = computed(() =>
-  servers.currentServerId === INTRO_ID || !servers.currentServer)
+  !conversations.dmMode
+  && (servers.currentServerId === INTRO_ID || !servers.currentServer))
 
 const hotkeysActive = computed(() => true)
 useHotkeys(
@@ -44,14 +58,53 @@ useHotkeys(
       voice.setDeafen(allOff)
     },
     search: () => {
-      const el = document.querySelector<HTMLInputElement>('.f-search input')
-      el?.focus()
+      // #42 B2：Ctrl+K 打开全局消息搜索（好友搜索框仍可点击使用）。
+      search.openDialog()
     },
     // 设置已独立为路由页（v0.1.2）
     settings: () => router.push('/settings'),
   },
   hotkeysActive,
 )
+
+// onSearchSelect 搜索结果落地（#42 B2）：先按会话 ID 判定私聊/群聊，否则在
+// 本地服务器频道里定位；切到目标后补拉历史并请求 ChatPanel 滚动高亮。
+// 频道不在本地列表（已被移出/删除）时只提示一次，不做二次请求。
+async function onSearchSelect(m: ChatMessage) {
+  const channelId = m.channel_id
+  const conv = conversations.list.find((c) => c.id === channelId)
+  const server = conv
+    ? undefined
+    : servers.servers.find((s) => s.channels.some((c) => c.id === channelId))
+  if (!channelId || (!conv && !server)) {
+    notify.show('无法定位该消息', true)
+    search.close()
+    return
+  }
+  // 先关面板：下面的补拉是网络操作，遮罩不能一直挡着已切到的频道。
+  search.close()
+  if (conv) {
+    conversations.enterDM()
+    try {
+      await conversations.open(channelId)
+    } catch {
+      notify.show('无法定位该消息', true)
+      return
+    }
+  } else if (server) {
+    conversations.exitDM()
+    servers.selectServer(server.id)
+    servers.selectChannel(channelId)
+  }
+  tab.value = 'chat'
+  try {
+    // 历史可能超过 50 条：目标不在补拉窗口内时由 ChatPanel 单条回填。
+    await chat.loadHistory(channelId)
+  } catch {
+    // 静默：ChatPanel 挂载后还会补拉，失败时仍尝试单条回填。
+  }
+  chat.requestJump(channelId, m.id)
+}
 
 // auth:session：Go 侧重试连上/中途断线时翻提示条。
 // eventsOn 返回按监听器的取消函数，卸载时逐个注销（不按事件名整体 Off）。
@@ -64,6 +117,9 @@ onMounted(() => {
   // 必须在登录后立即生效，不能依赖 FriendList 是否展开（它是可隐藏的子组件）。
   servers.bindEvents()
   friends.bindEvents()
+  conversations.bindEvents()
+  // 未读计数（#40）：chat:unread 覆盖本地计数，data:resync 后重拉快照。
+  unreads.bindEvents()
   offAuthSession = eventsOn('auth:session', (d) => {
     auth.setSignalOk((d as { ok?: boolean }).ok !== false)
   })
@@ -77,6 +133,10 @@ onMounted(() => {
   // 失败静默：服务器列表不可用不阻断主界面。
   if (auth.loggedIn) {
     servers.loadRemoteServers().catch(() => {})
+    // 私信列表登录后预取：进入私信模式时不必等一次网络往返。失败静默。
+    conversations.load().catch(() => {})
+    // 未读快照（#40）：登录后拉一次，含 0 值项；失败静默（徽标暂缺不阻断主界面）。
+    unreads.load().catch(() => {})
   }
 })
 
@@ -85,6 +145,8 @@ onUnmounted(() => {
   chat.unbindEvents()
   servers.unbindEvents()
   friends.unbindEvents()
+  conversations.unbindEvents()
+  unreads.unbindEvents()
   offAuthSession()
 })
 </script>
@@ -100,11 +162,31 @@ onUnmounted(() => {
   </div>
   <div class="app">
     <ServerRail />
-    <ChannelList v-if="!isIntro" />
+    <ConversationList v-if="conversations.dmMode" />
+    <ChannelList v-else-if="!isIntro" />
 
     <main class="stage">
       <!-- 介绍页：无 stage-head 页签、无频道栏，品牌卡占满舞台 -->
       <IntroView v-if="isIntro" />
+
+      <!-- 私信模式：第二栏为会话列表，舞台只保留标题与好友栏开关 -->
+      <template v-else-if="conversations.dmMode">
+        <div class="stage-head">
+          <div class="dm-title">
+            <MessageCircle :size="15" />私信
+          </div>
+          <div class="stage-stats">
+            <button class="icon-btn" :class="{ on: showFriends }" title="好友列表"
+                    @click="showFriends = !showFriends">
+              <Users :size="17" />
+            </button>
+          </div>
+        </div>
+
+        <div class="stage-body">
+          <ConversationChat />
+        </div>
+      </template>
 
       <template v-else>
         <div class="stage-head">
@@ -133,6 +215,9 @@ onUnmounted(() => {
 
     <FriendList v-if="showFriends && !isIntro" />
   </div>
+
+  <!-- 全局消息搜索（#42 B2）：Ctrl+K 打开，选中结果后跨频道定位 -->
+  <SearchDialog v-if="search.open" @select="onSearchSelect" @close="search.close()" />
 </template>
 
 <style scoped>
@@ -187,6 +272,14 @@ onUnmounted(() => {
   background: var(--surface); color: var(--brand-700);
   box-shadow: var(--shadow-1);
 }
+/* 私信模式标题：与页签同高同字重，不提供切换（私信只有会话视图） */
+.dm-title {
+  display: flex; align-items: center; gap: 6px;
+  height: 32px; padding: 0 14px; border-radius: 8px;
+  background: var(--brand-50);
+  font-size: 13px; font-weight: 600; color: var(--brand-700);
+}
+.dm-title :deep(svg) { color: var(--brand-600); }
 .stage-stats {
   margin-left: auto;
   display: flex; align-items: center; gap: 16px;

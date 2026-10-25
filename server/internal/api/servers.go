@@ -204,6 +204,8 @@ func (s *Server) JoinServer(ctx context.Context, request JoinServerRequestObject
 				}
 				// 并发加入也算入服：快照里可能还是「非成员」，同步作废。
 				s.authz.InvalidateServer(inv.ServerID)
+				// 新成员以当前最新消息为已读水位，避免把全部历史看成未读（#40）。
+				s.initServerReadStates(ctx, c.UserID, inv.ServerID)
 				return JoinServer200JSONResponse(serverView(srv)), nil
 			}
 			return nil, errf(http.StatusConflict, "code_exhausted", "邀请码使用次数已达上限")
@@ -220,6 +222,8 @@ func (s *Server) JoinServer(ctx context.Context, request JoinServerRequestObject
 	}
 	// 入服改变成员/角色：权限快照立即作废，下一次请求即按新身份裁决。
 	s.authz.InvalidateServer(inv.ServerID)
+	// 新成员以当前最新消息为已读水位，避免把全部历史看成未读（#40）。
+	s.initServerReadStates(ctx, c.UserID, inv.ServerID)
 	return JoinServer200JSONResponse(serverView(srv)), nil
 }
 

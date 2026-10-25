@@ -2,7 +2,7 @@
 // 浏览器独立开发（vite dev 无 Go 后端）时走 mock 桩，行为可联调 UI。
 // 原生环境判定：Go 在 webview 启动时注入 window._wails.flags（浏览器环境恒无）。
 import { Call, Events } from '@wailsio/runtime'
-import type { AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ConnConfigView, ConnTestResult, FriendDTO, HotkeySettings, PeerView, ServerChannels, ServerConfig, ServerDTO, UserProfile, VoiceStateView } from './types'
+import type { AttachmentView, AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ChatMessage, ConnConfigView, ConnTestResult, Conversation, FriendDTO, HotkeySettings, LinkPreview, MentionCandidate, PeerView, ServerChannels, ServerConfig, ServerDTO, UnreadChannel, Unreads, UserProfile, VoiceStateView } from './types'
 
 type GoApp = {
   GetVersion(): Promise<string>
@@ -54,6 +54,29 @@ type GoApp = {
   // RequestVoiceState 「请求静音」：请目标闭麦/静音（对方接受后生效，无强制）。
   RequestVoiceState(channelID: string, targetID: string, mute: boolean, deafen: boolean): Promise<void>
   SendChat(channelID: string, content: string): Promise<void>
+  // 消息编辑/删除/回复/@提及（#39）：ID 一律十进制字符串，Go 侧校验非法 ID。
+  // SendChatWithMeta：replyTo 空串 = 普通消息；mentions 空数组 = 无提及。
+  // EditMessage：mentions 整体替换（空数组清除全部提及），返回更新后的消息。
+  // DeleteMessage 软删；GetMessage 用于回复跳转（软删消息仍返回）。
+  SendChatWithMeta(channelID: string, content: string, replyTo: string, mentions: string[]): Promise<void>
+  // 附件与图片（#41）：PickAndUploadAttachments 打开系统文件选择器并上传，
+  // 返回绝对 url 的附件元数据（取消返回空数组）；SendChatWithAttachments 发送
+  // 纯附件消息（content 可为空串）；OpenAttachment 用系统浏览器打开 http(s) 附件。
+  PickAndUploadAttachments(): Promise<AttachmentView[]>
+  SendChatWithAttachments(channelID: string, content: string, replyTo: string, mentions: string[], attachmentIDs: string[]): Promise<void>
+  OpenAttachment(url: string): Promise<void>
+  EditMessage(channelID: string, messageID: string, content: string, mentions: string[]): Promise<ChatMessage>
+  DeleteMessage(channelID: string, messageID: string): Promise<void>
+  GetMessage(channelID: string, messageID: string): Promise<ChatMessage>
+  ListMentionCandidates(channelID: string): Promise<MentionCandidate[]>
+  // ListMessages 频道最近消息（旧→新，limit 上限 50）。私聊/群聊的会话 ID
+  // 即频道 ID；载荷与 chat:message 事件同口径，按 id 去重合并。
+  ListMessages(channelID: string, limit: number): Promise<ChatMessage[]>
+  // SearchMessages 全局消息搜索（#42）：跨服务器频道与会话，只返回可见频道；
+  // 载荷与 ListMessages 同口径（含附件）；q 1–100、limit 1–50 默认 20。
+  SearchMessages(query: string, limit: number): Promise<ChatMessage[]>
+  // GetLinkPreview 链接预览（#42 B4）：服务端抓取 + 缓存；无预览/功能关闭返回 null。
+  GetLinkPreview(url: string): Promise<LinkPreview | null>
   GetVoiceMembers(): Promise<PeerView[]>
   LogFromWeb(level: string, msg: string): Promise<void>
   // 服务器/频道/好友 REST CRUD（服务端已有端点；批次①接线）。
@@ -84,6 +107,22 @@ type GoApp = {
   AcceptFriend(id: string): Promise<void>
   RemoveFriend(id: string): Promise<void>
   UpdateFriend(id: string, remark: string, group: string): Promise<void>
+  // 私聊/群私聊（#38 B4）：Go 桥直接代理 REST，ID 一律十进制字符串。
+  // 会话变更由 conversation:changed 事件通知，前端收到后重新拉取。
+  ListConversations(): Promise<Conversation[]>
+  CreateDirectConversation(userID: string): Promise<Conversation>
+  CreateGroupConversation(name: string, userIDs: string[]): Promise<Conversation>
+  GetConversation(id: string): Promise<Conversation>
+  RenameConversation(id: string, name: string): Promise<Conversation>
+  DeleteConversation(id: string): Promise<void>
+  AddConversationMembers(id: string, userIDs: string[]): Promise<Conversation>
+  // 最后一人退出时服务端删除会话（204），Go 侧返回 null。
+  RemoveConversationMember(id: string, userID: string): Promise<Conversation | null>
+  // 未读与提及计数（#40）：ListUnreads 返回含 0 值项的快照（空数组非 null）；
+  // MarkChannelRead 上报已读水位并返回服务端重算后的计数。增量由 chat:unread
+  // 事件推送（覆盖语义，不能累加）。
+  ListUnreads(): Promise<Unreads>
+  MarkChannelRead(channelID: string, lastMessageID: string): Promise<UnreadChannel>
   // 介绍页/首页（v0.1.2：客户端级偏好，存 config.json）
   GetHomeServer(): Promise<string>
   SetHomeServer(id: string): Promise<void>
@@ -101,6 +140,19 @@ export interface SavedCredentials {
   email: string
   password: string
   saved: boolean
+}
+
+// mockConversation 浏览器开发用的会话桩：ID 为字符串，成员不含 email。
+function mockConversation(id: string, kind: Conversation['kind'], name: string): Conversation {
+  return {
+    id,
+    kind,
+    name,
+    members: [
+      { user_id: '1', nickname: 'dev', tag: '0001', role: 'owner', joined_at: '2026-01-01T00:00:00Z' },
+    ],
+    created_at: '2026-01-01T00:00:00Z',
+  }
 }
 
 declare global {
@@ -202,6 +254,32 @@ const mockApp: GoApp = {
   async SetDeafen() {},
   async SetPeerVolume() {},
   async SendChat() {},
+  // #39 消息编辑/回复/提及桩：回显传入内容，供浏览器开发联调 UI。
+  async SendChatWithMeta() {},
+  // #41 附件桩：浏览器开发没有原生文件选择器，返回空数组；发送/打开为空操作。
+  async PickAndUploadAttachments() { return [] },
+  async SendChatWithAttachments() {},
+  async OpenAttachment() {},
+  async EditMessage(channelID: string, messageID: string, content: string, mentions: string[]) {
+    return {
+      id: messageID, channel_id: channelID, user_id: '1', nickname: 'dev',
+      content, ts: String(Date.now()), mentions,
+    }
+  },
+  async DeleteMessage() {},
+  async GetMessage(channelID: string, messageID: string) {
+    return {
+      id: messageID, channel_id: channelID, user_id: '1', nickname: 'dev',
+      content: '', ts: String(Date.now()),
+    }
+  },
+  async ListMentionCandidates() { return [] },
+  // 消息历史桩：浏览器开发环境无可联调数据。
+  async ListMessages() { return [] },
+  // 搜索桩：浏览器开发环境无可联调数据。
+  async SearchMessages() { return [] },
+  // 链接预览桩：浏览器开发不发外网抓取，统一按「无预览」隐藏卡片。
+  async GetLinkPreview() { return null },
   async GetVoiceMembers() { return [] },
   async GetVoiceState() { return { channel_id: '', muted: false, deafened: false } },
   async RequestVoiceState() {},
@@ -259,6 +337,20 @@ const mockApp: GoApp = {
   async AcceptFriend() {},
   async RemoveFriend() {},
   async UpdateFriend() {},
+  // 会话桩：列表为空，创建/读取返回占位会话（浏览器开发环境无可联调数据）。
+  async ListConversations() { return [] },
+  async CreateDirectConversation() { return mockConversation('1001', 'direct', '') },
+  async CreateGroupConversation(name: string) { return mockConversation('1002', 'group', name) },
+  async GetConversation(id: string) { return mockConversation(id, 'group', '群聊') },
+  async RenameConversation(id: string, name: string) { return mockConversation(id, 'group', name) },
+  async DeleteConversation() {},
+  async AddConversationMembers(id: string) { return mockConversation(id, 'group', '群聊') },
+  async RemoveConversationMember(id: string) { return mockConversation(id, 'group', '群聊') },
+  // 未读计数桩：空快照/零值（浏览器开发环境无可联调数据）。
+  async ListUnreads() { return { channels: [], servers: [] } },
+  async MarkChannelRead(channelID: string) {
+    return { channel_id: channelID, unread_count: 0, mention_count: 0 }
+  },
   // 介绍页/首页桩：默认介绍页为首页、未隐藏。
   async GetHomeServer() { return '' },
   async SetHomeServer() {},

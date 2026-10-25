@@ -3,8 +3,12 @@ import { computed, ref } from 'vue'
 import { eventsOn, goApp } from '../api/bridge'
 import type { ServerConfig, UserProfile } from '../api/types'
 import { useChatStore } from './chat'
+import { useConversationsStore } from './conversations'
 import { useFriendsStore, useServersStore } from './data'
 import { useNotifyStore } from './notify'
+import { usePreviewStore } from './previews'
+import { useSearchStore } from './search'
+import { useUnreadsStore } from './unreads'
 import { useVoiceStore } from './voice'
 
 // resetSessionStores 业务 store 统一复位（#85）：主动登出、被踢、跨域换服与
@@ -17,6 +21,10 @@ function resetSessionStores() {
     () => useFriendsStore().resetAll(),
     () => useVoiceStore().resetAll(),
     () => useChatStore().resetAll(),
+    () => useConversationsStore().resetAll(),
+    () => useUnreadsStore().resetAll(),
+    () => useSearchStore().resetAll(),
+    () => usePreviewStore().resetAll(),
   ]
   for (const reset of resets) {
     try {

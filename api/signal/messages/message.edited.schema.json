@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litetalk:signal:message.edited",
+  "title": "MessageEditedData",
+  "x-wire-type": "message.edited",
+  "x-go-const": "TypeMessageEdited",
+  "x-direction": "S2C",
+  "x-since": 2,
+  "x-namespace": "event",
+  "description": "消息编辑广播（#39）：REST 编辑成功后推给该频道可见成员，客户端按 message_id 原地替换正文与提及。mentions 缺省表示无提及；空数组不会下发。",
+  "type": "object",
+  "properties": {
+    "channel_id": { "type": "string" },
+    "message_id": { "type": "string" },
+    "content": { "type": "string" },
+    "edited_at": {
+      "type": "integer",
+      "description": "编辑时间（Unix 毫秒）"
+    },
+    "mentions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "x-go-omitempty": true,
+      "description": "@提及的用户 ID 列表（服务端去重后按升序下发）"
+    }
+  },
+  "required": ["channel_id", "message_id", "content", "edited_at"],
+  "additionalProperties": false
+}

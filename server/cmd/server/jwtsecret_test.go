@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // TestResolveJWTSecretGeneratesAndReuses 生产首次启动生成 jwt.secret（0600），
@@ -97,6 +98,33 @@ func TestResolveJWTSecretRejectsWeakFile(t *testing.T) {
 	}
 	if _, _, err := resolveJWTSecret("", dir, false); err == nil || !strings.Contains(err.Error(), path) {
 		t.Fatalf("过短的持久化密钥应拒绝并指明文件，实际 %v", err)
+	}
+}
+
+// TestReadJWTSecretRetryWaitsForWriter 确定性复现并发首启窗口：读取方先看到空文件，
+// 写入方稍后补全内容，重试应读到完整密钥而不是立即失败。
+func TestReadJWTSecretRetryWaitsForWriter(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, jwtSecretFile)
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const want = "0123456789abcdef0123456789abcdef"
+	written := make(chan struct{})
+	go func() {
+		defer close(written)
+		time.Sleep(50 * time.Millisecond)
+		if err := os.WriteFile(path, []byte(want+"\n"), 0o600); err != nil {
+			t.Errorf("补写密钥失败: %v", err)
+		}
+	}()
+	got, err := readJWTSecretRetry(path)
+	if err != nil {
+		t.Fatalf("内容补全后应读取成功: %v", err)
+	}
+	<-written
+	if got != want {
+		t.Fatalf("密钥不符: %q != %q", got, want)
 	}
 }
 

@@ -12,6 +12,7 @@ import {
 } from 'lucide-vue-next'
 import { useRouter } from 'vue-router'
 import { useServersStore, catDropIndex, channelTree, type Channel } from '../stores/data'
+import { badgeText, unreadLabel, useUnreadsStore, type UnreadCount } from '../stores/unreads'
 import { useVoiceStore } from '../stores/voice'
 import { useAuthStore } from '../stores/auth'
 import { useNotifyStore } from '../stores/notify'
@@ -25,10 +26,17 @@ import VolumeSlider from './VolumeSlider.vue'
 const router = useRouter()
 const servers = useServersStore()
 const voice = useVoiceStore()
+const unreads = useUnreadsStore()
 const auth = useAuthStore()
 const notify = useNotifyStore()
 
 const collapsed = ref<Record<string, boolean>>({})
+
+// unreadOf 频道未读计数（#40）：只对文字频道有意义，语音频道恒零（不显示徽标）。
+const EMPTY_UNREAD: UnreadCount = { unread: 0, mentions: 0 }
+function unreadOf(ch: Channel): UnreadCount {
+  return ch.type === 'text' ? unreads.channel(ch.id) : EMPTY_UNREAD
+}
 
 // ---- 个人卡片音量悬停滑块（走查 5；批次③） ----
 // 初值从持久化读；@apply（松手）才 SetAudioSettings 热应用+落盘。
@@ -407,7 +415,12 @@ async function onCatDrop(e: DragEvent, gi: number) {
                  @contextmenu.prevent="openCtx($event, node.ch)">
               <component :is="node.ch.hasPassword || node.ch.locked ? Lock : (node.ch.type === 'text' ? Hash : Volume2)"
                          :size="16" />
-              <span class="cname">{{ node.ch.name }}</span>
+              <span class="cname" :class="{ unread: unreadOf(node.ch).unread > 0 }">{{ node.ch.name }}</span>
+              <!-- 未读徽标（#40）：提及数优先，否则未读圆点；语音频道不显示 -->
+              <span v-if="unreadOf(node.ch).mentions > 0" class="unread-badge"
+                    :title="unreadLabel(unreadOf(node.ch))">{{ badgeText(unreadOf(node.ch).mentions) }}</span>
+              <span v-else-if="unreadOf(node.ch).unread > 0" class="unread-dot"
+                    :title="unreadLabel(unreadOf(node.ch))" />
               <span v-if="node.ch.id === voice.channelId" class="count">
                 <Mic :size="12" />{{ voice.members.length }}
               </span>
@@ -429,7 +442,11 @@ async function onCatDrop(e: DragEvent, gi: number) {
                  @contextmenu.prevent="openCtx($event, child)">
               <component :is="child.hasPassword || child.locked ? Lock : (child.type === 'text' ? Hash : Volume2)"
                          :size="16" />
-              <span class="cname">{{ child.name }}</span>
+              <span class="cname" :class="{ unread: unreadOf(child).unread > 0 }">{{ child.name }}</span>
+              <span v-if="unreadOf(child).mentions > 0" class="unread-badge"
+                    :title="unreadLabel(unreadOf(child))">{{ badgeText(unreadOf(child).mentions) }}</span>
+              <span v-else-if="unreadOf(child).unread > 0" class="unread-dot"
+                    :title="unreadLabel(unreadOf(child))" />
               <span v-if="child.id === voice.channelId" class="count">
                 <Mic :size="12" />{{ voice.members.length }}
               </span>
@@ -583,6 +600,22 @@ async function onCatDrop(e: DragEvent, gi: number) {
 .chan .cname {
   flex: 1; font-size: 13.5px; font-weight: 500;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* 有未读的频道名加粗（#40），颜色用品牌蓝灰 */
+.chan .cname.unread { font-weight: 600; color: var(--ink-900); }
+/* 未读徽标（#40）：提及数为主色胶囊白字，未读为小圆点 */
+.chan .unread-badge {
+  flex: none;
+  min-width: 16px; height: 16px; padding: 0 4px;
+  border-radius: 8px;
+  background: var(--brand-500); color: var(--surface);
+  font-size: 10px; font-weight: 700; line-height: 16px;
+  text-align: center;
+}
+.chan .unread-dot {
+  flex: none;
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--brand-500);
 }
 .chan .count {
   font-size: 11.5px; color: var(--ink-400);

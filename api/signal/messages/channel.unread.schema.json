@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litetalk:signal:channel.unread",
+  "title": "ChannelUnreadData",
+  "x-wire-type": "channel.unread",
+  "x-go-const": "TypeChannelUnread",
+  "x-direction": "S2C",
+  "x-since": 2,
+  "x-namespace": "event",
+  "description": "频道未读/提及计数事件（#40）。计数按接收者精确计算：同一事件只投递给该用户，客户端收到后整体覆盖本地该频道的计数。自己的消息不计未读；多设备读标记与断线续传都通过本事件同步。",
+  "type": "object",
+  "properties": {
+    "channel_id": { "type": "string" },
+    "unread_count": { "type": "integer", "minimum": 0 },
+    "mention_count": { "type": "integer", "minimum": 0 }
+  },
+  "required": ["channel_id", "unread_count", "mention_count"],
+  "additionalProperties": false
+}

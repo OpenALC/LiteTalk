@@ -21,6 +21,33 @@
       "x-go-omitempty": true,
       "maxLength": 64,
       "description": "发送方 chat.send 携带的幂等键；仅发送方带 nonce 时回显（#31，协议 v2）。"
+    },
+    "reply_to": {
+      "type": "string",
+      "x-since": 2,
+      "x-go-omitempty": true,
+      "description": "回复目标消息 ID（#39）；非回复消息缺省。"
+    },
+    "reply_preview": {
+      "$ref": "components.schema.json#/$defs/ReplyPreview",
+      "x-since": 2,
+      "x-go-omitempty": true,
+      "x-go-pointer": true,
+      "description": "回复目标预览（#39）；目标已软删时 content 为空、deleted=true。"
+    },
+    "mentions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "x-since": 2,
+      "x-go-omitempty": true,
+      "description": "@提及的用户 ID 列表（#39），服务端去重后按升序下发。"
+    },
+    "attachments": {
+      "type": "array",
+      "items": { "$ref": "components.schema.json#/$defs/AttachmentInfo" },
+      "x-since": 2,
+      "x-go-omitempty": true,
+      "description": "消息附件（#41），按附件 ID 升序；无附件时缺省。纯附件消息 content 为空串。"
     }
   },
   "required": ["id", "channel_id", "content", "ts", "user"],

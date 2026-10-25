@@ -17,6 +17,11 @@ var (
 	ErrConflict  = errors.New("conflict")
 	ErrForbidden = errors.New("forbidden")
 	ErrExpired   = errors.New("expired")
+
+	// ErrAttachmentUnavailable 附件认领失败（#41 B1）：附件不存在、上传者不是消息作者、
+	// 已被其他消息引用，或请求里含重复/非法 ID。统一成同一错误，避免向调用方泄露
+	// 「附件是否存在 / 属于谁」；CreateMessage 认领失败时整条消息回滚，不留半条数据。
+	ErrAttachmentUnavailable = errors.New("attachment unavailable")
 )
 
 // newID 新行主键（#31）：调用方未预置时取 Snowflake，显式赋值优先（测试夹具用）。
@@ -102,21 +107,55 @@ const (
 	ChannelVoice ChannelType = "voice"
 )
 
+// ChannelScope 频道作用域（迁移 0012，#38 B1）：
+// server = 服务器频道；direct/group = 私聊/群私聊，没有所属服务器。
+type ChannelScope string
+
+const (
+	ChannelScopeServer ChannelScope = "server"
+	ChannelScopeDirect ChannelScope = "direct"
+	ChannelScopeGroup  ChannelScope = "group"
+)
+
 // Channel 频道。category_id 指向分类表（迁移 0003），NULL = 未分类。
 type Channel struct {
-	ID         int64       `json:"id" db:"id"`
-	ServerID   int64       `json:"server_id" db:"server_id"`
-	Name       string      `json:"name" db:"name"`
-	Type       ChannelType `json:"type" db:"type"`
-	CategoryID *int64      `json:"category_id" db:"category_id"`
-	Position   int         `json:"position" db:"position"`
-	CreatedAt  time.Time   `json:"created_at" db:"created_at"`
+	ID int64 `json:"id" db:"id"`
+	// ServerID 所属服务器；0 表示无服务器（direct/group，DB 存 NULL）。
+	ServerID int64        `json:"server_id" db:"server_id"`
+	Name     string       `json:"name" db:"name"`
+	Type     ChannelType  `json:"type" db:"type"`
+	Scope    ChannelScope `json:"scope" db:"scope"`
+	// DMKey 私聊去重键 "<minUID>:<maxUID>"，只有 direct 有值（server/group 存 NULL）。
+	// 不对外：客户端用会话 ID 与成员列表识别私聊，键里只是双方 uid。
+	DMKey      string    `json:"-" db:"dm_key"`
+	CategoryID *int64    `json:"category_id" db:"category_id"`
+	Position   int       `json:"position" db:"position"`
+	CreatedAt  time.Time `json:"created_at" db:"created_at"`
 	// #37 B1 频道选项：密码（bcrypt）、人数上限（0=不限）、子频道父级（NULL=顶层）。
 	// PasswordHash 不出 JSON——wire 只暴露 has_password，明文/哈希都不回显。
 	// 更新是全行写：读到的 hash 必须原样写回，清除密码写空串。
 	ParentID     *int64 `json:"parent_id" db:"parent_id"`
 	UserLimit    int    `json:"user_limit" db:"user_limit"`
 	PasswordHash string `json:"-" db:"password_hash"`
+}
+
+// ChannelMemberRole 会话成员角色。owner 只用于 group（首个成员即创建者）。
+type ChannelMemberRole string
+
+const (
+	ChannelMemberOwner  ChannelMemberRole = "owner"
+	ChannelMemberMember ChannelMemberRole = "member"
+)
+
+// ChannelMember 会话成员（迁移 0012 channel_members 表）。
+// Nickname/Tag 供成员列表响应内联（与 ServerMember 同口径，SQL 侧 JOIN users）。
+type ChannelMember struct {
+	ChannelID int64             `json:"channel_id" db:"channel_id"`
+	UserID    int64             `json:"user_id" db:"user_id"`
+	Role      ChannelMemberRole `json:"role" db:"role"`
+	JoinedAt  time.Time         `json:"joined_at" db:"joined_at"`
+	Nickname  string            `json:"nickname,omitempty" db:"-"`
+	Tag       string            `json:"tag,omitempty" db:"-"`
 }
 
 // Category 频道分类（v0.1.2 迁移 0003）。空分类可持久化，删除可连带频道。
@@ -130,16 +169,52 @@ type Category struct {
 
 // Message 文字频道消息。
 // Nonce 客户端幂等键（#31）：空 = 不去重；(channel_id, user_id, nonce) 唯一索引见迁移 0007。
+// EditedAt/DeletedAt/ReplyTo 见迁移 0013（#39）；DeletedAt 非空表示软删，正文已清空。
+// Mentions 不是 messages 列（message_mentions 表）：列表与详情默认不填，调用方按需
+// 用 MentionsOfMessages 批量查。
 type Message struct {
-	ID        int64     `json:"id" db:"id"`
-	ChannelID int64     `json:"channel_id" db:"channel_id"`
-	UserID    int64     `json:"user_id" db:"user_id"`
-	Content   string    `json:"content" db:"content"`
-	Nonce     string    `json:"nonce,omitempty" db:"nonce"`
-	CreatedAt time.Time `json:"created_at" db:"created_at"`
+	ID        int64      `json:"id" db:"id"`
+	ChannelID int64      `json:"channel_id" db:"channel_id"`
+	UserID    int64      `json:"user_id" db:"user_id"`
+	Content   string     `json:"content" db:"content"`
+	Nonce     string     `json:"nonce,omitempty" db:"nonce"`
+	CreatedAt time.Time  `json:"created_at" db:"created_at"`
+	EditedAt  *time.Time `json:"edited_at,omitempty" db:"edited_at"`
+	DeletedAt *time.Time `json:"deleted_at,omitempty" db:"deleted_at"`
+	ReplyTo   *int64     `json:"reply_to,omitempty" db:"reply_to"`
+	Mentions  []int64    `json:"mentions,omitempty" db:"-"`
+	// AttachmentIDs 发送时随消息认领的附件（#41 B1）：只在 CreateMessage 事务内消费，
+	// 不落消息行、读取不回填，附件归属查 AttachmentsByMessageIDs。
+	AttachmentIDs []int64 `json:"attachment_ids,omitempty" db:"-"`
 	// Sender 内联发送者信息（列表响应用）。
 	SenderNickname string `json:"sender_nickname,omitempty" db:"-"`
 	SenderTag      string `json:"sender_tag,omitempty" db:"-"`
+}
+
+// Attachment 消息附件元数据（迁移 0015，#41 B1）。二进制内容在 blob，不在库里。
+// MessageID 为 0 表示尚未被消息引用（message_id NULL）；一条附件只能属于一条消息。
+// StorageKey/ThumbKey 是 blob 内的不透明键，AccessKey 是下载能力凭证，三者都不对外
+// JSON 序列化（API 层按需显式输出）；宽高非图片为 0。
+type Attachment struct {
+	ID          int64     `json:"id" db:"id"`
+	UploaderID  int64     `json:"uploader_id" db:"uploader_id"`
+	MessageID   int64     `json:"message_id,omitempty" db:"message_id"`
+	Filename    string    `json:"filename" db:"filename"`
+	ContentType string    `json:"content_type" db:"content_type"`
+	Size        int64     `json:"size" db:"size"`
+	Width       int       `json:"width" db:"width"`
+	Height      int       `json:"height" db:"height"`
+	StorageKey  string    `json:"-" db:"storage_key"`
+	ThumbKey    string    `json:"-" db:"thumb_key"`
+	AccessKey   string    `json:"-" db:"access_key"`
+	SHA256      string    `json:"-" db:"sha256"`
+	CreatedAt   time.Time `json:"created_at" db:"created_at"`
+}
+
+// Unread 某用户在某频道的未读数与未读提及数（#40 B1）。
+type Unread struct {
+	UnreadCount  int `json:"unread_count"`
+	MentionCount int `json:"mention_count"`
 }
 
 // Invite 邀请码。
@@ -263,12 +338,45 @@ type Store interface {
 	MembersOfServer(ctx context.Context, serverID int64) ([]ServerMember, error)
 
 	// channels
+	// CreateChannel 只建服务器频道：scope 空串按 server 处理，非 server 或 server_id 为 0
+	// 返回 ErrForbidden。私聊/群私聊走 CreateConversation。
 	CreateChannel(ctx context.Context, c *Channel) error
 	ChannelByID(ctx context.Context, id int64) (*Channel, error)
+	// ChannelsOfServer 只返回该服的 server 作用域频道（不含 direct/group）。
 	ChannelsOfServer(ctx context.Context, serverID int64) ([]Channel, error)
+	// UpdateChannel 全行写；调用方必须读-改-写以保留 scope/dm_key，
+	// 私聊行写回时 ServerID=0 落 NULL、DMKey 空串落 NULL。
 	UpdateChannel(ctx context.Context, c *Channel) error
-	// DeleteChannel 同事务删消息、该频道覆盖与频道行。
+	// DeleteChannel 同事务删消息、该频道覆盖、会话成员与频道行。
 	DeleteChannel(ctx context.Context, id int64) error
+
+	// conversations（迁移 0012，#38 B1）：私聊/群私聊是 server_id NULL 的文字频道。
+	// CreateConversation 同一事务写频道行 + channel_members；direct 必须恰两个不同成员，
+	// 双方都是 member，dm_key 由成员 ID 规范化为 "<minUID>:<maxUID>"，重复创建返回 ErrConflict；
+	// group 至少一个成员，memberIDs[0] 视为创建者记 owner，其余 member。
+	// scope 非 direct/group 或成员数不合法返回 ErrForbidden。
+	CreateConversation(ctx context.Context, c *Channel, memberIDs []int64) error
+	// FindDirectChannel 按规范化 dm_key 找私聊；无命中 ErrNotFound。
+	FindDirectChannel(ctx context.Context, a, b int64) (*Channel, error)
+	// ListConversations 用户参与的 direct/group 会话，按创建时间、ID 倒序。
+	ListConversations(ctx context.Context, userID int64) ([]Channel, error)
+	// ChannelMembers 成员列表，按 joined_at、user_id 升序；频道不存在返回空列表。
+	ChannelMembers(ctx context.Context, channelID int64) ([]ChannelMember, error)
+	// ChannelMembersOfChannels 批量成员列表（#38 B2，GET /conversations 用），
+	// 按 channel_id 分组，组内 joined_at、user_id 升序；不存在的频道不出现。
+	ChannelMembersOfChannels(ctx context.Context, channelIDs []int64) (map[int64][]ChannelMember, error)
+	// ChannelMember 单个成员；非成员或频道不存在返回 ErrNotFound。
+	ChannelMember(ctx context.Context, channelID, userID int64) (*ChannelMember, error)
+	// SetChannelMemberRole 改成员角色（#38 B2 owner 转让用）。只接受 group 频道；
+	// direct/server 或非法角色返回 ErrForbidden，频道/成员不存在返回 ErrNotFound。
+	SetChannelMemberRole(ctx context.Context, channelID, userID int64, role ChannelMemberRole) error
+	// AddChannelMember 只接受 group 频道；role 空串按 member 处理，
+	// direct/server 频道或非法角色返回 ErrForbidden，重复成员返回 ErrConflict。
+	// direct 成员固定为双方，增删留给 B2 的 API 语义，不在 Store 放开。
+	AddChannelMember(ctx context.Context, channelID, userID int64, role ChannelMemberRole) error
+	// RemoveChannelMember 只接受 group 频道；direct/server 返回 ErrForbidden，
+	// 频道不存在或成员未命中返回 ErrNotFound。
+	RemoveChannelMember(ctx context.Context, channelID, userID int64) error
 
 	// categories（v0.1.2 迁移 0003）
 	CreateCategory(ctx context.Context, c *Category) error
@@ -283,7 +391,10 @@ type Store interface {
 	ReorderCategories(ctx context.Context, serverID, id int64, position int) error
 
 	// messages
-	// CreateMessage 带 nonce 且撞唯一索引时返回 ErrConflict（调用方回读原消息）。
+	// CreateMessage 同一事务写消息、@提及（去重后按 user_id 升序）并认领 AttachmentIDs；
+	// 带 nonce 撞唯一索引时整体回滚并返回 ErrConflict（调用方回读原消息，不得留下半条提及）。
+	// 认领要求附件为 m.UserID 上传且尚未被引用，任一不满足（含重复/非法 ID）返回
+	// ErrAttachmentUnavailable 并回滚整条消息；AttachmentIDs 为空时完全跳过。
 	CreateMessage(ctx context.Context, m *Message) error
 	// MessagesBefore 倒序分页：beforeID=0 取最新 limit 条（按 id 正序返回，旧→新）。
 	MessagesBefore(ctx context.Context, channelID, beforeID int64, limit int) ([]Message, error)
@@ -292,6 +403,62 @@ type Store interface {
 	MessagesAfter(ctx context.Context, channelID, afterID int64, limit int) ([]Message, error)
 	// MessageByNonce 幂等回读：按 (channel_id, user_id, nonce) 找原消息；无命中 ErrNotFound。
 	MessageByNonce(ctx context.Context, channelID, userID int64, nonce string) (*Message, error)
+	// MessageByID 单条回读（含软删行与发送者内联信息）；无命中 ErrNotFound。
+	MessageByID(ctx context.Context, id int64) (*Message, error)
+	// MessagesByIDs 批量回读（回复预览用），含软删行（正文已清空）；不存在的 id
+	// 不出现在结果里，空入参返回空 map。Mentions 不自动填，另用 MentionsOfMessages。
+	MessagesByIDs(ctx context.Context, ids []int64) (map[int64]*Message, error)
+	// MentionsOfMessages 批量查询提及用户，组内按 user_id 升序；没有提及的消息
+	// 不出现，空入参返回空 map。
+	MentionsOfMessages(ctx context.Context, ids []int64) (map[int64][]int64, error)
+	// UpdateMessageContent 同一事务更新正文/编辑时间并整体替换提及；软删或不存在
+	// 返回 ErrNotFound（作者权限由 API 层校验）。
+	UpdateMessageContent(ctx context.Context, id int64, content string, mentions []int64, editedAt time.Time) error
+	// SoftDeleteMessage 软删：置 deleted_at、清空正文，保留行供回复引用；已删除或
+	// 不存在返回 ErrNotFound（重复删除的幂等语义由 API 层决定）。
+	SoftDeleteMessage(ctx context.Context, id int64, deletedAt time.Time) error
+	// SearchMessages 在给定频道集合内按正文搜索（#42 B1）。只返回未软删的消息，
+	// 排序为相关度优先、同分按消息 ID 倒序；limit 夹到 [1,50]。
+	// channelIDs 为空或 query trim 后为空返回空结果（不报错）。SQLite/MySQL 对
+	// 过短的查询（SQLite <3 字符、MySQL <2 字符）回退 LIKE；Mem 一律做
+	// 大小写不敏感的子串匹配，不计算相关度（同分口径即 ID 倒序）。
+	// 频道可见性由调用方负责，store 只按传入的 channelIDs 过滤。
+	SearchMessages(ctx context.Context, channelIDs []int64, query string, limit int) ([]Message, error)
+
+	// attachments（迁移 0015，#41 B1）
+	// CreateAttachment 写入附件元数据；ID 未预置时取 Snowflake，回填 CreatedAt。
+	// UploaderID 为 0 返回 ErrForbidden；id 或 access_key 重复返回 ErrConflict。
+	// MessageID 为 0 落 NULL（未认领）；正常流程由 CreateMessage 在事务内认领。
+	CreateAttachment(ctx context.Context, a *Attachment) error
+	// AttachmentByID 无命中 ErrNotFound。
+	AttachmentByID(ctx context.Context, id int64) (*Attachment, error)
+	// AttachmentByAccessKey 按下载能力凭证查找；无命中 ErrNotFound。
+	AttachmentByAccessKey(ctx context.Context, accessKey string) (*Attachment, error)
+	// AttachmentsByMessageIDs 批量按消息分组，组内按 id 升序；未认领附件与不存在的
+	// 消息不出现（与 MentionsOfMessages 同口径），空入参返回空 map。
+	AttachmentsByMessageIDs(ctx context.Context, messageIDs []int64) (map[int64][]Attachment, error)
+	// OrphanAttachments 返回可回收附件（#41 生命周期回收）：未认领且 created_at 早于
+	// unclaimedBefore；或 message_id 非空但消息行已不存在（频道/分类/服务器/会话硬删）；
+	// 或消息已软删。按 id 升序，limit 夹到 [1, MaxAttachmentBatch]。
+	OrphanAttachments(ctx context.Context, unclaimedBefore time.Time, limit int) ([]Attachment, error)
+	// DeleteAttachmentRows 批量删除附件元数据行；空入参 no-op，不存在的 id 忽略。
+	// 调用方（后台 GC）必须先删 blob 再删行，避免删行后对象无法定位。
+	DeleteAttachmentRows(ctx context.Context, ids []int64) error
+
+	// read_states（迁移 0014，#40 B1）：每用户每频道一条「最后已读消息 id」水位。
+	// 未读 = 频道中 id 大于水位、非本人、未软删的消息；提及 = 其中提及该用户的条数。
+	// 没有 read_states 行的用户按水位 0 计（升级前历史已由迁移回填，见 0014）。
+	// ReadState 无记录返回 ErrNotFound。
+	ReadState(ctx context.Context, userID, channelID int64) (int64, error)
+	// SetReadState 原子 upsert 取 max(旧, 新)：多设备乱序上报只前进不回退。
+	SetReadState(ctx context.Context, userID, channelID, messageID int64) error
+	// EnsureReadState 仅在无记录时插入，绝不覆盖已有水位（升级回填/首次进入用）。
+	EnsureReadState(ctx context.Context, userID, channelID, messageID int64) error
+	// UnreadCounts 单用户多频道批量统计；空入参返回空 map。频道无消息也保留 0 值项。
+	UnreadCounts(ctx context.Context, userID int64, channelIDs []int64) (map[int64]Unread, error)
+	// UnreadCountsForUsers 单频道多用户批量统计（成员列表用）；没有 read_states
+	// 行的用户按水位 0 计，空入参返回空 map。
+	UnreadCountsForUsers(ctx context.Context, channelID int64, userIDs []int64) (map[int64]Unread, error)
 
 	// invites
 	CreateInvite(ctx context.Context, inv *Invite) error

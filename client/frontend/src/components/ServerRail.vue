@@ -7,20 +7,30 @@
 import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import {
-  Plus, Home, MessagesSquare, Gamepad2, Music, Palette, BookOpen, Coffee, Mic,
+  Plus, Home, MessageCircle, MessagesSquare, Gamepad2, Music, Palette, BookOpen, Coffee, Mic,
   GraduationCap, Heart, Rocket, Camera, Dumbbell, Undo2, Settings,
   Link, FolderPlus, Pencil, Trash2,
 } from 'lucide-vue-next'
 import { INTRO_ID, useServersStore } from '../stores/data'
+import { useConversationsStore } from '../stores/conversations'
 import { useNotifyStore } from '../stores/notify'
+import { badgeText, unreadLabel, useUnreadsStore } from '../stores/unreads'
 import { goApp } from '../api/bridge'
 import ServerDialog from './ServerDialog.vue'
 import ContextMenu, { type CtxItem } from './ContextMenu.vue'
 import PromptDialog from './PromptDialog.vue'
 
 const store = useServersStore()
+const conversations = useConversationsStore()
+const unreads = useUnreadsStore()
 const notify = useNotifyStore()
 const router = useRouter()
+
+// selectServer 切回服务器视图：先退出私信模式，再恢复原服务器/频道选择。
+function selectServer(id: string) {
+  conversations.exitDM()
+  store.selectServer(id)
+}
 
 // Lucide 图标名 → 组件（静态注册，避免动态导入复杂度）。
 // 键集合与 server/internal/api/servers.go 的 allowedIcons 保持一致。
@@ -172,19 +182,34 @@ async function removeServer(id: string) {
   <nav class="rail">
     <!-- 介绍页入口（v0.1.2 首页体系；被删除时隐藏，底部可恢复） -->
     <div v-if="!store.introHidden" class="rail-item intro-item"
-         :class="{ on: store.currentServerId === INTRO_ID }" data-tip="介绍页">
-      <button class="ri-btn intro-btn" @click="store.selectServer(INTRO_ID)"
+         :class="{ on: !conversations.dmMode && store.currentServerId === INTRO_ID }" data-tip="介绍页">
+      <button class="ri-btn intro-btn" @click="selectServer(INTRO_ID)"
               @contextmenu.prevent="openIntroCtx">
         <Home :size="21" />
       </button>
     </div>
     <div class="rail-sep" />
 
+    <!-- 私信入口（#38 B4b）：进入私信模式；点任意服务器/介绍页退出。
+         未读徽标（#40）：提及数字优先，否则小圆点；计数为全部会话频道之和。 -->
+    <div class="rail-item" :class="{ on: conversations.dmMode }" data-tip="私信"
+         :title="unreadLabel(unreads.dmTotals)">
+      <button class="ri-btn" @click="conversations.enterDM()">
+        <MessageCircle :size="21" />
+        <span v-if="unreads.dmTotals.mentions > 0" class="rail-badge">{{ badgeText(unreads.dmTotals.mentions) }}</span>
+        <span v-else-if="unreads.dmTotals.unread > 0" class="rail-dot" />
+      </button>
+    </div>
+    <div class="rail-sep" />
+
     <div v-for="s in currentIcons" :key="s.id" class="rail-item"
-         :class="{ on: s.id === store.currentServerId }" :data-tip="s.name">
-      <button class="ri-btn" @click="store.selectServer(s.id)"
+         :class="{ on: !conversations.dmMode && s.id === store.currentServerId }" :data-tip="s.name"
+         :title="unreadLabel(unreads.server(s.id))">
+      <button class="ri-btn" @click="selectServer(s.id)"
               @contextmenu.prevent="openCtx($event, s.id, s.name)">
         <component :is="s.iconComp" :size="21" />
+        <span v-if="unreads.server(s.id).mentions > 0" class="rail-badge">{{ badgeText(unreads.server(s.id).mentions) }}</span>
+        <span v-else-if="unreads.server(s.id).unread > 0" class="rail-dot" />
       </button>
     </div>
     <div class="spacer" />
@@ -229,10 +254,29 @@ async function removeServer(id: string) {
 }
 .rail-item { position: relative; width: 46px; height: 46px; flex: none; }
 .ri-btn {
+  position: relative;
   width: 46px; height: 46px; border-radius: 16px;
   display: flex; align-items: center; justify-content: center;
   background: rgba(255, 255, 255, 0.16); color: #fff;
   transition: border-radius 0.25s var(--ease), background 0.25s var(--ease);
+}
+/* 未读徽标（#40）：提及数优先（主色胶囊白字），否则未读小圆点；纯文本不用 emoji */
+.rail-badge {
+  position: absolute; top: -3px; right: -3px;
+  min-width: 16px; height: 16px; padding: 0 4px;
+  border-radius: 8px;
+  background: var(--brand-500); color: var(--surface);
+  font-size: 10px; font-weight: 700; line-height: 16px;
+  text-align: center;
+  box-shadow: 0 0 0 2px var(--brand-700);
+  pointer-events: none;
+}
+.rail-dot {
+  position: absolute; top: 1px; right: 1px;
+  width: 9px; height: 9px; border-radius: 50%;
+  background: var(--surface);
+  box-shadow: 0 0 0 2px var(--brand-700);
+  pointer-events: none;
 }
 .rail-item:hover .ri-btn {
   border-radius: 13px; background: rgba(255, 255, 255, 0.28);

@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -92,6 +94,134 @@ func TestAppAPIClientVersionHeader(t *testing.T) {
 	}
 	if got != version {
 		t.Fatalf("X-LiteTalk-Client = %q，期望构建版本 %q", got, version)
+	}
+}
+
+// ListMessages 桥接把 REST 消息归一为 chat:message 事件的同口径视图（#38 B4b）：
+// ID 十进制字符串、ts 毫秒字符串，历史补拉才能与实时广播按 id 合并。
+// #39：编辑/回复/提及字段一并映射。
+func TestListMessagesBridge(t *testing.T) {
+	var gotPath, gotLimit string
+	created := time.Date(2026, 10, 24, 12, 0, 0, 123_000_000, time.UTC)
+	edited := created.Add(time.Minute)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotLimit = r.URL.Path, r.URL.Query().Get("limit")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"id":"9001","channel_id":"123","user_id":"7","content":"hi",
+			"created_at":"` + created.Format(time.RFC3339Nano) + `","sender_nickname":"甲",
+			"edited_at":"` + edited.Format(time.RFC3339Nano) + `","reply_to":"9000",
+			"reply_preview":{"id":"9000","user_id":"8","nickname":"乙","content":"原","deleted":false},
+			"mentions":["8","9"]}]`))
+	}))
+	defer srv.Close()
+
+	app := &App{api: newAppAPI(srv.URL)}
+	out, err := app.ListMessages("123", 20)
+	if err != nil {
+		t.Fatalf("ListMessages: %v", err)
+	}
+	if gotPath != "/api/v1/channels/123/messages" || gotLimit != "20" {
+		t.Fatalf("请求路径/limit = %q %q", gotPath, gotLimit)
+	}
+	if len(out) != 1 {
+		t.Fatalf("消息条数 = %d，期望 1", len(out))
+	}
+	want := ChatMessageView{
+		ID: "9001", ChannelID: "123", UserID: "7", Nickname: "甲", Content: "hi",
+		TS:       strconv.FormatInt(created.UnixMilli(), 10),
+		EditedAt: strconv.FormatInt(edited.UnixMilli(), 10),
+		ReplyTo:  "9000",
+		ReplyPreview: &ReplyPreviewView{
+			ID: "9000", UserID: "8", Nickname: "乙", Content: "原", Deleted: false,
+		},
+		Mentions: []string{"8", "9"},
+	}
+	if !reflect.DeepEqual(out[0], want) {
+		t.Fatalf("消息视图 = %+v，期望 %+v", out[0], want)
+	}
+
+	// 非法 ID 在发请求前拒绝；空/非数字/非正数都不可当频道。
+	for _, id := range []string{"", "abc", "0", "-1"} {
+		if _, err := app.ListMessages(id, 10); err == nil {
+			t.Fatalf("非法 channel id %q 应报错", id)
+		}
+	}
+}
+
+// TestMessageMetaBridge #39 Wails 绑定：单条回读、编辑、软删、提及候选走
+// REST 并映射为桥接视图；非法 ID 在发请求前拒绝。
+func TestMessageMetaBridge(t *testing.T) {
+	deleted := time.Date(2026, 10, 24, 12, 2, 0, 0, time.UTC)
+	msgJSON := `{"id":"9001","channel_id":"123","user_id":"7","content":"",` +
+		`"created_at":"2026-10-24T12:00:00Z","sender_nickname":"甲",` +
+		`"deleted_at":"` + deleted.Format(time.RFC3339Nano) + `",` +
+		`"reply_to":"9000","mentions":["8"]}`
+	var gotMethod, gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		switch {
+		case r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		case r.URL.Path == "/api/v1/channels/123/mention-candidates":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[{"user_id":"8","nickname":"乙","tag":"0002"}]`))
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(msgJSON))
+		}
+	}))
+	defer srv.Close()
+
+	app := &App{api: newAppAPI(srv.URL)}
+	m, err := app.GetMessage("123", "9001")
+	if err != nil {
+		t.Fatalf("GetMessage: %v", err)
+	}
+	if gotMethod != http.MethodGet || gotPath != "/api/v1/channels/123/messages/9001" {
+		t.Fatalf("GetMessage 请求 = %s %s", gotMethod, gotPath)
+	}
+	if m.DeletedAt != strconv.FormatInt(deleted.UnixMilli(), 10) || m.ReplyTo != "9000" ||
+		len(m.Mentions) != 1 || m.Mentions[0] != "8" {
+		t.Fatalf("GetMessage 视图错误: %+v", m)
+	}
+
+	if _, err := app.EditMessage("123", "9001", "改后", []string{"8"}); err != nil {
+		t.Fatalf("EditMessage: %v", err)
+	}
+	if gotMethod != http.MethodPatch || gotPath != "/api/v1/channels/123/messages/9001" {
+		t.Fatalf("EditMessage 请求 = %s %s", gotMethod, gotPath)
+	}
+
+	if err := app.DeleteMessage("123", "9001"); err != nil {
+		t.Fatalf("DeleteMessage: %v", err)
+	}
+	if gotMethod != http.MethodDelete || gotPath != "/api/v1/channels/123/messages/9001" {
+		t.Fatalf("DeleteMessage 请求 = %s %s", gotMethod, gotPath)
+	}
+
+	cands, err := app.ListMentionCandidates("123")
+	if err != nil {
+		t.Fatalf("ListMentionCandidates: %v", err)
+	}
+	if gotPath != "/api/v1/channels/123/mention-candidates" || len(cands) != 1 ||
+		cands[0].UserID != "8" || cands[0].Nickname != "乙" || cands[0].Tag != "0002" {
+		t.Fatalf("候选映射错误: %+v", cands)
+	}
+
+	// 非法 ID：四个绑定都必须在发请求前报错。
+	for _, id := range []string{"", "abc", "0", "-1"} {
+		if _, err := app.GetMessage(id, "9001"); err == nil {
+			t.Fatalf("GetMessage 非法 channel id %q 应报错", id)
+		}
+		if _, err := app.EditMessage("123", id, "x", nil); err == nil {
+			t.Fatalf("EditMessage 非法 message id %q 应报错", id)
+		}
+		if err := app.DeleteMessage("123", id); err == nil {
+			t.Fatalf("DeleteMessage 非法 message id %q 应报错", id)
+		}
+		if _, err := app.ListMentionCandidates(id); err == nil {
+			t.Fatalf("ListMentionCandidates 非法 channel id %q 应报错", id)
+		}
 	}
 }
 

@@ -16,12 +16,124 @@ import (
 // #36 服务端强制闭麦 REST：权限门、频道形态、自我操作、目标不在房与审计。
 
 // fakeHub 记录 SetServerMuted 调用；按 "channelID|userID" 模拟目标不在房。
-// KickChannel 也记录（#37 删频道/分类的踢房断言）。
+// KickChannel 也记录（#37 删频道/分类的踢房断言）；会话变更通知同样记录（#38 B3）。
 type fakeHub struct {
 	mu    sync.Mutex
 	calls []string
 	notIn map[string]bool
 	kicks []string
+
+	convEvents []convEvent
+	msgEvents  []msgEvent
+	unreads    []unreadEvent
+}
+
+// unreadEvent 一次 channel.unread 广播的断言快照（#40）。
+type unreadEvent struct {
+	channelID string
+	counts    map[string]store.Unread
+}
+
+// msgEvent 一次 message.edited / message.deleted 广播的断言快照。
+type msgEvent struct {
+	kind      string // edited / deleted
+	uids      []string
+	channelID string
+	messageID string
+	content   string
+	editedAt  int64
+	mentions  []string
+}
+
+// convEvent 一次 conversation.changed 广播的断言快照。
+type convEvent struct {
+	uids   []string
+	id     string
+	action string
+}
+
+func (f *fakeHub) BroadcastConversationChanged(uids []string, conversationID, action string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.convEvents = append(f.convEvents, convEvent{
+		uids:   append([]string(nil), uids...),
+		id:     conversationID,
+		action: action,
+	})
+}
+
+// lastConvEvent 最近一次会话变更通知（无则 ok=false）。
+func (f *fakeHub) lastConvEvent() (convEvent, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.convEvents) == 0 {
+		return convEvent{}, false
+	}
+	return f.convEvents[len(f.convEvents)-1], true
+}
+
+// convLog 全部会话变更通知的快照。
+func (f *fakeHub) convLog() []convEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]convEvent(nil), f.convEvents...)
+}
+
+func (f *fakeHub) BroadcastMessageEdited(uids []string, channelID, messageID, content string, editedAt int64, mentions []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.msgEvents = append(f.msgEvents, msgEvent{
+		kind:      "edited",
+		uids:      append([]string(nil), uids...),
+		channelID: channelID,
+		messageID: messageID,
+		content:   content,
+		editedAt:  editedAt,
+		mentions:  append([]string(nil), mentions...),
+	})
+}
+
+func (f *fakeHub) BroadcastMessageDeleted(uids []string, channelID, messageID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.msgEvents = append(f.msgEvents, msgEvent{
+		kind:      "deleted",
+		uids:      append([]string(nil), uids...),
+		channelID: channelID,
+		messageID: messageID,
+	})
+}
+
+// msgLog 全部消息编辑/删除广播的快照。
+func (f *fakeHub) msgLog() []msgEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]msgEvent(nil), f.msgEvents...)
+}
+
+func (f *fakeHub) BroadcastChannelUnread(channelID string, counts map[string]store.Unread) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cp := make(map[string]store.Unread, len(counts))
+	for uid, u := range counts {
+		cp[uid] = u
+	}
+	f.unreads = append(f.unreads, unreadEvent{channelID: channelID, counts: cp})
+}
+
+// unreadLog 全部 channel.unread 广播的快照。
+func (f *fakeHub) unreadLog() []unreadEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]unreadEvent, 0, len(f.unreads))
+	for _, ev := range f.unreads {
+		cp := make(map[string]store.Unread, len(ev.counts))
+		for uid, u := range ev.counts {
+			cp[uid] = u
+		}
+		out = append(out, unreadEvent{channelID: ev.channelID, counts: cp})
+	}
+	return out
 }
 
 func (f *fakeHub) Kick(uid, dev, reason string) {}

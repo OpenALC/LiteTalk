@@ -292,6 +292,178 @@ export interface paths {
         patch: operations["patchFriend"];
         trace?: never;
     };
+    "/api/v1/conversations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 我的私聊/群私聊列表
+         * @description 返回当前用户参与的 direct/group 会话，按 created_at 倒序；每项内联成员 （成员只含昵称/tag，不含 email）。空结果为 [] 而非 null。 code：401；5xx internal。
+         */
+        get: operations["listConversations"];
+        put?: never;
+        /**
+         * 创建私聊/群私聊
+         * @description kind=direct：user_ids 恰好 1 人（不含创建者），双方必须是已接受好友； 同一对用户已有 direct 会话时幂等返回原会话（200），新建返回 201。 kind=group：user_ids 2–49 人（总人数 3–50），创建者必须是每个被邀请者的 已接受好友，创建者记 owner；name 可空，给出时为 1–64 字符。 user_ids 不得包含创建者、不得重复、不得为 0。 code：bad_kind、bad_members、bad_name、bad_request、too_large、路径参数不合法； 401；403 not_friend；429 rate_limited（10 次/分/用户）；5xx internal。
+         */
+        post: operations["createConversation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/conversations/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 会话详情（仅参与者）
+         * @description 仅参与者可读；非参与者与不存在一样返回 404 not_found，不泄露会话是否存在。 code：bad_request、路径参数不合法；401；404 not_found；5xx internal。
+         */
+        get: operations["getConversation"];
+        put?: never;
+        post?: never;
+        /**
+         * 删除会话（direct 任一方；group 仅 owner）
+         * @description 硬删除：会话行、channel_members 与消息一并删除（direct 双方都消失）。 group 非 owner 返回 403 forbidden；非参与者与不存在一样返回 404 not_found， 不泄露会话是否存在。 code：bad_request、路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
+         */
+        delete: operations["deleteConversation"];
+        options?: never;
+        head?: never;
+        /**
+         * 群聊改名（仅 owner）
+         * @description group 仅 owner 可改，name 为 1–64 字符；direct 返回 400 not_group （私聊没有名字语义）。非参与者 404 not_found。 code：bad_name、not_group、bad_request、too_large、路径参数不合法；401； 403 forbidden；404 not_found；429 rate_limited（10 次/分/用户）；5xx internal。
+         */
+        patch: operations["patchConversation"];
+        trace?: never;
+    };
+    "/api/v1/conversations/{id}/members": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 群聊加人（仅 owner）
+         * @description 仅 group；owner 只能添加自己的已接受好友；添加后总人数（含创建者）不得超过 50。 user_ids 不得重复、不得为 0、不得包含自己、不得已是成员。 code：not_group、bad_members、too_many_members、bad_request、too_large、 路径参数不合法；401；403 forbidden / not_friend；404 not_found； 409 conflict（并发重复添加）；429 rate_limited（20 次/分/用户）；5xx internal。
+         */
+        post: operations["addConversationMembers"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/conversations/{id}/members/{user_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * 移除/退出群聊成员
+         * @description 仅 group。owner 可移除任意成员或自己退出，普通成员只能移除自己（leave）； owner 退出时把 owner 转给最早加入的剩余成员；最后一人退出时会话随之删除。 非成员或目标不存在返回 404 not_found；非 owner 移除他人 403 forbidden； direct 返回 400 not_group（删除私聊用 DELETE /conversations/{id}）。 code：not_group、bad_request、路径参数不合法；401；403 forbidden； 404 not_found；5xx internal。
+         */
+        delete: operations["removeConversationMember"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/unreads": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 全部可见频道与服务器的未读/提及计数
+         * @description #40：当前用户全部可见频道的未读/提及计数，以及仅按服务器文本频道聚合 的服务器计数。频道 = 已加入服务器中对该用户可见（ViewChannel）的文字 频道，加上当前用户参与的 direct/group 会话；自己的消息与已软删消息不计 未读，提及数只统计未读消息中 @ 当前用户的条数。channels/servers 都包含 0 值项，数组不为 null，并按 ID 升序稳定输出。服务器聚合不包含会话频道。 code：401；5xx internal。
+         */
+        get: operations["listUnreads"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 搜索当前用户可见频道内的消息
+         * @description #42：在全部可见文字频道（已加入服务器中 ViewChannel 可见的频道 + 当前用户 参与的 direct/group 会话）内按正文搜索，结果按相关度、其次消息 ID 倒序返回。 频道可见性由服务端逐频道复核，非成员会话与无权限频道不会出现在结果里。 只返回未软删消息；q trim 后须为 1–100 字符，否则 400 bad_query；缺 q 由 生成层先拒（400 bad_request）。limit 缺省 20、显式越界（0 或 >50）返回 400 bad_limit。空结果是 []，不是 null。频控 30 次/分/用户，超限 429 rate_limited。 code：bad_request（缺 q）、bad_query、bad_limit；401；429 rate_limited； 5xx internal。
+         */
+        get: operations["searchMessages"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/link-preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 抓取链接预览
+         * @description #42：服务端抓取目标网页的 OpenGraph / <title> / description 元数据，返回 标题、描述、站点名与可选图片。抓取受 SSRF 防护约束：只允许 http/https， 拒绝 userinfo 与私网/回环/链路本地/CGNAT/云元数据地址（DNS 在拨号时解析并 逐 IP 校验，防重绑定）；重定向最多 3 跳且逐跳复核。默认 5s 超时、512 KiB 响应上限（LITETALK_LINK_PREVIEW_TIMEOUT_MS / _MAX_BYTES 可调并夹取区间）。 结果按 URL 缓存（有预览 24h、无预览 1h），每用户 30 次/分，超限 429 rate_limited。LITETALK_LINK_PREVIEW=off 时不构造抓取器，端点统一 404 no_preview。code：bad_request（缺 url）、bad_url（地址非法/超长或被 SSRF 防护拒绝）、no_preview（非 HTML/无元数据/抓取失败）、401；429 rate_limited； 5xx internal。
+         */
+        get: operations["getLinkPreview"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/channels/{id}/read": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * 标记频道已读（水位只前进）
+         * @description #40：把当前用户在该频道的已读水位推进到 last_message_id。水位只前进， 重复上报更旧的消息 ID 不会回退。last_message_id 必须存在且属于该频道， 否则 400 bad_read。会话频道非成员与频道不存在统一 404 not_found（不泄露 会话是否存在）；服务器频道无 ViewChannel 403 forbidden。成功返回更新后 的计数，并通过信令 channel.unread 推给当前用户的全部会话（多设备同步）。 code：bad_read、bad_request、路径参数不合法；401；403 forbidden； 404 not_found；5xx internal。
+         */
+        put: operations["markChannelRead"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/sync": {
         parameters: {
             query?: never;
@@ -547,9 +719,57 @@ export interface paths {
         put?: never;
         /**
          * 发送文字消息（≤2000 字 + 频控 20/分 + nonce 幂等）
-         * @description 仅文字频道。nonce（#31）：客户端生成的幂等键（≤64 字符），服务端按 (channel_id, user_id, nonce) 去重；重复提交回读原消息返回 200（原消息体）， 新消息返回 201。幂等命中先于频控判断，不消耗配额。不带 nonce 不去重。 code：bad_channel、bad_content、bad_nonce、bad_request、too_large、 路径参数不合法；401；403 forbidden；404 not_found；429 rate_limited； 5xx internal。
+         * @description 仅文字频道。nonce（#31）：客户端生成的幂等键（≤64 字符），服务端按 (channel_id, user_id, nonce) 去重；重复提交回读原消息返回 200（原消息体）， 新消息返回 201。幂等命中先于频控判断，不消耗配额。不带 nonce 不去重。 attachment_ids（#41）：最多 10 个、不可重复，只能引用本人上传且未被其它消息 认领的附件；格式不合法或认领失败返回 400 bad_attachment。带附件时 content 可为空串（纯附件消息），没有附件时仍须 1–2000 字符（否则 400 bad_content）。 code：bad_attachment、bad_channel、bad_content、bad_nonce、bad_request、 too_large、路径参数不合法；401；403 forbidden；404 not_found；429 rate_limited； 5xx internal。
          */
         post: operations["createMessage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/channels/{id}/messages/{message_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 单条消息
+         * @description #39：返回频道内一条消息。可见性沿用列表：会话（私聊/群聊）非成员 404 not_found（不泄露存在性），服务器频道无 ViewChannel 403 forbidden。 消息不存在或不属于路径频道 404 not_found。软删消息仍返回 （content 为空串、deleted_at 有值），供回复跳转；#41：软删消息不返回 attachments（即使附件行仍在库里）。 code：bad_request、路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
+         */
+        get: operations["getMessage"];
+        put?: never;
+        post?: never;
+        /**
+         * 删除消息（软删：作者或管理员）
+         * @description #39：软删——置 deleted_at、清空正文，行保留供回复引用，返回 204。 作者可删自己的消息；服务器频道另有 ManageServer（管理员/服主）可删他人消息； 会话（私聊/群聊）仅作者可删，其它参与者 403 forbidden。 已删除的消息 404 message_deleted（重复删除同口径）；消息不存在或不属于路径 频道 404 not_found。 频控 20 次/分/用户，超限 429 rate_limited。 code：message_deleted、bad_request、路径参数不合法；401；403 forbidden； 404 not_found；429 rate_limited；5xx internal。
+         */
+        delete: operations["deleteMessage"];
+        options?: never;
+        head?: never;
+        /**
+         * 编辑消息（仅作者）
+         * @description #39：仅作者可编辑，非作者 403 forbidden。content 1–2000 字符，越界 400 bad_content。 mentions 缺省 = 保持原提及不变；给出 = 整体替换（空数组清除全部提及）， 不合法 400 bad_mention。成功后写入 edited_at 并返回更新后的消息。 已删除的消息 404 message_deleted（重复编辑同口径）；消息不存在或不属于路径 频道 404 not_found。 频控 20 次/分/用户，超限 429 rate_limited。 code：bad_content、bad_mention、message_deleted、bad_request、路径参数不合法； 401；403 forbidden；404 not_found；429 rate_limited；5xx internal。
+         */
+        patch: operations["editMessage"];
+        trace?: never;
+    };
+    "/api/v1/channels/{id}/mention-candidates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * @提及候选用户
+         * @description #39：返回可被 @ 的用户 {user_id, nickname, tag}，按 nickname、user_id 升序稳定排序，不含 email。服务器频道 = 该服对频道有 ViewChannel 的成员； 会话频道 = 会话成员。会话非成员 404 not_found（不泄露存在性）；服务器 频道无 ViewChannel 403 forbidden；空结果为 [] 而非 null。 code：bad_request、路径参数不合法；401；403 forbidden；404 not_found；5xx internal。
+         */
+        get: operations["listMentionCandidates"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -708,24 +928,94 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/attachments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 上传附件（multipart，登录可传）
+         * @description multipart/form-data 只接受单个 file 字段（其余字段 400 bad_request）； 类型以服务端内容嗅探为准，不信任 filename/content_type。允许 jpeg/png/gif/ webp/pdf/txt/zip（部署可配），图片单边不超过 4096 像素，并生成最长边 320 的 JPEG 缩略图。返回的 url/thumbnail_url 是带能力凭证 key 的相对路径， 可直接用于 img 标签。附件与消息的关联由消息发送接口以 attachment_ids 完成（#41 B3），本端点只负责上传。 code：bad_request、bad_type、bad_image、too_large；401 unauthorized； 429 rate_limited（每用户 30 次/分钟）；5xx internal / storage_error。
+         */
+        post: operations["uploadAttachment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/attachments/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 下载附件（能力 URL，免 Bearer）
+         * @description 免鉴权：凭证是查询参数 key（上传响应 url 中携带的 256 位 hex），可直接 用作 img 的 src。ID 与 key 不匹配、附件不存在、blob 丢失、或所属消息已 软删一律 404 not_found（不区分原因，不泄露存在性）；尚未被消息引用的附件 也可下载（上传者尚未发送）。响应头：Content-Type 为附件类型（仅限白名单， 否则 application/octet-stream）、Content-Disposition 图片 inline 其余 attachment（filename* 按 RFC 2231 转义）、Content-Length、 Cache-Control private, max-age=86400, immutable、 X-Content-Type-Options nosniff。 code：bad_request（路径 ID 非法）；404 not_found；429 rate_limited （按 IP 的失败扫描限流）；5xx internal。
+         */
+        get: operations["downloadAttachment"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/attachments/{id}/thumbnail": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 下载图片缩略图（能力 URL，免 Bearer）
+         * @description 与下载附件同一能力凭证口径（security 为空，query key 必填）；只对图片且 缩略图已生成的附件可用，否则 404 not_found。响应为 image/jpeg，其余头 与下载附件一致。 code：bad_request（路径 ID 非法）；404 not_found；429 rate_limited （按 IP 的失败扫描限流）；5xx internal。
+         */
+        get: operations["downloadAttachmentThumbnail"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
         /**
          * Attachment
-         * @description 附件元数据（#31 预留 schema 占位，实现移出本批另单跟踪）。 计划端点：POST /api/v1/attachments（multipart，登录可传）返回本结构， 消息体以 attachment_ids 引用；存储后端可插拔（本地磁盘 / S3 兼容）。 本批不实现端点，字段形状以实现落地时为准。
+         * @description 附件元数据（#41）。二进制内容不在 JSON 中；url 与 thumbnail_url 是带下载 能力凭证（key）的相对路径（/api/v1/attachments/{id}?key=...），可直接放进 img 标签，不需要 Authorization。宽高仅图片非零；thumbnail_url 仅图片给出。
          */
         Attachment: {
             /** @description 附件 ID（十进制字符串） */
             id: string;
+            /** @description 展示用文件名（已去除路径分隔符与控制字符） */
             filename: string;
             /**
              * Format: int64
              * @description 字节数
              */
             size: number;
+            /** @description 服务端嗅探出的内容类型（白名单内） */
             content_type: string;
+            /** @description 原图像素宽（非图片为 0） */
+            width?: number;
+            /** @description 原图像素高（非图片为 0） */
+            height?: number;
+            /** @description 带能力 key 的下载路径（相对路径） */
+            url: string;
+            /** @description 带能力 key 的缩略图路径；非图片或缩略图生成失败时不返回 */
+            thumbnail_url?: string;
         };
         /**
          * Problem
@@ -921,7 +1211,7 @@ export interface components {
         };
         /**
          * Message
-         * @description 文字频道消息（发送者昵称/tag 内联，不含邮箱）。ID 为十进制字符串（#31）。
+         * @description 文字频道消息（发送者昵称/tag 内联，不含邮箱）。ID 为十进制字符串（#31）。 #39：edited_at/deleted_at 为编辑/软删时间；reply_to 为回复目标 ID， reply_preview 为跳转预览；mentions 为被 @ 的用户 ID（升序去重）。 软删消息 content 为空串、deleted_at 有值，仍出现在列表与单条响应里供回复引用， 但不返回 attachments（即使附件行仍在库里）。 #41：attachments 为消息携带的附件元数据（按附件 ID 升序）；有附件时 content 允许为空串（纯附件消息），没有附件时 content 至少 1 个字符。
          */
         Message: {
             id: string;
@@ -934,6 +1224,97 @@ export interface components {
             created_at: string;
             sender_nickname?: string;
             sender_tag?: string;
+            /**
+             * Format: date-time
+             * @description 首次编辑时间（#39）；未编辑时缺省
+             */
+            edited_at?: string;
+            /**
+             * Format: date-time
+             * @description 软删时间（#39）；未删除时缺省
+             */
+            deleted_at?: string;
+            /** @description 回复目标消息 ID（#39）；非回复消息缺省 */
+            reply_to?: string;
+            reply_preview?: components["schemas"]["ReplyPreview"];
+            /** @description 被 @ 的用户 ID（#39，升序去重）；无提及时缺省 */
+            mentions?: string[];
+            /** @description 消息附件元数据（#41，按附件 ID 升序）；无附件或消息已软删时缺省。 url/thumbnail_url 为带能力 key 的相对路径，可直接放进 img 标签。 */
+            attachments?: components["schemas"]["Attachment"][];
+        };
+        /**
+         * LinkPreview
+         * @description 链接预览（#42 B4）。url 为跟随重定向后的最终页面地址；文本已折叠空白、 去除控制字符并按 rune 截断（title 200 / description 500 / site_name 100）。 image_url 为绝对地址，仅 http(s) 且通过地址校验时给出；图片由客户端直接 加载，服务端不代理、不抓取。
+         */
+        LinkPreview: {
+            /** @description 最终页面地址（跟随重定向后） */
+            url: string;
+            /** @description 标题（OG 优先，回退 <title>、站点名或 host） */
+            title: string;
+            /** @description 描述（OG 优先，回退 meta[name=description]）；无则缺省 */
+            description?: string;
+            /** @description 站点名（og:site_name）；无则缺省 */
+            site_name?: string;
+            /** @description 预览图片绝对地址（og:image 优先，回退 twitter:image）；无则缺省 */
+            image_url?: string;
+        };
+        /**
+         * ReplyPreview
+         * @description 回复目标预览（#39）：只含跳转与展示所需字段，不含 email。目标已软删时 content 为空串、deleted=true；目标不存在（历史脏数据）时整个字段缺省。
+         */
+        ReplyPreview: {
+            id: string;
+            user_id: string;
+            /** @description 目标消息发送者昵称（发送时快照，非当前昵称） */
+            nickname: string;
+            /** @description 目标消息正文；已软删时为空串 */
+            content: string;
+            /** @description 目标消息是否已软删 */
+            deleted: boolean;
+        };
+        /**
+         * MentionCandidate
+         * @description @提及候选用户（#39）：只含昵称/tag，不含 email。
+         */
+        MentionCandidate: {
+            user_id: string;
+            nickname: string;
+            tag: string;
+        };
+        /**
+         * UnreadChannel
+         * @description 单个频道的未读/提及计数（#40）。未读 = 水位之后、非本人、未软删的消息； 提及 = 其中 @ 当前用户的条数。计数为 0 的频道仍返回。
+         */
+        UnreadChannel: {
+            channel_id: string;
+            /** @description 未读消息条数 */
+            unread_count: number;
+            /** @description 未读消息中提及当前用户的条数 */
+            mention_count: number;
+        };
+        /**
+         * UnreadServer
+         * @description 服务器维度的未读/提及计数（#40）：只聚合该服务器下当前用户可见的文字 频道，不含 direct/group 会话。没有可见频道的服务器也返回 0 值项。
+         */
+        UnreadServer: {
+            server_id: string;
+            /** @description 服务器可见文字频道的未读总数 */
+            unread_count: number;
+            /** @description 服务器可见文字频道的未读提及总数 */
+            mention_count: number;
+        };
+        /**
+         * Unreads
+         * @description 当前用户的未读快照（#40）：channels 覆盖全部可见频道（含 0 值项）， servers 覆盖全部已加入服务器（仅聚合服务器文字频道）。数组按 ID 升序， 空数组返回 [] 而非 null。
+         */
+        Unreads: {
+            channels: components["schemas"]["UnreadChannel"][];
+            servers: components["schemas"]["UnreadServer"][];
+        };
+        /** MarkReadRequest */
+        MarkReadRequest: {
+            /** @description 最后已读消息 ID（#40）：必须存在且属于路径频道，否则 400 bad_read； 水位只前进，更旧的 ID 不会让计数回退。 */
+            last_message_id: string;
         };
         /**
          * Invite
@@ -968,6 +1349,54 @@ export interface components {
             channel_id?: string;
             /** @description channel_id 所属服务器 ID（#92，可选）；与 channel_id 同现同缺。 */
             server_id?: string;
+        };
+        /**
+         * Conversation
+         * @description 私聊/群私聊会话（#38 B2，无服务器频道）。kind=direct 时 name 无意义， 可能为空串；成员只含昵称/tag，不含 email。ID 为十进制字符串。
+         */
+        Conversation: {
+            id: string;
+            /** @enum {string} */
+            kind: "direct" | "group";
+            /** @description 群聊名；direct 忽略（可能为空串） */
+            name: string;
+            members: components["schemas"]["ConversationMember"][];
+            /** Format: date-time */
+            created_at: string;
+        };
+        /**
+         * ConversationMember
+         * @description 会话成员（内联昵称/tag，不含 email）。owner 只用于 group，direct 双方都是 member。
+         */
+        ConversationMember: {
+            user_id: string;
+            nickname: string;
+            tag: string;
+            /** @enum {string} */
+            role: "owner" | "member";
+            /** Format: date-time */
+            joined_at: string;
+        };
+        /** CreateConversationRequest */
+        CreateConversationRequest: {
+            /** @enum {string} */
+            kind: "direct" | "group";
+            /** @description 被邀请用户 ID（不含创建者）。direct 恰好 1 个；group 2–49 个 （总人数含创建者 3–50）。不得重复、不得为 0。 */
+            user_ids: string[];
+            /** @description 群聊名称（可选；给出时 1–64 字符，direct 忽略） */
+            name?: string;
+        };
+        /**
+         * PatchConversationRequest
+         * @description JSON Merge Patch（RFC 7396）：缺省 = 不改；name 为 1–64 字符， null/空串被校验拒 400。仅 group owner 可写。
+         */
+        PatchConversationRequest: {
+            name?: string | null;
+        };
+        /** AddConversationMembersRequest */
+        AddConversationMembersRequest: {
+            /** @description 要添加的用户 ID（至少 1 个；添加后总人数不得超过 50） */
+            user_ids: string[];
         };
         /**
          * ServerChannels
@@ -1150,10 +1579,23 @@ export interface components {
         };
         /** CreateMessageRequest */
         CreateMessageRequest: {
-            /** @description 1–2000 字符 */
+            /** @description 0–2000 字符。带 attachment_ids 时允许空串（纯附件消息）； 没有附件时至少 1 个字符，否则 400 bad_content。 */
             content: string;
             /** @description 幂等键（#31，≤64 字符）；同频道同用户重复提交回读原消息（200）。缺省不去重。 */
             nonce?: string;
+            /** @description 回复目标消息 ID（#39）：必须属于同一频道且存在，否则 400 bad_reply； 目标已软删也允许（预览 deleted=true、content 为空）。 */
+            reply_to?: string;
+            /** @description @提及用户 ID（#39）：去重，元素须 > 0；每个用户必须是该频道可见成员， 否则 400 bad_mention。 */
+            mentions?: string[];
+            /** @description 随消息发送的附件 ID（#41）：最多 10 个、元素为正整数（十进制字符串）且 不可重复；只能引用本人上传且尚未被其它消息认领的附件。不能解析、超限、 重复、附件不存在、非本人上传或已被引用一律 400 bad_attachment。 给出附件时 content 可为空串。 */
+            attachment_ids?: string[];
+        };
+        /** EditMessageRequest */
+        EditMessageRequest: {
+            /** @description 1–2000 字符 */
+            content: string;
+            /** @description @提及用户 ID（#39）：缺省 = 保持原提及不变；给出 = 整体替换， 空数组清除全部提及。去重，元素须 > 0；每个用户必须是该频道可见成员， 否则 400 bad_mention。 */
+            mentions?: string[];
         };
         /**
          * Role
@@ -1315,6 +1757,15 @@ export interface components {
                 "application/problem+json": components["schemas"]["Problem"];
             };
         };
+        /** @description 请求体或上传文件超过大小上限（body.code：too_large）。 LITETALK_UPLOAD_MAX_BYTES 配置单附件上限（默认 10 MiB）。 */
+        TooLarge: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/problem+json": components["schemas"]["Problem"];
+            };
+        };
         /** @description 客户端版本过旧（body.code：client_too_old）。服务端要求请求头 X-LiteTalk-Client 不低于 1.5；缺失或更低版本的 /auth/* 请求被拒绝。 message 与 detail 同值，旧客户端可直接显示升级提示。 */
         ClientUpgradeRequired: {
             headers: {
@@ -1357,10 +1808,14 @@ export interface components {
         IDPath: number;
         /** @description 目标用户 ID 的十进制数字串（#35 B4） */
         UserIDPath: number;
+        /** @description 消息 ID 的十进制数字串（#39） */
+        MessageIDPath: number;
         /** @description 频道覆盖的目标类型（#35 B4） */
         TargetTypePath: "role" | "member";
         /** @description 覆盖目标（角色或成员）ID 的十进制数字串（#35 B4） */
         TargetIDPath: number;
+        /** @description 附件下载能力凭证（上传响应 url 中的 256 位 hex）。缺参由生成层 400； 空值或不匹配一律 404，不区分「不存在」与「凭证错误」。 */
+        AttachmentKeyQuery: string;
     };
     requestBodies: never;
     headers: never;
@@ -1789,6 +2244,335 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["FriendEntry"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    listConversations: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 会话数组（created_at 倒序） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Conversation"][];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    createConversation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateConversationRequest"];
+            };
+        };
+        responses: {
+            /** @description 已存在同一对用户的 direct 会话（幂等命中，原会话） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Conversation"];
+                };
+            };
+            /** @description 已创建 */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Conversation"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    getConversation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 会话（含成员） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Conversation"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    deleteConversation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 已删除（无响应体） */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    patchConversation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/merge-patch+json": components["schemas"]["PatchConversationRequest"];
+                "application/json": components["schemas"]["PatchConversationRequest"];
+            };
+        };
+        responses: {
+            /** @description 更新后的会话 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Conversation"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    addConversationMembers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AddConversationMembersRequest"];
+            };
+        };
+        responses: {
+            /** @description 更新后的会话（含新成员） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Conversation"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    removeConversationMember: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+                /** @description 目标用户 ID 的十进制数字串（#35 B4） */
+                user_id: components["parameters"]["UserIDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 更新后的会话（owner 转让后 role 已更新） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Conversation"];
+                };
+            };
+            /** @description 最后一名成员已退出，会话被删除（无响应体） */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    listUnreads: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 未读快照（channels/servers 含 0 值项，ID 升序） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Unreads"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    searchMessages: {
+        parameters: {
+            query: {
+                /** @description 搜索词（trim 后 1–100 字符；中文按子串匹配） */
+                q: string;
+                /** @description 条数上限（1–50，缺省 20；显式越界返回 400 bad_limit） */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 消息数组（相关度、ID 倒序；含附件/提及/回复预览；不含发送者邮箱） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Message"][];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    getLinkPreview: {
+        parameters: {
+            query: {
+                /** @description 目标页面地址（http/https，1–2048 字符） */
+                url: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 链接预览（文本已清洗；image_url 为绝对地址） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LinkPreview"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    markChannelRead: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MarkReadRequest"];
+            };
+        };
+        responses: {
+            /** @description 更新后的频道未读/提及计数 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnreadChannel"];
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -2306,7 +3090,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description 消息数组（旧→新正序；不含发送者邮箱） */
+            /** @description 消息数组（旧→新正序；不含发送者邮箱；软删消息不含 attachments） */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -2361,6 +3145,128 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             429: components["responses"]["RateLimited"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    getMessage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+                /** @description 消息 ID 的十进制数字串（#39） */
+                message_id: components["parameters"]["MessageIDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 消息（含 mentions/reply_preview；不含发送者邮箱） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Message"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    deleteMessage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+                /** @description 消息 ID 的十进制数字串（#39） */
+                message_id: components["parameters"]["MessageIDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 已删除（无响应体） */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    editMessage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+                /** @description 消息 ID 的十进制数字串（#39） */
+                message_id: components["parameters"]["MessageIDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EditMessageRequest"];
+            };
+        };
+        responses: {
+            /** @description 更新后的消息（edited_at 已置位） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Message"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    listMentionCandidates: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 提及候选数组（按 nickname、user_id 升序） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MentionCandidate"][];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             default: components["responses"]["Internal"];
         };
     };
@@ -2678,6 +3584,101 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    uploadAttachment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": {
+                    /**
+                     * Format: binary
+                     * @description 文件内容（唯一字段）
+                     */
+                    file: string;
+                };
+            };
+        };
+        responses: {
+            /** @description 上传成功；返回附件元数据与带能力凭证的下载路径 */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Attachment"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            413: components["responses"]["TooLarge"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    downloadAttachment: {
+        parameters: {
+            query: {
+                /** @description 附件下载能力凭证（上传响应 url 中的 256 位 hex）。缺参由生成层 400； 空值或不匹配一律 404，不区分「不存在」与「凭证错误」。 */
+                key: components["parameters"]["AttachmentKeyQuery"];
+            };
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 附件字节流（实际 Content-Type 为附件类型，见操作描述；此处按二进制声明） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    downloadAttachmentThumbnail: {
+        parameters: {
+            query: {
+                /** @description 附件下载能力凭证（上传响应 url 中的 256 位 hex）。缺参由生成层 400； 空值或不匹配一律 404，不区分「不存在」与「凭证错误」。 */
+                key: components["parameters"]["AttachmentKeyQuery"];
+            };
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description JPEG 缩略图（最长边 320，白底，quality 82） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
             default: components["responses"]["Internal"];
         };
     };

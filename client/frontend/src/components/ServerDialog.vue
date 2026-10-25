@@ -4,10 +4,12 @@
 import { ref } from 'vue'
 import { Plus, Ticket, X } from 'lucide-vue-next'
 import { useServersStore } from '../stores/data'
+import { useConversationsStore } from '../stores/conversations'
 import { useNotifyStore } from '../stores/notify'
 
 const emit = defineEmits<{ (e: 'close'): void }>()
 const servers = useServersStore()
+const conversations = useConversationsStore()
 const notify = useNotifyStore()
 
 const tab = ref<'create' | 'join'>('create')
@@ -30,6 +32,8 @@ async function submit() {
       await servers.joinServer(v)
       notify.show('已加入服务器')
     }
+    // 创建/加入后已选中对应服务器；退出私信模式，否则新服务器在舞台不可见。
+    conversations.exitDM()
     emit('close')
   } catch (e) {
     notify.fromErr(e)

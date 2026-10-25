@@ -36,6 +36,24 @@
     { "go_name": "ErrCodeQuotaExceeded", "value": "quota_exceeded" },
     { "go_name": "ErrCodeBadPassword", "value": "bad_password" },
     {
+      "go_name": "ErrCodeBadReply",
+      "value": "bad_reply",
+      "since": 2,
+      "comment": "回复目标不合法（#39）：不存在、非正 ID 或跨频道"
+    },
+    {
+      "go_name": "ErrCodeBadMention",
+      "value": "bad_mention",
+      "since": 2,
+      "comment": "提及目标不合法（#39）：非正 ID 或目标用户不可见该频道"
+    },
+    {
+      "go_name": "ErrCodeBadAttachment",
+      "value": "bad_attachment",
+      "since": 2,
+      "comment": "附件不合法（#41）：不存在、非本人上传、已被引用或超过 10 个"
+    },
+    {
       "go_name": "ErrCodeProtocolUnsupported",
       "value": "protocol_unsupported",
       "since": 2

@@ -113,7 +113,10 @@ func memberView(m *store.ServerMember, online bool) MemberInfo {
 	return out
 }
 
-func messageView(m *store.Message) Message {
+// messageView 消息 wire 视图（#39）：mentions 与回复目标由调用方批量装配后传入
+// （nil 表示无提及 / 目标不存在）。#41：attachments 由调用方批量加载后传入；
+// 软删消息即使库里仍有附件行也不下发。
+func messageView(m *store.Message, mentions []int64, reply *store.Message, attachments []store.Attachment) Message {
 	out := Message{
 		Id:        idOf(m.ID),
 		ChannelId: idOf(m.ChannelID),
@@ -133,7 +136,143 @@ func messageView(m *store.Message) Message {
 		t := m.SenderTag
 		out.SenderTag = &t
 	}
+	if m.EditedAt != nil {
+		t := timeOf(*m.EditedAt)
+		out.EditedAt = &t
+	}
+	if m.DeletedAt != nil {
+		t := timeOf(*m.DeletedAt)
+		out.DeletedAt = &t
+	}
+	if m.ReplyTo != nil {
+		out.ReplyTo = idPtr(*m.ReplyTo)
+	}
+	if len(mentions) > 0 {
+		ids := make([]ID, 0, len(mentions))
+		for _, uid := range mentions {
+			ids = append(ids, idOf(uid))
+		}
+		out.Mentions = &ids
+	}
+	if reply != nil {
+		out.ReplyPreview = replyPreviewView(reply)
+	}
+	if m.DeletedAt == nil && len(attachments) > 0 {
+		list := make([]Attachment, 0, len(attachments))
+		for i := range attachments {
+			list = append(list, attachmentView(&attachments[i]))
+		}
+		out.Attachments = &list
+	}
 	return out
+}
+
+// replyPreviewView 回复预览（#39）：目标已软删时 content 为空、deleted=true，
+// 只暴露跳转与展示所需字段；昵称取目标消息发送时的快照。
+func replyPreviewView(m *store.Message) *ReplyPreview {
+	content := m.Content
+	if m.DeletedAt != nil {
+		content = ""
+	}
+	return &ReplyPreview{
+		Id:       idOf(m.ID),
+		UserId:   idOf(m.UserID),
+		Nickname: m.SenderNickname,
+		Content:  content,
+		Deleted:  m.DeletedAt != nil,
+	}
+}
+
+// messageExtras 一批消息的 #39/#41 附加字段：提及用户、回复目标与附件。
+type messageExtras struct {
+	mentions    map[int64][]int64
+	replies     map[int64]*store.Message
+	attachments map[int64][]store.Attachment
+}
+
+// loadMessageExtras 批量装配提及、回复目标与附件：一次 MentionsOfMessages +
+// 一次 MessagesByIDs + 一次 AttachmentsByMessageIDs，列表不做 N+1。回复目标
+// 不存在（历史脏数据）时该条不出 reply_preview，不阻断其它消息。
+func (s *Server) loadMessageExtras(ctx context.Context, msgs []store.Message) (*messageExtras, *apiErr) {
+	ids := make([]int64, 0, len(msgs))
+	replyIDs := make([]int64, 0, len(msgs))
+	seen := make(map[int64]struct{}, len(msgs))
+	for i := range msgs {
+		ids = append(ids, msgs[i].ID)
+		if msgs[i].ReplyTo == nil {
+			continue
+		}
+		rid := *msgs[i].ReplyTo
+		if _, ok := seen[rid]; ok {
+			continue
+		}
+		seen[rid] = struct{}{}
+		replyIDs = append(replyIDs, rid)
+	}
+	mentions, err := s.store.MentionsOfMessages(ctx, ids)
+	if err != nil {
+		return nil, s.writeStoreErr(ctx, err)
+	}
+	replies, err := s.store.MessagesByIDs(ctx, replyIDs)
+	if err != nil {
+		return nil, s.writeStoreErr(ctx, err)
+	}
+	attachments, err := s.store.AttachmentsByMessageIDs(ctx, ids)
+	if err != nil {
+		return nil, s.writeStoreErr(ctx, err)
+	}
+	return &messageExtras{mentions: mentions, replies: replies, attachments: attachments}, nil
+}
+
+// view 单条转换（回复目标缺失时 reply_preview 缺省）。
+func (x *messageExtras) view(m *store.Message) Message {
+	var reply *store.Message
+	if m.ReplyTo != nil {
+		reply = x.replies[*m.ReplyTo]
+	}
+	// 软删消息不返回附件（附件行仍在库里，但随消息一起失效）。
+	var attachments []store.Attachment
+	if m.DeletedAt == nil {
+		attachments = x.attachments[m.ID]
+	}
+	return messageView(m, x.mentions[m.ID], reply, attachments)
+}
+
+// messageViews 批量转换（分页列表）。
+func (s *Server) messageViews(ctx context.Context, msgs []store.Message) ([]Message, *apiErr) {
+	x, e := s.loadMessageExtras(ctx, msgs)
+	if e != nil {
+		return nil, e
+	}
+	out := make([]Message, 0, len(msgs))
+	for i := range msgs {
+		out = append(out, x.view(&msgs[i]))
+	}
+	return out, nil
+}
+
+// messageViewFor 单条消息视图（新建/幂等回读/编辑后与 GetMessage 共用）。
+func (s *Server) messageViewFor(ctx context.Context, m *store.Message) (Message, *apiErr) {
+	x, e := s.loadMessageExtras(ctx, []store.Message{*m})
+	if e != nil {
+		return Message{}, e
+	}
+	return x.view(m), nil
+}
+
+// mentionCandidateView 提及候选视图（#39）：只出昵称/tag，不含 email。
+func mentionCandidateView(uid int64, nickname, tag string) MentionCandidate {
+	return MentionCandidate{UserId: idOf(uid), Nickname: nickname, Tag: tag}
+}
+
+// sortMentionCandidates 按 nickname、user_id 升序（稳定且确定的 wire 顺序）。
+func sortMentionCandidates(list []MentionCandidate) {
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].Nickname != list[j].Nickname {
+			return list[i].Nickname < list[j].Nickname
+		}
+		return list[i].UserId < list[j].UserId
+	})
 }
 
 func inviteView(inv *store.Invite) Invite {
@@ -147,15 +286,6 @@ func inviteView(inv *store.Invite) Invite {
 	if inv.ExpiresAt != nil {
 		t := timeOf(*inv.ExpiresAt)
 		out.ExpiresAt = &t
-	}
-	return out
-}
-
-// messageViews 批量转换（分页列表）。
-func messageViews(msgs []store.Message) []Message {
-	out := make([]Message, 0, len(msgs))
-	for i := range msgs {
-		out = append(out, messageView(&msgs[i]))
 	}
 	return out
 }

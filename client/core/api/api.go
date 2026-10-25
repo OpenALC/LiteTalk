@@ -95,6 +95,9 @@ type APIClient struct {
 	baseMu sync.RWMutex
 	base   string
 	http   *http.Client
+	// uploadHTTP 附件上传专用客户端：大文件在慢链路上可能远超普通 REST 的
+	// 15s，放宽到 uploadTimeout；Transport 为零值，与 http 共享默认连接池。
+	uploadHTTP *http.Client
 
 	// tokenMu 保护 access：SetToken/Token 与每个请求的读并发（CI -race）。
 	tokenMu sync.RWMutex
@@ -130,6 +133,7 @@ func NewAPIClient(base string) *APIClient {
 	return &APIClient{
 		base:          base,
 		http:          &http.Client{Timeout: 15 * time.Second},
+		uploadHTTP:    &http.Client{Timeout: uploadTimeout},
 		clientVersion: defaultClientVersion,
 	}
 }
@@ -1223,14 +1227,24 @@ func (f flexID) String() string { return string(f) }
 
 // MessageDTO 频道消息（GET /channels/{id}/messages，与 store.Message 的 wire 对齐）。
 // ID 用 flexID 吸收 #31 的字符串化；CreatedAt 解析 RFC3339（含 Nano）。
+// #39：EditedAt/DeletedAt 为编辑/软删时间（软删消息 content 为空串、仍会返回），
+// ReplyTo/ReplyPreview 为回复目标与跳转预览，Mentions 为被 @ 的用户 ID（升序去重）。
 type MessageDTO struct {
-	ID             flexID    `json:"id"`
-	ChannelID      flexID    `json:"channel_id"`
-	UserID         flexID    `json:"user_id"`
-	Content        string    `json:"content"`
-	CreatedAt      time.Time `json:"created_at"`
-	SenderNickname string    `json:"sender_nickname,omitempty"`
-	SenderTag      string    `json:"sender_tag,omitempty"`
+	ID             flexID           `json:"id"`
+	ChannelID      flexID           `json:"channel_id"`
+	UserID         flexID           `json:"user_id"`
+	Content        string           `json:"content"`
+	CreatedAt      time.Time        `json:"created_at"`
+	SenderNickname string           `json:"sender_nickname,omitempty"`
+	SenderTag      string           `json:"sender_tag,omitempty"`
+	EditedAt       *time.Time       `json:"edited_at,omitempty"`
+	DeletedAt      *time.Time       `json:"deleted_at,omitempty"`
+	ReplyTo        *flexID          `json:"reply_to,omitempty"`
+	ReplyPreview   *ReplyPreviewDTO `json:"reply_preview,omitempty"`
+	Mentions       []flexID         `json:"mentions,omitempty"`
+	// Attachments 消息附件（#41，按附件 ID 升序）；无附件或消息已软删时缺省。
+	// 用指针区分「无附件」与「空数组」，序列化时与契约一致地省略。
+	Attachments *[]AttachmentDTO `json:"attachments,omitempty"`
 }
 
 // ListMessages 拉频道最近消息（旧→新，limit 上限 50）。不带游标只取最新——

@@ -10,8 +10,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/OpenALC/LiteTalk/server/internal/attachment"
 	"github.com/OpenALC/LiteTalk/server/internal/auth"
 	"github.com/OpenALC/LiteTalk/server/internal/authz"
+	"github.com/OpenALC/LiteTalk/server/internal/blob"
+	"github.com/OpenALC/LiteTalk/server/internal/linkpreview"
 	"github.com/OpenALC/LiteTalk/server/internal/mailer"
 	"github.com/OpenALC/LiteTalk/server/internal/rtcapi"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
@@ -30,6 +33,17 @@ type Hub interface {
 	KickChannel(channelID, reason string)
 	// SetServerMuted 服务端强制闭麦/解禁（#36）：目标不在该频道返回 signal.ErrNotInChannel。
 	SetServerMuted(channelID, userID string, muted bool) error
+	// BroadcastConversationChanged 会话变更通知（#38 B3）：uids 为十进制用户 ID，
+	// 动作见 signal.ConversationChangedData.Action。空列表不广播。
+	BroadcastConversationChanged(uids []string, conversationID, action string)
+	// BroadcastMessageEdited 消息编辑广播（#39）：uids 为十进制用户 ID（调用方已按
+	// 频道可见性过滤）；editedAt 为 Unix 毫秒。
+	BroadcastMessageEdited(uids []string, channelID, messageID, content string, editedAt int64, mentions []string)
+	// BroadcastMessageDeleted 消息软删除广播（#39）：目标口径同上。
+	BroadcastMessageDeleted(uids []string, channelID, messageID string)
+	// BroadcastChannelUnread 未读计数变更（#40）：counts 按十进制 uid 给每个
+	// 接收者自己的精确计数，只推给该用户（不进其他人的事件环）。空 map 不广播。
+	BroadcastChannelUnread(channelID string, counts map[string]store.Unread)
 }
 
 // PresenceReader 在线状态读取（#11）：presence:{uid} 存在 = 在线。
@@ -45,6 +59,12 @@ type VoicePresence interface {
 	// VoiceChannelOf 返回 uid 当前语音房 ID 与所属服务器 ID（均为十进制字符串）。
 	// dev 内置房间 serverID 为 "0"（无 store 频道实体，调用方不带频道字段）。
 	VoiceChannelOf(uid string) (channelID, serverID string, ok bool)
+}
+
+// LinkPreviewFetcher 链接预览抓取器（#42 B4）。生产传 *linkpreview.Fetcher，
+// 测试注入桩。nil = 功能关闭：GET /api/v1/link-preview 一律 404 no_preview。
+type LinkPreviewFetcher interface {
+	Fetch(ctx context.Context, rawURL string) (*linkpreview.Preview, error)
 }
 
 // Server API 依赖集合。
@@ -73,6 +93,14 @@ type Server struct {
 	rtcCfg rtcapi.Config
 	// rtcAuth 从访问令牌提取 uid；nil 时该端点一律 401（fail-closed）。
 	rtcAuth rtcapi.UserFromToken
+	// blob 附件二进制存储（#41 B2）：上传/下载端点用；nil 时附件端点 500（测试/降级）。
+	blob blob.Store
+	// upload 附件校验参数（MaxBytes/MaxDimension/AllowedTypes）；New 里补默认值。
+	upload attachment.Config
+	// kv 共享键值存储（链接预览缓存，#42 B4）；nil 时链接预览按不可用处理。
+	kv store.KV
+	// linkPreview 链接预览抓取器（nil=功能关闭，端点统一 404 no_preview）。
+	linkPreview LinkPreviewFetcher
 }
 
 // Config 构造配置。
@@ -111,6 +139,18 @@ type Config struct {
 	// Authz 权限判定（#35 B3）。nil 时用 Store 自建默认实例（测试兼容）；
 	// 生产必须传入与 signal.Hub 共享的同一实例，否则写后失效不同步。
 	Authz *authz.Authorizer
+	// Blob 附件二进制存储（#41 B2）。生产由 cmd/server 按 LITETALK_UPLOAD_* 构造；
+	// nil 时上传/下载端点返回 500（测试未注入 blob 的旧用例不受影响）。
+	Blob blob.Store
+	// Upload 附件校验参数。MaxBytes<=0 回落 10 MiB；MaxDimension<=0 回落 4096
+	// （服务端显式收紧，包默认 8192 对解压炸弹风险偏高）；AllowedTypes 为空用默认白名单。
+	Upload attachment.Config
+	// KV 共享键值存储（链接预览缓存，#42 B4）。nil 时链接预览按不可用处理
+	// （端点 404 no_preview）；缓存读写故障则 fail-open，跳过缓存继续抓取。
+	KV store.KV
+	// LinkPreview 链接预览抓取器（#42 B4）。生产由 cmd/server 按
+	// LITETALK_LINK_PREVIEW* 构造；nil = 功能关闭，端点一律 404 no_preview。
+	LinkPreview LinkPreviewFetcher
 }
 
 // New 构造 API Server。
@@ -156,7 +196,30 @@ func New(cfg Config) *Server {
 		version:           ver,
 		rtcCfg:            cfg.RTC,
 		rtcAuth:           cfg.RTCAuth,
+		blob:              cfg.Blob,
+		upload:            normalizeUploadConfig(cfg.Upload),
+		kv:                cfg.KV,
+		linkPreview:       cfg.LinkPreview,
 	}
+}
+
+// serverDefaultMaxDimension 服务端图片单边上限（像素）。attachment 包默认 8192，
+// 服务端收紧到 4096：解码巨图的内存峰值与解压炸弹风险都随之下降。
+const serverDefaultMaxDimension = 4096
+
+// normalizeUploadConfig 补零值：单文件上限、图片单边上限与白名单都必须有值，
+// 否则 limitBody 会按 0 计算上传配额、下载白名单校验也会失效。
+func normalizeUploadConfig(cfg attachment.Config) attachment.Config {
+	if cfg.MaxBytes <= 0 {
+		cfg.MaxBytes = attachment.DefaultMaxBytes
+	}
+	if cfg.MaxDimension <= 0 {
+		cfg.MaxDimension = serverDefaultMaxDimension
+	}
+	if len(cfg.AllowedTypes) == 0 {
+		cfg.AllowedTypes = append([]string(nil), attachment.DefaultAllowedTypes...)
+	}
+	return cfg
 }
 
 // parseTrustedProxies 把 IP/CIDR 字符串列表解析成匹配网络；非法项跳过并记日志。
@@ -207,7 +270,7 @@ func (s *Server) Handler() http.Handler {
 	})
 	h := HandlerWithOptions(si, StdHTTPServerOptions{
 		BaseRouter:  &authMux{ServeMux: http.NewServeMux(), s: s},
-		Middlewares: []MiddlewareFunc{limitBody},
+		Middlewares: []MiddlewareFunc{s.limitBody},
 		ErrorHandlerFunc: func(w http.ResponseWriter, r *http.Request, err error) {
 			writeErr(w, http.StatusBadRequest, "bad_request", "路径参数不合法")
 		},

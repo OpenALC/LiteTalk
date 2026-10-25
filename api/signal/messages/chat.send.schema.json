@@ -7,7 +7,7 @@
   "x-direction": "C2S",
   "x-since": 1,
   "x-namespace": "event",
-  "description": "向频道发一条文字消息。type 为消息种类，本期仅支持 text，其他值拒收。",
+  "description": "向频道发一条文字消息。type 为消息种类，本期仅支持 text，其他值拒收。带 attachment_ids 时 content 可为空串（纯附件消息）；没有附件时 content 仍须 1–2000 字符。",
   "type": "object",
   "properties": {
     "channel_id": { "type": "string" },
@@ -15,13 +15,37 @@
       "type": "string",
       "description": "消息种类，本期仅 text"
     },
-    "content": { "type": "string" },
+    "content": {
+      "type": "string",
+      "description": "消息正文（≤2000 字符）；带 attachment_ids 时可为空串（纯附件消息）"
+    },
     "nonce": {
       "type": "string",
       "x-since": 2,
       "x-go-omitempty": true,
       "maxLength": 64,
       "description": "客户端幂等键（#31，≤64 字符）：同频道同用户重复提交只落一条，重复请求回显原消息。缺省不去重（老客户端）。"
+    },
+    "reply_to": {
+      "type": "string",
+      "x-since": 2,
+      "x-go-omitempty": true,
+      "description": "回复目标消息 ID（#39）：必须与该消息同频道；目标已软删也允许。"
+    },
+    "mentions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "x-since": 2,
+      "x-go-omitempty": true,
+      "description": "@提及的用户 ID 列表（#39）：服务端去重并校验目标可见该频道；不合法整条拒收。"
+    },
+    "attachment_ids": {
+      "type": "array",
+      "items": { "type": "string" },
+      "maxItems": 10,
+      "x-since": 2,
+      "x-go-omitempty": true,
+      "description": "随消息发送的附件 ID 列表（#41，最多 10 个，不可重复）：只能引用本人上传且尚未被其它消息认领的附件。附件不存在、非本人上传、已被引用或格式不合法时整条拒收（bad_attachment）。"
     }
   },
   "required": ["channel_id", "type", "content"],

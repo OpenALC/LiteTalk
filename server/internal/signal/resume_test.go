@@ -17,8 +17,8 @@ func TestGatewayResumeReplay(t *testing.T) {
 	chID := strconv.FormatInt(f.ch.ID, 10)
 
 	b.send(TypeChatSend, ChatSendData{ChannelID: chID, Type: "text", Content: "m1"})
-	if env := a.recvUntil(TypeChatMessage); env.Seq != 1 {
-		t.Fatalf("m1 seq = %d, want 1", env.Seq)
+	if env := a.recvUntil(TypeChatMessage); env.Seq != seqOfChat(1) {
+		t.Fatalf("m1 seq = %d, want %d", env.Seq, seqOfChat(1))
 	}
 	_ = a.conn.CloseNow()
 	waitOffline(t, f, "1")
@@ -29,27 +29,28 @@ func TestGatewayResumeReplay(t *testing.T) {
 			t.Fatalf("发送者未收到广播: %s", env.Type)
 		}
 	}
-	// 等最后一条 missed 真正进环再重连：慢调度下 a2 可能先连上，实时事件
-	// 先于补发到达，断言首条补发 seq=2 会偶发拿到 3（CI 踩过）。
-	waitRingSeq(t, f, "sa", 3)
+	// 等最后一条 missed（及其 channel.unread）真正进环再重连：慢调度下 a2 可能
+	// 先连上，实时事件先于补发到达，断言首条补发 seq 会偶发偏移（CI 踩过）。
+	waitRingSeq(t, f, "sa", seqOfChat(3)+1)
 
 	a2 := f.dial("1:desktop:sa", "alice")
 	a2.recvUntil(TypeHello)
-	a2.send(TypeGatewayResume, GatewayResumeData{SessionID: "sa", LastSeq: 1})
-	for want := int64(2); want <= 3; want++ {
+	// 客户端已消费 m1 的 chat(1) 与自己的 unread(2)。
+	a2.send(TypeGatewayResume, GatewayResumeData{SessionID: "sa", LastSeq: 2})
+	for n := int64(2); n <= 3; n++ {
 		env := a2.recvUntil(TypeChatMessage)
-		if env.Seq != want {
-			t.Fatalf("补发 seq = %d, want %d", env.Seq, want)
+		if env.Seq != seqOfChat(n) {
+			t.Fatalf("补发 seq = %d, want %d", env.Seq, seqOfChat(n))
 		}
 		var msg ChatMessageData
 		if err := env.Decode(&msg); err != nil || msg.Content != "missed" {
 			t.Fatalf("补发载荷 = %+v (%v)", msg, err)
 		}
 	}
-	// 补发完毕后新事件继续流式：seq 续接 4。
+	// 补发完毕后新事件继续流式：seq 续接第 4 条 chat。
 	b.send(TypeChatSend, ChatSendData{ChannelID: chID, Type: "text", Content: "live"})
-	if env := a2.recvUntil(TypeChatMessage); env.Seq != 4 {
-		t.Fatalf("续接 seq = %d, want 4", env.Seq)
+	if env := a2.recvUntil(TypeChatMessage); env.Seq != seqOfChat(4) {
+		t.Fatalf("续接 seq = %d, want %d", env.Seq, seqOfChat(4))
 	}
 }
 
@@ -61,11 +62,14 @@ func TestGatewayResumeUnknownSession(t *testing.T) {
 	a := f.dial("1:desktop:sa", "alice")
 	b := f.dial("2:desktop:sb", "bob")
 	a.recvUntil(TypeHello)
-	// 先制造一条事件，让 sa 的环有 latest_seq=1。
+	// 先制造一条事件，让 sa 的环有 latest_seq=2（chat 1 + unread 2）。
 	b.send(TypeChatSend, ChatSendData{ChannelID: chID, Type: "text", Content: "m1"})
-	if env := a.recvUntil(TypeChatMessage); env.Seq != 1 {
-		t.Fatalf("m1 seq = %d, want 1", env.Seq)
+	if env := a.recvUntil(TypeChatMessage); env.Seq != seqOfChat(1) {
+		t.Fatalf("m1 seq = %d, want %d", env.Seq, seqOfChat(1))
 	}
+	// 收到 chat.message 不代表 channel.unread 已进环（#40 查库后广播）；等环到位
+	// 再断言 latest_seq，避免偶发读到只有 chat 的中间态。
+	waitRingSeq(t, f, "sa", seqOfChat(1)+1)
 
 	// 借别的会话读流：session_id 与连接自己的 sid 不符。latest_seq 仍取本连接的。
 	a.send(TypeGatewayResume, GatewayResumeData{SessionID: "sb", LastSeq: 0})
@@ -74,8 +78,8 @@ func TestGatewayResumeUnknownSession(t *testing.T) {
 	if err := env.Decode(&d); err != nil || d.Reason != "unknown_session" {
 		t.Fatalf("invalid_session = %+v (%v), want unknown_session", d, err)
 	}
-	if d.LatestSeq != 1 {
-		t.Fatalf("latest_seq = %d, want 1（当前连接环现状）", d.LatestSeq)
+	if d.LatestSeq != seqOfChat(1)+1 {
+		t.Fatalf("latest_seq = %d, want %d（当前连接环现状）", d.LatestSeq, seqOfChat(1)+1)
 	}
 
 	// 空 session_id：bad_message（载荷校验），不是 invalid_session。
@@ -93,10 +97,10 @@ func TestGatewayResumeSeqExpired(t *testing.T) {
 	b := f.dial("2:desktop:sb", "bob")
 	chID := strconv.FormatInt(f.ch.ID, 10)
 
-	// 连接期间收到 seq 1（client 侧已知），随后离线积压 3 条把环滚过。
+	// 连接期间收到 seq 1（chat）+ 2（unread），随后离线积压 3 条把环滚过。
 	b.send(TypeChatSend, ChatSendData{ChannelID: chID, Type: "text", Content: "m1"})
-	if env := a.recvUntil(TypeChatMessage); env.Seq != 1 {
-		t.Fatalf("m1 seq = %d, want 1", env.Seq)
+	if env := a.recvUntil(TypeChatMessage); env.Seq != seqOfChat(1) {
+		t.Fatalf("m1 seq = %d, want %d", env.Seq, seqOfChat(1))
 	}
 	_ = a.conn.CloseNow()
 	waitOffline(t, f, "1")
@@ -106,8 +110,8 @@ func TestGatewayResumeSeqExpired(t *testing.T) {
 			t.Fatalf("发送者未收到广播: %s", env.Type)
 		}
 	}
-	// 同 Replay：确保 3 条 missed 都已进环（m1 + 3 = 4）再重连。
-	waitRingSeq(t, f, "sa", 4)
+	// 同 Replay：确保 3 条 missed（各自带 unread）都已进环（4 次发送 = 8 条）再重连。
+	waitRingSeq(t, f, "sa", 8)
 
 	a2 := f.dial("1:desktop:sa", "alice")
 	a2.recvUntil(TypeHello)
@@ -117,9 +121,9 @@ func TestGatewayResumeSeqExpired(t *testing.T) {
 	if err := env.Decode(&d); err != nil || d.Reason != "seq_expired" {
 		t.Fatalf("invalid_session = %+v (%v), want seq_expired", d, err)
 	}
-	// latest_seq = 环当前最大 seq（m1 + 3 条 missed = 4）；客户端据此对齐基准。
-	if d.LatestSeq != 4 {
-		t.Fatalf("latest_seq = %d, want 4", d.LatestSeq)
+	// latest_seq = 环当前最大 seq（4 次 chat + 4 次 unread = 8）；客户端据此对齐基准。
+	if d.LatestSeq != 8 {
+		t.Fatalf("latest_seq = %d, want 8", d.LatestSeq)
 	}
 }
 
@@ -131,14 +135,17 @@ func TestGatewayResumeTrailing(t *testing.T) {
 	chID := strconv.FormatInt(f.ch.ID, 10)
 
 	b.send(TypeChatSend, ChatSendData{ChannelID: chID, Type: "text", Content: "m1"})
-	if env := a.recvUntil(TypeChatMessage); env.Seq != 1 {
-		t.Fatalf("m1 seq = %d, want 1", env.Seq)
+	if env := a.recvUntil(TypeChatMessage); env.Seq != seqOfChat(1) {
+		t.Fatalf("m1 seq = %d, want %d", env.Seq, seqOfChat(1))
 	}
-	a.send(TypeGatewayResume, GatewayResumeData{SessionID: "sa", LastSeq: 1})
-	// 无缺失：不补发。下一条实时事件 seq=2 即证明连接仍在正常流式。
+	// 等 m1 的 channel.unread 也进环，确保 resume 时确实处于「追平」状态。
+	waitRingSeq(t, f, "sa", seqOfChat(1)+1)
+	// 已消费 m1 的 chat(seq=1) 与 unread(seq=2)，追平当前环。
+	a.send(TypeGatewayResume, GatewayResumeData{SessionID: "sa", LastSeq: 2})
+	// 无缺失：不补发。下一条实时事件 seq=3 即证明连接仍在正常流式。
 	b.send(TypeChatSend, ChatSendData{ChannelID: chID, Type: "text", Content: "m2"})
-	if env := a.recvUntil(TypeChatMessage); env.Seq != 2 {
-		t.Fatalf("m2 seq = %d, want 2", env.Seq)
+	if env := a.recvUntil(TypeChatMessage); env.Seq != seqOfChat(2) {
+		t.Fatalf("m2 seq = %d, want %d", env.Seq, seqOfChat(2))
 	}
 }
 

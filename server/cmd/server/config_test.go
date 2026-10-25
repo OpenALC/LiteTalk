@@ -5,8 +5,12 @@ import (
 	"io"
 	"net"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/OpenALC/LiteTalk/server/internal/blob"
 )
 
 // clearConfigEnv 清掉所有会影响 loadConfig 的环境变量，保证用例从默认值出发。
@@ -16,6 +20,13 @@ func clearConfigEnv(t *testing.T) {
 		"LITETALK_DOMAIN", "LITETALK_BEHIND_PROXY", "LITETALK_DATA_DIR",
 		"LITETALK_ACME_CACHE", "LITETALK_ADDR", "LITETALK_JWT_SECRET",
 		"LITETALK_SFU_IP", "LITETALK_AUTH_MODE", "LITETALK_GATEWAY_BACKLOG",
+		"LITETALK_UPLOAD_DRIVER", "LITETALK_UPLOAD_DIR", "LITETALK_UPLOAD_MAX_BYTES",
+		"LITETALK_UPLOAD_ALLOWED_TYPES",
+		"LITETALK_ATTACHMENT_GC", "LITETALK_ATTACHMENT_GC_INTERVAL",
+		"LITETALK_ATTACHMENT_GC_UNCLAIMED_TTL", "LITETALK_ATTACHMENT_GC_BATCH",
+		"LITETALK_S3_ENDPOINT", "LITETALK_S3_BUCKET", "LITETALK_S3_ACCESS_KEY",
+		"LITETALK_S3_SECRET_KEY", "LITETALK_S3_REGION", "LITETALK_S3_USE_SSL",
+		"LITETALK_S3_PATH_STYLE",
 	} {
 		t.Setenv(k, "")
 	}
@@ -64,6 +75,187 @@ func TestLoadConfigPrecedence(t *testing.T) {
 	}
 	if cfg.acmeCache != filepath.Join("C:/lt-data", "autocert") {
 		t.Fatalf("acmeCache 应跟随 flag dataDir，实际 %q", cfg.acmeCache)
+	}
+}
+
+// TestLoadConfigUpload 附件存储配置（#41 B2）：默认 local、env 覆盖、越界/非法即报错。
+func TestLoadConfigUpload(t *testing.T) {
+	clearConfigEnv(t)
+
+	cfg, err := loadConfig(nil, io.Discard)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.upload.Driver != "local" {
+		t.Fatalf("默认驱动应为 local，实际 %q", cfg.upload.Driver)
+	}
+	if cfg.upload.Dir != filepath.Join("./data", "uploads") {
+		t.Fatalf("默认上传目录应跟随 dataDir，实际 %q", cfg.upload.Dir)
+	}
+	if cfg.uploadMax != 10<<20 {
+		t.Fatalf("默认上限应为 10 MiB，实际 %d", cfg.uploadMax)
+	}
+	if cfg.uploadTypes != nil {
+		t.Fatalf("默认白名单应为空（回落包默认），实际 %v", cfg.uploadTypes)
+	}
+	if !cfg.upload.UseSSL || cfg.upload.PathStyle {
+		t.Fatalf("S3 默认应 TLS + 虚拟主机风格，实际 ssl=%v path=%v", cfg.upload.UseSSL, cfg.upload.PathStyle)
+	}
+	if err := cfg.validate(true); err != nil {
+		t.Fatalf("默认配置应通过校验: %v", err)
+	}
+
+	// env 覆盖：s3 全量配置 + 大小写/去重后的白名单。
+	t.Setenv("LITETALK_UPLOAD_DRIVER", "S3")
+	t.Setenv("LITETALK_UPLOAD_DIR", "/var/lib/lt/uploads")
+	t.Setenv("LITETALK_UPLOAD_MAX_BYTES", "2048")
+	t.Setenv("LITETALK_UPLOAD_ALLOWED_TYPES", "image/png, text/plain,image/PNG")
+	t.Setenv("LITETALK_S3_ENDPOINT", "minio.example.com:9000")
+	t.Setenv("LITETALK_S3_BUCKET", "litetalk")
+	t.Setenv("LITETALK_S3_ACCESS_KEY", "ak")
+	t.Setenv("LITETALK_S3_SECRET_KEY", "sk")
+	t.Setenv("LITETALK_S3_REGION", "us-east-1")
+	t.Setenv("LITETALK_S3_USE_SSL", "0")
+	t.Setenv("LITETALK_S3_PATH_STYLE", "1")
+	cfg, err = loadConfig(nil, io.Discard)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.upload.Driver != "s3" || cfg.upload.Dir != "/var/lib/lt/uploads" || cfg.uploadMax != 2048 {
+		t.Fatalf("env 未生效: %+v max=%d", cfg.upload, cfg.uploadMax)
+	}
+	if got := strings.Join(cfg.uploadTypes, ","); got != "image/png,text/plain" {
+		t.Fatalf("白名单解析 = %q", got)
+	}
+	if cfg.upload.Endpoint != "minio.example.com:9000" || cfg.upload.Bucket != "litetalk" ||
+		cfg.upload.AccessKey != "ak" || cfg.upload.SecretKey != "sk" || cfg.upload.Region != "us-east-1" {
+		t.Fatalf("S3 配置未生效: %+v", cfg.upload)
+	}
+	if cfg.upload.UseSSL || !cfg.upload.PathStyle {
+		t.Fatalf("S3 布尔未生效: ssl=%v path=%v", cfg.upload.UseSSL, cfg.upload.PathStyle)
+	}
+	if err := cfg.validate(true); err != nil {
+		t.Fatalf("s3 全量配置应通过校验: %v", err)
+	}
+
+	// <=0 回落默认，超上限/非整数报错。
+	t.Setenv("LITETALK_UPLOAD_MAX_BYTES", "0")
+	cfg, err = loadConfig(nil, io.Discard)
+	if err != nil || cfg.uploadMax != 10<<20 {
+		t.Fatalf("<=0 应回落 10 MiB: max=%d err=%v", cfg.uploadMax, err)
+	}
+	t.Setenv("LITETALK_UPLOAD_MAX_BYTES", strconv.FormatInt((100<<20)+1, 10))
+	if _, err := loadConfig(nil, io.Discard); err == nil || !strings.Contains(err.Error(), "LITETALK_UPLOAD_MAX_BYTES") {
+		t.Fatalf("超过 100 MiB 应报错，实际 %v", err)
+	}
+	t.Setenv("LITETALK_UPLOAD_MAX_BYTES", "10MB")
+	if _, err := loadConfig(nil, io.Discard); err == nil || !strings.Contains(err.Error(), "LITETALK_UPLOAD_MAX_BYTES") {
+		t.Fatalf("非整数应报错，实际 %v", err)
+	}
+	t.Setenv("LITETALK_UPLOAD_MAX_BYTES", "")
+	t.Setenv("LITETALK_UPLOAD_ALLOWED_TYPES", "not-a-mime")
+	if _, err := loadConfig(nil, io.Discard); err == nil || !strings.Contains(err.Error(), "LITETALK_UPLOAD_ALLOWED_TYPES") {
+		t.Fatalf("非法 MIME 应报错，实际 %v", err)
+	}
+}
+
+// TestLoadConfigAttachmentGC 附件回收配置（#41 P2）：默认开启、可关闭、越界夹取、
+// 非法时长/整数拒绝启动。
+func TestLoadConfigAttachmentGC(t *testing.T) {
+	clearConfigEnv(t)
+
+	cfg, err := loadConfig(nil, io.Discard)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	gc := cfg.attachmentGC
+	if !gc.Enabled || gc.Interval != time.Hour || gc.UnclaimedTTL != 24*time.Hour || gc.Batch != 200 {
+		t.Fatalf("默认回收配置不符: %+v", gc)
+	}
+
+	for _, off := range []string{"off", "0", "false", "OFF", " False "} {
+		t.Setenv("LITETALK_ATTACHMENT_GC", off)
+		cfg, err = loadConfig(nil, io.Discard)
+		if err != nil {
+			t.Fatalf("loadConfig(%q): %v", off, err)
+		}
+		if cfg.attachmentGC.Enabled {
+			t.Fatalf("LITETALK_ATTACHMENT_GC=%q 应关闭回收", off)
+		}
+	}
+	// 非关闭值按开启处理（与链接预览开关同口径）。
+	for _, on := range []string{"on", "1", "true", "yes"} {
+		t.Setenv("LITETALK_ATTACHMENT_GC", on)
+		cfg, err = loadConfig(nil, io.Discard)
+		if err != nil || !cfg.attachmentGC.Enabled {
+			t.Fatalf("LITETALK_ATTACHMENT_GC=%q 应开启: %v", on, err)
+		}
+	}
+
+	// 越界夹取。
+	t.Setenv("LITETALK_ATTACHMENT_GC", "")
+	t.Setenv("LITETALK_ATTACHMENT_GC_INTERVAL", "1m")
+	t.Setenv("LITETALK_ATTACHMENT_GC_UNCLAIMED_TTL", "10m")
+	t.Setenv("LITETALK_ATTACHMENT_GC_BATCH", "0")
+	cfg, err = loadConfig(nil, io.Discard)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.attachmentGC.Interval != 5*time.Minute ||
+		cfg.attachmentGC.UnclaimedTTL != time.Hour ||
+		cfg.attachmentGC.Batch != 1 {
+		t.Fatalf("下界夹取不符: %+v", cfg.attachmentGC)
+	}
+
+	t.Setenv("LITETALK_ATTACHMENT_GC_INTERVAL", "48h")
+	t.Setenv("LITETALK_ATTACHMENT_GC_UNCLAIMED_TTL", "720h")
+	t.Setenv("LITETALK_ATTACHMENT_GC_BATCH", "9999")
+	cfg, err = loadConfig(nil, io.Discard)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.attachmentGC.Interval != 24*time.Hour ||
+		cfg.attachmentGC.UnclaimedTTL != 7*24*time.Hour ||
+		cfg.attachmentGC.Batch != 500 {
+		t.Fatalf("上界夹取不符: %+v", cfg.attachmentGC)
+	}
+
+	// 非法值拒绝启动（即使开关关闭也保持配置可判定）。
+	t.Setenv("LITETALK_ATTACHMENT_GC", "off")
+	t.Setenv("LITETALK_ATTACHMENT_GC_INTERVAL", "1h30")
+	if _, err := loadConfig(nil, io.Discard); err == nil || !strings.Contains(err.Error(), "LITETALK_ATTACHMENT_GC_INTERVAL") {
+		t.Fatalf("非法时长应报错，实际 %v", err)
+	}
+	t.Setenv("LITETALK_ATTACHMENT_GC_INTERVAL", "")
+	t.Setenv("LITETALK_ATTACHMENT_GC_BATCH", "10.5")
+	if _, err := loadConfig(nil, io.Discard); err == nil || !strings.Contains(err.Error(), "LITETALK_ATTACHMENT_GC_BATCH") {
+		t.Fatalf("非法批大小应报错，实际 %v", err)
+	}
+}
+
+// TestConfigValidateUpload driver 非法 / s3 缺必填 → 启动校验失败。
+func TestConfigValidateUpload(t *testing.T) {
+	clearConfigEnv(t)
+	cfg, err := loadConfig(nil, io.Discard)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	cfg.upload.Driver = "ftp"
+	if err := cfg.validate(true); err == nil || !strings.Contains(err.Error(), "LITETALK_UPLOAD_DRIVER") {
+		t.Fatalf("非法驱动应报错，实际 %v", err)
+	}
+
+	cfg.upload.Driver = "s3"
+	if err := cfg.validate(true); err == nil || !strings.Contains(err.Error(), "LITETALK_S3_ENDPOINT") {
+		t.Fatalf("s3 缺必填应报错，实际 %v", err)
+	}
+	cfg.upload = blob.Config{Driver: "s3", Endpoint: "minio:9000", Bucket: "b", AccessKey: "a"}
+	if err := cfg.validate(true); err == nil || !strings.Contains(err.Error(), "LITETALK_S3_SECRET_KEY") {
+		t.Fatalf("s3 缺 secret 应报错，实际 %v", err)
+	}
+	cfg.upload.SecretKey = "s"
+	if err := cfg.validate(true); err != nil {
+		t.Fatalf("s3 完整配置应放行: %v", err)
 	}
 }
 

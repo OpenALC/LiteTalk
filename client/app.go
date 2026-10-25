@@ -25,6 +25,7 @@ import (
 	"github.com/OpenALC/LiteTalk/client/core/audio"
 	"github.com/OpenALC/LiteTalk/client/core/config"
 	"github.com/OpenALC/LiteTalk/client/core/hotkey"
+	"github.com/OpenALC/LiteTalk/client/core/signal"
 	"github.com/OpenALC/LiteTalk/client/core/voice"
 	"github.com/OpenALC/LiteTalk/client/desktop"
 	"github.com/OpenALC/LiteTalk/client/desktop/tray"
@@ -1293,6 +1294,41 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 			}
 			a.emit("presence:update", payload)
 		},
+		// 私聊/群聊变更（conversation.changed，#38 B3）：只转发会话 ID 与动作，
+		// 前端按 ID 重新拉取（删除/退出按 action=deleted 从列表移除）。回调跑在
+		// ws 读循环 goroutine，emit 不阻塞。
+		OnConversationChanged: func(conversationID, action string) {
+			a.emit("conversation:changed", map[string]string{
+				"conversation_id": conversationID, "action": action,
+			})
+		},
+		// 消息编辑/软删除广播（message.edited / message.deleted，#39）：前端按
+		// message_id 原地替换或显示墓碑。回调跑在 ws 读循环 goroutine，emit 不阻塞。
+		// edited_at 沿用桥接口径（Unix 毫秒字符串），与 chat:message 的 ts 一致。
+		OnMessageEdited: func(d signal.MessageEditedData) {
+			mentions := d.Mentions
+			if mentions == nil {
+				mentions = []string{}
+			}
+			a.emit("chat:edited", map[string]any{
+				"channel_id": d.ChannelID, "message_id": d.MessageID,
+				"content": d.Content, "edited_at": strconv.FormatInt(d.EditedAt, 10),
+				"mentions": mentions,
+			})
+		},
+		OnMessageDeleted: func(d signal.MessageDeletedData) {
+			a.emit("chat:deleted", map[string]string{
+				"channel_id": d.ChannelID, "message_id": d.MessageID,
+			})
+		},
+		// 频道未读/提及计数（channel.unread，#40）：服务端按接收者精确计算，
+		// 前端收到后整体覆盖本地计数（覆盖而非累加）。回调跑在 ws 读循环
+		// goroutine，emit 不阻塞。
+		OnChannelUnread: func(d signal.ChannelUnreadData) {
+			a.emit("chat:unread", map[string]any{
+				"channel_id": d.ChannelID, "unread_count": d.UnreadCount, "mention_count": d.MentionCount,
+			})
+		},
 		// 服务端优雅关闭（server.shutdown，#21）：前端提示「服务端已关闭」；
 		// 停止自动重连在 Session 侧已异步处理。
 		OnServerShutdown: func(reason string) {
@@ -1335,11 +1371,33 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 			log.Printf("apply audio devices: %v", err)
 		}
 	}
-	sess.ChatHandler(func(channelID, msgID, userID, nick, content, ts, nonce string) {
-		a.emit("chat:message", map[string]string{
-			"id": msgID, "channel_id": channelID, "user_id": userID,
-			"nickname": nick, "content": content, "ts": ts, "nonce": nonce,
-		})
+	sess.ChatMessageHandler(func(d signal.ChatMessageData) {
+		// 旧字段（id/channel_id/user_id/nickname/content/ts/nonce）保持不变，
+		// #39 追加回复与提及；reply_to/reply_preview 缺省时不发键，前端按无回复处理。
+		mentions := d.Mentions
+		if mentions == nil {
+			mentions = []string{}
+		}
+		payload := map[string]any{
+			"id": d.ID, "channel_id": d.ChannelID, "user_id": d.User.ID,
+			"nickname": d.User.Nickname, "content": d.Content,
+			"ts": strconv.FormatInt(d.TS, 10), "nonce": d.Nonce,
+			"mentions": mentions,
+		}
+		if d.ReplyTo != "" {
+			payload["reply_to"] = d.ReplyTo
+		}
+		if p := d.ReplyPreview; p != nil {
+			payload["reply_preview"] = map[string]any{
+				"id": p.ID, "user_id": p.UserID, "nickname": p.Nickname,
+				"content": p.Content, "deleted": p.Deleted,
+			}
+		}
+		// #41：无附件时不发键，前端按无附件处理；相对 url 在这里拼成绝对地址。
+		if len(d.Attachments) > 0 {
+			payload["attachments"] = a.attachmentViewsFromSignal(d.Attachments)
+		}
+		a.emit("chat:message", payload)
 	})
 	// 服务端 error 帧转发前端（B1：此前未订阅，服务端拒收时消息凭空消失）。
 	// 已归属进房路径的错误（#91）由 voice:join_failed 承载，这里跳过以免同一次
@@ -1580,6 +1638,335 @@ func (a *App) RemoveFriend(id string) error { return a.api.RemoveFriend(id) }
 // UpdateFriend 设置好友备注/分组（仅发起方向；空串清除）。
 func (a *App) UpdateFriend(id string, remark, group string) error {
 	return a.api.UpdateFriend(id, remark, group)
+}
+
+// ---------- 私聊/群私聊会话（#38 B4：REST 桥接） ----------
+// 以下方法直接代理 api.APIClient；ID 参数一律十进制字符串（#31）。
+// 变更通知走 conversation:changed 事件，前端据此重新拉取。
+
+// ListConversations 当前用户参与的私聊/群私聊（含成员）。
+func (a *App) ListConversations() ([]api.ConversationDTO, error) {
+	return a.api.ListConversations()
+}
+
+// CreateDirectConversation 创建私聊（已有则幂等返回原会话）。
+func (a *App) CreateDirectConversation(userID string) (*api.ConversationDTO, error) {
+	return a.api.CreateDirectConversation(userID)
+}
+
+// CreateGroupConversation 创建群私聊（name 可为空）。
+func (a *App) CreateGroupConversation(name string, userIDs []string) (*api.ConversationDTO, error) {
+	return a.api.CreateGroupConversation(name, userIDs)
+}
+
+// GetConversation 会话详情（仅参与者）。
+func (a *App) GetConversation(id string) (*api.ConversationDTO, error) {
+	return a.api.GetConversation(id)
+}
+
+// RenameConversation 群聊改名（仅 owner）。
+func (a *App) RenameConversation(id, name string) (*api.ConversationDTO, error) {
+	return a.api.RenameConversation(id, name)
+}
+
+// DeleteConversation 删除会话（direct 任一方；group 仅 owner）。
+func (a *App) DeleteConversation(id string) error {
+	return a.api.DeleteConversation(id)
+}
+
+// AddConversationMembers 群聊加人（仅 owner）。
+func (a *App) AddConversationMembers(id string, userIDs []string) (*api.ConversationDTO, error) {
+	return a.api.AddConversationMembers(id, userIDs)
+}
+
+// RemoveConversationMember 移除成员或退出群聊；最后一人退出时会话被删除，
+// 此时返回 nil（Wails 侧为 null）。
+func (a *App) RemoveConversationMember(id, userID string) (*api.ConversationDTO, error) {
+	return a.api.RemoveConversationMember(id, userID)
+}
+
+// ---------- 未读与提及计数（#40） ----------
+// 快照与已读上报直接代理 api.APIClient；计数变化由 chat:unread 事件推送，
+// 前端必须整体覆盖（服务端按接收者精确计算）。Wails 绑定不返回指针：
+// nil 归一为空结构，前端不必处理 null。
+
+// ListUnreads 当前用户的未读快照（含 0 值项；空数组为 []）。
+func (a *App) ListUnreads() (api.UnreadsDTO, error) {
+	out, err := a.api.ListUnreads()
+	if err != nil {
+		return api.UnreadsDTO{}, err
+	}
+	if out == nil {
+		return api.UnreadsDTO{
+			Channels: []api.UnreadChannelDTO{},
+			Servers:  []api.UnreadServerDTO{},
+		}, nil
+	}
+	return *out, nil
+}
+
+// MarkChannelRead 上报频道已读到 lastMessageID，返回服务端重算后的计数。
+func (a *App) MarkChannelRead(channelID, lastMessageID string) (api.UnreadChannelDTO, error) {
+	out, err := a.api.MarkChannelRead(channelID, lastMessageID)
+	if err != nil {
+		return api.UnreadChannelDTO{}, err
+	}
+	if out == nil {
+		return api.UnreadChannelDTO{}, nil
+	}
+	return *out, nil
+}
+
+// ChatMessageView 消息桥接视图：与 chat:message 事件的载荷同口径（ts 为毫秒
+// 字符串、ID 均为十进制字符串），前端可把历史补拉与实时广播直接按 id 合并。
+// 私聊/群聊的会话 ID 即频道 ID，历史消息仍走 /channels/{id}/messages。
+// #39：EditedAt/DeletedAt 也是毫秒字符串；软删消息 Content 为空、DeletedAt 有值。
+type ChatMessageView struct {
+	ID           string            `json:"id"`
+	ChannelID    string            `json:"channel_id"`
+	UserID       string            `json:"user_id"`
+	Nickname     string            `json:"nickname"`
+	Content      string            `json:"content"`
+	TS           string            `json:"ts"`
+	EditedAt     string            `json:"edited_at,omitempty"`
+	DeletedAt    string            `json:"deleted_at,omitempty"`
+	ReplyTo      string            `json:"reply_to,omitempty"`
+	ReplyPreview *ReplyPreviewView `json:"reply_preview,omitempty"`
+	Mentions     []string          `json:"mentions"`
+	// Attachments 消息附件（#41）：无附件或软删消息时缺省，前端按可选处理。
+	Attachments []AttachmentView `json:"attachments,omitempty"`
+}
+
+// AttachmentView 附件桥接视图（与 api.AttachmentDTO 同口径）。url/thumbnail_url
+// 已由 chatMessageView / chat.message 载荷拼成绝对地址，前端可直接作 img src。
+type AttachmentView struct {
+	ID           string `json:"id"`
+	Filename     string `json:"filename"`
+	Size         int64  `json:"size"`
+	ContentType  string `json:"content_type"`
+	Width        int    `json:"width"`
+	Height       int    `json:"height"`
+	URL          string `json:"url"`
+	ThumbnailURL string `json:"thumbnail_url,omitempty"`
+}
+
+// ReplyPreviewView 回复目标预览（与 REST ReplyPreview 同口径）。
+type ReplyPreviewView struct {
+	ID       string `json:"id"`
+	UserID   string `json:"user_id"`
+	Nickname string `json:"nickname"`
+	Content  string `json:"content"`
+	Deleted  bool   `json:"deleted"`
+}
+
+// MentionCandidateView @提及候选用户（不含 email）。
+type MentionCandidateView struct {
+	UserID   string `json:"user_id"`
+	Nickname string `json:"nickname"`
+	Tag      string `json:"tag"`
+}
+
+// chatMessageView REST 消息 → 桥接视图（ts/edited_at/deleted_at 统一毫秒字符串；
+// 附件相对 url 拼成当前基址的绝对地址，前端可直接加载）。
+func (a *App) chatMessageView(m api.MessageDTO) ChatMessageView {
+	v := ChatMessageView{
+		ID:        m.ID.String(),
+		ChannelID: m.ChannelID.String(),
+		UserID:    m.UserID.String(),
+		Nickname:  m.SenderNickname,
+		Content:   m.Content,
+		TS:        strconv.FormatInt(m.CreatedAt.UnixMilli(), 10),
+		Mentions:  make([]string, 0, len(m.Mentions)),
+	}
+	if m.EditedAt != nil {
+		v.EditedAt = strconv.FormatInt(m.EditedAt.UnixMilli(), 10)
+	}
+	if m.DeletedAt != nil {
+		v.DeletedAt = strconv.FormatInt(m.DeletedAt.UnixMilli(), 10)
+	}
+	if m.ReplyTo != nil {
+		v.ReplyTo = m.ReplyTo.String()
+	}
+	if p := m.ReplyPreview; p != nil {
+		v.ReplyPreview = &ReplyPreviewView{
+			ID: p.ID.String(), UserID: p.UserID.String(), Nickname: p.Nickname,
+			Content: p.Content, Deleted: p.Deleted,
+		}
+	}
+	for _, id := range m.Mentions {
+		v.Mentions = append(v.Mentions, id.String())
+	}
+	// 软删消息不下发附件（服务端已省略，这里再兜一层，避免墓碑后仍渲染图片）。
+	if m.DeletedAt == nil && m.Attachments != nil {
+		v.Attachments = a.attachmentViews(*m.Attachments)
+	}
+	return v
+}
+
+// attachmentViews api 附件列表 → 桥接视图，相对 url 统一拼基址。
+// api 未初始化（测试/启动早期）时保留相对地址，不 panic。
+func (a *App) attachmentViews(list []api.AttachmentDTO) []AttachmentView {
+	out := make([]AttachmentView, 0, len(list))
+	for _, at := range list {
+		out = append(out, AttachmentView{
+			ID: at.ID.String(), Filename: at.Filename, Size: at.Size,
+			ContentType: at.ContentType, Width: at.Width, Height: at.Height,
+			URL:          a.resolveAttachmentURL(at.URL),
+			ThumbnailURL: a.resolveAttachmentURL(at.ThumbnailURL),
+		})
+	}
+	return out
+}
+
+// attachmentViewsFromSignal WS chat.message 的附件载荷 → 桥接视图。
+func (a *App) attachmentViewsFromSignal(list []signal.AttachmentInfo) []AttachmentView {
+	out := make([]AttachmentView, 0, len(list))
+	for _, at := range list {
+		out = append(out, AttachmentView{
+			ID: at.ID, Filename: at.Filename, Size: at.Size,
+			ContentType: at.ContentType, Width: int(at.Width), Height: int(at.Height),
+			URL:          a.resolveAttachmentURL(at.URL),
+			ThumbnailURL: a.resolveAttachmentURL(at.ThumbnailURL),
+		})
+	}
+	return out
+}
+
+// resolveAttachmentURL 相对能力 URL → 绝对地址；空串原样返回。
+func (a *App) resolveAttachmentURL(rel string) string {
+	if rel == "" || a.api == nil {
+		return rel
+	}
+	return a.api.ResolveURL(rel)
+}
+
+// ListMessages 拉频道最近消息（旧→新，limit 由 APIClient 夹到 [1,50]）。
+// 打开私聊/群聊时补历史；失败由调用方静默，不阻断实时消息。
+func (a *App) ListMessages(channelID string, limit int) ([]ChatMessageView, error) {
+	id, err := strconv.ParseInt(channelID, 10, 64)
+	if err != nil || id <= 0 {
+		return nil, fmt.Errorf("invalid channel id")
+	}
+	if a.api == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	msgs, err := a.api.ListMessages(id, limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ChatMessageView, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, a.chatMessageView(m))
+	}
+	return out, nil
+}
+
+// SearchMessages 全局消息搜索（#42 B2）：跨服务器频道与会话，载荷与 ListMessages
+// 同口径（ts 毫秒字符串、附件 URL 已绝对化），前端可直接按 channel_id 定位。
+// 搜索词为空白时 APIClient 直接返回空结果；limit 由其夹到 [1,50]。
+func (a *App) SearchMessages(query string, limit int) ([]ChatMessageView, error) {
+	if a.api == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	msgs, err := a.api.SearchMessages(query, limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ChatMessageView, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, a.chatMessageView(m))
+	}
+	return out, nil
+}
+
+// GetLinkPreview 链接预览（#42 B4）：服务端抓取 + 缓存，客户端只渲染。
+// 无预览（服务端 404 no_preview / 功能关闭）返回 (nil, nil)，前端据此静默隐藏。
+func (a *App) GetLinkPreview(rawURL string) (*api.LinkPreviewDTO, error) {
+	if a.api == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	return a.api.GetLinkPreview(rawURL)
+}
+
+// GetMessage 单条消息（#39）：回复跳转与软删消息回读。不存在/不可见返回错误。
+func (a *App) GetMessage(channelID, messageID string) (*ChatMessageView, error) {
+	cid, err := strconv.ParseInt(channelID, 10, 64)
+	if err != nil || cid <= 0 {
+		return nil, fmt.Errorf("invalid channel id")
+	}
+	mid, err := strconv.ParseInt(messageID, 10, 64)
+	if err != nil || mid <= 0 {
+		return nil, fmt.Errorf("invalid message id")
+	}
+	if a.api == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	m, err := a.api.GetMessage(cid, mid)
+	if err != nil {
+		return nil, err
+	}
+	v := a.chatMessageView(*m)
+	return &v, nil
+}
+
+// EditMessage 编辑消息（仅作者，#39）。mentions 整体替换：空数组 = 清除全部提及。
+func (a *App) EditMessage(channelID, messageID, content string, mentions []string) (*ChatMessageView, error) {
+	cid, err := strconv.ParseInt(channelID, 10, 64)
+	if err != nil || cid <= 0 {
+		return nil, fmt.Errorf("invalid channel id")
+	}
+	mid, err := strconv.ParseInt(messageID, 10, 64)
+	if err != nil || mid <= 0 {
+		return nil, fmt.Errorf("invalid message id")
+	}
+	if a.api == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	m, err := a.api.EditMessage(cid, mid, content, mentions)
+	if err != nil {
+		return nil, err
+	}
+	v := a.chatMessageView(*m)
+	return &v, nil
+}
+
+// DeleteMessage 软删除消息（作者或管理员，#39）。
+func (a *App) DeleteMessage(channelID, messageID string) error {
+	cid, err := strconv.ParseInt(channelID, 10, 64)
+	if err != nil || cid <= 0 {
+		return fmt.Errorf("invalid channel id")
+	}
+	mid, err := strconv.ParseInt(messageID, 10, 64)
+	if err != nil || mid <= 0 {
+		return fmt.Errorf("invalid message id")
+	}
+	if a.api == nil {
+		return fmt.Errorf("not connected")
+	}
+	return a.api.DeleteMessage(cid, mid)
+}
+
+// ListMentionCandidates @提及候选用户（#39）：服务器频道为可查看该频道的成员，
+// 会话频道为会话成员；按昵称升序。空结果为 []。
+func (a *App) ListMentionCandidates(channelID string) ([]MentionCandidateView, error) {
+	cid, err := strconv.ParseInt(channelID, 10, 64)
+	if err != nil || cid <= 0 {
+		return nil, fmt.Errorf("invalid channel id")
+	}
+	if a.api == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	cands, err := a.api.ListMentionCandidates(cid)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]MentionCandidateView, 0, len(cands))
+	for _, c := range cands {
+		out = append(out, MentionCandidateView{
+			UserID: c.UserID.String(), Nickname: c.Nickname, Tag: c.Tag,
+		})
+	}
+	return out, nil
 }
 
 // ---------- 请求静音（v0.1.2） ----------
@@ -1905,13 +2292,117 @@ func (a *App) GetHotkeyAvailability() bool {
 
 // SendChat 发送文字消息。
 func (a *App) SendChat(channelID, content string) error {
+	return a.SendChatWithMeta(channelID, content, "", nil)
+}
+
+// SendChatWithMeta 发送带回复与 @提及的消息（#39）：replyTo 空串 = 普通消息，
+// mentions 为空 = 无提及。断线时连同 nonce 入队，重连重放不丢字段。
+func (a *App) SendChatWithMeta(channelID, content, replyTo string, mentions []string) error {
+	return a.SendChatWithAttachments(channelID, content, replyTo, mentions, nil)
+}
+
+// SendChatWithAttachments 发送带附件 ID 的消息（#41）：content 可为空（纯附件
+// 消息）；未连接时与 SendChat 同口径报错。附件 ID 随离线队列重放。
+func (a *App) SendChatWithAttachments(channelID, content, replyTo string, mentions, attachmentIDs []string) error {
 	a.mu.Lock()
 	s := a.sess
 	a.mu.Unlock()
 	if s == nil {
 		return fmt.Errorf("not connected")
 	}
-	return s.SendChat(channelID, content)
+	return s.SendChatWithAttachments(channelID, content, replyTo, mentions, attachmentIDs)
+}
+
+// 附件选择的上限（与服务端一致）与本地读入上限。服务端真实限制是 10MiB，
+// 这里放宽到 50MiB 只为在 os.ReadFile 之前拦住误选的超大文件。
+const (
+	maxAttachmentsPerMessage = 10
+	maxAttachmentReadBytes   = 50 << 20
+)
+
+// PickAndUploadAttachments 打开系统文件选择器，逐个上传附件并返回绝对 URL 的
+// 元数据。取消返回空切片；超过 10 个或单文件超过 50MiB 在读取前直接报错。
+func (a *App) PickAndUploadAttachments() ([]api.AttachmentDTO, error) {
+	if a.wails == nil {
+		return nil, fmt.Errorf("文件选择不可用：桌面环境未就绪")
+	}
+	if a.api == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	paths, err := a.wails.Dialog.OpenFile().
+		SetTitle("选择附件").
+		AddFilter("图片", "*.png;*.jpg;*.jpeg;*.gif;*.webp").
+		AddFilter("文档", "*.pdf;*.txt;*.zip").
+		PromptForMultipleSelection()
+	if err != nil {
+		return nil, fmt.Errorf("打开文件选择器失败: %w", err)
+	}
+	return a.uploadAttachmentPaths(paths)
+}
+
+// uploadAttachmentPaths 校验并上传已选中的本地文件（从对话框逻辑拆出便于测试）。
+func (a *App) uploadAttachmentPaths(paths []string) ([]api.AttachmentDTO, error) {
+	if a.api == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	files := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if strings.TrimSpace(p) != "" {
+			files = append(files, p)
+		}
+	}
+	// 取消选择：原生对话框返回空列表。
+	if len(files) == 0 {
+		return []api.AttachmentDTO{}, nil
+	}
+	if len(files) > maxAttachmentsPerMessage {
+		return nil, fmt.Errorf("一次最多选择 %d 个附件", maxAttachmentsPerMessage)
+	}
+	// 先整体校验再逐个上传：避免部分文件已上传后才发现某个超限。
+	for _, p := range files {
+		info, err := os.Stat(p)
+		if err != nil {
+			return nil, fmt.Errorf("读取附件失败: %w", err)
+		}
+		if info.IsDir() {
+			return nil, fmt.Errorf("不能上传文件夹")
+		}
+		if info.Size() > maxAttachmentReadBytes {
+			return nil, fmt.Errorf("附件 %s 超过 50MiB", filepath.Base(p))
+		}
+	}
+	out := make([]api.AttachmentDTO, 0, len(files))
+	for _, p := range files {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil, fmt.Errorf("读取附件失败: %w", err)
+		}
+		att, err := a.api.UploadAttachment(filepath.Base(p), data)
+		if err != nil {
+			return nil, err
+		}
+		// 服务端返回相对能力 URL，立即拼成绝对地址交给前端。
+		att.URL = a.api.ResolveURL(att.URL)
+		att.ThumbnailURL = a.api.ResolveURL(att.ThumbnailURL)
+		out = append(out, *att)
+	}
+	return out, nil
+}
+
+// OpenAttachment 用系统默认浏览器打开附件（仅 http/https，拒绝 file/javascript
+// 等本地或脚本 scheme）。url 必须是 chatMessageView 产出过的绝对地址。
+func (a *App) OpenAttachment(rawURL string) error {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("附件地址无效")
+	}
+	if !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") {
+		return fmt.Errorf("仅支持打开 http/https 附件")
+	}
+	if a.wails == nil {
+		return fmt.Errorf("浏览器不可用：桌面环境未就绪")
+	}
+	return a.wails.Browser.OpenURL(u.String())
 }
 
 // GetVoiceMembers 房间成员快照。

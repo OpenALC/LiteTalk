@@ -24,9 +24,12 @@ import (
 
 	"github.com/OpenALC/LiteTalk/server/internal/acme"
 	"github.com/OpenALC/LiteTalk/server/internal/api"
+	"github.com/OpenALC/LiteTalk/server/internal/attachment"
 	"github.com/OpenALC/LiteTalk/server/internal/auth"
 	"github.com/OpenALC/LiteTalk/server/internal/authz"
+	"github.com/OpenALC/LiteTalk/server/internal/blob"
 	"github.com/OpenALC/LiteTalk/server/internal/bootstrap"
+	"github.com/OpenALC/LiteTalk/server/internal/linkpreview"
 	"github.com/OpenALC/LiteTalk/server/internal/mailer"
 	"github.com/OpenALC/LiteTalk/server/internal/rtcapi"
 	"github.com/OpenALC/LiteTalk/server/internal/sfu"
@@ -327,12 +330,24 @@ func main() {
 	}, log.Default())
 	log.Printf("发信通道: %s", mailName)
 
+	// 附件二进制存储（#41 B2）：local（默认，$DATA_DIR/uploads）或 S3 兼容对象存储。
+	// 只校验配置不探测连通性：S3 暂时不可达不应挡住整个服务启动。
+	blobStore, blobDriver, err := blob.New(cfg.upload, log.Default())
+	if err != nil {
+		log.Fatalf("附件存储不可用: %v", err)
+	}
+	log.Printf("附件存储: %s（单文件上限 %d MiB，图片单边上限 %d 像素）",
+		blobDriver, cfg.uploadMax>>20, serverUploadMaxDimension)
+
 	// Auth 模式：full（默认，验证码流程）/ simple（免验证码，私域部署从简）。
 	// 合法性已在 cfg.validate（步骤 2）把关。
 	authMode := cfg.authMode
 	if authMode == "simple" {
 		log.Println("Auth 模式: simple（注册/找回免验证码，仅建议私域部署）")
 	}
+
+	// 链接预览（#42 B4）：关闭时为 nil，端点统一 404 no_preview；缓存复用现有 KV。
+	linkPreview := linkPreviewFromEnv(log.Default())
 
 	// REST API（§5.4 全量）
 	apiSrv := api.New(api.Config{
@@ -367,6 +382,16 @@ func main() {
 		RTCAuth: rtcAuth,
 		// 权限判定与信令 hub 共用同一实例（#35 B3）。
 		Authz: authzInst,
+		// 附件存储与校验（#41 B2）：上传/下载端点；MaxDimension 显式收紧到 4096。
+		Blob: blobStore,
+		Upload: attachment.Config{
+			MaxBytes:     cfg.uploadMax,
+			MaxDimension: serverUploadMaxDimension,
+			AllowedTypes: cfg.uploadTypes,
+		},
+		// 链接预览（#42 B4）：KV 缓存 + 抓取器；关闭时 LinkPreview=nil。
+		KV:          kv,
+		LinkPreview: linkPreview,
 	})
 
 	mux := http.NewServeMux()
@@ -379,6 +404,24 @@ func main() {
 	// 捕获 SIGINT / SIGTERM，触发优雅关闭
 	ctx, stop := ossignal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// 附件生命周期回收（#41 P2）：未认领超期、消息已硬删、消息已软删的孤儿。
+	// 用同一个优雅关闭 ctx；Run 在后台 goroutine 里先扫一轮，不阻塞启动。
+	if gcCfg := cfg.attachmentGC; gcCfg.Enabled {
+		attGC := &attachment.GC{
+			Store:        st,
+			Blob:         blobStore,
+			UnclaimedTTL: gcCfg.UnclaimedTTL,
+			Interval:     gcCfg.Interval,
+			Batch:        gcCfg.Batch,
+			Log:          log.Default(),
+		}
+		log.Printf("附件回收: 开启（间隔 %s，未认领 TTL %s，每批 %d）",
+			gcCfg.Interval, gcCfg.UnclaimedTTL, gcCfg.Batch)
+		go attGC.Run(ctx)
+	} else {
+		log.Println("附件回收: 关闭（LITETALK_ATTACHMENT_GC）")
+	}
 
 	// ---- 起 HTTP（§0.6 步骤 9）：ACME TLS + :80 挑战，或纯 HTTP ----
 	servers := startHTTP(cfg, mux, stop)
@@ -652,6 +695,40 @@ func envInt(key string, def int) int {
 		log.Fatalf("%s 不是合法整数: %q", key, v)
 	}
 	return n
+}
+
+// linkPreviewFromEnv 按环境变量构造链接预览抓取器（#42 B4）。
+// LITETALK_LINK_PREVIEW 默认开；off/0/false 关闭（返回 nil，端点统一 404）。
+// 超时与响应上限夹到安全区间：误配既不能把抓取拖到连接耗尽，也不能让单次
+// 响应吃爆内存。所有取值都有安全默认，非法整数直接拒绝启动（envInt）。
+func linkPreviewFromEnv(lg *log.Logger) *linkpreview.Fetcher {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("LITETALK_LINK_PREVIEW"))) {
+	case "off", "0", "false":
+		lg.Println("链接预览: 关闭（LITETALK_LINK_PREVIEW），/api/v1/link-preview 返回 404")
+		return nil
+	}
+	const (
+		minTimeout = time.Second
+		maxTimeout = 15 * time.Second
+		minBytes   = int64(64 << 10)
+		maxBytes   = int64(2 << 20)
+	)
+	timeout := time.Duration(envInt("LITETALK_LINK_PREVIEW_TIMEOUT_MS", 5000)) * time.Millisecond
+	if timeout < minTimeout {
+		timeout = minTimeout
+	}
+	if timeout > maxTimeout {
+		timeout = maxTimeout
+	}
+	limit := int64(envInt("LITETALK_LINK_PREVIEW_MAX_BYTES", 512<<10))
+	if limit < minBytes {
+		limit = minBytes
+	}
+	if limit > maxBytes {
+		limit = maxBytes
+	}
+	lg.Printf("链接预览: 开启（超时 %s，响应上限 %d KiB）", timeout, limit>>10)
+	return linkpreview.New(linkpreview.Config{Timeout: timeout, MaxBytes: limit})
 }
 
 func splitList(s string) []string {

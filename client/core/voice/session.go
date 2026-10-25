@@ -70,6 +70,23 @@ type Events struct {
 	// channelID/serverID 是该好友当前语音房（同现同缺，无查看权限或不在
 	// 语音房时为空串）。跑在 ws 读循环 goroutine，实现侧只做转发。
 	OnPresenceUpdate func(userID string, online bool, channelID, serverID string)
+	// OnConversationChanged 私聊/群聊会话变更（conversation.changed，#38 B3）：
+	// 只携带会话 ID 与 action（created/updated/member_added/member_removed/
+	// deleted），实现侧按 ID 重新拉取会话。跑在 ws 读循环 goroutine，实现侧
+	// 只做转发，不得阻塞、不得同步 Close 会话。
+	OnConversationChanged func(conversationID, action string)
+	// OnMessageEdited 消息编辑广播（message.edited，#39）：频道 ID、消息 ID、
+	// 新正文、编辑时间（Unix 毫秒）与提及，实现侧按 message_id 原地替换。
+	// 跑在 ws 读循环 goroutine，实现侧只做转发，不得阻塞、不得同步 Close 会话。
+	OnMessageEdited func(d signal.MessageEditedData)
+	// OnMessageDeleted 消息软删除广播（message.deleted，#39）：实现侧按
+	// message_id 就地显示墓碑。与 OnMessageEdited 同线程约定。
+	OnMessageDeleted func(d signal.MessageDeletedData)
+	// OnChannelUnread 频道未读/提及计数变化（channel.unread，#40）。服务端按
+	// 接收者精确计算，同一事件只投递给该用户；实现侧必须整体覆盖本地该频道的
+	// 计数，不能累加——自己的消息不计未读，多设备读标记与断线续传都靠它同步。
+	// 跑在 ws 读循环 goroutine，实现侧只做转发，不得阻塞、不得同步 Close 会话。
+	OnChannelUnread func(d signal.ChannelUnreadData)
 	// OnServerShutdown 服务端优雅关闭（server.shutdown，#21）：停自动重连并提示。
 	// 与 OnKicked 同线程约定。
 	OnServerShutdown func(reason string)
@@ -214,7 +231,8 @@ type Session struct {
 	mu        sync.Mutex
 	members   map[string]PeerView
 	selfID    string
-	chatFn    func(channelID, msgID, userID, nickname, content, ts, nonce string) // ChatHandler 注入
+	chatFn    func(channelID, msgID, userID, nickname, content, ts, nonce string) // ChatHandler 注入（旧签名）
+	chatMsgFn func(d signal.ChatMessageData)                                      // ChatMessageHandler 注入（#39 富字段）
 	seenChans map[string]bool                                                     // 本会话收过 chat.message 的频道（补拉范围）
 	errFns    []func(code, message string, joinHandled bool)                      // ErrorHandlerEx 注入（mu 保护）
 
@@ -750,6 +768,54 @@ func (s *Session) registerHandlers() {
 			s.ev.OnPresenceUpdate(d.UserID, d.Online, d.ChannelID, d.ServerID)
 		}
 	})
+	// conversation.changed：私聊/群聊变更（#38 B3）。只带会话 ID 与动作，成员
+	// 变化时新旧成员都会收到；删除/退出后 action=deleted，由 UI 从列表移除。
+	// 跑在 ws 读循环，不得阻塞（REST 重拉由 UI 侧异步做）。
+	s.ws.On(signal.TypeConversationChanged, func(env signal.Envelope) {
+		var d signal.ConversationChangedData
+		if env.Decode(&d) != nil || d.ConversationID == "" {
+			return
+		}
+		if s.ev.OnConversationChanged != nil {
+			s.ev.OnConversationChanged(d.ConversationID, d.Action)
+		}
+	})
+	// chat.message：实时消息统一分发点（旧 ChatHandler / #39 ChatMessageHandler
+	// 只存回调，不各自注册，避免两边同时设置时双投递）。
+	s.ws.On(signal.TypeChatMessage, s.handleChatMessage)
+	// message.edited：编辑广播（#39），按 message_id 原地替换正文与提及。
+	// 跑在 ws 读循环，只转发，不得阻塞（UI 侧合并由前端状态做）。
+	s.ws.On(signal.TypeMessageEdited, func(env signal.Envelope) {
+		var d signal.MessageEditedData
+		if env.Decode(&d) != nil || d.ChannelID == "" || d.MessageID == "" {
+			return
+		}
+		if s.ev.OnMessageEdited != nil {
+			s.ev.OnMessageEdited(d)
+		}
+	})
+	// message.deleted：软删除广播（#39），UI 按 message_id 就地显示墓碑。
+	s.ws.On(signal.TypeMessageDeleted, func(env signal.Envelope) {
+		var d signal.MessageDeletedData
+		if env.Decode(&d) != nil || d.ChannelID == "" || d.MessageID == "" {
+			return
+		}
+		if s.ev.OnMessageDeleted != nil {
+			s.ev.OnMessageDeleted(d)
+		}
+	})
+	// channel.unread：按接收者精确计算的未读/提及计数（#40）。事件是覆盖语义，
+	// 前端收到后整体替换该频道的计数；空 channel_id 的坏包不回调。跑在 ws 读
+	// 循环，只转发，不得阻塞。
+	s.ws.On(signal.TypeChannelUnread, func(env signal.Envelope) {
+		var d signal.ChannelUnreadData
+		if env.Decode(&d) != nil || d.ChannelID == "" {
+			return
+		}
+		if s.ev.OnChannelUnread != nil {
+			s.ev.OnChannelUnread(d)
+		}
+	})
 	// server.shutdown：服务端优雅关闭（#21）。停掉 ws 自动重连并转给 UI 层提示。
 	// Close 必须异步：同步调用会与读循环互等（Close 等 Run 退出、Run 等读循环返回）。
 	s.ws.On(signal.TypeServerShutdown, func(env signal.Envelope) {
@@ -1247,6 +1313,19 @@ func (s *Session) Stats() string {
 // nonce（#31）：每次用户发送生成一次；断线/写失败时消息连同 nonce 入队，
 // 重连后由 OnConnect 用同一个 nonce 重发，服务端据此去重（只落一条、只广播一次）。
 func (s *Session) SendChat(channelID, content string) error {
+	return s.SendChatWithMeta(channelID, content, "", nil)
+}
+
+// SendChatWithMeta 发送带回复与 @提及的消息（#39）。replyTo 空串 = 普通消息；
+// mentions 为空 = 无提及。两者与 nonce 一起入离线队列，重连重放不丢字段。
+func (s *Session) SendChatWithMeta(channelID, content, replyTo string, mentions []string) error {
+	return s.SendChatWithAttachments(channelID, content, replyTo, mentions, nil)
+}
+
+// SendChatWithAttachments 发送带附件 ID 的消息（#41）。content 可为空串
+// （纯附件消息）；attachmentIDs 与回复/提及一样随 nonce 入离线队列，重连
+// 重发原样带回——否则弱网下附件消息会掉附件。
+func (s *Session) SendChatWithAttachments(channelID, content, replyTo string, mentions, attachmentIDs []string) error {
 	if s.ws == nil || s.ws.Closed() {
 		return fmt.Errorf("session not connected")
 	}
@@ -1259,7 +1338,19 @@ func (s *Session) SendChat(channelID, content string) error {
 	if len(s.pendingChats) >= maxPendingChats {
 		return fmt.Errorf("离线消息队列已满（%d 条），请等连接恢复后重试", maxPendingChats)
 	}
-	s.pendingChats = append(s.pendingChats, pendingChat{channelID: channelID, content: content, nonce: nonce})
+	// 复制 mentions/attachmentIDs：调用方可能复用切片，入队后内容必须以调用时的快照为准。
+	var ms []string
+	if len(mentions) > 0 {
+		ms = append([]string(nil), mentions...)
+	}
+	var as []string
+	if len(attachmentIDs) > 0 {
+		as = append([]string(nil), attachmentIDs...)
+	}
+	s.pendingChats = append(s.pendingChats, pendingChat{
+		channelID: channelID, content: content, nonce: nonce,
+		replyTo: replyTo, mentions: ms, attachmentIDs: as,
+	})
 	s.flushPendingChatsLocked()
 	return nil
 }
@@ -1269,9 +1360,12 @@ const maxPendingChats = 64
 
 // pendingChat 一条待发消息。nonce 在用户发送时生成一次，重试不换。
 type pendingChat struct {
-	channelID string
-	content   string
-	nonce     string
+	channelID     string
+	content       string
+	nonce         string
+	replyTo       string   // #39 回复目标消息 ID（空 = 非回复）
+	mentions      []string // #39 被 @ 的用户 ID
+	attachmentIDs []string // #41 随消息发送的附件 ID（重连重发必须保留）
 }
 
 // flushPendingChats 重连后重发积压消息（OnConnect 在 ws 读循环上调用）。
@@ -1295,7 +1389,11 @@ func (s *Session) flushPendingChatsLocked() {
 // sendChatFrame 发送一条 chat.send。nonce 的 x-since 是 2：老服务端不协商协议
 // （protoVer=0），不带该字段，wire 与 v1 完全一致；v2 服务端才携带。
 func (s *Session) sendChatFrame(item pendingChat) error {
-	d := signal.ChatSendData{ChannelID: item.channelID, Type: "text", Content: item.content}
+	d := signal.ChatSendData{
+		ChannelID: item.channelID, Type: "text", Content: item.content,
+		ReplyTo: item.replyTo, Mentions: item.mentions,
+		AttachmentIDS: item.attachmentIDs,
+	}
 	if s.ProtocolVersion() >= 2 {
 		d.Nonce = item.nonce
 	}
@@ -1349,6 +1447,8 @@ func (s *Session) VoiceState() VoiceStateView {
 // 此前回调丢弃了 ID，前端只能拿时间戳当 key，无法可靠去重）。
 // nonce 为发送方 chat.send 携带的幂等键（#31，协议 v2；REST 补拉与老服务端为空串）。
 // 同时记录收过消息的频道（#32 全量补拉的范围），fn 回灌路径复用同一回调。
+// 旧签名不含 #39 的 reply/mentions 字段；新调用方用 ChatMessageHandler，
+// 两者同时设置时以 ChatMessageHandler 为准（只投递一次）。
 func (s *Session) ChatHandler(fn func(channelID, msgID, userID, nickname, content, ts, nonce string)) {
 	if s.ws == nil {
 		return
@@ -1356,26 +1456,76 @@ func (s *Session) ChatHandler(fn func(channelID, msgID, userID, nickname, conten
 	s.mu.Lock()
 	s.chatFn = fn
 	s.mu.Unlock()
-	s.ws.On(signal.TypeChatMessage, func(env signal.Envelope) {
-		var d struct {
-			ID        string `json:"id"`
-			ChannelID string `json:"channel_id"`
-			Content   string `json:"content"`
-			TS        int64  `json:"ts"`
-			Nonce     string `json:"nonce"`
-			User      struct {
-				ID       string `json:"id"`
-				Nickname string `json:"nickname"`
-			} `json:"user"`
+}
+
+// ChatMessageHandler 注入富字段 chat.message 处理（#39）：除旧字段外还带
+// reply_to / reply_preview / mentions。与 ChatHandler 二选一；补拉
+// （fullResync）回灌同样走这里，字段口径与实时广播一致。
+// 回调跑在 ws 读循环 goroutine，实现侧只做转发，不得阻塞、不得同步 Close 会话。
+func (s *Session) ChatMessageHandler(fn func(d signal.ChatMessageData)) {
+	if s.ws == nil {
+		return
+	}
+	s.mu.Lock()
+	s.chatMsgFn = fn
+	s.mu.Unlock()
+}
+
+// handleChatMessage chat.message 的统一分发：记录频道补拉范围后交给注入的回调。
+// 注册在 registerHandlers 里，只注册一次。
+func (s *Session) handleChatMessage(env signal.Envelope) {
+	var d signal.ChatMessageData
+	if env.Decode(&d) != nil {
+		return
+	}
+	s.mu.Lock()
+	s.seenChans[d.ChannelID] = true
+	rich := s.chatMsgFn
+	legacy := s.chatFn
+	s.mu.Unlock()
+	if rich != nil {
+		rich(d)
+		return
+	}
+	if legacy != nil {
+		legacy(d.ChannelID, d.ID, d.User.ID, d.User.Nickname, d.Content,
+			fmt.Sprintf("%d", d.TS), d.Nonce)
+	}
+}
+
+// chatMessageDataFromDTO REST 消息 → chat.message 载荷（#32/#78 补拉回灌用）：
+// 与实时广播同口径，保留回复目标、预览、提及与附件。
+func chatMessageDataFromDTO(m api.MessageDTO) signal.ChatMessageData {
+	d := signal.ChatMessageData{
+		ID:        m.ID.String(),
+		ChannelID: m.ChannelID.String(),
+		Content:   m.Content,
+		TS:        m.CreatedAt.UnixMilli(),
+		User:      signal.UserBrief{ID: m.UserID.String(), Nickname: m.SenderNickname},
+	}
+	if m.ReplyTo != nil {
+		d.ReplyTo = m.ReplyTo.String()
+	}
+	if p := m.ReplyPreview; p != nil {
+		d.ReplyPreview = &signal.ReplyPreview{
+			ID: p.ID.String(), UserID: p.UserID.String(),
+			Nickname: p.Nickname, Content: p.Content, Deleted: p.Deleted,
 		}
-		if env.Decode(&d) != nil {
-			return
+	}
+	for _, id := range m.Mentions {
+		d.Mentions = append(d.Mentions, id.String())
+	}
+	// #41：软删消息不下发附件；附件保持服务端相对 url，由 app 层拼基址。
+	if m.DeletedAt == nil && m.Attachments != nil {
+		for _, a := range *m.Attachments {
+			d.Attachments = append(d.Attachments, signal.AttachmentInfo{
+				ID: a.ID.String(), Filename: a.Filename, Size: a.Size,
+				ContentType: a.ContentType, Width: int64(a.Width), Height: int64(a.Height),
+				URL: a.URL, ThumbnailURL: a.ThumbnailURL,
+			})
 		}
-		s.mu.Lock()
-		s.seenChans[d.ChannelID] = true
-		s.mu.Unlock()
-		fn(d.ChannelID, d.ID, d.User.ID, d.User.Nickname, d.Content, fmt.Sprintf("%d", d.TS), d.Nonce)
-	})
+	}
+	return d
 }
 
 // resyncRecentMessages 单频道补拉的消息条数（最新 N 条，覆盖断线窗口）。
@@ -1411,6 +1561,7 @@ func (s *Session) fullResync() {
 		chans = append(chans, ch)
 	}
 	chatFn := s.chatFn
+	chatMsgFn := s.chatMsgFn
 	s.mu.Unlock()
 
 	if snap, err := s.api.Sync(); err != nil {
@@ -1434,10 +1585,14 @@ func (s *Session) fullResync() {
 			s.log.Printf("gateway: 补拉频道 %s 消息失败: %v", ch, err)
 			continue
 		}
-		if chatFn == nil {
+		if chatMsgFn == nil && chatFn == nil {
 			continue
 		}
 		for _, m := range msgs {
+			if chatMsgFn != nil {
+				chatMsgFn(chatMessageDataFromDTO(m))
+				continue
+			}
 			chatFn(ch, m.ID.String(), m.UserID.String(), m.SenderNickname, m.Content,
 				strconv.FormatInt(m.CreatedAt.UnixMilli(), 10), "")
 		}

@@ -46,6 +46,47 @@
       },
       "required": ["sdp"],
       "additionalProperties": false
+    },
+    "ReplyPreview": {
+      "title": "ReplyPreview",
+      "description": "回复消息的预览快照（#39）：只含跳转与展示所需字段；被引用消息已软删时 content 为空、deleted=true。",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "user_id": { "type": "string" },
+        "nickname": { "type": "string" },
+        "content": { "type": "string" },
+        "deleted": { "type": "boolean" }
+      },
+      "required": ["id", "user_id", "nickname", "content", "deleted"],
+      "additionalProperties": false
+    },
+    "AttachmentInfo": {
+      "title": "AttachmentInfo",
+      "description": "消息附件元数据（#41）。url/thumbnail_url 是带能力 key 的相对路径（/api/v1/attachments/{id}?key=...），客户端自行拼服务端基址；不需要 Authorization。",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "filename": { "type": "string" },
+        "size": { "type": "integer" },
+        "content_type": { "type": "string" },
+        "width": {
+          "type": "integer",
+          "description": "原图像素宽；非图片为 0"
+        },
+        "height": {
+          "type": "integer",
+          "description": "原图像素高；非图片为 0"
+        },
+        "url": { "type": "string" },
+        "thumbnail_url": {
+          "type": "string",
+          "x-go-omitempty": true,
+          "description": "带能力 key 的缩略图相对路径；非图片或未生成缩略图时缺省"
+        }
+      },
+      "required": ["id", "filename", "size", "content_type", "url"],
+      "additionalProperties": false
     }
   }
 }

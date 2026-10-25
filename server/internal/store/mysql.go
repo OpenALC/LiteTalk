@@ -498,6 +498,13 @@ func (m *MySQL) DeleteServer(ctx context.Context, id int64) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// 提及没有外键，必须先于 messages 删除，否则留下孤儿行（#39）。
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM message_mentions WHERE message_id IN (
+		   SELECT id FROM messages WHERE channel_id IN
+		     (SELECT id FROM channels WHERE server_id = ?))`, id); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM messages WHERE channel_id IN (SELECT id FROM channels WHERE server_id = ?)`, id); err != nil {
 		return err
@@ -615,12 +622,15 @@ func (m *MySQL) MembersOfServer(ctx context.Context, serverID int64) ([]ServerMe
 // ---- channels ----
 
 func (m *MySQL) CreateChannel(ctx context.Context, c *Channel) error {
+	if err := normalizeServerChannel(c); err != nil {
+		return err
+	}
 	c.ID = newID(c.ID)
 	_, err := m.db.ExecContext(ctx,
-		`INSERT INTO channels (id, server_id, name, type, category_id, position, password_hash, user_limit, parent_id)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO channels (id, server_id, name, type, category_id, position, password_hash, user_limit, parent_id, scope, dm_key)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
 		c.ID, c.ServerID, c.Name, c.Type, c.CategoryID, c.Position,
-		c.PasswordHash, c.UserLimit, c.ParentID)
+		c.PasswordHash, c.UserLimit, c.ParentID, c.Scope)
 	if err != nil {
 		return err
 	}
@@ -628,25 +638,32 @@ func (m *MySQL) CreateChannel(ctx context.Context, c *Channel) error {
 		Scan(&c.CreatedAt)
 }
 
-const channelCols = `id, server_id, name, type, category_id, position, created_at, password_hash, user_limit, parent_id`
+const channelCols = `id, server_id, name, type, category_id, position, created_at, password_hash, user_limit, parent_id, scope, dm_key`
 
-// scanChannel 扫描一行频道（category_id/parent_id 可空）。
+// scanChannel 扫描一行频道（server_id/category_id/parent_id/dm_key 可空）。
 func scanChannel(rows interface{ Scan(...any) error }) (*Channel, error) {
 	var c Channel
-	var catID, parentID sql.NullInt64
-	err := rows.Scan(&c.ID, &c.ServerID, &c.Name, &c.Type, &catID, &c.Position, &c.CreatedAt,
-		&c.PasswordHash, &c.UserLimit, &parentID)
+	var serverID, catID, parentID sql.NullInt64
+	var dmKey sql.NullString
+	err := rows.Scan(&c.ID, &serverID, &c.Name, &c.Type, &catID, &c.Position, &c.CreatedAt,
+		&c.PasswordHash, &c.UserLimit, &parentID, &c.Scope, &dmKey)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	if serverID.Valid {
+		c.ServerID = serverID.Int64
+	}
 	if catID.Valid {
 		c.CategoryID = &catID.Int64
 	}
 	if parentID.Valid {
 		c.ParentID = &parentID.Int64
+	}
+	if dmKey.Valid {
+		c.DMKey = dmKey.String
 	}
 	return &c, nil
 }
@@ -658,7 +675,7 @@ func (m *MySQL) ChannelByID(ctx context.Context, id int64) (*Channel, error) {
 
 func (m *MySQL) ChannelsOfServer(ctx context.Context, serverID int64) ([]Channel, error) {
 	rows, err := m.db.QueryContext(ctx,
-		`SELECT `+channelCols+` FROM channels WHERE server_id = ? ORDER BY position, id`, serverID)
+		`SELECT `+channelCols+` FROM channels WHERE server_id = ? AND scope = 'server' ORDER BY position, id`, serverID)
 	if err != nil {
 		return nil, err
 	}
@@ -674,14 +691,22 @@ func (m *MySQL) ChannelsOfServer(ctx context.Context, serverID int64) ([]Channel
 	return out, rows.Err()
 }
 
-// UpdateChannel 全行写（#37 B1 起含 password_hash/user_limit/parent_id）：
-// 调用方必须先读再写，清除密码写空串、提升顶层写 NULL。
+// UpdateChannel 全行写（#37 B1 起含 password_hash/user_limit/parent_id；#38 起含
+// server_id/scope/dm_key）：调用方必须先读再写，清除密码写空串、提升顶层写 NULL；
+// 会话行 ServerID=0 写 NULL、DMKey 空串写 NULL，server 行强制清空 dm_key。
 func (m *MySQL) UpdateChannel(ctx context.Context, c *Channel) error {
+	scope := normalizeChannelScope(c.Scope)
+	dmKey := c.DMKey
+	if scope == ChannelScopeServer {
+		dmKey = ""
+	} else if !isConversationScope(scope) {
+		return ErrForbidden
+	}
 	res, err := m.db.ExecContext(ctx,
-		`UPDATE channels SET name = ?, type = ?, category_id = ?, position = ?,
-		 password_hash = ?, user_limit = ?, parent_id = ? WHERE id = ?`,
-		c.Name, c.Type, c.CategoryID, c.Position,
-		c.PasswordHash, c.UserLimit, c.ParentID, c.ID)
+		`UPDATE channels SET server_id = ?, name = ?, type = ?, category_id = ?, position = ?,
+		 password_hash = ?, user_limit = ?, parent_id = ?, scope = ?, dm_key = ? WHERE id = ?`,
+		nullID(c.ServerID), c.Name, c.Type, c.CategoryID, c.Position,
+		c.PasswordHash, c.UserLimit, c.ParentID, scope, nullString(dmKey), c.ID)
 	if err != nil {
 		return err
 	}
@@ -689,14 +714,21 @@ func (m *MySQL) UpdateChannel(ctx context.Context, c *Channel) error {
 }
 
 func (m *MySQL) DeleteChannel(ctx context.Context, id int64) error {
-	// 单事务：消息 + 频道覆盖 + 子频道行 + 频道一起删（#22/#35/#37）。
-	// 子频道与父同行级联（消息/覆盖一并）；IN 子查询指向 channels，
+	// 单事务：消息 + 频道覆盖 + 会话成员 + 子频道行 + 频道一起删（#22/#35/#37/#38）。
+	// 子频道与父同行级联（消息/覆盖/成员一并）；IN 子查询指向 channels，
 	// 不是被删的 messages/overwrites 自身，无 1093 限制。
 	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// 提及没有外键，必须先于 messages 删除（含子频道消息，#39）。
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM message_mentions WHERE message_id IN (
+		   SELECT id FROM messages WHERE channel_id = ?
+		      OR channel_id IN (SELECT id FROM channels WHERE parent_id = ?))`, id, id); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM messages WHERE channel_id = ?
 		   OR channel_id IN (SELECT id FROM channels WHERE parent_id = ?)`, id, id); err != nil {
@@ -704,6 +736,11 @@ func (m *MySQL) DeleteChannel(ctx context.Context, id int64) error {
 	}
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM channel_overwrites WHERE channel_id = ?
+		   OR channel_id IN (SELECT id FROM channels WHERE parent_id = ?)`, id, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM channel_members WHERE channel_id = ?
 		   OR channel_id IN (SELECT id FROM channels WHERE parent_id = ?)`, id, id); err != nil {
 		return err
 	}
@@ -718,6 +755,221 @@ func (m *MySQL) DeleteChannel(ctx context.Context, id int64) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// ---- conversations（迁移 0012，#38 B1） ----
+
+func (m *MySQL) CreateConversation(ctx context.Context, c *Channel, memberIDs []int64) error {
+	ids, err := normalizeConversation(c, memberIDs)
+	if err != nil {
+		return err
+	}
+	c.ID = newID(c.ID)
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO channels (id, server_id, name, type, category_id, position, password_hash, user_limit, parent_id, scope, dm_key)
+		 VALUES (?, NULL, ?, ?, NULL, ?, '', ?, NULL, ?, ?)`,
+		c.ID, c.Name, c.Type, c.Position, c.UserLimit, c.Scope, nullString(c.DMKey)); err != nil {
+		if isDup(err) {
+			return ErrConflict
+		}
+		return err
+	}
+	now := time.Now()
+	for i, uid := range ids {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO channel_members (channel_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)`,
+			c.ID, uid, conversationMemberRole(c.Scope, i), now); err != nil {
+			if isDup(err) {
+				return ErrConflict
+			}
+			return err
+		}
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT created_at FROM channels WHERE id = ?`, c.ID).
+		Scan(&c.CreatedAt); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (m *MySQL) FindDirectChannel(ctx context.Context, a, b int64) (*Channel, error) {
+	return scanChannel(m.db.QueryRowContext(ctx,
+		`SELECT `+channelCols+` FROM channels WHERE scope = 'direct' AND dm_key = ?`, directKey(a, b)))
+}
+
+func (m *MySQL) ListConversations(ctx context.Context, userID int64) ([]Channel, error) {
+	rows, err := m.db.QueryContext(ctx,
+		`SELECT `+channelCols+` FROM channels c
+		   JOIN channel_members cm ON cm.channel_id = c.id
+		  WHERE cm.user_id = ? AND c.scope IN ('direct','group')
+		  ORDER BY c.created_at DESC, c.id DESC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Channel{}
+	for rows.Next() {
+		c, err := scanChannel(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *c)
+	}
+	return out, rows.Err()
+}
+
+// channelMemberJoin 成员列表/单查共用；users 用 LEFT JOIN：成员行存在但用户已删时
+// 仍返回成员（昵称留空），与 Mem 实现一致。
+const channelMemberJoin = `SELECT cm.channel_id, cm.user_id, cm.role, cm.joined_at, u.nickname, u.tag
+	FROM channel_members cm LEFT JOIN users u ON u.id = cm.user_id`
+
+func scanChannelMember(rows interface{ Scan(...any) error }) (*ChannelMember, error) {
+	var cm ChannelMember
+	var nickname, tag sql.NullString
+	err := rows.Scan(&cm.ChannelID, &cm.UserID, &cm.Role, &cm.JoinedAt, &nickname, &tag)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if nickname.Valid {
+		cm.Nickname = nickname.String
+	}
+	if tag.Valid {
+		cm.Tag = tag.String
+	}
+	return &cm, nil
+}
+
+func (m *MySQL) ChannelMembers(ctx context.Context, channelID int64) ([]ChannelMember, error) {
+	rows, err := m.db.QueryContext(ctx,
+		channelMemberJoin+` WHERE cm.channel_id = ? ORDER BY cm.joined_at, cm.user_id`, channelID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ChannelMember{}
+	for rows.Next() {
+		cm, err := scanChannelMember(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *cm)
+	}
+	return out, rows.Err()
+}
+
+func (m *MySQL) ChannelMember(ctx context.Context, channelID, userID int64) (*ChannelMember, error) {
+	return scanChannelMember(m.db.QueryRowContext(ctx,
+		channelMemberJoin+` WHERE cm.channel_id = ? AND cm.user_id = ?`, channelID, userID))
+}
+
+// ChannelMembersOfChannels 批量成员（#38 B2）：一条 IN 查询，组内排序与
+// ChannelMembers 一致；空入参直接返回空 map，不发 SQL。
+func (m *MySQL) ChannelMembersOfChannels(ctx context.Context, channelIDs []int64) (map[int64][]ChannelMember, error) {
+	out := map[int64][]ChannelMember{}
+	if len(channelIDs) == 0 {
+		return out, nil
+	}
+	args := make([]any, len(channelIDs))
+	for i, id := range channelIDs {
+		args[i] = id
+	}
+	rows, err := m.db.QueryContext(ctx,
+		channelMemberJoin+` WHERE cm.channel_id IN (`+placeholders(len(args))+`)
+		 ORDER BY cm.channel_id, cm.joined_at, cm.user_id`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		cm, err := scanChannelMember(rows)
+		if err != nil {
+			return nil, err
+		}
+		out[cm.ChannelID] = append(out[cm.ChannelID], *cm)
+	}
+	return out, rows.Err()
+}
+
+// placeholders 生成 SQL 的 ?,?,? 序列（调用方保证 n > 0）。
+func placeholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
+func (m *MySQL) SetChannelMemberRole(ctx context.Context, channelID, userID int64, role ChannelMemberRole) error {
+	role, err := normalizeChannelMemberRole(role)
+	if err != nil {
+		return err
+	}
+	var scope ChannelScope
+	if err := m.db.QueryRowContext(ctx, `SELECT scope FROM channels WHERE id = ?`, channelID).Scan(&scope); err != nil {
+		if err == sql.ErrNoRows {
+			return ErrNotFound
+		}
+		return err
+	}
+	if scope != ChannelScopeGroup {
+		return ErrForbidden
+	}
+	res, err := m.db.ExecContext(ctx,
+		`UPDATE channel_members SET role = ? WHERE channel_id = ? AND user_id = ?`, role, channelID, userID)
+	if err != nil {
+		return err
+	}
+	return checkAffected(res)
+}
+
+func (m *MySQL) AddChannelMember(ctx context.Context, channelID, userID int64, role ChannelMemberRole) error {
+	role, err := normalizeChannelMemberRole(role)
+	if err != nil {
+		return err
+	}
+	var scope ChannelScope
+	if err := m.db.QueryRowContext(ctx, `SELECT scope FROM channels WHERE id = ?`, channelID).Scan(&scope); err != nil {
+		if err == sql.ErrNoRows {
+			return ErrNotFound
+		}
+		return err
+	}
+	if scope != ChannelScopeGroup {
+		return ErrForbidden
+	}
+	_, err = m.db.ExecContext(ctx,
+		`INSERT INTO channel_members (channel_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)`,
+		channelID, userID, role, time.Now())
+	if isDup(err) {
+		return ErrConflict
+	}
+	return err
+}
+
+func (m *MySQL) RemoveChannelMember(ctx context.Context, channelID, userID int64) error {
+	var scope ChannelScope
+	if err := m.db.QueryRowContext(ctx, `SELECT scope FROM channels WHERE id = ?`, channelID).Scan(&scope); err != nil {
+		if err == sql.ErrNoRows {
+			return ErrNotFound
+		}
+		return err
+	}
+	if scope != ChannelScopeGroup {
+		return ErrForbidden
+	}
+	res, err := m.db.ExecContext(ctx,
+		`DELETE FROM channel_members WHERE channel_id = ? AND user_id = ?`, channelID, userID)
+	if err != nil {
+		return err
+	}
+	return checkAffected(res)
 }
 
 // ---- categories（v0.1.2 迁移 0003） ----
@@ -780,6 +1032,16 @@ func (m *MySQL) DeleteCategoryWithChannels(ctx context.Context, id int64) error 
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// 提及没有外键，必须先于 messages 删除（#39）。
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM message_mentions WHERE message_id IN (
+		   SELECT id FROM messages WHERE channel_id IN (
+		     SELECT id FROM channels WHERE category_id = ?
+		     UNION
+		     SELECT id FROM channels WHERE parent_id IN (SELECT id FROM channels WHERE category_id = ?)
+		   ))`, id, id); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM messages WHERE channel_id IN (
 		   SELECT id FROM channels WHERE category_id = ?
@@ -900,28 +1162,48 @@ func (m *MySQL) ReorderCategories(ctx context.Context, serverID, id int64, posit
 
 // ---- messages ----
 
+// CreateMessage 同一事务写消息、@提及（#39）并认领附件（#41）：nonce 撞唯一索引
+// 或附件认领失败时整体回滚，不会留下半条 message_mentions / 半认领的附件。
+// 空 nonce 落 NULL，唯一索引上不受约束。
 func (m *MySQL) CreateMessage(ctx context.Context, msg *Message) error {
 	msg.ID = newID(msg.ID)
-	// 空 nonce 落 NULL：唯一索引 (channel_id, user_id, nonce) 上 '' 会互相撞，NULL 不受约束。
+	claimIDs, err := normalizeClaimIDs(msg.AttachmentIDs)
+	if err != nil {
+		return err
+	}
 	var nonce any
 	if msg.Nonce != "" {
 		nonce = msg.Nonce
 	}
-	_, err := m.db.ExecContext(ctx,
-		`INSERT INTO messages (id, channel_id, user_id, content, nonce) VALUES (?, ?, ?, ?, ?)`,
-		msg.ID, msg.ChannelID, msg.UserID, msg.Content, nonce)
+	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO messages (id, channel_id, user_id, content, nonce, reply_to) VALUES (?, ?, ?, ?, ?, ?)`,
+		msg.ID, msg.ChannelID, msg.UserID, msg.Content, nonce, msg.ReplyTo); err != nil {
 		if isDup(err) {
 			return ErrConflict
 		}
 		return err
 	}
-	return m.db.QueryRowContext(ctx, `SELECT created_at FROM messages WHERE id = ?`, msg.ID).
-		Scan(&msg.CreatedAt)
+	if err := insertMessageMentions(ctx, tx, msg.ID, normalizeMentions(msg.Mentions)); err != nil {
+		return err
+	}
+	if err := claimAttachments(ctx, tx, msg.ID, msg.UserID, claimIDs); err != nil {
+		return err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT created_at FROM messages WHERE id = ?`, msg.ID).
+		Scan(&msg.CreatedAt); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // messageCols 列清单（nonce 经 COALESCE 归一空串，免 sql.NullString）。
-const messageCols = `m.id, m.channel_id, m.user_id, m.content, COALESCE(m.nonce, ''), m.created_at`
+const messageCols = `m.id, m.channel_id, m.user_id, m.content, COALESCE(m.nonce, ''), m.created_at,
+	m.edited_at, m.deleted_at, m.reply_to`
 
 func (m *MySQL) MessagesBefore(ctx context.Context, channelID, beforeID int64, limit int) ([]Message, error) {
 	if limit <= 0 || limit > 50 {
@@ -947,12 +1229,11 @@ func (m *MySQL) MessagesBefore(ctx context.Context, channelID, beforeID int64, l
 	// 倒序收集后反转为正序（旧→新）。
 	rev := []Message{}
 	for rows.Next() {
-		var msg Message
-		if err := rows.Scan(&msg.ID, &msg.ChannelID, &msg.UserID, &msg.Content, &msg.Nonce, &msg.CreatedAt,
-			&msg.SenderNickname, &msg.SenderTag); err != nil {
+		msg, err := scanMessage(rows, true)
+		if err != nil {
 			return nil, err
 		}
-		rev = append(rev, msg)
+		rev = append(rev, *msg)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -988,12 +1269,11 @@ func (m *MySQL) MessagesAfter(ctx context.Context, channelID, afterID int64, lim
 	defer rows.Close()
 	out := []Message{}
 	for rows.Next() {
-		var msg Message
-		if err := rows.Scan(&msg.ID, &msg.ChannelID, &msg.UserID, &msg.Content, &msg.Nonce, &msg.CreatedAt,
-			&msg.SenderNickname, &msg.SenderTag); err != nil {
+		msg, err := scanMessage(rows, true)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, msg)
+		out = append(out, *msg)
 	}
 	return out, rows.Err()
 }
@@ -1004,16 +1284,318 @@ func (m *MySQL) MessageByNonce(ctx context.Context, channelID, userID int64, non
 		`SELECT `+messageCols+`, u.nickname, u.tag
 		 FROM messages m JOIN users u ON u.id = m.user_id
 		 WHERE m.channel_id = ? AND m.user_id = ? AND m.nonce = ?`, channelID, userID, nonce)
-	var msg Message
-	err := row.Scan(&msg.ID, &msg.ChannelID, &msg.UserID, &msg.Content, &msg.Nonce, &msg.CreatedAt,
-		&msg.SenderNickname, &msg.SenderTag)
+	msg, err := scanMessage(row, true)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
-	return &msg, nil
+	return msg, nil
+}
+
+// MessageByID 单条回读（#39，含软删行；发送者内联）。
+func (m *MySQL) MessageByID(ctx context.Context, id int64) (*Message, error) {
+	row := m.db.QueryRowContext(ctx,
+		`SELECT `+messageCols+`, u.nickname, u.tag
+		 FROM messages m JOIN users u ON u.id = m.user_id
+		 WHERE m.id = ?`, id)
+	msg, err := scanMessage(row, true)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return msg, nil
+}
+
+// MessagesByIDs 批量回读（#39 回复预览）：一条 IN 查询，含软删行；不存在的 id 不出现。
+func (m *MySQL) MessagesByIDs(ctx context.Context, ids []int64) (map[int64]*Message, error) {
+	out := map[int64]*Message{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := m.db.QueryContext(ctx,
+		`SELECT `+messageCols+`, u.nickname, u.tag
+		 FROM messages m JOIN users u ON u.id = m.user_id
+		 WHERE m.id IN (`+placeholders(len(ids))+`)`, int64Args(ids)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		msg, err := scanMessage(rows, true)
+		if err != nil {
+			return nil, err
+		}
+		out[msg.ID] = msg
+	}
+	return out, rows.Err()
+}
+
+// MentionsOfMessages 批量查询提及用户（#39），组内按 user_id 升序；
+// 没有提及的消息不出现，空入参不发 SQL。
+func (m *MySQL) MentionsOfMessages(ctx context.Context, ids []int64) (map[int64][]int64, error) {
+	out := map[int64][]int64{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := m.db.QueryContext(ctx,
+		`SELECT message_id, user_id FROM message_mentions
+		 WHERE message_id IN (`+placeholders(len(ids))+`)
+		 ORDER BY message_id, user_id`, int64Args(ids)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var mid, uid int64
+		if err := rows.Scan(&mid, &uid); err != nil {
+			return nil, err
+		}
+		out[mid] = append(out[mid], uid)
+	}
+	return out, rows.Err()
+}
+
+// UpdateMessageContent 同一事务更新正文与编辑时间并整体替换提及（#39）。
+// 软删行与不存在的 id 一律 ErrNotFound：墓碑不可再编辑。
+func (m *MySQL) UpdateMessageContent(ctx context.Context, id int64, content string, mentions []int64, editedAt time.Time) error {
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx,
+		`UPDATE messages SET content = ?, edited_at = ? WHERE id = ? AND deleted_at IS NULL`,
+		content, editedAt, id)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		// MySQL 未开 clientFoundRows：值全同也报 0 行。行存在即成功（与 Mem 对齐），
+		// 不存在或已软删才 ErrNotFound。
+		var one int
+		err := tx.QueryRowContext(ctx,
+			`SELECT 1 FROM messages WHERE id = ? AND deleted_at IS NULL`, id).Scan(&one)
+		if err == sql.ErrNoRows {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM message_mentions WHERE message_id = ?`, id); err != nil {
+		return err
+	}
+	if err := insertMessageMentions(ctx, tx, id, normalizeMentions(mentions)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// SoftDeleteMessage 软删（#39）：置 deleted_at、清空正文，行保留供回复引用。
+// 单条 UPDATE 自身原子；deleted_at IS NULL 条件让重复删除返回 ErrNotFound。
+func (m *MySQL) SoftDeleteMessage(ctx context.Context, id int64, deletedAt time.Time) error {
+	res, err := m.db.ExecContext(ctx,
+		`UPDATE messages SET deleted_at = ?, content = '' WHERE id = ? AND deleted_at IS NULL`,
+		deletedAt, id)
+	if err != nil {
+		return err
+	}
+	return checkAffected(res)
+}
+
+// ---- attachments（迁移 0015，#41 B1） ----
+
+// CreateAttachment 写附件元数据；ID 未预置时取 Snowflake，created_at 回读数据库默认值。
+func (m *MySQL) CreateAttachment(ctx context.Context, a *Attachment) error {
+	if err := prepareAttachment(a); err != nil {
+		return err
+	}
+	a.ID = newID(a.ID)
+	var messageID any
+	if a.MessageID != 0 {
+		messageID = a.MessageID
+	}
+	if _, err := m.db.ExecContext(ctx, attachmentInsertSQL,
+		a.ID, a.UploaderID, messageID, a.Filename, a.ContentType, a.Size,
+		a.Width, a.Height, a.StorageKey, a.ThumbKey, a.AccessKey, a.SHA256); err != nil {
+		if isDup(err) {
+			return ErrConflict
+		}
+		return err
+	}
+	return m.db.QueryRowContext(ctx,
+		`SELECT created_at FROM attachments WHERE id = ?`, a.ID).Scan(&a.CreatedAt)
+}
+
+// AttachmentByID 无命中 ErrNotFound。
+func (m *MySQL) AttachmentByID(ctx context.Context, id int64) (*Attachment, error) {
+	a, err := scanAttachment(m.db.QueryRowContext(ctx,
+		`SELECT `+attachmentCols+` FROM attachments WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
+// AttachmentByAccessKey 按下载能力凭证查找；无命中 ErrNotFound。
+func (m *MySQL) AttachmentByAccessKey(ctx context.Context, accessKey string) (*Attachment, error) {
+	a, err := scanAttachment(m.db.QueryRowContext(ctx,
+		`SELECT `+attachmentCols+` FROM attachments WHERE access_key = ?`, accessKey))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
+// AttachmentsByMessageIDs 批量分组，组内按 id 升序；未认领与不存在的消息不出现。
+func (m *MySQL) AttachmentsByMessageIDs(ctx context.Context, messageIDs []int64) (map[int64][]Attachment, error) {
+	out := make(map[int64][]Attachment, len(messageIDs))
+	if len(messageIDs) == 0 {
+		return out, nil
+	}
+	rows, err := m.db.QueryContext(ctx,
+		`SELECT `+attachmentCols+` FROM attachments
+		  WHERE message_id IN (`+placeholders(len(messageIDs))+`) ORDER BY id ASC`,
+		int64Args(messageIDs)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		a, err := scanAttachment(rows)
+		if err != nil {
+			return nil, err
+		}
+		out[a.MessageID] = append(out[a.MessageID], *a)
+	}
+	return out, rows.Err()
+}
+
+// OrphanAttachments 见 Store 接口；三类孤儿由共用 SQL 一次查出。
+func (m *MySQL) OrphanAttachments(ctx context.Context, unclaimedBefore time.Time, limit int) ([]Attachment, error) {
+	return queryOrphanAttachments(ctx, m.db, unclaimedBefore, limit)
+}
+
+// DeleteAttachmentRows 批量删除元数据行；不存在的 id 忽略，空入参 no-op。
+func (m *MySQL) DeleteAttachmentRows(ctx context.Context, ids []int64) error {
+	return deleteAttachmentRowsByIDs(ctx, m.db, ids)
+}
+
+// ---- read_states（迁移 0014，#40 B1） ----
+
+// ReadState 返回该用户在该频道的已读水位；无记录 ErrNotFound。
+func (m *MySQL) ReadState(ctx context.Context, userID, channelID int64) (int64, error) {
+	var last int64
+	err := m.db.QueryRowContext(ctx,
+		`SELECT last_read_message_id FROM read_states WHERE user_id = ? AND channel_id = ?`,
+		userID, channelID).Scan(&last)
+	if err == sql.ErrNoRows {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, err
+	}
+	return last, nil
+}
+
+// SetReadState 原子 upsert 并取 max：多设备乱序上报不会把水位拉回去。
+func (m *MySQL) SetReadState(ctx context.Context, userID, channelID, messageID int64) error {
+	_, err := m.db.ExecContext(ctx,
+		`INSERT INTO read_states (user_id, channel_id, last_read_message_id) VALUES (?, ?, ?)
+		 ON DUPLICATE KEY UPDATE
+		     last_read_message_id = GREATEST(read_states.last_read_message_id, VALUES(last_read_message_id))`,
+		userID, channelID, messageID)
+	return err
+}
+
+// EnsureReadState 仅补缺失行；已有水位绝不覆盖。
+func (m *MySQL) EnsureReadState(ctx context.Context, userID, channelID, messageID int64) error {
+	_, err := m.db.ExecContext(ctx,
+		`INSERT IGNORE INTO read_states (user_id, channel_id, last_read_message_id) VALUES (?, ?, ?)`,
+		userID, channelID, messageID)
+	return err
+}
+
+// UnreadCounts 一条查询统计单用户在多个频道的未读/提及数；请求项全部出现在
+// 结果里（无消息或已读完为 0）。参数顺序：频道 id 列表 → userID 三次（水位
+// 关联、排除本人、提及关联）。
+func (m *MySQL) UnreadCounts(ctx context.Context, userID int64, channelIDs []int64) (map[int64]Unread, error) {
+	out := map[int64]Unread{}
+	if len(channelIDs) == 0 {
+		return out, nil
+	}
+	args := append(int64Args(channelIDs), userID, userID, userID)
+	rows, err := m.db.QueryContext(ctx,
+		`SELECT t.channel_id, COUNT(msg.id), COUNT(mm.message_id)
+		   FROM `+derivedUnion("channel_id", len(channelIDs))+` t
+		   LEFT JOIN read_states rs ON rs.channel_id = t.channel_id AND rs.user_id = ?
+		   LEFT JOIN messages msg ON msg.channel_id = t.channel_id
+		        AND msg.id > COALESCE(rs.last_read_message_id, 0)
+		        AND msg.user_id <> ?
+		        AND msg.deleted_at IS NULL
+		   LEFT JOIN message_mentions mm ON mm.message_id = msg.id AND mm.user_id = ?
+		  GROUP BY t.channel_id`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var channelID int64
+		var u Unread
+		if err := rows.Scan(&channelID, &u.UnreadCount, &u.MentionCount); err != nil {
+			return nil, err
+		}
+		out[channelID] = u
+	}
+	return out, rows.Err()
+}
+
+// UnreadCountsForUsers 一条查询统计某频道内多个用户的未读/提及数；没有
+// read_states 行的用户按水位 0 计（其全部历史消息都算未读）。
+// 参数顺序：用户 id 列表 → channelID 两次（水位关联、消息过滤）。
+func (m *MySQL) UnreadCountsForUsers(ctx context.Context, channelID int64, userIDs []int64) (map[int64]Unread, error) {
+	out := map[int64]Unread{}
+	if len(userIDs) == 0 {
+		return out, nil
+	}
+	args := append(int64Args(userIDs), channelID, channelID)
+	rows, err := m.db.QueryContext(ctx,
+		`SELECT t.user_id, COUNT(msg.id), COUNT(mm.message_id)
+		   FROM `+derivedUnion("user_id", len(userIDs))+` t
+		   LEFT JOIN read_states rs ON rs.user_id = t.user_id AND rs.channel_id = ?
+		   LEFT JOIN messages msg ON msg.channel_id = ?
+		        AND msg.id > COALESCE(rs.last_read_message_id, 0)
+		        AND msg.user_id <> t.user_id
+		        AND msg.deleted_at IS NULL
+		   LEFT JOIN message_mentions mm ON mm.message_id = msg.id AND mm.user_id = t.user_id
+		  GROUP BY t.user_id`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var userID int64
+		var u Unread
+		if err := rows.Scan(&userID, &u.UnreadCount, &u.MentionCount); err != nil {
+			return nil, err
+		}
+		out[userID] = u
+	}
+	return out, rows.Err()
 }
 
 // ---- invites ----
