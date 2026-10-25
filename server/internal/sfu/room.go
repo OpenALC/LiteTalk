@@ -447,6 +447,8 @@ func (r *Room) tickSpeak(onSpeak OnSpeakingFn) {
 //     被吞音——旧实现的门控在几乎每场日常通话里都生效。
 //
 // 其余房间只放行最响的 N 路；无电平源（v1 客户端/未协商扩展）不受门控，恒转发。
+// 帧长无关（#46）：电平按 RTP 包更新，10ms 包只是让 effLvl 刷新更频繁，
+// 活跃门的排序周期与保持窗口都是时间量，不随 50/100pps 改变语义。
 func (r *Room) tickActive() {
 	peers := r.snapPeers()
 	if len(peers) == 0 {

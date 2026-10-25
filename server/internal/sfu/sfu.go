@@ -74,9 +74,9 @@ func audioLevelExtID(exts []webrtc.RTPHeaderExtensionParameter) uint8 {
 	return 0
 }
 
-// speakingTick 说话翻转判定的采样周期。贴 Opus 帧周期（48kHz/960 样本 = 20ms，
-// 上行 50pps）：判定粒度即一帧，比它更快看不到新样本，比它更慢只加指示延迟。
-// 起判 1 拍 ⇒ 「电平到达服务端 → 翻转下发」worst case ≈ 1×20ms + 广播，
+// speakingTick 说话翻转判定的采样周期。上行 Opus 帧长可为 10ms 或 20ms
+// （#46，50/100pps），本周期不绑定帧长：10ms 包只让电平样本更新更频繁，
+// 按 20ms 采样仍足以判定翻转（起判 1 拍 ⇒ 最坏 ≈ 20ms + 广播）。
 // 不高于客户端现状（dsp EnterFrames=3=30ms）。
 const speakingTick = 20 * time.Millisecond
 
