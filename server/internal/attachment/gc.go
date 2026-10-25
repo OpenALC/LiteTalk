@@ -111,7 +111,7 @@ func (g *GC) sweep(ctx context.Context) {
 }
 
 // deleteBlobs 删一个附件的全部对象。任一对象删除失败即停止并返回 false，
-// 避免部分对象先没、行却因后续失败留下的半清理状态（重试仍幂等）。
+// 行保留到下一轮；此前已删的对象下轮重复删除是幂等的（不存在视为成功）。
 func (g *GC) deleteBlobs(ctx context.Context, a *store.Attachment, lg *log.Logger) (deleted int, ok bool) {
 	for _, key := range []string{a.StorageKey, a.ThumbKey} {
 		if key == "" {

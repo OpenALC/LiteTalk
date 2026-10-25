@@ -354,6 +354,16 @@ func runAttachmentsContract(t *testing.T, st Store) {
 	})
 }
 
+// TestClampAttachmentLimit 孤儿查询的 limit 夹取边界（含 500 上限）。
+func TestClampAttachmentLimit(t *testing.T) {
+	cases := map[int]int{-100: 1, -1: 1, 0: 1, 1: 1, 200: 200, 500: 500, 501: 500, 10000: 500}
+	for in, want := range cases {
+		if got := clampAttachmentLimit(in); got != want {
+			t.Fatalf("clampAttachmentLimit(%d) = %d，期望 %d", in, got, want)
+		}
+	}
+}
+
 // backdateAttachment 把附件 created_at 改到过去。Store 没有修改该字段的公开入口，
 // 测试按实现类型直接回填（Mem 改内存，SQL 执行 UPDATE）。
 func backdateAttachment(t *testing.T, st Store, id int64, at time.Time) {
