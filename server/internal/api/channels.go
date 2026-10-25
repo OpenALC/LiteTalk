@@ -222,6 +222,7 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 	}
 	// #46 音质三态：缺省不改、0 = 清零（跟随设置/默认帧长）、null 拒 400。
 	// 校验用上方定稿的频道类型：同一次 PATCH 改成 text 时非零音质会被拒。
+	audioChanged := req.AudioBitrateKbps.Set || req.AudioFrameMs.Set
 	if req.AudioBitrateKbps.Set {
 		if req.AudioBitrateKbps.Clearing() {
 			return nil, errf(http.StatusBadRequest, "bad_channel_option", "audio_bitrate_kbps 不可清除，0 表示不限制")
@@ -288,6 +289,18 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 		TargetType: "channel", TargetID: ptrID(ch.ID), ChannelID: ptrID(ch.ID),
 		Detail: auditDetail(detail),
 	})
+	// #46 音质变更通知：仅语音频道、且本次确实改了音质字段时广播。收件人按
+	// ViewChannel 可见性过滤（与消息事件同口径）；广播失败只记日志——PATCH
+	// 已经落库，不能因附属通知把成功改成 500。
+	if audioChanged && ch.Type == store.ChannelVoice && s.hub != nil {
+		recipients, e := s.messageRecipients(ctx, ch)
+		if e != nil {
+			s.log.Printf("channel.audio 收件人查询失败（频道 %d）: %v", ch.ID, e)
+		} else {
+			s.hub.BroadcastChannelAudio(recipients, strconv.FormatInt(ch.ID, 10),
+				ch.AudioBitrateKbps, ch.AudioFrameMS)
+		}
+	}
 	return PatchChannel200JSONResponse(channelView(ch)), nil
 }
 

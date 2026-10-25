@@ -16,6 +16,7 @@ const (
 
 // 信令消息类型（wire 值见 api/signal/messages/*.schema.json 的 x-wire-type）。
 const (
+	TypeChannelAudio          = "channel.audio"           // S→C · since 2
 	TypeChannelJoin           = "channel.join"            // C→S
 	TypeChannelJoined         = "channel.joined"          // S→C
 	TypeChannelLeave          = "channel.leave"           // C→S
@@ -126,6 +127,13 @@ type UserBrief struct {
 	Nickname string `json:"nickname"`
 }
 
+// ChannelAudioData 语音频道音质配置变更（#46）。管理员修改码率上限/帧长后，向该频道可见的成员下发（含当前在房客户端）；客户端只在事件频道等于当前房间时热应用，0 表示跟随用户设置/默认 20ms。
+type ChannelAudioData struct {
+	ChannelID        string `json:"channel_id"`
+	AudioBitrateKbps int64  `json:"audio_bitrate_kbps"`
+	AudioFrameMs     int64  `json:"audio_frame_ms"`
+}
+
 // ChannelJoinData 加入语音频道。
 type ChannelJoinData struct {
 	ChannelID string `json:"channel_id"`
@@ -134,9 +142,11 @@ type ChannelJoinData struct {
 
 // ChannelJoinedData 房间成员全量。成员变化时向房间内每个成员重发全量（Self 为接收者本人的快照）。
 type ChannelJoinedData struct {
-	ChannelID string       `json:"channel_id"`
-	Members   []MemberInfo `json:"members"`
-	Self      MemberInfo   `json:"self"`
+	ChannelID        string       `json:"channel_id"`
+	Members          []MemberInfo `json:"members"`
+	Self             MemberInfo   `json:"self"`
+	AudioBitrateKbps *int64       `json:"audio_bitrate_kbps,omitempty"` // 语音频道码率上限 kbps（#46，协议 v2）；0 = 跟随客户端用户设置。旧服务端/开发内置房间缺省。
+	AudioFrameMs     *int64       `json:"audio_frame_ms,omitempty"`     // 语音频道 Opus 帧长毫秒（#46，协议 v2）；0 = 默认 20ms。旧服务端/开发内置房间缺省。
 }
 
 // ChannelLeaveData 离开频道。载荷与 channel.join 同形；服务端以连接当前所在房间为准，channel_id 仅作回显。

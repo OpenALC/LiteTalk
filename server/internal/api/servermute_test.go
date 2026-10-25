@@ -26,6 +26,15 @@ type fakeHub struct {
 	convEvents []convEvent
 	msgEvents  []msgEvent
 	unreads    []unreadEvent
+	audios     []audioEvent
+}
+
+// audioEvent 一次 channel.audio 广播的断言快照（#46）。
+type audioEvent struct {
+	uids      []string
+	channelID string
+	bitrate   int
+	frameMS   int
 }
 
 // unreadEvent 一次 channel.unread 广播的断言快照（#40）。
@@ -134,6 +143,24 @@ func (f *fakeHub) unreadLog() []unreadEvent {
 		out = append(out, unreadEvent{channelID: ev.channelID, counts: cp})
 	}
 	return out
+}
+
+func (f *fakeHub) BroadcastChannelAudio(uids []string, channelID string, bitrateKbps, frameMS int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.audios = append(f.audios, audioEvent{
+		uids:      append([]string(nil), uids...),
+		channelID: channelID,
+		bitrate:   bitrateKbps,
+		frameMS:   frameMS,
+	})
+}
+
+// audioLog 全部 channel.audio 广播的快照。
+func (f *fakeHub) audioLog() []audioEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]audioEvent(nil), f.audios...)
 }
 
 func (f *fakeHub) Kick(uid, dev, reason string) {}

@@ -1045,11 +1045,20 @@ func (h *Hub) joinRoom(c *client, channelID, password string) {
 		all[i].Online = h.presenceOnline(all[i].UserID)
 		byUID[all[i].UserID] = all[i]
 	}
+	// #46 音质配置：语音频道随 joined 下发权威值（0 = 跟随设置/默认 20ms）。
+	// dev 内置房间没有 store 实体（ch == nil），字段缺省，客户端按默认处理。
+	var audioBitrate, audioFrame *int64
+	if ch != nil {
+		b, f := int64(ch.AudioBitrateKbps), int64(ch.AudioFrameMS)
+		audioBitrate, audioFrame = &b, &f
+	}
 	for _, m := range members {
 		h.sendJSON(m, TypeChannelJoined, ChannelJoinedData{
-			ChannelID: channelID,
-			Members:   all,
-			Self:      byUID[m.userID],
+			ChannelID:        channelID,
+			Members:          all,
+			Self:             byUID[m.userID],
+			AudioBitrateKbps: audioBitrate,
+			AudioFrameMs:     audioFrame,
 		})
 	}
 	// 好友频道 presence（#92）：登记完成才是状态变化点。中途 leaveWork 不单独推，

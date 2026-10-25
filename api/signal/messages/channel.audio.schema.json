@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litetalk:signal:channel.audio",
+  "title": "ChannelAudioData",
+  "x-wire-type": "channel.audio",
+  "x-go-const": "TypeChannelAudio",
+  "x-direction": "S2C",
+  "x-since": 2,
+  "x-namespace": "event",
+  "description": "语音频道音质配置变更（#46）。管理员修改码率上限/帧长后，向该频道可见的成员下发（含当前在房客户端）；客户端只在事件频道等于当前房间时热应用，0 表示跟随用户设置/默认 20ms。",
+  "type": "object",
+  "properties": {
+    "channel_id": { "type": "string" },
+    "audio_bitrate_kbps": { "type": "integer", "minimum": 0, "maximum": 128 },
+    "audio_frame_ms": { "type": "integer", "minimum": 0, "maximum": 20 }
+  },
+  "required": ["channel_id", "audio_bitrate_kbps", "audio_frame_ms"],
+  "additionalProperties": false
+}

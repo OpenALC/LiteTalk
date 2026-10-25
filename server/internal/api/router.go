@@ -44,6 +44,9 @@ type Hub interface {
 	// BroadcastChannelUnread 未读计数变更（#40）：counts 按十进制 uid 给每个
 	// 接收者自己的精确计数，只推给该用户（不进其他人的事件环）。空 map 不广播。
 	BroadcastChannelUnread(channelID string, counts map[string]store.Unread)
+	// BroadcastChannelAudio 语音频道音质变更（#46）：uids 为十进制用户 ID
+	//（调用方已按频道 ViewChannel 可见性过滤）；0 表示跟随设置/默认帧长。
+	BroadcastChannelAudio(uids []string, channelID string, bitrateKbps, frameMS int)
 }
 
 // PresenceReader 在线状态读取（#11）：presence:{uid} 存在 = 在线。

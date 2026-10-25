@@ -428,3 +428,42 @@ func TestChannelAudioOptions(t *testing.T) {
 	doJSON(t, rt, http.MethodPatch, fmt.Sprintf("/api/v1/channels/%d", chID), w.stranger,
 		map[string]any{"audio_bitrate_kbps": 16}, http.StatusForbidden)
 }
+
+// TestChannelAudioBroadcast 音质 PATCH 成功后广播 channel.audio（#46）：
+// 只改音质才发；text 频道与仅改名不发。
+func TestChannelAudioBroadcast(t *testing.T) {
+	w := newChannelOptsWorld(t)
+	rt := w.h
+	voice := w.createCh(t, map[string]any{"name": "音质广播", "type": "voice"})
+	voiceID := asID(voice["id"])
+	voicePath := fmt.Sprintf("/api/v1/channels/%d", voiceID)
+
+	doJSON(t, rt, http.MethodPatch, voicePath, w.owner,
+		map[string]any{"audio_bitrate_kbps": 32, "audio_frame_ms": 10}, http.StatusOK)
+	events := w.hub.audioLog()
+	if len(events) != 1 {
+		t.Fatalf("应广播一次 channel.audio，实际 %d: %+v", len(events), events)
+	}
+	ev := events[0]
+	if ev.channelID != fmt.Sprint(voiceID) || ev.bitrate != 32 || ev.frameMS != 10 {
+		t.Fatalf("广播载荷不符: %+v", ev)
+	}
+	if len(ev.uids) == 0 {
+		t.Fatalf("广播收件人不应为空: %+v", ev)
+	}
+
+	// 仅改名不广播。
+	doJSON(t, rt, http.MethodPatch, voicePath, w.owner,
+		map[string]any{"name": "改名"}, http.StatusOK)
+	if got := len(w.hub.audioLog()); got != 1 {
+		t.Fatalf("仅改名不应广播，实际累计 %d", got)
+	}
+
+	// text 频道设置音质（显式 0）不广播。
+	text := w.createCh(t, map[string]any{"name": "文字", "type": "text"})
+	doJSON(t, rt, http.MethodPatch, fmt.Sprintf("/api/v1/channels/%d", asID(text["id"])), w.owner,
+		map[string]any{"audio_bitrate_kbps": 0}, http.StatusOK)
+	if got := len(w.hub.audioLog()); got != 1 {
+		t.Fatalf("text 频道不应广播 channel.audio，实际累计 %d", got)
+	}
+}
