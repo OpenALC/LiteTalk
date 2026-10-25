@@ -1192,6 +1192,42 @@ func (m *Mem) AttachmentsByMessageIDs(_ context.Context, messageIDs []int64) (ma
 	return out, nil
 }
 
+// OrphanAttachments 见 Store 接口；与 SQL 实现同口径：未认领超期、消息行不存在、
+// 消息已软删。Map 遍历无序，排序后再截断。
+func (m *Mem) OrphanAttachments(_ context.Context, unclaimedBefore time.Time, limit int) ([]Attachment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	limit = clampAttachmentLimit(limit)
+	out := make([]Attachment, 0, limit)
+	for _, a := range m.attachments {
+		var orphan bool
+		if a.MessageID == 0 {
+			orphan = a.CreatedAt.Before(unclaimedBefore)
+		} else {
+			msg, ok := m.messages[a.MessageID]
+			orphan = !ok || msg.DeletedAt != nil
+		}
+		if orphan {
+			out = append(out, *a)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// DeleteAttachmentRows 批量删除元数据行；不存在的 id 忽略，空入参 no-op。
+func (m *Mem) DeleteAttachmentRows(_ context.Context, ids []int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, id := range ids {
+		delete(m.attachments, id)
+	}
+	return nil
+}
+
 // ---- read_states（迁移 0014，#40 B1） ----
 
 // ReadState 返回该用户在该频道的已读水位；无记录 ErrNotFound。

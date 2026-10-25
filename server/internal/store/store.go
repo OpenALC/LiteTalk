@@ -437,6 +437,13 @@ type Store interface {
 	// AttachmentsByMessageIDs 批量按消息分组，组内按 id 升序；未认领附件与不存在的
 	// 消息不出现（与 MentionsOfMessages 同口径），空入参返回空 map。
 	AttachmentsByMessageIDs(ctx context.Context, messageIDs []int64) (map[int64][]Attachment, error)
+	// OrphanAttachments 返回可回收附件（#41 生命周期回收）：未认领且 created_at 早于
+	// unclaimedBefore；或 message_id 非空但消息行已不存在（频道/分类/服务器/会话硬删）；
+	// 或消息已软删。按 id 升序，limit 夹到 [1, MaxAttachmentBatch]。
+	OrphanAttachments(ctx context.Context, unclaimedBefore time.Time, limit int) ([]Attachment, error)
+	// DeleteAttachmentRows 批量删除附件元数据行；空入参 no-op，不存在的 id 忽略。
+	// 调用方（后台 GC）必须先删 blob 再删行，避免删行后对象无法定位。
+	DeleteAttachmentRows(ctx context.Context, ids []int64) error
 
 	// read_states（迁移 0014，#40 B1）：每用户每频道一条「最后已读消息 id」水位。
 	// 未读 = 频道中 id 大于水位、非本人、未软删的消息；提及 = 其中提及该用户的条数。

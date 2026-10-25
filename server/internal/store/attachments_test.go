@@ -265,6 +265,121 @@ func runAttachmentsContract(t *testing.T, st Store) {
 			}
 		}
 	})
+
+	t.Run("孤儿查询与批量删除", func(t *testing.T) {
+		// 阈值取一小时前：之前子用例刚创建的未认领附件都不算超期，
+		// 只有显式回填过 created_at 的旧行才算，候选集合可控。
+		threshold := time.Now().Add(-time.Hour)
+		oldUnclaimed := mustCreateAttachment(t, st, newTestAttachment(owner.ID))
+		backdateAttachment(t, st, oldUnclaimed.ID, time.Now().Add(-2*time.Hour))
+		freshUnclaimed := mustCreateAttachment(t, st, newTestAttachment(owner.ID))
+
+		normal := mustCreateAttachment(t, st, newTestAttachment(owner.ID))
+		normalMsg := &Message{ChannelID: ch.ID, UserID: owner.ID, Content: "正常附件", AttachmentIDs: []int64{normal.ID}}
+		if err := st.CreateMessage(ctx, normalMsg); err != nil {
+			t.Fatalf("CreateMessage(normal): %v", err)
+		}
+
+		soft := mustCreateAttachment(t, st, newTestAttachment(owner.ID))
+		softMsg := &Message{ChannelID: ch.ID, UserID: owner.ID, Content: "待软删附件", AttachmentIDs: []int64{soft.ID}}
+		if err := st.CreateMessage(ctx, softMsg); err != nil {
+			t.Fatalf("CreateMessage(soft): %v", err)
+		}
+		if err := st.SoftDeleteMessage(ctx, softMsg.ID, time.Now()); err != nil {
+			t.Fatalf("SoftDeleteMessage: %v", err)
+		}
+
+		// 直接构造指向不存在消息的附件：硬删频道/服务器后就是这种残留形态。
+		missing := newTestAttachment(owner.ID)
+		missing.MessageID = 900000000 + attachmentSeq.Add(1)
+		mustCreateAttachment(t, st, missing)
+
+		got, err := st.OrphanAttachments(ctx, threshold, 500)
+		if err != nil {
+			t.Fatalf("OrphanAttachments: %v", err)
+		}
+		want := map[int64]bool{oldUnclaimed.ID: true, soft.ID: true, missing.ID: true}
+		for i, a := range got {
+			if i > 0 && got[i-1].ID >= a.ID {
+				t.Fatalf("结果应按 id 升序: %d, %d", got[i-1].ID, a.ID)
+			}
+			if !want[a.ID] {
+				t.Fatalf("出现不该回收的附件 %d（正常消息/未到期未认领/历史用例残留）", a.ID)
+			}
+			delete(want, a.ID)
+		}
+		if len(want) != 0 {
+			t.Fatalf("以下孤儿未返回: %v", want)
+		}
+		for _, id := range []int64{freshUnclaimed.ID, normal.ID} {
+			for _, a := range got {
+				if a.ID == id {
+					t.Fatalf("附件 %d 不应被回收", id)
+				}
+			}
+		}
+
+		// limit 夹取：0/负数夹到 1，超大值夹到 500（候选不足 500 时全量返回）。
+		one, err := st.OrphanAttachments(ctx, threshold, 0)
+		if err != nil || len(one) != 1 || one[0].ID != got[0].ID {
+			t.Fatalf("limit=0 应夹到 1 且取最小 id: %+v %v", one, err)
+		}
+		neg, err := st.OrphanAttachments(ctx, threshold, -5)
+		if err != nil || len(neg) != 1 || neg[0].ID != got[0].ID {
+			t.Fatalf("limit<0 应夹到 1: %+v %v", neg, err)
+		}
+		all, err := st.OrphanAttachments(ctx, threshold, 10000)
+		if err != nil || len(all) != len(got) {
+			t.Fatalf("limit 超上限应收敛到候选数: %d %v", len(all), err)
+		}
+
+		// 批量删行：命中的消失，未命中的保留；空入参/不存在 id 不报错。
+		if err := st.DeleteAttachmentRows(ctx, []int64{oldUnclaimed.ID, soft.ID}); err != nil {
+			t.Fatalf("DeleteAttachmentRows: %v", err)
+		}
+		for _, id := range []int64{oldUnclaimed.ID, soft.ID} {
+			if _, err := st.AttachmentByID(ctx, id); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("附件 %d 应已删除，实际 %v", id, err)
+			}
+		}
+		if _, err := st.AttachmentByID(ctx, missing.ID); err != nil {
+			t.Fatalf("未列入删除的附件应保留: %v", err)
+		}
+		if err := st.DeleteAttachmentRows(ctx, nil); err != nil {
+			t.Fatalf("空入参应 no-op: %v", err)
+		}
+		if err := st.DeleteAttachmentRows(ctx, []int64{missing.ID, 999999999}); err != nil {
+			t.Fatalf("不存在的 id 应忽略: %v", err)
+		}
+	})
+}
+
+// backdateAttachment 把附件 created_at 改到过去。Store 没有修改该字段的公开入口，
+// 测试按实现类型直接回填（Mem 改内存，SQL 执行 UPDATE）。
+func backdateAttachment(t *testing.T, st Store, id int64, at time.Time) {
+	t.Helper()
+	switch s := st.(type) {
+	case *Mem:
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		a, ok := s.attachments[id]
+		if !ok {
+			t.Fatalf("backdateAttachment: 附件 %d 不存在", id)
+		}
+		a.CreatedAt = at
+	case *SQLite:
+		if _, err := s.DB().ExecContext(context.Background(),
+			`UPDATE attachments SET created_at = ? WHERE id = ?`, at.UTC(), id); err != nil {
+			t.Fatalf("回填 SQLite created_at: %v", err)
+		}
+	case *MySQL:
+		if _, err := s.DB().ExecContext(context.Background(),
+			`UPDATE attachments SET created_at = ? WHERE id = ?`, at.UTC(), id); err != nil {
+			t.Fatalf("回填 MySQL created_at: %v", err)
+		}
+	default:
+		t.Fatalf("backdateAttachment: 未知 Store 类型 %T", st)
+	}
 }
 
 func TestAttachmentsContractMem(t *testing.T) {

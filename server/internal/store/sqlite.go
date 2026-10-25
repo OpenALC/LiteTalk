@@ -1455,6 +1455,16 @@ func (s *SQLite) AttachmentsByMessageIDs(ctx context.Context, messageIDs []int64
 	return out, rows.Err()
 }
 
+// OrphanAttachments 见 Store 接口；三类孤儿由共用 SQL 一次查出。
+func (s *SQLite) OrphanAttachments(ctx context.Context, unclaimedBefore time.Time, limit int) ([]Attachment, error) {
+	return queryOrphanAttachments(ctx, s.db, unclaimedBefore, limit)
+}
+
+// DeleteAttachmentRows 批量删除元数据行；不存在的 id 忽略，空入参 no-op。
+func (s *SQLite) DeleteAttachmentRows(ctx context.Context, ids []int64) error {
+	return deleteAttachmentRowsByIDs(ctx, s.db, ids)
+}
+
 // ---- read_states（迁移 0014，#40 B1） ----
 
 // ReadState 返回该用户在该频道的已读水位；无记录 ErrNotFound。
