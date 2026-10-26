@@ -1076,10 +1076,18 @@ func (h *Hub) joinRoom(c *client, channelID, password string) {
 		b, f := int64(ch.AudioBitrateKbps), int64(ch.AudioFrameMS)
 		audioBitrate, audioFrame = &b, &f
 	}
+	// #45：Members.Speaking 也按收件人收窄——非目标不能从入房快照里拿到
+	// 悄悄话说话者的 speaking=true，否则会误触发优先发言 ducking。
+	// 没有生效中的悄悄话时返回 nil，所有收件人共用同一份切片。
+	scopedMembers := h.scopeJoinedSpeaking(channelID, all, members)
 	for _, m := range members {
+		list := all
+		if scopedMembers != nil {
+			list = scopedMembers[m.userID]
+		}
 		h.sendJSON(m, TypeChannelJoined, ChannelJoinedData{
 			ChannelID:        channelID,
-			Members:          all,
+			Members:          list,
 			Self:             byUID[m.userID],
 			AudioBitrateKbps: audioBitrate,
 			AudioFrameMs:     audioFrame,
@@ -1403,6 +1411,40 @@ func (h *Hub) applyRoomWhisper(c *client, roomID string) {
 		return
 	}
 	h.log.Printf("ws: 频道 %s 成员 %s 悄悄话目标补应用 %d 人", roomID, c.userID, len(targets))
+}
+
+// scopeJoinedSpeaking 按收件人收窄 channel.joined 里的 Speaking（#45）：
+// 悄悄话说话者只对 targets + 本人显示为正在说话，非目标拿到 false，避免
+// 入房快照误触发优先发言 ducking。无生效中的悄悄话返回 nil（调用方复用原
+// 切片，不做额外分配）。内部自持 h.mu；不得反调 SFU。
+func (h *Hub) scopeJoinedSpeaking(channelID string, infos []MemberInfo, recipients []*client) map[string][]MemberInfo {
+	h.mu.Lock()
+	room := h.rooms[channelID]
+	if room == nil || len(room.whisper) == 0 {
+		h.mu.Unlock()
+		return nil
+	}
+	allowedBySpeaker := make(map[string]map[string]bool, len(room.whisper))
+	for uid := range room.whisper {
+		if a := speakingRecipientsLocked(room, uid); a != nil {
+			allowedBySpeaker[uid] = a
+		}
+	}
+	h.mu.Unlock()
+	if len(allowedBySpeaker) == 0 {
+		return nil
+	}
+	out := make(map[string][]MemberInfo, len(recipients))
+	for _, r := range recipients {
+		list := append([]MemberInfo(nil), infos...)
+		for i := range list {
+			if a, ok := allowedBySpeaker[list[i].UserID]; ok && !a[r.userID] {
+				list[i].Speaking = false
+			}
+		}
+		out[r.userID] = list
+	}
+	return out
 }
 
 // enrichMemberPriority 填充 MemberInfo.priority（#45）：authz 查询失败按 false，

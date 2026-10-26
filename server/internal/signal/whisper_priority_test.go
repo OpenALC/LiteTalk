@@ -270,6 +270,20 @@ func TestWhisperSpeakingScopedV2(t *testing.T) {
 	f.hub.sendJSON(f.hub.roomMember(vchID, "9"), "test.marker", nil)
 	recvUntilNo(t, m, "test.marker", TypeVoiceSpeaking)
 
+	// 非目标后来入房：channel.joined 的成员快照也不能带出悄悄话说话者的
+	// speaking=true（否则新入房客户端会误 duck）。
+	m.send(TypeChannelLeave, ChannelLeaveData{})
+	mj := joinAndCapture(t, m, vchID)
+	speakerSpeaking := false
+	for _, mm := range mj.Members {
+		if mm.UserID == "1" {
+			speakerSpeaking = mm.Speaking
+		}
+	}
+	if speakerSpeaking {
+		t.Fatalf("非目标入房快照不应看到悄悄话说话者 speaking=true: %+v", mj.Members)
+	}
+
 	// 取消悄悄话后 speaking 恢复全房广播：说话中途取消会先给非目标补一条
 	// true 纠正（范围切换），随后全房广播 false。
 	a.send(TypeVoiceWhisper, VoiceWhisperData{Targets: []string{}})
@@ -405,6 +419,63 @@ func TestWhisperSpeakingScopeTransition(t *testing.T) {
 	}
 	if on.UserID != "1" || !on.Speaking {
 		t.Fatalf("取消悄悄话后非目标应收 speaking=true，实际 %+v", on)
+	}
+}
+
+// TestJoinedSpeakingScopedToWhisperTargets channel.joined 快照按收件人收窄：
+// 目标与本人看到说话者的 speaking，非目标看到 false；无悄悄话时不复制切片。
+func TestJoinedSpeakingScopedToWhisperTargets(t *testing.T) {
+	mkClient := func(uid string, connID uint64) *client {
+		return &client{userID: uid, connID: connID}
+	}
+	room := &roomState{
+		id: "r",
+		members: map[string]*client{
+			"1": mkClient("1", 1),
+			"2": mkClient("2", 2),
+			"9": mkClient("9", 3),
+		},
+		whisper: map[string]whisperState{
+			"1": {connID: "1", active: true, targets: map[string]bool{"2": true}},
+		},
+	}
+	h := &Hub{rooms: map[string]*roomState{"r": room}}
+	infos := []MemberInfo{
+		{UserID: "1", Nickname: "a", Speaking: true},
+		{UserID: "2", Nickname: "b"},
+		{UserID: "9", Nickname: "c"},
+	}
+	recipients := []*client{room.members["1"], room.members["2"], room.members["9"]}
+	scoped := h.scopeJoinedSpeaking("r", infos, recipients)
+	if scoped == nil {
+		t.Fatal("有生效悄悄话时应返回按收件人收窄的副本")
+	}
+	speakerSpeaking := func(recipient string) bool {
+		for _, m := range scoped[recipient] {
+			if m.UserID == "1" {
+				return m.Speaking
+			}
+		}
+		t.Fatalf("收件人 %s 的快照缺说话者", recipient)
+		return false
+	}
+	if !speakerSpeaking("1") {
+		t.Fatal("本人应保持 speaking=true")
+	}
+	if !speakerSpeaking("2") {
+		t.Fatal("悄悄话目标应保持 speaking=true")
+	}
+	if speakerSpeaking("9") {
+		t.Fatal("非目标应看到 speaking=false")
+	}
+	// 原切片不得被改写（其他复用处仍保留真实状态）。
+	if !infos[0].Speaking {
+		t.Fatal("scopeJoinedSpeaking 不得原地修改原切片")
+	}
+	// 无生效悄悄话：返回 nil，调用方复用原切片。
+	room.whisper = nil
+	if got := h.scopeJoinedSpeaking("r", infos, recipients); got != nil {
+		t.Fatalf("无悄悄话时应返回 nil，实际 %+v", got)
 	}
 }
 
