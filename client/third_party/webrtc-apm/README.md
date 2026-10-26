@@ -110,9 +110,11 @@ cpp_link_args = ['-static-libgcc', '-static-libstdc++']
 ```
 
 ```bash
-meson setup build --cross-file=mingw-native.ini
+meson setup build --native-file=mingw-native.ini
 meson compile -C build
 ```
+
+Windows 上 mingw 是原生工具链，用 `--native-file`（不是 `--cross-file`）。
 
 Linux 用本机 g++；arm64 用 `aarch64-cross.ini`（`system='linux'`、
 `cpu_family='aarch64'`，编译器换成 `aarch64-linux-gnu-{gcc,g++,ar,strip}`）。
