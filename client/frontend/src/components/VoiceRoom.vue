@@ -7,7 +7,7 @@
 import { computed, ref } from 'vue'
 import {
   AudioLines, MicOff, HeadphoneOff, MoreHorizontal, UserPlus, Volume2, Info, PhoneOff,
-  UserPlus2,
+  UserPlus2, Ear, Crown,
 } from 'lucide-vue-next'
 import SoundOrb from '../components/SoundOrb.vue'
 import { useVoiceStore } from '../stores/voice'
@@ -82,6 +82,18 @@ const ctxItems = computed<CtxItem[]>(() => {
   return [
     { key: 'add-friend', label: '添加好友', icon: UserPlus2 },
     { key: 'volume', label: '调节播放音量', icon: Volume2 },
+    // 悄悄话（#45）：目标选择由本机维护，按住悄悄话热键时才真正只发给这些人。
+    {
+      key: 'whisper',
+      label: voice.isWhisperTarget(c.member.user_id) ? '取消悄悄话目标' : '设为悄悄话目标',
+      icon: Ear,
+    },
+    // 优先发言（#45）：需 ManageChannels，无权限时服务端 403 → toast。
+    {
+      key: 'priority',
+      label: c.member.priority ? '取消优先发言' : '设为优先发言',
+      icon: Crown,
+    },
     { key: 'req-mute', label: '请求闭麦', icon: MicOff },
     { key: 'req-deafen', label: '请求静音', icon: HeadphoneOff },
   ]
@@ -104,6 +116,12 @@ function onCtxSelect(key: string) {
       break
     case 'volume':
       toggleMore(m.user_id)
+      break
+    case 'whisper':
+      void voice.toggleWhisperTarget(m.user_id)
+      break
+    case 'priority':
+      void voice.setPrioritySpeaker(m.user_id, !m.priority)
       break
     case 'req-mute':
       // 请求≠强制：定向转发给对方，对方在 toast 里选择接受（设计决策 5.4）。
@@ -161,6 +179,10 @@ async function invite() {
         <div class="vname">
           {{ m.nickname }}<span v-if="m.tag" class="vtag">#{{ m.tag }}</span>
           <span v-if="m.user_id === voice.selfId()" class="me-tag">我</span>
+          <!-- 优先发言 / 悄悄话目标徽标（Lucide，不用 emoji） -->
+          <span v-if="m.priority" class="vbadge prio" title="优先发言"><Crown :size="12" /></span>
+          <span v-if="voice.isWhisperTarget(m.user_id)" class="vbadge ear"
+                title="悄悄话目标"><Ear :size="12" /></span>
         </div>
         <span v-if="chipFor(m)" class="chip" :class="chipFor(m)!.cls">
           <template v-if="chipFor(m)!.dual">
@@ -198,6 +220,17 @@ async function invite() {
     <div v-if="voice.channelId" class="voice-bar">
       <span class="vb-lat">
         <span class="dot" />延迟 {{ voice.latencyMs }}ms
+      </span>
+      <!-- 悄悄话目标指示（#45）：按住热键且有目标时高亮；离房目标标「离线」 -->
+      <span v-if="voice.whisperTargetViews.length" class="vb-whisper"
+            :class="{ on: voice.whisperActive }"
+            :title="voice.whisperActive ? '悄悄话发送中（仅目标可听）' : '按住悄悄话热键发送'">
+        <Ear :size="13" />
+        <span class="vb-wlabel">{{ voice.whisperActive ? '悄悄话中' : '悄悄话目标' }}</span>
+        <span v-for="(t, i) in voice.whisperTargetViews" :key="t.user_id" class="vb-wt">
+          {{ t.nickname }}<span v-if="!t.online" class="vb-off">离线</span><template
+            v-if="i < voice.whisperTargetViews.length - 1">、</template>
+        </span>
       </span>
       <button class="vb-leave" title="挂断" @click="hangup">
         <PhoneOff :size="15" />挂断
@@ -238,6 +271,20 @@ async function invite() {
 .vb-lat .dot {
   width: 7px; height: 7px; border-radius: 50%; background: var(--green);
 }
+.vb-whisper {
+  display: inline-flex; align-items: center; gap: 5px; min-width: 0;
+  font-size: 12px; color: var(--ink-400, #8A9BB0);
+  padding: 3px 9px; border-radius: 99px;
+  background: rgba(79, 164, 243, 0.08);
+}
+.vb-whisper.on {
+  color: var(--brand-600); background: rgba(79, 164, 243, 0.16);
+}
+.vb-wlabel { font-weight: 600; }
+.vb-wt {
+  max-width: 96px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.vb-off { font-size: 10.5px; color: var(--ink-400, #8A9BB0); margin-left: 2px; }
 .vb-leave {
   display: inline-flex; align-items: center; gap: 6px;
   height: 32px; padding: 0 14px; border-radius: 9px;
@@ -278,6 +325,13 @@ async function invite() {
   color: var(--brand-600); background: rgba(79, 164, 243, 0.12);
   padding: 1px 6px; border-radius: 6px; margin-left: 5px; vertical-align: 1px;
 }
+.vbadge {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px; border-radius: 6px; margin-left: 4px;
+  vertical-align: -3px;
+}
+.vbadge.prio { color: #B7791F; background: rgba(183, 121, 31, 0.12); }
+.vbadge.ear { color: var(--brand-600); background: rgba(79, 164, 243, 0.12); }
 .chip {
   display: inline-flex; align-items: center; gap: 4px;
   padding: 3px 9px; border-radius: 99px;

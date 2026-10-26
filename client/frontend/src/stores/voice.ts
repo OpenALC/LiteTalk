@@ -20,6 +20,23 @@ export const useVoiceStore = defineStore('voice', () => {
   // 打开「更多」弹层时以本缓存为初值，不再每次重置 100（走查建议）。
   const peerVolumes = ref<Record<string, number>>({})
 
+  // 悄悄话目标（#45）：选择由 UI 维护（同频道成员多选），Go 侧只在按住热键时
+  // 真正下发。目标离房后保留选择并标记离线（服务端会静默过滤）。
+  // names 用于成员离开后仍能展示目标名字。
+  const whisperTargets = ref<string[]>([])
+  const whisperTargetNames = ref<Record<string, string>>({})
+  const whisperPressed = ref(false) // 悄悄话键按住中
+  const whisperActive = ref(false) // 按住且有目标（Go 侧已开麦并下发）
+
+  // whisperTargetViews 指示条展示用：目标名 + 当前是否在线（仍在房间成员里）。
+  const whisperTargetViews = computed(() =>
+    whisperTargets.value.map((id) => ({
+      user_id: id,
+      nickname: whisperTargetNames.value[id] ?? id,
+      online: members.value.some((m) => m.user_id === id),
+    })),
+  )
+
   function selfId(): string {
     // 由 channel.joined 的 self 事件回填；此处从 members 里没有 self 字段，
     // 用 SetSelf 由 MainView 注入。
@@ -66,6 +83,11 @@ export const useVoiceStore = defineStore('voice', () => {
     // 失败事件已认领（pending 被清、seq 前移）或会话已复位：丢弃这次迟到的成功。
     if (gen !== generation || pendingJoin?.seq !== seq) return
     pendingJoin = null
+    // 入房（含切房）意味着目标集合换了：旧的悄悄话选择作废（Go 侧 JoinChannel 已清）。
+    whisperTargets.value = []
+    whisperTargetNames.value = {}
+    whisperPressed.value = false
+    whisperActive.value = false
     channelId.value = id
     const list = await goApp().GetVoiceMembers()
     if (gen !== generation) return
@@ -85,6 +107,11 @@ export const useVoiceStore = defineStore('voice', () => {
     members.value = []
     latencyMs.value = 0 // Q4：挂断即归零，避免 voice-bar 重开瞬间残留旧延迟
     connected.value = false
+    // 悄悄话选择属于房间内状态：离房即清（Go 侧在 Leave/断线时也已清旁路门）。
+    whisperTargets.value = []
+    whisperTargetNames.value = {}
+    whisperPressed.value = false
+    whisperActive.value = false
     // 在飞的 join 不得在复位后把房间态写回。
     pendingJoin = null
   }
@@ -132,6 +159,48 @@ export const useVoiceStore = defineStore('voice', () => {
     await goApp().RequestVoiceState(channelId.value, targetId, mute, deafen)
   }
 
+  // ---- 悄悄话目标（#45） ----
+
+  function isWhisperTarget(userId: string): boolean {
+    return whisperTargets.value.includes(userId)
+  }
+
+  // toggleWhisperTarget 切换某成员的悄悄话目标。选择只在按住热键时生效；
+  // 未按住时调用 Go 侧只保存选择，不产生信令。
+  async function toggleWhisperTarget(userId: string) {
+    if (!channelId.value || !userId || userId === _selfId) return
+    const member = members.value.find((m) => m.user_id === userId)
+    const set = new Set(whisperTargets.value)
+    if (set.has(userId)) {
+      set.delete(userId)
+      const names = { ...whisperTargetNames.value }
+      delete names[userId]
+      whisperTargetNames.value = names
+    } else {
+      set.add(userId)
+      if (member) {
+        whisperTargetNames.value = { ...whisperTargetNames.value, [userId]: member.nickname }
+      }
+    }
+    whisperTargets.value = [...set]
+    try {
+      await goApp().SetWhisperTargets(whisperTargets.value)
+    } catch (e) {
+      useNotifyStore().fromErr(e, '悄悄话设置失败')
+    }
+  }
+
+  // setPrioritySpeaker 授予/撤销优先发言（#45）。结果由服务端 voice.priority
+  // 广播回填；无 ManageChannels 权限时 Go 侧返回 403，这里只提示。
+  async function setPrioritySpeaker(userId: string, enabled: boolean) {
+    if (!channelId.value) return
+    try {
+      await goApp().SetPrioritySpeaker(channelId.value, userId, enabled)
+    } catch (e) {
+      useNotifyStore().fromErr(e, '优先发言设置失败')
+    }
+  }
+
   // restoreFromGo UI 销毁重载后回填语音态（Go 侧会话未断；未连接时为空态）。
   async function restoreFromGo() {
     const gen = generation
@@ -170,12 +239,29 @@ export const useVoiceStore = defineStore('voice', () => {
     }))
     offs.push(eventsOn('voice:peer-join', (p) => {
       const peer = p as PeerView
-      if (!members.value.some((m) => m.user_id === peer.user_id)) {
-        members.value.push(peer)
-      }
+      // channel.joined 全量重发也会走到这里：已存在则整体刷新（priority 等
+      // 字段可能在重进房后变化），不能只忽略重复。
+      const idx = members.value.findIndex((m) => m.user_id === peer.user_id)
+      if (idx >= 0) members.value[idx] = { ...members.value[idx], ...peer }
+      else members.value.push(peer)
     }))
     offs.push(eventsOn('voice:peer-leave', (id) => {
       members.value = members.value.filter((m) => m.user_id !== (id as string))
+      // 悄悄话选择保留：目标可能只是暂时离线，重新入房即恢复；指示条标离线。
+    }))
+    // voice:priority 优先发言实时变更（#45）：频道覆盖变更后服务端下发，
+    // 前端就地更新徽标；角色变更不实时推，重进房由 channel.joined 刷新。
+    offs.push(eventsOn('voice:priority', (d) => {
+      const p = d as { user_id?: string; priority?: boolean } | null
+      if (!p?.user_id) return
+      const m = members.value.find((x) => x.user_id === p.user_id)
+      if (m) m.priority = !!p.priority
+    }))
+    // hotkey:whisper 悄悄话键按住指示（#45）：active = 按住且有目标（已开麦）。
+    offs.push(eventsOn('hotkey:whisper', (d) => {
+      const p = d as { pressed?: boolean; active?: boolean } | null
+      whisperPressed.value = !!p?.pressed
+      whisperActive.value = !!p?.active
     }))
     offs.push(eventsOn('voice:speaking', (p) => {
       const d = p as PeerView
@@ -256,8 +342,10 @@ export const useVoiceStore = defineStore('voice', () => {
 
   return {
     channelId, members, muted, deafened, dualOff, latencyMs, connected, peerVolumes,
+    whisperTargets, whisperTargetNames, whisperPressed, whisperActive, whisperTargetViews,
     lastJoinFailed,
     selfId, setSelf, join, leave, resetRoom, resetAll, setMute, setDeafen, setPeerVolume,
-    requestVoiceState, restoreFromGo, bindEvents, unbindEvents,
+    requestVoiceState, isWhisperTarget, toggleWhisperTarget, setPrioritySpeaker,
+    restoreFromGo, bindEvents, unbindEvents,
   }
 })

@@ -76,6 +76,8 @@ export interface PeerView {
   speaking: boolean
   mute: boolean
   deafen: boolean
+  // priority 优先发言（#45）：接收端 ducking 与成员徽标用。
+  priority: boolean
 }
 
 // AttachmentView 消息附件（#41，与 Go 侧 ChatMessageView.Attachments 同口径）。
@@ -159,6 +161,8 @@ export interface HotkeySettings {
   enabled: boolean
   mode: 0 | 1 | 2
   ptt?: string
+  // whisper 按住悄悄话（#45）：默认不绑定。
+  whisper?: string
   mute?: string
   deafen?: string
   dual?: string

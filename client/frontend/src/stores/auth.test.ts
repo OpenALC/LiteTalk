@@ -228,6 +228,7 @@ describe('auth store 业务 store 复位（#85）', () => {
     voice.channelId = '1001'
     voice.members = [{
       user_id: '10', nickname: '好友甲', tag: '0001', speaking: false, mute: false, deafen: false,
+      priority: false,
     }]
     voice.connected = true
     voice.muted = true

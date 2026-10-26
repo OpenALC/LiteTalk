@@ -24,6 +24,8 @@ const mockEventsOn = vi.hoisted(() => {
 const mockGoApp = vi.hoisted(() => ({
   JoinChannel: vi.fn(),
   GetVoiceMembers: vi.fn(async () => [] as PeerView[]),
+  SetWhisperTargets: vi.fn(async () => {}),
+  SetPrioritySpeaker: vi.fn(async () => {}),
 }))
 vi.mock('../api/bridge', () => ({ goApp: () => mockGoApp, eventsOn: mockEventsOn.on }))
 
@@ -39,10 +41,13 @@ describe('voice store 房间态清理', () => {
     mockEventsOn.reset()
     mockGoApp.JoinChannel.mockReset()
     mockGoApp.GetVoiceMembers.mockReset().mockResolvedValue([])
+    mockGoApp.SetWhisperTargets.mockReset().mockResolvedValue(undefined)
+    mockGoApp.SetPrioritySpeaker.mockReset().mockResolvedValue(undefined)
   })
 
   const peer: PeerView = {
     user_id: 'u1', nickname: '甲', tag: '0001', speaking: false, mute: false, deafen: false,
+    priority: false,
   }
 
   it('resetRoom 清空频道、成员与延迟', () => {
@@ -310,5 +315,127 @@ describe('voice store 房间态清理', () => {
     expect(mockEventsOn.handlers.get('voice:join_failed')).toHaveLength(0)
     mockEventsOn.fire('voice:join_failed', { channel_id: 'room1', code: 'join_failed' })
     expect(voice.channelId).toBe('room1')
+  })
+})
+
+// #45：悄悄话目标选择、优先发言徽标与按住指示。
+describe('voice store 悄悄话与优先发言', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    mockEventsOn.reset()
+    mockGoApp.JoinChannel.mockReset().mockResolvedValue(undefined)
+    mockGoApp.GetVoiceMembers.mockReset().mockResolvedValue([])
+    mockGoApp.SetWhisperTargets.mockReset().mockResolvedValue(undefined)
+    mockGoApp.SetPrioritySpeaker.mockReset().mockResolvedValue(undefined)
+  })
+
+  const peer: PeerView = {
+    user_id: 'u1', nickname: '甲', tag: '0001', speaking: false, mute: false, deafen: false,
+    priority: false,
+  }
+
+  it('切换悄悄话目标：下发 Go、离房目标标离线、再点取消', async () => {
+    const voice = useVoiceStore()
+    voice.channelId = 'room1'
+    voice.members = [peer]
+    voice.setSelf('me')
+
+    await voice.toggleWhisperTarget('u1')
+    expect(voice.isWhisperTarget('u1')).toBe(true)
+    expect(mockGoApp.SetWhisperTargets).toHaveBeenCalledWith(['u1'])
+    expect(voice.whisperTargetViews).toEqual([{ user_id: 'u1', nickname: '甲', online: true }])
+
+    // 目标离房：选择保留，指示条标记离线。
+    voice.members = []
+    expect(voice.whisperTargetViews[0].online).toBe(false)
+
+    await voice.toggleWhisperTarget('u1')
+    expect(voice.isWhisperTarget('u1')).toBe(false)
+    expect(voice.whisperTargetViews).toEqual([])
+    expect(mockGoApp.SetWhisperTargets).toHaveBeenLastCalledWith([])
+  })
+
+  it('不能把自己设为悄悄话目标', async () => {
+    const voice = useVoiceStore()
+    voice.channelId = 'room1'
+    voice.members = [{ ...peer, user_id: 'me' }]
+    voice.setSelf('me')
+    await voice.toggleWhisperTarget('me')
+    expect(voice.whisperTargets).toEqual([])
+    expect(mockGoApp.SetWhisperTargets).not.toHaveBeenCalled()
+  })
+
+  it('resetRoom 清空悄悄话选择与按住态', () => {
+    const voice = useVoiceStore()
+    voice.channelId = 'room1'
+    voice.members = [peer]
+    voice.whisperTargets = ['u1']
+    voice.whisperTargetNames = { u1: '甲' }
+    voice.whisperPressed = true
+    voice.whisperActive = true
+
+    voice.resetRoom()
+
+    expect(voice.whisperTargets).toEqual([])
+    expect(voice.whisperTargetNames).toEqual({})
+    expect(voice.whisperPressed).toBe(false)
+    expect(voice.whisperActive).toBe(false)
+  })
+
+  it('voice:priority 事件就地更新成员徽标', () => {
+    const voice = useVoiceStore()
+    voice.bindEvents()
+    voice.members = [peer]
+
+    mockEventsOn.fire('voice:priority', { user_id: 'u1', priority: true })
+    expect(voice.members[0].priority).toBe(true)
+    mockEventsOn.fire('voice:priority', { user_id: 'u1', priority: false })
+    expect(voice.members[0].priority).toBe(false)
+    voice.unbindEvents()
+  })
+
+  it('hotkey:whisper 事件驱动按住/生效指示', () => {
+    const voice = useVoiceStore()
+    voice.bindEvents()
+
+    mockEventsOn.fire('hotkey:whisper', { pressed: true, active: true })
+    expect(voice.whisperPressed).toBe(true)
+    expect(voice.whisperActive).toBe(true)
+    mockEventsOn.fire('hotkey:whisper', { pressed: false, active: false })
+    expect(voice.whisperPressed).toBe(false)
+    expect(voice.whisperActive).toBe(false)
+    voice.unbindEvents()
+  })
+
+  it('peer-join 对已存在成员整体刷新（priority 变化不能丢）', () => {
+    const voice = useVoiceStore()
+    voice.bindEvents()
+    voice.members = [peer]
+
+    mockEventsOn.fire('voice:peer-join', { ...peer, priority: true, speaking: true })
+    expect(voice.members).toHaveLength(1)
+    expect(voice.members[0].priority).toBe(true)
+    expect(voice.members[0].speaking).toBe(true)
+    voice.unbindEvents()
+  })
+
+  it('setPrioritySpeaker 调用 Go 绑定（403 由 Go 侧错误提示）', async () => {
+    const voice = useVoiceStore()
+    voice.channelId = 'room1'
+    await voice.setPrioritySpeaker('u1', true)
+    expect(mockGoApp.SetPrioritySpeaker).toHaveBeenCalledWith('room1', 'u1', true)
+  })
+
+  it('加入频道清空旧的悄悄话选择', async () => {
+    const voice = useVoiceStore()
+    voice.channelId = 'room1'
+    voice.whisperTargets = ['u1']
+    voice.whisperTargetNames = { u1: '甲' }
+
+    await voice.join('room2')
+
+    expect(voice.channelId).toBe('room2')
+    expect(voice.whisperTargets).toEqual([])
+    expect(voice.whisperTargetNames).toEqual({})
   })
 })
