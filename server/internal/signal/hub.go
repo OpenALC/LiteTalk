@@ -1323,6 +1323,7 @@ func (h *Hub) handleVoiceWhisper(c *client, d VoiceWhisperData) {
 		return
 	}
 	connIDStr := strconv.FormatUint(c.connID, 10)
+	var oldAllowed, newAllowed map[string]bool
 	h.mu.Lock()
 	room := h.rooms[roomID]
 	// 发送者归属核对：同 uid 新连接顶替后，旧连接的迟到信令不得生效。
@@ -1330,6 +1331,8 @@ func (h *Hub) handleVoiceWhisper(c *client, d VoiceWhisperData) {
 	var filtered []string
 	var targetSet map[string]bool
 	if inRoom {
+		// 收件范围变化前/后的快照：若说话者正在说话，需要在下面补发纠正事件。
+		oldAllowed = speakingRecipientsLocked(room, c.userID)
 		filtered = make([]string, 0, len(d.Targets))
 		targetSet = make(map[string]bool, len(d.Targets))
 		for _, uid := range d.Targets {
@@ -1349,12 +1352,16 @@ func (h *Hub) handleVoiceWhisper(c *client, d VoiceWhisperData) {
 		} else {
 			delete(room.whisper, c.userID)
 		}
+		newAllowed = speakingRecipientsLocked(room, c.userID)
 	}
 	h.mu.Unlock()
 	if !inRoom {
 		h.sendError(c, ErrCodeNotInChannel, "不在频道中")
 		return
 	}
+	// 说话中途切换悄悄话范围：给进出范围的成员补发正确的 speaking 态，
+	// 避免非目标保留旧的指示/错误 ducking，或新目标错过当前说话态。
+	h.syncWhisperSpeakingScope(roomID, c.userID, oldAllowed, newAllowed)
 	if !h.sfu.SetWhisperTargets(roomID, c.userID, connIDStr, filtered, len(d.Targets) > 0) {
 		// channel.join 与 rtc.offer 之间 SFU peer 尚不存在：hub 已记录快照，
 		// handleRTCOffer 建好 peer 后会补应用，不会以全房转发泄漏悄悄话。

@@ -270,9 +270,17 @@ func TestWhisperSpeakingScopedV2(t *testing.T) {
 	f.hub.sendJSON(f.hub.roomMember(vchID, "9"), "test.marker", nil)
 	recvUntilNo(t, m, "test.marker", TypeVoiceSpeaking)
 
-	// 取消悄悄话后 speaking 恢复全房广播（非目标也能收到）。
+	// 取消悄悄话后 speaking 恢复全房广播：说话中途取消会先给非目标补一条
+	// true 纠正（范围切换），随后全房广播 false。
 	a.send(TypeVoiceWhisper, VoiceWhisperData{Targets: []string{}})
 	waitHubWhisper(t, f.hub, vchID, "1", false, "")
+	var corr VoiceSpeakingData
+	if err := m.recvUntil(TypeVoiceSpeaking).Decode(&corr); err != nil {
+		t.Fatalf("decode 纠正事件（取消后）: %v", err)
+	}
+	if corr.UserID != "1" || !corr.Speaking {
+		t.Fatalf("取消悄悄话后非目标应收 speaking=true 纠正，实际 %+v", corr)
+	}
 	f.hub.broadcastVoiceSpeaking(vchID, "1", false)
 	var off VoiceSpeakingData
 	if err := m.recvUntil(TypeVoiceSpeaking).Decode(&off); err != nil {
@@ -313,9 +321,16 @@ func TestWhisperSpeakingScopedLegacy(t *testing.T) {
 	f.hub.sendJSON(f.hub.roomMember(vchID, "9"), "test.marker", nil)
 	recvUntilNo(t, m, "test.marker", TypeVoiceState)
 
-	// 取消后非目标恢复收 voice.state。
+	// 取消后非目标恢复收 voice.state：先收到 true 纠正（范围切换），再收全房 false。
 	a.send(TypeVoiceWhisper, VoiceWhisperData{Targets: []string{}})
 	waitHubWhisper(t, f.hub, vchID, "1", false, "")
+	var corrOn VoiceStateData
+	if err := m.recvUntil(TypeVoiceState).Decode(&corrOn); err != nil {
+		t.Fatalf("decode v1 纠正事件（取消后）: %v", err)
+	}
+	if corrOn.UserID != "1" || corrOn.Speaking == nil || !*corrOn.Speaking {
+		t.Fatalf("取消悄悄话后 v1 非目标应收 speaking=true 纠正，实际 %+v", corrOn)
+	}
 	f.hub.broadcastVoiceSpeaking(vchID, "1", false)
 	var off VoiceStateData
 	if err := m.recvUntil(TypeVoiceState).Decode(&off); err != nil {
@@ -323,6 +338,73 @@ func TestWhisperSpeakingScopedLegacy(t *testing.T) {
 	}
 	if off.UserID != "1" || off.Speaking == nil || *off.Speaking {
 		t.Fatalf("取消后非目标应收 speaking=false，实际 %+v", off)
+	}
+
+	// 说话中途再次开启悄悄话：v1 非目标收到 false 纠正（与 v2 同一套范围切换逻辑）。
+	f.hub.broadcastVoiceSpeaking(vchID, "1", true)
+	var on VoiceStateData
+	if err := m.recvUntil(TypeVoiceState).Decode(&on); err != nil || on.Speaking == nil || !*on.Speaking {
+		t.Fatalf("正常 speaking（v1 非目标）异常: %+v %v", on, err)
+	}
+	a.send(TypeVoiceWhisper, VoiceWhisperData{Targets: []string{"2"}})
+	waitHubWhisper(t, f.hub, vchID, "1", true, "2")
+	var corr VoiceStateData
+	if err := m.recvUntil(TypeVoiceState).Decode(&corr); err != nil {
+		t.Fatalf("decode v1 纠正事件: %v", err)
+	}
+	if corr.UserID != "1" || corr.Speaking == nil || *corr.Speaking {
+		t.Fatalf("v1 非目标应收 speaking=false 纠正，实际 %+v", corr)
+	}
+}
+
+// TestWhisperSpeakingScopeTransition 说话中途开启/关闭悄悄话时补发纠正事件：
+// 非目标先收到 true，开启后收到 false；取消后恢复 true。避免保留旧指示并
+// 错误触发优先发言 ducking。
+func TestWhisperSpeakingScopeTransition(t *testing.T) {
+	f := newChatFixture(t)
+	vchID := strconv.FormatInt(f.vch.ID, 10)
+	a := f.dial("1", "alice")
+	b := f.dial("2", "bob")
+	m := f.dial("9", "mallory")
+	negotiate(t, a, 3)
+	negotiate(t, b, 3)
+	negotiate(t, m, 3)
+	joinAndCapture(t, a, vchID)
+	joinAndCapture(t, b, vchID)
+	joinAndCapture(t, m, vchID)
+
+	// 正常发言：全房收到 true。
+	f.hub.broadcastVoiceSpeaking(vchID, "1", true)
+	for _, c := range []*wsClient{a, b, m} {
+		var d VoiceSpeakingData
+		if err := c.recvUntil(TypeVoiceSpeaking).Decode(&d); err != nil || !d.Speaking {
+			t.Fatalf("正常 speaking 广播（%s）异常: %+v %v", c.user, d, err)
+		}
+	}
+
+	// 说话中途开启悄悄话：非目标 mallory 收到 false 纠正；目标 bob 保持 true，
+	// 不应收到纠正事件。
+	a.send(TypeVoiceWhisper, VoiceWhisperData{Targets: []string{"2"}})
+	waitHubWhisper(t, f.hub, vchID, "1", true, "2")
+	var off VoiceSpeakingData
+	if err := m.recvUntil(TypeVoiceSpeaking).Decode(&off); err != nil {
+		t.Fatalf("decode 纠正事件: %v", err)
+	}
+	if off.UserID != "1" || off.Speaking {
+		t.Fatalf("非目标应收 speaking=false 纠正，实际 %+v", off)
+	}
+	f.hub.sendJSON(f.hub.roomMember(vchID, "2"), "test.marker", nil)
+	recvUntilNo(t, b, "test.marker", TypeVoiceSpeaking)
+
+	// 仍在说话时取消悄悄话：非目标重新收到 true。
+	a.send(TypeVoiceWhisper, VoiceWhisperData{Targets: []string{}})
+	waitHubWhisper(t, f.hub, vchID, "1", false, "")
+	var on VoiceSpeakingData
+	if err := m.recvUntil(TypeVoiceSpeaking).Decode(&on); err != nil {
+		t.Fatalf("decode 恢复事件: %v", err)
+	}
+	if on.UserID != "1" || !on.Speaking {
+		t.Fatalf("取消悄悄话后非目标应收 speaking=true，实际 %+v", on)
 	}
 }
 
