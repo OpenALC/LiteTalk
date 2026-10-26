@@ -55,6 +55,7 @@ macOS 等未接入平台不会编译它。关键编译参数：
 - `-DWEBRTC_WIN -D_WIN32` / `-DWEBRTC_LINUX -DWEBRTC_POSIX -DWEBRTC_THREAD_RR`：
   与建库时一致，保证头文件里的平台分支一致；
 - `-DWEBRTC_APM_DEBUG_DUMP=0`：不启用 APM 调试转储；
+- `-DNDEBUG -D__STDC_FORMAT_MACROS=1`：与静态库构建宏一致；
 - Windows 链接参数 `-lwinmm -Wl,-Bstatic -lstdc++ -lwinpthread -Wl,-Bdynamic
   -static-libgcc -static-libstdc++`，产物只依赖 KERNEL32/WINMM/UCRT 系统 DLL，
   不引入 libstdc++-6.dll / libwinpthread-1.dll；
