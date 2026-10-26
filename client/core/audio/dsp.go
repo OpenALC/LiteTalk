@@ -540,7 +540,7 @@ func (d *DSP) processAPM(out, in []int16) (float32, error) {
 		// 不中断音频：撤回 APM 输出，按旧链路继续（前置增益仍生效）。
 		// 只在首次失败时留日志，避免每帧刷屏。
 		d.apmErrOnce.Do(func() {
-			log.Printf("audio: WebRTC APM 采集帧处理失败，后续帧按旧链路继续: %v", err)
+			log.Printf("audio: WebRTC APM 采集帧处理失败，本帧回落旧链路（后续帧仍尝试 APM）: %v", err)
 		})
 		if preGain != 1 {
 			applyGainInto(src, in[:FrameSize], preGain)

@@ -114,7 +114,7 @@ func (p *PeerInput) BufferedSamples() int { return p.ring.Available() }
 // Tick 热路径零分配：peer 快照经 atomic.Pointer 切换，仅在 Add/Remove 时
 // 重建；累加器/帧缓冲全部预分配。
 type Mixer struct {
-	writeOut func([]int16) int // 输出汇（管线 WritePlayback 或测试环）
+	writeOut func([]int16) int // 输出汇（通常是包了 ProcessRender 的管线 WritePlayback）
 
 	mu       sync.Mutex
 	peers    map[string]*PeerInput
@@ -140,7 +140,8 @@ type Mixer struct {
 }
 
 // NewMixer 创建混音器。writeOut 为输出汇（每 tick 写入 480 采样），
-// 通常为 pipeline.WritePlayback。
+// 生产路径传包了 ProcessRender 的 pipeline.WritePlayback（同一份输出
+// 既是播放内容也是 AEC 参考）。
 func NewMixer(writeOut func([]int16) int) *Mixer {
 	m := &Mixer{
 		writeOut: writeOut,
