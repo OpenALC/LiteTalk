@@ -292,6 +292,8 @@ func BenchmarkDSPProcessLegacy(b *testing.B) {
 func benchDSPProcess(b *testing.B, disableAPM bool) {
 	cfg := DefaultDSPConfig()
 	cfg.DisableAPM = disableAPM
+	// 两档都保持 AGC 关闭（DSPConfig 未开 agcOn），只比较固定链路的
+	// APM/RNNoise 成本；AGC2 的额外开销由 BenchmarkAPMCapture 单独计。
 	d, err := NewDSP(cfg)
 	if err != nil {
 		b.Fatal(err)
