@@ -109,6 +109,14 @@ type App struct {
 	hkQuit    chan struct{}
 	hkQuitOne sync.Once
 
+	// 悄悄话（#45）：whisperMu 保护 UI 维护的目标选择与按键/生效状态。
+	// whisperHeld 是物理按键态，whisperActive 是「已下发目标且旁路发送门」态
+	// （目标为空时按住键也不开麦、不发信令）。
+	whisperMu      sync.Mutex
+	whisperTargets []string
+	whisperHeld    bool
+	whisperActive  bool
+
 	// trayMute 托盘「静音」勾选项：前端/热键改静音时同步勾选态（此前只有
 	// 托盘自己的点击会更新，另两条路径改了静音托盘不跟着变）。
 	// setupTray 在 ServiceStartup 里赋值，早于热键 goroutine 启动。
@@ -1232,14 +1240,17 @@ func (a *App) connectSession(token, nickname string, gen uint64) error {
 func (a *App) connectSessionLocked(token, nickname string) error {
 	a.disconnectSessionLocked()
 	ev := voice.Events{
-		OnPeerJoin: func(userID, nickname, tag string, speaking, mute, deafen bool) {
+		OnPeerJoin: func(userID, nickname, tag string, speaking, mute, deafen, priority bool) {
 			a.emit("voice:peer-join", map[string]any{
 				"user_id": userID, "nickname": nickname, "tag": tag,
-				"speaking": speaking, "mute": mute, "deafen": deafen,
+				"speaking": speaking, "mute": mute, "deafen": deafen, "priority": priority,
 			})
 		},
 		OnPeerLeave: func(userID string) {
 			a.emit("voice:peer-leave", userID)
+		},
+		OnPeerPriority: func(userID string, priority bool) {
+			a.emit("voice:priority", map[string]any{"user_id": userID, "priority": priority})
 		},
 		OnPeerSpeaking: func(userID string, speaking, mute, deafen bool) {
 			a.emit("voice:speaking", map[string]any{
@@ -1280,6 +1291,7 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 		// 此处只把事实转给前端（toast + 清房间态）。同样跑在 ws 读循环
 		// goroutine 上，不得同步断开会话。
 		OnVoiceTaken: func() {
+			a.clearWhisper()
 			a.emit("voice:taken", nil)
 		},
 		// 好友在线状态变化（presence.update，#11/#92）：转给前端刷好友状态点；
@@ -1457,6 +1469,7 @@ func (a *App) disconnectSession() {
 // disconnectSessionLocked 前提：已持 connMu。
 func (a *App) disconnectSessionLocked() {
 	a.statsGen.Add(1) // 旧 ticker 代际失效（S9）
+	a.clearWhisper()
 	a.mu.Lock()
 	s := a.sess
 	a.sess = nil
@@ -1474,6 +1487,8 @@ func (a *App) JoinChannel(channelID string) error {
 	if s == nil {
 		return fmt.Errorf("not connected")
 	}
+	// 切房后旧的悄悄话目标已无意义（成员集合不同），清选择并关旁路门。
+	a.clearWhisper()
 	return s.JoinChannel(channelID)
 }
 
@@ -1486,6 +1501,7 @@ func (a *App) JoinChannelWithPassword(channelID, password string) error {
 	if s == nil {
 		return fmt.Errorf("not connected")
 	}
+	a.clearWhisper()
 	return s.JoinChannelWithPassword(channelID, password)
 }
 
@@ -1494,6 +1510,7 @@ func (a *App) LeaveChannel() error {
 	a.mu.Lock()
 	s := a.sess
 	a.mu.Unlock()
+	a.clearWhisper()
 	if s == nil {
 		return nil
 	}
@@ -1983,6 +2000,67 @@ func (a *App) RequestVoiceState(channelID, targetID string, mute, deafen bool) e
 	return s.RequestVoiceState(channelID, targetID, mute, deafen)
 }
 
+// priorityPermBit 频道覆盖里的 PrioritySpeaker 位（与 store.Permission 同值）。
+// 只增删这一位，其余位原样保留（#45）。
+const priorityPermBit uint64 = 1 << 4
+
+// SetPrioritySpeaker 授予/撤销某成员的优先发言（#45，需 ManageChannels）。
+// 读当前 member 覆盖 → 保留其他权限位、只增删 PrioritySpeaker → 空覆盖删除。
+// 撤销只清 allow 位、不写 deny，角色可能已授予该权限，不能反向压制。
+// 服务端权限不足时返回 API 错误（前端提示 403）。
+func (a *App) SetPrioritySpeaker(channelID, userID string, enabled bool) error {
+	if a.api == nil {
+		return fmt.Errorf("not connected")
+	}
+	ows, err := a.api.ListChannelOverwrites(channelID)
+	if err != nil {
+		return err
+	}
+	var cur *api.ChannelOverwriteDTO
+	for i := range ows {
+		if ows[i].TargetType == "member" && ows[i].TargetID.String() == userID {
+			cur = &ows[i]
+			break
+		}
+	}
+	var allow, deny uint64
+	if cur != nil {
+		if allow, err = parsePermBits(cur.Allow); err != nil {
+			return err
+		}
+		if deny, err = parsePermBits(cur.Deny); err != nil {
+			return err
+		}
+	}
+	if enabled {
+		allow |= priorityPermBit
+	} else {
+		// 撤销且无个人覆盖：角色授予保持原样，不必写一条 deny。
+		if cur == nil {
+			return nil
+		}
+		allow &^= priorityPermBit
+	}
+	if cur != nil && allow == 0 && deny == 0 {
+		return a.api.DeleteChannelOverwrite(channelID, "member", userID)
+	}
+	_, err = a.api.SetChannelOverwrite(channelID, "member", userID,
+		strconv.FormatUint(allow, 10), strconv.FormatUint(deny, 10))
+	return err
+}
+
+// parsePermBits 十进制权限位串 → uint64；空串按 0（服务端输出可能省略 0）。
+func parsePermBits(s string) (uint64, error) {
+	if s == "" {
+		return 0, nil
+	}
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("权限位格式非法: %q", s)
+	}
+	return v, nil
+}
+
 // GetVoiceState 当前语音态快照（UI 销毁重载后回填用；channel_id 空=未在频道）。
 func (a *App) GetVoiceState() voice.VoiceStateView {
 	a.mu.Lock()
@@ -2210,6 +2288,10 @@ func (a *App) handleHotkeyEvent(ev hotkey.Event) {
 		// 尾包窗：松手后补一小段话音，避免末字被硬切。
 		tail := time.Duration(a.cfg.GetHotkeySettings().TailMS) * time.Millisecond
 		a.hkGate.Release(tail)
+	case e.WhisperPress:
+		a.whisperPress()
+	case e.WhisperRelease:
+		a.whisperRelease()
 	case e.Mute:
 		mute, _ := a.voiceMuteState()
 		a.SetMute(!mute)
@@ -2227,6 +2309,117 @@ func (a *App) handleHotkeyEvent(ev hotkey.Event) {
 	if ev.Action == hotkey.ActionPTT {
 		a.emit("hotkey:ptt", map[string]any{"pressed": ev.Pressed})
 	}
+}
+
+// ---------- 同频道悄悄话（#45） ----------
+
+// SetWhisperTargets 更新悄悄话目标选择（UI 维护的同频道成员列表）。
+// 未按住悄悄话键时只保存选择、不产生任何信令；按住期间变化立即生效：
+// 目标清空会马上关旁路门并下发空数组取消，避免继续向全房广播。
+func (a *App) SetWhisperTargets(targets []string) error {
+	clean := make([]string, 0, len(targets))
+	seen := make(map[string]bool, len(targets))
+	for _, uid := range targets {
+		if uid == "" || seen[uid] {
+			continue
+		}
+		seen[uid] = true
+		clean = append(clean, uid)
+	}
+	a.whisperMu.Lock()
+	a.whisperTargets = clean
+	held := a.whisperHeld
+	wasActive := a.whisperActive
+	active := held && len(clean) > 0
+	a.whisperActive = active
+	a.whisperMu.Unlock()
+	if !held {
+		return nil
+	}
+	a.setWhisperGate(active)
+	if active || wasActive {
+		a.sendWhisperTargets(clean)
+	}
+	a.emitWhisperState(true, active)
+	return nil
+}
+
+// whisperPress 按住悄悄话键：有目标且在语音房内才下发并打开发送门；无目标
+// 或不在房时按键无效（不开麦、不发信令），也不影响 PTT 的既有状态。
+func (a *App) whisperPress() {
+	a.mu.Lock()
+	s := a.sess
+	a.mu.Unlock()
+	// 已登录但不在语音房：按住悄悄话无对象可发（会话为 nil 时无媒体链路，
+	// 这里放行也只会动一个没有管线的门，便于单元测试直接验证门组合）。
+	if s != nil && !s.InRoom() {
+		a.emitWhisperState(true, false)
+		return
+	}
+	a.whisperMu.Lock()
+	a.whisperHeld = true
+	targets := append([]string(nil), a.whisperTargets...)
+	active := len(targets) > 0
+	a.whisperActive = active
+	a.whisperMu.Unlock()
+	if active {
+		a.setWhisperGate(true)
+		a.sendWhisperTargets(targets)
+	}
+	a.emitWhisperState(true, active)
+}
+
+// whisperRelease 松开悄悄话键：关旁路门并下发空数组取消。旁路门与 PTT 的
+// pressed/tail 状态分离，故「先松 PTT 再松悄悄话」或相反都不会误关麦。
+func (a *App) whisperRelease() {
+	a.whisperMu.Lock()
+	a.whisperHeld = false
+	wasActive := a.whisperActive
+	a.whisperActive = false
+	a.whisperMu.Unlock()
+	a.setWhisperGate(false)
+	if wasActive {
+		a.sendWhisperTargets(nil)
+	}
+	a.emitWhisperState(false, false)
+}
+
+// clearWhisper 退房/断线/被抢占时清理悄悄话状态（#45）：只关本地旁路门与
+// 选择，不发 voice.whisper——SFU peer 已随离房销毁，且此时发送的取消消息
+// 可能被信令层误归属成进房失败（#91 的 pending join 错误归属窗口）。
+func (a *App) clearWhisper() {
+	a.whisperMu.Lock()
+	was := a.whisperHeld || a.whisperActive
+	a.whisperHeld = false
+	a.whisperActive = false
+	a.whisperTargets = nil
+	a.whisperMu.Unlock()
+	a.setWhisperGate(false)
+	if was {
+		a.emitWhisperState(false, false)
+	}
+}
+
+// setWhisperGate 设置发送门旁路位（hkGate 在 ServiceStartup 前为 nil，测试）。
+func (a *App) setWhisperGate(on bool) {
+	if a.hkGate != nil {
+		a.hkGate.Force(on)
+	}
+}
+
+// sendWhisperTargets 非阻塞交给会话专用 goroutine 下发（协议 <3 时由会话丢弃）。
+func (a *App) sendWhisperTargets(targets []string) {
+	a.mu.Lock()
+	s := a.sess
+	a.mu.Unlock()
+	if s != nil {
+		s.SetWhisperTargets(targets)
+	}
+}
+
+// emitWhisperState 推给前端做轻量指示（pressed=按住，active=有目标且已生效）。
+func (a *App) emitWhisperState(pressed, active bool) {
+	a.emit("hotkey:whisper", map[string]any{"pressed": pressed, "active": active})
 }
 
 // voiceMuteState 当前闭麦/静音态（无会话时两者皆 false）。

@@ -37,9 +37,13 @@ const KickReasonLoginExpired = "login_expired"
 // Events 会话 → UI 的事件回调（由 app 层接到 runtime.EventsEmit）。
 type Events struct {
 	// OnPeerJoin 有成员进入房间（含自己首次入房的成员全量推送前的逐个通知）。
-	OnPeerJoin func(userID, nickname, tag string, speaking, mute, deafen bool)
+	// priority 是优先发言标记（#45，MemberInfo.priority）。
+	OnPeerJoin func(userID, nickname, tag string, speaking, mute, deafen, priority bool)
 	// OnPeerLeave 有成员离开。
 	OnPeerLeave func(userID string)
+	// OnPeerPriority 某成员优先发言标记实时变化（voice.priority，#45）。
+	// 角色变更不实时通知，重进房时随 channel.joined 刷新。
+	OnPeerPriority func(userID string, priority bool)
 	// OnPeerSpeaking 远端说话状态变化。
 	OnPeerSpeaking func(userID string, speaking, mute, deafen bool)
 	// OnLatency 回环/远端延迟周期上报（毫秒）。
@@ -147,6 +151,7 @@ type PeerView struct {
 	Speaking bool   `json:"speaking"`
 	Mute     bool   `json:"mute"`
 	Deafen   bool   `json:"deafen"`
+	Priority bool   `json:"priority"` // 优先发言（#45）：接收端 ducking 与徽标用
 }
 
 // Session 一次登录后的通话会话：信令连接 + 媒体管线。
@@ -181,6 +186,13 @@ type Session struct {
 	// 积压旧状态无意义），由专用 goroutine 消费发送（音频回调禁止直发网络）。
 	voiceSend    chan signal.VoiceStateData
 	mediaStarted atomic.Bool // 采集/播放是否已启动（入房才启动，按需点亮麦克风）
+
+	// 悄悄话目标下发（#45）：Wails 绑定/热键线程只写最新目标并敲一下 wake，
+	// 专用 goroutine 读取后发 voice.whisper——禁止在音频回调或 Wails 线程同步
+	// ws.Send。wake 容量 1 合并突发，最新值以 whisperWant 为准。
+	whisperMu   sync.Mutex
+	whisperWant []string
+	whisperWake chan struct{}
 
 	// #46 频道音质配置：audioCfgMu 串行化「用户设置 + 当前频道上限/帧长」的
 	// 读取与应用（ApplyAudio 在 Wails 绑定线程、channel.audio 在 WS 读循环）。
@@ -270,14 +282,15 @@ func NewSession(api *api.APIClient, token, nickname string, ev Events, logger *l
 		logger = log.Default()
 	}
 	s := &Session{
-		api:       api,
-		log:       logger,
-		ev:        ev,
-		name:      nickname,
-		members:   make(map[string]PeerView),
-		seenChans: make(map[string]bool),
-		voiceSend: make(chan signal.VoiceStateData, 1),
-		gw:        gateway.New(),
+		api:         api,
+		log:         logger,
+		ev:          ev,
+		name:        nickname,
+		members:     make(map[string]PeerView),
+		seenChans:   make(map[string]bool),
+		voiceSend:   make(chan signal.VoiceStateData, 1),
+		whisperWake: make(chan struct{}, 1),
+		gw:          gateway.New(),
 		// 入房前的默认音质：与 audio.DefaultOpusConfig 的 32kbps、20ms 一致。
 		userBitrateKbps: 32,
 		chanFrameMS:     20,
@@ -445,6 +458,9 @@ func (s *Session) Connect(serverURL string) {
 		}
 		s.mixer = audio.NewMixer(pipe.WritePlayback)
 		s.remoteMgr = audio.NewRemoteManager(s.mixer, s.log)
+		// 新接入的远端轨才在混音器里出现，入房快照里的「优先发言者正在说话」
+		// 需要在这时补一次 ducking 重算，否则要等下一次说话翻转才生效（#45）。
+		s.remoteMgr.OnPeerChange = s.updateDucking
 		s.states = audio.NewStateTable()
 		s.states.OnChange = func(id string, st audio.PeerVoiceState) {
 			if s.ev.OnPeerSpeaking != nil {
@@ -466,6 +482,14 @@ func (s *Session) Connect(serverURL string) {
 				}
 			}
 		}
+	}()
+
+	// 悄悄话目标专用发送 goroutine（#45）：只在协议 ≥3 时下发；v2 服务端
+	// 不认该消息，客户端按住悄悄话键时也不应依赖它生效。
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.whisperLoop(ctx)
 	}()
 
 	s.wg.Add(1)
@@ -625,6 +649,7 @@ func (s *Session) registerHandlers() {
 			s.members[m.UserID] = PeerView{
 				UserID: m.UserID, Nickname: m.Nickname, Tag: m.Tag,
 				Speaking: m.Speaking, Mute: m.Mute, Deafen: m.Deafen,
+				Priority: m.Priority,
 			}
 			if m.UserID != d.Self.UserID && s.states != nil {
 				s.states.Set(m.UserID, audio.PeerVoiceState{Speaking: m.Speaking, Mute: m.Mute, Deafen: m.Deafen})
@@ -632,12 +657,14 @@ func (s *Session) registerHandlers() {
 		}
 		s.selfID = d.Self.UserID
 		s.mu.Unlock()
+		// 入房快照可能改变优先发言状态（含自己的 admin 授予）：重算 ducking。
+		s.updateDucking()
 		if s.ev.OnSelf != nil {
 			s.ev.OnSelf(d.Self.UserID)
 		}
 		if s.ev.OnPeerJoin != nil {
 			for _, m := range d.Members {
-				s.ev.OnPeerJoin(m.UserID, m.Nickname, m.Tag, m.Speaking, m.Mute, m.Deafen)
+				s.ev.OnPeerJoin(m.UserID, m.Nickname, m.Tag, m.Speaking, m.Mute, m.Deafen, m.Priority)
 			}
 		}
 		// 仅在无存活 peer 时建连（他人入房广播不动媒体链路）。
@@ -655,6 +682,9 @@ func (s *Session) registerHandlers() {
 				Deafen: signal.Bool(s.deafened.Load()),
 			})
 		}
+		// 重连/重入房后 SFU peer 是新的，悄悄话目标随旧 Peer 消失；用户仍按着
+		// 悄悄话键时重发一次当前目标（#45）。未按住（want 为空）不发。
+		s.resendWhisperIfAny()
 	})
 	// channel.audio 音质热更新（#46）：只对当前房间生效；其他频道（例如管理员
 	// 在别处改了配置）忽略，等入房时的 channel.joined 拿权威值。
@@ -715,6 +745,32 @@ func (s *Session) registerHandlers() {
 			s.members[d.UserID] = v
 		}
 		s.mu.Unlock()
+		s.updateDucking()
+	})
+	// voice.priority 优先发言实时变更（#45）：频道覆盖变更后由服务端下发；
+	// 角色/成员角色变更不实时广播，重进房由 channel.joined 刷新。旧房事件丢弃。
+	s.ws.On(signal.TypeVoicePriority, func(env signal.Envelope) {
+		var d signal.VoicePriorityData
+		if env.Decode(&d) != nil || d.UserID == "" || d.ChannelID == "" {
+			return
+		}
+		if room, _ := s.roomID.Load().(string); room != d.ChannelID {
+			return
+		}
+		s.mu.Lock()
+		v, ok := s.members[d.UserID]
+		if ok {
+			v.Priority = d.Priority
+			s.members[d.UserID] = v
+		}
+		s.mu.Unlock()
+		if !ok {
+			return
+		}
+		if s.ev.OnPeerPriority != nil {
+			s.ev.OnPeerPriority(d.UserID, d.Priority)
+		}
+		s.updateDucking()
 	})
 	// voice.speaking：服务端按 RFC 6464 电平统一判定的说话翻转（#33），含自己
 	//（自己的声波球同源，v1「自己不亮」的问题随本消息消失）。mute/deafen 电平
@@ -742,6 +798,7 @@ func (s *Session) registerHandlers() {
 		if s.states != nil {
 			s.states.Apply(d.UserID, &d.Speaking, nil, nil)
 		}
+		s.updateDucking()
 	})
 	s.ws.On(signal.TypeChannelPeerLeft, func(env signal.Envelope) {
 		var d signal.PeerLeftData
@@ -757,6 +814,7 @@ func (s *Session) registerHandlers() {
 		s.mu.Lock()
 		delete(s.members, d.UserID)
 		s.mu.Unlock()
+		s.updateDucking()
 		if s.ev.OnPeerLeave != nil {
 			s.ev.OnPeerLeave(d.UserID)
 		}
@@ -1217,11 +1275,107 @@ func (s *Session) SetDeafen(deafened bool) {
 	}
 }
 
-// SetPeerVolume 调整某远端成员音量（0.0–2.0）。
+// SetPeerVolume 调整某远端成员音量（0.0–2.0）。与优先发言 ducking 独立：
+// duck 乘数只作用于混音 Tick，不改写这里的用户设置（#45）。
 func (s *Session) SetPeerVolume(userID string, gain float64) {
 	if s.mixer != nil {
 		if in := s.mixer.Peer(userID); in != nil {
 			in.SetGain(gain)
+		}
+	}
+}
+
+// SetWhisperTargets 更新同频道悄悄话目标（#45）。空列表 = 取消，仅协议 ≥3
+// 时真正下发（v2 服务端不认该消息）。非阻塞：只保存最新值并敲一下容量 1 的
+// 唤醒通道，网络发送由 Connect 里的专用 goroutine 完成——不得在 Wails 绑定
+// 线程或音频回调里同步 ws.Send。
+func (s *Session) SetWhisperTargets(targets []string) {
+	cp := make([]string, 0, len(targets))
+	for _, uid := range targets {
+		if uid != "" {
+			cp = append(cp, uid)
+		}
+	}
+	s.whisperMu.Lock()
+	s.whisperWant = cp
+	s.whisperMu.Unlock()
+	s.wakeWhisper()
+}
+
+// wakeWhisper 合并一次下发唤醒（容量 1；发送 goroutine 总是读最新值）。
+func (s *Session) wakeWhisper() {
+	select {
+	case s.whisperWake <- struct{}{}:
+	default:
+	}
+}
+
+// whisperLoop 悄悄话目标发送循环（#45，Connect 启动；测试可直接跑）。
+// 每次唤醒读最新目标；协议 <3 时静默丢弃（v2 服务端不认 voice.whisper）。
+func (s *Session) whisperLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.whisperWake:
+			targets := s.takeWhisperWant()
+			if s.protoVer.Load() < 3 || s.ws == nil {
+				continue
+			}
+			_ = s.ws.Send(signal.TypeVoiceWhisper, signal.VoiceWhisperData{Targets: targets})
+		}
+	}
+}
+
+// takeWhisperWant 取当前目标快照。切片一经发布不再原地修改，直接返回安全。
+func (s *Session) takeWhisperWant() []string {
+	s.whisperMu.Lock()
+	want := s.whisperWant
+	s.whisperMu.Unlock()
+	if want == nil {
+		return []string{} // voice.whisper 的 targets 是 required 数组，不能下发 null
+	}
+	return want
+}
+
+// resendWhisperIfAny 重连/重入房后补发当前悄悄话目标（#45）：服务端 SFU peer
+// 是新的，旧目标集合已随旧 Peer 销毁。未按住悄悄话键（want 为空）时不发。
+func (s *Session) resendWhisperIfAny() {
+	s.whisperMu.Lock()
+	n := len(s.whisperWant)
+	s.whisperMu.Unlock()
+	if n > 0 {
+		s.wakeWhisper()
+	}
+}
+
+// updateDucking 重算各远端 peer 的优先发言 ducking（#45）：任一远端优先发言者
+// 正在说话时，其他远端 peer 压低；优先发言者本人不压，自己说话不触发（本地
+// 混音不含自己）。只在说话/优先状态翻转时调用，不在 Tick 热路径。
+func (s *Session) updateDucking() {
+	if s.mixer == nil {
+		return
+	}
+	s.mu.Lock()
+	prioritySpeaking := false
+	ids := make([]string, 0, len(s.members))
+	priority := make(map[string]bool, len(s.members))
+	for uid, m := range s.members {
+		if uid == s.selfID {
+			continue
+		}
+		ids = append(ids, uid)
+		if m.Priority {
+			priority[uid] = true
+			if m.Speaking {
+				prioritySpeaking = true
+			}
+		}
+	}
+	s.mu.Unlock()
+	for _, uid := range ids {
+		if in := s.mixer.Peer(uid); in != nil {
+			in.SetDucked(prioritySpeaking && !priority[uid])
 		}
 	}
 }

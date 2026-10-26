@@ -53,6 +53,23 @@ func TestEffectiveSendMode(t *testing.T) {
 	}
 }
 
+// TestWhisperBinding whisper 绑定（#45）参与规范化/校验，与 PTT 同规则。
+func TestWhisperBinding(t *testing.T) {
+	got := Settings{Whisper: " Alt + W "}.Sanitize()
+	if got.Whisper != "alt+w" {
+		t.Fatalf("Whisper 规范化 = %q，期望 alt+w", got.Whisper)
+	}
+	if err := checkBindings(Settings{Whisper: "alt+w"}); err != nil {
+		t.Fatalf("合法 whisper 绑定被拒: %v", err)
+	}
+	if err := checkBindings(Settings{Whisper: "bogus"}); err == nil {
+		t.Fatal("非法 whisper 绑定应报错")
+	}
+	if b := (Settings{Whisper: "ctrl+alt+w"}).specFor(ActionWhisper); b != "ctrl+alt+w" {
+		t.Fatalf("specFor(ActionWhisper) = %q", b)
+	}
+}
+
 func TestSanitizeConverges(t *testing.T) {
 	in := Settings{
 		Enabled:  true,

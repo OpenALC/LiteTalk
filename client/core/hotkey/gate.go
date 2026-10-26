@@ -18,6 +18,9 @@ type Gate struct {
 	mode      atomic.Uint32
 	pressed   atomic.Bool
 	tailUntil atomic.Int64 // unix nano；0 表示不在尾包窗内
+	// forced 悄悄话旁路（#45）：按住悄悄话键期间无视模式/PTT 放行，但不动
+	// pressed/tailUntil——PTT 与悄悄话同时按住、先后释放时各自的状态互不覆盖。
+	forced atomic.Bool
 }
 
 // SetMode 切换按键说话模式。
@@ -25,6 +28,10 @@ func (g *Gate) SetMode(m Mode) { g.mode.Store(uint32(m)) }
 
 // Press 标记 PTT 按下（按住说话）。重复调用幂等。
 func (g *Gate) Press() { g.pressed.Store(true) }
+
+// Force 悄悄话旁路开关（#45）。true 时 Allow 无条件放行；false 恢复原有
+// 模式/PTT/尾包语义。只改一个原子位，可在音频每帧路径调用。
+func (g *Gate) Force(on bool) { g.forced.Store(on) }
 
 // Release 标记 PTT 松开，并开启长为 tail 的尾包窗：松手后一小段时间内继续
 // 放行，避免最后一个字被硬切。tail<=0 表示不补尾音，同时清掉已开启的尾包窗。
@@ -44,6 +51,9 @@ func (g *Gate) Release(tail time.Duration) {
 // OnSpeakingChange，同一个地方顺手传进来即可，不增加跨 goroutine 状态，
 // 也省掉一次 atomic 往返。
 func (g *Gate) Allow(speaking bool) bool {
+	if g.forced.Load() {
+		return true
+	}
 	switch Mode(g.mode.Load()) {
 	case ModeOpen:
 		return true
