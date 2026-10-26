@@ -125,8 +125,11 @@ func main() {
 	}
 	defer pipe.Close()
 
-	// ---- 下行：混音器 → 管线播放环 ----
-	mixer := audio.NewMixer(pipe.WritePlayback)
+	// ---- 下行：混音器 → 管线播放环（混音输出同时作为 AEC 参考） ----
+	mixer := audio.NewMixer(func(pcm []int16) int {
+		pipe.ProcessRender(pcm)
+		return pipe.WritePlayback(pcm)
+	})
 	remoteMgr = audio.NewRemoteManager(mixer, logger)
 	states := audio.NewStateTable()
 	states.OnChange = func(id string, st audio.PeerVoiceState) {

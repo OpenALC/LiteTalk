@@ -461,7 +461,13 @@ func (s *Session) Connect(serverURL string) {
 		if g := s.sendGate.Load(); g != nil {
 			pipe.SetSendGate(g)
 		}
-		s.mixer = audio.NewMixer(pipe.WritePlayback)
+		// AEC 参考 = 混音器实际输出（含耳聋/欠载的零帧）：先喂 APM render，
+		// 再写播放环。混音 tick 是单 goroutine，且写环非阻塞，不会拖慢节拍。
+		// 播放环/声卡引入的附加延迟由 AEC3 的延迟估计吸收。
+		s.mixer = audio.NewMixer(func(pcm []int16) int {
+			pipe.ProcessRender(pcm)
+			return pipe.WritePlayback(pcm)
+		})
 		s.remoteMgr = audio.NewRemoteManager(s.mixer, s.log)
 		// 新接入的远端轨才在混音器里出现，入房快照里的「优先发言者正在说话」
 		// 需要在这时补一次 ducking 重算，否则要等下一次说话翻转才生效（#45）。
@@ -1541,6 +1547,7 @@ func (s *Session) ApplyAudio(rs audio.RuntimeSettings) error {
 	}
 	s.pipe.SetAGC(rs.AGC)
 	s.pipe.SetGain(rs.Gain)
+	s.pipe.SetDisableAEC(rs.DisableAEC)
 	if s.mixer != nil {
 		s.mixer.SetMasterGain(rs.PlaybackGain)
 	}
