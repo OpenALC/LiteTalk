@@ -44,7 +44,7 @@ func TestClientHelloNegotiation(t *testing.T) {
 	f := newChatFixture(t)
 	c := f.dial("1", "alice")
 
-	c.send(TypeClientHello, ClientHelloData{Min: 1, Max: 2})
+	c.send(TypeClientHello, ClientHelloData{Min: 1, Max: 3})
 	env := c.recvUntil(TypeServerHello)
 	var d ServerHelloData
 	if err := env.Decode(&d); err != nil {
@@ -79,7 +79,7 @@ func TestServerHelloSessionIDEmpty(t *testing.T) {
 	f := newChatFixture(t)
 	c := f.dial("1:desktop:", "alice") // 显式空 sid
 
-	c.send(TypeClientHello, ClientHelloData{Min: 1, Max: 2})
+	c.send(TypeClientHello, ClientHelloData{Min: 1, Max: 3})
 	env := c.recvUntil(TypeServerHello)
 	var d ServerHelloData
 	if err := env.Decode(&d); err != nil {

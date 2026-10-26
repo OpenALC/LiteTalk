@@ -7,11 +7,11 @@ package signal
 
 import "github.com/coder/websocket"
 
-// 协议版本（api/signal/catalog.json）。v2 起含网关事件面与 RFC 6464 说话状态。
+// 协议版本（api/signal/catalog.json）。v2 起含网关事件面与 RFC 6464 说话状态；v3 起含同频道悄悄话与优先发言。
 const (
 	ProtocolVersionMin     = 1
-	ProtocolVersionMax     = 2
-	ProtocolVersionCurrent = 2
+	ProtocolVersionMax     = 3
+	ProtocolVersionCurrent = 3
 )
 
 // 信令消息类型（wire 值见 api/signal/messages/*.schema.json 的 x-wire-type）。
@@ -41,10 +41,12 @@ const (
 	TypeServerShutdown        = "server.shutdown"         // S→C
 	TypeSessionKicked         = "session.kicked"          // S→C
 	TypeSessionVoiceTaken     = "session.voice_taken"     // S→C
+	TypeVoicePriority         = "voice.priority"          // S→C · since 3
 	TypeVoiceRequestState     = "voice.request_state"     // C→S
 	TypeVoiceSpeaking         = "voice.speaking"          // S→C · since 2
 	TypeVoiceState            = "voice.state"             // 双向
 	TypeVoiceStateRequest     = "voice.state_request"     // S→C
+	TypeVoiceWhisper          = "voice.whisper"           // C→S · since 3
 )
 
 // 下行 error 消息的 code 取值（api/signal/catalog.json error_codes）。
@@ -104,7 +106,8 @@ type MemberInfo struct {
 	Mute     bool   `json:"mute"`
 	Deafen   bool   `json:"deafen"`
 	Speaking bool   `json:"speaking"`
-	Online   bool   `json:"online"` // 在线态（presence:{uid} 存在即在线），与 REST 成员视图同源
+	Online   bool   `json:"online"`             // 在线态（presence:{uid} 存在即在线），与 REST 成员视图同源
+	Priority bool   `json:"priority,omitempty"` // 优先发言（PrioritySpeaker，#45，协议 v3）：owner/Administrator 经 effective() 自动为 true；角色/成员角色变更在下次 channel.joined 刷新。缺省 false。
 }
 
 // ReplyPreview 回复消息的预览快照（#39）：只含跳转与展示所需字段；被引用消息已软删时 content 为空、deleted=true。
@@ -286,6 +289,13 @@ type SessionKickedData struct {
 	DeviceType string `json:"device_type"` // 被踢连接自身的设备类型
 }
 
+// VoicePriorityData 优先发言（PrioritySpeaker）状态变更（#45）。只发给该语音房间成员的全部在线连接（含接收者本人的多设备）。频道覆盖变更后实时下发；角色/成员角色变更不实时广播，重进房时由 channel.joined 的 MemberInfo.priority 刷新。
+type VoicePriorityData struct {
+	ChannelID string `json:"channel_id"`
+	UserID    string `json:"user_id"`
+	Priority  bool   `json:"priority"`
+}
+
 // VoiceRequestStateData 请求目标成员闭麦/静音。仅「请求」语义：服务端定向转发给目标，由目标自行决定是否执行（无权限强制）。
 type VoiceRequestStateData struct {
 	ChannelID string `json:"channel_id"`
@@ -316,4 +326,9 @@ type VoiceStateRequestData struct {
 	Mute   *bool     `json:"mute,omitempty"`
 	Deafen *bool     `json:"deafen,omitempty"`
 	TS     int64     `json:"ts"`
+}
+
+// VoiceWhisperData 同频道悄悄话目标（#45）。瞬时语义，不进补发环：按住悄悄话键时下发当前目标集合，服务端只把这些成员作为该连接上行音频的接收者（绕过活跃门，server_muted 仍优先）；空数组 = 取消。目标必须是同频道成员，服务端去重、排除自己并静默过滤已离房者；上限 100。
+type VoiceWhisperData struct {
+	Targets []string `json:"targets"` // 悄悄话目标用户 ID 列表（十进制字符串）；空数组取消悄悄话。
 }

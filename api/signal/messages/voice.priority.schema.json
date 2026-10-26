@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litetalk:signal:voice.priority",
+  "title": "VoicePriorityData",
+  "x-wire-type": "voice.priority",
+  "x-go-const": "TypeVoicePriority",
+  "x-direction": "S2C",
+  "x-since": 3,
+  "x-namespace": "voice",
+  "description": "优先发言（PrioritySpeaker）状态变更（#45）。只发给该语音房间成员的全部在线连接（含接收者本人的多设备）。频道覆盖变更后实时下发；角色/成员角色变更不实时广播，重进房时由 channel.joined 的 MemberInfo.priority 刷新。",
+  "type": "object",
+  "properties": {
+    "channel_id": { "type": "string" },
+    "user_id": { "type": "string" },
+    "priority": { "type": "boolean" }
+  },
+  "required": ["channel_id", "user_id", "priority"],
+  "additionalProperties": false
+}

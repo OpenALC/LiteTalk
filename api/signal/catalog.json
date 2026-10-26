@@ -2,8 +2,8 @@
   "$comment": "信令契约目录（#29）。消息类型/错误码/close code/协议版本的唯一事实来源；两侧 protocol_gen.go 由 server/api/tools/signalgen 生成。只增不改：删字段或改语义须升协议版本并征得用户同意。",
   "protocol_versions": {
     "min": 1,
-    "max": 2,
-    "current": 2
+    "max": 3,
+    "current": 3
   },
   "close_codes": [
     {
