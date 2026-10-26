@@ -4,6 +4,7 @@ import (
 	"context"
 	"strconv"
 	"testing"
+	"time"
 )
 
 // #45：悄悄话信令校验、MemberInfo.priority 与 voice.priority 的收件人范围。
@@ -202,6 +203,148 @@ func TestBroadcastVoicePriorityRecipients(t *testing.T) {
 	// 若混入 voice.priority 即失败。
 	a.send(TypeChannelLeave, ChannelLeaveData{})
 	recvUntilNo(t, m, TypeChannelPeerLeft, TypeVoicePriority)
+}
+
+// waitHubWhisper 等 hub 侧悄悄话快照达到期望状态（同包测试读 h.mu）。
+// wantActive=false 表示条目应被删除（取消/离房）。
+func waitHubWhisper(t *testing.T, h *Hub, roomID, uid string, wantActive bool, wantTarget string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		h.mu.Lock()
+		var ws whisperState
+		ok := false
+		if room := h.rooms[roomID]; room != nil {
+			ws, ok = room.whisper[uid]
+		}
+		h.mu.Unlock()
+		if !wantActive {
+			if !ok {
+				return
+			}
+		} else if ok && ws.active && (wantTarget == "" || ws.targets[wantTarget]) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("hub 悄悄话快照未达到期望（room=%s uid=%s active=%v target=%s）", roomID, uid, wantActive, wantTarget)
+}
+
+// TestWhisperSpeakingScopedV2 悄悄话期间 voice.speaking 只发给目标与说话者本人；
+// 目标含同 uid 的其他在线设备；非目标不收到。取消后恢复全房广播。
+func TestWhisperSpeakingScopedV2(t *testing.T) {
+	f := newChatFixture(t)
+	vchID := strconv.FormatInt(f.vch.ID, 10)
+
+	a := f.dial("1", "alice")
+	if v := negotiate(t, a, 3); v != 3 {
+		t.Fatalf("alice 协商版本 = %d，期望 3", v)
+	}
+	b := f.dial("2", "bob")
+	negotiate(t, b, 3)
+	m := f.dial("9", "mallory")
+	negotiate(t, m, 3)
+	joinAndCapture(t, a, vchID)
+	joinAndCapture(t, b, vchID)
+	joinAndCapture(t, m, vchID)
+	// bob 的第二台设备：同一 uid 在线但不在房间内，仍应收到目标相关的说话指示。
+	phone := f.dial("2:phone", "bob-phone")
+	negotiate(t, phone, 3)
+
+	a.send(TypeVoiceWhisper, VoiceWhisperData{Targets: []string{"2"}})
+	waitHubWhisper(t, f.hub, vchID, "1", true, "2")
+
+	f.hub.broadcastVoiceSpeaking(vchID, "1", true)
+	want := VoiceSpeakingData{ChannelID: vchID, UserID: "1", Speaking: true}
+	for _, c := range []*wsClient{a, b, phone} {
+		var d VoiceSpeakingData
+		if err := c.recvUntil(TypeVoiceSpeaking).Decode(&d); err != nil {
+			t.Fatalf("decode voice.speaking（%s）: %v", c.user, err)
+		}
+		if d != want {
+			t.Fatalf("voice.speaking（%s）= %+v，期望 %+v", c.user, d, want)
+		}
+	}
+
+	// 非目标 mallory：marker 之前不得出现 voice.speaking。
+	f.hub.sendJSON(f.hub.roomMember(vchID, "9"), "test.marker", nil)
+	recvUntilNo(t, m, "test.marker", TypeVoiceSpeaking)
+
+	// 取消悄悄话后 speaking 恢复全房广播（非目标也能收到）。
+	a.send(TypeVoiceWhisper, VoiceWhisperData{Targets: []string{}})
+	waitHubWhisper(t, f.hub, vchID, "1", false, "")
+	f.hub.broadcastVoiceSpeaking(vchID, "1", false)
+	var off VoiceSpeakingData
+	if err := m.recvUntil(TypeVoiceSpeaking).Decode(&off); err != nil {
+		t.Fatalf("decode voice.speaking（取消后）: %v", err)
+	}
+	if off.UserID != "1" || off.Speaking {
+		t.Fatalf("取消后非目标应收到 speaking=false，实际 %+v", off)
+	}
+}
+
+// TestWhisperSpeakingScopedLegacy v1 legacy 路径同样收窄：目标收到
+// voice.state{speaking}，非目标收不到；取消后恢复。
+func TestWhisperSpeakingScopedLegacy(t *testing.T) {
+	f := newChatFixture(t)
+	vchID := strconv.FormatInt(f.vch.ID, 10)
+
+	a := f.dial("1", "alice")
+	negotiate(t, a, 3)
+	b := f.dial("2", "bob") // 不协商：按 v1 处理
+	m := f.dial("9", "mallory")
+	joinAndCapture(t, a, vchID)
+	joinAndCapture(t, b, vchID)
+	joinAndCapture(t, m, vchID)
+
+	a.send(TypeVoiceWhisper, VoiceWhisperData{Targets: []string{"2"}})
+	waitHubWhisper(t, f.hub, vchID, "1", true, "2")
+
+	f.hub.broadcastVoiceSpeaking(vchID, "1", true)
+	var d VoiceStateData
+	if err := b.recvUntil(TypeVoiceState).Decode(&d); err != nil {
+		t.Fatalf("decode voice.state（目标）: %v", err)
+	}
+	if d.UserID != "1" || d.Speaking == nil || !*d.Speaking {
+		t.Fatalf("目标 v1 应收 speaking=true，实际 %+v", d)
+	}
+
+	// 非目标 mallory：marker 之前不得出现 voice.state。
+	f.hub.sendJSON(f.hub.roomMember(vchID, "9"), "test.marker", nil)
+	recvUntilNo(t, m, "test.marker", TypeVoiceState)
+
+	// 取消后非目标恢复收 voice.state。
+	a.send(TypeVoiceWhisper, VoiceWhisperData{Targets: []string{}})
+	waitHubWhisper(t, f.hub, vchID, "1", false, "")
+	f.hub.broadcastVoiceSpeaking(vchID, "1", false)
+	var off VoiceStateData
+	if err := m.recvUntil(TypeVoiceState).Decode(&off); err != nil {
+		t.Fatalf("decode voice.state（取消后）: %v", err)
+	}
+	if off.UserID != "1" || off.Speaking == nil || *off.Speaking {
+		t.Fatalf("取消后非目标应收 speaking=false，实际 %+v", off)
+	}
+}
+
+// TestWhisperStateClearedOnLeave 离房/被顶号后 hub 快照必须删除：
+// 旧目标不得影响同 uid 的新连接或下次进房。
+func TestWhisperStateClearedOnLeave(t *testing.T) {
+	f := newChatFixture(t)
+	vchID := strconv.FormatInt(f.vch.ID, 10)
+	a := f.dial("1", "alice")
+	b := f.dial("2", "bob")
+	joinAndCapture(t, a, vchID)
+	joinAndCapture(t, b, vchID)
+
+	a.send(TypeVoiceWhisper, VoiceWhisperData{Targets: []string{"2"}})
+	waitHubWhisper(t, f.hub, vchID, "1", true, "2")
+
+	a.send(TypeChannelLeave, ChannelLeaveData{})
+	waitHubWhisper(t, f.hub, vchID, "1", false, "")
+	// 房间仍在（bob 未走），确保删除的是成员级快照而不是整房销毁。
+	if f.hub.roomMemberCount(vchID) != 1 {
+		t.Fatalf("离房后房间人数 = %d，期望 1", f.hub.roomMemberCount(vchID))
+	}
 }
 
 // TestBroadcastVoicePriorityNoRoom 房间不存在时静默返回（REST 调用方可直接调）。

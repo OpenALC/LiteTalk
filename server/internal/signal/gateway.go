@@ -17,6 +17,7 @@ package signal
 
 import (
 	"encoding/json"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -319,6 +320,29 @@ func (h *Hub) broadcastEvent(uids map[string]bool, msgType string, data any) {
 	}
 }
 
+// speakingRecipientsLocked 悄悄话生效时说话事件的收件 uid 集合（#45）：
+// 目标 + 说话者本人；目标只保留仍在房间里的成员。nil = 未启用悄悄话，保持
+// 原广播范围。调用方须持 h.mu；不得访问 SFU。
+func speakingRecipientsLocked(room *roomState, speakerUID string) map[string]bool {
+	ws, ok := room.whisper[speakerUID]
+	if !ok || !ws.active {
+		return nil
+	}
+	// 实例核对：旧连接残留的悄悄话态不得影响新连接。
+	m := room.members[speakerUID]
+	if m == nil || ws.connID != strconv.FormatUint(m.connID, 10) {
+		return nil
+	}
+	allowed := make(map[string]bool, len(ws.targets)+1)
+	allowed[speakerUID] = true
+	for uid := range ws.targets {
+		if room.members[uid] != nil {
+			allowed[uid] = true
+		}
+	}
+	return allowed
+}
+
 // broadcastVoiceSpeaking 说话翻转下发（#33）：SFU 按 RFC 6464 电平统一判定后
 // 经此投递网关事件面。按连接协议版本分流（裁定 #5 兼容过渡，一个版本周期）：
 //   - 协议 ≥2：voice.speaking 即时下行、**不进补发环**（seq=0），含本人（自己的
@@ -327,13 +351,21 @@ func (h *Hub) broadcastEvent(uids map[string]bool, msgType string, data any) {
 //   - 协议 <2（v1/未协商）：退化为 voice.state{speaking}——老客户端只认这条路，
 //     行为与今天一致（不含本人：v1 的自我指示由本地 DSP 驱动）。
 //
+// #45：源处于悄悄话 active 时，收件人收窄为 targets + 说话者本人（按 uid，
+// v2 含其多设备），非目标既不看指示、也不会因优先发言等逻辑被误导。
+// 过滤只读 hub roomState 的 whisper 快照——不得反调 SFU（死锁约定）。
+//
 // 调用方（SFU 判定 ticker）不持任何 SFU 锁；本函数不得反调 SFU。
 func (h *Hub) broadcastVoiceSpeaking(channelID, userID string, speaking bool) {
 	h.mu.Lock()
 	var legacy []*client
 	v2uids := make(map[string]bool)
 	if room := h.rooms[channelID]; room != nil {
+		allowed := speakingRecipientsLocked(room, userID)
 		for uid, m := range room.members {
+			if allowed != nil && !allowed[uid] {
+				continue
+			}
 			if m.protoVer.Load() >= 2 {
 				v2uids[uid] = true
 			} else {

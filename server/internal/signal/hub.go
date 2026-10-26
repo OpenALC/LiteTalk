@@ -110,6 +110,20 @@ type roomState struct {
 	id       string
 	serverID int64
 	members  map[string]*client // userID → client
+	// whisper uid → 当前生效的悄悄话快照（#45，受 h.mu 保护）。SFU Peer 上也有一份
+	// 同源快照，这里存 hub 侧副本有两个用途：voice.whisper 早于 rtc.offer 到达
+	// （peer 尚不存在）时在 peer 建立后补应用；voice.speaking 收窄收件人时读取
+	// （广播回调不得反调 SFU）。targets 发布后不再原地修改。
+	whisper map[string]whisperState
+}
+
+// whisperState 单个成员生效中的悄悄话目标（#45）。connID 用于实例核对：
+// 同 uid 新连接顶替后，旧连接迟到的状态不得影响新连接。active=false 不存储
+// （取消时直接删除条目）。
+type whisperState struct {
+	connID  string
+	active  bool
+	targets map[string]bool // uid 集合（已按同房成员过滤）
 }
 
 // client 一条 WS 连接。
@@ -1101,6 +1115,9 @@ func (h *Hub) leaveWorkLocked(c *client) *leaveWork {
 	}
 	if room.members[c.userID] == c {
 		delete(room.members, c.userID)
+		// 悄悄话随成员身份一起失效（#45）：离房/被顶号后不得把旧目标留给
+		// 同 uid 的新连接或下一次进房。
+		delete(room.whisper, c.userID)
 		if h.userRooms[c.userID] == roomID {
 			delete(h.userRooms, c.userID)
 		}
@@ -1159,6 +1176,9 @@ func (h *Hub) handleRTCOffer(c *client, sdp string) {
 		h.sendError(c, code, "RTC 协商失败: "+err.Error())
 		return
 	}
+	// peer 已建立：补应用可能早于 rtc.offer 到达的悄悄话目标（#45），
+	// 必须在客户端收到 answer 并发首个上行包之前完成。
+	h.applyRoomWhisper(c, roomID)
 	h.sendJSON(c, TypeRTCAnswer, SDPData{SDP: answer})
 }
 
@@ -1302,20 +1322,32 @@ func (h *Hub) handleVoiceWhisper(c *client, d VoiceWhisperData) {
 		h.sendError(c, ErrCodeNotInChannel, "不在频道中")
 		return
 	}
+	connIDStr := strconv.FormatUint(c.connID, 10)
 	h.mu.Lock()
 	room := h.rooms[roomID]
 	// 发送者归属核对：同 uid 新连接顶替后，旧连接的迟到信令不得生效。
 	inRoom := room != nil && room.members[c.userID] == c
 	var filtered []string
+	var targetSet map[string]bool
 	if inRoom {
 		filtered = make([]string, 0, len(d.Targets))
-		seen := make(map[string]bool, len(d.Targets))
+		targetSet = make(map[string]bool, len(d.Targets))
 		for _, uid := range d.Targets {
-			if uid == "" || uid == c.userID || seen[uid] || room.members[uid] == nil {
+			if uid == "" || uid == c.userID || targetSet[uid] || room.members[uid] == nil {
 				continue
 			}
-			seen[uid] = true
+			targetSet[uid] = true
 			filtered = append(filtered, uid)
+		}
+		// hub 侧快照：rtc.offer 晚于本消息时在 peer 建立后补应用；speaking
+		// 广播据此收窄收件人。空数组 = 取消，直接删条目（不存 inactive）。
+		if room.whisper == nil {
+			room.whisper = make(map[string]whisperState)
+		}
+		if len(d.Targets) > 0 {
+			room.whisper[c.userID] = whisperState{connID: connIDStr, active: true, targets: targetSet}
+		} else {
+			delete(room.whisper, c.userID)
 		}
 	}
 	h.mu.Unlock()
@@ -1323,13 +1355,47 @@ func (h *Hub) handleVoiceWhisper(c *client, d VoiceWhisperData) {
 		h.sendError(c, ErrCodeNotInChannel, "不在频道中")
 		return
 	}
-	if !h.sfu.SetWhisperTargets(roomID, c.userID, strconv.FormatUint(c.connID, 10), filtered, len(d.Targets) > 0) {
-		// channel.join 与 rtc.offer 之间 SFU peer 尚不存在：此时还没有可转发的
-		// 上行轨道，静默忽略即可（客户端按住期间不会重复下单次目标）。
-		h.log.Printf("ws: %s 悄悄话目标未应用（频道 %s 的 SFU peer 尚未建立）", c.userID, roomID)
+	if !h.sfu.SetWhisperTargets(roomID, c.userID, connIDStr, filtered, len(d.Targets) > 0) {
+		// channel.join 与 rtc.offer 之间 SFU peer 尚不存在：hub 已记录快照，
+		// handleRTCOffer 建好 peer 后会补应用，不会以全房转发泄漏悄悄话。
+		if len(d.Targets) > 0 {
+			h.log.Printf("ws: %s 悄悄话目标暂存（频道 %s 的 SFU peer 尚未建立），建 peer 后补应用", c.userID, roomID)
+		} else {
+			h.log.Printf("ws: %s 取消悄悄话（频道 %s 的 SFU peer 尚未建立）", c.userID, roomID)
+		}
 		return
 	}
 	h.log.Printf("ws: 频道 %s 成员 %s 悄悄话目标 %d 人", roomID, c.userID, len(filtered))
+}
+
+// applyRoomWhisper 把 hub 缓存的悄悄话目标补应用到场内 SFU peer（#45）。
+// voice.whisper 可能早于 rtc.offer 到达（入房后立刻按住），当时 peer 尚不存在；
+// peer 建立后必须在首个上行包之前补上白名单，否则会按普通全房转发。
+// 快照按 connID 核对，旧连接的迟到状态不会写给新连接。
+func (h *Hub) applyRoomWhisper(c *client, roomID string) {
+	connIDStr := strconv.FormatUint(c.connID, 10)
+	h.mu.Lock()
+	room := h.rooms[roomID]
+	found := false
+	var targets []string
+	if room != nil && room.members[c.userID] == c {
+		if ws, ok := room.whisper[c.userID]; ok && ws.active && ws.connID == connIDStr {
+			targets = make([]string, 0, len(ws.targets))
+			for uid := range ws.targets {
+				targets = append(targets, uid)
+			}
+			found = true
+		}
+	}
+	h.mu.Unlock()
+	if !found {
+		return
+	}
+	if !h.sfu.SetWhisperTargets(roomID, c.userID, connIDStr, targets, true) {
+		h.log.Printf("ws: %s 悄悄话目标补应用失败（频道 %s 的 SFU peer 缺失）", c.userID, roomID)
+		return
+	}
+	h.log.Printf("ws: 频道 %s 成员 %s 悄悄话目标补应用 %d 人", roomID, c.userID, len(targets))
 }
 
 // enrichMemberPriority 填充 MemberInfo.priority（#45）：authz 查询失败按 false，
