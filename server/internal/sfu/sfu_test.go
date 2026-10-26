@@ -29,8 +29,10 @@ type testClient struct {
 	remoteSet    bool
 	pendingCands []webrtc.ICECandidateInit
 
-	tracksUp atomic.Int64 // OnTrack 次数（重入房断言用：订阅端必须拿到新 OnTrack）
-	gen      atomic.Int64 // 读取代际：stopTrackReaders 后旧循环停计数（模拟 peer_left 拆读取循环）
+	tracksUp atomic.Int64  // OnTrack 次数（重入房断言用：订阅端必须拿到新 OnTrack）
+	gen      atomic.Int64  // 读取代际：stopTrackReaders 后旧循环停计数（模拟 peer_left 拆读取循环）
+	seq      atomic.Uint32 // 发送序号计数器：同一客户端可能并行多条 sendLoop（测试），
+	// 序号必须全局单调，否则 SRTP 抗重放会把后起步的那条流整段丢掉。
 
 	failedMu sync.Mutex
 	failed   []string // SendFailed 记录（#19）："<channelID>|<userID>|<reason>"
@@ -115,6 +117,7 @@ func newTestClientConfig(t *testing.T, s *SFU, roomID, userID string, networks [
 	t.Cleanup(func() { _ = pc.Close() })
 
 	c := &testClient{t: t, sfu: s, roomID: roomID, userID: userID, pc: pc}
+	c.seq.Store(100)
 
 	track, err := webrtc.NewTrackLocalStaticRTP(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
@@ -251,8 +254,6 @@ func (s *sentSet) has(p []byte) bool {
 // sendLoop 以 50pps 发送带唯一标记的 RTP，直到 stop 关闭。
 // payload 不是真实 Opus——透传与编解码无关，正好验证"不解包不分析"。
 func (c *testClient) sendLoop(stop <-chan struct{}, sent *sentSet, prefix string) {
-	seq := uint16(100)
-	ts := uint32(1000)
 	for i := 0; ; i++ {
 		select {
 		case <-stop:
@@ -261,8 +262,8 @@ func (c *testClient) sendLoop(stop <-chan struct{}, sent *sentSet, prefix string
 		}
 		payload := []byte(fmt.Sprintf("%s-%d", prefix, i))
 		sent.add(payload)
-		seq++
-		ts += 960
+		seq := uint16(c.seq.Add(1))
+		ts := uint32(seq) * 960
 		_ = c.track.WriteRTP(&rtp.Packet{
 			Header:  rtp.Header{Version: 2, SequenceNumber: seq, Timestamp: ts},
 			Payload: payload,
