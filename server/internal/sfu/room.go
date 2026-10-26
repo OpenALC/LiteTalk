@@ -355,13 +355,15 @@ func (r *Room) forward(src *Peer, srcTrack *webrtc.TrackRemote, levelExtID uint8
 	}
 }
 
-// SetWhisperTargets 设置/清除某成员的悄悄话目标集合（#45）。targets 为空 = 取消。
+// SetWhisperTargets 设置/清除某成员的悄悄话目标集合（#45）。active=false 表示
+// 取消（恢复普通转发）；active=true 时即使 targets 为空也保持悄悄话态——目标
+// 全部离房的情况下必须谁都不发，不能回落成全房广播（隐私边界）。
 // connID 归属核对（§0.9 同类保护）：旧连接迟到的信令不得改写新连接的悄悄话状态；
 // 成员不在房/连接不符返回 false，调用方静默忽略（此时尚无上行轨道，不存在泄漏
 // 窗口）。目标集合一次性构建后原子替换，包路径零分配。
-func (r *Room) SetWhisperTargets(userID, connID string, targets []string) bool {
+func (r *Room) SetWhisperTargets(userID, connID string, targets []string, active bool) bool {
 	var snap *map[string]struct{}
-	if len(targets) > 0 {
+	if active {
 		m := make(map[string]struct{}, len(targets))
 		for _, uid := range targets {
 			// 防御性排除自己：自己永远不是转发目标。
@@ -369,9 +371,7 @@ func (r *Room) SetWhisperTargets(userID, connID string, targets []string) bool {
 				m[uid] = struct{}{}
 			}
 		}
-		if len(m) > 0 {
-			snap = &m
-		}
+		snap = &m
 	}
 	r.mu.Lock()
 	p := r.peers[userID]

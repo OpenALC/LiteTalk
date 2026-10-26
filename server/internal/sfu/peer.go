@@ -64,9 +64,10 @@ type Peer struct {
 	// 初值继承 room.serverMuted[userID]（同房重入/换连接仍生效）；服务端解禁复位。
 	serverMuted atomic.Bool
 	// whisperTargets 同频道悄悄话目标（#45）：非 nil = 悄悄话激活，forward 只向
-	// 集合内的 uid 转发并绕过 fwdActive；nil = 普通转发。值为不可变 map 快照，
-	// 切换时整体替换；forward 每包只原子读 + 查表，禁止在包路径取锁或建 map。
-	// 目标按 uid 匹配（与路由记账一致），实例归属由 SetWhisperTargets 的 connID 核对保证。
+	// 集合内的 uid 转发并绕过 fwdActive；nil = 普通转发。集合可以为空——目标
+	// 全部离房时必须保持「谁都不发」的悄悄话态，绝不能回落成全房广播。
+	// 值为不可变 map 快照，切换时整体替换；forward 每包只原子读 + 查表，禁止
+	// 在包路径取锁或建 map。目标按 uid 匹配，实例归属由 SetWhisperTargets 核对。
 	whisperTargets atomic.Pointer[map[string]struct{}]
 
 	// —— 以下仅 speakingLoop goroutine 访问（单写者，免锁）——

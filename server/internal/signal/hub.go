@@ -1323,7 +1323,7 @@ func (h *Hub) handleVoiceWhisper(c *client, d VoiceWhisperData) {
 		h.sendError(c, ErrCodeNotInChannel, "不在频道中")
 		return
 	}
-	if !h.sfu.SetWhisperTargets(roomID, c.userID, strconv.FormatUint(c.connID, 10), filtered) {
+	if !h.sfu.SetWhisperTargets(roomID, c.userID, strconv.FormatUint(c.connID, 10), filtered, len(d.Targets) > 0) {
 		// channel.join 与 rtc.offer 之间 SFU peer 尚不存在：此时还没有可转发的
 		// 上行轨道，静默忽略即可（客户端按住期间不会重复下单次目标）。
 		h.log.Printf("ws: %s 悄悄话目标未应用（频道 %s 的 SFU peer 尚未建立）", c.userID, roomID)

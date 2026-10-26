@@ -15,7 +15,7 @@ func TestWhisperFiltersToTargets(t *testing.T) {
 	bob := newTestClient(t, s, "c1", "bob")
 	carol := newTestClient(t, s, "c1", "carol")
 
-	if !s.SetWhisperTargets("c1", "alice", "alice", []string{"bob"}) {
+	if !s.SetWhisperTargets("c1", "alice", "alice", []string{"bob"}, true) {
 		t.Fatal("SetWhisperTargets 应命中在房成员")
 	}
 	stop := make(chan struct{})
@@ -32,7 +32,7 @@ func TestWhisperFiltersToTargets(t *testing.T) {
 	}
 
 	// 空目标 = 取消：恢复普通全房转发。
-	if !s.SetWhisperTargets("c1", "alice", "alice", nil) {
+	if !s.SetWhisperTargets("c1", "alice", "alice", nil, false) {
 		t.Fatal("清除悄悄话应命中")
 	}
 	sentAfter := newSentSet()
@@ -74,7 +74,7 @@ func TestWhisperBypassesActiveGate(t *testing.T) {
 		t.Fatal("前置条件失败：alice 应被活跃门关闭")
 	}
 
-	if !s.SetWhisperTargets("c1", "alice", "alice", []string{"bob"}) {
+	if !s.SetWhisperTargets("c1", "alice", "alice", []string{"bob"}, true) {
 		t.Fatal("SetWhisperTargets 应命中")
 	}
 	stop := make(chan struct{})
@@ -92,7 +92,7 @@ func TestServerMutedBeatsWhisper(t *testing.T) {
 	alice := newTestClient(t, s, "c1", "alice")
 	bob := newTestClient(t, s, "c1", "bob")
 
-	if !s.SetWhisperTargets("c1", "alice", "alice", []string{"bob"}) {
+	if !s.SetWhisperTargets("c1", "alice", "alice", []string{"bob"}, true) {
 		t.Fatal("SetWhisperTargets 应命中")
 	}
 	if !s.SetServerMuted("c1", "alice", true) {
@@ -121,7 +121,7 @@ func TestWhisperSwitchTargets(t *testing.T) {
 	bob := newTestClient(t, s, "c1", "bob")
 	carol := newTestClient(t, s, "c1", "carol")
 
-	if !s.SetWhisperTargets("c1", "alice", "alice", []string{"bob"}) {
+	if !s.SetWhisperTargets("c1", "alice", "alice", []string{"bob"}, true) {
 		t.Fatal("SetWhisperTargets 应命中")
 	}
 	stop := make(chan struct{})
@@ -133,7 +133,7 @@ func TestWhisperSwitchTargets(t *testing.T) {
 	}
 
 	// 切换到 carol：用新标记，避免切换瞬间的在途包干扰计数。
-	if !s.SetWhisperTargets("c1", "alice", "alice", []string{"carol"}) {
+	if !s.SetWhisperTargets("c1", "alice", "alice", []string{"carol"}, true) {
 		t.Fatal("切换目标应命中")
 	}
 	sentCarol := newSentSet()
@@ -154,13 +154,13 @@ func TestWhisperConnIdentity(t *testing.T) {
 	alice := newTestClient(t, s, "c1", "alice")
 	_ = alice
 
-	if s.SetWhisperTargets("c1", "alice", "stale-conn", []string{"bob"}) {
+	if s.SetWhisperTargets("c1", "alice", "stale-conn", []string{"bob"}, true) {
 		t.Fatal("connID 不符时应拒绝")
 	}
 	if p := s.findPeer("c1", "alice"); p == nil || p.whisperTargets.Load() != nil {
 		t.Fatal("被拒绝的调用不得改写悄悄话状态")
 	}
-	if !s.SetWhisperTargets("c1", "alice", "alice", []string{"bob"}) {
+	if !s.SetWhisperTargets("c1", "alice", "alice", []string{"bob"}, true) {
 		t.Fatal("正确 connID 应命中")
 	}
 
@@ -169,6 +169,38 @@ func TestWhisperConnIdentity(t *testing.T) {
 	_ = alice2
 	if p := s.findPeer("c1", "alice"); p == nil || p.whisperTargets.Load() != nil {
 		t.Fatal("重入的新 peer 不应继承悄悄话目标")
+	}
+}
+
+// TestWhisperActiveEmptyTargets 目标全部离房/被过滤掉时保持悄悄话态：
+// 谁都不发，绝不回落成全房广播（隐私边界）。
+func TestWhisperActiveEmptyTargets(t *testing.T) {
+	s := newTestSFU(t, 10)
+	alice := newTestClient(t, s, "c1", "alice")
+	bob := newTestClient(t, s, "c1", "bob")
+	_ = bob
+
+	// active=true + 空集合：悄悄话处于「暂无接收者」状态。
+	if !s.SetWhisperTargets("c1", "alice", "alice", nil, true) {
+		t.Fatal("SetWhisperTargets 应命中")
+	}
+	stop := make(chan struct{})
+	defer close(stop)
+	sent := newSentSet()
+	go alice.sendLoop(stop, sent, "empty-whisper")
+	time.Sleep(500 * time.Millisecond)
+	if n := bob.countMatching(sent); n != 0 {
+		t.Fatalf("目标为空时不得回落全房广播，bob 收到 %d 包", n)
+	}
+
+	// 显式取消后恢复普通转发。
+	if !s.SetWhisperTargets("c1", "alice", "alice", nil, false) {
+		t.Fatal("取消悄悄话应命中")
+	}
+	sentNormal := newSentSet()
+	go alice.sendLoop(stop, sentNormal, "normal")
+	if bob.waitFor(sentNormal, 10*time.Second) == nil {
+		t.Fatal("取消悄悄话后应恢复全房转发")
 	}
 }
 
@@ -188,7 +220,7 @@ func TestWhisperConcurrentSet(t *testing.T) {
 		defer close(done)
 		targets := [][]string{{"bob"}, nil, {"bob", "carol"}, {}}
 		for i := 0; i < 200; i++ {
-			if !s.SetWhisperTargets("c1", "alice", "alice", targets[i%len(targets)]) {
+			if !s.SetWhisperTargets("c1", "alice", "alice", targets[i%len(targets)], true) {
 				t.Errorf("SetWhisperTargets 应命中（第 %d 次）", i)
 				return
 			}

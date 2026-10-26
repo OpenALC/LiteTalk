@@ -537,13 +537,14 @@ func (s *SFU) SetServerMuted(roomID, userID string, muted bool) bool {
 	return true
 }
 
-// SetWhisperTargets 设置/清除某成员的悄悄话目标集合（#45，空集合取消）。
+// SetWhisperTargets 设置/清除某成员的悄悄话目标集合（#45）。active=false 取消；
+// active=true 且 targets 为空表示目标全部离房——保持悄悄话态，谁都收不到。
 // connID 归属核对由 Room.SetWhisperTargets 完成；成员不在房/连接不符返回 false，
 // 调用方静默忽略（此时尚无该成员的上行轨道可转发）。
-func (s *SFU) SetWhisperTargets(roomID, userID, connID string, targets []string) bool {
+func (s *SFU) SetWhisperTargets(roomID, userID, connID string, targets []string, active bool) bool {
 	room := s.findRoom(roomID)
 	if room == nil {
 		return false
 	}
-	return room.SetWhisperTargets(userID, connID, targets)
+	return room.SetWhisperTargets(userID, connID, targets, active)
 }

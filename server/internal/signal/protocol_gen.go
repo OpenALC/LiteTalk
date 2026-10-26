@@ -328,7 +328,7 @@ type VoiceStateRequestData struct {
 	TS     int64     `json:"ts"`
 }
 
-// VoiceWhisperData 同频道悄悄话目标（#45）。瞬时语义，不进补发环：按住悄悄话键时下发当前目标集合，服务端只把这些成员作为该连接上行音频的接收者（绕过活跃门，server_muted 仍优先）；空数组 = 取消。目标必须是同频道成员，服务端去重、排除自己并静默过滤已离房者；上限 100。
+// VoiceWhisperData 同频道悄悄话目标（#45）。瞬时语义，不进补发环：按住悄悄话键时下发当前目标集合，服务端只把这些成员作为该连接上行音频的接收者（绕过活跃门，server_muted 仍优先）；空数组 = 取消。目标必须是同频道成员，服务端去重、排除自己并静默过滤已离房者；过滤后为空时仍保持悄悄话态（谁都不发，不回落全房广播，隐私边界）；上限 100。
 type VoiceWhisperData struct {
 	Targets []string `json:"targets"` // 悄悄话目标用户 ID 列表（十进制字符串）；空数组取消悄悄话。
 }
