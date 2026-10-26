@@ -27,6 +27,14 @@ type fakeHub struct {
 	msgEvents  []msgEvent
 	unreads    []unreadEvent
 	audios     []audioEvent
+	priorities []priorityEvent
+}
+
+// priorityEvent 一次 voice.priority 广播的断言快照（#45）。
+type priorityEvent struct {
+	channelID string
+	userID    string
+	priority  bool
 }
 
 // audioEvent 一次 channel.audio 广播的断言快照（#46）。
@@ -161,6 +169,20 @@ func (f *fakeHub) audioLog() []audioEvent {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]audioEvent(nil), f.audios...)
+}
+
+// BroadcastVoicePriority 记录 voice.priority 广播（#45）。
+func (f *fakeHub) BroadcastVoicePriority(channelID, userID string, priority bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.priorities = append(f.priorities, priorityEvent{channelID: channelID, userID: userID, priority: priority})
+}
+
+// priorityLog 全部 voice.priority 广播的快照。
+func (f *fakeHub) priorityLog() []priorityEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]priorityEvent(nil), f.priorities...)
 }
 
 func (f *fakeHub) Kick(uid, dev, reason string) {}

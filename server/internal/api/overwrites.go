@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"strconv"
 
 	"github.com/OpenALC/LiteTalk/server/internal/store"
 )
@@ -100,6 +101,7 @@ func (s *Server) SetChannelOverwrite(ctx context.Context, request SetChannelOver
 	}
 	// 覆盖参与频道可见性：快照作废，下一次列表/同步立即反映。
 	s.authz.InvalidateServer(ch.ServerID)
+	s.broadcastPriorityForOverwrite(ctx, ch, tt, request.TargetId)
 	s.audit(ctx, store.AuditLog{
 		ServerID: ch.ServerID, ActorID: c.UserID, Action: "channel.overwrite.set",
 		TargetType: string(tt), TargetID: ptrID(request.TargetId), ChannelID: ptrID(ch.ID),
@@ -138,6 +140,7 @@ func (s *Server) DeleteChannelOverwrite(ctx context.Context, request DeleteChann
 		return nil, s.writeStoreErr(ctx, err)
 	}
 	s.authz.InvalidateServer(ch.ServerID)
+	s.broadcastPriorityForOverwrite(ctx, ch, tt, request.TargetId)
 	s.audit(ctx, store.AuditLog{
 		ServerID: ch.ServerID, ActorID: c.UserID, Action: "channel.overwrite.delete",
 		TargetType: string(tt), TargetID: ptrID(request.TargetId), ChannelID: ptrID(ch.ID),
@@ -153,4 +156,21 @@ func overwriteTargetType(s string) (store.OverwriteTargetType, *apiErr) {
 		return store.OverwriteTargetType(s), nil
 	}
 	return "", errf(http.StatusBadRequest, "bad_request", "target_type 必须是 role 或 member")
+}
+
+// broadcastPriorityForOverwrite 频道覆盖变更后的优先发言实时通知（#45）。
+// 仅 member 目标 + 语音频道；必须在 InvalidateServer 之后按最终 effective 值
+// （allow/deny 与角色授予合并后）广播。查询或广播失败只记日志——REST 已经
+// 落库，不能把成功改成 500。角色/成员角色变更不走这里，重进房由
+// channel.joined 的 MemberInfo.priority 刷新。
+func (s *Server) broadcastPriorityForOverwrite(ctx context.Context, ch *store.Channel, tt store.OverwriteTargetType, targetID int64) {
+	if s.hub == nil || s.authz == nil || ch.Type != store.ChannelVoice || tt != store.OverwriteTargetMember {
+		return
+	}
+	ok, err := s.authz.CanInServer(ctx, targetID, ch.ServerID, ch.ID, store.PrioritySpeaker)
+	if err != nil {
+		s.log.Printf("voice.priority 判定失败（频道 %d 用户 %d）: %v", ch.ID, targetID, err)
+		return
+	}
+	s.hub.BroadcastVoicePriority(strconv.FormatInt(ch.ID, 10), strconv.FormatInt(targetID, 10), ok)
 }

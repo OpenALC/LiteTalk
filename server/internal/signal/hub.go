@@ -737,6 +737,13 @@ func (h *Hub) handleMessage(c *client, data []byte) {
 			return
 		}
 		h.handleVoiceRequestState(c, d)
+	case TypeVoiceWhisper:
+		var d VoiceWhisperData
+		if err := env.Decode(&d); err != nil {
+			h.sendError(c, ErrCodeBadMessage, "voice.whisper 数据格式错误")
+			return
+		}
+		h.handleVoiceWhisper(c, d)
 	case TypeChatSend:
 		var d ChatSendData
 		if err := env.Decode(&d); err != nil {
@@ -1039,6 +1046,9 @@ func (h *Hub) joinRoom(c *client, channelID, password string) {
 
 	h.log.Printf("ws: %s 加入频道 %s（%d 人）", c.userID, channelID, len(members))
 	all := memberInfos(members)
+	// #45 优先发言：MemberInfo.priority 在入房快照里一次算好（owner/Administrator
+	// 由 effective() 自动为 true）。角色/成员角色变更不实时广播，重进房刷新。
+	h.enrichMemberPriority(all, ch)
 	// 在线态从 presence KV 读取（不持 h.mu，逐成员一次 GET）；Self 取同一份快照。
 	byUID := make(map[string]MemberInfo, len(all))
 	for i := range all {
@@ -1268,6 +1278,112 @@ func (h *Hub) handleVoiceRequestState(c *client, d VoiceRequestStateData) {
 		Deafen: d.Deafen,
 		TS:     time.Now().UnixMilli(),
 	})
+}
+
+// maxWhisperTargets 悄悄话目标上限（#45）：超出整条拒收，不做静默截断——
+// 截断后的悄悄话会让用户以为对方听得到，实际没发出去。
+const maxWhisperTargets = 100
+
+// handleVoiceWhisper 同频道悄悄话（#45）：发送者必须当前在语音房间；目标去重、
+// 排除自己，只保留当前同房成员（成员可能刚离开，静默过滤）。空数组 = 取消。
+// 目标集合存到 SFU Peer 的不可变快照上，转发路径只做原子读 + 查表。
+// 本函数只做内存操作（成员表快照 + 一次原子替换），不阻塞 WS 读循环。
+func (h *Hub) handleVoiceWhisper(c *client, d VoiceWhisperData) {
+	if d.Targets == nil {
+		h.sendError(c, ErrCodeBadMessage, "voice.whisper 需要 targets 数组")
+		return
+	}
+	if len(d.Targets) > maxWhisperTargets {
+		h.sendError(c, ErrCodeBadMessage, "悄悄话目标最多 100 个")
+		return
+	}
+	roomID := c.roomIDLocked()
+	if roomID == "" {
+		h.sendError(c, ErrCodeNotInChannel, "不在频道中")
+		return
+	}
+	h.mu.Lock()
+	room := h.rooms[roomID]
+	// 发送者归属核对：同 uid 新连接顶替后，旧连接的迟到信令不得生效。
+	inRoom := room != nil && room.members[c.userID] == c
+	var filtered []string
+	if inRoom {
+		filtered = make([]string, 0, len(d.Targets))
+		seen := make(map[string]bool, len(d.Targets))
+		for _, uid := range d.Targets {
+			if uid == "" || uid == c.userID || seen[uid] || room.members[uid] == nil {
+				continue
+			}
+			seen[uid] = true
+			filtered = append(filtered, uid)
+		}
+	}
+	h.mu.Unlock()
+	if !inRoom {
+		h.sendError(c, ErrCodeNotInChannel, "不在频道中")
+		return
+	}
+	if !h.sfu.SetWhisperTargets(roomID, c.userID, strconv.FormatUint(c.connID, 10), filtered) {
+		// channel.join 与 rtc.offer 之间 SFU peer 尚不存在：此时还没有可转发的
+		// 上行轨道，静默忽略即可（客户端按住期间不会重复下单次目标）。
+		h.log.Printf("ws: %s 悄悄话目标未应用（频道 %s 的 SFU peer 尚未建立）", c.userID, roomID)
+		return
+	}
+	h.log.Printf("ws: 频道 %s 成员 %s 悄悄话目标 %d 人", roomID, c.userID, len(filtered))
+}
+
+// enrichMemberPriority 填充 MemberInfo.priority（#45）：authz 查询失败按 false，
+// 不阻断入房。dev 内置房间无 store 频道实体（ch == nil）或非语音频道一律 false。
+func (h *Hub) enrichMemberPriority(infos []MemberInfo, ch *store.Channel) {
+	if ch == nil || h.authz == nil || ch.Type != store.ChannelVoice {
+		return
+	}
+	ctx := context.Background()
+	for i := range infos {
+		uid, err := strconv.ParseInt(infos[i].UserID, 10, 64)
+		if err != nil {
+			continue
+		}
+		ok, aerr := h.authz.CanInServer(ctx, uid, ch.ServerID, ch.ID, store.PrioritySpeaker)
+		if aerr != nil {
+			h.log.Printf("ws: 优先发言判定失败（用户 %s 频道 %d）: %v", infos[i].UserID, ch.ID, aerr)
+			continue
+		}
+		infos[i].Priority = ok
+	}
+}
+
+// BroadcastVoicePriority 优先发言状态变更（#45）：REST 频道覆盖变更成功后调用。
+// 只发给该频道语音房成员的全部在线连接（含同 uid 的其他设备），且只发给协议
+// ≥3 的连接（消息 since 3）；角色/成员角色变更不实时广播，重进房由
+// channel.joined 的 MemberInfo.priority 刷新。房间不存在 = 无人可通知。
+func (h *Hub) BroadcastVoicePriority(channelID, userID string, priority bool) {
+	if channelID == "" || userID == "" {
+		return
+	}
+	h.mu.Lock()
+	room := h.rooms[channelID]
+	if room == nil {
+		h.mu.Unlock()
+		return
+	}
+	uids := make(map[string]bool, len(room.members))
+	for uid := range room.members {
+		uids[uid] = true
+	}
+	var targets []*client
+	for _, c := range h.conns {
+		if uids[c.userID] && c.protoVer.Load() >= 3 {
+			targets = append(targets, c)
+		}
+	}
+	h.mu.Unlock()
+
+	data := VoicePriorityData{ChannelID: channelID, UserID: userID, Priority: priority}
+	for _, c := range targets {
+		h.sendJSON(c, TypeVoicePriority, data)
+	}
+	h.log.Printf("ws: 频道 %s 成员 %s 优先发言=%v（%d 个连接已通知）", channelID, userID, priority, len(targets))
 }
 
 // SetServerMuted 服务端强制闭麦/解禁（#36）：SFU 包级丢弃（track 不摘）并向房间

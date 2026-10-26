@@ -47,6 +47,11 @@ type Hub interface {
 	// BroadcastChannelAudio 语音频道音质变更（#46）：uids 为十进制用户 ID
 	//（调用方已按频道 ViewChannel 可见性过滤）；0 表示跟随设置/默认帧长。
 	BroadcastChannelAudio(uids []string, channelID string, bitrateKbps, frameMS int)
+	// BroadcastVoicePriority 优先发言状态变更（#45）：调用方只在频道覆盖变更后
+	// 对 member 目标调用；实现只发给该语音房成员的全部在线连接（协议 ≥3）。
+	// 角色/成员角色变更不实时广播，重进房由 channel.joined 的 MemberInfo.priority
+	// 刷新，因此本方法不覆盖那些路径。
+	BroadcastVoicePriority(channelID, userID string, priority bool)
 }
 
 // PresenceReader 在线状态读取（#11）：presence:{uid} 存在 = 在线。

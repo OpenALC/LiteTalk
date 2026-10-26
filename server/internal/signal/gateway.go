@@ -5,8 +5,9 @@
 //     / voice.speaking——登录后常驻，按「订阅」下发给该用户全部服务器的相关事件，
 //     与是否在语音房无关；带 seq、断线后可 gateway.resume 补发。例外：voice.speaking
 //     高频且瞬时，即时下行但不进补发环（seq=0），避免挤掉聊天消息的补发窗口。
-//   - voice 语音面：channel.* / rtc.* / voice.state* / session.voice_taken——
-//     进房才产生，瞬时语义，不进环、无 seq（replay 过期状态只会污染客户端）。
+//   - voice 语音面：channel.* / rtc.* / voice.state* / voice.whisper / voice.priority
+//     / session.voice_taken——进房才产生，瞬时语义，不进环、无 seq（replay 过期状态
+//     只会污染客户端）。
 //   - session 连接控制：hello 系 / error / gateway.resume / gateway.invalid_session。
 //
 // 单实例假设：环在进程内存（默认 SQLite 单机部署），续传是**会话粘性**的。
