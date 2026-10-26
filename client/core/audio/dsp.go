@@ -2,7 +2,9 @@ package audio
 
 import (
 	"fmt"
+	"log"
 	"math"
+	"sync"
 	"sync/atomic"
 
 	"github.com/VoiceBlender/rnnoise-go"
@@ -102,9 +104,16 @@ func (n *noiseTracker) floorDB() float64 {
 type DSPConfig struct {
 	Denoise bool    // 是否启用 RNNoise（关闭时 VAD 不可用，说话判定退化为纯 RMS 门限）
 	Gain    float64 // 线性增益，1.0 为不变（输出音量）
-	// PreGainDB 前置增益 dB（-12~+24 ≈ 0.25×~16×）：施加在 RNNoise 之前，
+	// PreGainDB 前置增益 dB（-12~+24 ≈ 0.25×~16×）：施加在 RNNoise/APM 之前，
 	// 弱麦先抬进降噪器/VAD 的有效区；零值 0 = 不变。
 	PreGainDB float64
+
+	// DisableAEC 关闭 WebRTC APM 的回声消除（默认 false = 开启）。仅影响
+	// AEC 子模块；APM 的降噪/AGC2/高通仍按平台能力启用。
+	DisableAEC bool
+	// DisableAPM 整体绕过 WebRTC APM（AEC3/NS/AGC2/HPF），回落自研链路。
+	// 仅供测试与基准对比，不持久化、不在设置页暴露。
+	DisableAPM bool
 
 	// 说话判定：VAD 概率与自适应 RMS 门限并联 + 帧数迟滞。
 	// spike 实测纯白噪声 VAD 均值约 0.569 偏高，单靠概率会误触发，必须叠加 RMS 门限。
@@ -120,6 +129,7 @@ type DSPConfig struct {
 }
 
 // DefaultDSPConfig 返回一组经 spike 数据校准的默认配置。
+// 支持的平台默认启用 WebRTC APM（DisableAPM=false，AEC 默认开启）。
 func DefaultDSPConfig() DSPConfig {
 	return DSPConfig{
 		Denoise:     true,
@@ -131,7 +141,8 @@ func DefaultDSPConfig() DSPConfig {
 	}
 }
 
-// DSP 封装 RNNoise 降噪 + VAD + AGC + 增益 + 说话状态机。
+// DSP 封装 RNNoise 降噪 + VAD + AGC + 增益 + 说话状态机；平台支持时，
+// 前置一级 WebRTC APM（AEC3 + NS + AGC2 + 高通），此时自研 AGC 跳过。
 // Process 零分配；仅允许单 goroutine 调用（增益/开关/门限/强度/AGC 可跨 goroutine 原子修改）。
 type DSP struct {
 	cfg DSPConfig
@@ -147,8 +158,18 @@ type DSP struct {
 	vadEnterBits atomic.Uint64 // math.Float32bits(VADEnter)，热可调
 	vadExitBits  atomic.Uint64 // math.Float32bits(VADExit)，热可调
 	agcOn        atomic.Bool   // 自动增益开关（v1.1 默认开，nil→true 见 config 层）
+	aecOff       atomic.Bool   // 回声消除关闭（设置项 DisableAEC；仅 APM 生效）
 
-	// preBuf 前置增益的预分配 scratch（Process 里 in→preBuf→RNNoise，不改调用方 in）。
+	// apm 非 nil 表示 WebRTC APM 已启用；构造后不再替换（Close 在流停止后调用），
+	// Process/SetAGC/SetDisableAEC 可无锁读取。内部互斥锁保护 capture/render
+	// 两个 goroutine 的并发处理，以及运行期重配置。
+	apm *apmHandle
+	// apmCfgMu 串行化运行期 APM 重配置：SetAGC/SetDisableAEC 并发调用时，
+	// 保证最后一次 ApplyConfig 与原子开关终态一致。
+	apmCfgMu   sync.Mutex
+	apmErrOnce sync.Once
+
+	// preBuf 前置增益的预分配 scratch（Process 里 in→preBuf→RNNoise/APM，不改调用方 in）。
 	preBuf [FrameSize]int16
 
 	// noise minimum-statistics 底噪（说话门限与 AGC 门控共用；Process goroutine 私有）。
@@ -198,7 +219,81 @@ func NewDSP(cfg DSPConfig) (*DSP, error) {
 	d.denoiseOn.Store(cfg.Denoise)
 	d.vadEnterBits.Store(uint64(math.Float32bits(cfg.VADEnter)))
 	d.vadExitBits.Store(uint64(math.Float32bits(cfg.VADExit)))
+	d.aecOff.Store(cfg.DisableAEC)
+	// WebRTC APM：AEC3 + NS(moderate) + AGC2 + 高通。初始化失败只降级不阻断音频：
+	// 让 DSP 继续走原 RNNoise/自研 AGC 链路，日志留痕。
+	if !cfg.DisableAPM && apmSupported() {
+		if h, err := newAPM(d.currentAPMOptions()); err != nil {
+			log.Printf("audio: WebRTC APM 初始化失败，回落 RNNoise/自研 AGC 链路: %v", err)
+		} else {
+			d.apm = h
+		}
+	}
 	return d, nil
+}
+
+// currentAPMOptions 由原子开关合成 APM 子模块配置：AEC/AGC2 可热调，
+// NS 固定 moderate（RNNoise 作为可选强降噪叠加），高通常开。
+func (d *DSP) currentAPMOptions() apmOptions {
+	return apmOptions{
+		AEC:     !d.aecOff.Load(),
+		NS:      true,
+		NSLevel: apmNSModerate,
+		AGC2:    d.agcOn.Load(),
+		HPF:     true,
+	}
+}
+
+// reconfigureAPM 把当前原子开关应用到 APM。持 apmCfgMu 读取终态，避免并发
+// setter 的 ApplyConfig 顺序与原子值反转；无 APM 时是 no-op。
+func (d *DSP) reconfigureAPM() {
+	d.apmCfgMu.Lock()
+	defer d.apmCfgMu.Unlock()
+	if d.apm == nil {
+		return
+	}
+	if err := d.apm.configure(d.currentAPMOptions()); err != nil {
+		log.Printf("audio: WebRTC APM 重配置失败: %v", err)
+	}
+}
+
+// APMActive 报告 WebRTC APM 是否已启用（平台支持且初始化成功）。
+func (d *DSP) APMActive() bool { return d.apm != nil }
+
+// SetDisableAEC 开关回声消除（默认开启）。APM 不可用时保留旧链路，无副作用。
+func (d *DSP) SetDisableAEC(off bool) {
+	if d.aecOff.Swap(off) == off {
+		return
+	}
+	d.reconfigureAPM()
+}
+
+// DisableAEC 返回回声消除是否被关闭。
+func (d *DSP) DisableAEC() bool { return d.aecOff.Load() }
+
+// ProcessRender 送入一帧播放参考（混音器实际输出，480 采样）。仅 APM 启用时
+// 有效；失败只留一次日志，不影响播放——调用方在混音 tick 上，不能阻塞。
+// 必须在对应近端帧之前喂入；数字静音也要送，AEC 需要连续的时间轴。
+func (d *DSP) ProcessRender(pcm []int16) {
+	if d.apm == nil || len(pcm) < FrameSize {
+		return
+	}
+	if err := d.apm.processRender(pcm[:FrameSize]); err != nil {
+		d.apmErrOnce.Do(func() {
+			log.Printf("audio: WebRTC APM 参考帧处理失败（后续同类错误不再重复记录）: %v", err)
+		})
+	}
+}
+
+// Close 释放 APM 的 C++ 资源（幂等）。必须在处理/渲染 goroutine 停止后调用。
+func (d *DSP) Close() {
+	d.apmCfgMu.Lock()
+	h := d.apm
+	d.apm = nil
+	d.apmCfgMu.Unlock()
+	if h != nil {
+		h.close()
+	}
 }
 
 // SetGain 运行时调整线性增益（原子，热路径无锁）。
@@ -250,8 +345,14 @@ const (
 	agcInitGain   = 1.0
 )
 
-// SetAGC 开关自动增益（原子）。开启后 AGC 增益插在原固定增益之前应用。
-func (d *DSP) SetAGC(on bool) { d.agcOn.Store(on) }
+// SetAGC 开关自动增益（原子）。APM 启用时映射到 AGC2 并跳过自研 AGC；
+// 旧链路下 AGC 增益插在原固定增益之前应用。
+func (d *DSP) SetAGC(on bool) {
+	if d.agcOn.Swap(on) == on {
+		return
+	}
+	d.reconfigureAPM()
+}
 
 // AGC 当前开关状态。
 func (d *DSP) AGC() bool { return d.agcOn.Load() }
@@ -338,10 +439,22 @@ func (d *DSP) Speaking() bool { return d.speaking.Load() }
 // AudioLevel 返回最近一帧的 RFC 6464 电平（0=0dB … 127=静音，#33）。
 func (d *DSP) AudioLevel() uint8 { return uint8(d.levelBits.Load()) }
 
-// Process 处理一个 480 采样（10ms）帧：前置增益 → 降噪 → AGC → 固定增益 → RMS/VAD 说话判定。
-// out 与 in 长度都必须 >= FrameSize 且不得重叠；返回 VAD 概率（降噪关闭时为 0）。
-// 全程在预分配缓冲上操作，零堆分配。
+// Process 处理一个 480 采样（10ms）帧，返回 VAD 概率（降噪关闭时为 0）。
+// out 与 in 长度都必须 >= FrameSize 且不得重叠。
+//
+// APM 启用时链路：前置增益 → APM capture（AEC3/NS/AGC2/HPF）→ 可选 RNNoise
+// 强降噪 → 固定增益 → RMS/VAD；APM 不可用/被禁用时走原链路：
+// 前置增益 → RNNoise → 自研 AGC → 固定增益 → RMS/VAD。全程预分配缓冲，
+// 零堆分配；仅允许单 goroutine 调用。
 func (d *DSP) Process(out, in []int16) (float32, error) {
+	if d.apm != nil {
+		return d.processAPM(out, in)
+	}
+	return d.processLegacy(out, in)
+}
+
+// processLegacy 旧 DSP 链路（无 APM）。纯零帧短路 RNNoise 的说明见下。
+func (d *DSP) processLegacy(out, in []int16) (float32, error) {
 	// 纯零/近零帧短路：跳过 RNNoise。设备静音时输入为精确 0，RNNoise 内部的
 	// 输入高通 IIR 状态会指数衰减进 float32 次正规数区间并长期停留，x86 上走
 	// 微码慢路径，单帧耗时翻数倍（实测 181µs → 250~413µs）。短路后整个静音期
@@ -396,6 +509,70 @@ func (d *DSP) Process(out, in []int16) (float32, error) {
 		}
 		applyGain(out[:FrameSize], d.agcGain)
 	}
+	if g := d.Gain(); g != 1.0 {
+		applyGain(out[:FrameSize], g)
+	}
+	d.updateSpeaking(vad, rmsInt16(out[:FrameSize]))
+	return vad, nil
+}
+
+// processAPM APM 启用时的处理链路。与旧链路的关键差异：
+//   - 数字静音帧也必须进 APM（AEC 自适应按帧推进，跳帧会破坏采集/参考时间轴）；
+//   - APM 内部 AGC2 负责自动增益，这里不再跑自研 AGC，避免两级 AGC 串联；
+//   - APM 就地处理，先把（含前置增益的）输入落到 preBuf，绝不改调用方的 in。
+func (d *DSP) processAPM(out, in []int16) (float32, error) {
+	rawSilent := peakAbs(in[:FrameSize]) <= 1
+
+	// 底噪观察取原始输入（pre-gain 之前），与旧链路一致；数字静音没有可估底噪。
+	if !rawSilent {
+		d.noise.observe(rmsInt16(in[:FrameSize]))
+	}
+
+	src := d.preBuf[:FrameSize]
+	preGain := math.Float64frombits(d.preGainBits.Load())
+	if preGain != 1 {
+		applyGainInto(src, in[:FrameSize], preGain)
+	} else {
+		copy(src, in[:FrameSize])
+	}
+
+	if err := d.apm.processCapture(src); err != nil {
+		// 不中断音频：撤回 APM 输出，按旧链路继续（前置增益仍生效）。
+		// 只在首次失败时留日志，避免每帧刷屏。
+		d.apmErrOnce.Do(func() {
+			log.Printf("audio: WebRTC APM 采集帧处理失败，后续帧按旧链路继续: %v", err)
+		})
+		if preGain != 1 {
+			applyGainInto(src, in[:FrameSize], preGain)
+		} else {
+			copy(src, in[:FrameSize])
+		}
+	}
+
+	// APM 输出为数字静音时跳过 RNNoise（denormal 短路语义与旧链路一致）。
+	// APM 本身已经吃过这一帧，AEC 状态不受影响。
+	if peakAbs(src) <= 1 {
+		clear(out[:FrameSize])
+		d.silentRun++
+		if d.silentRun == 50 && d.denoiseOn.Load() {
+			d.denoiserPtr.Load().Reset()
+		}
+		d.updateSpeaking(0, 0)
+		return 0, nil
+	}
+	d.silentRun = 0
+
+	var vad float32
+	var err error
+	if d.denoiseOn.Load() {
+		vad, err = d.denoiserPtr.Load().ProcessInt16(out[:FrameSize], src)
+		if err != nil {
+			return 0, err
+		}
+	} else {
+		copy(out[:FrameSize], src)
+	}
+	// 自动增益由 APM 的 AGC2 负责（随 SetAGC 热切换），此处跳过自研 AGC。
 	if g := d.Gain(); g != 1.0 {
 		applyGain(out[:FrameSize], g)
 	}

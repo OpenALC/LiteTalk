@@ -87,13 +87,14 @@ type RuntimeSettings struct {
 	Opus            OpusConfig
 	Denoise         bool
 	DenoiseStrength int       // 1弱/2中/3强（v0.1.2）
-	AGC             bool      // 自动增益（v1.1 默认开）
+	AGC             bool      // 自动增益（v1.1 默认开；APM 启用时映射 AGC2）
 	Gain            float64   // 麦克风线性增益，1.0 为不变
 	PlaybackGain    float64   // 扬声器总音量（mixer master gain），1.0 为不变
 	VADSens         int       // 0–4 五档
 	Complexity      int       // Opus 复杂度 0–10（≤0 表示不改）
 	InputMode       InputMode // 采集下混模式（变更即热重启采集流）
-	PreGainDB       float64   // 前置增益 dB（-12~+24，RNNoise 之前；0=不变）
+	PreGainDB       float64   // 前置增益 dB（-12~+24，RNNoise/APM 之前；0=不变）
+	DisableAEC      bool      // 关闭 WebRTC 回声消除（默认 false = 开启）
 }
 
 // DefaultPipelineConfig 返回默认管线配置（声卡回环、降噪开、增益 1）。
@@ -288,11 +289,13 @@ func NewPipeline(cfg PipelineConfig) (*Pipeline, error) {
 
 	enc, err := codec.NewEncoder(SampleRate, 1, codec.AppVoIP)
 	if err != nil {
+		dsp.Close() // NewDSP 可能已创建 APM 的 C++ 句柄
 		return nil, fmt.Errorf("init opus encoder: %w", err)
 	}
 	p.opus = ResolveOpusConfig(cfg.Opus)
 	if err := p.applyOpusConfig(enc, p.opus); err != nil {
 		enc.Close()
+		dsp.Close()
 		return nil, fmt.Errorf("opus encoder 参数: %w", err)
 	}
 	p.enc = enc
@@ -301,6 +304,7 @@ func NewPipeline(cfg PipelineConfig) (*Pipeline, error) {
 		dec, err := codec.NewDecoder(SampleRate, 1)
 		if err != nil {
 			enc.Close()
+			dsp.Close()
 			return nil, fmt.Errorf("init opus decoder: %w", err)
 		}
 		p.dec = dec
@@ -492,6 +496,9 @@ func (p *Pipeline) Close() error {
 		_ = p.dec.Close()
 		p.dec = nil
 	}
+	// APM 的 C++ 句柄须在采集/处理 goroutine 停止后释放（Stop 已等待 wg）；
+	// 混音器的渲染参考由 Session 在 pipe.Close 之前先 Stop。
+	p.dsp.Close()
 	return nil
 }
 
@@ -518,6 +525,17 @@ func (p *Pipeline) SetDenoiseStrength(level int) error { return p.dsp.SetDenoise
 
 // SetAGC 运行时开关自动增益（v1.1 默认开）。
 func (p *Pipeline) SetAGC(on bool) { p.dsp.SetAGC(on) }
+
+// SetDisableAEC 开关 WebRTC 回声消除（默认开启；APM 不可用时无副作用）。
+func (p *Pipeline) SetDisableAEC(off bool) { p.dsp.SetDisableAEC(off) }
+
+// ProcessRender 把混音器的实际播放输出作为 AEC 参考帧送入 APM。
+// 必须先于对应的采集帧处理；静音/耳聋时也应持续送零帧（Mixer.Tick 正常时
+// 自动满足）。APM 未启用或帧长不足时为 no-op，不阻塞混音 tick。
+func (p *Pipeline) ProcessRender(pcm []int16) { p.dsp.ProcessRender(pcm) }
+
+// APMActive 报告 WebRTC APM 是否启用（诊断/测试）。
+func (p *Pipeline) APMActive() bool { return p.dsp.APMActive() }
 
 // SetPreGainDB 运行时调整前置增益（-12~+24dB，越界报错；原子热生效）。
 func (p *Pipeline) SetPreGainDB(db float64) error { return p.dsp.SetPreGainDB(db) }

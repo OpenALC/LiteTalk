@@ -28,6 +28,9 @@ func newLoopbackPipeline(t *testing.T, mutate func(*PipelineConfig)) *Pipeline {
 	requireOpus(t)
 	cfg := DefaultPipelineConfig()
 	cfg.Backend = BackendNull // 不 Start，仅同步注入，用不到后端
+	// 既有链路测试锁定编码/统计/说话判定行为：绕过 APM，避免 AGC2/NS 改变
+	// 断言基准。APM 专项见 apm_test.go 与 TestPipelineAPMRenderWiring。
+	cfg.DSP.DisableAPM = true
 	if mutate != nil {
 		mutate(&cfg)
 	}
@@ -409,6 +412,7 @@ func BenchmarkProcessPCMWithSendGate(b *testing.B) {
 	cfg.Backend = BackendNull
 	cfg.Loopback = false
 	cfg.DSP.Denoise = false
+	cfg.DSP.DisableAPM = true // 基准目标是发包门开销，排除 APM 的固定成本
 	p, err := NewPipeline(cfg)
 	if err != nil {
 		b.Fatalf("NewPipeline: %v", err)
@@ -429,6 +433,31 @@ func BenchmarkProcessPCMWithSendGate(b *testing.B) {
 		if err := p.ProcessPCM(in); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// TestPipelineAPMRenderWiring 管线暴露的 AEC 参考入口：APM 启用时 ProcessRender
+// 与 ProcessPCM 可并行接线运行，且不改变编码/播放账目。
+func TestPipelineAPMRenderWiring(t *testing.T) {
+	requireAPM(t)
+	p := newLoopbackPipeline(t, func(c *PipelineConfig) { c.DSP.DisableAPM = false })
+	if !p.APMActive() {
+		t.Fatal("Pipeline 应启用 APM")
+	}
+	ren := make([]int16, FrameSize)
+	in := make([]int16, FrameSize)
+	var phase float64
+	var rng uint32 = 0x43AE
+	for f := 0; f < 40; f++ {
+		aecRenderFrame(ren, f)
+		p.ProcessRender(ren) // 混音器 tick 的实际接线
+		sineNoiseFrame(in, &phase, 6000, 500, &rng)
+		if err := p.ProcessPCM(in); err != nil {
+			t.Fatalf("ProcessPCM frame %d: %v", f, err)
+		}
+	}
+	if st := p.Stats(); st.FramesProcessed != 40 || st.PacketsEncoded != 20 {
+		t.Fatalf("统计异常: frames=%d packets=%d", st.FramesProcessed, st.PacketsEncoded)
 	}
 }
 
