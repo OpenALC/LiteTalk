@@ -1355,6 +1355,8 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 		// 再重发 join）。前端据 voice:join_failed 清掉 channelId/延迟并提示。
 		// 同一次失败不再走 chat:error（见 ErrorHandlerEx）。
 		OnJoinFailed: func(channelID, code, message string) {
+			// 入房失败后没有语音房可悄悄话：关旁路门并清目标缓存。
+			a.clearWhisper()
 			a.emit("voice:join_failed", map[string]string{
 				"channel_id": channelID, "code": code, "message": message,
 			})
