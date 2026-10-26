@@ -102,6 +102,48 @@ func TestPriorityFromJoinedAndEvent(t *testing.T) {
 	}
 }
 
+// TestWhisperWantLifecycle 目标下发状态机（#45）：脏标记只发一次；取消为空
+// 也要下发；退房清空不发；入房同步强制发一次（空目标也算）。
+func TestWhisperWantLifecycle(t *testing.T) {
+	s := NewSession(api.NewAPIClient("http://127.0.0.1:1"), "tok", "n", Events{}, nil)
+
+	s.SetWhisperTargets([]string{"u1", "", "u2"})
+	targets, send := s.pendingWhisper()
+	if !send || len(targets) != 2 || targets[0] != "u1" || targets[1] != "u2" {
+		t.Fatalf("首次下发 = %v/%v", targets, send)
+	}
+	if _, send = s.pendingWhisper(); send {
+		t.Fatal("脏标记消费后不应重复下发")
+	}
+
+	// 取消（之前有目标）必须发空数组。
+	s.SetWhisperTargets(nil)
+	targets, send = s.pendingWhisper()
+	if !send || len(targets) != 0 {
+		t.Fatalf("取消应下发空数组，实际 %v/%v", targets, send)
+	}
+	// 重复取消（本就为空）不再下发。
+	s.SetWhisperTargets(nil)
+	if _, send = s.pendingWhisper(); send {
+		t.Fatal("重复取消不应下发")
+	}
+
+	// 退房清空：不发信令。
+	s.SetWhisperTargets([]string{"u1"})
+	_, _ = s.pendingWhisper()
+	s.ClearWhisperTargets()
+	if _, send = s.pendingWhisper(); send {
+		t.Fatal("退房清空不应下发")
+	}
+
+	// 入房同步：即使 want 为空也强制发一次空数组，清掉服务端残留。
+	s.syncWhisperOnJoin()
+	targets, send = s.pendingWhisper()
+	if !send || len(targets) != 0 {
+		t.Fatalf("入房同步应强制下发空数组，实际 %v/%v", targets, send)
+	}
+}
+
 // sawType 是否已收到过某类型消息。
 func (s *joinReplyStub) sawType(want string) bool {
 	s.mu.Lock()

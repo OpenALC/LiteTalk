@@ -2384,9 +2384,10 @@ func (a *App) whisperRelease() {
 	a.emitWhisperState(false, false)
 }
 
-// clearWhisper 退房/断线/被抢占时清理悄悄话状态（#45）：只关本地旁路门与
-// 选择，不发 voice.whisper——SFU peer 已随离房销毁，且此时发送的取消消息
-// 可能被信令层误归属成进房失败（#91 的 pending join 错误归属窗口）。
+// clearWhisper 退房/断线/被抢占时清理悄悄话状态（#45）：关本地旁路门并让会话
+// 丢掉缓存的目标，但不发 voice.whisper——SFU peer 会随离房销毁，且此刻发送的
+// 取消消息可能被信令层误归属成进房失败（#91 的 pending join 错误归属窗口）。
+// 切房后新房间的 channel.joined 会强制同步一次空目标，清掉服务端残留状态。
 func (a *App) clearWhisper() {
 	a.whisperMu.Lock()
 	was := a.whisperHeld || a.whisperActive
@@ -2395,6 +2396,12 @@ func (a *App) clearWhisper() {
 	a.whisperTargets = nil
 	a.whisperMu.Unlock()
 	a.setWhisperGate(false)
+	a.mu.Lock()
+	s := a.sess
+	a.mu.Unlock()
+	if s != nil {
+		s.ClearWhisperTargets()
+	}
 	if was {
 		a.emitWhisperState(false, false)
 	}

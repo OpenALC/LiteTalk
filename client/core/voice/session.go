@@ -190,9 +190,10 @@ type Session struct {
 	// 悄悄话目标下发（#45）：Wails 绑定/热键线程只写最新目标并敲一下 wake，
 	// 专用 goroutine 读取后发 voice.whisper——禁止在音频回调或 Wails 线程同步
 	// ws.Send。wake 容量 1 合并突发，最新值以 whisperWant 为准。
-	whisperMu   sync.Mutex
-	whisperWant []string
-	whisperWake chan struct{}
+	whisperMu       sync.Mutex
+	whisperWant     []string
+	whisperNeedSend bool // 有变更待下发（空 want 也可能是显式取消）
+	whisperWake     chan struct{}
 
 	// #46 频道音质配置：audioCfgMu 串行化「用户设置 + 当前频道上限/帧长」的
 	// 读取与应用（ApplyAudio 在 Wails 绑定线程、channel.audio 在 WS 读循环）。
@@ -682,9 +683,9 @@ func (s *Session) registerHandlers() {
 				Deafen: signal.Bool(s.deafened.Load()),
 			})
 		}
-		// 重连/重入房后 SFU peer 是新的，悄悄话目标随旧 Peer 消失；用户仍按着
-		// 悄悄话键时重发一次当前目标（#45）。未按住（want 为空）不发。
-		s.resendWhisperIfAny()
+		// 重连/重入房后 SFU peer 是新的：把当前目标同步过去。即使 want 为空
+		// 也发一条空数组，清掉服务端可能残留的旧目标（切房前在途发送的兜底）。
+		s.syncWhisperOnJoin()
 	})
 	// channel.audio 音质热更新（#46）：只对当前房间生效；其他频道（例如管理员
 	// 在别处改了配置）忽略，等入房时的 channel.joined 拿权威值。
@@ -1297,9 +1298,25 @@ func (s *Session) SetWhisperTargets(targets []string) {
 		}
 	}
 	s.whisperMu.Lock()
+	oldHas := len(s.whisperWant) > 0
 	s.whisperWant = cp
+	// 空列表只在之前确实有目标时才需要发取消；重复的「本就为空」不下发。
+	if len(cp) > 0 || oldHas {
+		s.whisperNeedSend = true
+	}
 	s.whisperMu.Unlock()
 	s.wakeWhisper()
+}
+
+// ClearWhisperTargets 退房/切房时清空会话缓存的悄悄话目标，且不下发任何
+// 信令（#45）：旧房间的 Peer 会随离房销毁，此刻发取消可能撞上 #91 的
+// pending join 错误归属窗口。新房间入房时 syncWhisperOnJoin 会补一条空数组，
+// 清掉服务端可能残留的旧目标。
+func (s *Session) ClearWhisperTargets() {
+	s.whisperMu.Lock()
+	s.whisperWant = nil
+	s.whisperNeedSend = false
+	s.whisperMu.Unlock()
 }
 
 // wakeWhisper 合并一次下发唤醒（容量 1；发送 goroutine 总是读最新值）。
@@ -1318,8 +1335,8 @@ func (s *Session) whisperLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-s.whisperWake:
-			targets := s.takeWhisperWant()
-			if s.protoVer.Load() < 3 || s.ws == nil {
+			targets, send := s.pendingWhisper()
+			if !send || s.protoVer.Load() < 3 || s.ws == nil {
 				continue
 			}
 			_ = s.ws.Send(signal.TypeVoiceWhisper, signal.VoiceWhisperData{Targets: targets})
@@ -1327,26 +1344,28 @@ func (s *Session) whisperLoop(ctx context.Context) {
 	}
 }
 
-// takeWhisperWant 取当前目标快照。切片一经发布不再原地修改，直接返回安全。
-func (s *Session) takeWhisperWant() []string {
+// pendingWhisper 取当前待下发快照并清掉脏标记。空目标也要返回（显式取消），
+// 由 send 区分「无需发送」与「发送空数组」。切片一经发布不再原地修改。
+func (s *Session) pendingWhisper() ([]string, bool) {
 	s.whisperMu.Lock()
 	want := s.whisperWant
+	send := s.whisperNeedSend
+	s.whisperNeedSend = false
 	s.whisperMu.Unlock()
 	if want == nil {
-		return []string{} // voice.whisper 的 targets 是 required 数组，不能下发 null
+		want = []string{} // voice.whisper 的 targets 是 required 数组，不能下发 null
 	}
-	return want
+	return want, send
 }
 
-// resendWhisperIfAny 重连/重入房后补发当前悄悄话目标（#45）：服务端 SFU peer
-// 是新的，旧目标集合已随旧 Peer 销毁。未按住悄悄话键（want 为空）时不发。
-func (s *Session) resendWhisperIfAny() {
+// syncWhisperOnJoin 入房/重连后把当前目标同步到新建的 SFU peer（#45）。
+// want 为空也强制下发一次空数组：切房前在途的旧目标可能落到新 peer 上，
+// 这条取消保证服务端最终状态正确。
+func (s *Session) syncWhisperOnJoin() {
 	s.whisperMu.Lock()
-	n := len(s.whisperWant)
+	s.whisperNeedSend = true
 	s.whisperMu.Unlock()
-	if n > 0 {
-		s.wakeWhisper()
-	}
+	s.wakeWhisper()
 }
 
 // updateDucking 重算各远端 peer 的优先发言 ducking（#45）：任一远端优先发言者
