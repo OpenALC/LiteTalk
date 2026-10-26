@@ -18,8 +18,8 @@ LiteTalk 客户端用 WebRTC APM 做回声消除（AEC3）、自动增益（AGC2
 
 ## 许可证
 
-- webrtc-audio-processing 本体（含其内置的 pffft/fft/rnnoise）：BSD-3-Clause，
-  全文见本目录 `COPYING`。
+- webrtc-audio-processing 本体：BSD-3-Clause，全文见本目录 `COPYING`；
+  其内置的 pffft/fft/rnnoise 等第三方组件保留各自 BSD 风格许可证头。
 - abseil 20230125.1：Apache-2.0。vendored 头文件逐个保留了 Apache-2.0 版权头；
   许可证全文见 https://www.apache.org/licenses/LICENSE-2.0 。
 - 静态库把上述代码合并为单一归档，分发二进制时 `COPYING` 与本节说明需随附。
