@@ -193,7 +193,11 @@ type Session struct {
 	whisperMu       sync.Mutex
 	whisperWant     []string
 	whisperNeedSend bool // 有变更待下发（空 want 也可能是显式取消）
-	whisperWake     chan struct{}
+	// whisperMaybe 服务端可能仍挂着非空目标（含已发成功、在途或待发）。切房后
+	// 即使 want 已清空，也需要发一条空数组兜底；从未用过悄悄话时保持 false，
+	// 避免每次入房都白发一条信令。
+	whisperMaybe bool
+	whisperWake  chan struct{}
 
 	// #46 频道音质配置：audioCfgMu 串行化「用户设置 + 当前频道上限/帧长」的
 	// 读取与应用（ApplyAudio 在 Wails 绑定线程、channel.audio 在 WS 读循环）。
@@ -1301,7 +1305,10 @@ func (s *Session) SetWhisperTargets(targets []string) {
 	oldHas := len(s.whisperWant) > 0
 	s.whisperWant = cp
 	// 空列表只在之前确实有目标时才需要发取消；重复的「本就为空」不下发。
-	if len(cp) > 0 || oldHas {
+	if len(cp) > 0 {
+		s.whisperNeedSend = true
+		s.whisperMaybe = true
+	} else if oldHas {
 		s.whisperNeedSend = true
 	}
 	s.whisperMu.Unlock()
@@ -1339,7 +1346,13 @@ func (s *Session) whisperLoop(ctx context.Context) {
 			if !send || s.protoVer.Load() < 3 || s.ws == nil {
 				continue
 			}
-			_ = s.ws.Send(signal.TypeVoiceWhisper, signal.VoiceWhisperData{Targets: targets})
+			if err := s.ws.Send(signal.TypeVoiceWhisper, signal.VoiceWhisperData{Targets: targets}); err == nil {
+				// 发送成功才更新「服务端可能有非空目标」：失败时间线未知，
+				// 保守保留原值，下次入房同步会再兜一次。
+				s.whisperMu.Lock()
+				s.whisperMaybe = len(targets) > 0
+				s.whisperMu.Unlock()
+			}
 		}
 	}
 }
@@ -1359,13 +1372,16 @@ func (s *Session) pendingWhisper() ([]string, bool) {
 }
 
 // syncWhisperOnJoin 入房/重连后把当前目标同步到新建的 SFU peer（#45）。
-// want 为空也强制下发一次空数组：切房前在途的旧目标可能落到新 peer 上，
-// 这条取消保证服务端最终状态正确。
+// want 为空但服务端可能残留旧目标（切房前在途发送）时强制下发一次空数组；
+// 从未用过悄悄话则不发，避免每次入房都产生无意义信令。
 func (s *Session) syncWhisperOnJoin() {
 	s.whisperMu.Lock()
-	s.whisperNeedSend = true
+	need := len(s.whisperWant) > 0 || s.whisperMaybe
+	s.whisperNeedSend = need
 	s.whisperMu.Unlock()
-	s.wakeWhisper()
+	if need {
+		s.wakeWhisper()
+	}
 }
 
 // updateDucking 重算各远端 peer 的优先发言 ducking（#45）：任一远端优先发言者

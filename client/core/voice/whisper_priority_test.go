@@ -107,6 +107,12 @@ func TestPriorityFromJoinedAndEvent(t *testing.T) {
 func TestWhisperWantLifecycle(t *testing.T) {
 	s := NewSession(api.NewAPIClient("http://127.0.0.1:1"), "tok", "n", Events{}, nil)
 
+	// 从未用过悄悄话：入房同步不应白发信令。
+	s.syncWhisperOnJoin()
+	if _, send := s.pendingWhisper(); send {
+		t.Fatal("从未启用悄悄话时入房不应下发")
+	}
+
 	s.SetWhisperTargets([]string{"u1", "", "u2"})
 	targets, send := s.pendingWhisper()
 	if !send || len(targets) != 2 || targets[0] != "u1" || targets[1] != "u2" {
