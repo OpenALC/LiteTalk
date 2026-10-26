@@ -271,11 +271,11 @@ func (d *DSP) SetDisableAEC(off bool) {
 // DisableAEC 返回回声消除是否被关闭。
 func (d *DSP) DisableAEC() bool { return d.aecOff.Load() }
 
-// ProcessRender 送入一帧播放参考（混音器实际输出，480 采样）。仅 APM 启用时
-// 有效；失败只留一次日志，不影响播放——调用方在混音 tick 上，不能阻塞。
-// 必须在对应近端帧之前喂入；数字静音也要送，AEC 需要连续的时间轴。
+// ProcessRender 送入一帧播放参考（混音器实际输出，480 采样）。仅 APM 启用
+// 且 AEC 未关闭时有效；失败只留一次日志，不影响播放——调用方在混音 tick 上，
+// 不能阻塞。必须在对应近端帧之前喂入；数字静音也要送，AEC 需要连续时间轴。
 func (d *DSP) ProcessRender(pcm []int16) {
-	if d.apm == nil || len(pcm) < FrameSize {
+	if d.apm == nil || d.aecOff.Load() || len(pcm) < FrameSize {
 		return
 	}
 	if err := d.apm.processRender(pcm[:FrameSize]); err != nil {
