@@ -11,7 +11,7 @@
 | `opus/` | libopus | 1.6.1 | `mingw-w64-ucrt-x86_64-opus-1.6.1-1` | BSD-3-Clause |
 | `opusfile/` | libopusfile / libopusurl | 0.12 | `mingw-w64-ucrt-x86_64-opusfile-0.12-4` | BSD-3-Clause |
 | `ogg/` | libogg | 1.3.6 | `mingw-w64-ucrt-x86_64-libogg-1.3.6-1` | BSD-3-Clause |
-| `webrtc-apm/` | libwebrtc-apm（WebRTC APM 1.3 + abseil） | 1.3 | 源码自建，见 `webrtc-apm/README.md` | BSD-3-Clause |
+| `webrtc-apm/` | libwebrtc-apm（WebRTC APM 1.3 + abseil） | 1.3 | 源码自建，见 `webrtc-apm/README.md` | BSD-3-Clause + Apache-2.0（abseil） |
 
 每个包的布局：
 

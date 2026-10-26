@@ -13,8 +13,16 @@ LiteTalk 客户端用 WebRTC APM 做回声消除（AEC3）、自动增益（AGC2
 | 源码包 | `webrtc-audio-processing-v1.3.tar.gz` |
 | 下载地址 | https://gitlab.freedesktop.org/pulseaudio/webrtc-audio-processing/-/archive/v1.3/webrtc-audio-processing-v1.3.tar.gz |
 | SHA256 | `b04404884e705464c1a2da0d5036ae0fc02d87ed150faa7da4536c99d6966660` |
-| 许可证 | BSD-3-Clause（见本目录 `COPYING`） |
+| 许可证 | webrtc-audio-processing：BSD-3-Clause（本目录 `COPYING`）；abseil：Apache-2.0（见下文） |
 | abseil | 20230125.1（上游 meson wrap 拉取，静态合并进库） |
+
+## 许可证
+
+- webrtc-audio-processing 本体（含其内置的 pffft/fft/rnnoise）：BSD-3-Clause，
+  全文见本目录 `COPYING`。
+- abseil 20230125.1：Apache-2.0。vendored 头文件逐个保留了 Apache-2.0 版权头；
+  许可证全文见 https://www.apache.org/licenses/LICENSE-2.0 。
+- 静态库把上述代码合并为单一归档，分发二进制时 `COPYING` 与本节说明需随附。
 
 ## 目录布局
 
