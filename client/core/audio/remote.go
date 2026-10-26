@@ -155,6 +155,11 @@ type RemoteManager struct {
 	mixer *Mixer
 	log   *log.Logger
 
+	// OnPeerChange 远端链路增删后的通知（#45 优先发言 ducking 重算）。在释放
+	// rm.mu 之后、调用方 goroutine 上同步触发，可安全回读状态表/混音器；
+	// 构造期赋值一次，之后只读。不得在实现里阻塞或回调本管理器。
+	OnPeerChange func()
+
 	// frameMS 当前频道帧长（10/20ms，#46）。新接入的远端轨继承此值；
 	// 热切换时同步写入全部在管远端。
 	frameMS atomic.Int32
@@ -241,50 +246,63 @@ func (rm *RemoteManager) HandleTrack(track *webrtc.TrackRemote, _ *webrtc.RTPRec
 	rm.mu.Unlock()
 
 	rm.log.Printf("remote: track up for %s (ssrc=%d, pt=%d)", peerID, track.SSRC(), track.PayloadType())
+	rm.peerChanged()
 	rp.wg.Add(2)
 	go rp.readLoop(rm)
 	go rp.decodeLoop()
+}
+
+// peerChanged 通知远端链路集合变化（调用方须已释放 rm.mu）。
+func (rm *RemoteManager) peerChanged() {
+	if rm.OnPeerChange != nil {
+		rm.OnPeerChange()
+	}
 }
 
 // RemovePeer 销毁某对端链路（channel.peer_left / 离房时调用），连同该 peer 的
 // 混音输入一并销毁。幂等；锁序固定 rm.mu → mixer.mu。
 func (rm *RemoteManager) RemovePeer(peerID string) {
 	rm.mu.Lock()
-	defer rm.mu.Unlock()
 	rp, ok := rm.peers[peerID]
 	if !ok {
+		rm.mu.Unlock()
 		return
 	}
 	delete(rm.peers, peerID)
 	rp.stop()
 	rm.mixer.RemovePeer(peerID)
+	rm.mu.Unlock()
 	rm.log.Printf("remote: peer %s removed", peerID)
+	rm.peerChanged()
 }
 
 // removeIf track EOF 自愈拆除：仅当 map 中仍是本实例时拆除（不误伤重协商
 // 后的新链路）。由 readLoop 异步调用（避免 stop 自我等待）。
 func (rm *RemoteManager) removeIf(rp *remotePeer) {
 	rm.mu.Lock()
-	defer rm.mu.Unlock()
 	if rm.peers[rp.id] != rp {
+		rm.mu.Unlock()
 		return
 	}
 	delete(rm.peers, rp.id)
 	rp.stop()
 	rm.mixer.RemovePeer(rp.id)
+	rm.mu.Unlock()
 	rm.log.Printf("remote: peer %s track ended, removed", rp.id)
+	rm.peerChanged()
 }
 
 // RemoveAll 销毁全部对端链路（离开频道/断开时调用）。
 func (rm *RemoteManager) RemoveAll() {
 	rm.mu.Lock()
-	defer rm.mu.Unlock()
 	peers := rm.peers
 	rm.peers = make(map[string]*remotePeer)
 	for id, rp := range peers {
 		rp.stop()
 		rm.mixer.RemovePeer(id)
 	}
+	rm.mu.Unlock()
+	rm.peerChanged()
 }
 
 // PeerIDs 当前在管的远端 peer 列表。

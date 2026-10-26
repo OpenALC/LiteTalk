@@ -751,6 +751,24 @@ func TestRemoteHandleTrackLoopback(t *testing.T) {
 
 // BenchmarkRemoteDecodeFrame 远端解码热路径（push → pop → 解码 → 写混音环，
 // 随后排空模拟混音 tick 消费）：必须 0 allocs/op。
+// TestRemoteManagerOnPeerChange 链路增删通知在锁外触发（#45 ducking 重算钩子）；
+// 无实际变化（未知 peer）不触发。
+func TestRemoteManagerOnPeerChange(t *testing.T) {
+	m := NewMixer(func([]int16) int { return 0 })
+	rm := NewRemoteManager(m, nil)
+	calls := 0
+	rm.OnPeerChange = func() { calls++ }
+
+	rm.RemovePeer("nope")
+	if calls != 0 {
+		t.Fatalf("未知 peer 不应触发回调，实际 %d 次", calls)
+	}
+	rm.RemoveAll()
+	if calls != 1 {
+		t.Fatalf("RemoveAll 应触发一次回调，实际 %d 次", calls)
+	}
+}
+
 func BenchmarkRemoteDecodeFrame(b *testing.B) {
 	m := NewMixer(func([]int16) int { return FrameSize })
 	rp := newTestRemotePeer(b, "a", m)
