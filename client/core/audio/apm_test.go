@@ -70,8 +70,8 @@ func nearEndFrame(dst []int16, phase *float64, amp, noiseAmp float64, rng *uint3
 	}
 }
 
-// TestAECSuppressesEcho 合成回声收敛测试：render 双音 → 延迟 50ms、衰减 -6dB
-// 的 capture 回声（无近端语音）。AEC3 有收敛期，先灌 4s 再测 1s 的 ERLE。
+// TestAECSuppressesEcho 合成回声收敛测试：render 宽带噪声 → 延迟 50ms、衰减
+// -6dB 的 capture 回声（无近端语音）。AEC3 有收敛期，先灌 4s 再测 1s 的 ERLE。
 //
 // 阈值取 6dB（能量降到约 1/4）：真实 AEC3 在平稳线性回声上通常远高于此，
 // 6dB 只要求"明显下降"且给合成信号/AEC 非线性处理留足余量，避免 CI 抖动。
@@ -214,7 +214,7 @@ func BenchmarkAPMCapture(b *testing.B) {
 }
 
 // TestDSPAPMIntegration DSP 的 APM 链路接线：render 参考 + capture 近端信号
-// 均能处理，AGC/AEC 热切换不报错，数字静音帧输出全零（AEC 状态仍推进）。
+// 均能处理，AGC/AEC 热切换不报错，数字静音帧输出落到近零（AEC 状态仍推进）。
 func TestDSPAPMIntegration(t *testing.T) {
 	requireAPM(t)
 
