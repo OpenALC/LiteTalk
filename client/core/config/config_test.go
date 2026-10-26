@@ -57,7 +57,8 @@ func TestAudioSettings(t *testing.T) {
 	}
 	if d.PacketLoss != 10 || !*d.Denoise || d.DenoiseStrength != 2 ||
 		!*d.AGC || *d.VADSens != 2 || d.Complexity != 9 ||
-		d.MicVolume != 100 || d.PlaybackVolume != 100 || d.InputMode != "auto" {
+		d.MicVolume != 100 || d.PlaybackVolume != 100 || d.InputMode != "auto" ||
+		d.DisableAEC {
 		t.Fatalf("默认 DSP 参数异常: %+v", d)
 	}
 
@@ -69,6 +70,7 @@ func TestAudioSettings(t *testing.T) {
 		PacketLoss: 15, Denoise: &f, DenoiseStrength: 3, AGC: &tr,
 		VADSens: &low, Complexity: 5,
 		MicVolume: 60, PlaybackVolume: 120, InputMode: "right", PreGainDB: 6,
+		DisableAEC: true,
 	}
 	if err := m.SetAudioSettings(custom); err != nil {
 		t.Fatalf("SetAudioSettings: %v", err)
@@ -81,7 +83,7 @@ func TestAudioSettings(t *testing.T) {
 	if got.PacketLoss != 15 || *got.Denoise || got.DenoiseStrength != 3 ||
 		!*got.AGC || *got.VADSens != 0 || got.Complexity != 5 ||
 		got.MicVolume != 60 || got.PlaybackVolume != 120 || got.InputMode != "right" ||
-		got.PreGainDB != 6 {
+		got.PreGainDB != 6 || !got.DisableAEC {
 		t.Fatalf("DSP 设置未持久化: %+v", got)
 	}
 

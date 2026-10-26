@@ -80,7 +80,8 @@ type AudioSettings struct {
 	MicVolume       int     `json:"mic_volume,omitempty"`       // 麦克风音量 0–120（默认 100）
 	PlaybackVolume  int     `json:"playback_volume,omitempty"`  // 扬声器音量 0–120（默认 100）
 	InputMode       string  `json:"input_mode,omitempty"`       // 输入声道下混：auto/left/right/mix（"" → auto）
-	PreGainDB       float64 `json:"pre_gain_db,omitempty"`      // 前置增益 dB（-12~+24，RNNoise 之前；0 → 0）
+	PreGainDB       float64 `json:"pre_gain_db,omitempty"`      // 前置增益 dB（-12~+24，RNNoise/APM 之前；0 → 0）
+	DisableAEC      bool    `json:"disable_aec,omitempty"`      // 关闭 WebRTC 回声消除（false → 开启，默认）
 }
 
 // InputModes 合法输入声道模式（SetAudioSettings 白名单 / GetAudioSettings 收敛）。

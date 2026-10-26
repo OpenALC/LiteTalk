@@ -3,7 +3,7 @@
 // （nativeInitFailed），绝不静默落 mock——生产 mock 会让「登录一律成功」。
 // node 环境无 window/DOM：用最小 FakeWindow（EventTarget 子类）顶替。
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { __resetBridgeForTest, isNative, isNativeInitFailed, whenNativeReady } from './bridge'
+import { __resetBridgeForTest, goApp, isNative, isNativeInitFailed, whenNativeReady } from './bridge'
 
 class FakeWindow extends EventTarget {
   _wails?: { flags?: Record<string, unknown> }
@@ -63,5 +63,21 @@ describe('whenNativeReady', () => {
     await p
     expect(isNative()).toBe(true)
     expect(isNativeInitFailed()).toBe(false)
+  })
+})
+
+// 浏览器 mock 的语音设置默认值：AEC 关闭字段缺省 = 开启，UI 依赖它初始化
+// 「回声消除 AEC」开关（Go 侧 omitempty 不会下发 false）。
+describe('语音设置 mock 默认值', () => {
+  afterEach(() => {
+    delete (globalThis as Record<string, unknown>).window
+    env.DEV = true
+  })
+
+  it('默认开启回声消除', async () => {
+    installWindow()
+    env.DEV = true
+    const s = await goApp().GetAudioSettings()
+    expect(s.disable_aec).toBe(false)
   })
 })

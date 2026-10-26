@@ -44,6 +44,8 @@ overrides:
       - libwebkit2gtk-4.1-0
       - libgtk-3-0
       - libopus0
+      # WebRTC APM 静态库用 C++ 编写，允许动态依赖系统 libstdc++（#43）。
+      - libstdc++6
       - libasound2 | libasound2t64
       - libpulse0 | pipewire-pulse
   rpm:
@@ -51,5 +53,7 @@ overrides:
       - webkit2gtk4.1
       - gtk3
       - opus
+      # 同上：APM 的静态库需要系统 libstdc++（#43）。
+      - libstdc++
       - alsa-lib
       - pulseaudio-libs

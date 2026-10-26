@@ -2146,6 +2146,7 @@ func (a *App) runtimeAudio() audio.RuntimeSettings {
 		Complexity:      complexity,
 		InputMode:       audio.ParseInputMode(as.InputMode),
 		PreGainDB:       as.PreGainDB,
+		DisableAEC:      as.DisableAEC,
 	}
 }
 

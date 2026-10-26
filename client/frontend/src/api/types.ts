@@ -151,6 +151,8 @@ export interface AudioSettings {
   input_mode?: 'auto' | 'left' | 'right' | 'mix'
   // 前置增益 dB（-12~+24，RNNoise 之前；0 = 不变，omitempty 后可能缺省）。
   pre_gain_db?: number
+  // 关闭 WebRTC 回声消除（false/缺省 = 开启；omitempty 后 false 不出现）。
+  disable_aec?: boolean
 }
 
 // HotkeySettings 全局热键与按键说话配置（与 Go 侧 hotkey.Settings / config 的

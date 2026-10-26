@@ -79,7 +79,7 @@ const audio = ref<AudioSettings>({
   bitrate_kbps: 32, vbr: true, dtx: true, fec: true,
   packet_loss: 10, denoise: true, denoise_strength: 2, agc: true,
   mic_volume: 100, playback_volume: 100, vad_sens: 2, opus_complexity: 9,
-  input_mode: 'auto', pre_gain_db: 0,
+  input_mode: 'auto', pre_gain_db: 0, disable_aec: false,
 })
 const BITRATES = [16, 24, 32, 48, 64]
 // VAD 五档（v0.1.2 扩展；旧三档由 Go 侧映射 0/2/4）。
@@ -102,6 +102,12 @@ function setInputMode(e: Event) {
 const denoiseIdx = ref(2)
 function syncDenoiseIdx() {
   denoiseIdx.value = audio.value.denoise ? audio.value.denoise_strength : 0
+}
+// 回声消除默认开启（Go 侧 disable_aec=false 时 omitempty 不下发，UI 补默认）。
+// 显式 setter 而不是 v-model 计算属性：保证先改值再保存，不依赖 change 监听顺序。
+function setAEC(on: boolean) {
+  audio.value.disable_aec = !on
+  void applyAudio()
 }
 function applyDenoiseIdx(i: number) {
   denoiseIdx.value = i
@@ -128,6 +134,7 @@ onMounted(async () => {
   // omitempty 字段（0/空值不序列化）在 UI 侧补默认，避免滑杆/下拉空值。
   audio.value.input_mode ??= 'auto'
   audio.value.pre_gain_db ??= 0
+  audio.value.disable_aec ??= false
   // 热键读取单独兜异常：Go 侧绑定缺失时只回落默认值，不连带弄崩下面设备列表的加载。
   try {
     hk.value = await goApp().GetHotkeySettings()
@@ -493,6 +500,13 @@ function bindRecording(spec: string) {
           <div class="k">自动增益 AGC</div>
           <label class="switch">
             <input v-model="audio.agc" type="checkbox" @change="applyAudio"><i />
+          </label>
+        </div>
+        <div class="s-row">
+          <div class="k">回声消除 AEC</div>
+          <label class="switch">
+            <input :checked="!audio.disable_aec" type="checkbox"
+                   @change="setAEC(($event.target as HTMLInputElement).checked)"><i />
           </label>
         </div>
         <div class="s-row">
