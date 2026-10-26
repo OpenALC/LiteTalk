@@ -473,7 +473,7 @@ function bindRecording(spec: string) {
       <section class="s-sec">
         <h3>语音</h3>
         <div class="s-row">
-          <div class="k">麦克风降噪强度（RNNoise）</div>
+          <div class="k">附加降噪（RNNoise）</div>
           <div class="seg-mini">
             <button v-for="(label, i) in DENOISE_LABELS" :key="i"
                     :class="{ on: denoiseIdx === i }"
