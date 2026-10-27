@@ -11,7 +11,7 @@ homepage: https://github.com/OpenALC/LiteTalk
 vendor: OpenALC
 description: |
   轻音 LiteTalk 桌面语音联机客户端。
-  基于 Wails v3 构建，运行时依赖 WebKitGTK 4.1 与 libopus。
+  基于 Wails v3 构建，运行时依赖 WebKitGTK 4.1（libopus 静态内置）。
 contents:
   - src: ./build/bin/LiteTalk
     dst: /usr/bin/litetalk
@@ -38,12 +38,12 @@ contents:
       mode: 0644
 # 依赖对齐 WebKitGTK 4.1（gtk3 构建标签）：不再备选 webkit2gtk-4.0，去 portaudio。
 # 音频后端 miniaudio 在运行时 dlopen alsa / pulse，故仍声明为依赖保证面板可用。
+# libopus 已静态链接进二进制（third_party/opus-linux-*），不再声明运行时依赖。
 overrides:
   deb:
     depends:
       - libwebkit2gtk-4.1-0
       - libgtk-3-0
-      - libopus0
       # WebRTC APM 静态库用 C++ 编写，允许动态依赖系统 libstdc++（#43）。
       - libstdc++6
       - libasound2 | libasound2t64
@@ -52,7 +52,6 @@ overrides:
     depends:
       - webkit2gtk4.1
       - gtk3
-      - opus
       # 同上：APM 的静态库需要系统 libstdc++（#43）。
       - libstdc++
       - alsa-lib
