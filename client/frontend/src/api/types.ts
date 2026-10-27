@@ -138,6 +138,8 @@ export interface AudioSettings {
   vbr: boolean
   dtx: boolean
   fec: boolean
+  // 深度冗余：突发丢包恢复（#44，omitempty 后可能缺省；缺省 = 开）。
+  dred?: boolean
   packet_loss: number // 5–20
   denoise: boolean
   denoise_strength: number // 1 弱 / 2 中 / 3 强（rnnoise Aggressiveness 档位）

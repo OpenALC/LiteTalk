@@ -81,6 +81,13 @@ describe('Beta APM mock 默认值', () => {
     expect(s.enable_apm).toBe(false)
   })
 
+  it('DRED 默认开启', async () => {
+    installWindow()
+    env.DEV = true
+    const s = await goApp().GetAudioSettings()
+    expect(s.dred).toBe(true)
+  })
+
   it('mock 平台报告支持 APM', async () => {
     installWindow()
     env.DEV = true

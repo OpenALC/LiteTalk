@@ -16,6 +16,7 @@ import {
   findHotkeyConflicts, findInAppClashes, normalizeBinding, type HotkeyActionID,
 } from '../utils/hotkeySpec'
 import { cleanErrorText } from '../utils/errorText'
+import { withAudioDefaults } from '../utils/audioSettings'
 import ServerConnPanel from '../components/ServerConnPanel.vue'
 import Toast from '../components/Toast.vue'
 
@@ -76,7 +77,7 @@ function levelBridge() {
 // 语音设置：Go 侧返回已回落默认的完整值（码率/VBR/DTX/FEC/丢包/降噪强度/AGC/
 // 麦克风/扬声器音量/VAD 五档/Opus 复杂度/输入声道/前置增益）。
 const audio = ref<AudioSettings>({
-  bitrate_kbps: 32, vbr: true, dtx: true, fec: true,
+  bitrate_kbps: 32, vbr: true, dtx: true, fec: true, dred: true,
   packet_loss: 10, denoise: true, denoise_strength: 2, agc: true,
   mic_volume: 100, playback_volume: 100, vad_sens: 2, opus_complexity: 9,
   input_mode: 'auto', pre_gain_db: 0, enable_apm: false,
@@ -134,11 +135,7 @@ onMounted(async () => {
     if (typeof p?.mode === 'string') secretMode.value = p.mode
   })
   secretMode.value = await goApp().SecretStorageMode().catch(() => '')
-  audio.value = await goApp().GetAudioSettings()
-  // omitempty 字段（0/空值不序列化）在 UI 侧补默认，避免滑杆/下拉空值。
-  audio.value.input_mode ??= 'auto'
-  audio.value.pre_gain_db ??= 0
-  audio.value.enable_apm ??= false
+  audio.value = withAudioDefaults(await goApp().GetAudioSettings())
   apmSupported.value = await goApp().APMSupported().catch(() => false)
   if (!apmSupported.value) audio.value.enable_apm = false
   // 热键读取单独兜异常：Go 侧绑定缺失时只回落默认值，不连带弄崩下面设备列表的加载。
@@ -559,6 +556,14 @@ function bindRecording(spec: string) {
           <input v-model.number="audio.packet_loss" type="range" min="5" max="20" step="5" @change="applyAudio">
           <span class="v">{{ audio.packet_loss }}%</span>
         </div>
+        <!-- 深度冗余：突发丢包时用后续包里的 200ms 冗余恢复，FEC 不可用时兜底 -->
+        <div class="s-row">
+          <div class="k">弱网深度冗余（DRED）</div>
+          <label class="switch">
+            <input v-model="audio.dred" type="checkbox" @change="applyAudio"><i />
+          </label>
+        </div>
+        <p class="s-note">提高突发丢包恢复，码率略增</p>
       </section>
 
       <section class="s-sec">

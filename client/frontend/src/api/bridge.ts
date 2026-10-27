@@ -236,7 +236,7 @@ const mockApp: GoApp = {
   async TestSpeaker() {},
   async GetAudioSettings() {
     return {
-      bitrate_kbps: 32, vbr: true, dtx: true, fec: true, packet_loss: 10,
+      bitrate_kbps: 32, vbr: true, dtx: true, fec: true, dred: true, packet_loss: 10,
       denoise: true, denoise_strength: 2, agc: false, gain: 10,
       mic_volume: 100, playback_volume: 100, vad_sens: 2, opus_complexity: 9,
       enable_apm: false,
