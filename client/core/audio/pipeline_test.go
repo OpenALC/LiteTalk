@@ -28,9 +28,8 @@ func newLoopbackPipeline(t *testing.T, mutate func(*PipelineConfig)) *Pipeline {
 	requireOpus(t)
 	cfg := DefaultPipelineConfig()
 	cfg.Backend = BackendNull // 不 Start，仅同步注入，用不到后端
-	// 既有链路测试锁定编码/统计/说话判定行为：绕过 APM，避免 AGC2/NS 改变
-	// 断言基准。APM 专项见 apm_test.go 与 TestPipelineAPMRenderWiring。
-	cfg.DSP.DisableAPM = true
+	// APM 是 Beta 功能默认关闭；既有链路测试锁定旧 DSP 行为，APM 专项
+	// 由调用方 mutate 显式 EnableAPM=true。
 	if mutate != nil {
 		mutate(&cfg)
 	}
@@ -412,7 +411,7 @@ func BenchmarkProcessPCMWithSendGate(b *testing.B) {
 	cfg.Backend = BackendNull
 	cfg.Loopback = false
 	cfg.DSP.Denoise = false
-	cfg.DSP.DisableAPM = true // 基准目标是发包门开销，排除 APM 的固定成本
+	// APM 默认关闭；基准目标是发包门开销，保持默认旧链路。
 	p, err := NewPipeline(cfg)
 	if err != nil {
 		b.Fatalf("NewPipeline: %v", err)
@@ -440,7 +439,7 @@ func BenchmarkProcessPCMWithSendGate(b *testing.B) {
 // 与 ProcessPCM 可并行接线运行，且不改变编码/播放账目。
 func TestPipelineAPMRenderWiring(t *testing.T) {
 	requireAPM(t)
-	p := newLoopbackPipeline(t, func(c *PipelineConfig) { c.DSP.DisableAPM = false })
+	p := newLoopbackPipeline(t, func(c *PipelineConfig) { c.DSP.EnableAPM = true })
 	if !p.APMActive() {
 		t.Fatal("Pipeline 应启用 APM")
 	}
@@ -458,6 +457,55 @@ func TestPipelineAPMRenderWiring(t *testing.T) {
 	}
 	if st := p.Stats(); st.FramesProcessed != 40 || st.PacketsEncoded != 20 {
 		t.Fatalf("统计异常: frames=%d packets=%d", st.FramesProcessed, st.PacketsEncoded)
+	}
+}
+
+// TestPipelineAPMHotSwitch 管线默认关闭 APM；Beta 开关运行期创建/销毁句柄，
+// 关闭后 ProcessPCM 完全走旧链路。
+func TestPipelineAPMHotSwitch(t *testing.T) {
+	requireAPM(t)
+	p := newLoopbackPipeline(t, nil)
+	if p.APMActive() {
+		t.Fatal("APM 默认应关闭")
+	}
+	ren := make([]int16, FrameSize)
+	in := make([]int16, FrameSize)
+	var phase float64
+	var rng uint32 = 0x43AF
+	feed := func(frames int) {
+		t.Helper()
+		for f := 0; f < frames; f++ {
+			aecRenderFrame(ren, f)
+			p.ProcessRender(ren)
+			sineNoiseFrame(in, &phase, 6000, 500, &rng)
+			if err := p.ProcessPCM(in); err != nil {
+				t.Fatalf("ProcessPCM: %v", err)
+			}
+		}
+	}
+	feed(10)
+	if err := p.SetEnableAPM(true); err != nil {
+		t.Fatalf("SetEnableAPM(true): %v", err)
+	}
+	if !p.APMActive() {
+		t.Fatal("开启后 APM 应生效")
+	}
+	feed(40)
+	if err := p.SetEnableAPM(false); err != nil {
+		t.Fatalf("SetEnableAPM(false): %v", err)
+	}
+	if p.APMActive() {
+		t.Fatal("关闭后 APM 应停用")
+	}
+	feed(10)
+	if err := p.SetEnableAPM(true); err != nil {
+		t.Fatalf("重新开启: %v", err)
+	}
+	if err := p.SetEnableAPM(true); err != nil { // 幂等
+		t.Fatalf("重复开启: %v", err)
+	}
+	if err := p.SetEnableAPM(false); err != nil {
+		t.Fatalf("最终关闭: %v", err)
 	}
 }
 

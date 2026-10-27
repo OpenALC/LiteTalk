@@ -384,8 +384,6 @@ func newNullPipeline(t *testing.T) *audio.Pipeline {
 	t.Helper()
 	cfg := audio.DefaultPipelineConfig()
 	cfg.Backend = audio.BackendNull
-	// 会话测试不验证音质：绕过 APM，避免 AEC3 初始化开销与 AGC2 对电平断言的干扰。
-	cfg.DSP.DisableAPM = true
 	p, err := audio.NewPipeline(cfg)
 	if err != nil {
 		t.Fatalf("NewPipeline: %v", err)

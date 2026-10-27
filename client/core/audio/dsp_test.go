@@ -30,9 +30,6 @@ func noiseFrame(dst []int16, noiseAmp float64, rng *uint32) {
 func newTestDSP(t *testing.T, mutate func(*DSPConfig)) *DSP {
 	t.Helper()
 	cfg := DefaultDSPConfig()
-	// 单元测试默认绕过 APM：这些用例锁定旧 DSP 链路的精确行为；APM 相关
-	// 行为由 apm_test.go 显式开启验证。
-	cfg.DisableAPM = true
 	if mutate != nil {
 		mutate(&cfg)
 	}
@@ -277,21 +274,21 @@ func TestDenoiseBypass(t *testing.T) {
 	}
 }
 
-// BenchmarkDSPProcess 生产默认链路（WebRTC APM + RNNoise）热路径：必须 0 Go allocs/op。
+// BenchmarkDSPProcess Beta 开关开启 APM 后的热路径：必须 0 Go allocs/op。
 // APM 的 C++ 内部分配不计入 Go 堆，cgo 调用本身也不分配。
 func BenchmarkDSPProcess(b *testing.B) {
-	benchDSPProcess(b, false)
-}
-
-// BenchmarkDSPProcessLegacy 旧链路（无 APM）基准，用于对比接入 APM 前后的
-// 每帧开销；同为 0 Go allocs/op。
-func BenchmarkDSPProcessLegacy(b *testing.B) {
 	benchDSPProcess(b, true)
 }
 
-func benchDSPProcess(b *testing.B, disableAPM bool) {
+// BenchmarkDSPProcessLegacy 默认路径（APM 关闭，RNNoise + 自研 AGC 链路），
+// 用于对比开启 Beta APM 前后的每帧开销；同为 0 Go allocs/op。
+func BenchmarkDSPProcessLegacy(b *testing.B) {
+	benchDSPProcess(b, false)
+}
+
+func benchDSPProcess(b *testing.B, enableAPM bool) {
 	cfg := DefaultDSPConfig()
-	cfg.DisableAPM = disableAPM
+	cfg.EnableAPM = enableAPM
 	// 两档都保持 AGC 关闭（DSPConfig 未开 agcOn），只比较固定链路的
 	// APM/RNNoise 成本；AGC2 的额外开销由 BenchmarkAPMCapture 单独计。
 	d, err := NewDSP(cfg)
@@ -310,7 +307,7 @@ func benchDSPProcess(b *testing.B, disableAPM bool) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		// 生产路径每 10ms 同时喂一帧混音参考（旧链路为 no-op）。
+		// APM 档每 10ms 同时喂一帧混音参考；默认旧链路为 no-op。
 		d.ProcessRender(ren)
 		if _, err := d.Process(out, in); err != nil {
 			b.Fatal(err)
@@ -323,10 +320,10 @@ func benchDSPProcess(b *testing.B, disableAPM bool) {
 // 区间而比语音段慢 1.4~2.3 倍；短路后静音段只有峰值扫描，比值应远小于 1。
 // 必须 0 allocs/op。
 func BenchmarkDSPSilenceAfterSpeech(b *testing.B) {
-	// 该基准专测 RNNoise 的 denormal 短路：绕过 APM，否则静音帧也进 APM，
-	// 测的就不是短路路径了。
+	// 该基准专测 RNNoise 的 denormal 短路：显式关闭 APM（Beta 默认即关闭，
+	// 这里写明以固定基准语义），否则静音帧也进 APM，测的就不是短路路径了。
 	cfg := DefaultDSPConfig()
-	cfg.DisableAPM = true
+	cfg.EnableAPM = false
 	d, err := NewDSP(cfg)
 	if err != nil {
 		b.Fatal(err)
@@ -410,7 +407,7 @@ func TestDSPSilenceAfterSpeech(t *testing.T) {
 
 // TestSetVADSensitivity 灵敏度五档（v0.1.2）映射到 VAD 双门限，非法档回落中档。
 func TestSetVADSensitivity(t *testing.T) {
-	d, err := NewDSP(DSPConfig{Denoise: true, DisableAPM: true})
+	d, err := NewDSP(DSPConfig{Denoise: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -438,7 +435,7 @@ func TestSetVADSensitivity(t *testing.T) {
 // RNNoise 有 20ms 算法延迟（Delay=2×FrameSize），首帧输出近零，
 // 须先灌入若干帧填满延迟线再比较稳态段。
 func TestSetDenoiseStrength(t *testing.T) {
-	d, err := NewDSP(DSPConfig{Denoise: true, DisableAPM: true})
+	d, err := NewDSP(DSPConfig{Denoise: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -486,7 +483,7 @@ func TestSetDenoiseStrength(t *testing.T) {
 
 // TestAGCConverge AGC 低幅输入增益上升、高幅输入增益下降并限幅（v0.1.2）。
 func TestAGCConverge(t *testing.T) {
-	d, err := NewDSP(DSPConfig{Denoise: false, DisableAPM: true})
+	d, err := NewDSP(DSPConfig{Denoise: false})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -536,7 +533,7 @@ func TestAGCConverge(t *testing.T) {
 
 // TestSetVADThresholds 直接指定门限时强制 ≥0.2 回差。
 func TestSetVADThresholds(t *testing.T) {
-	d, err := NewDSP(DSPConfig{Denoise: true, DisableAPM: true})
+	d, err := NewDSP(DSPConfig{Denoise: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -797,7 +794,7 @@ func TestPureSilenceNeverTriggers(t *testing.T) {
 
 // TestAGCCapped 弱恒定信号 AGC 收敛到上限且全程不超过（v1.1 上限 10×）。
 func TestAGCCapped(t *testing.T) {
-	d, err := NewDSP(DSPConfig{Denoise: false, DisableAPM: true})
+	d, err := NewDSP(DSPConfig{Denoise: false})
 	if err != nil {
 		t.Fatal(err)
 	}

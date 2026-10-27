@@ -214,12 +214,13 @@ func BenchmarkAPMCapture(b *testing.B) {
 }
 
 // TestDSPAPMIntegration DSP 的 APM 链路接线：render 参考 + capture 近端信号
-// 均能处理，AGC/AEC 热切换不报错，数字静音帧输出落到近零（AEC 状态仍推进）。
+// 均能处理，AGC 热切换与 APM 启停不报错，数字静音帧输出落到近零。
 func TestDSPAPMIntegration(t *testing.T) {
 	requireAPM(t)
 
 	cfg := DefaultDSPConfig()
 	cfg.Denoise = false // 用 RMS 门限验证说话状态，避免合成音的 RNNoise VAD 偏低
+	cfg.EnableAPM = true
 	d, err := NewDSP(cfg)
 	if err != nil {
 		t.Fatalf("NewDSP: %v", err)
@@ -267,27 +268,129 @@ func TestDSPAPMIntegration(t *testing.T) {
 		t.Fatal("持续静音后说话态未退出")
 	}
 
-	if d.DisableAEC() {
-		t.Fatal("DisableAEC 默认应为 false")
+	// 热切换关闭：句柄销毁，回到旧链路；纯数字静音逐样本为零。
+	if err := d.SetEnableAPM(false); err != nil {
+		t.Fatalf("SetEnableAPM(false): %v", err)
 	}
-	d.SetDisableAEC(true)
-	if !d.DisableAEC() {
-		t.Fatal("SetDisableAEC(true) 未生效")
+	if d.APMActive() {
+		t.Fatal("关闭后 APM 应停用")
 	}
-	// AEC 关闭且参考为零时，纯数字静音必须逐样本为零（与旧链路短路等价）。
 	for f := 0; f < 20; f++ {
 		clear(in)
 		clear(ren)
 		d.ProcessRender(ren)
 		if _, err := d.Process(out, in); err != nil {
-			t.Fatalf("AEC off silence frame %d: %v", f, err)
+			t.Fatalf("APM off silence frame %d: %v", f, err)
 		}
 		if peakAbs(out) != 0 {
-			t.Fatalf("AEC 关闭后静音输出非零（peak=%d）", peakAbs(out))
+			t.Fatalf("APM 关闭后静音输出非零（peak=%d）", peakAbs(out))
 		}
 	}
-	d.SetDisableAEC(false)
-	if d.DisableAEC() {
-		t.Fatal("SetDisableAEC(false) 未生效")
+	// 重新开启再关闭，验证句柄可重复创建/销毁。
+	if err := d.SetEnableAPM(true); err != nil {
+		t.Fatalf("重新开启 APM: %v", err)
+	}
+	if !d.APMActive() {
+		t.Fatal("重新开启后 APM 应生效")
+	}
+	if err := d.SetEnableAPM(false); err != nil {
+		t.Fatalf("再次关闭 APM: %v", err)
+	}
+	if d.APMActive() {
+		t.Fatal("再次关闭后 APM 应停用")
+	}
+}
+
+// TestDSPAPMDefaultOff Beta APM 默认关闭：不创建 C++ 句柄，Process/ProcessRender
+// 都走旧链路；所有平台都必须满足。
+func TestDSPAPMDefaultOff(t *testing.T) {
+	cfg := DefaultDSPConfig()
+	cfg.Denoise = false
+	d, err := NewDSP(cfg)
+	if err != nil {
+		t.Fatalf("NewDSP: %v", err)
+	}
+	defer d.Close()
+	if d.APMActive() {
+		t.Fatal("APM 默认应关闭")
+	}
+
+	in := make([]int16, FrameSize)
+	out := make([]int16, FrameSize)
+	ren := make([]int16, FrameSize)
+	var phase float64
+	var rng uint32 = 0x0FF1
+	for f := 0; f < 20; f++ {
+		aecRenderFrame(ren, f)
+		sineNoiseFrame(in, &phase, 12000, 2000, &rng)
+		d.ProcessRender(ren) // 关闭时必须是 no-op
+		if _, err := d.Process(out, in); err != nil {
+			t.Fatalf("Process frame %d: %v", f, err)
+		}
+	}
+	if peakAbs(out) == 0 {
+		t.Fatal("旧链路输出不应为零")
+	}
+}
+
+// TestDSPAPMHotSwitch 运行期开启/关闭 APM：默认旧链路 → 开启 → 处理 →
+// 关闭 → 回到旧链路，反复切换句柄创建/销毁不报错。
+func TestDSPAPMHotSwitch(t *testing.T) {
+	requireAPM(t)
+	cfg := DefaultDSPConfig()
+	cfg.Denoise = false
+	d, err := NewDSP(cfg)
+	if err != nil {
+		t.Fatalf("NewDSP: %v", err)
+	}
+	defer d.Close()
+	if d.APMActive() {
+		t.Fatal("APM 默认应关闭")
+	}
+
+	in := make([]int16, FrameSize)
+	out := make([]int16, FrameSize)
+	ren := make([]int16, FrameSize)
+	var phase float64
+	var rng uint32 = 0x43B0
+	feed := func(frames int) {
+		t.Helper()
+		for f := 0; f < frames; f++ {
+			aecRenderFrame(ren, f)
+			nearEndFrame(in, &phase, 12000, 1000, &rng)
+			d.ProcessRender(ren)
+			if _, err := d.Process(out, in); err != nil {
+				t.Fatalf("Process frame %d: %v", f, err)
+			}
+		}
+	}
+	feed(10)
+	if err := d.SetEnableAPM(true); err != nil {
+		t.Fatalf("SetEnableAPM(true): %v", err)
+	}
+	if !d.APMActive() {
+		t.Fatal("开启后 APM 应生效")
+	}
+	feed(50)
+	if err := d.SetEnableAPM(true); err != nil { // 幂等
+		t.Fatalf("重复开启: %v", err)
+	}
+	if err := d.SetEnableAPM(false); err != nil {
+		t.Fatalf("SetEnableAPM(false): %v", err)
+	}
+	if d.APMActive() {
+		t.Fatal("关闭后 APM 应停用")
+	}
+	feed(10)
+	for i := 0; i < 3; i++ {
+		if err := d.SetEnableAPM(true); err != nil {
+			t.Fatalf("第 %d 次开启: %v", i, err)
+		}
+		if err := d.SetEnableAPM(false); err != nil {
+			t.Fatalf("第 %d 次关闭: %v", i, err)
+		}
+	}
+	if d.APMActive() {
+		t.Fatal("最终应保持关闭")
 	}
 }
