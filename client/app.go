@@ -2138,6 +2138,7 @@ func (a *App) runtimeAudio() audio.RuntimeSettings {
 		Opus: audio.OpusConfig{
 			BitrateKbps: as.BitrateKbps,
 			VBR:         as.VBR, DTX: as.DTX, FEC: as.FEC,
+			DRED:       as.DRED,
 			PacketLoss: as.PacketLoss,
 		},
 		Denoise:         as.Denoise != nil && *as.Denoise,

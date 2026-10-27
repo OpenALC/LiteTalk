@@ -381,8 +381,8 @@ func printStats(logger *log.Logger, pipe *audio.Pipeline, peer *rtc.Peer, mixer 
 		if !ok {
 			continue
 		}
-		fmt.Fprintf(&b, " | %s: rtp=%d lost=%d plc=%d fec=%d jit=%.1fms tgt=%d jbuf=%d ring=%d pcm=%d underrun=%d drop=%d",
-			id, ls.RTPReceived, ls.Jitter.Lost, ls.PLCFrames, ls.FECFrames,
+		fmt.Fprintf(&b, " | %s: rtp=%d lost=%d plc=%d fec=%d dred=%d jit=%.1fms tgt=%d jbuf=%d ring=%d pcm=%d underrun=%d drop=%d",
+			id, ls.RTPReceived, ls.Jitter.Lost, ls.PLCFrames, ls.FECFrames, ls.DREDFrames,
 			ls.Jitter.JitterMs, ls.Jitter.TargetPackets, ls.Jitter.Buffered,
 			ls.RingAvailable, ls.WrittenSamples, ls.UnderrunFrames, ls.DroppedSamples)
 	}

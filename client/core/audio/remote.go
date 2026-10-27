@@ -121,8 +121,9 @@ func (t *StateTable) Snapshot() map[string]PeerVoiceState {
 type RemoteStats struct {
 	RTPReceived  atomic.Uint64 // 收到的 RTP 包数
 	FramesPopped atomic.Uint64 // jitter 弹出的正常帧数
-	PLCFrames    atomic.Uint64 // 无 FEC 可用时的 PLC 补偿帧数
+	PLCFrames    atomic.Uint64 // 无 FEC/DRED 可用时的 PLC 补偿帧数
 	FECFrames    atomic.Uint64 // 用后继包带内 FEC 恢复的丢帧数
+	DREDFrames   atomic.Uint64 // 用后继包 DRED 冗余恢复的丢帧数（#44）
 	DecodeErrors atomic.Uint64
 }
 
@@ -133,6 +134,11 @@ type remotePeer struct {
 	jb    *rtc.JitterBuffer
 	dec   *codec.Decoder
 	input *PeerInput
+
+	// dred 懒创建的 DRED 解码器（#44）：只在丢包且 FEC 不可用时才需要。
+	// 仅解码 goroutine 访问，无锁；dredFail 标记创建失败，避免反复分配。
+	dred     *codec.DREDDecoder
+	dredFail bool
 
 	done chan struct{}
 	wg   sync.WaitGroup
@@ -145,7 +151,7 @@ type remotePeer struct {
 
 	// 预分配热路径缓冲（仅解码循环使用）
 	payloadBuf [rtc.JitterMaxPayload]byte
-	fecBuf     [rtc.JitterMaxPayload]byte // 丢帧瞬间的后继包副本（FEC 用）
+	fecBuf     [rtc.JitterMaxPayload]byte // 丢帧瞬间的后继包副本（FEC/DRED 用）
 	pcm        [OpusFrameSize]int16
 }
 
@@ -335,6 +341,7 @@ type RemoteLinkStats struct {
 	FramesPopped   uint64
 	PLCFrames      uint64
 	FECFrames      uint64
+	DREDFrames     uint64
 	DecodeErrors   uint64
 	RingAvailable  int    // 该 peer 混音输入环当前可读采样数
 	UnderrunFrames uint64 // 混音 tick 读到不足的帧数
@@ -356,6 +363,7 @@ func (rm *RemoteManager) LinkStats(peerID string) (RemoteLinkStats, bool) {
 		FramesPopped: rp.Stats.FramesPopped.Load(),
 		PLCFrames:    rp.Stats.PLCFrames.Load(),
 		FECFrames:    rp.Stats.FECFrames.Load(),
+		DREDFrames:   rp.Stats.DREDFrames.Load(),
 		DecodeErrors: rp.Stats.DecodeErrors.Load(),
 	}
 	if rp.input != nil {
@@ -367,14 +375,35 @@ func (rm *RemoteManager) LinkStats(peerID string) (RemoteLinkStats, bool) {
 	return st, true
 }
 
-// stop 停止并回收单路（解码器、goroutine、混音输入）。
+// stop 停止并回收单路（解码器、DRED 解码器、goroutine、混音输入）。
 func (rp *remotePeer) stop() {
 	close(rp.done)
 	if rp.track != nil {
 		_ = rp.track.SetReadDeadline(time.Now()) // 解除 readLoop 阻塞
 	}
 	rp.wg.Wait()
+	if rp.dred != nil {
+		_ = rp.dred.Close()
+		rp.dred = nil
+	}
 	_ = rp.dec.Close()
+}
+
+// dredDecoder 懒创建 DRED 解码器（#44）。平台/库不支持时只记一次日志并置
+// dredFail，之后丢帧继续走 PLC——不能因为冗余不可用影响正常音频。
+// 仅解码 goroutine 调用。
+func (rp *remotePeer) dredDecoder() *codec.DREDDecoder {
+	if rp.dred != nil || rp.dredFail {
+		return rp.dred
+	}
+	d, err := codec.NewDREDDecoder()
+	if err != nil {
+		rp.dredFail = true
+		log.Printf("remote: DRED decoder unavailable for %s: %v", rp.id, err)
+		return nil
+	}
+	rp.dred = d
+	return d
 }
 
 // readLoop 阻塞读 RTP → 推 jitter（每路唯一写者）。
@@ -432,8 +461,9 @@ func (rp *remotePeer) frameSamples() int {
 
 // decodeOnce 单拍：到点 pop → 解码/丢帧补偿 → 写该 peer 的混音输入环。
 // 丢帧时若后继包已在 jitter 槽内，先用它的带内 FEC 恢复丢失帧（不消费后继，
-// 也不做常驻 +1 包 lookahead，稳态延迟不变）；连续丢包/后继未到/后继是 DTX
-// 心跳包时回落 PLC。PLC 按当前帧长合成（10ms=480、20ms=960，#46）。
+// 也不做常驻 +1 包 lookahead，稳态延迟不变）；FEC 不可用时再尝试同一后继包
+// 里的 DRED 冗余（#44，覆盖编码端未开 FEC / 该包无 LBRR 的情况）；都失败才
+// 回落 PLC。PLC 按当前帧长合成（10ms=480、20ms=960，#46）。
 // 热路径零分配（预分配 payloadBuf/fecBuf/pcm）；测试可同步调用。
 func (rp *remotePeer) decodeOnce() {
 	n, lost, ok := rp.jb.Pop(rp.payloadBuf[:])
@@ -441,12 +471,19 @@ func (rp *remotePeer) decodeOnce() {
 		return // 预填中/断流静默：本拍不出帧，混音侧自然补零
 	}
 	if lost {
-		// 只在丢帧瞬间窥视后继槽位；DTX 包（≤2 字节）不含 FEC 数据。
+		// 只在丢帧瞬间窥视后继槽位；DTX 包（≤2 字节）不含 FEC/DRED 数据。
 		if nn, ok := rp.jb.PeekNext(rp.fecBuf[:]); ok && nn > rtc.DTXPayloadMax {
 			if m, err := rp.dec.Decode(rp.fecBuf[:nn], rp.pcm[:], true); err == nil {
 				rp.Stats.FECFrames.Add(1)
 				rp.input.Write(rp.pcm[:m])
 				return
+			}
+			if d := rp.dredDecoder(); d != nil {
+				if m, ok, err := d.Recover(rp.dec, rp.fecBuf[:nn], rp.pcm[:], rp.frameSamples(), SampleRate); ok && err == nil {
+					rp.Stats.DREDFrames.Add(1)
+					rp.input.Write(rp.pcm[:m])
+					return
+				}
 			}
 		}
 		m, err := rp.dec.Decode(nil, rp.pcm[:rp.frameSamples()], false) // PLC：按当前帧长合成

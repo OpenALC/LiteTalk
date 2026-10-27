@@ -139,6 +139,7 @@ type PeerLinkDiag struct {
 	RingSamples           int     `json:"ring_samples"`
 	PLCFrames             uint64  `json:"plc_frames"`
 	FECFrames             uint64  `json:"fec_frames"`
+	DREDFrames            uint64  `json:"dred_frames"`
 	UnderrunFrames        uint64  `json:"underrun_frames"`
 	DroppedSamples        uint64  `json:"dropped_samples"`
 }
@@ -1525,6 +1526,7 @@ func (s *Session) ApplyAudio(rs audio.RuntimeSettings) error {
 		{"vbr", func() error { return s.pipe.SetOpusVBR(*rs.Opus.VBR) }},
 		{"dtx", func() error { return s.pipe.SetOpusDTX(*rs.Opus.DTX) }},
 		{"fec", func() error { return s.pipe.SetOpusFEC(*rs.Opus.FEC) }},
+		{"dred", func() error { return s.pipe.SetOpusDRED(*rs.Opus.DRED) }},
 		{"packet_loss", func() error { return s.pipe.SetOpusPacketLoss(rs.Opus.PacketLoss) }},
 		{"pre_gain", func() error { return s.pipe.SetPreGainDB(rs.PreGainDB) }},
 		{"input_mode", func() error { return s.pipe.SetInputMode(rs.InputMode) }},
@@ -1610,6 +1612,7 @@ func (s *Session) Stats() string {
 				RingSamples:           ls.RingAvailable,
 				PLCFrames:             ls.PLCFrames,
 				FECFrames:             ls.FECFrames,
+				DREDFrames:            ls.DREDFrames,
 				UnderrunFrames:        ls.UnderrunFrames,
 				DroppedSamples:        ls.DroppedSamples,
 			})

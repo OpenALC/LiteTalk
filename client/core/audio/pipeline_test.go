@@ -653,6 +653,9 @@ func TestOpusSetterAfterClose(t *testing.T) {
 	if err := p.SetOpusFEC(false); !errors.Is(err, codec.ErrClosed) {
 		t.Fatalf("SetOpusFEC after Close: %v", err)
 	}
+	if err := p.SetOpusDRED(false); !errors.Is(err, codec.ErrClosed) {
+		t.Fatalf("SetOpusDRED after Close: %v", err)
+	}
 	if err := p.SetOpusPacketLoss(20); !errors.Is(err, codec.ErrClosed) {
 		t.Fatalf("SetOpusPacketLoss after Close: %v", err)
 	}
@@ -661,13 +664,55 @@ func TestOpusSetterAfterClose(t *testing.T) {
 // TestOpusConfigResolve 零值字段回落默认。
 func TestOpusConfigResolve(t *testing.T) {
 	r := ResolveOpusConfig(OpusConfig{})
-	if r.BitrateKbps != 32 || !*r.VBR || !*r.DTX || !*r.FEC || r.PacketLoss != 10 {
+	if r.BitrateKbps != 32 || !*r.VBR || !*r.DTX || !*r.FEC || !*r.DRED || r.PacketLoss != 10 {
 		t.Fatalf("ResolveOpusConfig 零值回落异常: %+v", r)
 	}
-	custom := OpusConfig{BitrateKbps: 48, PacketLoss: 15}
+	off := false
+	custom := OpusConfig{BitrateKbps: 48, PacketLoss: 15, DRED: &off}
 	r = ResolveOpusConfig(custom)
-	if r.BitrateKbps != 48 || r.PacketLoss != 15 || !*r.VBR {
+	if r.BitrateKbps != 48 || r.PacketLoss != 15 || !*r.VBR || *r.DRED {
 		t.Fatalf("ResolveOpusConfig 应保留显式值: %+v", r)
+	}
+}
+
+// TestOpusDREDToggle DRED 默认开：编码器 DRED=20 帧、PLP 抬到 20%；关闭后
+// DRED 归零、PLP 恢复用户值；DRED 开启时用户调低 PLP 仍保留 20% 下限。
+func TestOpusDREDToggle(t *testing.T) {
+	p := newLoopbackPipeline(t, func(c *PipelineConfig) { c.DSP.Denoise = false })
+	if !*p.opus.DRED {
+		t.Fatal("默认 DRED 应为开")
+	}
+	if d, err := p.enc.DREDDuration(); err != nil || d != DREDDurationFrames {
+		t.Fatalf("DREDDuration = %d, %v; want %d", d, err, DREDDurationFrames)
+	}
+	if plp, err := p.enc.PacketLossPerc(); err != nil || plp != DREDMinPacketLoss {
+		t.Fatalf("PacketLossPerc = %d, %v; want %d", plp, err, DREDMinPacketLoss)
+	}
+
+	if err := p.SetOpusDRED(false); err != nil {
+		t.Fatalf("SetOpusDRED(false): %v", err)
+	}
+	if *p.opus.DRED {
+		t.Fatal("关闭后 p.opus.DRED 应为 false")
+	}
+	if d, err := p.enc.DREDDuration(); err != nil || d != 0 {
+		t.Fatalf("关闭后 DREDDuration = %d, %v; want 0", d, err)
+	}
+	if plp, err := p.enc.PacketLossPerc(); err != nil || plp != 10 {
+		t.Fatalf("关闭后 PacketLossPerc = %d, %v; want 用户值 10", plp, err)
+	}
+
+	if err := p.SetOpusDRED(true); err != nil {
+		t.Fatalf("SetOpusDRED(true): %v", err)
+	}
+	if err := p.SetOpusPacketLoss(5); err != nil {
+		t.Fatalf("SetOpusPacketLoss(5): %v", err)
+	}
+	if p.opus.PacketLoss != 5 {
+		t.Fatalf("用户 PLP 配置应保留 5: %+v", p.opus)
+	}
+	if plp, err := p.enc.PacketLossPerc(); err != nil || plp != DREDMinPacketLoss {
+		t.Fatalf("DRED 开启时编码器 PLP = %d, %v; want %d", plp, err, DREDMinPacketLoss)
 	}
 }
 

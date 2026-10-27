@@ -52,7 +52,7 @@ func TestAudioSettings(t *testing.T) {
 	// 未设置：全部回落默认（v0.1.2：强度中档 2、VAD 中档 2、复杂度 9、双音量 100；
 	// v1.1：AGC 默认开、输入声道 auto）。
 	d := m.GetAudioSettings()
-	if d.BitrateKbps != 32 || !*d.VBR || !*d.DTX || !*d.FEC {
+	if d.BitrateKbps != 32 || !*d.VBR || !*d.DTX || !*d.FEC || !*d.DRED {
 		t.Fatalf("默认 Opus 参数异常: %+v", d)
 	}
 	if d.PacketLoss != 10 || !*d.Denoise || d.DenoiseStrength != 2 ||
@@ -66,7 +66,7 @@ func TestAudioSettings(t *testing.T) {
 	f, tr := false, true
 	low := 0
 	custom := AudioSettings{
-		BitrateKbps: 48, VBR: &f, DTX: &tr, FEC: &f,
+		BitrateKbps: 48, VBR: &f, DTX: &tr, FEC: &f, DRED: &f,
 		PacketLoss: 15, Denoise: &f, DenoiseStrength: 3, AGC: &tr,
 		VADSens: &low, Complexity: 5,
 		MicVolume: 60, PlaybackVolume: 120, InputMode: "right", PreGainDB: 6,
@@ -77,7 +77,7 @@ func TestAudioSettings(t *testing.T) {
 	}
 	m2 := NewWithPath(m.Path())
 	got := m2.GetAudioSettings()
-	if got.BitrateKbps != 48 || *got.VBR || !*got.DTX || *got.FEC {
+	if got.BitrateKbps != 48 || *got.VBR || !*got.DTX || *got.FEC || *got.DRED {
 		t.Fatalf("Opus 设置未持久化: %+v", got)
 	}
 	if got.PacketLoss != 15 || *got.Denoise || got.DenoiseStrength != 3 ||

@@ -70,6 +70,7 @@ type AudioSettings struct {
 	VBR             *bool   `json:"vbr,omitempty"`              // 可变码率（nil → true）
 	DTX             *bool   `json:"dtx,omitempty"`              // 静音期非连续传输（nil → true）
 	FEC             *bool   `json:"fec,omitempty"`              // 带内前向纠错（nil → true）
+	DRED            *bool   `json:"dred,omitempty"`             // 深度冗余：突发丢包恢复（nil → true，#44）
 	PacketLoss      int     `json:"packet_loss,omitempty"`      // 告知编码器的预期丢包率 %（0 → 10；FEC 关闭时无意义）
 	Denoise         *bool   `json:"denoise,omitempty"`          // RNNoise 降噪总开关（nil → true）
 	DenoiseStrength int     `json:"denoise_strength,omitempty"` // 降噪强度 1弱/2中/3强（0 → 2；0 档配合 Denoise=false 即"关"）
@@ -98,7 +99,7 @@ func DefaultAudioSettings() AudioSettings {
 	t := true
 	two := 2
 	return AudioSettings{
-		BitrateKbps: 32, VBR: &t, DTX: &t, FEC: &t,
+		BitrateKbps: 32, VBR: &t, DTX: &t, FEC: &t, DRED: &t,
 		PacketLoss: 10, Denoise: &t, DenoiseStrength: 2,
 		AGC: &t, VADSens: &two, Complexity: 9,
 		Gain: 10, MicVolume: 100, PlaybackVolume: 100,
@@ -128,6 +129,9 @@ func (m *Manager) GetAudioSettings() AudioSettings {
 	}
 	if s.FEC == nil {
 		s.FEC = d.FEC
+	}
+	if s.DRED == nil {
+		s.DRED = d.DRED
 	}
 	if s.PacketLoss <= 0 || s.PacketLoss > 100 {
 		s.PacketLoss = d.PacketLoss

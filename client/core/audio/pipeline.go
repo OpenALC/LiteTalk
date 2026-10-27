@@ -3,6 +3,7 @@ package audio
 import (
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -44,18 +45,27 @@ type PipelineConfig struct {
 }
 
 // OpusConfig Opus 编码参数。零值字段由 ResolveOpusConfig 回落为管线默认值
-// （32kbps / VBR / DTX / FEC 开，丢包率告知 10%）。
+// （32kbps / VBR / DTX / FEC / DRED 开，丢包率告知 10%）。
 type OpusConfig struct {
 	BitrateKbps int   // 目标码率 kbps（16/24/32/48/64；0 → 32）
 	VBR         *bool // 可变码率（nil → true）
 	DTX         *bool // 静音期非连续传输（nil → true）
 	FEC         *bool // 带内前向纠错（nil → true）
+	DRED        *bool // 深度冗余：突发丢包恢复（nil → true）
 	PacketLoss  int   // 告知编码器的预期丢包率 %（0 → 10；FEC 关闭时无意义）
 }
 
+// DRED 参数（#44）：20 个 10ms 冗余帧 = 200ms 恢复窗口。libopus 只在预期
+// 丢包率足够高时才真正分配冗余，故开启 DRED 时 PLP 至少抬到 20%，关闭后恢复
+// 用户值；否则 10% 下实测可能完全没有 DRED 数据。
+const (
+	DREDDurationFrames = 20
+	DREDMinPacketLoss  = 20
+)
+
 // DefaultOpusConfig 管线默认 Opus 参数（与既有硬编码等价）。
 func DefaultOpusConfig() OpusConfig {
-	return OpusConfig{BitrateKbps: 32, VBR: boolPtr(true), DTX: boolPtr(true), FEC: boolPtr(true), PacketLoss: 10}
+	return OpusConfig{BitrateKbps: 32, VBR: boolPtr(true), DTX: boolPtr(true), FEC: boolPtr(true), DRED: boolPtr(true), PacketLoss: 10}
 }
 
 // ResolveOpusConfig 把零值字段回落为默认值，返回可直接应用的有效配置。
@@ -72,6 +82,9 @@ func ResolveOpusConfig(c OpusConfig) OpusConfig {
 	}
 	if c.FEC == nil {
 		c.FEC = d.FEC
+	}
+	if c.DRED == nil {
+		c.DRED = d.DRED
 	}
 	if c.PacketLoss <= 0 {
 		c.PacketLoss = d.PacketLoss
@@ -205,6 +218,12 @@ type Pipeline struct {
 	dec      *codec.Decoder
 	encMu    sync.Mutex // 保护 enc：opus_encoder_ctl 不得并发 opus_encode
 	stats    Stats
+
+	// dredActive 编码器实际启用了 DRED（旧库/不支持时 SetDRED 失败 → false）。
+	// 受 encMu 保护；决定 PLP 是否抬到 DREDMinPacketLoss。
+	dredActive bool
+	// dredWarn 旧库不支持 DRED 时只记一次日志，不阻断音频链路。
+	dredWarn sync.Once
 
 	ctx      *Context
 	capture  *Capture
@@ -555,19 +574,49 @@ func (p *Pipeline) SetComplexity(v int) error {
 }
 
 // applyOpusConfig 把已解析的 Opus 配置刷到编码器（持锁，可在运行中调用）。
+// DRED 失败（旧库）只记一次日志并继续，其余参数错误上抛。
 func (p *Pipeline) applyOpusConfig(enc *codec.Encoder, c OpusConfig) error {
+	dred := c.DRED != nil && *c.DRED
+	frames := 0
+	if dred {
+		frames = DREDDurationFrames
+	}
+	p.dredActive = false
+	if err := enc.SetDRED(frames); err != nil {
+		p.warnDREDOnce(err)
+	} else {
+		p.dredActive = dred
+	}
+	plp := p.effectivePacketLoss(c.PacketLoss)
 	for name, fn := range map[string]func() error{
 		"SetBitrate":        func() error { return enc.SetBitrate(c.BitrateKbps * 1000) },
 		"SetVBR":            func() error { return enc.SetVBR(*c.VBR) },
 		"SetDTX":            func() error { return enc.SetDTX(*c.DTX) },
 		"SetInBandFEC":      func() error { return enc.SetInBandFEC(*c.FEC) },
-		"SetPacketLossPerc": func() error { return enc.SetPacketLossPerc(c.PacketLoss) },
+		"SetPacketLossPerc": func() error { return enc.SetPacketLossPerc(plp) },
 	} {
 		if err := fn(); err != nil {
 			return fmt.Errorf("%s: %w", name, err)
 		}
 	}
 	return nil
+}
+
+// effectivePacketLoss DRED 生效时把编码器 PLP 抬到 DREDMinPacketLoss：低于该值
+// libopus 可能不分配 DRED 冗余。仅影响告知编码器的值，用户配置的 PacketLoss
+// 保持不变。调用方须持 encMu（读 dredActive）。
+func (p *Pipeline) effectivePacketLoss(user int) int {
+	if p.dredActive && user < DREDMinPacketLoss {
+		return DREDMinPacketLoss
+	}
+	return user
+}
+
+// warnDREDOnce 记录一次 DRED 不可用（旧库/未启用 DRED 的构建），之后静默降级。
+func (p *Pipeline) warnDREDOnce(err error) {
+	p.dredWarn.Do(func() {
+		log.Printf("opus: DRED 不可用，按普通模式继续: %v", err)
+	})
 }
 
 // SetOpusBitrate 热调码率（kbps）。编码中调用安全（内部持锁）。
@@ -629,7 +678,30 @@ func (p *Pipeline) SetOpusFEC(on bool) error {
 	return nil
 }
 
-// SetOpusPacketLoss 热调告知编码器的预期丢包率 %（5–20）。
+// SetOpusDRED 热调深度冗余开关（#44）：开启 20 帧（200ms）冗余，关闭恢复
+// 用户配置的 PLP。旧库不支持 DRED 时只记一次日志并保持音频可用。
+func (p *Pipeline) SetOpusDRED(on bool) error {
+	p.encMu.Lock()
+	defer p.encMu.Unlock()
+	if p.enc == nil {
+		return codec.ErrClosed
+	}
+	frames := 0
+	if on {
+		frames = DREDDurationFrames
+	}
+	if err := p.enc.SetDRED(frames); err != nil {
+		p.warnDREDOnce(err)
+		p.dredActive = false
+	} else {
+		p.dredActive = on
+	}
+	p.opus.DRED = boolPtr(on)
+	return p.enc.SetPacketLossPerc(p.effectivePacketLoss(p.opus.PacketLoss))
+}
+
+// SetOpusPacketLoss 热调告知编码器的预期丢包率 %（5–20）。DRED 开启时实际
+// 下发给编码器的值不会低于 DREDMinPacketLoss，用户设置原样保留。
 func (p *Pipeline) SetOpusPacketLoss(pct int) error {
 	if pct < 0 || pct > 100 {
 		return fmt.Errorf("丢包率非法: %d", pct)
@@ -639,7 +711,7 @@ func (p *Pipeline) SetOpusPacketLoss(pct int) error {
 	if p.enc == nil {
 		return codec.ErrClosed
 	}
-	if err := p.enc.SetPacketLossPerc(pct); err != nil {
+	if err := p.enc.SetPacketLossPerc(p.effectivePacketLoss(pct)); err != nil {
 		return err
 	}
 	p.opus.PacketLoss = pct
