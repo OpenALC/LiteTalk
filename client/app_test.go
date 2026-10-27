@@ -21,6 +21,7 @@ import (
 	"github.com/OpenALC/LiteTalk/client/core/hotkey"
 	"github.com/OpenALC/LiteTalk/client/core/voice"
 	"github.com/OpenALC/LiteTalk/client/desktop"
+	"github.com/coder/websocket"
 )
 
 // 验证休眠模式三态（off/hibernate/destroy）的读写、持久化与非法值校验。
@@ -1148,5 +1149,67 @@ func TestLogFanoutNoShortCircuit(t *testing.T) {
 	f = logFanout{failWriter{reopenErr}, failWriter{errors.New("stderr unavailable")}}
 	if n, err := f.Write([]byte("line\n")); err == nil || n != 0 {
 		t.Fatalf("全部目标失败应返回错误：n=%d err=%v", n, err)
+	}
+}
+
+// TestNetworkDiagWiring 一键网络诊断（#49 C）接线：REST/WS 走本地服务，
+// STUN/TURN 无配置按 skipped 处理，整体判通过；不触碰真实网络。
+func TestNetworkDiagWiring(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","version":"diag-test"}`))
+	})
+	mux.HandleFunc("/api/v1/rtc/credentials", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"iceServers":[],"expiresAt":0}`))
+	})
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "probe")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	m := config.NewWithPath(filepath.Join(t.TempDir(), "config.json"))
+	if err := m.Save(config.Config{ServerBase: srv.URL}); err != nil {
+		t.Fatalf("保存配置: %v", err)
+	}
+	app := newAppWithConfig(m)
+	app.api = api.NewAPIClient(srv.URL)
+
+	res := app.NetworkDiag()
+	if !res.OK {
+		t.Fatalf("诊断应通过: %+v", res)
+	}
+	if !res.REST.OK || res.REST.Version != "diag-test" {
+		t.Fatalf("REST 探测错误: %+v", res.REST)
+	}
+	if !res.WS.OK || res.WS.Skipped {
+		t.Fatalf("WS 探测错误: %+v", res.WS)
+	}
+	if !res.STUN.Skipped || !res.TURN.Skipped {
+		t.Fatalf("无 ICE 配置应为 skipped: stun=%+v turn=%+v", res.STUN, res.TURN)
+	}
+}
+
+// TestNetworkDiagNoAPIDoesNotPanic 未登录/未初始化 API 客户端（测试环境）时
+// 诊断仍能返回结果：REST 可通、WS 可拨号（无 token）、ICE 一律 skipped。
+func TestNetworkDiagNoAPIDoesNotPanic(t *testing.T) {
+	app := newAppWithConfig(config.NewWithPath(filepath.Join(t.TempDir(), "config.json")))
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("NetworkDiag 不应 panic: %v", r)
+		}
+	}()
+	res := app.NetworkDiag()
+	if res == nil {
+		t.Fatal("应返回诊断结果")
+	}
+	if !res.STUN.Skipped || !res.TURN.Skipped {
+		t.Fatalf("无凭证时 STUN/TURN 应 skipped: %+v", res)
 	}
 }

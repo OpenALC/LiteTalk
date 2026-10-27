@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +24,7 @@ import (
 	"github.com/OpenALC/LiteTalk/client/core/audio"
 	"github.com/OpenALC/LiteTalk/client/core/config"
 	"github.com/OpenALC/LiteTalk/client/core/hotkey"
+	"github.com/OpenALC/LiteTalk/client/core/netdiag"
 	"github.com/OpenALC/LiteTalk/client/core/signal"
 	"github.com/OpenALC/LiteTalk/client/core/voice"
 	"github.com/OpenALC/LiteTalk/client/desktop"
@@ -895,28 +895,50 @@ type ConnTestResult struct {
 // TestServerConnection 测试服务器连通性：GET <base>/api/v1/healthz（3s 超时）。
 // 用于设置页「测试连接」，可对未保存的地址直接测试。
 func (a *App) TestServerConnection(baseURL string) *ConnTestResult {
-	if err := config.ValidateBase(baseURL); err != nil {
-		return &ConnTestResult{OK: false, ErrorMsg: err.Error()}
+	r := netdiag.Healthz(context.Background(), baseURL, 3*time.Second)
+	return &ConnTestResult{OK: r.OK, Latency: r.LatencyMS, Version: r.Version, ErrorMsg: r.Error}
+}
+
+// NetworkDiag 一键网络诊断（#49 C）：REST healthz、信令 WS、STUN binding 与
+// TURN allocate 四项并行探测，各带独立超时、互不影响，不修改现有连接。
+// STUN/TURN 取当前 /rtc/credentials 配置；未配置或缺少凭证时标记 skipped。
+func (a *App) NetworkDiag() *netdiag.Result {
+	resolved := a.cfg.Resolve()
+	var servers []netdiag.ICEServer
+	token := ""
+	wsConnected := false
+	a.mu.Lock()
+	sess := a.sess
+	a.mu.Unlock()
+	if a.api != nil {
+		token = a.api.Token()
+		if resp, err := a.api.RTCCredentials(); err == nil && resp != nil {
+			for _, srv := range resp.ICEServers {
+				servers = append(servers, netdiag.ICEServer{
+					URLs:       srv.URLs,
+					Username:   srv.Username,
+					Credential: srv.Credential,
+				})
+			}
+		} else if err != nil {
+			// 无 TURN 的部署本就会 503：诊断里按「未配置」展示，日志留底即可。
+			log.Printf("network diag: rtc credentials: %v", err)
+		}
 	}
-	client := &http.Client{Timeout: 3 * time.Second}
-	start := time.Now()
-	resp, err := client.Get(baseURL + "/api/v1/healthz")
-	if err != nil {
-		return &ConnTestResult{OK: false, ErrorMsg: "连接失败"}
+	if sess != nil {
+		wsConnected = sess.SignalConnected()
 	}
-	defer resp.Body.Close()
-	latency := time.Since(start).Milliseconds()
-	if resp.StatusCode != http.StatusOK {
-		return &ConnTestResult{OK: false, Latency: latency, ErrorMsg: fmt.Sprintf("服务端返回 %d", resp.StatusCode)}
-	}
-	var body struct {
-		Status  string `json:"status"`
-		Version string `json:"version"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return &ConnTestResult{OK: true, Latency: latency} // 可达但响应格式异常：仍算连通
-	}
-	return &ConnTestResult{OK: true, Latency: latency, Version: body.Version}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	res := netdiag.Run(ctx, netdiag.Config{
+		BaseURL:     resolved.BaseURL,
+		WSURL:       resolved.WSURL,
+		Token:       token,
+		ICEServers:  servers,
+		Timeout:     4 * time.Second,
+		WSConnected: wsConnected,
+	})
+	return &res
 }
 
 // ---------- 认证（转发 REST，§5.4） ----------
