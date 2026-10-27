@@ -1378,6 +1378,9 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 	if err := sess.ApplyAudio(a.runtimeAudio()); err != nil {
 		log.Printf("apply audio settings: %v", err)
 	}
+	if a.rollbackAPMIfInactive(sess) {
+		log.Printf("WebRTC APM 未启用，已回滚 enable_apm")
+	}
 	// 连接即应用持久化的设备选择（设置页未连接时仅落盘，此处补应用）。
 	c := a.cfg.Get()
 	if c.AudioCapture != "" || c.AudioPlayback != "" {
@@ -2146,9 +2149,13 @@ func (a *App) runtimeAudio() audio.RuntimeSettings {
 		Complexity:      complexity,
 		InputMode:       audio.ParseInputMode(as.InputMode),
 		PreGainDB:       as.PreGainDB,
-		DisableAEC:      as.DisableAEC,
+		EnableAPM:       as.EnableAPM,
 	}
 }
+
+// APMSupported 报告当前平台是否提供 WebRTC APM（Beta 开关可用性）。
+// false 的平台（如 macOS stub）设置页应禁用开关并提示不支持。
+func (a *App) APMSupported() bool { return audio.APMSupported() }
 
 // GetAudioSettings 读取持久化语音设置（设置页初始化用；未设置字段回落默认值）。
 func (a *App) GetAudioSettings() config.AudioSettings { return a.cfg.GetAudioSettings() }
@@ -2183,6 +2190,9 @@ func (a *App) SetAudioSettings(s config.AudioSettings) error {
 	if s.PreGainDB < config.PreGainMinDB || s.PreGainDB > config.PreGainMaxDB {
 		return fmt.Errorf("前置增益越界: %.1fdB", s.PreGainDB)
 	}
+	if s.EnableAPM && !audio.APMSupported() {
+		return fmt.Errorf("当前平台不支持 WebRTC APM")
+	}
 	if err := a.cfg.SetAudioSettings(s); err != nil {
 		return err
 	}
@@ -2190,9 +2200,30 @@ func (a *App) SetAudioSettings(s config.AudioSettings) error {
 	sess := a.sess
 	a.mu.Unlock()
 	if sess != nil {
-		return sess.ApplyAudio(a.runtimeAudio())
+		err := sess.ApplyAudio(a.runtimeAudio())
+		if s.EnableAPM && a.rollbackAPMIfInactive(sess) && err == nil {
+			err = fmt.Errorf("启用 WebRTC APM 失败")
+		}
+		return err
 	}
 	return nil
+}
+
+// rollbackAPMIfInactive 会话未能启用 APM 时回滚持久化的 enable_apm，避免
+// 设置页/下次启动显示已开启而实际走旧链路。返回是否发生回滚。
+func (a *App) rollbackAPMIfInactive(sess *voice.Session) bool {
+	if sess != nil && sess.APMActive() {
+		return false
+	}
+	as := a.cfg.GetAudioSettings()
+	if !as.EnableAPM {
+		return false
+	}
+	as.EnableAPM = false
+	if err := a.cfg.SetAudioSettings(as); err != nil {
+		log.Printf("rollback enable_apm: %v", err)
+	}
+	return true
 }
 
 // ---------- 全局热键（v1.2.0：PTT / 闭麦 / 静音 / 全关全开） ----------

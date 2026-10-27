@@ -1547,7 +1547,9 @@ func (s *Session) ApplyAudio(rs audio.RuntimeSettings) error {
 	}
 	s.pipe.SetAGC(rs.AGC)
 	s.pipe.SetGain(rs.Gain)
-	s.pipe.SetDisableAEC(rs.DisableAEC)
+	if err := s.pipe.SetEnableAPM(rs.EnableAPM); err != nil && firstErr == nil {
+		firstErr = fmt.Errorf("audio enable_apm: %w", err)
+	}
 	if s.mixer != nil {
 		s.mixer.SetMasterGain(rs.PlaybackGain)
 	}
@@ -1561,6 +1563,9 @@ func (s *Session) ApplyAudio(rs audio.RuntimeSettings) error {
 	s.audioCfgMu.Unlock()
 	return firstErr
 }
+
+// APMActive 报告当前媒体管线是否启用了 WebRTC APM（Beta 设置回滚/诊断）。
+func (s *Session) APMActive() bool { return s.pipe != nil && s.pipe.APMActive() }
 
 // Muted / Deafened 本地状态查询。
 func (s *Session) Muted() bool    { return s.muted.Load() }

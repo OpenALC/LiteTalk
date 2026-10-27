@@ -94,7 +94,7 @@ type RuntimeSettings struct {
 	Complexity      int       // Opus 复杂度 0–10（≤0 表示不改）
 	InputMode       InputMode // 采集下混模式（变更即热重启采集流）
 	PreGainDB       float64   // 前置增益 dB（-12~+24，RNNoise/APM 之前；0=不变）
-	DisableAEC      bool      // 关闭 WebRTC 回声消除（默认 false = 开启）
+	EnableAPM       bool      // 启用 WebRTC APM（Beta 功能，默认关闭）
 }
 
 // DefaultPipelineConfig 返回默认管线配置（声卡回环、降噪开、增益 1）。
@@ -526,15 +526,16 @@ func (p *Pipeline) SetDenoiseStrength(level int) error { return p.dsp.SetDenoise
 // SetAGC 运行时开关自动增益（v1.1 默认开）。
 func (p *Pipeline) SetAGC(on bool) { p.dsp.SetAGC(on) }
 
-// SetDisableAEC 开关 WebRTC 回声消除（默认开启；APM 不可用时无副作用）。
-func (p *Pipeline) SetDisableAEC(off bool) { p.dsp.SetDisableAEC(off) }
+// SetEnableAPM 运行期启用/关闭 WebRTC APM（Beta 功能）。启用失败返回错误并
+// 保持关闭；关闭后完全回到 RNNoise/自研 AGC 旧链路。
+func (p *Pipeline) SetEnableAPM(on bool) error { return p.dsp.SetEnableAPM(on) }
 
 // ProcessRender 把混音器的实际播放输出作为 AEC 参考帧送入 APM。
 // 必须先于对应的采集帧处理；静音/耳聋时也应持续送零帧（Mixer.Tick 正常时
 // 自动满足）。APM 未启用或帧长不足时为 no-op，不阻塞混音 tick。
 func (p *Pipeline) ProcessRender(pcm []int16) { p.dsp.ProcessRender(pcm) }
 
-// APMActive 报告 WebRTC APM 是否启用（诊断/测试）。
+// APMActive 报告 WebRTC APM 当前是否启用（Beta 开关 + 创建成功；诊断/测试）。
 func (p *Pipeline) APMActive() bool { return p.dsp.APMActive() }
 
 // SetPreGainDB 运行时调整前置增益（-12~+24dB，越界报错；原子热生效）。

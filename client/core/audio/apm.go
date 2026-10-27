@@ -24,3 +24,7 @@ type apmOptions struct {
 
 // errAPMUnsupported 表示当前平台没有 APM 实现（stub 平台）或 C++ 初始化失败。
 var errAPMUnsupported = errors.New("webrtc apm: unsupported platform")
+
+// APMSupported 报告当前平台是否提供 WebRTC APM 实现（设置页 Beta 开关用）。
+// false 的平台应隐藏/禁用开关并提示不支持。
+func APMSupported() bool { return apmSupported() }
