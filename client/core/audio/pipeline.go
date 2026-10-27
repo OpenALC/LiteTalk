@@ -583,7 +583,9 @@ func (p *Pipeline) applyOpusConfig(enc *codec.Encoder, c OpusConfig) error {
 	}
 	p.dredActive = false
 	if err := enc.SetDRED(frames); err != nil {
-		p.warnDREDOnce(err)
+		if dred { // 关闭时旧库报「不支持 DRED」无须吓唬用户
+			p.warnDREDOnce(err)
+		}
 	} else {
 		p.dredActive = dred
 	}
@@ -691,7 +693,9 @@ func (p *Pipeline) SetOpusDRED(on bool) error {
 		frames = DREDDurationFrames
 	}
 	if err := p.enc.SetDRED(frames); err != nil {
-		p.warnDREDOnce(err)
+		if on {
+			p.warnDREDOnce(err)
+		}
 		p.dredActive = false
 	} else {
 		p.dredActive = on
