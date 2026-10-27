@@ -277,6 +277,7 @@ func TestDenoiseBypass(t *testing.T) {
 // BenchmarkDSPProcess Beta 开关开启 APM 后的热路径：必须 0 Go allocs/op。
 // APM 的 C++ 内部分配不计入 Go 堆，cgo 调用本身也不分配。
 func BenchmarkDSPProcess(b *testing.B) {
+	requireAPM(b)
 	benchDSPProcess(b, true)
 }
 
