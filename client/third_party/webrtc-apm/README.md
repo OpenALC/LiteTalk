@@ -1,7 +1,8 @@
 # WebRTC APM（webrtc-audio-processing 1.3）预编译静态库
 
 LiteTalk 客户端用 WebRTC APM 做回声消除（AEC3）、自动增益（AGC2）、
-中等强度降噪（NS moderate）与高通滤波；RNNoise 保留为可选的强降噪叠加。
+中等强度降噪（NS moderate）与高通滤波。该功能是 Beta，默认关闭；用户在
+设置 → Beta 功能主动开启后才创建 APM 句柄。RNNoise 保留为独立的强降噪档。
 本目录只存放头文件与链接期静态库，不参与 Go 编译/链接以外的构建步骤。
 
 ## 来源与版本
@@ -174,8 +175,9 @@ arm64 的 MRI 去掉 `common_audio_avx` / `common_audio_sse2`（无 x86 优化�
 
 `client/core/audio/apm_test.go` 的 `TestAPMSmoke` 覆盖创建/连续 100 帧
 capture+render；`TestAECSuppressesEcho` 用合成的延迟回声验证收敛（ERLE ≥ 6dB），
-`TestAECDisabledPassesEcho` 作为直通对照组。Windows/Linux CI 均会真实运行
-cgo 路径；macOS 为 stub，只有 `apmSupported()==false` 的回落行为。
+`TestAECDisabledPassesEcho` 作为直通对照组；`TestDSPAPMDefaultOff` /
+`TestDSPAPMHotSwitch` 覆盖 Beta 默认关闭与运行期开关。Windows/Linux CI 均会
+真实运行 cgo 路径；macOS 为 stub，只有 `apmSupported()==false` 的回落行为。
 
 ## 升级注意
 

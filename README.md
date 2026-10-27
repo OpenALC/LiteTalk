@@ -5,7 +5,7 @@
 ## 特性
 
 - **多人语音**：频道内最多 10 人同聊（可配置），WebRTC/SRTP 加密传输，Opus 编解码
-- **降噪与回声消除**：WebRTC APM（AEC3 回声消除 / AGC2 自动增益 / 高通）+ 可选 RNNoise 强降噪，语音检测，说话才发包
+- **降噪与回声消除**：WebRTC APM（Beta，默认关闭；AEC3 回声消除 / AGC2 自动增益 / 高通）+ 可选 RNNoise 强降噪，语音检测，说话才发包
 - **跨平台**：Windows / Linux 桌面端（macOS 产物为实验性，非阻塞发布）
 - **自托管**：单二进制服务端 + MySQL/Redis/coturn，一份部署手册照抄即可
 - **开源可复用**：Auth 支持 full/simple 双模式；验证码邮件可对接任意自有发码平台（Webhook 契约）或 SMTP
@@ -101,8 +101,9 @@ cd client && set FRONTEND_DEVSERVER_URL=http://localhost:5173 && go run .
 ```
 
 客户端 cgo 依赖的 WebRTC APM 静态库已内置在 `client/third_party/webrtc-apm/`
-（Windows / Linux amd64 / Linux arm64），无需额外安装；回声消除默认开启，
-可在设置 → 语音中关闭（AEC），macOS 暂为 stub。
+（Windows / Linux amd64 / Linux arm64），无需额外安装；WebRTC APM 为 Beta 功能，
+默认关闭，可在设置 → Beta 功能主动开启（AEC/AGC2/高通，CPU 占用增加），
+macOS 暂为 stub。
 
 国内开发建议先配镜像：`go env -w GOPROXY=https://goproxy.cn,direct`（前端镜像已内置）。
 
