@@ -2,7 +2,7 @@
 // 浏览器独立开发（vite dev 无 Go 后端）时走 mock 桩，行为可联调 UI。
 // 原生环境判定：Go 在 webview 启动时注入 window._wails.flags（浏览器环境恒无）。
 import { Call, Events } from '@wailsio/runtime'
-import type { AttachmentView, AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ChatMessage, ConnConfigView, ConnTestResult, Conversation, FriendDTO, HotkeySettings, LinkPreview, MentionCandidate, PeerView, ServerChannels, ServerConfig, ServerDTO, UnreadChannel, Unreads, UserProfile, VoiceStateView } from './types'
+import type { AttachmentView, AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ChatMessage, ConnConfigView, ConnTestResult, Conversation, FriendDTO, HotkeySettings, LinkPreview, MentionCandidate, NetworkDiagResult, PeerView, ServerChannels, ServerConfig, ServerDTO, UnreadChannel, Unreads, UserProfile, VoiceStateView } from './types'
 
 type GoApp = {
   GetVersion(): Promise<string>
@@ -12,6 +12,8 @@ type GoApp = {
   GetServerConfig(): Promise<ConnConfigView>
   SetServerConfig(baseURL: string): Promise<void>
   TestServerConnection(baseURL: string): Promise<ConnTestResult>
+  // NetworkDiag 一键网络诊断（#49 C）：REST/WS/STUN/TURN 四项独立探测。
+  NetworkDiag(): Promise<NetworkDiagResult>
   WindowMinimize(): Promise<void>
   WindowMaximize(): Promise<void>
   WindowClose(): Promise<void>
@@ -192,6 +194,15 @@ const mockApp: GoApp = {
   async SetServerConfig() {},
   async TestServerConnection() {
     return { ok: true, latency_ms: 12, version: 'dev', error: '' }
+  },
+  async NetworkDiag() {
+    return {
+      ok: true,
+      rest: { ok: true, latency_ms: 12, version: 'dev' },
+      ws: { ok: true, latency_ms: 0, note: '信令已连接（未重复拨号）' },
+      stun: { ok: true, latency_ms: 8, address: '203.0.113.7:51820' },
+      turn: { ok: true, skipped: true, latency_ms: 0, note: '未配置' },
+    }
   },
   async WindowMinimize() {},
   async WindowMaximize() {},

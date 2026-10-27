@@ -4,9 +4,9 @@
 //（走查 1/2：延迟不常驻、卡片位于语音列表区下方）。
 // 批次③：成员卡片右键菜单——他人=添加好友/调节播放音量/请求闭麦/请求静音，
 // 自己=离开频道（走查 6）；请求经 voice.request_state 定向转发，对方接受后生效。
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import {
-  AudioLines, MicOff, HeadphoneOff, MoreHorizontal, UserPlus, Volume2, Info, PhoneOff,
+  Activity, AudioLines, MicOff, HeadphoneOff, MoreHorizontal, UserPlus, Volume2, Info, PhoneOff,
   UserPlus2, Ear, Crown,
 } from 'lucide-vue-next'
 import SoundOrb from '../components/SoundOrb.vue'
@@ -66,6 +66,19 @@ async function hangup() {
   } catch (e) {
     notify.fromErr(e, '离开频道失败')
   }
+}
+
+// ---- 网络详情浮层（#49 B）----
+// voice-bar 只常驻 RTT；丢包/抖动/缓冲深度按需点开，避免控制条信息过载。
+// 离房时自动收起，重进房需要重新点开。
+const netOpen = ref(false)
+watch(() => voice.channelId, (id) => { if (!id) netOpen.value = false })
+
+function fmtPct(v: number | undefined): string {
+  return v === undefined || v === null ? '—' : `${v.toFixed(1)}%`
+}
+function fmtMS(v: number | undefined): string {
+  return v === undefined || v === null ? '—' : `${Math.round(v)}ms`
 }
 
 // ---- 成员右键菜单（批次③，走查 6） ----
@@ -206,6 +219,18 @@ async function invite() {
             <button class="mp-item" @click="showProfile(m)">
               <Info :size="14" />查看资料
             </button>
+            <!-- per-peer 链路诊断（#49 B）：有下行统计才显示 -->
+            <div v-if="voice.peerDiag(m.user_id)" class="mp-diag">
+              <div class="mp-drow">
+                <span>丢包</span><b>{{ fmtPct(voice.peerDiag(m.user_id)?.loss_pct ?? 0) }}</b>
+              </div>
+              <div class="mp-drow">
+                <span>抖动</span><b>{{ fmtMS(voice.peerDiag(m.user_id)?.rtp_jitter_ms ?? 0) }}</b>
+              </div>
+              <div class="mp-drow">
+                <span>缓冲</span><b>{{ fmtMS(voice.peerDiag(m.user_id)?.buffer_ms ?? 0) }}</b>
+              </div>
+            </div>
           </div>
         </template>
       </div>
@@ -218,9 +243,28 @@ async function invite() {
 
     <!-- 语音控制条（走查 1/2）：仅语音频道中显示；延迟 + 挂断，无频道名/人数 -->
     <div v-if="voice.channelId" class="voice-bar">
-      <span class="vb-lat">
-        <span class="dot" />延迟 {{ voice.latencyMs }}ms
-      </span>
+      <div class="vb-lat-wrap">
+        <button class="vb-lat" title="查看网络详情" @click="netOpen = !netOpen">
+          <Activity :size="13" />延迟 {{ voice.latencyMs }}ms
+        </button>
+        <!-- 网络详情浮层（#49 B）：丢包 / 抖动 / 抖动缓冲深度 -->
+        <template v-if="netOpen">
+          <div class="net-mask" @click="netOpen = false" />
+          <div class="net-pop">
+            <div class="np-row">
+              <span>丢包</span><b>{{ fmtPct(voice.stats.loss_pct ?? 0) }}</b>
+            </div>
+            <div class="np-row">
+              <span>抖动</span><b>{{ fmtMS(voice.stats.rtp_jitter_ms ?? 0) }}</b>
+            </div>
+            <div class="np-row">
+              <span>缓冲</span>
+              <b>{{ fmtMS(voice.stats.jitter_buffer_ms ?? 0) }}</b>
+              <span class="np-dim">/ {{ fmtMS(voice.stats.jitter_target_ms ?? 0) }}</span>
+            </div>
+          </div>
+        </template>
+      </div>
       <!-- 悄悄话目标指示（#45）：按住热键且有目标时高亮；离房目标标「离线」 -->
       <span v-if="voice.whisperTargetViews.length" class="vb-whisper"
             :class="{ on: voice.whisperActive }"
@@ -264,13 +308,30 @@ async function invite() {
   background: var(--surface); border: 1px solid var(--line);
   border-radius: 12px; box-shadow: var(--shadow-1);
 }
+.vb-lat-wrap { position: relative; }
 .vb-lat {
   display: flex; align-items: center; gap: 7px;
+  height: 26px; padding: 0 8px; margin-left: -8px; border-radius: 8px;
   font-size: 12.5px; color: var(--ink-400);
+  transition: background 0.15s, color 0.15s;
 }
-.vb-lat .dot {
-  width: 7px; height: 7px; border-radius: 50%; background: var(--green);
+.vb-lat:hover { background: var(--brand-50); color: var(--ink-600); }
+.vb-lat svg { flex: none; color: var(--green); }
+/* 网络详情浮层：控制条只常驻 RTT，其余指标按需展开 */
+.net-mask { position: fixed; inset: 0; z-index: 25; }
+.net-pop {
+  position: absolute; bottom: 34px; left: 0; z-index: 30;
+  width: 172px; padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 7px;
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: 12px; box-shadow: var(--shadow-2);
 }
+.np-row {
+  display: flex; align-items: baseline; gap: 8px;
+  font-size: 12px; color: var(--ink-400);
+}
+.np-row b { margin-left: auto; color: var(--ink-600); font-weight: 600; }
+.np-dim { font-size: 11px; color: var(--ink-300); }
 .vb-whisper {
   display: inline-flex; align-items: center; gap: 5px; min-width: 0;
   font-size: 12px; color: var(--ink-400, #8A9BB0);
@@ -380,4 +441,15 @@ async function invite() {
   transition: background 0.15s, color 0.15s;
 }
 .mp-item:hover { background: var(--brand-50); color: var(--ink-900); }
+/* per-peer 诊断（#49 B）：与操作项用分隔线区分，数值右对齐 */
+.mp-diag {
+  margin-top: 6px; padding: 8px 8px 2px;
+  border-top: 1px solid var(--line);
+  display: flex; flex-direction: column; gap: 6px;
+}
+.mp-drow {
+  display: flex; align-items: baseline; gap: 8px;
+  font-size: 11.5px; color: var(--ink-400);
+}
+.mp-drow b { margin-left: auto; color: var(--ink-600); font-weight: 600; }
 </style>

@@ -1,8 +1,23 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { eventsOn, goApp } from '../api/bridge'
-import type { PeerView } from '../api/types'
+import type { PeerView, VoicePeerDiag, VoiceStats } from '../api/types'
 import { useNotifyStore } from './notify'
+
+// emptyVoiceStats 空统计快照（未入房/事件未到）。字段与 Go VoiceStats 对齐，
+// 可选字段保持缺省，UI 统一按 0/-- 渲染。
+function emptyVoiceStats(): VoiceStats {
+  return {
+    latency_ms: 0,
+    members: 0,
+    peer_ids: [],
+    enc_packets: 0,
+    rtp_sent: 0,
+    playback_buffered_ms: 0,
+    playback_underruns: 0,
+    playback_dropped: 0,
+  }
+}
 
 // voice 语音房状态：房间成员、说话/闭麦/静音、统计。
 export const useVoiceStore = defineStore('voice', () => {
@@ -11,6 +26,9 @@ export const useVoiceStore = defineStore('voice', () => {
   const muted = ref(false)
   const deafened = ref(false)
   const latencyMs = ref(0)
+  // stats 最近一次 voice:stats 快照（#49 B）：丢包/抖动/缓冲深度与 per-peer
+  // 诊断。latencyMs 保留为独立 ref 以兼容既有 UI 与测试的直接赋值。
+  const stats = ref<VoiceStats>(emptyVoiceStats())
   const connected = ref(false)
 
   // 双关态（闭麦+静音同时开启）——用户要求的独立样式依据
@@ -106,6 +124,7 @@ export const useVoiceStore = defineStore('voice', () => {
     channelId.value = ''
     members.value = []
     latencyMs.value = 0 // Q4：挂断即归零，避免 voice-bar 重开瞬间残留旧延迟
+    stats.value = emptyVoiceStats()
     connected.value = false
     // 悄悄话选择属于房间内状态：离房即清（Go 侧在 Leave/断线时也已清旁路门）。
     whisperTargets.value = []
@@ -146,6 +165,12 @@ export const useVoiceStore = defineStore('voice', () => {
       me.mute = muted.value
       me.deafen = deafened.value
     }
+  }
+
+  // peerDiag 某成员的最近一次 per-peer 链路诊断（#49 B）。该成员还没发过
+  // 下行包时可能暂时没有条目，调用方据此隐藏诊断区。
+  function peerDiag(userId: string): VoicePeerDiag | undefined {
+    return stats.value.peers?.find((p) => p.peer_id === userId)
   }
 
   async function setPeerVolume(userId: string, gain: number) {
@@ -274,8 +299,12 @@ export const useVoiceStore = defineStore('voice', () => {
     }))
     offs.push(eventsOn('voice:stats', (s) => {
       try {
-        const st = JSON.parse(s as string)
-        latencyMs.value = st.latency_ms ?? 0
+        const st = JSON.parse(s as string) as Partial<VoiceStats>
+        // 整体覆盖而不是逐字段合并：peer 离房后旧 peers 条目不能残留。
+        const next = emptyVoiceStats()
+        Object.assign(next, st)
+        stats.value = next
+        latencyMs.value = next.latency_ms ?? 0
       } catch { /* 忽略坏包 */ }
     }))
     // voice.state_request：他人请求我闭麦/静音——toast 带「接受」按钮，由我决定执行。
@@ -341,11 +370,12 @@ export const useVoiceStore = defineStore('voice', () => {
   }
 
   return {
-    channelId, members, muted, deafened, dualOff, latencyMs, connected, peerVolumes,
+    channelId, members, muted, deafened, dualOff, latencyMs, stats, connected, peerVolumes,
     whisperTargets, whisperTargetNames, whisperPressed, whisperActive, whisperTargetViews,
     lastJoinFailed,
     selfId, setSelf, join, leave, resetRoom, resetAll, setMute, setDeafen, setPeerVolume,
     requestVoiceState, isWhisperTarget, toggleWhisperTarget, setPrioritySpeaker,
+    peerDiag,
     restoreFromGo, bindEvents, unbindEvents,
   }
 })

@@ -18,6 +18,7 @@ import {
 import { cleanErrorText } from '../utils/errorText'
 import { withAudioDefaults } from '../utils/audioSettings'
 import ServerConnPanel from '../components/ServerConnPanel.vue'
+import NetworkDiagPanel from '../components/NetworkDiagPanel.vue'
 import Toast from '../components/Toast.vue'
 
 const router = useRouter()
@@ -387,6 +388,8 @@ function bindRecording(spec: string) {
       <section class="s-sec">
         <h3>连接</h3>
         <ServerConnPanel @saved="toast?.show('已保存')" />
+        <!-- 一键网络诊断（#49 C）：REST/信令/STUN/TURN 四项并测 -->
+        <NetworkDiagPanel />
       </section>
 
       <section class="s-sec">

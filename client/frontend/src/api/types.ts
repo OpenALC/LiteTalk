@@ -131,6 +131,73 @@ export interface ConnTestResult {
   error: string
 }
 
+// VoicePeerDiag 单路下行链路诊断（voice:stats 的 peers[]，#49）。
+// jitter_ms 是抖动缓冲自身的到达抖动估计；rtp_jitter_ms 是入站 RTP 的
+// RFC3550 抖动，语义不同。buffer_ms/target_ms 是缓冲当前/目标深度。
+export interface VoicePeerDiag {
+  peer_id: string
+  jitter_ms: number
+  jitter_target_packets: number
+  jitter_buffered_packets: number
+  jitter_lost: number
+  ring_samples: number
+  plc_frames: number
+  fec_frames: number
+  dred_frames: number
+  underrun_frames: number
+  dropped_samples: number
+  // #49 新增（Go omitempty：无入站流时不出现）
+  loss_pct?: number
+  rtp_jitter_ms?: number
+  buffer_ms?: number
+  target_ms?: number
+  rtp_received?: number
+  rtp_lost?: number
+}
+
+// VoiceStats voice:stats 事件载荷（Go 侧 VoiceStats 的 JSON）。
+// 新增字段均可选：旧服务端/未入房时缺省，UI 按 0 / -- 处理。
+export interface VoiceStats {
+  latency_ms: number
+  members: number
+  peer_ids: string[]
+  enc_packets: number
+  rtp_sent: number
+  playback_buffered_ms: number
+  playback_underruns: number
+  playback_dropped: number
+  peers?: VoicePeerDiag[]
+  // #49：入站 RTP 丢包率（%）、抖动（ms）、抖动缓冲深度/目标（ms）与计数。
+  loss_pct?: number
+  rtp_jitter_ms?: number
+  jitter_buffer_ms?: number
+  jitter_target_ms?: number
+  rtp_received?: number
+  rtp_lost?: number
+}
+
+// NetworkDiagProbe 单项网络诊断结果（#49 C）。
+// skipped 表示未配置或已有活跃连接而主动跳过，不计为失败；
+// note 是跳过原因（如「信令已连接」），error 是已脱敏的短错误。
+export interface NetworkDiagProbe {
+  ok: boolean
+  skipped?: boolean
+  latency_ms: number
+  version?: string
+  address?: string
+  note?: string
+  error?: string
+}
+
+// NetworkDiagResult App.NetworkDiag 的返回（REST/WS/STUN/TURN 四项独立）。
+export interface NetworkDiagResult {
+  ok: boolean
+  rest: NetworkDiagProbe
+  ws: NetworkDiagProbe
+  stun: NetworkDiagProbe
+  turn: NetworkDiagProbe
+}
+
 // AudioSettings 语音设置（与 Go 侧 config.AudioSettings 对齐；指针/零值字段未设置即默认）。
 // v0.1.2 扩展：降噪强度/AGC/Opus 复杂度/麦克风/扬声器音量；旧 gain 保留兼容读取。
 export interface AudioSettings {
