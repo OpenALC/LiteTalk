@@ -250,7 +250,11 @@ func TestDREDRecoversLostFrame(t *testing.T) {
 		}
 	}
 
-	// 第 3 帧丢失：用后继包 4 的 DRED 恢复。
+	// 第 3 帧丢失：用后继包 4 的 DRED 恢复。FEC 已关，包内不应有 LBRR
+	// （否则 opus_decode(fec=true) 会先把它当 FEC 用掉）。
+	if HasLBRR(pkts[4]) {
+		t.Fatal("FEC 已关闭，后继包不应携带 LBRR")
+	}
 	n, ok, err := dred.Recover(dec, pkts[4], out, testFrameSize, testSampleRate)
 	if err != nil {
 		t.Fatalf("DRED Recover: %v", err)

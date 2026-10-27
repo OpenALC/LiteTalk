@@ -460,9 +460,9 @@ func (rp *remotePeer) frameSamples() int {
 }
 
 // decodeOnce 单拍：到点 pop → 解码/丢帧补偿 → 写该 peer 的混音输入环。
-// 丢帧时若后继包已在 jitter 槽内，先用它的带内 FEC 恢复丢失帧（不消费后继，
-// 也不做常驻 +1 包 lookahead，稳态延迟不变）；FEC 不可用时再尝试同一后继包
-// 里的 DRED 冗余（#44，覆盖编码端未开 FEC / 该包无 LBRR 的情况）；都失败才
+// 丢帧时若后继包已在 jitter 槽内且带 LBRR，先用它的带内 FEC 恢复丢失帧（不消费
+// 后继，也不做常驻 +1 包 lookahead，稳态延迟不变）；FEC 不可用时再尝试同一后继
+// 包里的 DRED 冗余（#44，覆盖编码端未开 FEC / 该包无 LBRR 的情况）；都失败才
 // 回落 PLC。PLC 按当前帧长合成（10ms=480、20ms=960，#46）。
 // 热路径零分配（预分配 payloadBuf/fecBuf/pcm）；测试可同步调用。
 func (rp *remotePeer) decodeOnce() {
@@ -472,11 +472,15 @@ func (rp *remotePeer) decodeOnce() {
 	}
 	if lost {
 		// 只在丢帧瞬间窥视后继槽位；DTX 包（≤2 字节）不含 FEC/DRED 数据。
+		// 先用 opus_packet_has_lbrr 探测：opus_decode(fec=true) 在没有 LBRR 时
+		// 会静默返回 PLC 帧且不报错，不探测就会把 PLC 误计入 FEC 并挡住 DRED。
 		if nn, ok := rp.jb.PeekNext(rp.fecBuf[:]); ok && nn > rtc.DTXPayloadMax {
-			if m, err := rp.dec.Decode(rp.fecBuf[:nn], rp.pcm[:], true); err == nil {
-				rp.Stats.FECFrames.Add(1)
-				rp.input.Write(rp.pcm[:m])
-				return
+			if codec.HasLBRR(rp.fecBuf[:nn]) {
+				if m, err := rp.dec.Decode(rp.fecBuf[:nn], rp.pcm[:], true); err == nil {
+					rp.Stats.FECFrames.Add(1)
+					rp.input.Write(rp.pcm[:m])
+					return
+				}
 			}
 			if d := rp.dredDecoder(); d != nil {
 				if m, ok, err := d.Recover(rp.dec, rp.fecBuf[:nn], rp.pcm[:], rp.frameSamples(), SampleRate); ok && err == nil {

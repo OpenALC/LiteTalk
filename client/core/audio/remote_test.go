@@ -189,6 +189,9 @@ func TestRemoteDecodeFECRecoversLostFrame(t *testing.T) {
 	}
 
 	// 103 丢失、104 已到：FEC 恢复 103。
+	if !codec.HasLBRR(pkts[4]) {
+		t.Fatal("FEC 用例前提不成立：后继包 104 不含 LBRR")
+	}
 	rp.jb.Push(104, pkts[4], remoteArrival(104))
 	rp.decodeOnce()
 	if n := rp.input.ring.Read(drain); n != OpusFrameSize {
@@ -300,6 +303,9 @@ func TestRemoteDecodeDREDRecoversLostFrame(t *testing.T) {
 	}
 
 	// 103 丢失、104 已到：FEC 无 LBRR 可用，DRED 从 104 恢复 103。
+	if codec.HasLBRR(pkts[4]) {
+		t.Fatal("DRED 用例前提不成立：FEC 已关闭，后继包不应带 LBRR")
+	}
 	rp.jb.Push(104, pkts[4], remoteArrival(104))
 	rp.decodeOnce()
 	n := rp.input.ring.Read(drain)
@@ -888,8 +894,8 @@ func BenchmarkRemoteDecodeFrame(b *testing.B) {
 }
 
 // BenchmarkRemoteDecodePLCFrame 丢包路径：只推偶数 seq，每包弹两拍
-// （空洞用后继包 FEC 恢复/回落 PLC + 正常帧），验证丢帧分支（含 PeekNext
-// 与 FEC 解码）同样零分配。
+// （空洞先探测后继包 LBRR，无 FEC/DRED 时回落 PLC + 正常帧），验证丢帧分支
+// （含 PeekNext、LBRR 探测与 DRED 解析）同样零分配。
 func BenchmarkRemoteDecodePLCFrame(b *testing.B) {
 	m := NewMixer(func([]int16) int { return FrameSize })
 	rp := newTestRemotePeer(b, "a", m)

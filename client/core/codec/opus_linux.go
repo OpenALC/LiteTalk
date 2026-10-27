@@ -210,6 +210,7 @@ func NewDecoder(sampleRate, channels int) (*Decoder, error) {
 //   - pkt 非空、fec=false：常规解码；
 //   - pkt 为空（nil/长度 0）、fec=false：PLC 丢包隐藏，out 长度即要合成的采样数；
 //   - pkt 非空、fec=true：用本包的带内 FEC 恢复「上一帧」，out 为上一帧长度。
+//     包内没有 LBRR 时库会静默按丢包处理（返回 PLC 帧），需先用 HasLBRR 探测。
 func (d *Decoder) Decode(pkt []byte, out []int16, fec bool) (int, error) {
 	if d.st == nil {
 		return 0, ErrClosed
@@ -238,6 +239,18 @@ func (d *Decoder) Close() error {
 		d.st = nil
 	}
 	return nil
+}
+
+// HasLBRR 报告 Opus 包是否携带带内 FEC（LBRR）数据。
+//
+// 必须先用它探测再决定是否走 FEC：opus_decode(fec=true) 在包里没有 LBRR 时
+// 会「按丢包处理」并返回 PLC 帧且不报错，直接调用会把 PLC 误当成 FEC 恢复，
+// 也会挡住 DRED 兜底（#44）。
+func HasLBRR(pkt []byte) bool {
+	if len(pkt) == 0 {
+		return false
+	}
+	return C.opus_packet_has_lbrr((*C.uchar)(unsafe.Pointer(&pkt[0])), C.opus_int32(len(pkt))) == 1
 }
 
 // DREDDecoder 封装 Opus 深度冗余（DRED）解码器，复用一块 OpusDRED 状态。

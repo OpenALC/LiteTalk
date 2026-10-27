@@ -92,6 +92,9 @@ func (d *Decoder) Decode(pkt []byte, out []int16, fec bool) (int, error) {
 // Close stub。
 func (d *Decoder) Close() error { return nil }
 
+// HasLBRR stub：无 libopus 实现时恒 false。
+func HasLBRR(pkt []byte) bool { return false }
+
 // DREDDecoder stub。
 type DREDDecoder struct{}
 
