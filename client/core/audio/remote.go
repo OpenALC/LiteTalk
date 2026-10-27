@@ -336,6 +336,9 @@ func (rm *RemoteManager) JitterStats(peerID string) (rtc.JitterStats, bool) {
 // RemoteLinkStats 单路远端链路诊断快照（#95）：抖动缓冲、FEC/PLC 计数与
 // 混音输入环占用。全部为原子/快照读取，不在音频热路径上。
 type RemoteLinkStats struct {
+	// SSRC 该路下行轨的同步源标识：Session.Stats 据此把 PeerConnection 的
+	// 入站 RTP 统计归到对应成员（#49 B）。track 为空时为 0。
+	SSRC           uint32
 	Jitter         rtc.JitterStats
 	RTPReceived    uint64
 	FramesPopped   uint64
@@ -365,6 +368,9 @@ func (rm *RemoteManager) LinkStats(peerID string) (RemoteLinkStats, bool) {
 		FECFrames:    rp.Stats.FECFrames.Load(),
 		DREDFrames:   rp.Stats.DREDFrames.Load(),
 		DecodeErrors: rp.Stats.DecodeErrors.Load(),
+	}
+	if rp.track != nil {
+		st.SSRC = uint32(rp.track.SSRC())
 	}
 	if rp.input != nil {
 		st.RingAvailable = rp.input.BufferedSamples()

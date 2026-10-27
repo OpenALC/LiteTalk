@@ -426,35 +426,68 @@ func (p *Peer) ConnectionState() webrtc.PeerConnectionState { return p.pc.Connec
 // LocalSSRC 上行轨 SSRC（调试用）。
 func (p *Peer) LocalSSRC() uint32 { return p.pkt.SSRC }
 
+// InboundStreamStats 单条入站音频 RTP 流的统计快照（#49 B）。
+// Jitter 是 pion stats 拦截器按 RFC3550 计算的到达间隔抖动（秒转时长）。
+type InboundStreamStats struct {
+	SSRC            uint32
+	PacketsReceived uint32
+	PacketsLost     int32
+	Jitter          time.Duration
+}
+
+// LinkSnapshot 一次 GetStats 采集的链路快照：选中 ICE pair 的 RTT 与全部
+// 入站音频流（每路远端轨一个 SSRC）。voice:stats 每 2s 调一次，单独采 RTT
+// 与入站统计会重复拷贝整张统计表，故合并为一次。
+type LinkSnapshot struct {
+	RTT     time.Duration
+	HasRTT  bool
+	Inbound []InboundStreamStats
+}
+
+// LinkSnapshot 采集链路快照（未连接或已关闭时返回零值）。
+func (p *Peer) LinkSnapshot() LinkSnapshot {
+	var out LinkSnapshot
+	if p.closed.Load() {
+		return out
+	}
+	var best float64
+	for _, s := range p.pc.GetStats() {
+		switch st := s.(type) {
+		case webrtc.ICECandidatePairStats:
+			// 只采纳已 nominated 且检查成功的 pair（媒体实际走的通路）
+			if !st.Nominated || st.State != webrtc.StatsICECandidatePairStateSucceeded {
+				continue
+			}
+			if st.CurrentRoundTripTime > 0 && (!out.HasRTT || st.CurrentRoundTripTime < best) {
+				best = st.CurrentRoundTripTime
+				out.HasRTT = true
+			}
+		case webrtc.InboundRTPStreamStats:
+			if st.Kind != "audio" {
+				continue
+			}
+			out.Inbound = append(out.Inbound, InboundStreamStats{
+				SSRC:            uint32(st.SSRC),
+				PacketsReceived: st.PacketsReceived,
+				PacketsLost:     st.PacketsLost,
+				Jitter:          time.Duration(st.Jitter * float64(time.Second)),
+			})
+		}
+	}
+	if out.HasRTT {
+		out.RTT = time.Duration(best * float64(time.Second))
+	}
+	return out
+}
+
 // RTT 返回当前选中 ICE candidate pair 的最新往返时延
 // （WebRTC stats 的 currentRoundTripTime，真实网络 RTT）。
 // 此前 UI 的延迟恒为 0：Session.Stats 取的是管线回环延迟估计，
 // 而回环估计只在 Loopback 模式（M1 试听）有样本，真实通话 Loopback=false。
 // ok=false 表示连接未建立或尚无 RTT 样本（此时调用方应保留上一次值或显示 --）。
 func (p *Peer) RTT() (time.Duration, bool) {
-	if p.closed.Load() {
-		return 0, false
-	}
-	var best float64
-	found := false
-	for _, s := range p.pc.GetStats() {
-		pair, ok := s.(webrtc.ICECandidatePairStats)
-		if !ok {
-			continue
-		}
-		// 只采纳已 nominated 且检查成功的 pair（媒体实际走的通路）
-		if !pair.Nominated || pair.State != webrtc.StatsICECandidatePairStateSucceeded {
-			continue
-		}
-		if pair.CurrentRoundTripTime > 0 && (!found || pair.CurrentRoundTripTime < best) {
-			best = pair.CurrentRoundTripTime
-			found = true
-		}
-	}
-	if !found {
-		return 0, false
-	}
-	return time.Duration(best * float64(time.Second)), true
+	snap := p.LinkSnapshot()
+	return snap.RTT, snap.HasRTT
 }
 
 // Close 关闭 PeerConnection（幂等）。

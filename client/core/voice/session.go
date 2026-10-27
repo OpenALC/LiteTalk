@@ -126,6 +126,15 @@ type VoiceStats struct {
 	PlaybackUnderruns  uint64         `json:"playback_underruns"`
 	PlaybackDropped    uint64         `json:"playback_dropped"`
 	Peers              []PeerLinkDiag `json:"peers,omitempty"`
+
+	// 网络链路诊断（#49 B）：真实 RTT 已在 LatencyMS；这里补入站 RTP 丢包、
+	// RFC3550 抖动与自适应抖动缓冲深度。全为 0 时省略（未入房/无下行流）。
+	LossPct        float64 `json:"loss_pct,omitempty"`
+	RTPJitterMS    float64 `json:"rtp_jitter_ms,omitempty"`
+	JitterBufferMS int     `json:"jitter_buffer_ms,omitempty"`
+	JitterTargetMS int     `json:"jitter_target_ms,omitempty"`
+	RTPReceived    uint32  `json:"rtp_received,omitempty"`
+	RTPLost        int32   `json:"rtp_lost,omitempty"`
 }
 
 // PeerLinkDiag 单路下行链路诊断（#95）：抖动缓冲深度、丢失/FEC/PLC 计数
@@ -142,6 +151,16 @@ type PeerLinkDiag struct {
 	DREDFrames            uint64  `json:"dred_frames"`
 	UnderrunFrames        uint64  `json:"underrun_frames"`
 	DroppedSamples        uint64  `json:"dropped_samples"`
+
+	// 入站 RTP 与缓冲深度（#49 B）：loss_pct / rtp_jitter_ms 来自 Pion 的
+	// InboundRTPStreamStats；buffer_ms/target_ms 由抖动缓冲包数按帧长换算。
+	// 与上面的 jitter_ms（缓冲自身的到达抖动估计）语义不同，故分开命名。
+	LossPct     float64 `json:"loss_pct,omitempty"`
+	RTPJitterMS float64 `json:"rtp_jitter_ms,omitempty"`
+	BufferMS    int     `json:"buffer_ms,omitempty"`
+	TargetMS    int     `json:"target_ms,omitempty"`
+	RTPReceived uint32  `json:"rtp_received,omitempty"`
+	RTPLost     int32   `json:"rtp_lost,omitempty"`
 }
 
 // PeerView UI 侧成员视图。
@@ -253,6 +272,15 @@ type Session struct {
 	// 阻塞的 Wails 绑定线程预取，读循环只读缓存；缓存空则降级空 ICE 列表。
 	iceMu      sync.RWMutex
 	iceServers []webrtc.ICEServer
+
+	// roomRebuildMu 串行化「拆 PC + 重发 channel.join」的重建路径（#19/#49）：
+	// rtc.failed 在 WS 读循环、网络变化在网络轮询 goroutine，两者不得并发
+	// 拆链路（会留下两套 join 回执互相顶替）。两处都用 TryLock——拿不到锁
+	// 说明已有重建在途，读循环绝不能等待。
+	roomRebuildMu sync.Mutex
+	// lastNetRecover 上次网络变化重建的 UnixNano（#49 A）：接口切换过程中
+	// 签名可能连续变化，冷却窗内不重复拆链路。
+	lastNetRecover atomic.Int64
 
 	mu        sync.Mutex
 	members   map[string]PeerView
@@ -507,6 +535,7 @@ func (s *Session) Connect(serverURL string) {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+
 		if err := s.ws.Run(ctx); err != nil && err != context.Canceled {
 			// ErrAuthFatal：刷新被明确拒绝 / 无刷新来源 / 换服，Run 已停止重连。
 			// 必须上报被踢回登录页——否则前端停在「信令连接中」永远等不到结果。
@@ -516,6 +545,14 @@ func (s *Session) Connect(serverURL string) {
 			}
 			s.log.Printf("signal run: %v", err)
 		}
+	}()
+
+	// #49 A：网络接口变化监听（Wi-Fi/有线/代理切换后旧 ICE 候选失效）。
+	// 仅在房内触发一次轻量重建，随会话 ctx 退出。
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.watchNetwork(ctx)
 	}()
 }
 
@@ -679,13 +716,19 @@ func (s *Session) registerHandlers() {
 				s.ev.OnPeerJoin(m.UserID, m.Nickname, m.Tag, m.Speaking, m.Mute, m.Deafen, m.Priority)
 			}
 		}
-		// 仅在无存活 peer 时建连（他人入房广播不动媒体链路）。
+		// 仅在无存活 peer 时建连（他人入房广播不动媒体链路）。与网络恢复/
+		// ICE 重建互斥：已有重建在途时由那条路径负责建新 PC，读循环不并发
+		// 再建一条（否则两次 rtc.offer 互相顶替）。
 		if p := s.peerRef.Load(); p != nil &&
 			p.ConnectionState() != webrtc.PeerConnectionStateClosed &&
 			p.ConnectionState() != webrtc.PeerConnectionStateFailed {
 			return
 		}
+		if !s.roomRebuildMu.TryLock() {
+			return
+		}
 		s.setupPeer()
+		s.roomRebuildMu.Unlock()
 		// 补发完整语音状态（muted+deafened 现值）：重连/重入房后服务端内存里的
 		// 旧状态可能已丢，peer 又是新建（默认不静音）——不发则「UI 显示已闭麦但声音照传」。
 		if s.ws != nil {
@@ -961,6 +1004,16 @@ func (s *Session) rebuildAfterICEFail(channelID string) {
 		p.ConnectionState() == webrtc.PeerConnectionStateConnected {
 		return
 	}
+	// 已有重建在途（网络切换/并发的 rtc.failed）：让在途那次完成即可，
+	// 读循环不等待（#49：网络恢复可能正在预取凭证）。
+	if !s.roomRebuildMu.TryLock() {
+		return
+	}
+	defer s.roomRebuildMu.Unlock()
+	// 锁内重读：等锁期间可能已退房/换房。
+	if room, _ = s.roomID.Load().(string); room == "" || (channelID != "" && channelID != room) {
+		return
+	}
 	if p := s.peerRef.Swap(nil); p != nil {
 		_ = p.Close()
 	}
@@ -1040,17 +1093,28 @@ func (s *Session) handleKicked(reason string) {
 }
 
 // setupPeer 建立对 SFU 的单条 PeerConnection（初始 offer 一次，此后只应答）。
-func (s *Session) setupPeer() {
+// offer 发送失败只记日志（读循环路径没有可回滚的更好选择，等下一次 joined）。
+func (s *Session) setupPeer() { _ = s.setupPeerOffer() }
+
+// setupPeerOffer 同 setupPeer，但把建 PC 与生成初始 offer 的错误返回给
+// 调用方：网络变化恢复据此清掉半成品，交由 WS 重连兜底。信令发送失败在
+// OnLocalSDP 回调里只能忽略——连接断开时 OnDisconnect 会清 peerRef。
+func (s *Session) setupPeerOffer() error {
 	if old := s.peerRef.Swap(nil); old != nil {
 		_ = old.Close()
 	}
 	if s.remoteMgr == nil { // 音频降级路径不可能走到（JoinChannel 已拦截），防御
-		return
+		return errors.New("remote manager unavailable")
 	}
 	s.remoteMgr.RemoveAll()
 	streamID := s.name
 	if s.selfID != "" {
 		streamID = s.selfID
+	}
+	// 媒体降级时 pipe 为空：不挂电平扩展即可，不能解引用 nil（防御）。
+	var levelFn func() uint8
+	if s.pipe != nil {
+		levelFn = s.pipe.AudioLevel
 	}
 	peer, err := rtc.NewPeer(rtc.PeerConfig{
 		StreamID: streamID,
@@ -1059,7 +1123,7 @@ func (s *Session) setupPeer() {
 		ICEServers:      s.cachedICE(),
 		IncludeLoopback: IsLoopbackURL(s.api.Base()), // 环回候选仅本机/内网 SFU 需要
 		// RFC 6464 电平源（#33）：管线 DSP 已算好的帧电平，SendOpus 每包读一次。
-		LevelFn: s.pipe.AudioLevel,
+		LevelFn: levelFn,
 		Callbacks: rtc.PeerCallbacks{
 			OnLocalSDP: func(sdp webrtc.SessionDescription) {
 				msgType := signal.TypeRTCOffer
@@ -1082,7 +1146,7 @@ func (s *Session) setupPeer() {
 	})
 	if err != nil {
 		s.log.Printf("new peer: %v", err)
-		return
+		return err
 	}
 	// 新 peer 默认不静音：必须同步本地静音态，否则重连后出现
 	//「UI 显示已闭麦但声音照传」。deafen 是混音器总线层的口，无 peer 级对应。
@@ -1095,7 +1159,9 @@ func (s *Session) setupPeer() {
 	s.peerRef.Store(peer)
 	if err := peer.Offer(); err != nil {
 		s.log.Printf("offer: %v", err)
+		return err
 	}
+	return nil
 }
 
 // JoinChannel 加入语音频道（不带密码；带密码用 JoinChannelWithPassword）。
@@ -1595,47 +1661,117 @@ func (s *Session) Stats() string {
 		vs.PlaybackUnderruns = ps.PlaybackUnderruns
 		vs.PlaybackDropped = ps.PlaybackDropped
 	}
+	// #49 B：一次 GetStats 同时取 RTT 与全部入站 RTP 流。2s 轮询下重复
+	// 调 GetStats 会把整张统计表拷贝两次，且入站流按 SSRC 与远端成员对账。
+	var snap rtc.LinkSnapshot
+	if p := s.peerRef.Load(); p != nil {
+		snap = p.LinkSnapshot()
+		vs.RtpSent = p.Stats.PacketsSent.Load()
+	}
+	inbound := inboundBySSRC(snap.Inbound)
 	if s.remoteMgr != nil {
 		vs.PeerIDs = s.remoteMgr.PeerIDs()
-		// 下行链路诊断（#95）：app 层每 2s 入房期间调用，快照读取。
+		frameMS := s.remoteMgr.FrameMS()
+		// 下行链路诊断（#95/#49）：app 层每 2s 入房期间调用，快照读取。
 		for _, id := range vs.PeerIDs {
 			ls, ok := s.remoteMgr.LinkStats(id)
 			if !ok {
 				continue
 			}
-			vs.Peers = append(vs.Peers, PeerLinkDiag{
-				PeerID:                id,
-				JitterMs:              ls.Jitter.JitterMs,
-				JitterTargetPackets:   ls.Jitter.TargetPackets,
-				JitterBufferedPackets: ls.Jitter.Buffered,
-				JitterLost:            ls.Jitter.Lost,
-				RingSamples:           ls.RingAvailable,
-				PLCFrames:             ls.PLCFrames,
-				FECFrames:             ls.FECFrames,
-				DREDFrames:            ls.DREDFrames,
-				UnderrunFrames:        ls.UnderrunFrames,
-				DroppedSamples:        ls.DroppedSamples,
-			})
+			diag := peerLinkDiag(id, ls, frameMS, inbound)
+			vs.Peers = append(vs.Peers, diag)
+			// 抖动/缓冲取最差一路：用户关心的是哪一路在拖后腿，平均后会
+			// 把明显异常的一路稀释成「看起来还行」。丢包率则按总包数聚合，
+			// 与 RTPReceived/RTPLost 两个计数保持自洽。
+			if diag.RTPJitterMS > vs.RTPJitterMS {
+				vs.RTPJitterMS = diag.RTPJitterMS
+			}
+			if diag.BufferMS > vs.JitterBufferMS {
+				vs.JitterBufferMS = diag.BufferMS
+			}
+			if diag.TargetMS > vs.JitterTargetMS {
+				vs.JitterTargetMS = diag.TargetMS
+			}
+			vs.RTPReceived += diag.RTPReceived
+			vs.RTPLost += diag.RTPLost
 		}
+		vs.LossPct = lossPercent(vs.RTPReceived, vs.RTPLost)
 	}
-	if p := s.peerRef.Load(); p != nil {
-		vs.RtpSent = p.Stats.PacketsSent.Load()
+	if snap.HasRTT {
 		// 延迟优先取 WebRTC 选中 ICE pair 的真实 RTT（问题：此前恒 0ms——
 		// 管线回环估计只在 Loopback 模式有样本，真实通话不产样本）。
 		// 用 ok 作哨兵而非值——RTT 真实但 <1ms 时会被错误覆盖（S1）。
-		if rtt, ok := p.RTT(); ok {
-			vs.LatencyMS = int(rtt.Milliseconds())
-		} else if havePipe {
-			// 无 RTT 样本时回落管线回环估计（本机联调场景）。
-			vs.EncPackets = ps.PacketsEncoded
-			vs.LatencyMS = int(ps.LatencyAvgUS / 1000)
-		}
+		vs.LatencyMS = int(snap.RTT.Milliseconds())
+	} else if havePipe {
+		// 无 RTT 样本时回落管线回环估计（本机联调场景）。
+		vs.EncPackets = ps.PacketsEncoded
+		vs.LatencyMS = int(ps.LatencyAvgUS / 1000)
 	}
 	s.mu.Lock()
 	vs.Members = len(s.members)
 	s.mu.Unlock()
 	b, _ := json.Marshal(vs)
 	return string(b)
+}
+
+// inboundBySSRC 按 SSRC 索引 PeerConnection 的入站音频流，供 per-peer 归账。
+func inboundBySSRC(streams []rtc.InboundStreamStats) map[uint32]rtc.InboundStreamStats {
+	if len(streams) == 0 {
+		return nil
+	}
+	m := make(map[uint32]rtc.InboundStreamStats, len(streams))
+	for _, st := range streams {
+		m[st.SSRC] = st
+	}
+	return m
+}
+
+// peerLinkDiag 组装单路诊断：抖动缓冲快照 + 同 SSRC 的入站 RTP 统计。
+// 入站流尚未出现（对端未发过包）时只输出缓冲侧字段。
+func peerLinkDiag(id string, ls audio.RemoteLinkStats, frameMS int, inbound map[uint32]rtc.InboundStreamStats) PeerLinkDiag {
+	if frameMS <= 0 {
+		frameMS = rtc.JitterFrameMS
+	}
+	diag := PeerLinkDiag{
+		PeerID:                id,
+		JitterMs:              ls.Jitter.JitterMs,
+		JitterTargetPackets:   ls.Jitter.TargetPackets,
+		JitterBufferedPackets: ls.Jitter.Buffered,
+		JitterLost:            ls.Jitter.Lost,
+		RingSamples:           ls.RingAvailable,
+		PLCFrames:             ls.PLCFrames,
+		FECFrames:             ls.FECFrames,
+		DREDFrames:            ls.DREDFrames,
+		UnderrunFrames:        ls.UnderrunFrames,
+		DroppedSamples:        ls.DroppedSamples,
+		BufferMS:              ls.Jitter.Buffered * frameMS,
+		TargetMS:              ls.Jitter.TargetPackets * frameMS,
+	}
+	if st, ok := inbound[ls.SSRC]; ok {
+		diag.LossPct = lossPercent(st.PacketsReceived, st.PacketsLost)
+		diag.RTPJitterMS = float64(st.Jitter.Microseconds()) / 1000
+		diag.RTPReceived = st.PacketsReceived
+		diag.RTPLost = st.PacketsLost
+	}
+	return diag
+}
+
+// lossPercent 入站丢包率（%）。PacketsLost 在重复包多于丢失包时可为负，
+// 统一夹到 0..100；还没有任何包时返回 0。
+func lossPercent(received uint32, lost int32) float64 {
+	lost64 := int64(lost)
+	if lost64 < 0 {
+		lost64 = 0
+	}
+	total := int64(received) + lost64
+	if total <= 0 {
+		return 0
+	}
+	pct := float64(lost64) * 100 / float64(total)
+	if pct > 100 {
+		return 100
+	}
+	return pct
 }
 
 // SendChat 发送文字消息（chat.send，chat.message 由 WS 回落）。
