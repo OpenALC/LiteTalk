@@ -66,18 +66,24 @@ describe('whenNativeReady', () => {
   })
 })
 
-// 浏览器 mock 的语音设置默认值：AEC 关闭字段缺省 = 开启，UI 依赖它初始化
-// 「回声消除 AEC」开关（Go 侧 omitempty 不会下发 false）。
-describe('语音设置 mock 默认值', () => {
+// 浏览器 mock 的语音设置默认值：Beta APM 默认关闭；APMSupported 为 true
+// 让 Beta 区在浏览器预览里可见可操作（原生 stub 平台由真实绑定返回 false）。
+describe('Beta APM mock 默认值', () => {
   afterEach(() => {
     delete (globalThis as Record<string, unknown>).window
     env.DEV = true
   })
 
-  it('默认开启回声消除', async () => {
+  it('APM 默认关闭', async () => {
     installWindow()
     env.DEV = true
     const s = await goApp().GetAudioSettings()
-    expect(s.disable_aec).toBe(false)
+    expect(s.enable_apm).toBe(false)
+  })
+
+  it('mock 平台报告支持 APM', async () => {
+    installWindow()
+    env.DEV = true
+    await expect(goApp().APMSupported()).resolves.toBe(true)
   })
 })

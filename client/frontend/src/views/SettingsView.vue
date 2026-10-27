@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // SettingsView 设置页（独立路由 /settings，v0.1.2 起不再复用语音/文字舞台区域）。
-// 分区：连接/账号/常规/音频设备/语音/快捷键/关于；改动即热应用 + 落盘 config.json。
+// 分区：连接/账号/常规/音频设备/语音/Beta 功能/快捷键/关于；改动即热应用 + 落盘 config.json。
 // 语音默认值全部由 Go 侧 GetAudioSettings 回落（零值 → 默认），UI 只消费完整值。
 import { onMounted, onUnmounted, ref, computed } from 'vue'
 import { ArrowLeft, CircleAlert, Keyboard, LogOut, Mic, Volume2 } from 'lucide-vue-next'
@@ -79,7 +79,7 @@ const audio = ref<AudioSettings>({
   bitrate_kbps: 32, vbr: true, dtx: true, fec: true,
   packet_loss: 10, denoise: true, denoise_strength: 2, agc: true,
   mic_volume: 100, playback_volume: 100, vad_sens: 2, opus_complexity: 9,
-  input_mode: 'auto', pre_gain_db: 0, disable_aec: false,
+  input_mode: 'auto', pre_gain_db: 0, enable_apm: false,
 })
 const BITRATES = [16, 24, 32, 48, 64]
 // VAD 五档（v0.1.2 扩展；旧三档由 Go 侧映射 0/2/4）。
@@ -103,11 +103,15 @@ const denoiseIdx = ref(2)
 function syncDenoiseIdx() {
   denoiseIdx.value = audio.value.denoise ? audio.value.denoise_strength : 0
 }
-// 回声消除默认开启（Go 侧 disable_aec=false 时 omitempty 不下发，UI 补默认）。
-// 显式 setter 而不是 v-model 计算属性：保证先改值再保存，不依赖 change 监听顺序。
-function setAEC(on: boolean) {
-  audio.value.disable_aec = !on
-  void applyAudio()
+// Beta APM：默认关闭；平台不支持时禁用开关并提示（原生 stub 平台返回 false）。
+const apmSupported = ref(true)
+// 显式 setter：先改值再保存；保存/创建失败时回滚 UI 勾选，避免与 Go 侧实际状态不一致。
+async function setEnableAPM(on: boolean) {
+  if (on && !apmSupported.value) return
+  audio.value.enable_apm = on
+  if (!(await applyAudio())) {
+    audio.value.enable_apm = !on
+  }
 }
 function applyDenoiseIdx(i: number) {
   denoiseIdx.value = i
@@ -134,7 +138,9 @@ onMounted(async () => {
   // omitempty 字段（0/空值不序列化）在 UI 侧补默认，避免滑杆/下拉空值。
   audio.value.input_mode ??= 'auto'
   audio.value.pre_gain_db ??= 0
-  audio.value.disable_aec ??= false
+  audio.value.enable_apm ??= false
+  apmSupported.value = await goApp().APMSupported().catch(() => false)
+  if (!apmSupported.value) audio.value.enable_apm = false
   // 热键读取单独兜异常：Go 侧绑定缺失时只回落默认值，不连带弄崩下面设备列表的加载。
   try {
     hk.value = await goApp().GetHotkeySettings()
@@ -241,12 +247,14 @@ async function testSpeaker() {
   }
 }
 
-// 语音设置改动：热应用到当前会话（未连接仅落盘），失败弹提示。
-async function applyAudio() {
+// 语音设置改动：热应用到当前会话（未连接仅落盘），失败弹提示并返回 false。
+async function applyAudio(): Promise<boolean> {
   try {
     await goApp().SetAudioSettings({ ...audio.value })
+    return true
   } catch (e) {
     toast.value?.show(`语音设置保存失败：${cleanErrorText(e, '未知错误')}`, true)
+    return false
   }
 }
 
@@ -473,7 +481,7 @@ function bindRecording(spec: string) {
       <section class="s-sec">
         <h3>语音</h3>
         <div class="s-row">
-          <div class="k">附加降噪（RNNoise）</div>
+          <div class="k">降噪强度（RNNoise）</div>
           <div class="seg-mini">
             <button v-for="(label, i) in DENOISE_LABELS" :key="i"
                     :class="{ on: denoiseIdx === i }"
@@ -500,13 +508,6 @@ function bindRecording(spec: string) {
           <div class="k">自动增益 AGC</div>
           <label class="switch">
             <input v-model="audio.agc" type="checkbox" @change="applyAudio"><i />
-          </label>
-        </div>
-        <div class="s-row">
-          <div class="k">回声消除 AEC</div>
-          <label class="switch">
-            <input :checked="!audio.disable_aec" type="checkbox"
-                   @change="setAEC(($event.target as HTMLInputElement).checked)"><i />
           </label>
         </div>
         <div class="s-row">
@@ -558,6 +559,21 @@ function bindRecording(spec: string) {
           <input v-model.number="audio.packet_loss" type="range" min="5" max="20" step="5" @change="applyAudio">
           <span class="v">{{ audio.packet_loss }}%</span>
         </div>
+      </section>
+
+      <section class="s-sec">
+        <h3>Beta 功能</h3>
+        <div class="s-row">
+          <div class="k">回声消除（WebRTC APM）</div>
+          <label class="switch" :class="{ disabled: !apmSupported }">
+            <input :checked="audio.enable_apm" type="checkbox" :disabled="!apmSupported"
+                   @change="setEnableAPM(($event.target as HTMLInputElement).checked)"><i />
+          </label>
+        </div>
+        <p class="s-note">启用 AEC / AGC2 / 高通；CPU 占用增加，默认关闭</p>
+        <p v-if="!apmSupported" class="s-note s-warn">
+          <CircleAlert :size="13" />当前平台不支持 WebRTC APM
+        </p>
       </section>
 
       <section class="s-sec">
@@ -684,6 +700,8 @@ select {
 .s-row { flex-wrap: wrap; }
 input[type="range"] { flex: 0 0 140px; accent-color: var(--brand-500); }
 .switch { position: relative; width: 36px; height: 20px; flex: none; }
+.switch.disabled { opacity: 0.45; cursor: not-allowed; }
+.switch.disabled i { cursor: not-allowed; }
 .switch input { display: none; }
 .switch i {
   position: absolute; inset: 0;

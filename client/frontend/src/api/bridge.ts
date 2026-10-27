@@ -38,6 +38,8 @@ type GoApp = {
   TestSpeaker(): Promise<void>
   GetAudioSettings(): Promise<AudioSettings>
   SetAudioSettings(s: AudioSettings): Promise<void>
+  // WebRTC APM（Beta）可用性：false 的平台（如 macOS stub）设置页禁用开关。
+  APMSupported(): Promise<boolean>
   // 全局热键与按键说话（GetHotkeyAvailability 为 false 时平台不支持，UI 需明示降级）。
   GetHotkeySettings(): Promise<HotkeySettings>
   SetHotkeySettings(s: HotkeySettings): Promise<void>
@@ -237,10 +239,12 @@ const mockApp: GoApp = {
       bitrate_kbps: 32, vbr: true, dtx: true, fec: true, packet_loss: 10,
       denoise: true, denoise_strength: 2, agc: false, gain: 10,
       mic_volume: 100, playback_volume: 100, vad_sens: 2, opus_complexity: 9,
-      disable_aec: false,
+      enable_apm: false,
     }
   },
   async SetAudioSettings() {},
+  // 浏览器预览没有 C++ APM，但保持 Beta 区可见可操作（落盘为 no-op）。
+  async APMSupported() { return true },
   // 全局热键桩：默认值走 Go 侧 hotkey.DefaultSettings 的 TS 等价（全关、绑定全空）。
   // 浏览器环境没有原生钩子，可用性恒 false——设置页据此展示降级说明。
   async GetHotkeySettings() {
