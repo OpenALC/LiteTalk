@@ -2,7 +2,7 @@
 // 浏览器独立开发（vite dev 无 Go 后端）时走 mock 桩，行为可联调 UI。
 // 原生环境判定：Go 在 webview 启动时注入 window._wails.flags（浏览器环境恒无）。
 import { Call, Events } from '@wailsio/runtime'
-import type { AttachmentView, AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ChatMessage, ConnConfigView, ConnTestResult, Conversation, FriendDTO, HotkeySettings, LinkPreview, MentionCandidate, NetworkDiagResult, PeerView, ServerChannels, ServerConfig, ServerDTO, UnreadChannel, Unreads, UserProfile, VoiceStateView } from './types'
+import type { AttachmentView, AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ChatMessage, ConnConfigView, ConnTestResult, Conversation, FriendDTO, HotkeySettings, LinkPreview, MentionCandidate, NetworkDiagResult, PeerView, ServerChannels, ServerConfig, ServerDTO, UnreadChannel, Unreads, UserProfile, VoiceStateView, WindowOverlaySettings } from './types'
 
 type GoApp = {
   GetVersion(): Promise<string>
@@ -42,6 +42,10 @@ type GoApp = {
   SetAudioSettings(s: AudioSettings): Promise<void>
   // WebRTC APM（Beta）可用性：false 的平台（如 macOS stub）设置页禁用开关。
   APMSupported(): Promise<boolean>
+  // 游戏内悬浮层（#47，Beta，仅 Windows）：Supported 为 false 时设置页禁用开关。
+  WindowOverlaySupported(): Promise<boolean>
+  GetWindowOverlaySettings(): Promise<WindowOverlaySettings>
+  SetWindowOverlaySettings(s: WindowOverlaySettings): Promise<void>
   // 全局热键与按键说话（GetHotkeyAvailability 为 false 时平台不支持，UI 需明示降级）。
   GetHotkeySettings(): Promise<HotkeySettings>
   SetHotkeySettings(s: HotkeySettings): Promise<void>
@@ -256,6 +260,11 @@ const mockApp: GoApp = {
   async SetAudioSettings() {},
   // 浏览器预览没有 C++ APM，但保持 Beta 区可见可操作（落盘为 no-op）。
   async APMSupported() { return true },
+  // 悬浮层 mock：默认关闭；浏览器预览没有原生窗口，仍报告支持以便联调 UI，
+  // 保存为 no-op（真实平台能力由 Go 侧 Supported 报告）。
+  async WindowOverlaySupported() { return true },
+  async GetWindowOverlaySettings() { return { enabled: false } },
+  async SetWindowOverlaySettings() {},
   // 全局热键桩：默认值走 Go 侧 hotkey.DefaultSettings 的 TS 等价（全关、绑定全空）。
   // 浏览器环境没有原生钩子，可用性恒 false——设置页据此展示降级说明。
   async GetHotkeySettings() {

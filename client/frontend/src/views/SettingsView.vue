@@ -17,6 +17,7 @@ import {
 } from '../utils/hotkeySpec'
 import { cleanErrorText } from '../utils/errorText'
 import { withAudioDefaults } from '../utils/audioSettings'
+import { useWindowOverlay } from '../utils/windowOverlay'
 import ServerConnPanel from '../components/ServerConnPanel.vue'
 import NetworkDiagPanel from '../components/NetworkDiagPanel.vue'
 import Toast from '../components/Toast.vue'
@@ -115,6 +116,19 @@ async function setEnableAPM(on: boolean) {
     audio.value.enable_apm = !on
   }
 }
+
+// 游戏内悬浮层（#47，Beta，仅 Windows）：默认关闭；平台不支持时开关禁用。
+// 保存失败回滚勾选（逻辑在 useWindowOverlay 内，见单测）。
+const {
+  enabled: overlayEnabled,
+  supported: overlaySupported,
+  load: loadWindowOverlay,
+  setEnabled: applyWindowOverlay,
+} = useWindowOverlay(goApp())
+async function setWindowOverlay(on: boolean) {
+  const err = await applyWindowOverlay(on)
+  if (err) toast.value?.show(`悬浮层设置保存失败：${err}`, true)
+}
 function applyDenoiseIdx(i: number) {
   denoiseIdx.value = i
   if (i === 0) {
@@ -139,6 +153,7 @@ onMounted(async () => {
   audio.value = withAudioDefaults(await goApp().GetAudioSettings())
   apmSupported.value = await goApp().APMSupported().catch(() => false)
   if (!apmSupported.value) audio.value.enable_apm = false
+  await loadWindowOverlay()
   // 热键读取单独兜异常：Go 侧绑定缺失时只回落默认值，不连带弄崩下面设备列表的加载。
   try {
     hk.value = await goApp().GetHotkeySettings()
@@ -581,6 +596,18 @@ function bindRecording(spec: string) {
         <p class="s-note">启用 AEC / AGC2 / 高通；CPU 占用增加，默认关闭</p>
         <p v-if="!apmSupported" class="s-note s-warn">
           <CircleAlert :size="13" />当前平台不支持 WebRTC APM
+        </p>
+        <!-- 游戏内悬浮层：仅 Windows 有原生分层窗口；独占全屏（DX exclusive）可能不可见 -->
+        <div class="s-row">
+          <div class="k">游戏内悬浮层</div>
+          <label class="switch" :class="{ disabled: !overlaySupported }">
+            <input :checked="overlayEnabled" type="checkbox" :disabled="!overlaySupported"
+                   @change="setWindowOverlay(($event.target as HTMLInputElement).checked)"><i />
+          </label>
+        </div>
+        <p class="s-note">显示正在说话的成员；独占全屏游戏可能不可见</p>
+        <p v-if="!overlaySupported" class="s-note s-warn">
+          <CircleAlert :size="13" />仅 Windows 支持游戏内悬浮层
         </p>
       </section>
 

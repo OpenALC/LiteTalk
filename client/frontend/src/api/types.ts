@@ -241,6 +241,12 @@ export interface HotkeySettings {
   cue_sound?: boolean
 }
 
+// WindowOverlaySettings 游戏内悬浮层（#47，Beta，仅 Windows）配置。
+// enabled 默认 false；平台不支持时设置页禁用开关（能力由 WindowOverlaySupported 报告）。
+export interface WindowOverlaySettings {
+  enabled: boolean
+}
+
 // AudioLevel audio:level 事件载荷（设置页麦克风测试期间 100ms 推送一次）。
 // peak/rms/threshold 均为 dBFS 负值；threshold 为当前说话进入门限（电平条标线）。
 export interface AudioLevel {

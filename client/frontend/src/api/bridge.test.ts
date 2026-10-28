@@ -94,3 +94,31 @@ describe('Beta APM mock 默认值', () => {
     await expect(goApp().APMSupported()).resolves.toBe(true)
   })
 })
+
+// 游戏内悬浮层（#47，Beta，仅 Windows）：浏览器 mock 默认关闭、报告支持，
+// 让 Beta 区在预览里可见可操作；真实平台能力由 Go 侧 Supported 报告。
+describe('游戏内悬浮层 mock 默认值', () => {
+  afterEach(() => {
+    delete (globalThis as Record<string, unknown>).window
+    env.DEV = true
+  })
+
+  it('默认关闭', async () => {
+    installWindow()
+    env.DEV = true
+    const s = await goApp().GetWindowOverlaySettings()
+    expect(s.enabled).toBe(false)
+  })
+
+  it('mock 平台报告支持', async () => {
+    installWindow()
+    env.DEV = true
+    await expect(goApp().WindowOverlaySupported()).resolves.toBe(true)
+  })
+
+  it('保存为 no-op', async () => {
+    installWindow()
+    env.DEV = true
+    await expect(goApp().SetWindowOverlaySettings({ enabled: true })).resolves.toBeUndefined()
+  })
+})
