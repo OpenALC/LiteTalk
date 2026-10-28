@@ -51,6 +51,7 @@ type Config struct {
 	AudioCapture        string           `json:"audio_capture,omitempty"`         // 采集设备 ID（空=默认）
 	AudioPlayback       string           `json:"audio_playback,omitempty"`        // 播放设备 ID（空=默认）
 	Hotkeys             *hotkey.Settings `json:"hotkeys,omitempty"`               // 全局热键与按键说话（v1.2.0；默认关闭，见 hotkey 包）
+	WindowOverlay       *OverlaySettings `json:"window_overlay,omitempty"`        // 游戏内悬浮层（#47，Beta，仅 Windows；默认关闭）
 	// v0.1.2：界面销毁休眠/首页服务器/介绍页隐藏（客户端级偏好，无需服务端）。
 	UIDestroyOnHibernate *bool  `json:"ui_destroy_on_hibernate,omitempty"` // 休眠时 WindowReloadApp 卸载界面（默认 false）
 	HomeServerID         string `json:"home_server_id,omitempty"`          // 首页服务器 id（空 = 介绍页 __intro__）
@@ -229,6 +230,30 @@ func (m *Manager) GetHotkeySettings() hotkey.Settings {
 func (m *Manager) SetHotkeySettings(s hotkey.Settings) error {
 	return m.Update(func(c *Config) error {
 		c.Hotkeys = &s
+		return nil
+	})
+}
+
+// ---------- 游戏内悬浮层（#47，Beta） ----------
+
+// OverlaySettings 游戏内悬浮层配置。只有 Windows 有原生实现；其余平台
+// 读路径仍如实返回持久化值，由前端按平台能力禁用开关。
+type OverlaySettings struct {
+	Enabled bool `json:"enabled"` // 用户主动启用（Beta 默认关闭）
+}
+
+// GetWindowOverlaySettings 读取悬浮层设置（未配置 = 关闭）。
+func (m *Manager) GetWindowOverlaySettings() OverlaySettings {
+	if s := m.Get().WindowOverlay; s != nil {
+		return *s
+	}
+	return OverlaySettings{}
+}
+
+// SetWindowOverlaySettings 持久化悬浮层设置（平台能力校验在 app 层）。
+func (m *Manager) SetWindowOverlaySettings(s OverlaySettings) error {
+	return m.Update(func(c *Config) error {
+		c.WindowOverlay = &s
 		return nil
 	})
 }

@@ -188,6 +188,28 @@ func TestHotkeySettings(t *testing.T) {
 	}
 }
 
+// TestWindowOverlaySettings 游戏内悬浮层（#47，Beta）：默认关闭、开关持久化往返。
+func TestWindowOverlaySettings(t *testing.T) {
+	m := tmpManager(t)
+	if m.GetWindowOverlaySettings().Enabled {
+		t.Fatal("悬浮层默认应关闭")
+	}
+	if err := m.SetWindowOverlaySettings(OverlaySettings{Enabled: true}); err != nil {
+		t.Fatalf("SetWindowOverlaySettings: %v", err)
+	}
+	m2 := NewWithPath(m.Path())
+	if !m2.GetWindowOverlaySettings().Enabled {
+		t.Fatal("启用状态未持久化")
+	}
+	if err := m2.SetWindowOverlaySettings(OverlaySettings{Enabled: false}); err != nil {
+		t.Fatalf("关闭: %v", err)
+	}
+	m3 := NewWithPath(m.Path())
+	if m3.GetWindowOverlaySettings().Enabled {
+		t.Fatal("关闭状态未持久化")
+	}
+}
+
 // TestUIPrefs v0.1.2 界面偏好：UI 销毁休眠/首页服务器/介绍页隐藏。
 func TestUIPrefs(t *testing.T) {
 	m := tmpManager(t)

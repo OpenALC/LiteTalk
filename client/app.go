@@ -28,6 +28,7 @@ import (
 	"github.com/OpenALC/LiteTalk/client/core/signal"
 	"github.com/OpenALC/LiteTalk/client/core/voice"
 	"github.com/OpenALC/LiteTalk/client/desktop"
+	"github.com/OpenALC/LiteTalk/client/desktop/overlay"
 	"github.com/OpenALC/LiteTalk/client/desktop/tray"
 	"github.com/gen2brain/malgo"
 	"github.com/wailsapp/wails/v3/pkg/application"
@@ -108,6 +109,10 @@ type App struct {
 	hkGate    *hotkey.Gate
 	hkQuit    chan struct{}
 	hkQuitOne sync.Once
+
+	// overlayMu 串行化悬浮层开关（Wails 绑定可并发调用）：配置落盘、启动/
+	// 停止窗口必须在同一临界区，否则连点开关会留下「配置开、窗口停」的撕裂态。
+	overlayMu sync.Mutex
 
 	// 悄悄话（#45）：whisperMu 保护 UI 维护的目标选择与按键/生效状态。
 	// whisperHeld 是物理按键态，whisperActive 是「已下发目标且旁路发送门」态
@@ -370,6 +375,7 @@ func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) 
 	})
 	a.setupTray()
 	a.startHotkeys()
+	a.startWindowOverlay()
 	// 机密存储模式推一次给前端（契约 §0.6 sys:secret）：回落明文文件存储必须
 	// 让 UI 可感知，不能静默降级。前端也可能主动调 SecretStorageMode 补拉。
 	a.emit("sys:secret", SecretModeEvent{Mode: config.SecretMode()})
@@ -2368,6 +2374,85 @@ func (a *App) handleHotkeyEvent(ev hotkey.Event) {
 	}
 }
 
+// ---------- 游戏内悬浮层（#47，Beta，仅 Windows） ----------
+
+// WindowOverlaySupported 报告当前平台是否提供原生悬浮层（仅 Windows）。
+// false 时设置页禁用开关并提示，不把持久化值当成可用能力。
+func (a *App) WindowOverlaySupported() bool { return overlay.Supported() }
+
+// GetWindowOverlaySettings 读取持久化的悬浮层设置（设置页初始化用）。
+func (a *App) GetWindowOverlaySettings() config.OverlaySettings {
+	return a.cfg.GetWindowOverlaySettings()
+}
+
+// SetWindowOverlaySettings 持久化并热切换悬浮层。启用失败（窗口创建失败）
+// 时回滚为关闭并返回错误，避免设置页显示已开启而实际没有窗口。
+func (a *App) SetWindowOverlaySettings(s config.OverlaySettings) error {
+	if s.Enabled && !overlay.Supported() {
+		return overlay.ErrUnsupportedPlatform
+	}
+	a.overlayMu.Lock()
+	defer a.overlayMu.Unlock()
+	if err := a.cfg.SetWindowOverlaySettings(s); err != nil {
+		return err
+	}
+	if s.Enabled {
+		if err := overlay.Start(a.overlaySnapshot); err != nil {
+			rb := config.OverlaySettings{Enabled: false}
+			if rbErr := a.cfg.SetWindowOverlaySettings(rb); rbErr != nil {
+				log.Printf("rollback window_overlay: %v", rbErr)
+			}
+			return fmt.Errorf("启用游戏内悬浮层失败: %w", err)
+		}
+		return nil
+	}
+	overlay.Stop()
+	return nil
+}
+
+// startWindowOverlay ServiceStartup 调用：按持久化配置启动（Beta 默认关闭）。
+// 平台不支持或窗口创建失败只记日志，不影响主窗口可用性。
+func (a *App) startWindowOverlay() {
+	a.overlayMu.Lock()
+	defer a.overlayMu.Unlock()
+	if !overlay.Supported() || !a.cfg.GetWindowOverlaySettings().Enabled {
+		return
+	}
+	if err := overlay.Start(a.overlaySnapshot); err != nil {
+		log.Printf("overlay start: %v", err)
+	}
+}
+
+// stopWindowOverlay 关闭悬浮层（ServiceShutdown 调用，幂等）。
+func (a *App) stopWindowOverlay() {
+	a.overlayMu.Lock()
+	defer a.overlayMu.Unlock()
+	overlay.Stop()
+}
+
+// overlaySnapshot 悬浮层窗口线程每 100ms 调用：取当前会话成员并过滤正在
+// 说话的人。在 App 侧持锁取会话，overlay 线程只读快照，不直接触碰 App 状态。
+func (a *App) overlaySnapshot() []overlay.Speaker {
+	a.mu.Lock()
+	s := a.sess
+	a.mu.Unlock()
+	if s == nil {
+		return nil
+	}
+	members := s.Members()
+	out := make([]overlay.Speaker, 0, len(members))
+	for _, m := range members {
+		if !m.Speaking {
+			continue
+		}
+		out = append(out, overlay.Speaker{
+			UID: m.UserID, Nickname: m.Nickname, Speaking: true,
+			Mute: m.Mute, Deafen: m.Deafen, Priority: m.Priority,
+		})
+	}
+	return out
+}
+
 // ---------- 同频道悄悄话（#45） ----------
 
 // SetWhisperTargets 更新悄悄话目标选择（UI 维护的同频道成员列表）。
@@ -2678,6 +2763,9 @@ func (a *App) GetVoiceMembers() []voice.PeerView {
 
 // ServiceShutdown v3 服务关闭回调：退出清理。
 func (a *App) ServiceShutdown() error {
+	// 先停悬浮层：Stop 会等待窗口线程退出，保证后续拆会话时没有快照回调
+	// 还在访问 Session。
+	a.stopWindowOverlay()
 	a.disconnectSession()
 	a.stopHotkeys()
 	a.mu.Lock()
