@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { eventsOn, goApp } from '../api/bridge'
-import type { PeerView, VoicePeerDiag, VoiceStats } from '../api/types'
+import type { PeerView, VoicePeerDiag, VoiceStats, WhisperEvent } from '../api/types'
 import { useNotifyStore } from './notify'
 
 // emptyVoiceStats 空统计快照（未入房/事件未到）。字段与 Go VoiceStats 对齐，
@@ -45,6 +45,12 @@ export const useVoiceStore = defineStore('voice', () => {
   const whisperTargetNames = ref<Record<string, string>>({})
   const whisperPressed = ref(false) // 悄悄话键按住中
   const whisperActive = ref(false) // 按住且有目标（Go 侧已开麦并下发）
+  // whisperSupported 服务端协议是否支持悄悄话（#116）：协议 <3 无 voice.whisper，
+  // 菜单禁用目标选择并提示升级服务器。未入房/未知时按 false 处理。
+  const whisperSupported = ref(false)
+  // whisperUnsupportedNotified 同一次会话只提示一次「服务器不支持」，避免每次
+  // 按热键都弹 toast。
+  let whisperUnsupportedNotified = false
 
   // whisperTargetViews 指示条展示用：目标名 + 当前是否在线（仍在房间成员里）。
   const whisperTargetViews = computed(() =>
@@ -131,6 +137,7 @@ export const useVoiceStore = defineStore('voice', () => {
     whisperTargetNames.value = {}
     whisperPressed.value = false
     whisperActive.value = false
+    whisperSupported.value = false
     // 在飞的 join 不得在复位后把房间态写回。
     pendingJoin = null
   }
@@ -145,6 +152,7 @@ export const useVoiceStore = defineStore('voice', () => {
     deafened.value = false
     peerVolumes.value = {}
     _selfId = ''
+    whisperUnsupportedNotified = false // 重新登录可再次提示不支持
   }
 
   async function setMute(v: boolean) {
@@ -190,10 +198,24 @@ export const useVoiceStore = defineStore('voice', () => {
     return whisperTargets.value.includes(userId)
   }
 
+  // refreshWhisperSupport 刷新服务端协议是否支持悄悄话（#116）：进入房间时
+  // 调用。绑定不可用（未连接/方法缺失）按不支持处理，避免入口开放成死路。
+  async function refreshWhisperSupport() {
+    try {
+      whisperSupported.value = await goApp().WhisperSupported()
+    } catch {
+      whisperSupported.value = false
+    }
+  }
+
   // toggleWhisperTarget 切换某成员的悄悄话目标。选择只在按住热键时生效；
-  // 未按住时调用 Go 侧只保存选择，不产生信令。
+  // 未按住时调用 Go 侧只保存选择，不产生信令。服务端协议不支持时禁用入口。
   async function toggleWhisperTarget(userId: string) {
     if (!channelId.value || !userId || userId === _selfId) return
+    if (!whisperSupported.value) {
+      useNotifyStore().show('服务器版本不支持悄悄话')
+      return
+    }
     const member = members.value.find((m) => m.user_id === userId)
     const set = new Set(whisperTargets.value)
     if (set.has(userId)) {
@@ -282,11 +304,24 @@ export const useVoiceStore = defineStore('voice', () => {
       const m = members.value.find((x) => x.user_id === p.user_id)
       if (m) m.priority = !!p.priority
     }))
-    // hotkey:whisper 悄悄话键按住指示（#45）：active = 按住且有目标（已开麦）。
+    // hotkey:whisper 悄悄话键按住指示（#45/#116）：active = 按住且目标已生效
+    // （v4 在 ack 后才为 true）。supported=false 提示服务端不支持并禁用入口。
     offs.push(eventsOn('hotkey:whisper', (d) => {
-      const p = d as { pressed?: boolean; active?: boolean } | null
+      const p = d as WhisperEvent | null
       whisperPressed.value = !!p?.pressed
       whisperActive.value = !!p?.active
+      if (typeof p?.supported === 'boolean') {
+        whisperSupported.value = p.supported
+        if (p.supported) {
+          whisperUnsupportedNotified = false
+        } else if (!whisperUnsupportedNotified) {
+          whisperUnsupportedNotified = true
+          notify.show('服务器版本不支持悄悄话')
+        }
+      }
+      // 瞬时失败提示：ack 超时/发送失败时 Go 侧已关麦，提示用户重按重试。
+      if (p?.error === 'ack_timeout') notify.show('悄悄话未能生效，请重试', true)
+      else if (p?.error === 'send_failed') notify.show('悄悄话发送失败', true)
     }))
     offs.push(eventsOn('voice:speaking', (p) => {
       const d = p as PeerView
@@ -371,10 +406,12 @@ export const useVoiceStore = defineStore('voice', () => {
 
   return {
     channelId, members, muted, deafened, dualOff, latencyMs, stats, connected, peerVolumes,
-    whisperTargets, whisperTargetNames, whisperPressed, whisperActive, whisperTargetViews,
+    whisperTargets, whisperTargetNames, whisperPressed, whisperActive, whisperSupported,
+    whisperTargetViews,
     lastJoinFailed,
     selfId, setSelf, join, leave, resetRoom, resetAll, setMute, setDeafen, setPeerVolume,
-    requestVoiceState, isWhisperTarget, toggleWhisperTarget, setPrioritySpeaker,
+    requestVoiceState, isWhisperTarget, toggleWhisperTarget, refreshWhisperSupport,
+    setPrioritySpeaker,
     peerDiag,
     restoreFromGo, bindEvents, unbindEvents,
   }

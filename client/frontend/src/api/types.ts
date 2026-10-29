@@ -262,3 +262,13 @@ export interface VoiceStateView {
   muted: boolean
   deafened: boolean
 }
+
+// WhisperEvent hotkey:whisper 事件载荷（#45/#116）：pressed=按住，active=目标
+// 已生效并开麦；supported=false 表示服务端协议不支持悄悄话（UI 禁用入口）；
+// error 是瞬时失败原因（unsupported/send_failed/ack_timeout），仅用于提示。
+export interface WhisperEvent {
+  pressed: boolean
+  active: boolean
+  supported: boolean
+  error?: string
+}

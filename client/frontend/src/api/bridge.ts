@@ -60,6 +60,9 @@ type GoApp = {
   // SetWhisperTargets 悄悄话目标选择（#45）：未按住悄悄话键时只保存选择，
   // 按住期间变化立即下发；空数组取消。目标必须是当前同频道成员。
   SetWhisperTargets(targets: string[]): Promise<void>
+  // WhisperSupported 服务端协议是否支持同频道悄悄话（#116）：false 时 UI 禁用
+  // 目标选择并提示升级服务器（协议 <3 无 voice.whisper）。
+  WhisperSupported(): Promise<boolean>
   // SetPrioritySpeaker 授予/撤销优先发言（#45，需 ManageChannels；无权限时抛 403）。
   SetPrioritySpeaker(channelID: string, userID: string, enabled: boolean): Promise<void>
   // GetVoiceState UI 销毁重载后的语音态恢复（Go 会话未断，前端重建后回填）。
@@ -285,6 +288,8 @@ const mockApp: GoApp = {
   async SetDeafen() {},
   async SetPeerVolume() {},
   async SetWhisperTargets() {},
+  // 浏览器预览没有真实服务端协议：按支持处理以便联调目标选择 UI。
+  async WhisperSupported() { return true },
   async SetPrioritySpeaker() {},
   async SendChat() {},
   // #39 消息编辑/回复/提及桩：回显传入内容，供浏览器开发联调 UI。

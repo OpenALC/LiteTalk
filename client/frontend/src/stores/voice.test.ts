@@ -25,6 +25,7 @@ const mockGoApp = vi.hoisted(() => ({
   JoinChannel: vi.fn(),
   GetVoiceMembers: vi.fn(async () => [] as PeerView[]),
   SetWhisperTargets: vi.fn(async () => {}),
+  WhisperSupported: vi.fn(async () => true),
   SetPrioritySpeaker: vi.fn(async () => {}),
 }))
 vi.mock('../api/bridge', () => ({ goApp: () => mockGoApp, eventsOn: mockEventsOn.on }))
@@ -43,6 +44,7 @@ describe('voice store 房间态清理', () => {
     mockGoApp.GetVoiceMembers.mockReset().mockResolvedValue([])
     mockGoApp.SetWhisperTargets.mockReset().mockResolvedValue(undefined)
     mockGoApp.SetPrioritySpeaker.mockReset().mockResolvedValue(undefined)
+    mockGoApp.WhisperSupported.mockReset().mockResolvedValue(true)
   })
 
   const peer: PeerView = {
@@ -327,6 +329,7 @@ describe('voice store 悄悄话与优先发言', () => {
     mockGoApp.GetVoiceMembers.mockReset().mockResolvedValue([])
     mockGoApp.SetWhisperTargets.mockReset().mockResolvedValue(undefined)
     mockGoApp.SetPrioritySpeaker.mockReset().mockResolvedValue(undefined)
+    mockGoApp.WhisperSupported.mockReset().mockResolvedValue(true)
   })
 
   const peer: PeerView = {
@@ -339,6 +342,7 @@ describe('voice store 悄悄话与优先发言', () => {
     voice.channelId = 'room1'
     voice.members = [peer]
     voice.setSelf('me')
+    voice.whisperSupported = true // 已由 refreshWhisperSupport 确认支持
 
     await voice.toggleWhisperTarget('u1')
     expect(voice.isWhisperTarget('u1')).toBe(true)
@@ -405,6 +409,81 @@ describe('voice store 悄悄话与优先发言', () => {
     expect(voice.whisperPressed).toBe(false)
     expect(voice.whisperActive).toBe(false)
     voice.unbindEvents()
+  })
+
+  it('hotkey:whisper supported=false 提示一次并禁用入口', () => {
+    const voice = useVoiceStore()
+    const notify = useNotifyStore()
+    const spy = vi.spyOn(notify, 'show')
+    voice.bindEvents()
+
+    mockEventsOn.fire('hotkey:whisper', { pressed: true, active: false, supported: false })
+    expect(voice.whisperSupported).toBe(false)
+    expect(spy).toHaveBeenCalledWith('服务器版本不支持悄悄话')
+
+    // 重复按键不再重复提示。
+    mockEventsOn.fire('hotkey:whisper', { pressed: true, active: false, supported: false })
+    const unsupported = spy.mock.calls.filter((c) => c[0] === '服务器版本不支持悄悄话')
+    expect(unsupported).toHaveLength(1)
+    voice.unbindEvents()
+  })
+
+  it('hotkey:whisper 映射 ack 生效与超时', () => {
+    const voice = useVoiceStore()
+    const notify = useNotifyStore()
+    const spy = vi.spyOn(notify, 'show')
+    voice.bindEvents()
+
+    mockEventsOn.fire('hotkey:whisper', { pressed: true, active: false, supported: true })
+    expect(voice.whisperSupported).toBe(true)
+    expect(voice.whisperPressed).toBe(true)
+    expect(voice.whisperActive).toBe(false)
+
+    // v4 ack 确认后才亮「悄悄话中」。
+    mockEventsOn.fire('hotkey:whisper', { pressed: true, active: true, supported: true })
+    expect(voice.whisperActive).toBe(true)
+
+    // 超时：Go 侧已关麦，前端提示重试。
+    mockEventsOn.fire('hotkey:whisper', {
+      pressed: true, active: false, supported: true, error: 'ack_timeout',
+    })
+    expect(voice.whisperActive).toBe(false)
+    expect(spy).toHaveBeenCalledWith('悄悄话未能生效，请重试', true)
+    voice.unbindEvents()
+  })
+
+  it('refreshWhisperSupport 读取 Go 能力；不支持时目标选择不再下发', async () => {
+    const voice = useVoiceStore()
+    const notify = useNotifyStore()
+    const spy = vi.spyOn(notify, 'show')
+
+    mockGoApp.WhisperSupported.mockResolvedValueOnce(false)
+    await voice.refreshWhisperSupport()
+    expect(voice.whisperSupported).toBe(false)
+
+    voice.channelId = 'room1'
+    voice.members = [peer]
+    voice.setSelf('me')
+    await voice.toggleWhisperTarget('u1')
+    expect(voice.isWhisperTarget('u1')).toBe(false)
+    expect(mockGoApp.SetWhisperTargets).not.toHaveBeenCalled()
+    expect(spy).toHaveBeenCalledWith('服务器版本不支持悄悄话')
+  })
+
+  it('refreshWhisperSupport 调用失败按不支持处理', async () => {
+    const voice = useVoiceStore()
+    mockGoApp.WhisperSupported.mockRejectedValueOnce(new Error('no bridge'))
+    await voice.refreshWhisperSupport()
+    expect(voice.whisperSupported).toBe(false)
+  })
+
+  it('resetRoom 清空悄悄话能力标记', async () => {
+    const voice = useVoiceStore()
+    voice.channelId = 'room1'
+    await voice.refreshWhisperSupport()
+    expect(voice.whisperSupported).toBe(true)
+    voice.resetRoom()
+    expect(voice.whisperSupported).toBe(false)
   })
 
   it('peer-join 对已存在成员整体刷新（priority 变化不能丢）', () => {

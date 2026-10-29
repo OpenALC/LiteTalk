@@ -74,6 +74,11 @@ async function hangup() {
 const netOpen = ref(false)
 watch(() => voice.channelId, (id) => { if (!id) netOpen.value = false })
 
+// 悄悄话能力随服务端协议版本变化（#116）：进入房间时刷新，协议 <3 的服务端
+// 在成员菜单里禁用目标选择。重复进入（切房/重连）都重新取一次。
+watch(() => voice.channelId, (id) => { if (id) void voice.refreshWhisperSupport() },
+  { immediate: true })
+
 function fmtPct(v: number | undefined): string {
   return v === undefined || v === null ? '—' : `${v.toFixed(1)}%`
 }
@@ -96,10 +101,13 @@ const ctxItems = computed<CtxItem[]>(() => {
     { key: 'add-friend', label: '添加好友', icon: UserPlus2 },
     { key: 'volume', label: '调节播放音量', icon: Volume2 },
     // 悄悄话（#45）：目标选择由本机维护，按住悄悄话热键时才真正只发给这些人。
+    // 协议 <3 的服务端无 voice.whisper（#116）：禁用入口并说明原因。
     {
       key: 'whisper',
       label: voice.isWhisperTarget(c.member.user_id) ? '取消悄悄话目标' : '设为悄悄话目标',
       icon: Ear,
+      disabled: !voice.whisperSupported,
+      title: voice.whisperSupported ? undefined : '服务器版本不支持悄悄话',
     },
     // 优先发言（#45）：需 ManageChannels，无权限时服务端 403 → toast。
     {
