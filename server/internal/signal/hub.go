@@ -124,6 +124,9 @@ type whisperState struct {
 	connID  string
 	active  bool
 	targets map[string]bool // uid 集合（已按同房成员过滤）
+	// seq 最近一次 voice.whisper 的客户端请求序号（#116，协议 v4）：peer 建立后
+	// 补应用时据此回 voice.whisper_ack；0 = 旧客户端，不回 ack。
+	seq int64
 }
 
 // client 一条 WS 连接。
@@ -1356,7 +1359,7 @@ func (h *Hub) handleVoiceWhisper(c *client, d VoiceWhisperData) {
 			room.whisper = make(map[string]whisperState)
 		}
 		if len(d.Targets) > 0 {
-			room.whisper[c.userID] = whisperState{connID: connIDStr, active: true, targets: targetSet}
+			room.whisper[c.userID] = whisperState{connID: connIDStr, active: true, targets: targetSet, seq: d.Seq}
 		} else {
 			delete(room.whisper, c.userID)
 		}
@@ -1370,17 +1373,33 @@ func (h *Hub) handleVoiceWhisper(c *client, d VoiceWhisperData) {
 	// 说话中途切换悄悄话范围：给进出范围的成员补发正确的 speaking 态，
 	// 避免非目标保留旧的指示/错误 ducking，或新目标错过当前说话态。
 	h.syncWhisperSpeakingScope(roomID, c.userID, oldAllowed, newAllowed)
-	if !h.sfu.SetWhisperTargets(roomID, c.userID, connIDStr, filtered, len(d.Targets) > 0) {
+	// active 取客户端意图（targets 非空），而不是过滤后的集合：目标全部离房时
+	// 仍保持悄悄话态（谁都不发），ack 只需确认「意图已生效」。
+	active := len(d.Targets) > 0
+	if !h.sfu.SetWhisperTargets(roomID, c.userID, connIDStr, filtered, active) {
 		// channel.join 与 rtc.offer 之间 SFU peer 尚不存在：hub 已记录快照，
-		// handleRTCOffer 建好 peer 后会补应用，不会以全房转发泄漏悄悄话。
-		if len(d.Targets) > 0 {
+		// handleRTCOffer 建好 peer 后会补应用并发 ack（#116）。此刻不能 ack——
+		// 白名单尚未生效，客户端提前开麦会泄漏首帧。取消路径同理（无快照，
+		// peer 建好后本就按普通转发）。
+		if active {
 			h.log.Printf("ws: %s 悄悄话目标暂存（频道 %s 的 SFU peer 尚未建立），建 peer 后补应用", c.userID, roomID)
 		} else {
 			h.log.Printf("ws: %s 取消悄悄话（频道 %s 的 SFU peer 尚未建立）", c.userID, roomID)
 		}
 		return
 	}
+	h.sendWhisperAck(c, d.Seq, active)
 	h.log.Printf("ws: 频道 %s 成员 %s 悄悄话目标 %d 人", roomID, c.userID, len(filtered))
+}
+
+// sendWhisperAck 悄悄话生效确认（#116，协议 v4）：只回给发起该 seq 的连接，
+// 直接下发、不进补发环。seq<=0（旧客户端不带序号）或协议 <4 一律不发，
+// 保持 v3 行为——旧客户端不认该消息，也不需要等它开麦。
+func (h *Hub) sendWhisperAck(c *client, seq int64, active bool) {
+	if seq <= 0 || c.protoVer.Load() < 4 {
+		return
+	}
+	h.sendJSON(c, TypeVoiceWhisperAck, VoiceWhisperAckData{Seq: seq, Active: active})
 }
 
 // applyRoomWhisper 把 hub 缓存的悄悄话目标补应用到场内 SFU peer（#45）。
@@ -1393,12 +1412,14 @@ func (h *Hub) applyRoomWhisper(c *client, roomID string) {
 	room := h.rooms[roomID]
 	found := false
 	var targets []string
+	var seq int64
 	if room != nil && room.members[c.userID] == c {
 		if ws, ok := room.whisper[c.userID]; ok && ws.active && ws.connID == connIDStr {
 			targets = make([]string, 0, len(ws.targets))
 			for uid := range ws.targets {
 				targets = append(targets, uid)
 			}
+			seq = ws.seq
 			found = true
 		}
 	}
@@ -1410,6 +1431,8 @@ func (h *Hub) applyRoomWhisper(c *client, roomID string) {
 		h.log.Printf("ws: %s 悄悄话目标补应用失败（频道 %s 的 SFU peer 缺失）", c.userID, roomID)
 		return
 	}
+	// 白名单已生效，再回 ack（#116）：客户端收到后才开麦，首帧不会按全房转发。
+	h.sendWhisperAck(c, seq, true)
 	h.log.Printf("ws: 频道 %s 成员 %s 悄悄话目标补应用 %d 人", roomID, c.userID, len(targets))
 }
 

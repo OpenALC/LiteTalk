@@ -78,6 +78,10 @@ type rtcProbe struct {
 	mu       sync.Mutex
 	received []*rtp.Packet
 
+	// acks voice.whisper_ack 观察窗口（#116）：pump 串行处理下行信封，
+	// 这里只记录不阻塞；测试用 waitAck 读取。
+	acks chan VoiceWhisperAckData
+
 	seq  atomic.Uint32
 	in   chan Envelope
 	done chan struct{}
@@ -95,7 +99,7 @@ func newRTCProbe(t *testing.T, ws *wsClient) *rtcProbe {
 	if err != nil {
 		t.Fatalf("NewPeerConnection: %v", err)
 	}
-	p := &rtcProbe{ws: ws, pc: pc, in: make(chan Envelope, 64), done: make(chan struct{})}
+	p := &rtcProbe{ws: ws, pc: pc, in: make(chan Envelope, 64), done: make(chan struct{}), acks: make(chan VoiceWhisperAckData, 8)}
 	t.Cleanup(func() {
 		close(p.done)
 		_ = pc.Close()
@@ -232,6 +236,28 @@ func (p *rtcProbe) handle(env Envelope) {
 			p.pendingCands = append(p.pendingCands, toICECandidate(d))
 		}
 		p.opMu.Unlock()
+	case TypeVoiceWhisperAck:
+		// 悄悄话生效确认（#116）：记录供测试断言，不影响 PC 操作。
+		var d VoiceWhisperAckData
+		if env.Decode(&d) != nil {
+			return
+		}
+		select {
+		case p.acks <- d:
+		default: // 测试只关心前几条；满了丢弃，避免阻塞 pump。
+		}
+	}
+}
+
+// waitAck 等一条 voice.whisper_ack（超时即失败）。
+func (p *rtcProbe) waitAck(t *testing.T, timeout time.Duration) VoiceWhisperAckData {
+	t.Helper()
+	select {
+	case d := <-p.acks:
+		return d
+	case <-time.After(timeout):
+		t.Fatalf("未收到 voice.whisper_ack（user=%s）", p.ws.user)
+		return VoiceWhisperAckData{}
 	}
 }
 
