@@ -7,11 +7,11 @@ package signal
 
 import "github.com/coder/websocket"
 
-// 协议版本（api/signal/catalog.json）。v2 起含网关事件面与 RFC 6464 说话状态；v3 起含同频道悄悄话与优先发言。
+// 协议版本（api/signal/catalog.json）。v2 起含网关事件面与 RFC 6464 说话状态；v3 起含同频道悄悄话与优先发言；v4 起含悄悄话生效确认（voice.whisper_ack）与 10ms 帧长能力闸。
 const (
 	ProtocolVersionMin     = 1
-	ProtocolVersionMax     = 3
-	ProtocolVersionCurrent = 3
+	ProtocolVersionMax     = 4
+	ProtocolVersionCurrent = 4
 )
 
 // 信令消息类型（wire 值见 api/signal/messages/*.schema.json 的 x-wire-type）。
@@ -47,6 +47,7 @@ const (
 	TypeVoiceState            = "voice.state"             // 双向
 	TypeVoiceStateRequest     = "voice.state_request"     // S→C
 	TypeVoiceWhisper          = "voice.whisper"           // C→S · since 3
+	TypeVoiceWhisperAck       = "voice.whisper_ack"       // S→C · since 4
 )
 
 // 下行 error 消息的 code 取值（api/signal/catalog.json error_codes）。
@@ -330,5 +331,12 @@ type VoiceStateRequestData struct {
 
 // VoiceWhisperData 同频道悄悄话目标（#45）。瞬时语义，不进补发环：按住悄悄话键时下发当前目标集合，服务端只把这些成员作为该连接上行音频的接收者（绕过活跃门，server_muted 仍优先）；空数组 = 取消。目标必须是同频道成员，服务端去重、排除自己并静默过滤已离房者；过滤后为空时仍保持悄悄话态（谁都不发，不回落全房广播，隐私边界）；上限 100。
 type VoiceWhisperData struct {
-	Targets []string `json:"targets"` // 悄悄话目标用户 ID 列表（十进制字符串）；空数组取消悄悄话。
+	Targets []string `json:"targets"`       // 悄悄话目标用户 ID 列表（十进制字符串）；空数组取消悄悄话。
+	Seq     int64    `json:"seq,omitempty"` // 客户端请求序号（协议 v4）：服务端把本 seq 的目标集合应用到该连接的 SFU peer 后，以 voice.whisper_ack 原样回传。旧客户端不发送（缺省 0），服务端不回 ack，行为与 v3 一致。
+}
+
+// VoiceWhisperAckData 悄悄话目标生效确认（#116，协议 v4）。只回给发起该 seq 的连接：服务端已把这一 seq 的目标集合应用到该连接的 SFU peer（rtc.offer 晚到时，于 peer 建立后补应用并确认），客户端收到后才开麦，消除白名单生效前的首帧竞态。瞬时语义，不进补发环；seq 原样回传用于对齐乱序/过期的确认。
+type VoiceWhisperAckData struct {
+	Seq    int64 `json:"seq"`    // 对应 voice.whisper.seq，原样回传。
+	Active bool  `json:"active"` // true = 目标集合已生效；false = 取消已生效（恢复普通转发）。
 }

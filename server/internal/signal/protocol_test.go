@@ -44,7 +44,7 @@ func TestClientHelloNegotiation(t *testing.T) {
 	f := newChatFixture(t)
 	c := f.dial("1", "alice")
 
-	c.send(TypeClientHello, ClientHelloData{Min: 1, Max: 3})
+	c.send(TypeClientHello, ClientHelloData{Min: 1, Max: 4})
 	env := c.recvUntil(TypeServerHello)
 	var d ServerHelloData
 	if err := env.Decode(&d); err != nil {
@@ -63,7 +63,7 @@ func TestClientHelloNegotiation(t *testing.T) {
 	if err := env.Decode(&d); err != nil {
 		t.Fatalf("decode server.hello: %v", err)
 	}
-	// 首次协商已定 v2，重复 client.hello 只回当前结果、不重开区间。
+	// 首次协商已定 v4，重复 client.hello 只回当前结果、不重开区间。
 	if d.Version != ProtocolVersionMax {
 		t.Fatalf("重复协商后的 version = %d, want %d（首次结果不变）", d.Version, ProtocolVersionMax)
 	}
@@ -79,7 +79,7 @@ func TestServerHelloSessionIDEmpty(t *testing.T) {
 	f := newChatFixture(t)
 	c := f.dial("1:desktop:", "alice") // 显式空 sid
 
-	c.send(TypeClientHello, ClientHelloData{Min: 1, Max: 3})
+	c.send(TypeClientHello, ClientHelloData{Min: 1, Max: 4})
 	env := c.recvUntil(TypeServerHello)
 	var d ServerHelloData
 	if err := env.Decode(&d); err != nil {
@@ -158,6 +158,10 @@ func TestWireKeyMessagesJSON(t *testing.T) {
 		{"GatewayInvalidSessionData", GatewayInvalidSessionData{Reason: "seq_expired"}, []string{`"reason":"seq_expired"`}},
 		{"VoiceSpeakingData", VoiceSpeakingData{ChannelID: "3", UserID: "1", Speaking: true},
 			[]string{`"channel_id":"3"`, `"user_id":"1"`, `"speaking":true`}},
+		{"VoiceWhisperData 带序号", VoiceWhisperData{Targets: []string{"2"}, Seq: 5},
+			[]string{`"targets":["2"]`, `"seq":5`}},
+		{"VoiceWhisperAckData", VoiceWhisperAckData{Seq: 5, Active: false},
+			[]string{`"seq":5`, `"active":false`}},
 	}
 	for _, tc := range cases {
 		raw, err := json.Marshal(tc.val)
@@ -182,6 +186,11 @@ func TestWireKeyMessagesJSON(t *testing.T) {
 	raw, _ = json.Marshal(ServerHelloData{Version: 2})
 	if strings.Contains(string(raw), "session_id") {
 		t.Errorf("ServerHelloData 无会话时应省略 session_id: %s", raw)
+	}
+	// 旧客户端的 voice.whisper 不带 seq（omitempty）：wire 与 v3 完全一致。
+	raw, _ = json.Marshal(VoiceWhisperData{Targets: []string{}})
+	if strings.Contains(string(raw), "seq") {
+		t.Errorf("VoiceWhisperData seq=0 应省略: %s", raw)
 	}
 }
 

@@ -15,6 +15,13 @@
       "items": { "type": "string" },
       "maxItems": 100,
       "description": "悄悄话目标用户 ID 列表（十进制字符串）；空数组取消悄悄话。"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1,
+      "x-since": 4,
+      "x-go-omitempty": true,
+      "description": "客户端请求序号（协议 v4）：服务端把本 seq 的目标集合应用到该连接的 SFU peer 后，以 voice.whisper_ack 原样回传。旧客户端不发送（缺省 0），服务端不回 ack，行为与 v3 一致。"
     }
   },
   "required": ["targets"],

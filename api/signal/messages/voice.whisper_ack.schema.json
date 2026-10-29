@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litetalk:signal:voice.whisper_ack",
+  "title": "VoiceWhisperAckData",
+  "x-wire-type": "voice.whisper_ack",
+  "x-go-const": "TypeVoiceWhisperAck",
+  "x-direction": "S2C",
+  "x-since": 4,
+  "x-namespace": "event",
+  "description": "悄悄话目标生效确认（#116，协议 v4）。只回给发起该 seq 的连接：服务端已把这一 seq 的目标集合应用到该连接的 SFU peer（rtc.offer 晚到时，于 peer 建立后补应用并确认），客户端收到后才开麦，消除白名单生效前的首帧竞态。瞬时语义，不进补发环；seq 原样回传用于对齐乱序/过期的确认。",
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "对应 voice.whisper.seq，原样回传。"
+    },
+    "active": {
+      "type": "boolean",
+      "description": "true = 目标集合已生效；false = 取消已生效（恢复普通转发）。"
+    }
+  },
+  "required": ["seq", "active"],
+  "additionalProperties": false
+}
