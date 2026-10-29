@@ -117,10 +117,14 @@ type App struct {
 	// 悄悄话（#45）：whisperMu 保护 UI 维护的目标选择与按键/生效状态。
 	// whisperHeld 是物理按键态，whisperActive 是「已下发目标且旁路发送门」态
 	// （目标为空时按住键也不开麦、不发信令）。
+	// whisperSeq 是正在等 voice.whisper_ack 的请求序号（0 = 无在途，#116）；
+	// whisperTimer 是等待确认的超时计时器，ack/释放/超时/清理都要停掉。
 	whisperMu      sync.Mutex
 	whisperTargets []string
 	whisperHeld    bool
 	whisperActive  bool
+	whisperSeq     int64
+	whisperTimer   *time.Timer
 
 	// trayMute 托盘「静音」勾选项：前端/热键改静音时同步勾选态（此前只有
 	// 托盘自己的点击会更新，另两条路径改了静音托盘不跟着变）。
@@ -1396,6 +1400,12 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 		OnResync: func() {
 			a.emit("data:resync", nil)
 		},
+		// 悄悄话目标生效确认（voice.whisper_ack，#116 协议 v4）：只有匹配当前
+		// 按住期间在途 seq 的确认才开麦/关麦，乱序与过期确认直接丢弃。
+		// 回调跑在 ws 读循环 goroutine，分发表状态不阻塞。
+		OnWhisperAck: func(seq int64, active bool) {
+			a.onWhisperAck(seq, active)
+		},
 	}
 	server := a.cfg.Resolve().WSURL
 	sess := voice.NewSession(a.api, token, nickname, ev, log.Default())
@@ -2455,9 +2465,23 @@ func (a *App) overlaySnapshot() []overlay.Speaker {
 
 // ---------- 同频道悄悄话（#45） ----------
 
+// whisperAckTimeout 等待 voice.whisper_ack 的上限（#116）：超时关麦并提示，
+// 保留按住态供用户松手重按重试。
+const whisperAckTimeout = 300 * time.Millisecond
+
+// WhisperSupported 报告当前会话的服务端协议是否支持同频道悄悄话（#116）。
+// false 时前端禁用目标选择并提示升级服务器；无会话（未登录）同样视为不支持。
+func (a *App) WhisperSupported() bool {
+	a.mu.Lock()
+	s := a.sess
+	a.mu.Unlock()
+	return s != nil && s.SupportsWhisper()
+}
+
 // SetWhisperTargets 更新悄悄话目标选择（UI 维护的同频道成员列表）。
 // 未按住悄悄话键时只保存选择、不产生任何信令；按住期间变化立即生效：
 // 目标清空会马上关旁路门并下发空数组取消，避免继续向全房广播。
+// 协议 v4 下非空变更要等新 seq 的 ack 才重新开麦（#116）。
 func (a *App) SetWhisperTargets(targets []string) error {
 	clean := make([]string, 0, len(targets))
 	seen := make(map[string]bool, len(targets))
@@ -2468,26 +2492,66 @@ func (a *App) SetWhisperTargets(targets []string) error {
 		seen[uid] = true
 		clean = append(clean, uid)
 	}
+	a.mu.Lock()
+	s := a.sess
+	a.mu.Unlock()
+	// 服务端协议 <3 不认 voice.whisper：清空选择并明确报错，不留「选了但
+	// 永远不生效」的假象（正常路径前端已按 WhisperSupported 禁用入口）。
+	if s != nil && !s.SupportsWhisper() {
+		a.whisperMu.Lock()
+		a.whisperTargets = nil
+		a.whisperActive = false
+		a.whisperSeq = 0
+		a.stopWhisperTimerLocked()
+		a.whisperMu.Unlock()
+		a.setWhisperGate(false)
+		return fmt.Errorf("服务器版本不支持悄悄话")
+	}
+
 	a.whisperMu.Lock()
 	a.whisperTargets = clean
-	held := a.whisperHeld
-	wasActive := a.whisperActive
-	active := held && len(clean) > 0
-	a.whisperActive = active
-	a.whisperMu.Unlock()
-	if !held {
+	if !a.whisperHeld {
+		a.whisperMu.Unlock()
 		return nil
 	}
-	a.setWhisperGate(active)
-	if active || wasActive {
-		a.sendWhisperTargets(clean)
+	// 按住期间的 v4 非空变更：先关麦，等服务端把新目标应用到 SFU peer 后再开。
+	if s != nil && s.SupportsWhisperAck() && len(clean) > 0 {
+		seq, ok := s.SendWhisperTargets(clean)
+		a.whisperActive = false
+		if ok {
+			a.whisperSeq = seq
+			a.armWhisperAckLocked(seq)
+		} else {
+			a.whisperSeq = 0
+			a.stopWhisperTimerLocked()
+		}
+		a.whisperMu.Unlock()
+		a.setWhisperGate(false)
+		if !ok {
+			a.emitWhisperState(true, false, "send_failed")
+			return nil
+		}
+		a.emitWhisperState(true, false)
+		return nil
 	}
+	// v3 路径（无 ack）与 v4 清空目标：直接生效。清空不需要等确认——本地
+	// 关麦后即使取消还在途，也只会让服务端晚一点恢复普通转发。
+	if s != nil {
+		s.SetWhisperTargets(clean) // 空数组 = 取消；会话侧对重复取消去重
+	}
+	active := len(clean) > 0
+	a.whisperActive = active
+	a.whisperSeq = 0
+	a.stopWhisperTimerLocked()
+	a.whisperMu.Unlock()
+	a.setWhisperGate(active)
 	a.emitWhisperState(true, active)
 	return nil
 }
 
-// whisperPress 按住悄悄话键：有目标且在语音房内才下发并打开发送门；无目标
-// 或不在房时按键无效（不开麦、不发信令），也不影响 PTT 的既有状态。
+// whisperPress 按住悄悄话键：有目标且在语音房内才下发；协议 v4 等 ack 后才
+// 开麦，v3 立即生效，v<3 完全禁用（不开门、不发信令）。无目标或不在房时按键
+// 无效，也不影响 PTT 的既有状态。
 func (a *App) whisperPress() {
 	a.mu.Lock()
 	s := a.sess
@@ -2498,32 +2562,116 @@ func (a *App) whisperPress() {
 		a.emitWhisperState(true, false)
 		return
 	}
+	// 旧服务端不认 voice.whisper：开麦只会把音频发给全房，且没有生效确认。
+	if s != nil && !s.SupportsWhisper() {
+		a.emitWhisperState(true, false, "unsupported")
+		return
+	}
+
 	a.whisperMu.Lock()
 	a.whisperHeld = true
+	a.whisperActive = false
+	a.whisperSeq = 0
 	targets := append([]string(nil), a.whisperTargets...)
-	active := len(targets) > 0
-	a.whisperActive = active
-	a.whisperMu.Unlock()
-	if active {
-		a.setWhisperGate(true)
-		a.sendWhisperTargets(targets)
+	if len(targets) == 0 {
+		a.stopWhisperTimerLocked()
+		a.whisperMu.Unlock()
+		a.emitWhisperState(true, false)
+		return
 	}
-	a.emitWhisperState(true, active)
+	if s != nil && s.SupportsWhisperAck() {
+		seq, ok := s.SendWhisperTargets(targets)
+		if !ok {
+			a.stopWhisperTimerLocked()
+			a.whisperMu.Unlock()
+			a.setWhisperGate(false)
+			a.emitWhisperState(true, false, "send_failed")
+			return
+		}
+		a.whisperSeq = seq
+		a.armWhisperAckLocked(seq)
+		a.whisperMu.Unlock()
+		// 白名单生效前保持关麦：否则首帧会按普通转发发给全房。
+		a.emitWhisperState(true, false)
+		return
+	}
+	// v3 服务端（或不带会话的单测场景）：无 ack，立即开麦。
+	a.whisperActive = true
+	if s != nil {
+		s.SetWhisperTargets(targets)
+	}
+	a.whisperMu.Unlock()
+	a.setWhisperGate(true)
+	a.emitWhisperState(true, true)
 }
 
 // whisperRelease 松开悄悄话键：关旁路门并下发空数组取消。旁路门与 PTT 的
 // pressed/tail 状态分离，故「先松 PTT 再松悄悄话」或相反都不会误关麦。
+// v4 等 ack 期间松开同样要发取消：服务端可能已经应用了目标集合。
 func (a *App) whisperRelease() {
+	a.mu.Lock()
+	s := a.sess
+	a.mu.Unlock()
 	a.whisperMu.Lock()
-	a.whisperHeld = false
+	wasHeld := a.whisperHeld
+	hadPending := a.whisperSeq != 0
 	wasActive := a.whisperActive
+	a.whisperHeld = false
 	a.whisperActive = false
+	a.whisperSeq = 0
+	a.stopWhisperTimerLocked()
 	a.whisperMu.Unlock()
 	a.setWhisperGate(false)
-	if wasActive {
-		a.sendWhisperTargets(nil)
+	if s != nil && s.SupportsWhisper() && (wasHeld || wasActive || hadPending) {
+		s.SetWhisperTargets(nil) // 会话侧对「本就为空」的重复取消去重
 	}
 	a.emitWhisperState(false, false)
+}
+
+// onWhisperAck 处理服务端确认（voice.whisper_ack，#116）：只认当前按住期间、
+// seq 匹配的确认；乱序/过期确认与已松开的确认一律丢弃。
+func (a *App) onWhisperAck(seq int64, active bool) {
+	a.whisperMu.Lock()
+	if !a.whisperHeld || seq <= 0 || seq != a.whisperSeq {
+		a.whisperMu.Unlock()
+		return
+	}
+	a.whisperSeq = 0
+	a.whisperActive = active
+	a.stopWhisperTimerLocked()
+	a.whisperMu.Unlock()
+	a.setWhisperGate(active)
+	a.emitWhisperState(true, active)
+}
+
+// whisperAckTimeout 等确认超时（#116）：关麦并提示，保留按住态——用户松手
+// 重按即可重试，不能因为一次确认丢失把按键态吞掉。
+func (a *App) whisperAckTimeout(seq int64) {
+	a.whisperMu.Lock()
+	if !a.whisperHeld || seq != a.whisperSeq {
+		a.whisperMu.Unlock()
+		return
+	}
+	a.whisperSeq = 0
+	a.whisperActive = false
+	a.whisperTimer = nil
+	a.whisperMu.Unlock()
+	a.setWhisperGate(false)
+	a.emitWhisperState(true, false, "ack_timeout")
+}
+
+// armWhisperAckLocked 启动/重置确认超时计时器（调用方持 whisperMu）。
+func (a *App) armWhisperAckLocked(seq int64) {
+	a.stopWhisperTimerLocked()
+	a.whisperTimer = time.AfterFunc(whisperAckTimeout, func() { a.whisperAckTimeout(seq) })
+}
+
+// stopWhisperTimerLocked 停掉在途确认计时器（调用方持 whisperMu）。
+func (a *App) stopWhisperTimerLocked() {
+	if a.whisperTimer != nil {
+		a.whisperTimer.Stop()
+		a.whisperTimer = nil
+	}
 }
 
 // clearWhisper 退房/断线/被抢占时清理悄悄话状态（#45）：关本地旁路门并让会话
@@ -2536,6 +2684,8 @@ func (a *App) clearWhisper() {
 	a.whisperHeld = false
 	a.whisperActive = false
 	a.whisperTargets = nil
+	a.whisperSeq = 0
+	a.stopWhisperTimerLocked()
 	a.whisperMu.Unlock()
 	a.setWhisperGate(false)
 	a.mu.Lock()
@@ -2556,19 +2706,17 @@ func (a *App) setWhisperGate(on bool) {
 	}
 }
 
-// sendWhisperTargets 非阻塞交给会话专用 goroutine 下发（协议 <3 时由会话丢弃）。
-func (a *App) sendWhisperTargets(targets []string) {
-	a.mu.Lock()
-	s := a.sess
-	a.mu.Unlock()
-	if s != nil {
-		s.SetWhisperTargets(targets)
-	}
-}
-
 // emitWhisperState 推给前端做轻量指示（pressed=按住，active=有目标且已生效）。
-func (a *App) emitWhisperState(pressed, active bool) {
-	a.emit("hotkey:whisper", map[string]any{"pressed": pressed, "active": active})
+// errCode 是瞬时失败原因（unsupported/send_failed/ack_timeout），正常态省略；
+// supported 随服务端协议版本变化（#116），前端据此禁用目标选择并提示升级。
+func (a *App) emitWhisperState(pressed, active bool, errCode ...string) {
+	payload := map[string]any{
+		"pressed": pressed, "active": active, "supported": a.WhisperSupported(),
+	}
+	if len(errCode) > 0 && errCode[0] != "" {
+		payload["error"] = errCode[0]
+	}
+	a.emit("hotkey:whisper", payload)
 }
 
 // voiceMuteState 当前闭麦/静音态（无会话时两者皆 false）。

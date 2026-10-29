@@ -2,12 +2,18 @@ package voice
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/OpenALC/LiteTalk/client/core/api"
 	"github.com/OpenALC/LiteTalk/client/core/audio"
 	"github.com/OpenALC/LiteTalk/client/core/signal"
+	"github.com/coder/websocket"
 )
 
 // #45：悄悄话下发受协议版本门控；优先发言 ducking 只压非优先远端。
@@ -109,44 +115,251 @@ func TestWhisperWantLifecycle(t *testing.T) {
 
 	// 从未用过悄悄话：入房同步不应白发信令。
 	s.syncWhisperOnJoin()
-	if _, send := s.pendingWhisper(); send {
+	if _, _, send := s.pendingWhisper(); send {
 		t.Fatal("从未启用悄悄话时入房不应下发")
 	}
 
 	s.SetWhisperTargets([]string{"u1", "", "u2"})
-	targets, send := s.pendingWhisper()
+	targets, seq, send := s.pendingWhisper()
 	if !send || len(targets) != 2 || targets[0] != "u1" || targets[1] != "u2" {
 		t.Fatalf("首次下发 = %v/%v", targets, send)
 	}
-	if _, send = s.pendingWhisper(); send {
+	if seq != 0 {
+		t.Fatalf("SetWhisperTargets 是 v3 兼容路径，seq 应为 0，得到 %d", seq)
+	}
+	if _, _, send = s.pendingWhisper(); send {
 		t.Fatal("脏标记消费后不应重复下发")
 	}
 
 	// 取消（之前有目标）必须发空数组。
 	s.SetWhisperTargets(nil)
-	targets, send = s.pendingWhisper()
+	targets, _, send = s.pendingWhisper()
 	if !send || len(targets) != 0 {
 		t.Fatalf("取消应下发空数组，实际 %v/%v", targets, send)
 	}
 	// 重复取消（本就为空）不再下发。
 	s.SetWhisperTargets(nil)
-	if _, send = s.pendingWhisper(); send {
+	if _, _, send = s.pendingWhisper(); send {
 		t.Fatal("重复取消不应下发")
 	}
 
 	// 退房清空：不发信令。
 	s.SetWhisperTargets([]string{"u1"})
-	_, _ = s.pendingWhisper()
+	_, _, _ = s.pendingWhisper()
 	s.ClearWhisperTargets()
-	if _, send = s.pendingWhisper(); send {
+	if _, _, send = s.pendingWhisper(); send {
 		t.Fatal("退房清空不应下发")
 	}
 
 	// 入房同步：即使 want 为空也强制发一次空数组，清掉服务端残留。
 	s.syncWhisperOnJoin()
-	targets, send = s.pendingWhisper()
+	targets, seq, send = s.pendingWhisper()
 	if !send || len(targets) != 0 {
 		t.Fatalf("入房同步应强制下发空数组，实际 %v/%v", targets, send)
+	}
+	if seq != 0 {
+		t.Fatalf("入房同步走 v3 语义，seq 应为 0，得到 %d", seq)
+	}
+
+	// v4 在途请求不能被入房同步降级成 seq=0：App 正等这条 seq 的 ack。
+	s.ws = signal.NewClient(signal.Config{URL: "ws://127.0.0.1:1/ws"})
+	defer s.ws.Close()
+	s.protoVer.Store(4)
+	wantSeq, ok := s.SendWhisperTargets([]string{"u1"})
+	if !ok || wantSeq == 0 {
+		t.Fatalf("SendWhisperTargets = %d/%v", wantSeq, ok)
+	}
+	s.syncWhisperOnJoin()
+	targets, seq, send = s.pendingWhisper()
+	if !send || seq != wantSeq || len(targets) != 1 {
+		t.Fatalf("入房同步不得覆盖在途 seq：targets=%v seq=%d send=%v，期望 seq=%d",
+			targets, seq, send, wantSeq)
+	}
+}
+
+// TestWhisperProtocolCapabilities 协议能力门：v<3 不支持悄悄话，v4 才有 ack。
+func TestWhisperProtocolCapabilities(t *testing.T) {
+	s := NewSession(api.NewAPIClient("http://127.0.0.1:1"), "tok", "n", Events{}, nil)
+	cases := []struct {
+		ver        int64
+		whisper    bool
+		whisperAck bool
+	}{
+		{0, false, false}, // 尚未收到 server.hello / 老服务端
+		{2, false, false},
+		{3, true, false},
+		{4, true, true},
+	}
+	for _, tc := range cases {
+		s.protoVer.Store(tc.ver)
+		if got := s.SupportsWhisper(); got != tc.whisper {
+			t.Fatalf("v%d SupportsWhisper = %v, want %v", tc.ver, got, tc.whisper)
+		}
+		if got := s.SupportsWhisperAck(); got != tc.whisperAck {
+			t.Fatalf("v%d SupportsWhisperAck = %v, want %v", tc.ver, got, tc.whisperAck)
+		}
+	}
+}
+
+// whisperWireStub 记录 voice.whisper 载荷的 WS 桩（#116）：断言 seq 随 wire
+// 下发、v<3 不发。
+type whisperWireStub struct {
+	*httptest.Server
+
+	mu   sync.Mutex
+	sent []signal.VoiceWhisperData
+}
+
+func newWhisperWireStub(t *testing.T) *whisperWireStub {
+	t.Helper()
+	s := &whisperWireStub{}
+	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			_, raw, err := conn.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var env signal.Envelope
+			if json.Unmarshal(raw, &env) != nil || env.Type != signal.TypeVoiceWhisper {
+				continue
+			}
+			var d signal.VoiceWhisperData
+			if env.Decode(&d) != nil {
+				continue
+			}
+			s.mu.Lock()
+			s.sent = append(s.sent, d)
+			s.mu.Unlock()
+		}
+	}))
+	t.Cleanup(s.Server.Close)
+	return s
+}
+
+func (s *whisperWireStub) wsURL() string {
+	return "ws" + strings.TrimPrefix(s.URL, "http") + "/ws"
+}
+
+func (s *whisperWireStub) whispers() []signal.VoiceWhisperData {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]signal.VoiceWhisperData(nil), s.sent...)
+}
+
+func (s *whisperWireStub) waitWhispers(t *testing.T, n int) []signal.VoiceWhisperData {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := s.whispers(); len(got) >= n {
+			return got
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("等待 %d 条 voice.whisper 超时，实际 %d", n, len(s.whispers()))
+	return nil
+}
+
+// TestSendWhisperTargetsSeqAndWire 协议 v4 的显式下发：seq 从 1 递增并随 wire
+// 下发；空目标仍作为取消下发；协议 v2 不排队、不发（#116）。
+func TestSendWhisperTargetsSeqAndWire(t *testing.T) {
+	stub := newWhisperWireStub(t)
+	s := NewSession(api.NewAPIClient(stub.wsURL()), "tok", "n", Events{}, nil)
+	s.ws = signal.NewClient(signal.Config{URL: stub.wsURL(), PingInterval: 50 * time.Millisecond})
+	defer s.ws.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.ws.Run(ctx)
+	waitSignalConnected(t, s)
+	go s.whisperLoop(ctx)
+
+	// 协议 v2 不认 voice.whisper：不分配序号、不排队。
+	s.protoVer.Store(2)
+	if seq, ok := s.SendWhisperTargets([]string{"bob"}); ok || seq != 0 {
+		t.Fatalf("协议 v2 应拒绝，得到 seq=%d ok=%v", seq, ok)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := len(stub.whispers()); got != 0 {
+		t.Fatalf("协议 v2 不应下发，实际 %d 条", got)
+	}
+
+	s.protoVer.Store(4)
+	seq1, ok := s.SendWhisperTargets([]string{"bob", ""})
+	if !ok || seq1 != 1 {
+		t.Fatalf("首次 seq = %d/%v，期望 1/true", seq1, ok)
+	}
+	got := stub.waitWhispers(t, 1)
+	if got[0].Seq != 1 || len(got[0].Targets) != 1 || got[0].Targets[0] != "bob" {
+		t.Fatalf("wire #1 = %+v", got[0])
+	}
+
+	seq2, ok := s.SendWhisperTargets([]string{"bob", "carol"})
+	if !ok || seq2 != seq1+1 {
+		t.Fatalf("第二次 seq = %d/%v，期望 %d/true", seq2, ok, seq1+1)
+	}
+	got = stub.waitWhispers(t, 2)
+	if got[1].Seq != seq2 || len(got[1].Targets) != 2 {
+		t.Fatalf("wire #2 = %+v", got[1])
+	}
+
+	seq3, ok := s.SendWhisperTargets(nil)
+	if !ok || seq3 != seq2+1 {
+		t.Fatalf("取消 seq = %d/%v，期望 %d/true", seq3, ok, seq2+1)
+	}
+	got = stub.waitWhispers(t, 3)
+	if got[2].Seq != seq3 || len(got[2].Targets) != 0 {
+		t.Fatalf("wire #3 = %+v", got[2])
+	}
+}
+
+// TestWhisperAckCallback voice.whisper_ack 只在房内分发，seq 必须为正（#116）。
+func TestWhisperAckCallback(t *testing.T) {
+	type ack struct {
+		seq    int64
+		active bool
+	}
+	acks := make(chan ack, 2)
+	s := NewSession(api.NewAPIClient("http://127.0.0.1:1"), "tok", "n", Events{
+		OnWhisperAck: func(seq int64, active bool) { acks <- ack{seq, active} },
+	}, nil)
+	env := signal.Envelope{
+		Type: signal.TypeVoiceWhisperAck, TS: 1,
+		Data: json.RawMessage(`{"seq":7,"active":true}`),
+	}
+
+	// 不在房：丢弃。
+	s.handleWhisperAck(env)
+	select {
+	case got := <-acks:
+		t.Fatalf("不在房时不应分发 ack，得到 %+v", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// 在房：原样回传 seq/active。
+	s.roomID.Store("room1")
+	s.handleWhisperAck(env)
+	select {
+	case got := <-acks:
+		if got.seq != 7 || !got.active {
+			t.Fatalf("ack = %+v，期望 {7 true}", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("未收到 OnWhisperAck")
+	}
+
+	// seq<=0 不是有效请求序号：丢弃。
+	s.handleWhisperAck(signal.Envelope{
+		Type: signal.TypeVoiceWhisperAck, TS: 2,
+		Data: json.RawMessage(`{"seq":0,"active":true}`),
+	})
+	select {
+	case got := <-acks:
+		t.Fatalf("seq=0 不应分发，得到 %+v", got)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 

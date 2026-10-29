@@ -110,6 +110,12 @@ type Events struct {
 	// app 层固定以 data:resync 事件转发，前端收到后经绑定自取。
 	// 跑在独立 goroutine，可安全触发网络请求；nil = 不通知。
 	OnResync func()
+	// OnWhisperAck 悄悄话目标生效确认（voice.whisper_ack，#116 协议 v4）：
+	// seq 是 voice.whisper 原样回传的请求序号，active=true 表示目标集合已应用
+	// 到本连接的 SFU peer（可以开麦），false 表示取消已生效（关麦）。
+	// 只有仍在房内才会回调；实现侧按自己的在途 seq 过滤过期确认。
+	// 跑在 ws 读循环 goroutine，实现侧只做转发，不得阻塞、不得同步 Close 会话。
+	OnWhisperAck func(seq int64, active bool)
 }
 
 // VoiceStats 推给 UI 的语音房统计快照。
@@ -217,7 +223,13 @@ type Session struct {
 	// 即使 want 已清空，也需要发一条空数组兜底；从未用过悄悄话时保持 false，
 	// 避免每次入房都白发一条信令。
 	whisperMaybe bool
-	whisperWake  chan struct{}
+	// whisperSeq 已分配的最新请求序号（#116，协议 v4）：每次显式下发递增，
+	// 随 voice.whisper.seq 带给服务端，由其原样回传 voice.whisper_ack。
+	// whisperSendSeq 是当前待发版本的序号（0 = v3 兼容路径，服务端不回 ack）；
+	// 两者分开是因为 wake 合并突发时只有最新版本会被真正发送。
+	whisperSeq     int64
+	whisperSendSeq int64
+	whisperWake    chan struct{}
 
 	// #46 频道音质配置：audioCfgMu 串行化「用户设置 + 当前频道上限/帧长」的
 	// 读取与应用（ApplyAudio 在 Wails 绑定线程、channel.audio 在 WS 读循环）。
@@ -753,6 +765,9 @@ func (s *Session) registerHandlers() {
 		}
 		s.setChannelAudio(int(d.AudioBitrateKbps), int(d.AudioFrameMs))
 	})
+	// voice.whisper_ack：服务端确认目标集合已应用到本连接的 SFU peer（#116，
+	// 协议 v4）。
+	s.ws.On(signal.TypeVoiceWhisperAck, s.handleWhisperAck)
 	s.ws.On(signal.TypeRTCOffer, func(env signal.Envelope) {
 		var d signal.SDPData
 		if env.Decode(&d) != nil {
@@ -1367,25 +1382,60 @@ func (s *Session) SetPeerVolume(userID string, gain float64) {
 // 时真正下发（v2 服务端不认该消息）。非阻塞：只保存最新值并敲一下容量 1 的
 // 唤醒通道，网络发送由 Connect 里的专用 goroutine 完成——不得在 Wails 绑定
 // 线程或音频回调里同步 ws.Send。
+//
+// 这是 v3 兼容路径（seq=0，服务端不回 ack）；协议 v4 需要确认目标生效后才
+// 开麦时用 SendWhisperTargets。
 func (s *Session) SetWhisperTargets(targets []string) {
-	cp := make([]string, 0, len(targets))
-	for _, uid := range targets {
-		if uid != "" {
-			cp = append(cp, uid)
-		}
+	s.whisperMu.Lock()
+	s.queueWhisperLocked(cleanWhisperTargets(targets), 0)
+	s.whisperMu.Unlock()
+	s.wakeWhisper()
+}
+
+// SendWhisperTargets 更新目标并返回本次请求序号（#116，协议 v4）。
+// 协议 <3 或信令未连接时返回 ok=false 且不排队——调用方据此提示，而不是
+// 空等一个永远不会到来的 ack。目标为空仍是取消；是否真正下发沿用与
+// SetWhisperTargets 相同的去重语义（服务端已可能为空时补发一条兜底取消）。
+// 非阻塞：只保存最新值与序号并唤醒专用发送 goroutine。
+func (s *Session) SendWhisperTargets(targets []string) (int64, bool) {
+	if s.protoVer.Load() < 3 || s.ws == nil {
+		return 0, false
 	}
 	s.whisperMu.Lock()
+	s.whisperSeq++
+	seq := s.whisperSeq
+	s.queueWhisperLocked(cleanWhisperTargets(targets), seq)
+	s.whisperMu.Unlock()
+	s.wakeWhisper()
+	return seq, true
+}
+
+// queueWhisperLocked 写入最新目标与待发序号（调用方持 whisperMu）。空目标
+// 只在之前确实有目标时才需要显式取消；重复的「本就为空」不下发（服务端残留
+// 由入房同步兜底）。
+func (s *Session) queueWhisperLocked(cp []string, seq int64) {
 	oldHas := len(s.whisperWant) > 0
 	s.whisperWant = cp
-	// 空列表只在之前确实有目标时才需要发取消；重复的「本就为空」不下发。
 	if len(cp) > 0 {
 		s.whisperNeedSend = true
 		s.whisperMaybe = true
 	} else if oldHas {
 		s.whisperNeedSend = true
 	}
-	s.whisperMu.Unlock()
-	s.wakeWhisper()
+	if s.whisperNeedSend {
+		s.whisperSendSeq = seq
+	}
+}
+
+// cleanWhisperTargets 过滤空 ID 并复制一份（切片一经发布不再原地修改）。
+func cleanWhisperTargets(targets []string) []string {
+	cp := make([]string, 0, len(targets))
+	for _, uid := range targets {
+		if uid != "" {
+			cp = append(cp, uid)
+		}
+	}
+	return cp
 }
 
 // ClearWhisperTargets 退房/切房时清空会话缓存的悄悄话目标，且不下发任何
@@ -1396,6 +1446,7 @@ func (s *Session) ClearWhisperTargets() {
 	s.whisperMu.Lock()
 	s.whisperWant = nil
 	s.whisperNeedSend = false
+	s.whisperSendSeq = 0
 	s.whisperMu.Unlock()
 }
 
@@ -1409,17 +1460,18 @@ func (s *Session) wakeWhisper() {
 
 // whisperLoop 悄悄话目标发送循环（#45，Connect 启动；测试可直接跑）。
 // 每次唤醒读最新目标；协议 <3 时静默丢弃（v2 服务端不认 voice.whisper）。
+// 发送失败不重试（#117 已登记）：等下一次目标变化或入房同步再兜底。
 func (s *Session) whisperLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-s.whisperWake:
-			targets, send := s.pendingWhisper()
+			targets, seq, send := s.pendingWhisper()
 			if !send || s.protoVer.Load() < 3 || s.ws == nil {
 				continue
 			}
-			if err := s.ws.Send(signal.TypeVoiceWhisper, signal.VoiceWhisperData{Targets: targets}); err == nil {
+			if err := s.ws.Send(signal.TypeVoiceWhisper, signal.VoiceWhisperData{Targets: targets, Seq: seq}); err == nil {
 				// 发送成功才更新「服务端可能有非空目标」：失败时间线未知，
 				// 保守保留原值，下次入房同步会再兜一次。
 				s.whisperMu.Lock()
@@ -1431,29 +1483,58 @@ func (s *Session) whisperLoop(ctx context.Context) {
 }
 
 // pendingWhisper 取当前待下发快照并清掉脏标记。空目标也要返回（显式取消），
-// 由 send 区分「无需发送」与「发送空数组」。切片一经发布不再原地修改。
-func (s *Session) pendingWhisper() ([]string, bool) {
+// 由 send 区分「无需发送」与「发送空数组」；seq 是该版本的请求序号（0 = v3
+// 兼容路径）。切片一经发布不再原地修改。
+func (s *Session) pendingWhisper() ([]string, int64, bool) {
 	s.whisperMu.Lock()
 	want := s.whisperWant
+	seq := s.whisperSendSeq
 	send := s.whisperNeedSend
 	s.whisperNeedSend = false
+	s.whisperSendSeq = 0
 	s.whisperMu.Unlock()
 	if want == nil {
 		want = []string{} // voice.whisper 的 targets 是 required 数组，不能下发 null
 	}
-	return want, send
+	return want, seq, send
 }
 
 // syncWhisperOnJoin 入房/重连后把当前目标同步到新建的 SFU peer（#45）。
 // want 为空但服务端可能残留旧目标（切房前在途发送）时强制下发一次空数组；
-// 从未用过悄悄话则不发，避免每次入房都产生无意义信令。
+// 从未用过悄悄话则不发，避免每次入房都产生无意义信令。同步走 seq=0 的 v3
+// 语义：入房重建不是一次用户请求，无需 voice.whisper_ack。
 func (s *Session) syncWhisperOnJoin() {
 	s.whisperMu.Lock()
+	if s.whisperNeedSend && s.whisperSendSeq != 0 {
+		// 队列里已有一条带 seq 的显式请求（用户按住悄悄话时恰好切房/重连）：
+		// 服务端会在 peer 建立后补应用并回 ack，不能降级成 seq=0 的同步消息，
+		// 否则 App 永远等不到确认，只能按超时关麦。
+		s.whisperMu.Unlock()
+		s.wakeWhisper()
+		return
+	}
 	need := len(s.whisperWant) > 0 || s.whisperMaybe
 	s.whisperNeedSend = need
+	s.whisperSendSeq = 0
 	s.whisperMu.Unlock()
 	if need {
 		s.wakeWhisper()
+	}
+}
+
+// handleWhisperAck 分发 voice.whisper_ack（#116，协议 v4）。ack 不带频道 ID，
+// 无法按频道比对：退房后到达的旧 ack 由「不在房即丢弃」+ App 侧按在途 seq
+// 匹配（clearWhisper 会清零 seq）共同排除。跑在 ws 读循环 goroutine。
+func (s *Session) handleWhisperAck(env signal.Envelope) {
+	var d signal.VoiceWhisperAckData
+	if env.Decode(&d) != nil || d.Seq <= 0 {
+		return
+	}
+	if !s.InRoom() {
+		return
+	}
+	if s.ev.OnWhisperAck != nil {
+		s.ev.OnWhisperAck(d.Seq, d.Active)
 	}
 }
 
@@ -2197,6 +2278,14 @@ func (s *Session) SignalConnected() bool { return s.ws != nil && s.ws.Connected(
 // ProtocolVersion 返回服务端协商到的协议版本（#29）。
 // 0 = 尚未收到 server.hello（老服务端或还没协商完）——按 v1 行为处理。
 func (s *Session) ProtocolVersion() int64 { return s.protoVer.Load() }
+
+// SupportsWhisper 报告服务端是否支持同频道悄悄话（voice.whisper，协议 ≥3）。
+// false 时 App 层不得开旁路发送门，UI 应明示不支持。
+func (s *Session) SupportsWhisper() bool { return s.protoVer.Load() >= 3 }
+
+// SupportsWhisperAck 报告服务端是否会回 voice.whisper_ack（协议 ≥4）。
+// true 时客户端必须等到匹配 seq 的确认后才开麦（#116）。
+func (s *Session) SupportsWhisperAck() bool { return s.protoVer.Load() >= 4 }
 
 // InRoom 报告当前是否在语音频道（app 层 voice:stats ticker 据它门控发送）。
 func (s *Session) InRoom() bool {
