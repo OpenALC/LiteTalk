@@ -72,6 +72,15 @@ func remoteArrival(seq int) time.Time {
 // 开启带内 FEC 并告知 20% 丢包率。幅度递增让「FEC 恢复真实丢帧」与
 // 「PLC 沿用上一帧包络」的能量差异可判定。
 func encodeRampedSinePackets(t testing.TB, n int) [][]byte {
+	return encodeRampedSineFrames(t, n, OpusFrameSize)
+}
+
+// encodeRampedSine10msPackets 同 20ms 版，但帧长 10ms（480 采样，#116）。
+func encodeRampedSine10msPackets(t testing.TB, n int) [][]byte {
+	return encodeRampedSineFrames(t, n, FrameSize)
+}
+
+func encodeRampedSineFrames(t testing.TB, n, frameSize int) [][]byte {
 	t.Helper()
 	enc, err := codec.NewEncoder(SampleRate, 1, codec.AppVoIP)
 	if err != nil {
@@ -87,7 +96,7 @@ func encodeRampedSinePackets(t testing.TB, n int) [][]byte {
 	if err := enc.SetPacketLossPerc(20); err != nil {
 		t.Fatalf("set packet loss: %v", err)
 	}
-	pcm := make([]int16, OpusFrameSize)
+	pcm := make([]int16, frameSize)
 	buf := make([]byte, 4000)
 	var phase float64
 	out := make([][]byte, 0, n)
@@ -241,6 +250,62 @@ func TestRemoteDecodeFECRecoversLostFrame(t *testing.T) {
 
 	if fecRMS <= plcRMS*1.15 {
 		t.Fatalf("FEC RMS %.0f not clearly better than PLC RMS %.0f", fecRMS, plcRMS)
+	}
+}
+
+// TestRemoteDecodeFECRecoversLostFrame10ms 10ms 频道（#116）：丢帧用后继包的
+// 带内 FEC 恢复，输出必须按当前帧长 480 截断（不能沿用整块 960），FECFrames
+// 增加且后继包随后仍正常解码。
+func TestRemoteDecodeFECRecoversLostFrame10ms(t *testing.T) {
+	pkts := encodeRampedSine10msPackets(t, 10)
+	m, _ := newTestMixer()
+	rp := newTestRemotePeer(t, "a", m)
+	rp.frameMS.Store(FrameMS10)
+	if err := rp.jb.SetFrameMS(FrameMS10); err != nil {
+		t.Fatal(err)
+	}
+	arrival := func(seq int) time.Time {
+		return remoteArrivalBase.Add(time.Duration(seq) * 10 * time.Millisecond)
+	}
+	drain := make([]int16, FrameSize)
+
+	// 10ms 帧的预填深度是 6 包（60ms），比 20ms 的 3 包多一倍。
+	for i := 0; i < 6; i++ {
+		rp.jb.Push(uint16(100+i), pkts[i], arrival(100+i))
+	}
+	for i := 0; i < 6; i++ {
+		rp.decodeOnce()
+		if n := rp.input.ring.Read(drain); n != FrameSize {
+			t.Fatalf("normal frame produced %d samples, want %d", n, FrameSize)
+		}
+	}
+
+	// 106 丢失、107 已到：FEC 恢复 106。
+	if !codec.HasLBRR(pkts[7]) {
+		t.Fatal("10ms FEC 用例前提不成立：后继包 107 不含 LBRR")
+	}
+	rp.jb.Push(107, pkts[7], arrival(107))
+	rp.decodeOnce()
+	if n := rp.input.ring.Read(drain); n != FrameSize {
+		t.Fatalf("FEC frame produced %d samples, want %d", n, FrameSize)
+	}
+	if got := rp.Stats.FECFrames.Load(); got != 1 {
+		t.Fatalf("FECFrames = %d, want 1", got)
+	}
+	if got := rp.Stats.DREDFrames.Load(); got != 0 {
+		t.Fatalf("DREDFrames = %d, want 0（FEC 可用时应优先 FEC）", got)
+	}
+	if got := rp.Stats.PLCFrames.Load(); got != 0 {
+		t.Fatalf("PLCFrames = %d, want 0", got)
+	}
+
+	// 后继 107 正常解码（480 采样），未被 FEC 消费。
+	rp.decodeOnce()
+	if n := rp.input.ring.Read(drain); n != FrameSize {
+		t.Fatalf("successor frame produced %d samples, want %d", n, FrameSize)
+	}
+	if got := rp.Stats.FramesPopped.Load(); got != 7 {
+		t.Fatalf("FramesPopped = %d, want 7 (6 prefill + successor)", got)
 	}
 }
 

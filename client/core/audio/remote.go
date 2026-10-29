@@ -482,7 +482,9 @@ func (rp *remotePeer) decodeOnce() {
 		// 会静默返回 PLC 帧且不报错，不探测就会把 PLC 误计入 FEC 并挡住 DRED。
 		if nn, ok := rp.jb.PeekNext(rp.fecBuf[:]); ok && nn > rtc.DTXPayloadMax {
 			if codec.HasLBRR(rp.fecBuf[:nn]) {
-				if m, err := rp.dec.Decode(rp.fecBuf[:nn], rp.pcm[:], true); err == nil {
+				// FEC 恢复的是上一帧，输出长度必须按当前帧长（10ms=480，
+				// 20ms=960）截断；传整块 960 会让解码器按错误帧长解释 LBRR。
+				if m, err := rp.dec.Decode(rp.fecBuf[:nn], rp.pcm[:rp.frameSamples()], true); err == nil {
 					rp.Stats.FECFrames.Add(1)
 					rp.input.Write(rp.pcm[:m])
 					return
