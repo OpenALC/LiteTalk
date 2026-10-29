@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/OpenALC/LiteTalk/server/internal/signal"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
 )
 
@@ -427,6 +429,93 @@ func TestChannelAudioOptions(t *testing.T) {
 		map[string]any{"audio_bitrate_kbps": 16}, http.StatusNotFound)
 	doJSON(t, rt, http.MethodPatch, fmt.Sprintf("/api/v1/channels/%d", chID), w.stranger,
 		map[string]any{"audio_bitrate_kbps": 16}, http.StatusForbidden)
+}
+
+// TestPatchChannel10msLegacyGate PATCH 启用 10ms 帧长（#116）：房内有 proto<3
+// 客户端时 409 且不落库；检查与 join 竞态（预检查通过、落库后复查命中）回滚
+// 帧长再 409；无旧客户端或降到 20ms 时放行。
+func TestPatchChannel10msLegacyGate(t *testing.T) {
+	w := newChannelOptsWorld(t)
+	rt := w.h
+	ch := w.createCh(t, map[string]any{"name": "10ms", "type": "voice"})
+	voiceID := asID(ch["id"])
+	voicePath := fmt.Sprintf("/api/v1/channels/%d", voiceID)
+	key := strconv.FormatInt(voiceID, 10)
+	frameOf := func() int {
+		t.Helper()
+		got, err := w.mem.ChannelByID(context.Background(), voiceID)
+		if err != nil {
+			t.Fatalf("ChannelByID: %v", err)
+		}
+		return got.AudioFrameMS
+	}
+	wantConflict := func(resp map[string]any) {
+		t.Helper()
+		if resp["code"] != signal.ErrCodeProtocolUnsupported {
+			t.Fatalf("409 code 应为 %q，实际 %v", signal.ErrCodeProtocolUnsupported, resp)
+		}
+	}
+
+	// 预检查命中：房内有旧客户端 → 409，帧长保持 0（不落库、不广播）。
+	w.hub.setRoomLegacy(key, true, 0)
+	wantConflict(doJSON(t, rt, http.MethodPatch, voicePath, w.owner,
+		map[string]any{"audio_frame_ms": 10}, http.StatusConflict))
+	if got := frameOf(); got != 0 {
+		t.Fatalf("被拒后库值应保持 0，实际 %d", got)
+	}
+	if got := len(w.hub.audioLog()); got != 0 {
+		t.Fatalf("被拒时不应广播 channel.audio，实际 %d", got)
+	}
+
+	// 竞态分支：预检查放行，落库后复查命中 → 409 且帧长回滚为修改前的 0。
+	w.hub.setRoomLegacy(key, true, 1)
+	wantConflict(doJSON(t, rt, http.MethodPatch, voicePath, w.owner,
+		map[string]any{"audio_frame_ms": 10}, http.StatusConflict))
+	if got := frameOf(); got != 0 {
+		t.Fatalf("复查命中后帧长应回滚为 0，实际 %d", got)
+	}
+	if got := w.hub.legacyChecks(); got != 2 {
+		t.Fatalf("竞态分支应检查两次（预检查 + 复查），实际 %d", got)
+	}
+	if got := len(w.hub.audioLog()); got != 0 {
+		t.Fatalf("回滚时不应广播错误配置，实际 %d", got)
+	}
+
+	// 无旧客户端：启用 10ms 放行并落库、广播。
+	w.hub.setRoomLegacy(key, false, 0)
+	resp := doJSON(t, rt, http.MethodPatch, voicePath, w.owner,
+		map[string]any{"audio_frame_ms": 10}, http.StatusOK)
+	if resp["audio_frame_ms"] != float64(10) || frameOf() != 10 {
+		t.Fatalf("无旧客户端应启用 10ms: resp=%v db=%d", resp, frameOf())
+	}
+	if got := len(w.hub.audioLog()); got != 1 {
+		t.Fatalf("成功后应广播一次 channel.audio，实际 %d", got)
+	}
+
+	// 10→20 不检查：即使房内标记有旧客户端也放行。
+	w.hub.setRoomLegacy(key, true, 0)
+	if resp := doJSON(t, rt, http.MethodPatch, voicePath, w.owner,
+		map[string]any{"audio_frame_ms": 20}, http.StatusOK); resp["audio_frame_ms"] != float64(20) {
+		t.Fatalf("10→20 不应受能力闸影响: %v", resp)
+	}
+	if got := frameOf(); got != 20 {
+		t.Fatalf("10→20 应落库 20，实际 %d", got)
+	}
+	if got := w.hub.legacyChecks(); got != 0 {
+		t.Fatalf("10→20 不应检查旧客户端，实际检查 %d 次", got)
+	}
+
+	// 值不变（10 再设 10）不触发检查；恢复 10 后房内标记旧客户端再设 10 仍放行。
+	w.hub.setRoomLegacy(key, false, 0)
+	doJSON(t, rt, http.MethodPatch, voicePath, w.owner, map[string]any{"audio_frame_ms": 10}, http.StatusOK)
+	w.hub.setRoomLegacy(key, true, 0)
+	if resp := doJSON(t, rt, http.MethodPatch, voicePath, w.owner,
+		map[string]any{"audio_frame_ms": 10}, http.StatusOK); resp["audio_frame_ms"] != float64(10) {
+		t.Fatalf("值不变不应受能力闸影响: %v", resp)
+	}
+	if got := w.hub.legacyChecks(); got != 0 {
+		t.Fatalf("值不变不应检查旧客户端，实际检查 %d 次", got)
+	}
 }
 
 // TestChannelAudioBroadcast 音质 PATCH 成功后广播 channel.audio（#46）：

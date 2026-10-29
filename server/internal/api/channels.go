@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/OpenALC/LiteTalk/server/internal/signal"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
 )
 
@@ -142,6 +143,9 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 	if req == nil {
 		return nil, bodyMissing()
 	}
+	// #116 10ms 帧长能力闸的「修改前」值：必须在应用 body 之前取，用于判断
+	// 本次是否真的把帧长启用为 10ms（值不变或 10→20 不触发）。
+	prevFrameMS := ch.AudioFrameMS
 	// 有子频道时禁改 category/type/挂父（#37）：子树的分类/类型/层级跟着父走，
 	// 半改会造成树形漂移；先于任何字段应用判，避免半写。
 	if req.CategoryID.Set || req.Type.Set || req.ParentID.Set {
@@ -281,8 +285,27 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 			return nil, errf(http.StatusBadRequest, "bad_parent", "父子频道分类必须相同")
 		}
 	}
+	// #116 10ms 帧长能力闸：本次把频道启用为 10ms 且最终是语音频道时，房内
+	// 若有协议 <3 的客户端必须拒绝——它们不认 10ms 的 frame_size/FEC，混用会
+	// 互相干扰。检查放在字段应用之后，保证用的是最终类型/帧长；数值不变或
+	// 10→20、0→20 不检查。房间不存在（无成员）直接放行。
+	channelID := strconv.FormatInt(ch.ID, 10)
+	frameTo10 := ch.Type == store.ChannelVoice && ch.AudioFrameMS == channelFrameMS10 && prevFrameMS != channelFrameMS10
+	if frameTo10 && s.hub != nil && s.hub.RoomHasLegacyClients(channelID) {
+		return nil, errf(http.StatusConflict, signal.ErrCodeProtocolUnsupported, "频道内有旧版客户端，无法启用 10ms 帧长")
+	}
 	if err := s.store.UpdateChannel(ctx, ch); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
+	}
+	// 竞态兜底（#116）：预检查与 channel.join 并发时，旧客户端可能恰好在两步
+	// 之间进房。落库后再查一次；命中则把帧长回滚为修改前的值，保证不把 10ms
+	// 配置留在有旧客户端的房间上。审计与 channel.audio 广播都不发出错误配置。
+	if frameTo10 && s.hub != nil && s.hub.RoomHasLegacyClients(channelID) {
+		ch.AudioFrameMS = prevFrameMS
+		if err := s.store.UpdateChannel(ctx, ch); err != nil {
+			s.log.Printf("[500] 频道 %d 帧长回滚失败: %v", ch.ID, err)
+		}
+		return nil, errf(http.StatusConflict, signal.ErrCodeProtocolUnsupported, "频道内有旧版客户端，无法启用 10ms 帧长")
 	}
 	s.audit(ctx, store.AuditLog{
 		ServerID: ch.ServerID, ActorID: c.UserID, Action: "channel.update",

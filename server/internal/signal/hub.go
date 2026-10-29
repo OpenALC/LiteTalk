@@ -956,6 +956,15 @@ func (h *Hub) joinRoom(c *client, channelID, password string) {
 		return
 	}
 
+	// 10ms 帧长能力闸（#116）：proto <3 的客户端不认 10ms 的 frame_size/FEC，
+	// 与 10ms 频道混用会互相干扰，直接拒绝入房（不登记、不广播）。
+	// dev 内置房间没有 store 实体（ch == nil），不受影响；后续把频道改成
+	// 10ms 的 PATCH 会由 RoomHasLegacyClients 拦下，两道门互补。
+	if ch != nil && ch.Type == store.ChannelVoice && ch.AudioFrameMS == 10 && c.protoVer.Load() < 3 {
+		h.sendError(c, ErrCodeProtocolUnsupported, "频道使用 10ms 帧长，请升级客户端")
+		return
+	}
+
 	// 密码（#37）：频道未设密码时忽略携带值；管理员（Administrator/owner）旁路。
 	// 没带密码 → forbidden（老客户端安全回滚）；带错 → bad_password。
 	if ch != nil && ch.PasswordHash != "" {
@@ -1582,6 +1591,24 @@ func (h *Hub) roomMemberCount(channelID string) int {
 		return 0
 	}
 	return len(room.members)
+}
+
+// RoomHasLegacyClients 该房间当前是否有协议 <3 的连接（#116 10ms 帧长能力闸）。
+// 未协商（0）与版本无交集（-1）都按旧客户端计——它们不认 10ms 帧长。
+// 房间不存在（含 dev 内置房间）返回 false。持 h.mu。
+func (h *Hub) RoomHasLegacyClients(channelID string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	room := h.rooms[channelID]
+	if room == nil {
+		return false
+	}
+	for _, m := range room.members {
+		if m.protoVer.Load() < 3 {
+			return true
+		}
+	}
+	return false
 }
 
 // VoiceChannelOf 反查 uid 当前语音房（#92 好友频道 presence，api.VoicePresence 满足）。

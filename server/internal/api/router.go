@@ -52,6 +52,9 @@ type Hub interface {
 	// 角色/成员角色变更不实时广播，重进房由 channel.joined 的 MemberInfo.priority
 	// 刷新，因此本方法不覆盖那些路径。
 	BroadcastVoicePriority(channelID, userID string, priority bool)
+	// RoomHasLegacyClients 该房间当前是否有协议 <3 的连接（#116）：PATCH 启用
+	// 10ms 帧长前检查，避免与不认识 10ms 的旧客户端混用；房间不存在返回 false。
+	RoomHasLegacyClients(channelID string) bool
 }
 
 // PresenceReader 在线状态读取（#11）：presence:{uid} 存在 = 在线。

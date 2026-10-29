@@ -26,6 +26,7 @@ func TestChannelJoinedAudioConfig(t *testing.T) {
 
 	// 默认（0/0）也显式下发，客户端不必区分「字段缺省」与「跟随设置」。
 	a := f.dial("1", "alice")
+	negotiate(t, a, 4) // 10ms 频道要求协议 ≥3（#116），先协商到 v4
 	a.send(TypeChannelJoin, ChannelJoinData{ChannelID: vchID})
 	var joined ChannelJoinedData
 	if err := a.recvUntil(TypeChannelJoined).Decode(&joined); err != nil {
