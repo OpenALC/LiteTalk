@@ -74,9 +74,9 @@ func audioLevelExtID(exts []webrtc.RTPHeaderExtensionParameter) uint8 {
 	return 0
 }
 
-// speakingTick 说话翻转判定的采样周期。贴 Opus 帧周期（48kHz/960 样本 = 20ms，
-// 上行 50pps）：判定粒度即一帧，比它更快看不到新样本，比它更慢只加指示延迟。
-// 起判 1 拍 ⇒ 「电平到达服务端 → 翻转下发」worst case ≈ 1×20ms + 广播，
+// speakingTick 说话翻转判定的采样周期。上行 Opus 帧长可为 10ms 或 20ms
+// （#46，50/100pps），本周期不绑定帧长：10ms 包只让电平样本更新更频繁，
+// 按 20ms 采样仍足以判定翻转（起判 1 拍 ⇒ 最坏 ≈ 20ms + 广播）。
 // 不高于客户端现状（dsp EnterFrames=3=30ms）。
 const speakingTick = 20 * time.Millisecond
 
@@ -535,4 +535,16 @@ func (s *SFU) SetServerMuted(roomID, userID string, muted bool) bool {
 	room.mu.Unlock()
 	s.log.Printf("sfu: 房间 %s 成员 %s 服务端闭麦=%v", roomID, userID, muted)
 	return true
+}
+
+// SetWhisperTargets 设置/清除某成员的悄悄话目标集合（#45）。active=false 取消；
+// active=true 且 targets 为空表示目标全部离房——保持悄悄话态，谁都收不到。
+// connID 归属核对由 Room.SetWhisperTargets 完成；成员不在房/连接不符返回 false，
+// 调用方静默忽略（此时尚无该成员的上行轨道可转发）。
+func (s *SFU) SetWhisperTargets(roomID, userID, connID string, targets []string, active bool) bool {
+	room := s.findRoom(roomID)
+	if room == nil {
+		return false
+	}
+	return room.SetWhisperTargets(userID, connID, targets, active)
 }

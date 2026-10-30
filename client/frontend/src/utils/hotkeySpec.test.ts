@@ -234,8 +234,8 @@ describe('findHotkeyConflicts 冲突检测', () => {
 })
 
 describe('HOTKEY_ACTIONS 动作表', () => {
-  it('与 Go 侧 hotkey.Action 的四个动作一一对应', () => {
-    expect(HOTKEY_ACTIONS.map((a) => a.id)).toEqual(['ptt', 'mute', 'deafen', 'dual'])
+  it('与 Go 侧 hotkey.Action 的五个动作一一对应', () => {
+    expect(HOTKEY_ACTIONS.map((a) => a.id)).toEqual(['ptt', 'whisper', 'mute', 'deafen', 'dual'])
   })
 })
 

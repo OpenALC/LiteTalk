@@ -3,8 +3,8 @@
 // Package codec 的 fallback stub：darwin 等未接入平台，以及关闭 CGO 的
 // Linux 交叉编译（cgo 文件整体被排除，须回落 stub 才能编译通过）。
 //
-// Windows 用仓库内预编译静态库，Linux + CGO 链系统 libopus，
-// 其余组合返回 ErrUnsupportedPlatform，保证 go vet / go test / go build 不炸。
+// Windows/Linux 均链接仓库内预编译静态库；其余组合返回
+// ErrUnsupportedPlatform，保证 go vet / go test / go build 不炸。
 package codec
 
 import "errors"
@@ -59,6 +59,15 @@ func (e *Encoder) SetVBR(on bool) error { return ErrUnsupportedPlatform }
 // SetComplexity 非 Windows stub。
 func (e *Encoder) SetComplexity(v int) error { return ErrUnsupportedPlatform }
 
+// SetDRED stub。
+func (e *Encoder) SetDRED(frames int) error { return ErrUnsupportedPlatform }
+
+// DREDDuration stub。
+func (e *Encoder) DREDDuration() (int, error) { return 0, ErrUnsupportedPlatform }
+
+// PacketLossPerc stub。
+func (e *Encoder) PacketLossPerc() (int, error) { return 0, ErrUnsupportedPlatform }
+
 // Encode stub。
 func (e *Encoder) Encode(pcm []int16, out []byte) (int, error) {
 	return 0, ErrUnsupportedPlatform
@@ -82,6 +91,23 @@ func (d *Decoder) Decode(pkt []byte, out []int16, fec bool) (int, error) {
 
 // Close stub。
 func (d *Decoder) Close() error { return nil }
+
+// HasLBRR stub：无 libopus 实现时恒 false。
+func HasLBRR(pkt []byte) bool { return false }
+
+// DREDDecoder stub。
+type DREDDecoder struct{}
+
+// NewDREDDecoder stub：永远返回 ErrUnsupportedPlatform。
+func NewDREDDecoder() (*DREDDecoder, error) { return nil, ErrUnsupportedPlatform }
+
+// Recover stub。
+func (d *DREDDecoder) Recover(dec *Decoder, pkt []byte, out []int16, frameSamples, sampleRate int) (int, bool, error) {
+	return 0, false, ErrUnsupportedPlatform
+}
+
+// Close stub。
+func (d *DREDDecoder) Close() error { return nil }
 
 // Version stub。
 func Version() string { return "unsupported" }

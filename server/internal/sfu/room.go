@@ -322,13 +322,22 @@ func (r *Room) forward(src *Peer, srcTrack *webrtc.TrackRemote, levelExtID uint8
 			}
 			src.pktSeq.Add(1) // 停流检测（muted/DTX 后无包，ticker 据此按静音处理）
 		}
-		if !src.fwdActive.Load() {
+		// #45 过滤优先级定死：serverMuted（上面已整包丢弃）> 悄悄话白名单 > fwdActive。
+		// 悄悄话激活时绕过活跃门——top-N 是带宽决策，不能让不经意的轻声悄悄话被
+		// 整包吞掉。whisper 是不可变快照：这里只原子读，查表零分配、不取锁。
+		whisper := src.whisperTargets.Load()
+		if whisper == nil && !src.fwdActive.Load() {
 			continue
 		}
 		r.mu.RLock()
 		for uid, p := range r.peers {
 			if uid == src.userID {
 				continue
+			}
+			if whisper != nil {
+				if _, ok := (*whisper)[uid]; !ok {
+					continue
+				}
 			}
 			p.mu.Lock()
 			route := p.outbound[src.userID]
@@ -344,6 +353,35 @@ func (r *Room) forward(src *Peer, srcTrack *webrtc.TrackRemote, levelExtID uint8
 		}
 		r.mu.RUnlock()
 	}
+}
+
+// SetWhisperTargets 设置/清除某成员的悄悄话目标集合（#45）。active=false 表示
+// 取消（恢复普通转发）；active=true 时即使 targets 为空也保持悄悄话态——目标
+// 全部离房的情况下必须谁都不发，不能回落成全房广播（隐私边界）。
+// connID 归属核对（§0.9 同类保护）：旧连接迟到的信令不得改写新连接的悄悄话状态；
+// 成员不在房/连接不符返回 false，调用方静默忽略（此时尚无上行轨道，不存在泄漏
+// 窗口）。目标集合一次性构建后原子替换，包路径零分配。
+func (r *Room) SetWhisperTargets(userID, connID string, targets []string, active bool) bool {
+	var snap *map[string]struct{}
+	if active {
+		m := make(map[string]struct{}, len(targets))
+		for _, uid := range targets {
+			// 防御性排除自己：自己永远不是转发目标。
+			if uid != "" && uid != userID {
+				m[uid] = struct{}{}
+			}
+		}
+		snap = &m
+	}
+	r.mu.Lock()
+	p := r.peers[userID]
+	if p == nil || p.connID != connID {
+		r.mu.Unlock()
+		return false
+	}
+	p.whisperTargets.Store(snap)
+	r.mu.Unlock()
+	return true
 }
 
 // speakFlip 一次说话翻转（tickSpeak 累积后统一触发回调）。
@@ -447,6 +485,8 @@ func (r *Room) tickSpeak(onSpeak OnSpeakingFn) {
 //     被吞音——旧实现的门控在几乎每场日常通话里都生效。
 //
 // 其余房间只放行最响的 N 路；无电平源（v1 客户端/未协商扩展）不受门控，恒转发。
+// 帧长无关（#46）：电平按 RTP 包更新，10ms 包只是让 effLvl 刷新更频繁，
+// 活跃门的排序周期与保持窗口都是时间量，不随 50/100pps 改变语义。
 func (r *Room) tickActive() {
 	peers := r.snapPeers()
 	if len(peers) == 0 {

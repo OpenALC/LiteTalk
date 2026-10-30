@@ -15,7 +15,25 @@
       "type": "array",
       "items": { "$ref": "components.schema.json#/$defs/MemberInfo" }
     },
-    "self": { "$ref": "components.schema.json#/$defs/MemberInfo" }
+    "self": { "$ref": "components.schema.json#/$defs/MemberInfo" },
+    "audio_bitrate_kbps": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 128,
+      "x-since": 2,
+      "x-go-omitempty": true,
+      "x-go-pointer": true,
+      "description": "语音频道码率上限 kbps（#46，协议 v2）；0 = 跟随客户端用户设置。旧服务端/开发内置房间缺省。"
+    },
+    "audio_frame_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 20,
+      "x-since": 2,
+      "x-go-omitempty": true,
+      "x-go-pointer": true,
+      "description": "语音频道 Opus 帧长毫秒（#46，协议 v2）；0 = 默认 20ms。旧服务端/开发内置房间缺省。"
+    }
   },
   "required": ["channel_id", "members", "self"],
   "additionalProperties": false

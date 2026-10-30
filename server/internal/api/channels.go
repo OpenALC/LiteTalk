@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/OpenALC/LiteTalk/server/internal/signal"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
 )
 
@@ -42,6 +43,17 @@ func (s *Server) CreateChannel(ctx context.Context, request CreateChannelRequest
 	}
 	if req.UserLimit != nil {
 		if e := checkUserLimit(*req.UserLimit, chType); e != nil {
+			return nil, e
+		}
+	}
+	// #46 音质选项：仅语音频道可设非零值；text 的 0 值会被 normalizeChannelAudio 归一。
+	if req.AudioBitrateKbps != nil {
+		if e := checkChannelBitrate(*req.AudioBitrateKbps, chType); e != nil {
+			return nil, e
+		}
+	}
+	if req.AudioFrameMs != nil {
+		if e := checkChannelFrameMS(*req.AudioFrameMs, chType); e != nil {
 			return nil, e
 		}
 	}
@@ -83,19 +95,27 @@ func (s *Server) CreateChannel(ctx context.Context, request CreateChannelRequest
 	if req.UserLimit != nil {
 		ch.UserLimit = *req.UserLimit
 	}
+	if req.AudioBitrateKbps != nil {
+		ch.AudioBitrateKbps = *req.AudioBitrateKbps
+	}
+	if req.AudioFrameMs != nil {
+		ch.AudioFrameMS = *req.AudioFrameMs
+	}
+	normalizeChannelAudio(ch)
 	if parentID != 0 {
 		ch.ParentID = &parentID
 	}
 	if err := s.store.CreateChannel(ctx, ch); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	// 审计只记 has_password/user_limit/parent_id（#37）：密码明文与哈希都不进 detail。
+	// 审计只记 has_password/user_limit/parent_id/音质（#37/#46）：密码明文与哈希都不进 detail。
 	s.audit(ctx, store.AuditLog{
 		ServerID: request.Id, ActorID: c.UserID, Action: "channel.create",
 		TargetType: "channel", TargetID: ptrID(ch.ID), ChannelID: ptrID(ch.ID),
 		Detail: auditDetail(map[string]any{
 			"name": ch.Name, "type": string(ch.Type),
 			"has_password": hash != "", "user_limit": ch.UserLimit, "parent_id": parentID,
+			"audio_bitrate_kbps": ch.AudioBitrateKbps, "audio_frame_ms": ch.AudioFrameMS,
 		}),
 	})
 	return CreateChannel201JSONResponse(channelView(ch)), nil
@@ -123,6 +143,9 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 	if req == nil {
 		return nil, bodyMissing()
 	}
+	// #116 10ms 帧长能力闸的「修改前」值：必须在应用 body 之前取，用于判断
+	// 本次是否真的把帧长启用为 10ms（值不变或 10→20 不触发）。
+	prevFrameMS := ch.AudioFrameMS
 	// 有子频道时禁改 category/type/挂父（#37）：子树的分类/类型/层级跟着父走，
 	// 半改会造成树形漂移；先于任何字段应用判，避免半写。
 	if req.CategoryID.Set || req.Type.Set || req.ParentID.Set {
@@ -201,6 +224,29 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 		ch.UserLimit = req.UserLimit.Val
 		detail["user_limit"] = req.UserLimit.Val
 	}
+	// #46 音质三态：缺省不改、0 = 清零（跟随设置/默认帧长）、null 拒 400。
+	// 校验用上方定稿的频道类型：同一次 PATCH 改成 text 时非零音质会被拒。
+	audioChanged := req.AudioBitrateKbps.Set || req.AudioFrameMs.Set
+	if req.AudioBitrateKbps.Set {
+		if req.AudioBitrateKbps.Clearing() {
+			return nil, errf(http.StatusBadRequest, "bad_channel_option", "audio_bitrate_kbps 不可清除，0 表示不限制")
+		}
+		if e := checkChannelBitrate(req.AudioBitrateKbps.Val, ch.Type); e != nil {
+			return nil, e
+		}
+		ch.AudioBitrateKbps = req.AudioBitrateKbps.Val
+		detail["audio_bitrate_kbps"] = req.AudioBitrateKbps.Val
+	}
+	if req.AudioFrameMs.Set {
+		if req.AudioFrameMs.Clearing() {
+			return nil, errf(http.StatusBadRequest, "bad_channel_option", "audio_frame_ms 不可清除，0 表示默认 20ms")
+		}
+		if e := checkChannelFrameMS(req.AudioFrameMs.Val, ch.Type); e != nil {
+			return nil, e
+		}
+		ch.AudioFrameMS = req.AudioFrameMs.Val
+		detail["audio_frame_ms"] = req.AudioFrameMs.Val
+	}
 	if req.ParentID.Set {
 		if req.ParentID.Clearing() || req.ParentID.Val == 0 {
 			ch.ParentID = nil // 提升顶层
@@ -216,6 +262,8 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 			detail["parent_id"] = req.ParentID.Val
 		}
 	}
+	// 类型改成 text 时清掉旧音质（text 恒 0/0）；校验已在各字段应用时按最终类型完成。
+	normalizeChannelAudio(ch)
 	// 子频道自身改 type/category 也必须与父一致（#101 P2）：上方 409 只拦
 	// 「有子频道的父频道」，子频道此前可以单方面漂移出父的类型/分类，破坏
 	// 两级树的不变量。字段应用完成后统一核对最终值，避免半写。
@@ -237,14 +285,45 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 			return nil, errf(http.StatusBadRequest, "bad_parent", "父子频道分类必须相同")
 		}
 	}
+	// #116 10ms 帧长能力闸：本次把频道启用为 10ms 且最终是语音频道时，房内
+	// 若有协议 <3 的客户端必须拒绝——它们不认 10ms 的 frame_size/FEC，混用会
+	// 互相干扰。检查放在字段应用之后，保证用的是最终类型/帧长；数值不变或
+	// 10→20、0→20 不检查。房间不存在（无成员）直接放行。
+	channelID := strconv.FormatInt(ch.ID, 10)
+	frameTo10 := ch.Type == store.ChannelVoice && ch.AudioFrameMS == channelFrameMS10 && prevFrameMS != channelFrameMS10
+	if frameTo10 && s.hub != nil && s.hub.RoomHasLegacyClients(channelID) {
+		return nil, errf(http.StatusConflict, signal.ErrCodeProtocolUnsupported, "频道内有旧版客户端，无法启用 10ms 帧长")
+	}
 	if err := s.store.UpdateChannel(ctx, ch); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
+	}
+	// 竞态兜底（#116）：预检查与 channel.join 并发时，旧客户端可能恰好在两步
+	// 之间进房。落库后再查一次；命中则把帧长回滚为修改前的值，保证不把 10ms
+	// 配置留在有旧客户端的房间上。审计与 channel.audio 广播都不发出错误配置。
+	if frameTo10 && s.hub != nil && s.hub.RoomHasLegacyClients(channelID) {
+		ch.AudioFrameMS = prevFrameMS
+		if err := s.store.UpdateChannel(ctx, ch); err != nil {
+			s.log.Printf("[500] 频道 %d 帧长回滚失败: %v", ch.ID, err)
+		}
+		return nil, errf(http.StatusConflict, signal.ErrCodeProtocolUnsupported, "频道内有旧版客户端，无法启用 10ms 帧长")
 	}
 	s.audit(ctx, store.AuditLog{
 		ServerID: ch.ServerID, ActorID: c.UserID, Action: "channel.update",
 		TargetType: "channel", TargetID: ptrID(ch.ID), ChannelID: ptrID(ch.ID),
 		Detail: auditDetail(detail),
 	})
+	// #46 音质变更通知：仅语音频道、且本次确实改了音质字段时广播。收件人按
+	// ViewChannel 可见性过滤（与消息事件同口径）；广播失败只记日志——PATCH
+	// 已经落库，不能因附属通知把成功改成 500。
+	if audioChanged && ch.Type == store.ChannelVoice && s.hub != nil {
+		recipients, e := s.messageRecipients(ctx, ch)
+		if e != nil {
+			s.log.Printf("channel.audio 收件人查询失败（频道 %d）: %v", ch.ID, e)
+		} else {
+			s.hub.BroadcastChannelAudio(recipients, strconv.FormatInt(ch.ID, 10),
+				ch.AudioBitrateKbps, ch.AudioFrameMS)
+		}
+	}
 	return PatchChannel200JSONResponse(channelView(ch)), nil
 }
 

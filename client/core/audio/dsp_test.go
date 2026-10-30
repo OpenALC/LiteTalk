@@ -37,6 +37,7 @@ func newTestDSP(t *testing.T, mutate func(*DSPConfig)) *DSP {
 	if err != nil {
 		t.Fatalf("NewDSP: %v", err)
 	}
+	t.Cleanup(d.Close)
 	return d
 }
 
@@ -273,14 +274,33 @@ func TestDenoiseBypass(t *testing.T) {
 	}
 }
 
-// BenchmarkDSPProcess 降噪热路径：必须 0 allocs/op（rnnoise-go 官方承诺构建后零分配）。
+// BenchmarkDSPProcess Beta 开关开启 APM 后的热路径：必须 0 Go allocs/op。
+// APM 的 C++ 内部分配不计入 Go 堆，cgo 调用本身也不分配。
 func BenchmarkDSPProcess(b *testing.B) {
-	d, err := NewDSP(DefaultDSPConfig())
+	requireAPM(b)
+	benchDSPProcess(b, true)
+}
+
+// BenchmarkDSPProcessLegacy 默认路径（APM 关闭，RNNoise + 自研 AGC 链路），
+// 用于对比开启 Beta APM 前后的每帧开销；同为 0 Go allocs/op。
+func BenchmarkDSPProcessLegacy(b *testing.B) {
+	benchDSPProcess(b, false)
+}
+
+func benchDSPProcess(b *testing.B, enableAPM bool) {
+	cfg := DefaultDSPConfig()
+	cfg.EnableAPM = enableAPM
+	// 两档都保持 AGC 关闭（DSPConfig 未开 agcOn），只比较固定链路的
+	// APM/RNNoise 成本；AGC2 的额外开销由 BenchmarkAPMCapture 单独计。
+	d, err := NewDSP(cfg)
 	if err != nil {
 		b.Fatal(err)
 	}
+	defer d.Close()
 	in := make([]int16, FrameSize)
 	out := make([]int16, FrameSize)
+	ren := make([]int16, FrameSize)
+	aecRenderFrame(ren, 0)
 	var phase float64
 	var rng uint32 = 42
 	sineNoiseFrame(in, &phase, 12000, 2000, &rng)
@@ -288,6 +308,8 @@ func BenchmarkDSPProcess(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		// APM 档每 10ms 同时喂一帧混音参考；默认旧链路为 no-op。
+		d.ProcessRender(ren)
 		if _, err := d.Process(out, in); err != nil {
 			b.Fatal(err)
 		}
@@ -299,10 +321,15 @@ func BenchmarkDSPProcess(b *testing.B) {
 // 区间而比语音段慢 1.4~2.3 倍；短路后静音段只有峰值扫描，比值应远小于 1。
 // 必须 0 allocs/op。
 func BenchmarkDSPSilenceAfterSpeech(b *testing.B) {
-	d, err := NewDSP(DefaultDSPConfig())
+	// 该基准专测 RNNoise 的 denormal 短路：显式关闭 APM（Beta 默认即关闭，
+	// 这里写明以固定基准语义），否则静音帧也进 APM，测的就不是短路路径了。
+	cfg := DefaultDSPConfig()
+	cfg.EnableAPM = false
+	d, err := NewDSP(cfg)
 	if err != nil {
 		b.Fatal(err)
 	}
+	defer d.Close()
 	in := make([]int16, FrameSize)
 	out := make([]int16, FrameSize)
 	var phase float64

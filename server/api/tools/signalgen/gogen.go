@@ -13,7 +13,7 @@ func emit(cat *catalog, comps map[string]*typeDef, msgs []*typeDef) ([]byte, err
 	var b strings.Builder
 	b.WriteString(genHeader)
 
-	fmt.Fprintf(&b, "// 协议版本（api/signal/catalog.json）。v2 起含网关事件面与 RFC 6464 说话状态。\n")
+	fmt.Fprintf(&b, "// 协议版本（api/signal/catalog.json）。v2 起含网关事件面与 RFC 6464 说话状态；v3 起含同频道悄悄话与优先发言；v4 起含悄悄话生效确认（voice.whisper_ack）与 10ms 帧长能力闸。\n")
 	fmt.Fprintf(&b, "const (\n\tProtocolVersionMin = %d\n\tProtocolVersionMax = %d\n\tProtocolVersionCurrent = %d\n)\n\n",
 		cat.ProtocolVersions.Min, cat.ProtocolVersions.Max, cat.ProtocolVersions.Current)
 

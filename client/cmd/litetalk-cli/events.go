@@ -61,9 +61,9 @@ func (c *console) events() voice.Events {
 			default:
 			}
 		},
-		OnPeerJoin: func(userID, nickname, tag string, speaking, mute, deafen bool) {
-			fmt.Printf("event peer-join uid=%s nick=%s tag=%s speaking=%v mute=%v deafen=%v\n",
-				userID, nickname, tag, speaking, mute, deafen)
+		OnPeerJoin: func(userID, nickname, tag string, speaking, mute, deafen, priority bool) {
+			fmt.Printf("event peer-join uid=%s nick=%s tag=%s speaking=%v mute=%v deafen=%v priority=%v\n",
+				userID, nickname, tag, speaking, mute, deafen, priority)
 		},
 		OnPeerLeave: func(userID string) {
 			fmt.Printf("event peer-leave uid=%s\n", userID)

@@ -431,6 +431,20 @@ func targetSet(uids []string) map[string]bool {
 	return targets
 }
 
+// BroadcastChannelAudio 语音频道音质变更（#46）：REST PATCH 成功后调用，
+// uids 由调用方按频道 ViewChannel 可见性算好；0 表示跟随用户设置/默认帧长。
+func (h *Hub) BroadcastChannelAudio(uids []string, channelID string, bitrateKbps, frameMS int) {
+	targets := targetSet(uids)
+	if len(targets) == 0 || channelID == "" {
+		return
+	}
+	h.broadcastEvent(targets, TypeChannelAudio, ChannelAudioData{
+		ChannelID:        channelID,
+		AudioBitrateKbps: int64(bitrateKbps),
+		AudioFrameMs:     int64(frameMS),
+	})
+}
+
 // permCheckQuiet 只要结果不翻译错误码（广播过滤用：失败=跳过该收件人）。
 func (h *Hub) permCheckQuiet(ctx context.Context, uid, serverID, channelID int64, perm store.Permission) (bool, error) {
 	if h.authz == nil {

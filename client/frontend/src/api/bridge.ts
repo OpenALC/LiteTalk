@@ -2,7 +2,7 @@
 // 浏览器独立开发（vite dev 无 Go 后端）时走 mock 桩，行为可联调 UI。
 // 原生环境判定：Go 在 webview 启动时注入 window._wails.flags（浏览器环境恒无）。
 import { Call, Events } from '@wailsio/runtime'
-import type { AttachmentView, AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ChatMessage, ConnConfigView, ConnTestResult, Conversation, FriendDTO, HotkeySettings, LinkPreview, MentionCandidate, PeerView, ServerChannels, ServerConfig, ServerDTO, UnreadChannel, Unreads, UserProfile, VoiceStateView } from './types'
+import type { AttachmentView, AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ChatMessage, ConnConfigView, ConnTestResult, Conversation, FriendDTO, HotkeySettings, LinkPreview, MentionCandidate, NetworkDiagResult, PeerView, ServerChannels, ServerConfig, ServerDTO, UnreadChannel, Unreads, UserProfile, VoiceStateView, WindowOverlaySettings } from './types'
 
 type GoApp = {
   GetVersion(): Promise<string>
@@ -12,6 +12,8 @@ type GoApp = {
   GetServerConfig(): Promise<ConnConfigView>
   SetServerConfig(baseURL: string): Promise<void>
   TestServerConnection(baseURL: string): Promise<ConnTestResult>
+  // NetworkDiag 一键网络诊断（#49 C）：REST/WS/STUN/TURN 四项独立探测。
+  NetworkDiag(): Promise<NetworkDiagResult>
   WindowMinimize(): Promise<void>
   WindowMaximize(): Promise<void>
   WindowClose(): Promise<void>
@@ -38,6 +40,12 @@ type GoApp = {
   TestSpeaker(): Promise<void>
   GetAudioSettings(): Promise<AudioSettings>
   SetAudioSettings(s: AudioSettings): Promise<void>
+  // WebRTC APM（Beta）可用性：false 的平台（如 macOS stub）设置页禁用开关。
+  APMSupported(): Promise<boolean>
+  // 游戏内悬浮层（#47，Beta，仅 Windows）：Supported 为 false 时设置页禁用开关。
+  WindowOverlaySupported(): Promise<boolean>
+  GetWindowOverlaySettings(): Promise<WindowOverlaySettings>
+  SetWindowOverlaySettings(s: WindowOverlaySettings): Promise<void>
   // 全局热键与按键说话（GetHotkeyAvailability 为 false 时平台不支持，UI 需明示降级）。
   GetHotkeySettings(): Promise<HotkeySettings>
   SetHotkeySettings(s: HotkeySettings): Promise<void>
@@ -49,6 +57,14 @@ type GoApp = {
   SetMute(muted: boolean): Promise<void>
   SetDeafen(deafened: boolean): Promise<void>
   SetPeerVolume(userID: string, gain: number): Promise<void>
+  // SetWhisperTargets 悄悄话目标选择（#45）：未按住悄悄话键时只保存选择，
+  // 按住期间变化立即下发；空数组取消。目标必须是当前同频道成员。
+  SetWhisperTargets(targets: string[]): Promise<void>
+  // WhisperSupported 服务端协议是否支持同频道悄悄话（#116）：false 时 UI 禁用
+  // 目标选择并提示升级服务器（协议 <3 无 voice.whisper）。
+  WhisperSupported(): Promise<boolean>
+  // SetPrioritySpeaker 授予/撤销优先发言（#45，需 ManageChannels；无权限时抛 403）。
+  SetPrioritySpeaker(channelID: string, userID: string, enabled: boolean): Promise<void>
   // GetVoiceState UI 销毁重载后的语音态恢复（Go 会话未断，前端重建后回填）。
   GetVoiceState(): Promise<VoiceStateView>
   // RequestVoiceState 「请求静音」：请目标闭麦/静音（对方接受后生效，无强制）。
@@ -90,10 +106,11 @@ type GoApp = {
   CreateInviteCode(serverID: string): Promise<string>
   // categoryID 空串/「0」= 不归类（#72 新建即归组，不用等重启对账）。
   CreateChannel(serverID: string, name: string, typ: string, categoryID: string): Promise<ChannelDTO>
-  // 频道选项（#37 B2）：子频道（类型随父）与选项更新（parentID ""=不改/"0"=顶层；
-  // userLimit <0 不改；password 空串不改，clearPassword 清除）。
+  // 频道选项（#37 B2、#46）：子频道（类型随父）与选项更新（parentID ""=不改/"0"=顶层；
+  // userLimit <0 不改；audioBitrateKbps/audioFrameMs <0 不改，0 = 跟随设置/默认帧长；
+  // password 空串不改，clearPassword 清除）。
   CreateSubchannel(serverID: string, name: string, typ: string, parentID: string): Promise<ChannelDTO>
-  UpdateChannelOptions(channelID: string, parentID: string, userLimit: number, password: string, clearPassword: boolean): Promise<ChannelDTO>
+  UpdateChannelOptions(channelID: string, parentID: string, userLimit: number, audioBitrateKbps: number, audioFrameMs: number, password: string, clearPassword: boolean): Promise<ChannelDTO>
   RenameChannel(id: string, name: string): Promise<void>
   DeleteChannel(id: string): Promise<void>
   CreateCategory(serverID: string, name: string): Promise<CategoryDTO>
@@ -185,6 +202,15 @@ const mockApp: GoApp = {
   async TestServerConnection() {
     return { ok: true, latency_ms: 12, version: 'dev', error: '' }
   },
+  async NetworkDiag() {
+    return {
+      ok: true,
+      rest: { ok: true, latency_ms: 12, version: 'dev' },
+      ws: { ok: true, latency_ms: 0, note: '信令已连接（未重复拨号）' },
+      stun: { ok: true, latency_ms: 8, address: '203.0.113.7:51820' },
+      turn: { ok: true, skipped: true, latency_ms: 0, note: '未配置' },
+    }
+  },
   async WindowMinimize() {},
   async WindowMaximize() {},
   async WindowClose() {},
@@ -228,12 +254,20 @@ const mockApp: GoApp = {
   async TestSpeaker() {},
   async GetAudioSettings() {
     return {
-      bitrate_kbps: 32, vbr: true, dtx: true, fec: true, packet_loss: 10,
+      bitrate_kbps: 32, vbr: true, dtx: true, fec: true, dred: true, packet_loss: 10,
       denoise: true, denoise_strength: 2, agc: false, gain: 10,
       mic_volume: 100, playback_volume: 100, vad_sens: 2, opus_complexity: 9,
+      enable_apm: false,
     }
   },
   async SetAudioSettings() {},
+  // 浏览器预览没有 C++ APM，但保持 Beta 区可见可操作（落盘为 no-op）。
+  async APMSupported() { return true },
+  // 悬浮层 mock：默认关闭；浏览器预览没有原生窗口，仍报告支持以便联调 UI，
+  // 保存为 no-op（真实平台能力由 Go 侧 Supported 报告）。
+  async WindowOverlaySupported() { return true },
+  async GetWindowOverlaySettings() { return { enabled: false } },
+  async SetWindowOverlaySettings() {},
   // 全局热键桩：默认值走 Go 侧 hotkey.DefaultSettings 的 TS 等价（全关、绑定全空）。
   // 浏览器环境没有原生钩子，可用性恒 false——设置页据此展示降级说明。
   async GetHotkeySettings() {
@@ -253,6 +287,10 @@ const mockApp: GoApp = {
   async SetMute() {},
   async SetDeafen() {},
   async SetPeerVolume() {},
+  async SetWhisperTargets() {},
+  // 浏览器预览没有真实服务端协议：按支持处理以便联调目标选择 UI。
+  async WhisperSupported() { return true },
+  async SetPrioritySpeaker() {},
   async SendChat() {},
   // #39 消息编辑/回复/提及桩：回显传入内容，供浏览器开发联调 UI。
   async SendChatWithMeta() {},

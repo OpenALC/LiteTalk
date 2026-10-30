@@ -76,6 +76,8 @@ export interface PeerView {
   speaking: boolean
   mute: boolean
   deafen: boolean
+  // priority 优先发言（#45）：接收端 ducking 与成员徽标用。
+  priority: boolean
 }
 
 // AttachmentView 消息附件（#41，与 Go 侧 ChatMessageView.Attachments 同口径）。
@@ -129,6 +131,73 @@ export interface ConnTestResult {
   error: string
 }
 
+// VoicePeerDiag 单路下行链路诊断（voice:stats 的 peers[]，#49）。
+// jitter_ms 是抖动缓冲自身的到达抖动估计；rtp_jitter_ms 是入站 RTP 的
+// RFC3550 抖动，语义不同。buffer_ms/target_ms 是缓冲当前/目标深度。
+export interface VoicePeerDiag {
+  peer_id: string
+  jitter_ms: number
+  jitter_target_packets: number
+  jitter_buffered_packets: number
+  jitter_lost: number
+  ring_samples: number
+  plc_frames: number
+  fec_frames: number
+  dred_frames: number
+  underrun_frames: number
+  dropped_samples: number
+  // #49 新增（Go omitempty：无入站流时不出现）
+  loss_pct?: number
+  rtp_jitter_ms?: number
+  buffer_ms?: number
+  target_ms?: number
+  rtp_received?: number
+  rtp_lost?: number
+}
+
+// VoiceStats voice:stats 事件载荷（Go 侧 VoiceStats 的 JSON）。
+// 新增字段均可选：旧服务端/未入房时缺省，UI 按 0 / -- 处理。
+export interface VoiceStats {
+  latency_ms: number
+  members: number
+  peer_ids: string[]
+  enc_packets: number
+  rtp_sent: number
+  playback_buffered_ms: number
+  playback_underruns: number
+  playback_dropped: number
+  peers?: VoicePeerDiag[]
+  // #49：入站 RTP 丢包率（%）、抖动（ms）、抖动缓冲深度/目标（ms）与计数。
+  loss_pct?: number
+  rtp_jitter_ms?: number
+  jitter_buffer_ms?: number
+  jitter_target_ms?: number
+  rtp_received?: number
+  rtp_lost?: number
+}
+
+// NetworkDiagProbe 单项网络诊断结果（#49 C）。
+// skipped 表示未配置或已有活跃连接而主动跳过，不计为失败；
+// note 是跳过原因（如「信令已连接」），error 是已脱敏的短错误。
+export interface NetworkDiagProbe {
+  ok: boolean
+  skipped?: boolean
+  latency_ms: number
+  version?: string
+  address?: string
+  note?: string
+  error?: string
+}
+
+// NetworkDiagResult App.NetworkDiag 的返回（REST/WS/STUN/TURN 四项独立）。
+export interface NetworkDiagResult {
+  ok: boolean
+  rest: NetworkDiagProbe
+  ws: NetworkDiagProbe
+  stun: NetworkDiagProbe
+  turn: NetworkDiagProbe
+}
+
 // AudioSettings 语音设置（与 Go 侧 config.AudioSettings 对齐；指针/零值字段未设置即默认）。
 // v0.1.2 扩展：降噪强度/AGC/Opus 复杂度/麦克风/扬声器音量；旧 gain 保留兼容读取。
 export interface AudioSettings {
@@ -136,6 +205,8 @@ export interface AudioSettings {
   vbr: boolean
   dtx: boolean
   fec: boolean
+  // 深度冗余：突发丢包恢复（#44，omitempty 后可能缺省；缺省 = 开）。
+  dred?: boolean
   packet_loss: number // 5–20
   denoise: boolean
   denoise_strength: number // 1 弱 / 2 中 / 3 强（rnnoise Aggressiveness 档位）
@@ -149,6 +220,8 @@ export interface AudioSettings {
   input_mode?: 'auto' | 'left' | 'right' | 'mix'
   // 前置增益 dB（-12~+24，RNNoise 之前；0 = 不变，omitempty 后可能缺省）。
   pre_gain_db?: number
+  // 启用 WebRTC APM（Beta 功能，默认关闭；omitempty 后 false 不出现）。
+  enable_apm?: boolean
 }
 
 // HotkeySettings 全局热键与按键说话配置（与 Go 侧 hotkey.Settings / config 的
@@ -159,11 +232,19 @@ export interface HotkeySettings {
   enabled: boolean
   mode: 0 | 1 | 2
   ptt?: string
+  // whisper 按住悄悄话（#45）：默认不绑定。
+  whisper?: string
   mute?: string
   deafen?: string
   dual?: string
   tail_ms?: number
   cue_sound?: boolean
+}
+
+// WindowOverlaySettings 游戏内悬浮层（#47，Beta，仅 Windows）配置。
+// enabled 默认 false；平台不支持时设置页禁用开关（能力由 WindowOverlaySupported 报告）。
+export interface WindowOverlaySettings {
+  enabled: boolean
 }
 
 // AudioLevel audio:level 事件载荷（设置页麦克风测试期间 100ms 推送一次）。
@@ -180,4 +261,14 @@ export interface VoiceStateView {
   channel_id: string
   muted: boolean
   deafened: boolean
+}
+
+// WhisperEvent hotkey:whisper 事件载荷（#45/#116）：pressed=按住，active=目标
+// 已生效并开麦；supported=false 表示服务端协议不支持悄悄话（UI 禁用入口）；
+// error 是瞬时失败原因（unsupported/send_failed/ack_timeout），仅用于提示。
+export interface WhisperEvent {
+  pressed: boolean
+  active: boolean
+  supported: boolean
+  error?: string
 }

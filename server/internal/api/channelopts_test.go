@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/OpenALC/LiteTalk/server/internal/signal"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
 )
 
@@ -320,5 +322,237 @@ func TestPatchChildChannelInvariants(t *testing.T) {
 		map[string]any{"type": "text", "category_id": fmt.Sprint(catB)}, http.StatusOK)
 	if up["type"] != "text" || asID(up["category_id"]) != catB {
 		t.Fatalf("顶层频道改类型/分类不应受限: %v", up)
+	}
+}
+
+// TestChannelAudioOptions 频道音质（#46）：创建/更新往返、校验矩阵、text 归零。
+func TestChannelAudioOptions(t *testing.T) {
+	w := newChannelOptsWorld(t)
+	rt := w.h
+
+	// 语音频道创建带音质：响应恒含两字段，ListChannels 也一致。
+	ch := w.createCh(t, map[string]any{
+		"name": "音质", "type": "voice", "audio_bitrate_kbps": 16, "audio_frame_ms": 10,
+	})
+	chID := asID(ch["id"])
+	if ch["audio_bitrate_kbps"] != float64(16) || ch["audio_frame_ms"] != float64(10) {
+		t.Fatalf("创建响应音质不符: %v", ch)
+	}
+	list := getJSON(t, rt, fmt.Sprintf("/api/v1/servers/%d/channels", w.serverID), w.owner, http.StatusOK).(map[string]any)
+	found := false
+	for _, raw := range list["channels"].([]any) {
+		m := raw.(map[string]any)
+		if asID(m["id"]) == chID {
+			found = true
+			if m["audio_bitrate_kbps"] != float64(16) || m["audio_frame_ms"] != float64(10) {
+				t.Fatalf("列表音质不符: %v", m)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("列表里找不到新建频道: %v", list)
+	}
+
+	// 校验矩阵：码率 0/8/128 放行；7/129/-1 拒。帧长 0/10/20 放行；15 拒。
+	patch := func(body map[string]any, want int) map[string]any {
+		t.Helper()
+		return doJSON(t, rt, http.MethodPatch, fmt.Sprintf("/api/v1/channels/%d", chID), w.owner, body, want)
+	}
+	for _, kbps := range []int{0, 8, 128} {
+		resp := patch(map[string]any{"audio_bitrate_kbps": kbps}, http.StatusOK)
+		if resp["audio_bitrate_kbps"] != float64(kbps) {
+			t.Fatalf("码率 %d 更新不符: %v", kbps, resp)
+		}
+	}
+	for _, kbps := range []int{7, 129, -1} {
+		resp := patch(map[string]any{"audio_bitrate_kbps": kbps}, http.StatusBadRequest)
+		if resp["code"] != "bad_channel_option" {
+			t.Fatalf("码率 %d 应 bad_channel_option: %v", kbps, resp)
+		}
+	}
+	for _, ms := range []int{0, 10, 20} {
+		resp := patch(map[string]any{"audio_frame_ms": ms}, http.StatusOK)
+		if resp["audio_frame_ms"] != float64(ms) {
+			t.Fatalf("帧长 %d 更新不符: %v", ms, resp)
+		}
+	}
+	for _, ms := range []int{15, 5, -10} {
+		resp := patch(map[string]any{"audio_frame_ms": ms}, http.StatusBadRequest)
+		if resp["code"] != "bad_channel_option" {
+			t.Fatalf("帧长 %d 应 bad_channel_option: %v", ms, resp)
+		}
+	}
+	// null 不表示清除：用 0 清零。缺省字段不改动另一字段。
+	if resp := patch(map[string]any{"audio_bitrate_kbps": nil}, http.StatusBadRequest); resp["code"] != "bad_channel_option" {
+		t.Fatalf("码率 null 应 400: %v", resp)
+	}
+	cur := patch(map[string]any{"audio_bitrate_kbps": 48}, http.StatusOK)
+	if cur["audio_frame_ms"] != float64(20) {
+		t.Fatalf("未提供的帧长应保持不变: %v", cur)
+	}
+
+	// text 频道：非零音质 400；显式 0 放行且响应保持 0/0。
+	text := w.createCh(t, map[string]any{"name": "文", "type": "text", "audio_bitrate_kbps": 0, "audio_frame_ms": 0})
+	if text["audio_bitrate_kbps"] != float64(0) || text["audio_frame_ms"] != float64(0) {
+		t.Fatalf("text 音质应恒为 0/0: %v", text)
+	}
+	textID := asID(text["id"])
+	textPatch := func(body map[string]any) map[string]any {
+		t.Helper()
+		return doJSON(t, rt, http.MethodPatch, fmt.Sprintf("/api/v1/channels/%d", textID), w.owner, body, http.StatusBadRequest)
+	}
+	if resp := textPatch(map[string]any{"audio_bitrate_kbps": 16}); resp["code"] != "bad_channel_option" {
+		t.Fatalf("text 设码率应 400: %v", resp)
+	}
+	if resp := textPatch(map[string]any{"audio_frame_ms": 10}); resp["code"] != "bad_channel_option" {
+		t.Fatalf("text 设帧长应 400: %v", resp)
+	}
+	doJSON(t, rt, http.MethodPost, fmt.Sprintf("/api/v1/servers/%d/channels", w.serverID), w.owner,
+		map[string]any{"name": "文2", "type": "text", "audio_bitrate_kbps": 32}, http.StatusBadRequest)
+	doJSON(t, rt, http.MethodPost, fmt.Sprintf("/api/v1/servers/%d/channels", w.serverID), w.owner,
+		map[string]any{"name": "文3", "type": "text", "audio_frame_ms": 10}, http.StatusBadRequest)
+
+	// voice→text 未显式改音质：旧值清零，不能把语音参数留在文字频道上。
+	up := patch(map[string]any{"type": "text"}, http.StatusOK)
+	if up["audio_bitrate_kbps"] != float64(0) || up["audio_frame_ms"] != float64(0) {
+		t.Fatalf("改为 text 后音质应清零: %v", up)
+	}
+	// text→voice 同一次请求带音质：允许。
+	if resp := patch(map[string]any{"type": "voice", "audio_bitrate_kbps": 24, "audio_frame_ms": 10}, http.StatusOK); resp["audio_bitrate_kbps"] != float64(24) {
+		t.Fatalf("改回 voice 并设音质应放行: %v", resp)
+	}
+
+	// 权限/存在性：普通成员 403，不存在频道 404，非成员 403。
+	doJSON(t, rt, http.MethodPatch, fmt.Sprintf("/api/v1/channels/%d", chID), w.member,
+		map[string]any{"audio_bitrate_kbps": 16}, http.StatusForbidden)
+	doJSON(t, rt, http.MethodPatch, "/api/v1/channels/4242424242", w.owner,
+		map[string]any{"audio_bitrate_kbps": 16}, http.StatusNotFound)
+	doJSON(t, rt, http.MethodPatch, fmt.Sprintf("/api/v1/channels/%d", chID), w.stranger,
+		map[string]any{"audio_bitrate_kbps": 16}, http.StatusForbidden)
+}
+
+// TestPatchChannel10msLegacyGate PATCH 启用 10ms 帧长（#116）：房内有 proto<3
+// 客户端时 409 且不落库；检查与 join 竞态（预检查通过、落库后复查命中）回滚
+// 帧长再 409；无旧客户端或降到 20ms 时放行。
+func TestPatchChannel10msLegacyGate(t *testing.T) {
+	w := newChannelOptsWorld(t)
+	rt := w.h
+	ch := w.createCh(t, map[string]any{"name": "10ms", "type": "voice"})
+	voiceID := asID(ch["id"])
+	voicePath := fmt.Sprintf("/api/v1/channels/%d", voiceID)
+	key := strconv.FormatInt(voiceID, 10)
+	frameOf := func() int {
+		t.Helper()
+		got, err := w.mem.ChannelByID(context.Background(), voiceID)
+		if err != nil {
+			t.Fatalf("ChannelByID: %v", err)
+		}
+		return got.AudioFrameMS
+	}
+	wantConflict := func(resp map[string]any) {
+		t.Helper()
+		if resp["code"] != signal.ErrCodeProtocolUnsupported {
+			t.Fatalf("409 code 应为 %q，实际 %v", signal.ErrCodeProtocolUnsupported, resp)
+		}
+	}
+
+	// 预检查命中：房内有旧客户端 → 409，帧长保持 0（不落库、不广播）。
+	w.hub.setRoomLegacy(key, true, 0)
+	wantConflict(doJSON(t, rt, http.MethodPatch, voicePath, w.owner,
+		map[string]any{"audio_frame_ms": 10}, http.StatusConflict))
+	if got := frameOf(); got != 0 {
+		t.Fatalf("被拒后库值应保持 0，实际 %d", got)
+	}
+	if got := len(w.hub.audioLog()); got != 0 {
+		t.Fatalf("被拒时不应广播 channel.audio，实际 %d", got)
+	}
+
+	// 竞态分支：预检查放行，落库后复查命中 → 409 且帧长回滚为修改前的 0。
+	w.hub.setRoomLegacy(key, true, 1)
+	wantConflict(doJSON(t, rt, http.MethodPatch, voicePath, w.owner,
+		map[string]any{"audio_frame_ms": 10}, http.StatusConflict))
+	if got := frameOf(); got != 0 {
+		t.Fatalf("复查命中后帧长应回滚为 0，实际 %d", got)
+	}
+	if got := w.hub.legacyChecks(); got != 2 {
+		t.Fatalf("竞态分支应检查两次（预检查 + 复查），实际 %d", got)
+	}
+	if got := len(w.hub.audioLog()); got != 0 {
+		t.Fatalf("回滚时不应广播错误配置，实际 %d", got)
+	}
+
+	// 无旧客户端：启用 10ms 放行并落库、广播。
+	w.hub.setRoomLegacy(key, false, 0)
+	resp := doJSON(t, rt, http.MethodPatch, voicePath, w.owner,
+		map[string]any{"audio_frame_ms": 10}, http.StatusOK)
+	if resp["audio_frame_ms"] != float64(10) || frameOf() != 10 {
+		t.Fatalf("无旧客户端应启用 10ms: resp=%v db=%d", resp, frameOf())
+	}
+	if got := len(w.hub.audioLog()); got != 1 {
+		t.Fatalf("成功后应广播一次 channel.audio，实际 %d", got)
+	}
+
+	// 10→20 不检查：即使房内标记有旧客户端也放行。
+	w.hub.setRoomLegacy(key, true, 0)
+	if resp := doJSON(t, rt, http.MethodPatch, voicePath, w.owner,
+		map[string]any{"audio_frame_ms": 20}, http.StatusOK); resp["audio_frame_ms"] != float64(20) {
+		t.Fatalf("10→20 不应受能力闸影响: %v", resp)
+	}
+	if got := frameOf(); got != 20 {
+		t.Fatalf("10→20 应落库 20，实际 %d", got)
+	}
+	if got := w.hub.legacyChecks(); got != 0 {
+		t.Fatalf("10→20 不应检查旧客户端，实际检查 %d 次", got)
+	}
+
+	// 值不变（10 再设 10）不触发检查；恢复 10 后房内标记旧客户端再设 10 仍放行。
+	w.hub.setRoomLegacy(key, false, 0)
+	doJSON(t, rt, http.MethodPatch, voicePath, w.owner, map[string]any{"audio_frame_ms": 10}, http.StatusOK)
+	w.hub.setRoomLegacy(key, true, 0)
+	if resp := doJSON(t, rt, http.MethodPatch, voicePath, w.owner,
+		map[string]any{"audio_frame_ms": 10}, http.StatusOK); resp["audio_frame_ms"] != float64(10) {
+		t.Fatalf("值不变不应受能力闸影响: %v", resp)
+	}
+	if got := w.hub.legacyChecks(); got != 0 {
+		t.Fatalf("值不变不应检查旧客户端，实际检查 %d 次", got)
+	}
+}
+
+// TestChannelAudioBroadcast 音质 PATCH 成功后广播 channel.audio（#46）：
+// 只改音质才发；text 频道与仅改名不发。
+func TestChannelAudioBroadcast(t *testing.T) {
+	w := newChannelOptsWorld(t)
+	rt := w.h
+	voice := w.createCh(t, map[string]any{"name": "音质广播", "type": "voice"})
+	voiceID := asID(voice["id"])
+	voicePath := fmt.Sprintf("/api/v1/channels/%d", voiceID)
+
+	doJSON(t, rt, http.MethodPatch, voicePath, w.owner,
+		map[string]any{"audio_bitrate_kbps": 32, "audio_frame_ms": 10}, http.StatusOK)
+	events := w.hub.audioLog()
+	if len(events) != 1 {
+		t.Fatalf("应广播一次 channel.audio，实际 %d: %+v", len(events), events)
+	}
+	ev := events[0]
+	if ev.channelID != fmt.Sprint(voiceID) || ev.bitrate != 32 || ev.frameMS != 10 {
+		t.Fatalf("广播载荷不符: %+v", ev)
+	}
+	if len(ev.uids) == 0 {
+		t.Fatalf("广播收件人不应为空: %+v", ev)
+	}
+
+	// 仅改名不广播。
+	doJSON(t, rt, http.MethodPatch, voicePath, w.owner,
+		map[string]any{"name": "改名"}, http.StatusOK)
+	if got := len(w.hub.audioLog()); got != 1 {
+		t.Fatalf("仅改名不应广播，实际累计 %d", got)
+	}
+
+	// text 频道设置音质（显式 0）不广播。
+	text := w.createCh(t, map[string]any{"name": "文字", "type": "text"})
+	doJSON(t, rt, http.MethodPatch, fmt.Sprintf("/api/v1/channels/%d", asID(text["id"])), w.owner,
+		map[string]any{"audio_bitrate_kbps": 0}, http.StatusOK)
+	if got := len(w.hub.audioLog()); got != 1 {
+		t.Fatalf("text 频道不应广播 channel.audio，实际累计 %d", got)
 	}
 }

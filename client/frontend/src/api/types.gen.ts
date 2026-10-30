@@ -1178,6 +1178,10 @@ export interface components {
             has_password?: boolean;
             /** @description 语音人数上限（#37）；0 = 不限。可选属性，服务端始终返回 */
             user_limit?: number;
+            /** @description 语音码率上限 kbps（#46）；0 = 不限制（跟随客户端用户设置），8–128 = 上限。 仅语音频道有意义，文字频道恒为 0。可选属性，服务端始终返回 */
+            audio_bitrate_kbps?: number;
+            /** @description 语音 Opus 帧长毫秒（#46）；0 = 默认 20ms，10/20 = 指定帧长。 仅语音频道有意义，文字频道恒为 0。可选属性，服务端始终返回 */
+            audio_frame_ms?: number;
         };
         /**
          * CategoryInfo
@@ -1544,10 +1548,14 @@ export interface components {
             user_limit?: number;
             /** @description 父频道 ID（#37，仅语音频道、最多两级）；省略 category_id 时继承父分类 */
             parent_id?: string | null;
+            /** @description 语音码率上限 kbps（#46，仅语音频道）；0/缺省 = 不限制，8–128 = 上限 */
+            audio_bitrate_kbps?: number;
+            /** @description 语音 Opus 帧长毫秒（#46，仅语音频道）；0/缺省 = 默认 20ms，10/20 = 指定 */
+            audio_frame_ms?: number;
         };
         /**
          * PatchChannelRequest
-         * @description JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name/type 不可清，空值被校验拒 400；category_id 的 null = 移出分类；position 的 null 拒 400——「删除位置」无语义），值 = 设置。#37：password 三态 （缺省不改、null/空串清除、非空设置）；user_limit 的 null 拒 400； parent_id 的 null/0 = 提升顶层、值 = 设置父级。
+         * @description JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name/type 不可清，空值被校验拒 400；category_id 的 null = 移出分类；position 的 null 拒 400——「删除位置」无语义），值 = 设置。#37：password 三态 （缺省不改、null/空串清除、非空设置）；user_limit 的 null 拒 400； parent_id 的 null/0 = 提升顶层、值 = 设置父级。#46：audio_bitrate_kbps / audio_frame_ms 缺省不改，0 = 清零（跟随/默认），null 拒 400。
          */
         PatchChannelRequest: {
             name?: string | null;
@@ -1562,6 +1570,10 @@ export interface components {
             user_limit?: number | null;
             /** @description null/0 = 提升顶层；值 = 设置父级（仅语音频道、最多两级） */
             parent_id?: string | null;
+            /** @description 0 = 不限制；8–128 = 上限；null 拒 400（仅语音频道） */
+            audio_bitrate_kbps?: number | null;
+            /** @description 0 = 默认 20ms；10/20 = 指定；null 拒 400（仅语音频道） */
+            audio_frame_ms?: number | null;
         };
         /** CreateCategoryRequest */
         CreateCategoryRequest: {

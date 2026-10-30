@@ -1,9 +1,15 @@
 <script setup lang="ts">
-// ChannelSettingsDialog 频道设置（#37 B2）：密码（留空=不改 / 移除）、人数上限、
-// 父频道。不回显现有密码；保存只发送变更字段（store 侧同约定）。校验以服务端为准。
+// ChannelSettingsDialog 频道设置（#37 B2、#46）：密码（留空=不改 / 移除）、人数上限、
+// 码率上限、帧长、父频道。不回显现有密码；保存只发送变更字段（store 侧同约定）。
+// 校验以服务端为准；音质选项在提交前按白名单归一，非法值回落跟随/默认。
 import { computed, ref } from 'vue'
 import { X } from 'lucide-vue-next'
-import { useServersStore } from '../stores/data'
+import {
+  AUDIO_BITRATE_CHOICES,
+  AUDIO_FRAME_CHOICES,
+  normalizeChannelAudioOptions,
+  useServersStore,
+} from '../stores/data'
 import { useNotifyStore } from '../stores/notify'
 
 const props = defineProps<{ channelId: string }>()
@@ -29,6 +35,17 @@ const password = ref('')
 const clearPassword = ref(false)
 const limit = ref(ch.value?.userLimit ?? 0)
 const parent = ref(ch.value?.parentId ?? '0')
+const bitrate = ref(ch.value?.audioBitrateKbps ?? 0)
+const frameMS = ref(ch.value?.audioFrameMs ?? 0)
+
+// bitrateLabel 码率选项文案（0 = 跟随用户设置）。
+function bitrateLabel(v: number) {
+  return v === 0 ? '跟随用户设置' : `${v} kbps`
+}
+
+function frameLabel(v: number) {
+  return v === 0 ? '默认（20ms）' : `${v}ms`
+}
 
 function onRemovePassword() {
   clearPassword.value = true
@@ -44,7 +61,12 @@ async function submit() {
   }
   try {
     // parent：'0' = 提升顶层；其余 = 设置父（空串在 store 侧=不改，这里总是有值）。
-    await servers.updateChannelOptions(servers.currentServerId, cur.id, parent.value, limit.value, password.value, clearPassword.value)
+    // 音质只对语音频道生效；text 频道服务端会把两字段归一为 0。
+    const audio = normalizeChannelAudioOptions(bitrate.value, frameMS.value)
+    await servers.updateChannelOptions(
+      servers.currentServerId, cur.id, parent.value, limit.value,
+      audio.bitrateKbps, audio.frameMS, password.value, clearPassword.value,
+    )
     notify.show('频道设置已保存')
     emit('close')
   } catch (e) {
@@ -74,6 +96,21 @@ async function submit() {
       <input v-model.number="limit" class="cs-input" type="number" min="0" max="100"
              :disabled="ch?.type !== 'voice'" title="0 = 不限">
       <p class="cs-hint">0 = 不限（仅语音频道生效）</p>
+
+      <!-- #46 音质：仅语音频道显示；0 = 跟随用户设置 / 默认 20ms -->
+      <template v-if="ch?.type === 'voice'">
+        <label class="cs-label">码率上限</label>
+        <select v-model.number="bitrate" class="cs-input">
+          <option v-for="v in AUDIO_BITRATE_CHOICES" :key="v" :value="v">{{ bitrateLabel(v) }}</option>
+        </select>
+        <p class="cs-hint">实际码率取用户设置与该上限的较小值</p>
+
+        <label class="cs-label">帧长</label>
+        <select v-model.number="frameMS" class="cs-input">
+          <option v-for="v in AUDIO_FRAME_CHOICES" :key="v" :value="v">{{ frameLabel(v) }}</option>
+        </select>
+        <p class="cs-hint">10ms 延迟更低，抗丢包略弱于 20ms</p>
+      </template>
 
       <label class="cs-label">父频道</label>
       <select v-model="parent" class="cs-input" :disabled="hasChildren || !parentChoices.length">

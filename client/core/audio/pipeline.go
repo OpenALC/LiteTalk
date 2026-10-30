@@ -3,6 +3,7 @@ package audio
 import (
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -44,18 +45,27 @@ type PipelineConfig struct {
 }
 
 // OpusConfig Opus 编码参数。零值字段由 ResolveOpusConfig 回落为管线默认值
-// （32kbps / VBR / DTX / FEC 开，丢包率告知 10%）。
+// （32kbps / VBR / DTX / FEC / DRED 开，丢包率告知 10%）。
 type OpusConfig struct {
 	BitrateKbps int   // 目标码率 kbps（16/24/32/48/64；0 → 32）
 	VBR         *bool // 可变码率（nil → true）
 	DTX         *bool // 静音期非连续传输（nil → true）
 	FEC         *bool // 带内前向纠错（nil → true）
+	DRED        *bool // 深度冗余：突发丢包恢复（nil → true）
 	PacketLoss  int   // 告知编码器的预期丢包率 %（0 → 10；FEC 关闭时无意义）
 }
 
+// DRED 参数（#44）：20 个 10ms 冗余帧 = 200ms 恢复窗口。libopus 只在预期
+// 丢包率足够高时才真正分配冗余，故开启 DRED 时 PLP 至少抬到 20%，关闭后恢复
+// 用户值；否则 10% 下实测可能完全没有 DRED 数据。
+const (
+	DREDDurationFrames = 20
+	DREDMinPacketLoss  = 20
+)
+
 // DefaultOpusConfig 管线默认 Opus 参数（与既有硬编码等价）。
 func DefaultOpusConfig() OpusConfig {
-	return OpusConfig{BitrateKbps: 32, VBR: boolPtr(true), DTX: boolPtr(true), FEC: boolPtr(true), PacketLoss: 10}
+	return OpusConfig{BitrateKbps: 32, VBR: boolPtr(true), DTX: boolPtr(true), FEC: boolPtr(true), DRED: boolPtr(true), PacketLoss: 10}
 }
 
 // ResolveOpusConfig 把零值字段回落为默认值，返回可直接应用的有效配置。
@@ -73,6 +83,9 @@ func ResolveOpusConfig(c OpusConfig) OpusConfig {
 	if c.FEC == nil {
 		c.FEC = d.FEC
 	}
+	if c.DRED == nil {
+		c.DRED = d.DRED
+	}
 	if c.PacketLoss <= 0 {
 		c.PacketLoss = d.PacketLoss
 	}
@@ -87,13 +100,14 @@ type RuntimeSettings struct {
 	Opus            OpusConfig
 	Denoise         bool
 	DenoiseStrength int       // 1弱/2中/3强（v0.1.2）
-	AGC             bool      // 自动增益（v1.1 默认开）
+	AGC             bool      // 自动增益（v1.1 默认开；APM 启用时映射 AGC2）
 	Gain            float64   // 麦克风线性增益，1.0 为不变
 	PlaybackGain    float64   // 扬声器总音量（mixer master gain），1.0 为不变
 	VADSens         int       // 0–4 五档
 	Complexity      int       // Opus 复杂度 0–10（≤0 表示不改）
 	InputMode       InputMode // 采集下混模式（变更即热重启采集流）
-	PreGainDB       float64   // 前置增益 dB（-12~+24，RNNoise 之前；0=不变）
+	PreGainDB       float64   // 前置增益 dB（-12~+24，RNNoise/APM 之前；0=不变）
+	EnableAPM       bool      // 启用 WebRTC APM（Beta 功能，默认关闭）
 }
 
 // DefaultPipelineConfig 返回默认管线配置（声卡回环、降噪开、增益 1）。
@@ -111,7 +125,7 @@ type Stats struct {
 	CaptureSamples    atomic.Uint64 // 实际写入采集环的采样数
 	CaptureDropped    atomic.Uint64 // 采集环满丢弃的采样数
 	FramesProcessed   atomic.Uint64 // 过 DSP 的 10ms 帧数
-	PacketsEncoded    atomic.Uint64 // 编码出的 Opus 包数（20ms）
+	PacketsEncoded    atomic.Uint64 // 编码出的 Opus 包数（当前帧长 10/20ms）
 	PacketsDecoded    atomic.Uint64 // 回环解码的包数
 	BytesEncoded      atomic.Uint64 // 编码总字节数
 	EncodeErrors      atomic.Uint64
@@ -121,7 +135,7 @@ type Stats struct {
 	PlaybackUnderruns atomic.Uint64 // 播放欠载次数（补静音）
 	PlaybackDropped   atomic.Uint64 // 播放环满丢弃的采样数
 	SpeakingChanges   atomic.Uint64 // 说话状态翻转次数
-	PTTDropped        atomic.Uint64 // 按键说话发送门拦下的包数（20ms）
+	PTTDropped        atomic.Uint64 // 按键说话发送门拦下的包数（10/20ms 按当前帧长）
 	LatencyCount      atomic.Uint64 // 延迟测量样本数
 	LatencySumUS      atomic.Uint64 // 延迟累计（微秒）
 	LatencyMaxUS      atomic.Uint64 // 延迟峰值（微秒）
@@ -187,8 +201,9 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	}
 }
 
-// Pipeline 音频管线：采集 → (10ms 帧) DSP → (2 帧拼 20ms) Opus 编码 →
-// 回环模式本地解码 → 播放。M2 时编码结果改经 OnPacket 送 RTP。
+// Pipeline 音频管线：采集 → (10ms 帧) DSP → Opus 编码（默认 2 帧拼 20ms，
+// 频道配置 10ms 时逐帧编码，见 SetFrameMS）→ 回环模式本地解码 → 播放。
+// M2 时编码结果改经 OnPacket 送 RTP。
 //
 // 使用方式：
 //   - 常规：NewPipeline → Start → Stop/Close；
@@ -203,6 +218,12 @@ type Pipeline struct {
 	dec      *codec.Decoder
 	encMu    sync.Mutex // 保护 enc：opus_encoder_ctl 不得并发 opus_encode
 	stats    Stats
+
+	// dredActive 编码器实际启用了 DRED（旧库/不支持时 SetDRED 失败 → false）。
+	// 受 encMu 保护；决定 PLP 是否抬到 DREDMinPacketLoss。
+	dredActive bool
+	// dredWarn 旧库不支持 DRED 时只记一次日志，不阻断音频链路。
+	dredWarn sync.Once
 
 	ctx      *Context
 	capture  *Capture
@@ -221,6 +242,10 @@ type Pipeline struct {
 	// 恒放行。原子指针：处理 goroutine 每帧 Load，SetSendGate 可在任意
 	// goroutine 调用（值对象长期存活，跨会话复用不会泄漏）。
 	sendGate atomic.Pointer[hotkey.Gate]
+
+	// frameMS Opus 帧长（10/20，默认 20；#46 频道配置热切换）。处理 goroutine
+	// 每帧 Load；切换时丢弃尚未拼满的半帧，最多损失一个旧帧。
+	frameMS atomic.Int32
 
 	done    chan struct{}
 	wg      sync.WaitGroup
@@ -256,6 +281,7 @@ func NewPipeline(cfg PipelineConfig) (*Pipeline, error) {
 		done:     make(chan struct{}),
 		nullRNG:  0x1EAF1234,
 	}
+	p.frameMS.Store(FrameMS20) // 默认 20ms；频道配置在入房后热切换
 	if cfg.InputMode > InputModeMix {
 		cfg.InputMode = InputModeAuto
 		p.cfg.InputMode = InputModeAuto
@@ -282,11 +308,13 @@ func NewPipeline(cfg PipelineConfig) (*Pipeline, error) {
 
 	enc, err := codec.NewEncoder(SampleRate, 1, codec.AppVoIP)
 	if err != nil {
+		dsp.Close() // NewDSP 可能已创建 APM 的 C++ 句柄
 		return nil, fmt.Errorf("init opus encoder: %w", err)
 	}
 	p.opus = ResolveOpusConfig(cfg.Opus)
 	if err := p.applyOpusConfig(enc, p.opus); err != nil {
 		enc.Close()
+		dsp.Close()
 		return nil, fmt.Errorf("opus encoder 参数: %w", err)
 	}
 	p.enc = enc
@@ -295,6 +323,7 @@ func NewPipeline(cfg PipelineConfig) (*Pipeline, error) {
 		dec, err := codec.NewDecoder(SampleRate, 1)
 		if err != nil {
 			enc.Close()
+			dsp.Close()
 			return nil, fmt.Errorf("init opus decoder: %w", err)
 		}
 		p.dec = dec
@@ -486,6 +515,9 @@ func (p *Pipeline) Close() error {
 		_ = p.dec.Close()
 		p.dec = nil
 	}
+	// APM 的 C++ 句柄须在采集/处理 goroutine 停止后释放（Stop 已等待 wg）；
+	// 混音器的渲染参考由 Session 在 pipe.Close 之前先 Stop。
+	p.dsp.Close()
 	return nil
 }
 
@@ -513,6 +545,18 @@ func (p *Pipeline) SetDenoiseStrength(level int) error { return p.dsp.SetDenoise
 // SetAGC 运行时开关自动增益（v1.1 默认开）。
 func (p *Pipeline) SetAGC(on bool) { p.dsp.SetAGC(on) }
 
+// SetEnableAPM 运行期启用/关闭 WebRTC APM（Beta 功能）。启用失败返回错误并
+// 保持关闭；关闭后完全回到 RNNoise/自研 AGC 旧链路。
+func (p *Pipeline) SetEnableAPM(on bool) error { return p.dsp.SetEnableAPM(on) }
+
+// ProcessRender 把混音器的实际播放输出作为 AEC 参考帧送入 APM。
+// 必须先于对应的采集帧处理；静音/耳聋时也应持续送零帧（Mixer.Tick 正常时
+// 自动满足）。APM 未启用或帧长不足时为 no-op，不阻塞混音 tick。
+func (p *Pipeline) ProcessRender(pcm []int16) { p.dsp.ProcessRender(pcm) }
+
+// APMActive 报告 WebRTC APM 当前是否启用（Beta 开关 + 创建成功；诊断/测试）。
+func (p *Pipeline) APMActive() bool { return p.dsp.APMActive() }
+
 // SetPreGainDB 运行时调整前置增益（-12~+24dB，越界报错；原子热生效）。
 func (p *Pipeline) SetPreGainDB(db float64) error { return p.dsp.SetPreGainDB(db) }
 
@@ -530,19 +574,51 @@ func (p *Pipeline) SetComplexity(v int) error {
 }
 
 // applyOpusConfig 把已解析的 Opus 配置刷到编码器（持锁，可在运行中调用）。
+// DRED 失败（旧库）只记一次日志并继续，其余参数错误上抛。
 func (p *Pipeline) applyOpusConfig(enc *codec.Encoder, c OpusConfig) error {
+	dred := c.DRED != nil && *c.DRED
+	frames := 0
+	if dred {
+		frames = DREDDurationFrames
+	}
+	p.dredActive = false
+	if err := enc.SetDRED(frames); err != nil {
+		if dred { // 关闭时旧库报「不支持 DRED」无须吓唬用户
+			p.warnDREDOnce(err)
+		}
+	} else {
+		p.dredActive = dred
+	}
+	plp := p.effectivePacketLoss(c.PacketLoss)
 	for name, fn := range map[string]func() error{
 		"SetBitrate":        func() error { return enc.SetBitrate(c.BitrateKbps * 1000) },
 		"SetVBR":            func() error { return enc.SetVBR(*c.VBR) },
 		"SetDTX":            func() error { return enc.SetDTX(*c.DTX) },
 		"SetInBandFEC":      func() error { return enc.SetInBandFEC(*c.FEC) },
-		"SetPacketLossPerc": func() error { return enc.SetPacketLossPerc(c.PacketLoss) },
+		"SetPacketLossPerc": func() error { return enc.SetPacketLossPerc(plp) },
 	} {
 		if err := fn(); err != nil {
 			return fmt.Errorf("%s: %w", name, err)
 		}
 	}
 	return nil
+}
+
+// effectivePacketLoss DRED 生效时把编码器 PLP 抬到 DREDMinPacketLoss：低于该值
+// libopus 可能不分配 DRED 冗余。仅影响告知编码器的值，用户配置的 PacketLoss
+// 保持不变。调用方须持 encMu（读 dredActive）。
+func (p *Pipeline) effectivePacketLoss(user int) int {
+	if p.dredActive && user < DREDMinPacketLoss {
+		return DREDMinPacketLoss
+	}
+	return user
+}
+
+// warnDREDOnce 记录一次 DRED 不可用（旧库/未启用 DRED 的构建），之后静默降级。
+func (p *Pipeline) warnDREDOnce(err error) {
+	p.dredWarn.Do(func() {
+		log.Printf("opus: DRED 不可用，按普通模式继续: %v", err)
+	})
 }
 
 // SetOpusBitrate 热调码率（kbps）。编码中调用安全（内部持锁）。
@@ -604,7 +680,32 @@ func (p *Pipeline) SetOpusFEC(on bool) error {
 	return nil
 }
 
-// SetOpusPacketLoss 热调告知编码器的预期丢包率 %（5–20）。
+// SetOpusDRED 热调深度冗余开关（#44）：开启 20 帧（200ms）冗余，关闭恢复
+// 用户配置的 PLP。旧库不支持 DRED 时只记一次日志并保持音频可用。
+func (p *Pipeline) SetOpusDRED(on bool) error {
+	p.encMu.Lock()
+	defer p.encMu.Unlock()
+	if p.enc == nil {
+		return codec.ErrClosed
+	}
+	frames := 0
+	if on {
+		frames = DREDDurationFrames
+	}
+	if err := p.enc.SetDRED(frames); err != nil {
+		if on {
+			p.warnDREDOnce(err)
+		}
+		p.dredActive = false
+	} else {
+		p.dredActive = on
+	}
+	p.opus.DRED = boolPtr(on)
+	return p.enc.SetPacketLossPerc(p.effectivePacketLoss(p.opus.PacketLoss))
+}
+
+// SetOpusPacketLoss 热调告知编码器的预期丢包率 %（5–20）。DRED 开启时实际
+// 下发给编码器的值不会低于 DREDMinPacketLoss，用户设置原样保留。
 func (p *Pipeline) SetOpusPacketLoss(pct int) error {
 	if pct < 0 || pct > 100 {
 		return fmt.Errorf("丢包率非法: %d", pct)
@@ -614,7 +715,7 @@ func (p *Pipeline) SetOpusPacketLoss(pct int) error {
 	if p.enc == nil {
 		return codec.ErrClosed
 	}
-	if err := p.enc.SetPacketLossPerc(pct); err != nil {
+	if err := p.enc.SetPacketLossPerc(p.effectivePacketLoss(pct)); err != nil {
 		return err
 	}
 	p.opus.PacketLoss = pct
@@ -631,6 +732,20 @@ func (p *Pipeline) AudioLevel() uint8 { return p.dsp.AudioLevel() }
 // SetSendGate 设置按键说话发送门（传 nil 清除）。Gate 是零分配的值对象，
 // 可在会话建立时注入一次、长期复用；热路径只做一次原子指针 Load。
 func (p *Pipeline) SetSendGate(g *hotkey.Gate) { p.sendGate.Store(g) }
+
+// SetFrameMS 热切换 Opus 帧长（10/20ms，#46 频道配置）。处理 goroutine 下一帧
+// 生效；从 20 切到 10 时尚未拼满的半帧被丢弃（最多一个 10ms 帧的短暂空隙）。
+// 编码缓冲仍按最大帧（960）预分配，热路径不因切换分配内存。
+func (p *Pipeline) SetFrameMS(ms int) error {
+	if ms != FrameMS10 && ms != FrameMS20 {
+		return fmt.Errorf("帧长非法: %d（只支持 10/20ms）", ms)
+	}
+	p.frameMS.Store(int32(ms))
+	return nil
+}
+
+// FrameMS 当前生效的 Opus 帧长（10/20ms）。
+func (p *Pipeline) FrameMS() int { return int(p.frameMS.Load()) }
 
 // ReadPlayback 从播放环读出解码后的采样（测试/null 汇用），返回采样数。
 func (p *Pipeline) ReadPlayback(out []int16) int { return p.playRing.Read(out) }
@@ -727,10 +842,13 @@ func (p *Pipeline) synthFrame(dst []int16) {
 	}
 }
 
-// processFrame 单个 10ms 帧的核心链路：DSP → 拼 20ms → 编码 → 发包门 →
-// 回环解码 → 播放环。全部使用预分配缓冲，零堆分配。仅处理 goroutine 调用。
+// processFrame 单个 10ms 帧的核心链路：DSP → 按当前帧长拼帧 → 编码 → 发包门 →
+// 回环解码 → 播放环。20ms 模式拼 2 个 10ms 帧，10ms 模式逐帧编码（#46）。
+// 全部使用预分配缓冲，零堆分配。仅处理 goroutine 调用。
 func (p *Pipeline) processFrame(frame []int16) {
-	if p.opusHalf == 0 {
+	frameMS := p.FrameMS()
+	// 10ms 每帧独立；20ms 以首半帧进入管线的时间作为延迟测量起点。
+	if frameMS == FrameMS10 || p.opusHalf == 0 {
 		p.frameStart = time.Now()
 	}
 	if _, err := p.dsp.Process(p.dspOut[:], frame); err != nil {
@@ -739,17 +857,26 @@ func (p *Pipeline) processFrame(frame []int16) {
 	}
 	p.stats.FramesProcessed.Add(1)
 
-	copy(p.opusFrame[p.opusHalf*FrameSize:(p.opusHalf+1)*FrameSize], p.dspOut[:])
-	p.opusHalf++
-	if p.opusHalf < 2 {
-		return
+	// samples 指向本次要编码的 PCM：10ms 直接引用 DSP 输出（无需拷贝），
+	// 20ms 攒满两帧后引用预分配的 opusFrame。
+	var samples []int16
+	if frameMS == FrameMS10 {
+		p.opusHalf = 0 // 切换瞬间丢弃旧模式残留的半帧
+		samples = p.dspOut[:FrameSize]
+	} else {
+		copy(p.opusFrame[p.opusHalf*FrameSize:(p.opusHalf+1)*FrameSize], p.dspOut[:])
+		p.opusHalf++
+		if p.opusHalf < 2 {
+			return
+		}
+		p.opusHalf = 0
+		samples = p.opusFrame[:OpusFrameSize]
 	}
-	p.opusHalf = 0
 
 	n, err := func() (int, error) {
 		p.encMu.Lock()
 		defer p.encMu.Unlock()
-		return p.enc.Encode(p.opusFrame[:], p.pktBuf[:])
+		return p.enc.Encode(samples, p.pktBuf[:])
 	}()
 	if err != nil {
 		p.stats.EncodeErrors.Add(1)

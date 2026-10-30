@@ -32,6 +32,12 @@
         "online": {
           "type": "boolean",
           "description": "在线态（presence:{uid} 存在即在线），与 REST 成员视图同源"
+        },
+        "priority": {
+          "type": "boolean",
+          "x-since": 3,
+          "x-go-omitempty": true,
+          "description": "优先发言（PrioritySpeaker，#45，协议 v3）：owner/Administrator 经 effective() 自动为 true；角色/成员角色变更在下次 channel.joined 刷新。缺省 false。"
         }
       },
       "required": ["user_id", "nickname", "mute", "deafen", "speaking", "online"],

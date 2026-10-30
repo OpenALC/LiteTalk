@@ -137,6 +137,10 @@ type Channel struct {
 	ParentID     *int64 `json:"parent_id" db:"parent_id"`
 	UserLimit    int    `json:"user_limit" db:"user_limit"`
 	PasswordHash string `json:"-" db:"password_hash"`
+	// #46 频道音质（仅 voice）：AudioBitrateKbps 0=跟随客户端设置、8–128=上限；
+	// AudioFrameMS 0=默认 20ms、10/20=指定帧长。text 频道由 API 层归零，Store 原样存取。
+	AudioBitrateKbps int `json:"audio_bitrate_kbps" db:"audio_bitrate_kbps"`
+	AudioFrameMS     int `json:"audio_frame_ms" db:"audio_frame_ms"`
 }
 
 // ChannelMemberRole 会话成员角色。owner 只用于 group（首个成员即创建者）。

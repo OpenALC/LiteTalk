@@ -52,12 +52,13 @@ func TestAudioSettings(t *testing.T) {
 	// 未设置：全部回落默认（v0.1.2：强度中档 2、VAD 中档 2、复杂度 9、双音量 100；
 	// v1.1：AGC 默认开、输入声道 auto）。
 	d := m.GetAudioSettings()
-	if d.BitrateKbps != 32 || !*d.VBR || !*d.DTX || !*d.FEC {
+	if d.BitrateKbps != 32 || !*d.VBR || !*d.DTX || !*d.FEC || !*d.DRED {
 		t.Fatalf("默认 Opus 参数异常: %+v", d)
 	}
 	if d.PacketLoss != 10 || !*d.Denoise || d.DenoiseStrength != 2 ||
 		!*d.AGC || *d.VADSens != 2 || d.Complexity != 9 ||
-		d.MicVolume != 100 || d.PlaybackVolume != 100 || d.InputMode != "auto" {
+		d.MicVolume != 100 || d.PlaybackVolume != 100 || d.InputMode != "auto" ||
+		d.EnableAPM {
 		t.Fatalf("默认 DSP 参数异常: %+v", d)
 	}
 
@@ -65,23 +66,24 @@ func TestAudioSettings(t *testing.T) {
 	f, tr := false, true
 	low := 0
 	custom := AudioSettings{
-		BitrateKbps: 48, VBR: &f, DTX: &tr, FEC: &f,
+		BitrateKbps: 48, VBR: &f, DTX: &tr, FEC: &f, DRED: &f,
 		PacketLoss: 15, Denoise: &f, DenoiseStrength: 3, AGC: &tr,
 		VADSens: &low, Complexity: 5,
 		MicVolume: 60, PlaybackVolume: 120, InputMode: "right", PreGainDB: 6,
+		EnableAPM: true,
 	}
 	if err := m.SetAudioSettings(custom); err != nil {
 		t.Fatalf("SetAudioSettings: %v", err)
 	}
 	m2 := NewWithPath(m.Path())
 	got := m2.GetAudioSettings()
-	if got.BitrateKbps != 48 || *got.VBR || !*got.DTX || *got.FEC {
+	if got.BitrateKbps != 48 || *got.VBR || !*got.DTX || *got.FEC || *got.DRED {
 		t.Fatalf("Opus 设置未持久化: %+v", got)
 	}
 	if got.PacketLoss != 15 || *got.Denoise || got.DenoiseStrength != 3 ||
 		!*got.AGC || *got.VADSens != 0 || got.Complexity != 5 ||
 		got.MicVolume != 60 || got.PlaybackVolume != 120 || got.InputMode != "right" ||
-		got.PreGainDB != 6 {
+		got.PreGainDB != 6 || !got.EnableAPM {
 		t.Fatalf("DSP 设置未持久化: %+v", got)
 	}
 
@@ -183,6 +185,28 @@ func TestHotkeySettings(t *testing.T) {
 	}
 	if got.PTT != "" || got.Mute != "" || got.Dual != "" {
 		t.Fatalf("非法绑定应被清空: %+v", got)
+	}
+}
+
+// TestWindowOverlaySettings 游戏内悬浮层（#47，Beta）：默认关闭、开关持久化往返。
+func TestWindowOverlaySettings(t *testing.T) {
+	m := tmpManager(t)
+	if m.GetWindowOverlaySettings().Enabled {
+		t.Fatal("悬浮层默认应关闭")
+	}
+	if err := m.SetWindowOverlaySettings(OverlaySettings{Enabled: true}); err != nil {
+		t.Fatalf("SetWindowOverlaySettings: %v", err)
+	}
+	m2 := NewWithPath(m.Path())
+	if !m2.GetWindowOverlaySettings().Enabled {
+		t.Fatal("启用状态未持久化")
+	}
+	if err := m2.SetWindowOverlaySettings(OverlaySettings{Enabled: false}); err != nil {
+		t.Fatalf("关闭: %v", err)
+	}
+	m3 := NewWithPath(m.Path())
+	if m3.GetWindowOverlaySettings().Enabled {
+		t.Fatal("关闭状态未持久化")
 	}
 }
 

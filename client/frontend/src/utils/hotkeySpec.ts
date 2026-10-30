@@ -10,9 +10,11 @@
 // 保证 UI 预览与 Go 侧落库结果一致。
 import { HOTKEYS } from '../composables/useHotkeys'
 
-// HOTKEY_ACTIONS 可绑定的四个动作（与 Go 侧 hotkey.Action 对齐；悄悄话属 issue #45，本批不绑）。
+// HOTKEY_ACTIONS 可绑定的五个动作（与 Go 侧 hotkey.Action 对齐；顺序即设置页
+// 展示顺序）。whisper 为按住悄悄话（#45），默认不绑定。
 export const HOTKEY_ACTIONS = [
   { id: 'ptt', label: '按住说话' },
+  { id: 'whisper', label: '悄悄话（按住）' },
   { id: 'mute', label: '闭麦 / 取消闭麦' },
   { id: 'deafen', label: '静音 / 取消静音' },
   { id: 'dual', label: '全关 / 全开' },

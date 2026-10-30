@@ -328,6 +328,36 @@ func TestPeerLoopback(t *testing.T) {
 		t.Fatalf("downlink payload mismatch: got %d bytes", len(got.Payload))
 	}
 
+	// 8. 链路快照（#49 B）：按 SSRC 的入站 RTP 统计。统计拦截器要等首个包
+	// 过手，轮询避免与读循环的时序竞争。RTT 依赖对端对本端 binding 请求的
+	// 响应，纯本机 fake SFU 下不保证有样本，不在本用例断言。
+	var snap LinkSnapshot
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		snap = peer.LinkSnapshot()
+		if len(snap.Inbound) > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(snap.Inbound) == 0 {
+		t.Fatal("应有入站音频流统计")
+	}
+	// Pion 的 TrackLocalStaticRTP 会重写 SSRC，以对端轨实际 SSRC 为准。
+	wantSSRC := uint32(track.SSRC())
+	found := false
+	for _, in := range snap.Inbound {
+		if in.SSRC == wantSSRC {
+			found = true
+			if in.PacketsReceived == 0 {
+				t.Fatalf("入站包数应大于 0: %+v", in)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("入站统计缺少下行 SSRC %d: %+v", wantSSRC, snap.Inbound)
+	}
+
 	close(localICE)
 	<-iceDone
 }
@@ -464,5 +494,57 @@ func TestPeerPendingICE(t *testing.T) {
 	peer.remoteMu.Unlock()
 	if queued != 1 {
 		t.Fatalf("pending ICE = %d, want 1", queued)
+	}
+}
+
+// TestSetFrameMSRTPTimestampStep 帧长 → RTP 时戳步进（#46）：20ms=960、10ms=480；
+// 非法值拒绝且不改当前步进。
+func TestSetFrameMSRTPTimestampStep(t *testing.T) {
+	p := &Peer{}
+	if err := p.SetFrameMS(10); err != nil {
+		t.Fatalf("SetFrameMS(10): %v", err)
+	}
+	if got := p.tsStep.Load(); got != 480 {
+		t.Fatalf("10ms 时戳步进 = %d, want 480", got)
+	}
+	if err := p.SetFrameMS(20); err != nil {
+		t.Fatalf("SetFrameMS(20): %v", err)
+	}
+	if got := p.tsStep.Load(); got != rtpTimestampStep {
+		t.Fatalf("20ms 时戳步进 = %d, want %d", got, rtpTimestampStep)
+	}
+	if err := p.SetFrameMS(15); err == nil {
+		t.Fatal("非法帧长应报错")
+	}
+	if got := p.tsStep.Load(); got != rtpTimestampStep {
+		t.Fatalf("非法值不应改变步进: %d", got)
+	}
+	if got := timestampStepForMS(10); got != 480 {
+		t.Fatalf("timestampStepForMS(10) = %d, want 480", got)
+	}
+}
+
+// TestPeerLinkSnapshot 未建立连接时快照为空且不 panic；关闭后同样返回零值。
+// 入站流/RTT 的真实数值依赖网络，由集成场景覆盖，这里锁住安全降级路径。
+func TestPeerLinkSnapshot(t *testing.T) {
+	p, err := NewPeer(PeerConfig{StreamID: "u1"})
+	if err != nil {
+		t.Fatalf("NewPeer: %v", err)
+	}
+	snap := p.LinkSnapshot()
+	if snap.HasRTT || snap.RTT != 0 {
+		t.Fatalf("未连接时不应有 RTT: %+v", snap)
+	}
+	if len(snap.Inbound) != 0 {
+		t.Fatalf("未连接时不应有入站流: %+v", snap.Inbound)
+	}
+	if rtt, ok := p.RTT(); ok || rtt != 0 {
+		t.Fatalf("RTT() 未连接应返回 false: %v %v", rtt, ok)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if snap := p.LinkSnapshot(); snap.HasRTT || len(snap.Inbound) != 0 {
+		t.Fatalf("关闭后快照应为零值: %+v", snap)
 	}
 }

@@ -825,6 +825,10 @@ type ChannelDTO struct {
 	ParentID    *ID  `json:"parent_id"`
 	HasPassword bool `json:"has_password"`
 	UserLimit   int  `json:"user_limit"`
+	// #46 音质（仅 voice）：码率上限 kbps（0=跟随用户设置）、Opus 帧长
+	//（0=默认 20ms）。text 频道恒为 0/0。
+	AudioBitrateKbps int `json:"audio_bitrate_kbps"`
+	AudioFrameMS     int `json:"audio_frame_ms"`
 }
 
 // ServerChannels GET /servers/{id}/channels 响应（categories + channels 两数组）。
@@ -981,16 +985,23 @@ func (c *APIClient) CreateSubchannel(serverID, name, typ, parentID string) (*Cha
 	return &ch, nil
 }
 
-// UpdateChannelOptions 更新频道选项（#37 B2）：只发送要改的字段——
+// UpdateChannelOptions 更新频道选项（#37 B2、#46）：只发送要改的字段——
 // parentID 空串不改 / "0" 提升顶层 / 其余设置父；userLimit <0 不改，>=0 设置；
+// audioBitrateKbps/audioFrameMS <0 不改，>=0 设置（0 = 跟随设置/默认帧长）；
 // password 空串不改，clearPassword 清除，非空设置。不触碰 name/type/position。
-func (c *APIClient) UpdateChannelOptions(channelID, parentID string, userLimit int, password string, clearPassword bool) (*ChannelDTO, error) {
+func (c *APIClient) UpdateChannelOptions(channelID, parentID string, userLimit, audioBitrateKbps, audioFrameMS int, password string, clearPassword bool) (*ChannelDTO, error) {
 	body := map[string]any{}
 	if parentID != "" {
 		body["parent_id"] = parentID
 	}
 	if userLimit >= 0 {
 		body["user_limit"] = userLimit
+	}
+	if audioBitrateKbps >= 0 {
+		body["audio_bitrate_kbps"] = audioBitrateKbps
+	}
+	if audioFrameMS >= 0 {
+		body["audio_frame_ms"] = audioFrameMS
 	}
 	if clearPassword {
 		body["password"] = nil

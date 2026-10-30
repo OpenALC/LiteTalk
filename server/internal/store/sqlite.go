@@ -570,10 +570,10 @@ func (s *SQLite) CreateChannel(ctx context.Context, c *Channel) error {
 	}
 	c.ID = newID(c.ID)
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO channels (id, server_id, name, type, category_id, position, password_hash, user_limit, parent_id, scope, dm_key)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+		`INSERT INTO channels (id, server_id, name, type, category_id, position, password_hash, user_limit, parent_id, audio_bitrate_kbps, audio_frame_ms, scope, dm_key)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
 		c.ID, c.ServerID, c.Name, c.Type, c.CategoryID, c.Position,
-		c.PasswordHash, c.UserLimit, c.ParentID, c.Scope)
+		c.PasswordHash, c.UserLimit, c.ParentID, c.AudioBitrateKbps, c.AudioFrameMS, c.Scope)
 	if err != nil {
 		return err
 	}
@@ -581,7 +581,7 @@ func (s *SQLite) CreateChannel(ctx context.Context, c *Channel) error {
 		Scan(&c.CreatedAt)
 }
 
-const sqChannelCols = `id, server_id, name, type, category_id, position, created_at, password_hash, user_limit, parent_id, scope, dm_key`
+const sqChannelCols = `id, server_id, name, type, category_id, position, created_at, password_hash, user_limit, parent_id, audio_bitrate_kbps, audio_frame_ms, scope, dm_key`
 
 // scanChannel 扫描一行频道（server_id/category_id/parent_id/dm_key 可空）。
 func scanChannelLite(rows interface{ Scan(...any) error }) (*Channel, error) {
@@ -589,7 +589,7 @@ func scanChannelLite(rows interface{ Scan(...any) error }) (*Channel, error) {
 	var serverID, catID, parentID sql.NullInt64
 	var dmKey sql.NullString
 	err := rows.Scan(&c.ID, &serverID, &c.Name, &c.Type, &catID, &c.Position, &c.CreatedAt,
-		&c.PasswordHash, &c.UserLimit, &parentID, &c.Scope, &dmKey)
+		&c.PasswordHash, &c.UserLimit, &parentID, &c.AudioBitrateKbps, &c.AudioFrameMS, &c.Scope, &dmKey)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -635,8 +635,8 @@ func (s *SQLite) ChannelsOfServer(ctx context.Context, serverID int64) ([]Channe
 }
 
 // UpdateChannel 全行写（#37 B1 起含 password_hash/user_limit/parent_id；#38 起含
-// server_id/scope/dm_key）：调用方必须先读再写，清除密码写空串、提升顶层写 NULL；
-// 会话行 ServerID=0 写 NULL、DMKey 空串写 NULL，server 行强制清空 dm_key。
+// server_id/scope/dm_key；#46 起含音质两列）：调用方必须先读再写，清除密码写空串、
+// 提升顶层写 NULL；会话行 ServerID=0 写 NULL、DMKey 空串写 NULL，server 行强制清空 dm_key。
 func (s *SQLite) UpdateChannel(ctx context.Context, c *Channel) error {
 	scope := normalizeChannelScope(c.Scope)
 	dmKey := c.DMKey
@@ -647,9 +647,11 @@ func (s *SQLite) UpdateChannel(ctx context.Context, c *Channel) error {
 	}
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE channels SET server_id = ?, name = ?, type = ?, category_id = ?, position = ?,
-		 password_hash = ?, user_limit = ?, parent_id = ?, scope = ?, dm_key = ? WHERE id = ?`,
+		 password_hash = ?, user_limit = ?, parent_id = ?, audio_bitrate_kbps = ?, audio_frame_ms = ?,
+		 scope = ?, dm_key = ? WHERE id = ?`,
 		nullID(c.ServerID), c.Name, c.Type, c.CategoryID, c.Position,
-		c.PasswordHash, c.UserLimit, c.ParentID, scope, nullString(dmKey), c.ID)
+		c.PasswordHash, c.UserLimit, c.ParentID, c.AudioBitrateKbps, c.AudioFrameMS,
+		scope, nullString(dmKey), c.ID)
 	if err != nil {
 		return err
 	}

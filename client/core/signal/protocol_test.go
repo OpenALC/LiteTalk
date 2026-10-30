@@ -90,7 +90,7 @@ func TestWireHelloJSON(t *testing.T) {
 	if TypeClientHello != "client.hello" || TypeServerHello != "server.hello" {
 		t.Fatalf("常量值漂移: %q %q", TypeClientHello, TypeServerHello)
 	}
-	if ProtocolVersionMin != 1 || ProtocolVersionMax != 2 || ProtocolVersionCurrent != 2 {
+	if ProtocolVersionMin != 1 || ProtocolVersionMax != 4 || ProtocolVersionCurrent != 4 {
 		t.Fatalf("协议版本常量漂移: %d %d %d",
 			ProtocolVersionMin, ProtocolVersionMax, ProtocolVersionCurrent)
 	}

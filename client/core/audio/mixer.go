@@ -11,14 +11,28 @@ import (
 // 足以吸收解码 goroutine（960/20ms 突发写）与混音 tick（480/10ms 读）的错位。
 const PeerRingCapacity = 4096
 
+// 优先发言 ducking（#45）：远端优先发言者说话时，其他远端 peer 乘 0.35。
+// duck 是独立乘数，与用户 SetGain 相乘——不得覆盖用户手动音量。
+// 10ms tick 下线性过渡：attack 12 拍 ≈120ms，release 20 拍 ≈200ms。
+const (
+	PriorityDuckGain = 0.35
+	duckAttackTicks  = 12
+	duckReleaseTicks = 20
+)
+
 // PeerInput 单路对端的混音输入：解码 goroutine 写 PCM，混音 tick 读。
-// 增益/静音可跨 goroutine 原子修改。
+// 增益/静音/duck 可跨 goroutine 原子修改。
 type PeerInput struct {
 	ID   string
 	ring *RingBuffer
 
 	gainBits atomic.Uint64 // math.Float64bits(gain)
 	muted    atomic.Bool
+	// duckBits duck 目标乘数（math.Float64bits；1.0 = 不压低，#45）。与 gainBits
+	// 分离：用户音量保持原值，duck 只在 Tick 内叠乘。
+	duckBits atomic.Uint64
+	// duckCur 平滑中的当前乘数。仅 Tick goroutine 读写（单写者，免锁）。
+	duckCur float64
 
 	// 统计（原子计数）
 	UnderrunFrames atomic.Uint64 // tick 读到不足 480 采样的帧数（对端静默/断流）
@@ -49,6 +63,48 @@ func (p *PeerInput) SetMuted(m bool) { p.muted.Store(m) }
 // Muted 当前静音状态。
 func (p *PeerInput) Muted() bool { return p.muted.Load() }
 
+// SetDucked 优先发言 ducking 开关（#45）：true 时该路目标乘数降为
+// PriorityDuckGain。只改独立乘数，不动用户 Gain。
+func (p *PeerInput) SetDucked(ducked bool) {
+	target := 1.0
+	if ducked {
+		target = PriorityDuckGain
+	}
+	p.duckBits.Store(math.Float64bits(target))
+}
+
+// Ducked 当前 duck 目标（平滑过程中的瞬时值不对外；UI/测试看目标态）。
+func (p *PeerInput) Ducked() bool {
+	return math.Float64frombits(p.duckBits.Load()) < 1.0
+}
+
+// nextDuck 推进一步 10ms duck 平滑并返回本拍乘数。仅 Tick goroutine 调用；
+// 纯算术、零分配。attack 快于 release，避免伴奏压得太慢、恢复拖沓。
+func (p *PeerInput) nextDuck() float64 {
+	target := math.Float64frombits(p.duckBits.Load())
+	cur := p.duckCur
+	if cur == target {
+		return cur
+	}
+	step := (1 - PriorityDuckGain) / duckReleaseTicks
+	if target < cur {
+		step = (1 - PriorityDuckGain) / duckAttackTicks
+	}
+	if cur < target {
+		cur += step
+		if cur > target {
+			cur = target
+		}
+	} else {
+		cur -= step
+		if cur < target {
+			cur = target
+		}
+	}
+	p.duckCur = cur
+	return cur
+}
+
 // BufferedSamples 输入环当前可读采样数（诊断用；只读原子，不干扰混音）。
 func (p *PeerInput) BufferedSamples() int { return p.ring.Available() }
 
@@ -58,7 +114,7 @@ func (p *PeerInput) BufferedSamples() int { return p.ring.Available() }
 // Tick 热路径零分配：peer 快照经 atomic.Pointer 切换，仅在 Add/Remove 时
 // 重建；累加器/帧缓冲全部预分配。
 type Mixer struct {
-	writeOut func([]int16) int // 输出汇（管线 WritePlayback 或测试环）
+	writeOut func([]int16) int // 输出汇（通常是包了 ProcessRender 的管线 WritePlayback）
 
 	mu       sync.Mutex
 	peers    map[string]*PeerInput
@@ -84,7 +140,8 @@ type Mixer struct {
 }
 
 // NewMixer 创建混音器。writeOut 为输出汇（每 tick 写入 480 采样），
-// 通常为 pipeline.WritePlayback。
+// 生产路径传包了 ProcessRender 的 pipeline.WritePlayback（同一份输出
+// 既是播放内容也是 AEC 参考）。
 func NewMixer(writeOut func([]int16) int) *Mixer {
 	m := &Mixer{
 		writeOut: writeOut,
@@ -106,6 +163,8 @@ func (m *Mixer) AddPeer(id string) *PeerInput {
 	}
 	p := &PeerInput{ID: id, ring: NewRingBuffer(PeerRingCapacity)}
 	p.SetGain(1.0)
+	p.duckCur = 1.0
+	p.duckBits.Store(math.Float64bits(1.0))
 	m.peers[id] = p
 	m.rebuildLocked()
 	return p
@@ -190,10 +249,13 @@ func (m *Mixer) Tick() {
 			}
 			p.UnderrunFrames.Add(1)
 		}
+		// duck 平滑即使在静音期间也推进：解除静音时乘数已是目标值，不会突然
+		// 从旧的 1.0 跳变（用户在悄悄话中取消静音的情形）。
+		duck := p.nextDuck()
 		if p.muted.Load() {
 			continue // 已排空，不混入
 		}
-		g := p.Gain()
+		g := p.Gain() * duck
 		if g == 1.0 {
 			for i := range m.acc {
 				m.acc[i] += int32(m.frame[i])

@@ -125,8 +125,11 @@ func main() {
 	}
 	defer pipe.Close()
 
-	// ---- 下行：混音器 → 管线播放环 ----
-	mixer := audio.NewMixer(pipe.WritePlayback)
+	// ---- 下行：混音器 → 管线播放环（混音输出同时作为 AEC 参考） ----
+	mixer := audio.NewMixer(func(pcm []int16) int {
+		pipe.ProcessRender(pcm)
+		return pipe.WritePlayback(pcm)
+	})
 	remoteMgr = audio.NewRemoteManager(mixer, logger)
 	states := audio.NewStateTable()
 	states.OnChange = func(id string, st audio.PeerVoiceState) {
@@ -378,8 +381,8 @@ func printStats(logger *log.Logger, pipe *audio.Pipeline, peer *rtc.Peer, mixer 
 		if !ok {
 			continue
 		}
-		fmt.Fprintf(&b, " | %s: rtp=%d lost=%d plc=%d fec=%d jit=%.1fms tgt=%d jbuf=%d ring=%d pcm=%d underrun=%d drop=%d",
-			id, ls.RTPReceived, ls.Jitter.Lost, ls.PLCFrames, ls.FECFrames,
+		fmt.Fprintf(&b, " | %s: rtp=%d lost=%d plc=%d fec=%d dred=%d jit=%.1fms tgt=%d jbuf=%d ring=%d pcm=%d underrun=%d drop=%d",
+			id, ls.RTPReceived, ls.Jitter.Lost, ls.PLCFrames, ls.FECFrames, ls.DREDFrames,
 			ls.Jitter.JitterMs, ls.Jitter.TargetPackets, ls.Jitter.Buffered,
 			ls.RingAvailable, ls.WrittenSamples, ls.UnderrunFrames, ls.DroppedSamples)
 	}

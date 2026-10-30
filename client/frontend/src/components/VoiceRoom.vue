@@ -4,10 +4,10 @@
 //（走查 1/2：延迟不常驻、卡片位于语音列表区下方）。
 // 批次③：成员卡片右键菜单——他人=添加好友/调节播放音量/请求闭麦/请求静音，
 // 自己=离开频道（走查 6）；请求经 voice.request_state 定向转发，对方接受后生效。
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import {
-  AudioLines, MicOff, HeadphoneOff, MoreHorizontal, UserPlus, Volume2, Info, PhoneOff,
-  UserPlus2,
+  Activity, AudioLines, MicOff, HeadphoneOff, MoreHorizontal, UserPlus, Volume2, Info, PhoneOff,
+  UserPlus2, Ear, Crown,
 } from 'lucide-vue-next'
 import SoundOrb from '../components/SoundOrb.vue'
 import { useVoiceStore } from '../stores/voice'
@@ -68,6 +68,24 @@ async function hangup() {
   }
 }
 
+// ---- 网络详情浮层（#49 B）----
+// voice-bar 只常驻 RTT；丢包/抖动/缓冲深度按需点开，避免控制条信息过载。
+// 离房时自动收起，重进房需要重新点开。
+const netOpen = ref(false)
+watch(() => voice.channelId, (id) => { if (!id) netOpen.value = false })
+
+// 悄悄话能力随服务端协议版本变化（#116）：进入房间时刷新，协议 <3 的服务端
+// 在成员菜单里禁用目标选择。重复进入（切房/重连）都重新取一次。
+watch(() => voice.channelId, (id) => { if (id) void voice.refreshWhisperSupport() },
+  { immediate: true })
+
+function fmtPct(v: number | undefined): string {
+  return v === undefined || v === null ? '—' : `${v.toFixed(1)}%`
+}
+function fmtMS(v: number | undefined): string {
+  return v === undefined || v === null ? '—' : `${Math.round(v)}ms`
+}
+
 // ---- 成员右键菜单（批次③，走查 6） ----
 // 他人：添加好友 / 调节播放音量 / 请求闭麦 / 请求静音；
 // 自己：离开频道（对他人=踢人，需权限模型，超范围——设计决策 5.9）。
@@ -82,6 +100,21 @@ const ctxItems = computed<CtxItem[]>(() => {
   return [
     { key: 'add-friend', label: '添加好友', icon: UserPlus2 },
     { key: 'volume', label: '调节播放音量', icon: Volume2 },
+    // 悄悄话（#45）：目标选择由本机维护，按住悄悄话热键时才真正只发给这些人。
+    // 协议 <3 的服务端无 voice.whisper（#116）：禁用入口并说明原因。
+    {
+      key: 'whisper',
+      label: voice.isWhisperTarget(c.member.user_id) ? '取消悄悄话目标' : '设为悄悄话目标',
+      icon: Ear,
+      disabled: !voice.whisperSupported,
+      title: voice.whisperSupported ? undefined : '服务器版本不支持悄悄话',
+    },
+    // 优先发言（#45）：需 ManageChannels，无权限时服务端 403 → toast。
+    {
+      key: 'priority',
+      label: c.member.priority ? '取消优先发言' : '设为优先发言',
+      icon: Crown,
+    },
     { key: 'req-mute', label: '请求闭麦', icon: MicOff },
     { key: 'req-deafen', label: '请求静音', icon: HeadphoneOff },
   ]
@@ -104,6 +137,12 @@ function onCtxSelect(key: string) {
       break
     case 'volume':
       toggleMore(m.user_id)
+      break
+    case 'whisper':
+      void voice.toggleWhisperTarget(m.user_id)
+      break
+    case 'priority':
+      void voice.setPrioritySpeaker(m.user_id, !m.priority)
       break
     case 'req-mute':
       // 请求≠强制：定向转发给对方，对方在 toast 里选择接受（设计决策 5.4）。
@@ -161,6 +200,10 @@ async function invite() {
         <div class="vname">
           {{ m.nickname }}<span v-if="m.tag" class="vtag">#{{ m.tag }}</span>
           <span v-if="m.user_id === voice.selfId()" class="me-tag">我</span>
+          <!-- 优先发言 / 悄悄话目标徽标（Lucide，不用 emoji） -->
+          <span v-if="m.priority" class="vbadge prio" title="优先发言"><Crown :size="12" /></span>
+          <span v-if="voice.isWhisperTarget(m.user_id)" class="vbadge ear"
+                title="悄悄话目标"><Ear :size="12" /></span>
         </div>
         <span v-if="chipFor(m)" class="chip" :class="chipFor(m)!.cls">
           <template v-if="chipFor(m)!.dual">
@@ -184,6 +227,18 @@ async function invite() {
             <button class="mp-item" @click="showProfile(m)">
               <Info :size="14" />查看资料
             </button>
+            <!-- per-peer 链路诊断（#49 B）：有下行统计才显示 -->
+            <div v-if="voice.peerDiag(m.user_id)" class="mp-diag">
+              <div class="mp-drow">
+                <span>丢包</span><b>{{ fmtPct(voice.peerDiag(m.user_id)?.loss_pct ?? 0) }}</b>
+              </div>
+              <div class="mp-drow">
+                <span>抖动</span><b>{{ fmtMS(voice.peerDiag(m.user_id)?.rtp_jitter_ms ?? 0) }}</b>
+              </div>
+              <div class="mp-drow">
+                <span>缓冲</span><b>{{ fmtMS(voice.peerDiag(m.user_id)?.buffer_ms ?? 0) }}</b>
+              </div>
+            </div>
           </div>
         </template>
       </div>
@@ -196,8 +251,38 @@ async function invite() {
 
     <!-- 语音控制条（走查 1/2）：仅语音频道中显示；延迟 + 挂断，无频道名/人数 -->
     <div v-if="voice.channelId" class="voice-bar">
-      <span class="vb-lat">
-        <span class="dot" />延迟 {{ voice.latencyMs }}ms
+      <div class="vb-lat-wrap">
+        <button class="vb-lat" title="查看网络详情" @click="netOpen = !netOpen">
+          <Activity :size="13" />延迟 {{ voice.latencyMs }}ms
+        </button>
+        <!-- 网络详情浮层（#49 B）：丢包 / 抖动 / 抖动缓冲深度 -->
+        <template v-if="netOpen">
+          <div class="net-mask" @click="netOpen = false" />
+          <div class="net-pop">
+            <div class="np-row">
+              <span>丢包</span><b>{{ fmtPct(voice.stats.loss_pct ?? 0) }}</b>
+            </div>
+            <div class="np-row">
+              <span>抖动</span><b>{{ fmtMS(voice.stats.rtp_jitter_ms ?? 0) }}</b>
+            </div>
+            <div class="np-row">
+              <span>缓冲</span>
+              <b>{{ fmtMS(voice.stats.jitter_buffer_ms ?? 0) }}</b>
+              <span class="np-dim">/ {{ fmtMS(voice.stats.jitter_target_ms ?? 0) }}</span>
+            </div>
+          </div>
+        </template>
+      </div>
+      <!-- 悄悄话目标指示（#45）：按住热键且有目标时高亮；离房目标标「离线」 -->
+      <span v-if="voice.whisperTargetViews.length" class="vb-whisper"
+            :class="{ on: voice.whisperActive }"
+            :title="voice.whisperActive ? '悄悄话发送中（仅目标可听）' : '按住悄悄话热键发送'">
+        <Ear :size="13" />
+        <span class="vb-wlabel">{{ voice.whisperActive ? '悄悄话中' : '悄悄话目标' }}</span>
+        <span v-for="(t, i) in voice.whisperTargetViews" :key="t.user_id" class="vb-wt">
+          {{ t.nickname }}<span v-if="!t.online" class="vb-off">离线</span><template
+            v-if="i < voice.whisperTargetViews.length - 1">、</template>
+        </span>
       </span>
       <button class="vb-leave" title="挂断" @click="hangup">
         <PhoneOff :size="15" />挂断
@@ -231,13 +316,44 @@ async function invite() {
   background: var(--surface); border: 1px solid var(--line);
   border-radius: 12px; box-shadow: var(--shadow-1);
 }
+.vb-lat-wrap { position: relative; }
 .vb-lat {
   display: flex; align-items: center; gap: 7px;
+  height: 26px; padding: 0 8px; margin-left: -8px; border-radius: 8px;
   font-size: 12.5px; color: var(--ink-400);
+  transition: background 0.15s, color 0.15s;
 }
-.vb-lat .dot {
-  width: 7px; height: 7px; border-radius: 50%; background: var(--green);
+.vb-lat:hover { background: var(--brand-50); color: var(--ink-600); }
+.vb-lat svg { flex: none; color: var(--green); }
+/* 网络详情浮层：控制条只常驻 RTT，其余指标按需展开 */
+.net-mask { position: fixed; inset: 0; z-index: 25; }
+.net-pop {
+  position: absolute; bottom: 34px; left: 0; z-index: 30;
+  width: 172px; padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 7px;
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: 12px; box-shadow: var(--shadow-2);
 }
+.np-row {
+  display: flex; align-items: baseline; gap: 8px;
+  font-size: 12px; color: var(--ink-400);
+}
+.np-row b { margin-left: auto; color: var(--ink-600); font-weight: 600; }
+.np-dim { font-size: 11px; color: var(--ink-300); }
+.vb-whisper {
+  display: inline-flex; align-items: center; gap: 5px; min-width: 0;
+  font-size: 12px; color: var(--ink-400, #8A9BB0);
+  padding: 3px 9px; border-radius: 99px;
+  background: rgba(79, 164, 243, 0.08);
+}
+.vb-whisper.on {
+  color: var(--brand-600); background: rgba(79, 164, 243, 0.16);
+}
+.vb-wlabel { font-weight: 600; }
+.vb-wt {
+  max-width: 96px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.vb-off { font-size: 10.5px; color: var(--ink-400, #8A9BB0); margin-left: 2px; }
 .vb-leave {
   display: inline-flex; align-items: center; gap: 6px;
   height: 32px; padding: 0 14px; border-radius: 9px;
@@ -278,6 +394,13 @@ async function invite() {
   color: var(--brand-600); background: rgba(79, 164, 243, 0.12);
   padding: 1px 6px; border-radius: 6px; margin-left: 5px; vertical-align: 1px;
 }
+.vbadge {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px; border-radius: 6px; margin-left: 4px;
+  vertical-align: -3px;
+}
+.vbadge.prio { color: #B7791F; background: rgba(183, 121, 31, 0.12); }
+.vbadge.ear { color: var(--brand-600); background: rgba(79, 164, 243, 0.12); }
 .chip {
   display: inline-flex; align-items: center; gap: 4px;
   padding: 3px 9px; border-radius: 99px;
@@ -326,4 +449,15 @@ async function invite() {
   transition: background 0.15s, color 0.15s;
 }
 .mp-item:hover { background: var(--brand-50); color: var(--ink-900); }
+/* per-peer 诊断（#49 B）：与操作项用分隔线区分，数值右对齐 */
+.mp-diag {
+  margin-top: 6px; padding: 8px 8px 2px;
+  border-top: 1px solid var(--line);
+  display: flex; flex-direction: column; gap: 6px;
+}
+.mp-drow {
+  display: flex; align-items: baseline; gap: 8px;
+  font-size: 11.5px; color: var(--ink-400);
+}
+.mp-drow b { margin-left: auto; color: var(--ink-600); font-weight: 600; }
 </style>

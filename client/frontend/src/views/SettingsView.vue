@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // SettingsView 设置页（独立路由 /settings，v0.1.2 起不再复用语音/文字舞台区域）。
-// 分区：连接/账号/常规/音频设备/语音/快捷键/关于；改动即热应用 + 落盘 config.json。
+// 分区：连接/账号/常规/音频设备/语音/Beta 功能/快捷键/关于；改动即热应用 + 落盘 config.json。
 // 语音默认值全部由 Go 侧 GetAudioSettings 回落（零值 → 默认），UI 只消费完整值。
 import { onMounted, onUnmounted, ref, computed } from 'vue'
 import { ArrowLeft, CircleAlert, Keyboard, LogOut, Mic, Volume2 } from 'lucide-vue-next'
@@ -16,7 +16,10 @@ import {
   findHotkeyConflicts, findInAppClashes, normalizeBinding, type HotkeyActionID,
 } from '../utils/hotkeySpec'
 import { cleanErrorText } from '../utils/errorText'
+import { withAudioDefaults } from '../utils/audioSettings'
+import { useWindowOverlay } from '../utils/windowOverlay'
 import ServerConnPanel from '../components/ServerConnPanel.vue'
+import NetworkDiagPanel from '../components/NetworkDiagPanel.vue'
 import Toast from '../components/Toast.vue'
 
 const router = useRouter()
@@ -76,10 +79,10 @@ function levelBridge() {
 // 语音设置：Go 侧返回已回落默认的完整值（码率/VBR/DTX/FEC/丢包/降噪强度/AGC/
 // 麦克风/扬声器音量/VAD 五档/Opus 复杂度/输入声道/前置增益）。
 const audio = ref<AudioSettings>({
-  bitrate_kbps: 32, vbr: true, dtx: true, fec: true,
+  bitrate_kbps: 32, vbr: true, dtx: true, fec: true, dred: true,
   packet_loss: 10, denoise: true, denoise_strength: 2, agc: true,
   mic_volume: 100, playback_volume: 100, vad_sens: 2, opus_complexity: 9,
-  input_mode: 'auto', pre_gain_db: 0,
+  input_mode: 'auto', pre_gain_db: 0, enable_apm: false,
 })
 const BITRATES = [16, 24, 32, 48, 64]
 // VAD 五档（v0.1.2 扩展；旧三档由 Go 侧映射 0/2/4）。
@@ -103,6 +106,29 @@ const denoiseIdx = ref(2)
 function syncDenoiseIdx() {
   denoiseIdx.value = audio.value.denoise ? audio.value.denoise_strength : 0
 }
+// Beta APM：默认关闭；平台不支持时禁用开关并提示（原生 stub 平台返回 false）。
+const apmSupported = ref(true)
+// 显式 setter：先改值再保存；保存/创建失败时回滚 UI 勾选，避免与 Go 侧实际状态不一致。
+async function setEnableAPM(on: boolean) {
+  if (on && !apmSupported.value) return
+  audio.value.enable_apm = on
+  if (!(await applyAudio())) {
+    audio.value.enable_apm = !on
+  }
+}
+
+// 游戏内悬浮层（#47，Beta，仅 Windows）：默认关闭；平台不支持时开关禁用。
+// 保存失败回滚勾选（逻辑在 useWindowOverlay 内，见单测）。
+const {
+  enabled: overlayEnabled,
+  supported: overlaySupported,
+  load: loadWindowOverlay,
+  setEnabled: applyWindowOverlay,
+} = useWindowOverlay(goApp())
+async function setWindowOverlay(on: boolean) {
+  const err = await applyWindowOverlay(on)
+  if (err) toast.value?.show(`悬浮层设置保存失败：${err}`, true)
+}
 function applyDenoiseIdx(i: number) {
   denoiseIdx.value = i
   if (i === 0) {
@@ -124,10 +150,10 @@ onMounted(async () => {
     if (typeof p?.mode === 'string') secretMode.value = p.mode
   })
   secretMode.value = await goApp().SecretStorageMode().catch(() => '')
-  audio.value = await goApp().GetAudioSettings()
-  // omitempty 字段（0/空值不序列化）在 UI 侧补默认，避免滑杆/下拉空值。
-  audio.value.input_mode ??= 'auto'
-  audio.value.pre_gain_db ??= 0
+  audio.value = withAudioDefaults(await goApp().GetAudioSettings())
+  apmSupported.value = await goApp().APMSupported().catch(() => false)
+  if (!apmSupported.value) audio.value.enable_apm = false
+  await loadWindowOverlay()
   // 热键读取单独兜异常：Go 侧绑定缺失时只回落默认值，不连带弄崩下面设备列表的加载。
   try {
     hk.value = await goApp().GetHotkeySettings()
@@ -234,12 +260,14 @@ async function testSpeaker() {
   }
 }
 
-// 语音设置改动：热应用到当前会话（未连接仅落盘），失败弹提示。
-async function applyAudio() {
+// 语音设置改动：热应用到当前会话（未连接仅落盘），失败弹提示并返回 false。
+async function applyAudio(): Promise<boolean> {
   try {
     await goApp().SetAudioSettings({ ...audio.value })
+    return true
   } catch (e) {
     toast.value?.show(`语音设置保存失败：${cleanErrorText(e, '未知错误')}`, true)
+    return false
   }
 }
 
@@ -375,6 +403,8 @@ function bindRecording(spec: string) {
       <section class="s-sec">
         <h3>连接</h3>
         <ServerConnPanel @saved="toast?.show('已保存')" />
+        <!-- 一键网络诊断（#49 C）：REST/信令/STUN/TURN 四项并测 -->
+        <NetworkDiagPanel />
       </section>
 
       <section class="s-sec">
@@ -466,7 +496,7 @@ function bindRecording(spec: string) {
       <section class="s-sec">
         <h3>语音</h3>
         <div class="s-row">
-          <div class="k">麦克风降噪强度（RNNoise）</div>
+          <div class="k">降噪强度（RNNoise）</div>
           <div class="seg-mini">
             <button v-for="(label, i) in DENOISE_LABELS" :key="i"
                     :class="{ on: denoiseIdx === i }"
@@ -544,6 +574,41 @@ function bindRecording(spec: string) {
           <input v-model.number="audio.packet_loss" type="range" min="5" max="20" step="5" @change="applyAudio">
           <span class="v">{{ audio.packet_loss }}%</span>
         </div>
+        <!-- 深度冗余：突发丢包时用后续包里的 200ms 冗余恢复，FEC 不可用时兜底 -->
+        <div class="s-row">
+          <div class="k">弱网深度冗余（DRED）</div>
+          <label class="switch">
+            <input v-model="audio.dred" type="checkbox" @change="applyAudio"><i />
+          </label>
+        </div>
+        <p class="s-note">提高突发丢包恢复，码率略增</p>
+      </section>
+
+      <section class="s-sec">
+        <h3>Beta 功能</h3>
+        <div class="s-row">
+          <div class="k">回声消除（WebRTC APM）</div>
+          <label class="switch" :class="{ disabled: !apmSupported }">
+            <input :checked="audio.enable_apm" type="checkbox" :disabled="!apmSupported"
+                   @change="setEnableAPM(($event.target as HTMLInputElement).checked)"><i />
+          </label>
+        </div>
+        <p class="s-note">启用 AEC / AGC2 / 高通；CPU 占用增加，默认关闭</p>
+        <p v-if="!apmSupported" class="s-note s-warn">
+          <CircleAlert :size="13" />当前平台不支持 WebRTC APM
+        </p>
+        <!-- 游戏内悬浮层：仅 Windows 有原生分层窗口；独占全屏（DX exclusive）可能不可见 -->
+        <div class="s-row">
+          <div class="k">游戏内悬浮层</div>
+          <label class="switch" :class="{ disabled: !overlaySupported }">
+            <input :checked="overlayEnabled" type="checkbox" :disabled="!overlaySupported"
+                   @change="setWindowOverlay(($event.target as HTMLInputElement).checked)"><i />
+          </label>
+        </div>
+        <p class="s-note">显示正在说话的成员；独占全屏游戏可能不可见</p>
+        <p v-if="!overlaySupported" class="s-note s-warn">
+          <CircleAlert :size="13" />仅 Windows 支持游戏内悬浮层
+        </p>
       </section>
 
       <section class="s-sec">
@@ -670,6 +735,8 @@ select {
 .s-row { flex-wrap: wrap; }
 input[type="range"] { flex: 0 0 140px; accent-color: var(--brand-500); }
 .switch { position: relative; width: 36px; height: 20px; flex: none; }
+.switch.disabled { opacity: 0.45; cursor: not-allowed; }
+.switch.disabled i { cursor: not-allowed; }
 .switch input { display: none; }
 .switch i {
   position: absolute; inset: 0;

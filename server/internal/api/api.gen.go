@@ -358,6 +358,12 @@ type CategoryInfo struct {
 
 // ChannelInfo 频道。ID 为十进制字符串（#31）。
 type ChannelInfo struct {
+	// AudioBitrateKbps 语音码率上限 kbps（#46）；0 = 不限制（跟随客户端用户设置），8–128 = 上限。 仅语音频道有意义，文字频道恒为 0。可选属性，服务端始终返回
+	AudioBitrateKbps *int `json:"audio_bitrate_kbps,omitempty"`
+
+	// AudioFrameMs 语音 Opus 帧长毫秒（#46）；0 = 默认 20ms，10/20 = 指定帧长。 仅语音频道有意义，文字频道恒为 0。可选属性，服务端始终返回
+	AudioFrameMs *int `json:"audio_frame_ms,omitempty"`
+
 	// CategoryId 分类归属；null = 未分类（请求侧 0 也表示未分类）
 	CategoryId *ID  `json:"category_id"`
 	CreatedAt  Time `json:"created_at"`
@@ -430,6 +436,12 @@ type CreateCategoryRequest struct {
 
 // CreateChannelRequest defines model for CreateChannelRequest.
 type CreateChannelRequest struct {
+	// AudioBitrateKbps 语音码率上限 kbps（#46，仅语音频道）；0/缺省 = 不限制，8–128 = 上限
+	AudioBitrateKbps *int `json:"audio_bitrate_kbps,omitempty"`
+
+	// AudioFrameMs 语音 Opus 帧长毫秒（#46，仅语音频道）；0/缺省 = 默认 20ms，10/20 = 指定
+	AudioFrameMs *int `json:"audio_frame_ms,omitempty"`
+
 	// CategoryId 0/缺省 = 未分类；请求侧数字与字符串双接受（#31）
 	CategoryId *ID `json:"category_id,omitempty"`
 
@@ -709,7 +721,7 @@ type PasswordResetRequest struct {
 // PatchCategoryRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name 不可清， 空值被校验拒 400；position 的 null 拒 400），值 = 设置。 name 与 position 至少给一个。
 type PatchCategoryRequest = PatchCategoryBody
 
-// PatchChannelRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name/type 不可清，空值被校验拒 400；category_id 的 null = 移出分类；position 的 null 拒 400——「删除位置」无语义），值 = 设置。#37：password 三态 （缺省不改、null/空串清除、非空设置）；user_limit 的 null 拒 400； parent_id 的 null/0 = 提升顶层、值 = 设置父级。
+// PatchChannelRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（name/type 不可清，空值被校验拒 400；category_id 的 null = 移出分类；position 的 null 拒 400——「删除位置」无语义），值 = 设置。#37：password 三态 （缺省不改、null/空串清除、非空设置）；user_limit 的 null 拒 400； parent_id 的 null/0 = 提升顶层、值 = 设置父级。#46：audio_bitrate_kbps / audio_frame_ms 缺省不改，0 = 清零（跟随/默认），null 拒 400。
 type PatchChannelRequest = PatchChannelBody
 
 // PatchConversationRequest JSON Merge Patch（RFC 7396）：缺省 = 不改；name 为 1–64 字符， null/空串被校验拒 400。仅 group owner 可写。

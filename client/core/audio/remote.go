@@ -121,8 +121,9 @@ func (t *StateTable) Snapshot() map[string]PeerVoiceState {
 type RemoteStats struct {
 	RTPReceived  atomic.Uint64 // 收到的 RTP 包数
 	FramesPopped atomic.Uint64 // jitter 弹出的正常帧数
-	PLCFrames    atomic.Uint64 // 无 FEC 可用时的 PLC 补偿帧数
+	PLCFrames    atomic.Uint64 // 无 FEC/DRED 可用时的 PLC 补偿帧数
 	FECFrames    atomic.Uint64 // 用后继包带内 FEC 恢复的丢帧数
+	DREDFrames   atomic.Uint64 // 用后继包 DRED 冗余恢复的丢帧数（#44）
 	DecodeErrors atomic.Uint64
 }
 
@@ -134,14 +135,23 @@ type remotePeer struct {
 	dec   *codec.Decoder
 	input *PeerInput
 
+	// dred 懒创建的 DRED 解码器（#44）：只在丢包且 FEC 不可用时才需要。
+	// 仅解码 goroutine 访问，无锁；dredFail 标记创建失败，避免反复分配。
+	dred     *codec.DREDDecoder
+	dredFail bool
+
 	done chan struct{}
 	wg   sync.WaitGroup
 
 	Stats RemoteStats
 
+	// frameMS 当前频道 Opus 帧长（10/20ms，#46）：决定弹帧节拍与 PLC 合成长度。
+	// 由 RemoteManager.SetFrameMS 统一写入（同一语音频道配置一致）。
+	frameMS atomic.Int32
+
 	// 预分配热路径缓冲（仅解码循环使用）
 	payloadBuf [rtc.JitterMaxPayload]byte
-	fecBuf     [rtc.JitterMaxPayload]byte // 丢帧瞬间的后继包副本（FEC 用）
+	fecBuf     [rtc.JitterMaxPayload]byte // 丢帧瞬间的后继包副本（FEC/DRED 用）
 	pcm        [OpusFrameSize]int16
 }
 
@@ -150,6 +160,15 @@ type remotePeer struct {
 type RemoteManager struct {
 	mixer *Mixer
 	log   *log.Logger
+
+	// OnPeerChange 远端链路增删后的通知（#45 优先发言 ducking 重算）。在释放
+	// rm.mu 之后、调用方 goroutine 上同步触发，可安全回读状态表/混音器；
+	// 构造期赋值一次，之后只读。不得在实现里阻塞或回调本管理器。
+	OnPeerChange func()
+
+	// frameMS 当前频道帧长（10/20ms，#46）。新接入的远端轨继承此值；
+	// 热切换时同步写入全部在管远端。
+	frameMS atomic.Int32
 
 	mu    sync.Mutex
 	peers map[string]*remotePeer
@@ -160,8 +179,30 @@ func NewRemoteManager(m *Mixer, logger *log.Logger) *RemoteManager {
 	if logger == nil {
 		logger = log.New(nopWriter{}, "", 0)
 	}
-	return &RemoteManager{mixer: m, log: logger, peers: make(map[string]*remotePeer)}
+	rm := &RemoteManager{mixer: m, log: logger, peers: make(map[string]*remotePeer)}
+	rm.frameMS.Store(FrameMS20)
+	return rm
 }
+
+// SetFrameMS 热切换下行帧长（10/20ms，#46 频道配置）：后续弹帧节拍与 PLC
+// 帧长随之改变。切换不重置抖动缓冲——已缓冲的旧帧按包内时长解码，过渡期
+// 最多一拍的节拍偏差。
+func (rm *RemoteManager) SetFrameMS(ms int) error {
+	if ms != FrameMS10 && ms != FrameMS20 {
+		return fmt.Errorf("帧长非法: %d（只支持 10/20ms）", ms)
+	}
+	rm.frameMS.Store(int32(ms))
+	rm.mu.Lock()
+	for _, rp := range rm.peers {
+		rp.frameMS.Store(int32(ms))
+		_ = rp.jb.SetFrameMS(ms) // 帧长同时决定抖动估计的 transit 基准与预填目标
+	}
+	rm.mu.Unlock()
+	return nil
+}
+
+// FrameMS 当前下行帧长（10/20ms）。
+func (rm *RemoteManager) FrameMS() int { return int(rm.frameMS.Load()) }
 
 // identifyPeer 从下行轨识别说话成员（与信令 user_id 对齐，供 StateTable/
 // peer_left 对账）：服务端约定 TrackID="audio-<user_id>"、StreamID=
@@ -199,6 +240,8 @@ func (rm *RemoteManager) HandleTrack(track *webrtc.TrackRemote, _ *webrtc.RTPRec
 		dec:   dec,
 		done:  make(chan struct{}),
 	}
+	rp.frameMS.Store(rm.frameMS.Load())
+	_ = rp.jb.SetFrameMS(int(rm.frameMS.Load())) // 抖动估计/预填目标按频道帧长换算
 
 	rm.mu.Lock()
 	if old, ok := rm.peers[peerID]; ok {
@@ -209,50 +252,63 @@ func (rm *RemoteManager) HandleTrack(track *webrtc.TrackRemote, _ *webrtc.RTPRec
 	rm.mu.Unlock()
 
 	rm.log.Printf("remote: track up for %s (ssrc=%d, pt=%d)", peerID, track.SSRC(), track.PayloadType())
+	rm.peerChanged()
 	rp.wg.Add(2)
 	go rp.readLoop(rm)
 	go rp.decodeLoop()
+}
+
+// peerChanged 通知远端链路集合变化（调用方须已释放 rm.mu）。
+func (rm *RemoteManager) peerChanged() {
+	if rm.OnPeerChange != nil {
+		rm.OnPeerChange()
+	}
 }
 
 // RemovePeer 销毁某对端链路（channel.peer_left / 离房时调用），连同该 peer 的
 // 混音输入一并销毁。幂等；锁序固定 rm.mu → mixer.mu。
 func (rm *RemoteManager) RemovePeer(peerID string) {
 	rm.mu.Lock()
-	defer rm.mu.Unlock()
 	rp, ok := rm.peers[peerID]
 	if !ok {
+		rm.mu.Unlock()
 		return
 	}
 	delete(rm.peers, peerID)
 	rp.stop()
 	rm.mixer.RemovePeer(peerID)
+	rm.mu.Unlock()
 	rm.log.Printf("remote: peer %s removed", peerID)
+	rm.peerChanged()
 }
 
 // removeIf track EOF 自愈拆除：仅当 map 中仍是本实例时拆除（不误伤重协商
 // 后的新链路）。由 readLoop 异步调用（避免 stop 自我等待）。
 func (rm *RemoteManager) removeIf(rp *remotePeer) {
 	rm.mu.Lock()
-	defer rm.mu.Unlock()
 	if rm.peers[rp.id] != rp {
+		rm.mu.Unlock()
 		return
 	}
 	delete(rm.peers, rp.id)
 	rp.stop()
 	rm.mixer.RemovePeer(rp.id)
+	rm.mu.Unlock()
 	rm.log.Printf("remote: peer %s track ended, removed", rp.id)
+	rm.peerChanged()
 }
 
 // RemoveAll 销毁全部对端链路（离开频道/断开时调用）。
 func (rm *RemoteManager) RemoveAll() {
 	rm.mu.Lock()
-	defer rm.mu.Unlock()
 	peers := rm.peers
 	rm.peers = make(map[string]*remotePeer)
 	for id, rp := range peers {
 		rp.stop()
 		rm.mixer.RemovePeer(id)
 	}
+	rm.mu.Unlock()
+	rm.peerChanged()
 }
 
 // PeerIDs 当前在管的远端 peer 列表。
@@ -280,11 +336,15 @@ func (rm *RemoteManager) JitterStats(peerID string) (rtc.JitterStats, bool) {
 // RemoteLinkStats 单路远端链路诊断快照（#95）：抖动缓冲、FEC/PLC 计数与
 // 混音输入环占用。全部为原子/快照读取，不在音频热路径上。
 type RemoteLinkStats struct {
+	// SSRC 该路下行轨的同步源标识：Session.Stats 据此把 PeerConnection 的
+	// 入站 RTP 统计归到对应成员（#49 B）。track 为空时为 0。
+	SSRC           uint32
 	Jitter         rtc.JitterStats
 	RTPReceived    uint64
 	FramesPopped   uint64
 	PLCFrames      uint64
 	FECFrames      uint64
+	DREDFrames     uint64
 	DecodeErrors   uint64
 	RingAvailable  int    // 该 peer 混音输入环当前可读采样数
 	UnderrunFrames uint64 // 混音 tick 读到不足的帧数
@@ -306,7 +366,11 @@ func (rm *RemoteManager) LinkStats(peerID string) (RemoteLinkStats, bool) {
 		FramesPopped: rp.Stats.FramesPopped.Load(),
 		PLCFrames:    rp.Stats.PLCFrames.Load(),
 		FECFrames:    rp.Stats.FECFrames.Load(),
+		DREDFrames:   rp.Stats.DREDFrames.Load(),
 		DecodeErrors: rp.Stats.DecodeErrors.Load(),
+	}
+	if rp.track != nil {
+		st.SSRC = uint32(rp.track.SSRC())
 	}
 	if rp.input != nil {
 		st.RingAvailable = rp.input.BufferedSamples()
@@ -317,14 +381,35 @@ func (rm *RemoteManager) LinkStats(peerID string) (RemoteLinkStats, bool) {
 	return st, true
 }
 
-// stop 停止并回收单路（解码器、goroutine、混音输入）。
+// stop 停止并回收单路（解码器、DRED 解码器、goroutine、混音输入）。
 func (rp *remotePeer) stop() {
 	close(rp.done)
 	if rp.track != nil {
 		_ = rp.track.SetReadDeadline(time.Now()) // 解除 readLoop 阻塞
 	}
 	rp.wg.Wait()
+	if rp.dred != nil {
+		_ = rp.dred.Close()
+		rp.dred = nil
+	}
 	_ = rp.dec.Close()
+}
+
+// dredDecoder 懒创建 DRED 解码器（#44）。平台/库不支持时只记一次日志并置
+// dredFail，之后丢帧继续走 PLC——不能因为冗余不可用影响正常音频。
+// 仅解码 goroutine 调用。
+func (rp *remotePeer) dredDecoder() *codec.DREDDecoder {
+	if rp.dred != nil || rp.dredFail {
+		return rp.dred
+	}
+	d, err := codec.NewDREDDecoder()
+	if err != nil {
+		rp.dredFail = true
+		log.Printf("remote: DRED decoder unavailable for %s: %v", rp.id, err)
+		return nil
+	}
+	rp.dred = d
+	return d
 }
 
 // readLoop 阻塞读 RTP → 推 jitter（每路唯一写者）。
@@ -346,25 +431,45 @@ func (rp *remotePeer) readLoop(rm *RemoteManager) {
 	}
 }
 
-// decodeLoop 20ms 节拍驱动 decodeOnce。
+// decodeLoop 按当前帧长驱动 decodeOnce（20ms 或 10ms，可热切换）。
 func (rp *remotePeer) decodeLoop() {
 	defer rp.wg.Done()
-	tick := time.NewTicker(JitterPopInterval)
-	defer tick.Stop()
+	timer := time.NewTimer(rp.popInterval())
+	defer timer.Stop()
 	for {
 		select {
 		case <-rp.done:
 			return
-		case <-tick.C:
+		case <-timer.C:
 		}
 		rp.decodeOnce()
+		timer.Reset(rp.popInterval())
 	}
 }
 
+// frameMSValue 当前帧长（零值按默认 20ms，测试可直接构造 remotePeer）。
+func (rp *remotePeer) frameMSValue() int {
+	if int(rp.frameMS.Load()) == FrameMS10 {
+		return FrameMS10
+	}
+	return FrameMS20
+}
+
+// popInterval 弹帧节拍 = 当前帧长。
+func (rp *remotePeer) popInterval() time.Duration {
+	return time.Duration(rp.frameMSValue()) * time.Millisecond
+}
+
+// frameSamples 当前帧长的 48kHz 采样数（10ms=480，20ms=960）。
+func (rp *remotePeer) frameSamples() int {
+	return rp.frameMSValue() * SampleRate / 1000
+}
+
 // decodeOnce 单拍：到点 pop → 解码/丢帧补偿 → 写该 peer 的混音输入环。
-// 丢帧时若后继包已在 jitter 槽内，先用它的带内 FEC 恢复丢失帧（不消费后继，
-// 也不做常驻 +1 包 lookahead，稳态延迟不变）；连续丢包/后继未到/后继是 DTX
-// 心跳包时回落 PLC。
+// 丢帧时若后继包已在 jitter 槽内且带 LBRR，先用它的带内 FEC 恢复丢失帧（不消费
+// 后继，也不做常驻 +1 包 lookahead，稳态延迟不变）；FEC 不可用时再尝试同一后继
+// 包里的 DRED 冗余（#44，覆盖编码端未开 FEC / 该包无 LBRR 的情况）；都失败才
+// 回落 PLC。PLC 按当前帧长合成（10ms=480、20ms=960，#46）。
 // 热路径零分配（预分配 payloadBuf/fecBuf/pcm）；测试可同步调用。
 func (rp *remotePeer) decodeOnce() {
 	n, lost, ok := rp.jb.Pop(rp.payloadBuf[:])
@@ -372,15 +477,28 @@ func (rp *remotePeer) decodeOnce() {
 		return // 预填中/断流静默：本拍不出帧，混音侧自然补零
 	}
 	if lost {
-		// 只在丢帧瞬间窥视后继槽位；DTX 包（≤2 字节）不含 FEC 数据。
+		// 只在丢帧瞬间窥视后继槽位；DTX 包（≤2 字节）不含 FEC/DRED 数据。
+		// 先用 opus_packet_has_lbrr 探测：opus_decode(fec=true) 在没有 LBRR 时
+		// 会静默返回 PLC 帧且不报错，不探测就会把 PLC 误计入 FEC 并挡住 DRED。
 		if nn, ok := rp.jb.PeekNext(rp.fecBuf[:]); ok && nn > rtc.DTXPayloadMax {
-			if m, err := rp.dec.Decode(rp.fecBuf[:nn], rp.pcm[:], true); err == nil {
-				rp.Stats.FECFrames.Add(1)
-				rp.input.Write(rp.pcm[:m])
-				return
+			if codec.HasLBRR(rp.fecBuf[:nn]) {
+				// FEC 恢复的是上一帧，输出长度必须按当前帧长（10ms=480，
+				// 20ms=960）截断；传整块 960 会让解码器按错误帧长解释 LBRR。
+				if m, err := rp.dec.Decode(rp.fecBuf[:nn], rp.pcm[:rp.frameSamples()], true); err == nil {
+					rp.Stats.FECFrames.Add(1)
+					rp.input.Write(rp.pcm[:m])
+					return
+				}
+			}
+			if d := rp.dredDecoder(); d != nil {
+				if m, ok, err := d.Recover(rp.dec, rp.fecBuf[:nn], rp.pcm[:], rp.frameSamples(), SampleRate); ok && err == nil {
+					rp.Stats.DREDFrames.Add(1)
+					rp.input.Write(rp.pcm[:m])
+					return
+				}
 			}
 		}
-		m, err := rp.dec.Decode(nil, rp.pcm[:], false) // PLC
+		m, err := rp.dec.Decode(nil, rp.pcm[:rp.frameSamples()], false) // PLC：按当前帧长合成
 		if err != nil {
 			rp.Stats.DecodeErrors.Add(1)
 			return
@@ -398,7 +516,7 @@ func (rp *remotePeer) decodeOnce() {
 	rp.input.Write(rp.pcm[:m])
 }
 
-// JitterPopInterval 抖动缓冲弹出节拍（与 Opus 帧长一致）。
+// JitterPopInterval 默认抖动缓冲弹出节拍（20ms 帧长；10ms 频道按配置动态计算）。
 const JitterPopInterval = 20 * time.Millisecond
 
 type nopWriter struct{}

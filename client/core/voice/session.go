@@ -37,9 +37,13 @@ const KickReasonLoginExpired = "login_expired"
 // Events 会话 → UI 的事件回调（由 app 层接到 runtime.EventsEmit）。
 type Events struct {
 	// OnPeerJoin 有成员进入房间（含自己首次入房的成员全量推送前的逐个通知）。
-	OnPeerJoin func(userID, nickname, tag string, speaking, mute, deafen bool)
+	// priority 是优先发言标记（#45，MemberInfo.priority）。
+	OnPeerJoin func(userID, nickname, tag string, speaking, mute, deafen, priority bool)
 	// OnPeerLeave 有成员离开。
 	OnPeerLeave func(userID string)
+	// OnPeerPriority 某成员优先发言标记实时变化（voice.priority，#45）。
+	// 角色变更不实时通知，重进房时随 channel.joined 刷新。
+	OnPeerPriority func(userID string, priority bool)
 	// OnPeerSpeaking 远端说话状态变化。
 	OnPeerSpeaking func(userID string, speaking, mute, deafen bool)
 	// OnLatency 回环/远端延迟周期上报（毫秒）。
@@ -106,6 +110,12 @@ type Events struct {
 	// app 层固定以 data:resync 事件转发，前端收到后经绑定自取。
 	// 跑在独立 goroutine，可安全触发网络请求；nil = 不通知。
 	OnResync func()
+	// OnWhisperAck 悄悄话目标生效确认（voice.whisper_ack，#116 协议 v4）：
+	// seq 是 voice.whisper 原样回传的请求序号，active=true 表示目标集合已应用
+	// 到本连接的 SFU peer（可以开麦），false 表示取消已生效（关麦）。
+	// 只有仍在房内才会回调；实现侧按自己的在途 seq 过滤过期确认。
+	// 跑在 ws 读循环 goroutine，实现侧只做转发，不得阻塞、不得同步 Close 会话。
+	OnWhisperAck func(seq int64, active bool)
 }
 
 // VoiceStats 推给 UI 的语音房统计快照。
@@ -122,6 +132,15 @@ type VoiceStats struct {
 	PlaybackUnderruns  uint64         `json:"playback_underruns"`
 	PlaybackDropped    uint64         `json:"playback_dropped"`
 	Peers              []PeerLinkDiag `json:"peers,omitempty"`
+
+	// 网络链路诊断（#49 B）：真实 RTT 已在 LatencyMS；这里补入站 RTP 丢包、
+	// RFC3550 抖动与自适应抖动缓冲深度。全为 0 时省略（未入房/无下行流）。
+	LossPct        float64 `json:"loss_pct,omitempty"`
+	RTPJitterMS    float64 `json:"rtp_jitter_ms,omitempty"`
+	JitterBufferMS int     `json:"jitter_buffer_ms,omitempty"`
+	JitterTargetMS int     `json:"jitter_target_ms,omitempty"`
+	RTPReceived    uint32  `json:"rtp_received,omitempty"`
+	RTPLost        int32   `json:"rtp_lost,omitempty"`
 }
 
 // PeerLinkDiag 单路下行链路诊断（#95）：抖动缓冲深度、丢失/FEC/PLC 计数
@@ -135,8 +154,19 @@ type PeerLinkDiag struct {
 	RingSamples           int     `json:"ring_samples"`
 	PLCFrames             uint64  `json:"plc_frames"`
 	FECFrames             uint64  `json:"fec_frames"`
+	DREDFrames            uint64  `json:"dred_frames"`
 	UnderrunFrames        uint64  `json:"underrun_frames"`
 	DroppedSamples        uint64  `json:"dropped_samples"`
+
+	// 入站 RTP 与缓冲深度（#49 B）：loss_pct / rtp_jitter_ms 来自 Pion 的
+	// InboundRTPStreamStats；buffer_ms/target_ms 由抖动缓冲包数按帧长换算。
+	// 与上面的 jitter_ms（缓冲自身的到达抖动估计）语义不同，故分开命名。
+	LossPct     float64 `json:"loss_pct,omitempty"`
+	RTPJitterMS float64 `json:"rtp_jitter_ms,omitempty"`
+	BufferMS    int     `json:"buffer_ms,omitempty"`
+	TargetMS    int     `json:"target_ms,omitempty"`
+	RTPReceived uint32  `json:"rtp_received,omitempty"`
+	RTPLost     int32   `json:"rtp_lost,omitempty"`
 }
 
 // PeerView UI 侧成员视图。
@@ -147,6 +177,7 @@ type PeerView struct {
 	Speaking bool   `json:"speaking"`
 	Mute     bool   `json:"mute"`
 	Deafen   bool   `json:"deafen"`
+	Priority bool   `json:"priority"` // 优先发言（#45）：接收端 ducking 与徽标用
 }
 
 // Session 一次登录后的通话会话：信令连接 + 媒体管线。
@@ -181,6 +212,32 @@ type Session struct {
 	// 积压旧状态无意义），由专用 goroutine 消费发送（音频回调禁止直发网络）。
 	voiceSend    chan signal.VoiceStateData
 	mediaStarted atomic.Bool // 采集/播放是否已启动（入房才启动，按需点亮麦克风）
+
+	// 悄悄话目标下发（#45）：Wails 绑定/热键线程只写最新目标并敲一下 wake，
+	// 专用 goroutine 读取后发 voice.whisper——禁止在音频回调或 Wails 线程同步
+	// ws.Send。wake 容量 1 合并突发，最新值以 whisperWant 为准。
+	whisperMu       sync.Mutex
+	whisperWant     []string
+	whisperNeedSend bool // 有变更待下发（空 want 也可能是显式取消）
+	// whisperMaybe 服务端可能仍挂着非空目标（含已发成功、在途或待发）。切房后
+	// 即使 want 已清空，也需要发一条空数组兜底；从未用过悄悄话时保持 false，
+	// 避免每次入房都白发一条信令。
+	whisperMaybe bool
+	// whisperSeq 已分配的最新请求序号（#116，协议 v4）：每次显式下发递增，
+	// 随 voice.whisper.seq 带给服务端，由其原样回传 voice.whisper_ack。
+	// whisperSendSeq 是当前待发版本的序号（0 = v3 兼容路径，服务端不回 ack）；
+	// 两者分开是因为 wake 合并突发时只有最新版本会被真正发送。
+	whisperSeq     int64
+	whisperSendSeq int64
+	whisperWake    chan struct{}
+
+	// #46 频道音质配置：audioCfgMu 串行化「用户设置 + 当前频道上限/帧长」的
+	// 读取与应用（ApplyAudio 在 Wails 绑定线程、channel.audio 在 WS 读循环）。
+	// 生效码率 = min(用户设置, 频道上限>0)；帧长只由频道配置决定，默认 20ms。
+	audioCfgMu      sync.Mutex
+	userBitrateKbps int // 最近一次用户设置（已解析默认值，入房不受频道上限影响）
+	chanBitrateKbps int // 当前频道码率上限，0 = 跟随用户设置
+	chanFrameMS     int // 当前频道帧长，10/20
 	// mediaFailReported 媒体启动失败是否已上报（#80）：同一故障周期只提示一次，
 	// 重入房仍会真实重试但不再重复弹 toast；启动成功后复位，下次故障可再报。
 	mediaFailReported atomic.Bool
@@ -228,6 +285,15 @@ type Session struct {
 	iceMu      sync.RWMutex
 	iceServers []webrtc.ICEServer
 
+	// roomRebuildMu 串行化「拆 PC + 重发 channel.join」的重建路径（#19/#49）：
+	// rtc.failed 在 WS 读循环、网络变化在网络轮询 goroutine，两者不得并发
+	// 拆链路（会留下两套 join 回执互相顶替）。两处都用 TryLock——拿不到锁
+	// 说明已有重建在途，读循环绝不能等待。
+	roomRebuildMu sync.Mutex
+	// lastNetRecover 上次网络变化重建的 UnixNano（#49 A）：接口切换过程中
+	// 签名可能连续变化，冷却窗内不重复拆链路。
+	lastNetRecover atomic.Int64
+
 	mu        sync.Mutex
 	members   map[string]PeerView
 	selfID    string
@@ -262,14 +328,18 @@ func NewSession(api *api.APIClient, token, nickname string, ev Events, logger *l
 		logger = log.Default()
 	}
 	s := &Session{
-		api:       api,
-		log:       logger,
-		ev:        ev,
-		name:      nickname,
-		members:   make(map[string]PeerView),
-		seenChans: make(map[string]bool),
-		voiceSend: make(chan signal.VoiceStateData, 1),
-		gw:        gateway.New(),
+		api:         api,
+		log:         logger,
+		ev:          ev,
+		name:        nickname,
+		members:     make(map[string]PeerView),
+		seenChans:   make(map[string]bool),
+		voiceSend:   make(chan signal.VoiceStateData, 1),
+		whisperWake: make(chan struct{}, 1),
+		gw:          gateway.New(),
+		// 入房前的默认音质：与 audio.DefaultOpusConfig 的 32kbps、20ms 一致。
+		userBitrateKbps: 32,
+		chanFrameMS:     20,
 	}
 	s.token.Store(token)
 	s.roomID.Store("")
@@ -432,8 +502,17 @@ func (s *Session) Connect(serverURL string) {
 		if g := s.sendGate.Load(); g != nil {
 			pipe.SetSendGate(g)
 		}
-		s.mixer = audio.NewMixer(pipe.WritePlayback)
+		// AEC 参考 = 混音器实际输出（含耳聋/欠载的零帧）：先喂 APM render，
+		// 再写播放环。混音 tick 是单 goroutine，且写环非阻塞，不会拖慢节拍。
+		// 播放环/声卡引入的附加延迟由 AEC3 的延迟估计吸收。
+		s.mixer = audio.NewMixer(func(pcm []int16) int {
+			pipe.ProcessRender(pcm)
+			return pipe.WritePlayback(pcm)
+		})
 		s.remoteMgr = audio.NewRemoteManager(s.mixer, s.log)
+		// 新接入的远端轨才在混音器里出现，入房快照里的「优先发言者正在说话」
+		// 需要在这时补一次 ducking 重算，否则要等下一次说话翻转才生效（#45）。
+		s.remoteMgr.OnPeerChange = s.updateDucking
 		s.states = audio.NewStateTable()
 		s.states.OnChange = func(id string, st audio.PeerVoiceState) {
 			if s.ev.OnPeerSpeaking != nil {
@@ -457,9 +536,18 @@ func (s *Session) Connect(serverURL string) {
 		}
 	}()
 
+	// 悄悄话目标专用发送 goroutine（#45）：只在协议 ≥3 时下发；v2 服务端
+	// 不认该消息，客户端按住悄悄话键时也不应依赖它生效。
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		s.whisperLoop(ctx)
+	}()
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+
 		if err := s.ws.Run(ctx); err != nil && err != context.Canceled {
 			// ErrAuthFatal：刷新被明确拒绝 / 无刷新来源 / 换服，Run 已停止重连。
 			// 必须上报被踢回登录页——否则前端停在「信令连接中」永远等不到结果。
@@ -469,6 +557,14 @@ func (s *Session) Connect(serverURL string) {
 			}
 			s.log.Printf("signal run: %v", err)
 		}
+	}()
+
+	// #49 A：网络接口变化监听（Wi-Fi/有线/代理切换后旧 ICE 候选失效）。
+	// 仅在房内触发一次轻量重建，随会话 ctx 退出。
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.watchNetwork(ctx)
 	}()
 }
 
@@ -596,6 +692,17 @@ func (s *Session) registerHandlers() {
 			}
 			return
 		}
+		// #46 频道音质：joined 是入房的权威配置（0 = 跟随设置/默认 20ms）。
+		// 旧服务端不带字段时按 0/0 处理，行为与升级前一致。必须在 startMedia
+		// 与 setupPeer 之前应用，首个上行包就使用正确帧长。
+		bitrate, frameMS := 0, 0
+		if d.AudioBitrateKbps != nil {
+			bitrate = int(*d.AudioBitrateKbps)
+		}
+		if d.AudioFrameMs != nil {
+			frameMS = int(*d.AudioFrameMs)
+		}
+		s.setChannelAudio(bitrate, frameMS)
 		s.startMedia() // 入房才启动采集/播放
 		s.mu.Lock()
 		s.members = make(map[string]PeerView, len(d.Members))
@@ -603,6 +710,7 @@ func (s *Session) registerHandlers() {
 			s.members[m.UserID] = PeerView{
 				UserID: m.UserID, Nickname: m.Nickname, Tag: m.Tag,
 				Speaking: m.Speaking, Mute: m.Mute, Deafen: m.Deafen,
+				Priority: m.Priority,
 			}
 			if m.UserID != d.Self.UserID && s.states != nil {
 				s.states.Set(m.UserID, audio.PeerVoiceState{Speaking: m.Speaking, Mute: m.Mute, Deafen: m.Deafen})
@@ -610,21 +718,29 @@ func (s *Session) registerHandlers() {
 		}
 		s.selfID = d.Self.UserID
 		s.mu.Unlock()
+		// 入房快照可能改变优先发言状态（含自己的 admin 授予）：重算 ducking。
+		s.updateDucking()
 		if s.ev.OnSelf != nil {
 			s.ev.OnSelf(d.Self.UserID)
 		}
 		if s.ev.OnPeerJoin != nil {
 			for _, m := range d.Members {
-				s.ev.OnPeerJoin(m.UserID, m.Nickname, m.Tag, m.Speaking, m.Mute, m.Deafen)
+				s.ev.OnPeerJoin(m.UserID, m.Nickname, m.Tag, m.Speaking, m.Mute, m.Deafen, m.Priority)
 			}
 		}
-		// 仅在无存活 peer 时建连（他人入房广播不动媒体链路）。
+		// 仅在无存活 peer 时建连（他人入房广播不动媒体链路）。与网络恢复/
+		// ICE 重建互斥：已有重建在途时由那条路径负责建新 PC，读循环不并发
+		// 再建一条（否则两次 rtc.offer 互相顶替）。
 		if p := s.peerRef.Load(); p != nil &&
 			p.ConnectionState() != webrtc.PeerConnectionStateClosed &&
 			p.ConnectionState() != webrtc.PeerConnectionStateFailed {
 			return
 		}
+		if !s.roomRebuildMu.TryLock() {
+			return
+		}
 		s.setupPeer()
+		s.roomRebuildMu.Unlock()
 		// 补发完整语音状态（muted+deafened 现值）：重连/重入房后服务端内存里的
 		// 旧状态可能已丢，peer 又是新建（默认不静音）——不发则「UI 显示已闭麦但声音照传」。
 		if s.ws != nil {
@@ -633,7 +749,25 @@ func (s *Session) registerHandlers() {
 				Deafen: signal.Bool(s.deafened.Load()),
 			})
 		}
+		// 重连/重入房后 SFU peer 是新的：把当前目标同步过去。即使 want 为空
+		// 也发一条空数组，清掉服务端可能残留的旧目标（切房前在途发送的兜底）。
+		s.syncWhisperOnJoin()
 	})
+	// channel.audio 音质热更新（#46）：只对当前房间生效；其他频道（例如管理员
+	// 在别处改了配置）忽略，等入房时的 channel.joined 拿权威值。
+	s.ws.On(signal.TypeChannelAudio, func(env signal.Envelope) {
+		var d signal.ChannelAudioData
+		if env.Decode(&d) != nil || d.ChannelID == "" {
+			return
+		}
+		if room, _ := s.roomID.Load().(string); room != d.ChannelID {
+			return
+		}
+		s.setChannelAudio(int(d.AudioBitrateKbps), int(d.AudioFrameMs))
+	})
+	// voice.whisper_ack：服务端确认目标集合已应用到本连接的 SFU peer（#116，
+	// 协议 v4）。
+	s.ws.On(signal.TypeVoiceWhisperAck, s.handleWhisperAck)
 	s.ws.On(signal.TypeRTCOffer, func(env signal.Envelope) {
 		var d signal.SDPData
 		if env.Decode(&d) != nil {
@@ -681,6 +815,32 @@ func (s *Session) registerHandlers() {
 			s.members[d.UserID] = v
 		}
 		s.mu.Unlock()
+		s.updateDucking()
+	})
+	// voice.priority 优先发言实时变更（#45）：频道覆盖变更后由服务端下发；
+	// 角色/成员角色变更不实时广播，重进房由 channel.joined 刷新。旧房事件丢弃。
+	s.ws.On(signal.TypeVoicePriority, func(env signal.Envelope) {
+		var d signal.VoicePriorityData
+		if env.Decode(&d) != nil || d.UserID == "" || d.ChannelID == "" {
+			return
+		}
+		if room, _ := s.roomID.Load().(string); room != d.ChannelID {
+			return
+		}
+		s.mu.Lock()
+		v, ok := s.members[d.UserID]
+		if ok {
+			v.Priority = d.Priority
+			s.members[d.UserID] = v
+		}
+		s.mu.Unlock()
+		if !ok {
+			return
+		}
+		if s.ev.OnPeerPriority != nil {
+			s.ev.OnPeerPriority(d.UserID, d.Priority)
+		}
+		s.updateDucking()
 	})
 	// voice.speaking：服务端按 RFC 6464 电平统一判定的说话翻转（#33），含自己
 	//（自己的声波球同源，v1「自己不亮」的问题随本消息消失）。mute/deafen 电平
@@ -708,6 +868,7 @@ func (s *Session) registerHandlers() {
 		if s.states != nil {
 			s.states.Apply(d.UserID, &d.Speaking, nil, nil)
 		}
+		s.updateDucking()
 	})
 	s.ws.On(signal.TypeChannelPeerLeft, func(env signal.Envelope) {
 		var d signal.PeerLeftData
@@ -723,6 +884,7 @@ func (s *Session) registerHandlers() {
 		s.mu.Lock()
 		delete(s.members, d.UserID)
 		s.mu.Unlock()
+		s.updateDucking()
 		if s.ev.OnPeerLeave != nil {
 			s.ev.OnPeerLeave(d.UserID)
 		}
@@ -857,6 +1019,16 @@ func (s *Session) rebuildAfterICEFail(channelID string) {
 		p.ConnectionState() == webrtc.PeerConnectionStateConnected {
 		return
 	}
+	// 已有重建在途（网络切换/并发的 rtc.failed）：让在途那次完成即可，
+	// 读循环不等待（#49：网络恢复可能正在预取凭证）。
+	if !s.roomRebuildMu.TryLock() {
+		return
+	}
+	defer s.roomRebuildMu.Unlock()
+	// 锁内重读：等锁期间可能已退房/换房。
+	if room, _ = s.roomID.Load().(string); room == "" || (channelID != "" && channelID != room) {
+		return
+	}
 	if p := s.peerRef.Swap(nil); p != nil {
 		_ = p.Close()
 	}
@@ -905,6 +1077,8 @@ func (s *Session) teardownLocalRoomLocked() {
 	if s.mixer != nil {
 		s.mixer.SetDeafen(false)
 	}
+	// #46：离开频道即取消码率上限、帧长回默认，恢复用户自己的设置。
+	s.resetChannelAudio()
 	s.clearRoomTables()
 }
 
@@ -934,17 +1108,28 @@ func (s *Session) handleKicked(reason string) {
 }
 
 // setupPeer 建立对 SFU 的单条 PeerConnection（初始 offer 一次，此后只应答）。
-func (s *Session) setupPeer() {
+// offer 发送失败只记日志（读循环路径没有可回滚的更好选择，等下一次 joined）。
+func (s *Session) setupPeer() { _ = s.setupPeerOffer() }
+
+// setupPeerOffer 同 setupPeer，但把建 PC 与生成初始 offer 的错误返回给
+// 调用方：网络变化恢复据此清掉半成品，交由 WS 重连兜底。信令发送失败在
+// OnLocalSDP 回调里只能忽略——连接断开时 OnDisconnect 会清 peerRef。
+func (s *Session) setupPeerOffer() error {
 	if old := s.peerRef.Swap(nil); old != nil {
 		_ = old.Close()
 	}
 	if s.remoteMgr == nil { // 音频降级路径不可能走到（JoinChannel 已拦截），防御
-		return
+		return errors.New("remote manager unavailable")
 	}
 	s.remoteMgr.RemoveAll()
 	streamID := s.name
 	if s.selfID != "" {
 		streamID = s.selfID
+	}
+	// 媒体降级时 pipe 为空：不挂电平扩展即可，不能解引用 nil（防御）。
+	var levelFn func() uint8
+	if s.pipe != nil {
+		levelFn = s.pipe.AudioLevel
 	}
 	peer, err := rtc.NewPeer(rtc.PeerConfig{
 		StreamID: streamID,
@@ -953,7 +1138,7 @@ func (s *Session) setupPeer() {
 		ICEServers:      s.cachedICE(),
 		IncludeLoopback: IsLoopbackURL(s.api.Base()), // 环回候选仅本机/内网 SFU 需要
 		// RFC 6464 电平源（#33）：管线 DSP 已算好的帧电平，SendOpus 每包读一次。
-		LevelFn: s.pipe.AudioLevel,
+		LevelFn: levelFn,
 		Callbacks: rtc.PeerCallbacks{
 			OnLocalSDP: func(sdp webrtc.SessionDescription) {
 				msgType := signal.TypeRTCOffer
@@ -976,15 +1161,22 @@ func (s *Session) setupPeer() {
 	})
 	if err != nil {
 		s.log.Printf("new peer: %v", err)
-		return
+		return err
 	}
 	// 新 peer 默认不静音：必须同步本地静音态，否则重连后出现
 	//「UI 显示已闭麦但声音照传」。deafen 是混音器总线层的口，无 peer 级对应。
 	peer.SetMuted(s.muted.Load())
+	// #46：上行 RTP 时戳步进必须匹配频道帧长（10ms=480/20ms=960）。此时
+	// channel.joined 已应用频道配置；下行远端链路也已同步同一帧长。
+	if err := peer.SetFrameMS(s.currentFrameMS()); err != nil {
+		s.log.Printf("peer frame size: %v", err)
+	}
 	s.peerRef.Store(peer)
 	if err := peer.Offer(); err != nil {
 		s.log.Printf("offer: %v", err)
+		return err
 	}
+	return nil
 }
 
 // JoinChannel 加入语音频道（不带密码；带密码用 JoinChannelWithPassword）。
@@ -1176,11 +1368,203 @@ func (s *Session) SetDeafen(deafened bool) {
 	}
 }
 
-// SetPeerVolume 调整某远端成员音量（0.0–2.0）。
+// SetPeerVolume 调整某远端成员音量（0.0–2.0）。与优先发言 ducking 独立：
+// duck 乘数只作用于混音 Tick，不改写这里的用户设置（#45）。
 func (s *Session) SetPeerVolume(userID string, gain float64) {
 	if s.mixer != nil {
 		if in := s.mixer.Peer(userID); in != nil {
 			in.SetGain(gain)
+		}
+	}
+}
+
+// SetWhisperTargets 更新同频道悄悄话目标（#45）。空列表 = 取消，仅协议 ≥3
+// 时真正下发（v2 服务端不认该消息）。非阻塞：只保存最新值并敲一下容量 1 的
+// 唤醒通道，网络发送由 Connect 里的专用 goroutine 完成——不得在 Wails 绑定
+// 线程或音频回调里同步 ws.Send。
+//
+// 这是 v3 兼容路径（seq=0，服务端不回 ack）；协议 v4 需要确认目标生效后才
+// 开麦时用 SendWhisperTargets。
+func (s *Session) SetWhisperTargets(targets []string) {
+	s.whisperMu.Lock()
+	s.queueWhisperLocked(cleanWhisperTargets(targets), 0)
+	s.whisperMu.Unlock()
+	s.wakeWhisper()
+}
+
+// SendWhisperTargets 更新目标并返回本次请求序号（#116，协议 v4）。
+// 协议 <3 或信令未连接时返回 ok=false 且不排队——调用方据此提示，而不是
+// 空等一个永远不会到来的 ack。目标为空仍是取消；是否真正下发沿用与
+// SetWhisperTargets 相同的去重语义（服务端已可能为空时补发一条兜底取消）。
+// 非阻塞：只保存最新值与序号并唤醒专用发送 goroutine。
+func (s *Session) SendWhisperTargets(targets []string) (int64, bool) {
+	if s.protoVer.Load() < 3 || s.ws == nil {
+		return 0, false
+	}
+	s.whisperMu.Lock()
+	s.whisperSeq++
+	seq := s.whisperSeq
+	s.queueWhisperLocked(cleanWhisperTargets(targets), seq)
+	s.whisperMu.Unlock()
+	s.wakeWhisper()
+	return seq, true
+}
+
+// queueWhisperLocked 写入最新目标与待发序号（调用方持 whisperMu）。空目标
+// 只在之前确实有目标时才需要显式取消；重复的「本就为空」不下发（服务端残留
+// 由入房同步兜底）。
+func (s *Session) queueWhisperLocked(cp []string, seq int64) {
+	oldHas := len(s.whisperWant) > 0
+	s.whisperWant = cp
+	if len(cp) > 0 {
+		s.whisperNeedSend = true
+		s.whisperMaybe = true
+	} else if oldHas {
+		s.whisperNeedSend = true
+	}
+	if s.whisperNeedSend {
+		s.whisperSendSeq = seq
+	}
+}
+
+// cleanWhisperTargets 过滤空 ID 并复制一份（切片一经发布不再原地修改）。
+func cleanWhisperTargets(targets []string) []string {
+	cp := make([]string, 0, len(targets))
+	for _, uid := range targets {
+		if uid != "" {
+			cp = append(cp, uid)
+		}
+	}
+	return cp
+}
+
+// ClearWhisperTargets 退房/切房时清空会话缓存的悄悄话目标，且不下发任何
+// 信令（#45）：旧房间的 Peer 会随离房销毁，此刻发取消可能撞上 #91 的
+// pending join 错误归属窗口。新房间入房时 syncWhisperOnJoin 会补一条空数组，
+// 清掉服务端可能残留的旧目标。
+func (s *Session) ClearWhisperTargets() {
+	s.whisperMu.Lock()
+	s.whisperWant = nil
+	s.whisperNeedSend = false
+	s.whisperSendSeq = 0
+	s.whisperMu.Unlock()
+}
+
+// wakeWhisper 合并一次下发唤醒（容量 1；发送 goroutine 总是读最新值）。
+func (s *Session) wakeWhisper() {
+	select {
+	case s.whisperWake <- struct{}{}:
+	default:
+	}
+}
+
+// whisperLoop 悄悄话目标发送循环（#45，Connect 启动；测试可直接跑）。
+// 每次唤醒读最新目标；协议 <3 时静默丢弃（v2 服务端不认 voice.whisper）。
+// 发送失败不重试（#117 已登记）：等下一次目标变化或入房同步再兜底。
+func (s *Session) whisperLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.whisperWake:
+			targets, seq, send := s.pendingWhisper()
+			if !send || s.protoVer.Load() < 3 || s.ws == nil {
+				continue
+			}
+			if err := s.ws.Send(signal.TypeVoiceWhisper, signal.VoiceWhisperData{Targets: targets, Seq: seq}); err == nil {
+				// 发送成功才更新「服务端可能有非空目标」：失败时间线未知，
+				// 保守保留原值，下次入房同步会再兜一次。
+				s.whisperMu.Lock()
+				s.whisperMaybe = len(targets) > 0
+				s.whisperMu.Unlock()
+			}
+		}
+	}
+}
+
+// pendingWhisper 取当前待下发快照并清掉脏标记。空目标也要返回（显式取消），
+// 由 send 区分「无需发送」与「发送空数组」；seq 是该版本的请求序号（0 = v3
+// 兼容路径）。切片一经发布不再原地修改。
+func (s *Session) pendingWhisper() ([]string, int64, bool) {
+	s.whisperMu.Lock()
+	want := s.whisperWant
+	seq := s.whisperSendSeq
+	send := s.whisperNeedSend
+	s.whisperNeedSend = false
+	s.whisperSendSeq = 0
+	s.whisperMu.Unlock()
+	if want == nil {
+		want = []string{} // voice.whisper 的 targets 是 required 数组，不能下发 null
+	}
+	return want, seq, send
+}
+
+// syncWhisperOnJoin 入房/重连后把当前目标同步到新建的 SFU peer（#45）。
+// want 为空但服务端可能残留旧目标（切房前在途发送）时强制下发一次空数组；
+// 从未用过悄悄话则不发，避免每次入房都产生无意义信令。同步走 seq=0 的 v3
+// 语义：入房重建不是一次用户请求，无需 voice.whisper_ack。
+func (s *Session) syncWhisperOnJoin() {
+	s.whisperMu.Lock()
+	if s.whisperNeedSend && s.whisperSendSeq != 0 {
+		// 队列里已有一条带 seq 的显式请求（用户按住悄悄话时恰好切房/重连）：
+		// 服务端会在 peer 建立后补应用并回 ack，不能降级成 seq=0 的同步消息，
+		// 否则 App 永远等不到确认，只能按超时关麦。
+		s.whisperMu.Unlock()
+		s.wakeWhisper()
+		return
+	}
+	need := len(s.whisperWant) > 0 || s.whisperMaybe
+	s.whisperNeedSend = need
+	s.whisperSendSeq = 0
+	s.whisperMu.Unlock()
+	if need {
+		s.wakeWhisper()
+	}
+}
+
+// handleWhisperAck 分发 voice.whisper_ack（#116，协议 v4）。ack 不带频道 ID，
+// 无法按频道比对：退房后到达的旧 ack 由「不在房即丢弃」+ App 侧按在途 seq
+// 匹配（clearWhisper 会清零 seq）共同排除。跑在 ws 读循环 goroutine。
+func (s *Session) handleWhisperAck(env signal.Envelope) {
+	var d signal.VoiceWhisperAckData
+	if env.Decode(&d) != nil || d.Seq <= 0 {
+		return
+	}
+	if !s.InRoom() {
+		return
+	}
+	if s.ev.OnWhisperAck != nil {
+		s.ev.OnWhisperAck(d.Seq, d.Active)
+	}
+}
+
+// updateDucking 重算各远端 peer 的优先发言 ducking（#45）：任一远端优先发言者
+// 正在说话时，其他远端 peer 压低；优先发言者本人不压，自己说话不触发（本地
+// 混音不含自己）。只在说话/优先状态翻转时调用，不在 Tick 热路径。
+func (s *Session) updateDucking() {
+	if s.mixer == nil {
+		return
+	}
+	s.mu.Lock()
+	prioritySpeaking := false
+	ids := make([]string, 0, len(s.members))
+	priority := make(map[string]bool, len(s.members))
+	for uid, m := range s.members {
+		if uid == s.selfID {
+			continue
+		}
+		ids = append(ids, uid)
+		if m.Priority {
+			priority[uid] = true
+			if m.Speaking {
+				prioritySpeaking = true
+			}
+		}
+	}
+	s.mu.Unlock()
+	for _, uid := range ids {
+		if in := s.mixer.Peer(uid); in != nil {
+			in.SetDucked(prioritySpeaking && !priority[uid])
 		}
 	}
 }
@@ -1193,23 +1577,103 @@ func (s *Session) RestartDevices(captureID, playbackID string) error {
 	return s.pipe.RestartDevices(captureID, playbackID)
 }
 
+// effectiveBitrateKbps 频道上限与用户设置取小（#46）：上限 0 = 跟随用户设置。
+// 纯函数便于单测；用户设置已被 ResolveOpusConfig 兜底为正数。
+func effectiveBitrateKbps(user, cap int) int {
+	if cap > 0 && cap < user {
+		return cap
+	}
+	return user
+}
+
+// normalizeChannelFrameMS 频道下发的帧长归一：只认 10，其余（含 0/20/非法值）
+// 一律默认 20ms——旧服务端缺省字段与显式默认走同一条路径。
+func normalizeChannelFrameMS(ms int) int {
+	if ms == audio.FrameMS10 {
+		return audio.FrameMS10
+	}
+	return audio.FrameMS20
+}
+
+// setChannelAudio 应用当前频道音质配置（#46）。只改码率/帧长，不碰用户其他
+// 音频设置；离开频道时用 resetChannelAudio 恢复用户码率与 20ms 帧长。
+func (s *Session) setChannelAudio(bitrateKbps, frameMS int) {
+	s.audioCfgMu.Lock()
+	defer s.audioCfgMu.Unlock()
+	s.chanBitrateKbps = bitrateKbps
+	s.chanFrameMS = normalizeChannelFrameMS(frameMS)
+	if err := s.applyChannelAudioLocked(); err != nil {
+		s.log.Printf("session: 应用频道音质失败: %v", err)
+	}
+}
+
+// resetChannelAudio 离开房间后恢复用户设置（码率上限取消、帧长回 20ms）。
+func (s *Session) resetChannelAudio() {
+	s.audioCfgMu.Lock()
+	defer s.audioCfgMu.Unlock()
+	s.chanBitrateKbps = 0
+	s.chanFrameMS = audio.FrameMS20
+	if err := s.applyChannelAudioLocked(); err != nil {
+		s.log.Printf("session: 恢复用户音质失败: %v", err)
+	}
+}
+
+// currentFrameMS 当前生效帧长（建 peer 前读取）。
+func (s *Session) currentFrameMS() int {
+	s.audioCfgMu.Lock()
+	defer s.audioCfgMu.Unlock()
+	return normalizeChannelFrameMS(s.chanFrameMS)
+}
+
+// applyChannelAudioLocked 把生效码率/帧长刷到管线、上行 peer 与下行远端链路。
+// 调用方须持 audioCfgMu；pipe 为 nil（音频降级）时只需维护状态。
+func (s *Session) applyChannelAudioLocked() error {
+	if s.pipe == nil {
+		return nil
+	}
+	var firstErr error
+	if err := s.pipe.SetOpusBitrate(effectiveBitrateKbps(s.userBitrateKbps, s.chanBitrateKbps)); err != nil {
+		firstErr = fmt.Errorf("bitrate: %w", err)
+	}
+	frameMS := normalizeChannelFrameMS(s.chanFrameMS)
+	if err := s.pipe.SetFrameMS(frameMS); err != nil && firstErr == nil {
+		firstErr = fmt.Errorf("frame: %w", err)
+	}
+	if p := s.peerRef.Load(); p != nil {
+		if err := p.SetFrameMS(frameMS); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("peer frame: %w", err)
+		}
+	}
+	if s.remoteMgr != nil {
+		if err := s.remoteMgr.SetFrameMS(frameMS); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("remote frame: %w", err)
+		}
+	}
+	return firstErr
+}
+
 // ApplyAudio 把运行时音频设置热应用到媒体管线（通话中可调，未 Connect 时空操作）。
 // Opus 参数经 ResolveOpusConfig 回落默认；逐项应用，返回首个错误（不中断）。
 // v0.1.2 扩展：复杂度/降噪强度/AGC/扬声器总音量（mixer master gain）。
 // v1.1 扩展：前置增益（原子热生效）/输入声道模式（热重启采集流）。
+// #46：用户码率设置只存原始值，实际生效值再与当前频道上限取小；频道帧长不受
+// 用户设置影响。
 func (s *Session) ApplyAudio(rs audio.RuntimeSettings) error {
 	if s.pipe == nil {
 		return nil
 	}
 	rs.Opus = audio.ResolveOpusConfig(rs.Opus)
+	s.audioCfgMu.Lock()
+	s.userBitrateKbps = rs.Opus.BitrateKbps
+	s.audioCfgMu.Unlock()
 	steps := []struct {
 		name string
 		fn   func() error
 	}{
-		{"bitrate", func() error { return s.pipe.SetOpusBitrate(rs.Opus.BitrateKbps) }},
 		{"vbr", func() error { return s.pipe.SetOpusVBR(*rs.Opus.VBR) }},
 		{"dtx", func() error { return s.pipe.SetOpusDTX(*rs.Opus.DTX) }},
 		{"fec", func() error { return s.pipe.SetOpusFEC(*rs.Opus.FEC) }},
+		{"dred", func() error { return s.pipe.SetOpusDRED(*rs.Opus.DRED) }},
 		{"packet_loss", func() error { return s.pipe.SetOpusPacketLoss(rs.Opus.PacketLoss) }},
 		{"pre_gain", func() error { return s.pipe.SetPreGainDB(rs.PreGainDB) }},
 		{"input_mode", func() error { return s.pipe.SetInputMode(rs.InputMode) }},
@@ -1232,12 +1696,25 @@ func (s *Session) ApplyAudio(rs audio.RuntimeSettings) error {
 	}
 	s.pipe.SetAGC(rs.AGC)
 	s.pipe.SetGain(rs.Gain)
+	if err := s.pipe.SetEnableAPM(rs.EnableAPM); err != nil && firstErr == nil {
+		firstErr = fmt.Errorf("audio enable_apm: %w", err)
+	}
 	if s.mixer != nil {
 		s.mixer.SetMasterGain(rs.PlaybackGain)
 	}
 	s.pipe.SetVADSensitivity(rs.VADSens)
+	// 码率与帧长统一走频道合并逻辑：用户调码率时若在受上限约束的房内，
+	// 实际值不得越过频道上限。
+	s.audioCfgMu.Lock()
+	if err := s.applyChannelAudioLocked(); err != nil && firstErr == nil {
+		firstErr = fmt.Errorf("audio channel: %w", err)
+	}
+	s.audioCfgMu.Unlock()
 	return firstErr
 }
+
+// APMActive 报告当前媒体管线是否启用了 WebRTC APM（Beta 设置回滚/诊断）。
+func (s *Session) APMActive() bool { return s.pipe != nil && s.pipe.APMActive() }
 
 // Muted / Deafened 本地状态查询。
 func (s *Session) Muted() bool    { return s.muted.Load() }
@@ -1265,46 +1742,117 @@ func (s *Session) Stats() string {
 		vs.PlaybackUnderruns = ps.PlaybackUnderruns
 		vs.PlaybackDropped = ps.PlaybackDropped
 	}
+	// #49 B：一次 GetStats 同时取 RTT 与全部入站 RTP 流。2s 轮询下重复
+	// 调 GetStats 会把整张统计表拷贝两次，且入站流按 SSRC 与远端成员对账。
+	var snap rtc.LinkSnapshot
+	if p := s.peerRef.Load(); p != nil {
+		snap = p.LinkSnapshot()
+		vs.RtpSent = p.Stats.PacketsSent.Load()
+	}
+	inbound := inboundBySSRC(snap.Inbound)
 	if s.remoteMgr != nil {
 		vs.PeerIDs = s.remoteMgr.PeerIDs()
-		// 下行链路诊断（#95）：app 层每 2s 入房期间调用，快照读取。
+		frameMS := s.remoteMgr.FrameMS()
+		// 下行链路诊断（#95/#49）：app 层每 2s 入房期间调用，快照读取。
 		for _, id := range vs.PeerIDs {
 			ls, ok := s.remoteMgr.LinkStats(id)
 			if !ok {
 				continue
 			}
-			vs.Peers = append(vs.Peers, PeerLinkDiag{
-				PeerID:                id,
-				JitterMs:              ls.Jitter.JitterMs,
-				JitterTargetPackets:   ls.Jitter.TargetPackets,
-				JitterBufferedPackets: ls.Jitter.Buffered,
-				JitterLost:            ls.Jitter.Lost,
-				RingSamples:           ls.RingAvailable,
-				PLCFrames:             ls.PLCFrames,
-				FECFrames:             ls.FECFrames,
-				UnderrunFrames:        ls.UnderrunFrames,
-				DroppedSamples:        ls.DroppedSamples,
-			})
+			diag := peerLinkDiag(id, ls, frameMS, inbound)
+			vs.Peers = append(vs.Peers, diag)
+			// 抖动/缓冲取最差一路：用户关心的是哪一路在拖后腿，平均后会
+			// 把明显异常的一路稀释成「看起来还行」。丢包率则按总包数聚合，
+			// 与 RTPReceived/RTPLost 两个计数保持自洽。
+			if diag.RTPJitterMS > vs.RTPJitterMS {
+				vs.RTPJitterMS = diag.RTPJitterMS
+			}
+			if diag.BufferMS > vs.JitterBufferMS {
+				vs.JitterBufferMS = diag.BufferMS
+			}
+			if diag.TargetMS > vs.JitterTargetMS {
+				vs.JitterTargetMS = diag.TargetMS
+			}
+			vs.RTPReceived += diag.RTPReceived
+			vs.RTPLost += diag.RTPLost
 		}
+		vs.LossPct = lossPercent(vs.RTPReceived, vs.RTPLost)
 	}
-	if p := s.peerRef.Load(); p != nil {
-		vs.RtpSent = p.Stats.PacketsSent.Load()
+	if snap.HasRTT {
 		// 延迟优先取 WebRTC 选中 ICE pair 的真实 RTT（问题：此前恒 0ms——
 		// 管线回环估计只在 Loopback 模式有样本，真实通话不产样本）。
 		// 用 ok 作哨兵而非值——RTT 真实但 <1ms 时会被错误覆盖（S1）。
-		if rtt, ok := p.RTT(); ok {
-			vs.LatencyMS = int(rtt.Milliseconds())
-		} else if havePipe {
-			// 无 RTT 样本时回落管线回环估计（本机联调场景）。
-			vs.EncPackets = ps.PacketsEncoded
-			vs.LatencyMS = int(ps.LatencyAvgUS / 1000)
-		}
+		vs.LatencyMS = int(snap.RTT.Milliseconds())
+	} else if havePipe {
+		// 无 RTT 样本时回落管线回环估计（本机联调场景）。
+		vs.EncPackets = ps.PacketsEncoded
+		vs.LatencyMS = int(ps.LatencyAvgUS / 1000)
 	}
 	s.mu.Lock()
 	vs.Members = len(s.members)
 	s.mu.Unlock()
 	b, _ := json.Marshal(vs)
 	return string(b)
+}
+
+// inboundBySSRC 按 SSRC 索引 PeerConnection 的入站音频流，供 per-peer 归账。
+func inboundBySSRC(streams []rtc.InboundStreamStats) map[uint32]rtc.InboundStreamStats {
+	if len(streams) == 0 {
+		return nil
+	}
+	m := make(map[uint32]rtc.InboundStreamStats, len(streams))
+	for _, st := range streams {
+		m[st.SSRC] = st
+	}
+	return m
+}
+
+// peerLinkDiag 组装单路诊断：抖动缓冲快照 + 同 SSRC 的入站 RTP 统计。
+// 入站流尚未出现（对端未发过包）时只输出缓冲侧字段。
+func peerLinkDiag(id string, ls audio.RemoteLinkStats, frameMS int, inbound map[uint32]rtc.InboundStreamStats) PeerLinkDiag {
+	if frameMS <= 0 {
+		frameMS = rtc.JitterFrameMS
+	}
+	diag := PeerLinkDiag{
+		PeerID:                id,
+		JitterMs:              ls.Jitter.JitterMs,
+		JitterTargetPackets:   ls.Jitter.TargetPackets,
+		JitterBufferedPackets: ls.Jitter.Buffered,
+		JitterLost:            ls.Jitter.Lost,
+		RingSamples:           ls.RingAvailable,
+		PLCFrames:             ls.PLCFrames,
+		FECFrames:             ls.FECFrames,
+		DREDFrames:            ls.DREDFrames,
+		UnderrunFrames:        ls.UnderrunFrames,
+		DroppedSamples:        ls.DroppedSamples,
+		BufferMS:              ls.Jitter.Buffered * frameMS,
+		TargetMS:              ls.Jitter.TargetPackets * frameMS,
+	}
+	if st, ok := inbound[ls.SSRC]; ok {
+		diag.LossPct = lossPercent(st.PacketsReceived, st.PacketsLost)
+		diag.RTPJitterMS = float64(st.Jitter.Microseconds()) / 1000
+		diag.RTPReceived = st.PacketsReceived
+		diag.RTPLost = st.PacketsLost
+	}
+	return diag
+}
+
+// lossPercent 入站丢包率（%）。PacketsLost 在重复包多于丢失包时可为负，
+// 统一夹到 0..100；还没有任何包时返回 0。
+func lossPercent(received uint32, lost int32) float64 {
+	lost64 := int64(lost)
+	if lost64 < 0 {
+		lost64 = 0
+	}
+	total := int64(received) + lost64
+	if total <= 0 {
+		return 0
+	}
+	pct := float64(lost64) * 100 / float64(total)
+	if pct > 100 {
+		return 100
+	}
+	return pct
 }
 
 // SendChat 发送文字消息（chat.send，chat.message 由 WS 回落）。
@@ -1730,6 +2278,14 @@ func (s *Session) SignalConnected() bool { return s.ws != nil && s.ws.Connected(
 // ProtocolVersion 返回服务端协商到的协议版本（#29）。
 // 0 = 尚未收到 server.hello（老服务端或还没协商完）——按 v1 行为处理。
 func (s *Session) ProtocolVersion() int64 { return s.protoVer.Load() }
+
+// SupportsWhisper 报告服务端是否支持同频道悄悄话（voice.whisper，协议 ≥3）。
+// false 时 App 层不得开旁路发送门，UI 应明示不支持。
+func (s *Session) SupportsWhisper() bool { return s.protoVer.Load() >= 3 }
+
+// SupportsWhisperAck 报告服务端是否会回 voice.whisper_ack（协议 ≥4）。
+// true 时客户端必须等到匹配 seq 的确认后才开麦（#116）。
+func (s *Session) SupportsWhisperAck() bool { return s.protoVer.Load() >= 4 }
 
 // InRoom 报告当前是否在语音频道（app 层 voice:stats ticker 据它门控发送）。
 func (s *Session) InRoom() bool {

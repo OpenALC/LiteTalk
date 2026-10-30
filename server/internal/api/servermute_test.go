@@ -26,6 +26,30 @@ type fakeHub struct {
 	convEvents []convEvent
 	msgEvents  []msgEvent
 	unreads    []unreadEvent
+	audios     []audioEvent
+	priorities []priorityEvent
+
+	// roomLegacy 10ms 帧长能力闸（#116）：记录哪些频道「有协议 <3 的成员」；
+	// legacyPassCall > 0 时前 N 次调用返回 false，用于构造「预检查通过、
+	// 落库后复查命中」的竞态分支。
+	roomLegacy     map[string]bool
+	legacyCalls    int
+	legacyPassCall int
+}
+
+// priorityEvent 一次 voice.priority 广播的断言快照（#45）。
+type priorityEvent struct {
+	channelID string
+	userID    string
+	priority  bool
+}
+
+// audioEvent 一次 channel.audio 广播的断言快照（#46）。
+type audioEvent struct {
+	uids      []string
+	channelID string
+	bitrate   int
+	frameMS   int
 }
 
 // unreadEvent 一次 channel.unread 广播的断言快照（#40）。
@@ -134,6 +158,69 @@ func (f *fakeHub) unreadLog() []unreadEvent {
 		out = append(out, unreadEvent{channelID: ev.channelID, counts: cp})
 	}
 	return out
+}
+
+func (f *fakeHub) BroadcastChannelAudio(uids []string, channelID string, bitrateKbps, frameMS int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.audios = append(f.audios, audioEvent{
+		uids:      append([]string(nil), uids...),
+		channelID: channelID,
+		bitrate:   bitrateKbps,
+		frameMS:   frameMS,
+	})
+}
+
+// audioLog 全部 channel.audio 广播的快照。
+func (f *fakeHub) audioLog() []audioEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]audioEvent(nil), f.audios...)
+}
+
+// BroadcastVoicePriority 记录 voice.priority 广播（#45）。
+func (f *fakeHub) BroadcastVoicePriority(channelID, userID string, priority bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.priorities = append(f.priorities, priorityEvent{channelID: channelID, userID: userID, priority: priority})
+}
+
+// priorityLog 全部 voice.priority 广播的快照。
+func (f *fakeHub) priorityLog() []priorityEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]priorityEvent(nil), f.priorities...)
+}
+
+// RoomHasLegacyClients 10ms 帧长能力闸（#116）：按 roomLegacy 返回；legacyPassCall
+// 让前 N 次调用返回 false，模拟「预检查与 join 竞态」——落库后复查才命中。
+func (f *fakeHub) RoomHasLegacyClients(channelID string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.legacyCalls++
+	if f.legacyPassCall > 0 && f.legacyCalls <= f.legacyPassCall {
+		return false
+	}
+	return f.roomLegacy[channelID]
+}
+
+// setRoomLegacy 设置某频道是否有旧客户端；passCalls > 0 时前 N 次检查放行（竞态用）。
+func (f *fakeHub) setRoomLegacy(channelID string, legacy bool, passCalls int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.roomLegacy == nil {
+		f.roomLegacy = map[string]bool{}
+	}
+	f.roomLegacy[channelID] = legacy
+	f.legacyPassCall = passCalls
+	f.legacyCalls = 0
+}
+
+// legacyChecks 该频道能力闸被检查的次数（预检查 + 复查）。
+func (f *fakeHub) legacyChecks() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.legacyCalls
 }
 
 func (f *fakeHub) Kick(uid, dev, reason string) {}

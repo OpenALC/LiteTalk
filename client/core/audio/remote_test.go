@@ -72,6 +72,15 @@ func remoteArrival(seq int) time.Time {
 // 开启带内 FEC 并告知 20% 丢包率。幅度递增让「FEC 恢复真实丢帧」与
 // 「PLC 沿用上一帧包络」的能量差异可判定。
 func encodeRampedSinePackets(t testing.TB, n int) [][]byte {
+	return encodeRampedSineFrames(t, n, OpusFrameSize)
+}
+
+// encodeRampedSine10msPackets 同 20ms 版，但帧长 10ms（480 采样，#116）。
+func encodeRampedSine10msPackets(t testing.TB, n int) [][]byte {
+	return encodeRampedSineFrames(t, n, FrameSize)
+}
+
+func encodeRampedSineFrames(t testing.TB, n, frameSize int) [][]byte {
 	t.Helper()
 	enc, err := codec.NewEncoder(SampleRate, 1, codec.AppVoIP)
 	if err != nil {
@@ -87,7 +96,7 @@ func encodeRampedSinePackets(t testing.TB, n int) [][]byte {
 	if err := enc.SetPacketLossPerc(20); err != nil {
 		t.Fatalf("set packet loss: %v", err)
 	}
-	pcm := make([]int16, OpusFrameSize)
+	pcm := make([]int16, frameSize)
 	buf := make([]byte, 4000)
 	var phase float64
 	out := make([][]byte, 0, n)
@@ -189,6 +198,9 @@ func TestRemoteDecodeFECRecoversLostFrame(t *testing.T) {
 	}
 
 	// 103 丢失、104 已到：FEC 恢复 103。
+	if !codec.HasLBRR(pkts[4]) {
+		t.Fatal("FEC 用例前提不成立：后继包 104 不含 LBRR")
+	}
 	rp.jb.Push(104, pkts[4], remoteArrival(104))
 	rp.decodeOnce()
 	if n := rp.input.ring.Read(drain); n != OpusFrameSize {
@@ -197,6 +209,9 @@ func TestRemoteDecodeFECRecoversLostFrame(t *testing.T) {
 	fecRMS := rmsInt16(drain)
 	if got := rp.Stats.FECFrames.Load(); got != 1 {
 		t.Fatalf("FECFrames = %d, want 1", got)
+	}
+	if got := rp.Stats.DREDFrames.Load(); got != 0 {
+		t.Fatalf("DREDFrames = %d, want 0（FEC 可用时应优先 FEC）", got)
 	}
 	if got := rp.Stats.PLCFrames.Load(); got != 0 {
 		t.Fatalf("PLCFrames = %d, want 0", got)
@@ -235,6 +250,156 @@ func TestRemoteDecodeFECRecoversLostFrame(t *testing.T) {
 
 	if fecRMS <= plcRMS*1.15 {
 		t.Fatalf("FEC RMS %.0f not clearly better than PLC RMS %.0f", fecRMS, plcRMS)
+	}
+}
+
+// TestRemoteDecodeFECRecoversLostFrame10ms 10ms 频道（#116）：丢帧用后继包的
+// 带内 FEC 恢复，输出必须按当前帧长 480 截断（不能沿用整块 960），FECFrames
+// 增加且后继包随后仍正常解码。
+func TestRemoteDecodeFECRecoversLostFrame10ms(t *testing.T) {
+	pkts := encodeRampedSine10msPackets(t, 10)
+	m, _ := newTestMixer()
+	rp := newTestRemotePeer(t, "a", m)
+	rp.frameMS.Store(FrameMS10)
+	if err := rp.jb.SetFrameMS(FrameMS10); err != nil {
+		t.Fatal(err)
+	}
+	arrival := func(seq int) time.Time {
+		return remoteArrivalBase.Add(time.Duration(seq) * 10 * time.Millisecond)
+	}
+	drain := make([]int16, FrameSize)
+
+	// 10ms 帧的预填深度是 6 包（60ms），比 20ms 的 3 包多一倍。
+	for i := 0; i < 6; i++ {
+		rp.jb.Push(uint16(100+i), pkts[i], arrival(100+i))
+	}
+	for i := 0; i < 6; i++ {
+		rp.decodeOnce()
+		if n := rp.input.ring.Read(drain); n != FrameSize {
+			t.Fatalf("normal frame produced %d samples, want %d", n, FrameSize)
+		}
+	}
+
+	// 106 丢失、107 已到：FEC 恢复 106。
+	if !codec.HasLBRR(pkts[7]) {
+		t.Fatal("10ms FEC 用例前提不成立：后继包 107 不含 LBRR")
+	}
+	rp.jb.Push(107, pkts[7], arrival(107))
+	rp.decodeOnce()
+	if n := rp.input.ring.Read(drain); n != FrameSize {
+		t.Fatalf("FEC frame produced %d samples, want %d", n, FrameSize)
+	}
+	if got := rp.Stats.FECFrames.Load(); got != 1 {
+		t.Fatalf("FECFrames = %d, want 1", got)
+	}
+	if got := rp.Stats.DREDFrames.Load(); got != 0 {
+		t.Fatalf("DREDFrames = %d, want 0（FEC 可用时应优先 FEC）", got)
+	}
+	if got := rp.Stats.PLCFrames.Load(); got != 0 {
+		t.Fatalf("PLCFrames = %d, want 0", got)
+	}
+
+	// 后继 107 正常解码（480 采样），未被 FEC 消费。
+	rp.decodeOnce()
+	if n := rp.input.ring.Read(drain); n != FrameSize {
+		t.Fatalf("successor frame produced %d samples, want %d", n, FrameSize)
+	}
+	if got := rp.Stats.FramesPopped.Load(); got != 7 {
+		t.Fatalf("FramesPopped = %d, want 7 (6 prefill + successor)", got)
+	}
+}
+
+// encodeDREDPackets 编码 n 个 20ms 包：440Hz 正弦逐帧提升幅度，开启 DRED
+// （200ms）并告知 20% 丢包率，但关闭带内 FEC——模拟编码端未提供 LBRR、只能靠
+// DRED 恢复的弱网场景（#44）。
+func encodeDREDPackets(t testing.TB, n int) [][]byte {
+	t.Helper()
+	enc, err := codec.NewEncoder(SampleRate, 1, codec.AppVoIP)
+	if err != nil {
+		t.Fatalf("new encoder: %v", err)
+	}
+	defer enc.Close()
+	if err := enc.SetBitrate(32000); err != nil {
+		t.Fatalf("set bitrate: %v", err)
+	}
+	if err := enc.SetInBandFEC(false); err != nil {
+		t.Fatalf("disable fec: %v", err)
+	}
+	if err := enc.SetDRED(20); err != nil {
+		t.Fatalf("set dred: %v", err)
+	}
+	if err := enc.SetPacketLossPerc(20); err != nil {
+		t.Fatalf("set packet loss: %v", err)
+	}
+	pcm := make([]int16, OpusFrameSize)
+	buf := make([]byte, 4000)
+	var phase float64
+	out := make([][]byte, 0, n)
+	for i := 0; i < n; i++ {
+		amp := 8000 + 1000*float64(i)
+		for j := range pcm {
+			phase += 2 * math.Pi * 440 / SampleRate
+			pcm[j] = int16(amp * math.Sin(phase))
+		}
+		m, err := enc.Encode(pcm, buf)
+		if err != nil {
+			t.Fatalf("encode %d: %v", i, err)
+		}
+		out = append(out, append([]byte(nil), buf[:m]...))
+	}
+	return out
+}
+
+// TestRemoteDecodeDREDRecoversLostFrame FEC 不可用时（编码端未开 FEC），丢帧
+// 由后继包的 DRED 冗余恢复：DREDFrames 增加、输出非静音并写入混音输入环；
+// 后继包随后仍按正常路径解码。
+func TestRemoteDecodeDREDRecoversLostFrame(t *testing.T) {
+	m, _ := newTestMixer()
+	rp := newTestRemotePeer(t, "a", m)
+	pkts := encodeDREDPackets(t, 8)
+	drain := make([]int16, OpusFrameSize)
+
+	for i := 0; i < 3; i++ {
+		rp.jb.Push(uint16(100+i), pkts[i], remoteArrival(100+i))
+	}
+	for i := 0; i < 3; i++ {
+		rp.decodeOnce()
+		rp.input.ring.Read(drain) // 排空正常帧
+	}
+
+	// 103 丢失、104 已到：FEC 无 LBRR 可用，DRED 从 104 恢复 103。
+	if codec.HasLBRR(pkts[4]) {
+		t.Fatal("DRED 用例前提不成立：FEC 已关闭，后继包不应带 LBRR")
+	}
+	rp.jb.Push(104, pkts[4], remoteArrival(104))
+	rp.decodeOnce()
+	n := rp.input.ring.Read(drain)
+	if n != OpusFrameSize {
+		t.Fatalf("DRED frame produced %d samples, want %d", n, OpusFrameSize)
+	}
+	if got := rp.Stats.DREDFrames.Load(); got != 1 {
+		t.Fatalf("DREDFrames = %d, want 1", got)
+	}
+	if got := rp.Stats.FECFrames.Load(); got != 0 {
+		t.Fatalf("FECFrames = %d, want 0", got)
+	}
+	if got := rp.Stats.PLCFrames.Load(); got != 0 {
+		t.Fatalf("PLCFrames = %d, want 0（DRED 已恢复）", got)
+	}
+	if r := rmsInt16(drain); r < 1000 {
+		t.Fatalf("DRED 恢复输出接近静音（RMS %.0f）", r)
+	}
+
+	// 后继 104 正常解码，DRED 未破坏解码器状态。
+	rp.decodeOnce()
+	if n := rp.input.ring.Read(drain); n != OpusFrameSize {
+		t.Fatalf("successor frame produced %d samples, want %d", n, OpusFrameSize)
+	}
+	if got := rp.Stats.FramesPopped.Load(); got != 4 {
+		t.Fatalf("FramesPopped = %d, want 4 (3 prefill + successor)", got)
+	}
+	if r := rmsInt16(drain); r < 1000 {
+		t.Fatalf("successor decoded RMS %.0f too low", r)
 	}
 }
 
@@ -299,6 +464,94 @@ func TestRemoteDecodeError(t *testing.T) {
 	}
 }
 
+// encode10msPackets 编码 n 个 10ms（480 采样）的 440Hz 正弦 Opus 包（#46）。
+func encode10msPackets(t testing.TB, n int) [][]byte {
+	t.Helper()
+	enc, err := codec.NewEncoder(SampleRate, 1, codec.AppVoIP)
+	if err != nil {
+		t.Fatalf("new encoder: %v", err)
+	}
+	defer enc.Close()
+	if err := enc.SetBitrate(32000); err != nil {
+		t.Fatalf("set bitrate: %v", err)
+	}
+	pcm := make([]int16, FrameSize)
+	buf := make([]byte, 4000)
+	var phase float64
+	out := make([][]byte, 0, n)
+	for i := 0; i < n; i++ {
+		for j := range pcm {
+			phase += 2 * math.Pi * 440 / SampleRate
+			pcm[j] = int16(12000 * math.Sin(phase))
+		}
+		m, err := enc.Encode(pcm, buf)
+		if err != nil {
+			t.Fatalf("encode %d: %v", i, err)
+		}
+		out = append(out, append([]byte(nil), buf[:m]...))
+	}
+	return out
+}
+
+// TestRemoteDecode10ms 10ms 频道（#46）：正常帧解码 480 采样，PLC 同样合成
+// 480 采样（不能沿用上一包的 960），写出总量按 480/拍累计。
+func TestRemoteDecode10ms(t *testing.T) {
+	m, _ := newTestMixer()
+	rp := newTestRemotePeer(t, "a", m)
+	rp.frameMS.Store(FrameMS10)
+	if err := rp.jb.SetFrameMS(FrameMS10); err != nil {
+		t.Fatal(err)
+	}
+	if got := rp.frameSamples(); got != FrameSize {
+		t.Fatalf("frameSamples = %d, want %d", got, FrameSize)
+	}
+	pkts := encode10msPackets(t, 6)
+	// 10ms 到达间隔（与帧长一致），避免抖动估计被测试夹具放大。
+	arrival10 := func(seq int) time.Time {
+		return remoteArrivalBase.Add(time.Duration(seq) * 10 * time.Millisecond)
+	}
+	for i := 0; i < 6; i++ {
+		rp.jb.Push(uint16(100+i), pkts[i], arrival10(100+i))
+	}
+	for i := 0; i < 7; i++ {
+		rp.decodeOnce()
+	}
+	if got := rp.Stats.FramesPopped.Load(); got != 6 {
+		t.Fatalf("FramesPopped = %d, want 6", got)
+	}
+	if got := rp.Stats.PLCFrames.Load(); got != 1 {
+		t.Fatalf("PLCFrames = %d, want 1", got)
+	}
+	if got := rp.input.WrittenSamples.Load(); got != 7*FrameSize {
+		t.Fatalf("WrittenSamples = %d, want %d", got, 7*FrameSize)
+	}
+	buf := make([]int16, 6*FrameSize)
+	if n := rp.input.ring.Read(buf); n != len(buf) {
+		t.Fatalf("ring read %d, want %d", n, len(buf))
+	}
+	if r := rmsInt16(buf); r < 1000 {
+		t.Fatalf("decoded RMS %.0f too low", r)
+	}
+}
+
+// TestRemoteManagerFrameMS 管理器帧长写入与热切换；非法值拒绝。
+func TestRemoteManagerFrameMS(t *testing.T) {
+	m, _ := newTestMixer()
+	rm := NewRemoteManager(m, nil)
+	if got := rm.FrameMS(); got != FrameMS20 {
+		t.Fatalf("默认帧长 = %d, want %d", got, FrameMS20)
+	}
+	if err := rm.SetFrameMS(FrameMS10); err != nil || rm.FrameMS() != FrameMS10 {
+		t.Fatalf("SetFrameMS(10): %v, got %d", err, rm.FrameMS())
+	}
+	if err := rm.SetFrameMS(15); err == nil {
+		t.Fatal("非法帧长应报错")
+	}
+	if got := rm.FrameMS(); got != FrameMS10 {
+		t.Fatalf("非法值不应改变帧长: %d", got)
+	}
+}
+
 // TestRemoteLinkStats 诊断快照（#95）：抖动统计、链路计数与混音输入环占用
 // 与解码路径一致；未知 peer 返回 false。
 func TestRemoteLinkStats(t *testing.T) {
@@ -319,8 +572,8 @@ func TestRemoteLinkStats(t *testing.T) {
 	if !ok {
 		t.Fatal("LinkStats(a) not found")
 	}
-	if ls.RTPReceived != 3 || ls.FramesPopped != 3 || ls.PLCFrames != 0 || ls.FECFrames != 0 {
-		t.Fatalf("link counters = %+v, want rtp=3 popped=3 plc=0 fec=0", ls)
+	if ls.RTPReceived != 3 || ls.FramesPopped != 3 || ls.PLCFrames != 0 || ls.FECFrames != 0 || ls.DREDFrames != 0 {
+		t.Fatalf("link counters = %+v, want rtp=3 popped=3 plc=0 fec=0 dred=0", ls)
 	}
 	if ls.RingAvailable != 3*OpusFrameSize || ls.WrittenSamples != 3*OpusFrameSize {
 		t.Fatalf("ring = %d/%d, want %d/%d", ls.RingAvailable, ls.WrittenSamples, 3*OpusFrameSize, 3*OpusFrameSize)
@@ -663,6 +916,24 @@ func TestRemoteHandleTrackLoopback(t *testing.T) {
 
 // BenchmarkRemoteDecodeFrame 远端解码热路径（push → pop → 解码 → 写混音环，
 // 随后排空模拟混音 tick 消费）：必须 0 allocs/op。
+// TestRemoteManagerOnPeerChange 链路增删通知在锁外触发（#45 ducking 重算钩子）；
+// 无实际变化（未知 peer）不触发。
+func TestRemoteManagerOnPeerChange(t *testing.T) {
+	m := NewMixer(func([]int16) int { return 0 })
+	rm := NewRemoteManager(m, nil)
+	calls := 0
+	rm.OnPeerChange = func() { calls++ }
+
+	rm.RemovePeer("nope")
+	if calls != 0 {
+		t.Fatalf("未知 peer 不应触发回调，实际 %d 次", calls)
+	}
+	rm.RemoveAll()
+	if calls != 1 {
+		t.Fatalf("RemoveAll 应触发一次回调，实际 %d 次", calls)
+	}
+}
+
 func BenchmarkRemoteDecodeFrame(b *testing.B) {
 	m := NewMixer(func([]int16) int { return FrameSize })
 	rp := newTestRemotePeer(b, "a", m)
@@ -688,8 +959,8 @@ func BenchmarkRemoteDecodeFrame(b *testing.B) {
 }
 
 // BenchmarkRemoteDecodePLCFrame 丢包路径：只推偶数 seq，每包弹两拍
-// （空洞用后继包 FEC 恢复/回落 PLC + 正常帧），验证丢帧分支（含 PeekNext
-// 与 FEC 解码）同样零分配。
+// （空洞先探测后继包 LBRR，无 FEC/DRED 时回落 PLC + 正常帧），验证丢帧分支
+// （含 PeekNext、LBRR 探测与 DRED 解析）同样零分配。
 func BenchmarkRemoteDecodePLCFrame(b *testing.B) {
 	m := NewMixer(func([]int16) int { return FrameSize })
 	rp := newTestRemotePeer(b, "a", m)

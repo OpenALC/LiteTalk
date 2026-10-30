@@ -51,6 +51,7 @@ type Config struct {
 	AudioCapture        string           `json:"audio_capture,omitempty"`         // 采集设备 ID（空=默认）
 	AudioPlayback       string           `json:"audio_playback,omitempty"`        // 播放设备 ID（空=默认）
 	Hotkeys             *hotkey.Settings `json:"hotkeys,omitempty"`               // 全局热键与按键说话（v1.2.0；默认关闭，见 hotkey 包）
+	WindowOverlay       *OverlaySettings `json:"window_overlay,omitempty"`        // 游戏内悬浮层（#47，Beta，仅 Windows；默认关闭）
 	// v0.1.2：界面销毁休眠/首页服务器/介绍页隐藏（客户端级偏好，无需服务端）。
 	UIDestroyOnHibernate *bool  `json:"ui_destroy_on_hibernate,omitempty"` // 休眠时 WindowReloadApp 卸载界面（默认 false）
 	HomeServerID         string `json:"home_server_id,omitempty"`          // 首页服务器 id（空 = 介绍页 __intro__）
@@ -70,6 +71,7 @@ type AudioSettings struct {
 	VBR             *bool   `json:"vbr,omitempty"`              // 可变码率（nil → true）
 	DTX             *bool   `json:"dtx,omitempty"`              // 静音期非连续传输（nil → true）
 	FEC             *bool   `json:"fec,omitempty"`              // 带内前向纠错（nil → true）
+	DRED            *bool   `json:"dred,omitempty"`             // 深度冗余：突发丢包恢复（nil → true，#44）
 	PacketLoss      int     `json:"packet_loss,omitempty"`      // 告知编码器的预期丢包率 %（0 → 10；FEC 关闭时无意义）
 	Denoise         *bool   `json:"denoise,omitempty"`          // RNNoise 降噪总开关（nil → true）
 	DenoiseStrength int     `json:"denoise_strength,omitempty"` // 降噪强度 1弱/2中/3强（0 → 2；0 档配合 Denoise=false 即"关"）
@@ -80,7 +82,8 @@ type AudioSettings struct {
 	MicVolume       int     `json:"mic_volume,omitempty"`       // 麦克风音量 0–120（默认 100）
 	PlaybackVolume  int     `json:"playback_volume,omitempty"`  // 扬声器音量 0–120（默认 100）
 	InputMode       string  `json:"input_mode,omitempty"`       // 输入声道下混：auto/left/right/mix（"" → auto）
-	PreGainDB       float64 `json:"pre_gain_db,omitempty"`      // 前置增益 dB（-12~+24，RNNoise 之前；0 → 0）
+	PreGainDB       float64 `json:"pre_gain_db,omitempty"`      // 前置增益 dB（-12~+24，RNNoise/APM 之前；0 → 0）
+	EnableAPM       bool    `json:"enable_apm,omitempty"`       // 启用 WebRTC APM（Beta 功能，默认关闭）
 }
 
 // InputModes 合法输入声道模式（SetAudioSettings 白名单 / GetAudioSettings 收敛）。
@@ -97,7 +100,7 @@ func DefaultAudioSettings() AudioSettings {
 	t := true
 	two := 2
 	return AudioSettings{
-		BitrateKbps: 32, VBR: &t, DTX: &t, FEC: &t,
+		BitrateKbps: 32, VBR: &t, DTX: &t, FEC: &t, DRED: &t,
 		PacketLoss: 10, Denoise: &t, DenoiseStrength: 2,
 		AGC: &t, VADSens: &two, Complexity: 9,
 		Gain: 10, MicVolume: 100, PlaybackVolume: 100,
@@ -127,6 +130,9 @@ func (m *Manager) GetAudioSettings() AudioSettings {
 	}
 	if s.FEC == nil {
 		s.FEC = d.FEC
+	}
+	if s.DRED == nil {
+		s.DRED = d.DRED
 	}
 	if s.PacketLoss <= 0 || s.PacketLoss > 100 {
 		s.PacketLoss = d.PacketLoss
@@ -224,6 +230,30 @@ func (m *Manager) GetHotkeySettings() hotkey.Settings {
 func (m *Manager) SetHotkeySettings(s hotkey.Settings) error {
 	return m.Update(func(c *Config) error {
 		c.Hotkeys = &s
+		return nil
+	})
+}
+
+// ---------- 游戏内悬浮层（#47，Beta） ----------
+
+// OverlaySettings 游戏内悬浮层配置。只有 Windows 有原生实现；其余平台
+// 读路径仍如实返回持久化值，由前端按平台能力禁用开关。
+type OverlaySettings struct {
+	Enabled bool `json:"enabled"` // 用户主动启用（Beta 默认关闭）
+}
+
+// GetWindowOverlaySettings 读取悬浮层设置（未配置 = 关闭）。
+func (m *Manager) GetWindowOverlaySettings() OverlaySettings {
+	if s := m.Get().WindowOverlay; s != nil {
+		return *s
+	}
+	return OverlaySettings{}
+}
+
+// SetWindowOverlaySettings 持久化悬浮层设置（平台能力校验在 app 层）。
+func (m *Manager) SetWindowOverlaySettings(s OverlaySettings) error {
+	return m.Update(func(c *Config) error {
+		c.WindowOverlay = &s
 		return nil
 	})
 }

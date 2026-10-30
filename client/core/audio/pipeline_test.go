@@ -28,6 +28,8 @@ func newLoopbackPipeline(t *testing.T, mutate func(*PipelineConfig)) *Pipeline {
 	requireOpus(t)
 	cfg := DefaultPipelineConfig()
 	cfg.Backend = BackendNull // 不 Start，仅同步注入，用不到后端
+	// APM 是 Beta 功能默认关闭；既有链路测试锁定旧 DSP 行为，APM 专项
+	// 由调用方 mutate 显式 EnableAPM=true。
 	if mutate != nil {
 		mutate(&cfg)
 	}
@@ -409,6 +411,7 @@ func BenchmarkProcessPCMWithSendGate(b *testing.B) {
 	cfg.Backend = BackendNull
 	cfg.Loopback = false
 	cfg.DSP.Denoise = false
+	// APM 默认关闭；基准目标是发包门开销，保持默认旧链路。
 	p, err := NewPipeline(cfg)
 	if err != nil {
 		b.Fatalf("NewPipeline: %v", err)
@@ -429,6 +432,80 @@ func BenchmarkProcessPCMWithSendGate(b *testing.B) {
 		if err := p.ProcessPCM(in); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// TestPipelineAPMRenderWiring 管线暴露的 AEC 参考入口：APM 启用时 ProcessRender
+// 与 ProcessPCM 可并行接线运行，且不改变编码/播放账目。
+func TestPipelineAPMRenderWiring(t *testing.T) {
+	requireAPM(t)
+	p := newLoopbackPipeline(t, func(c *PipelineConfig) { c.DSP.EnableAPM = true })
+	if !p.APMActive() {
+		t.Fatal("Pipeline 应启用 APM")
+	}
+	ren := make([]int16, FrameSize)
+	in := make([]int16, FrameSize)
+	var phase float64
+	var rng uint32 = 0x43AE
+	for f := 0; f < 40; f++ {
+		aecRenderFrame(ren, f)
+		p.ProcessRender(ren) // 混音器 tick 的实际接线
+		sineNoiseFrame(in, &phase, 6000, 500, &rng)
+		if err := p.ProcessPCM(in); err != nil {
+			t.Fatalf("ProcessPCM frame %d: %v", f, err)
+		}
+	}
+	if st := p.Stats(); st.FramesProcessed != 40 || st.PacketsEncoded != 20 {
+		t.Fatalf("统计异常: frames=%d packets=%d", st.FramesProcessed, st.PacketsEncoded)
+	}
+}
+
+// TestPipelineAPMHotSwitch 管线默认关闭 APM；Beta 开关运行期创建/销毁句柄，
+// 关闭后 ProcessPCM 完全走旧链路。
+func TestPipelineAPMHotSwitch(t *testing.T) {
+	requireAPM(t)
+	p := newLoopbackPipeline(t, nil)
+	if p.APMActive() {
+		t.Fatal("APM 默认应关闭")
+	}
+	ren := make([]int16, FrameSize)
+	in := make([]int16, FrameSize)
+	var phase float64
+	var rng uint32 = 0x43AF
+	feed := func(frames int) {
+		t.Helper()
+		for f := 0; f < frames; f++ {
+			aecRenderFrame(ren, f)
+			p.ProcessRender(ren)
+			sineNoiseFrame(in, &phase, 6000, 500, &rng)
+			if err := p.ProcessPCM(in); err != nil {
+				t.Fatalf("ProcessPCM: %v", err)
+			}
+		}
+	}
+	feed(10)
+	if err := p.SetEnableAPM(true); err != nil {
+		t.Fatalf("SetEnableAPM(true): %v", err)
+	}
+	if !p.APMActive() {
+		t.Fatal("开启后 APM 应生效")
+	}
+	feed(40)
+	if err := p.SetEnableAPM(false); err != nil {
+		t.Fatalf("SetEnableAPM(false): %v", err)
+	}
+	if p.APMActive() {
+		t.Fatal("关闭后 APM 应停用")
+	}
+	feed(10)
+	if err := p.SetEnableAPM(true); err != nil {
+		t.Fatalf("重新开启: %v", err)
+	}
+	if err := p.SetEnableAPM(true); err != nil { // 幂等
+		t.Fatalf("重复开启: %v", err)
+	}
+	if err := p.SetEnableAPM(false); err != nil {
+		t.Fatalf("最终关闭: %v", err)
 	}
 }
 
@@ -576,6 +653,9 @@ func TestOpusSetterAfterClose(t *testing.T) {
 	if err := p.SetOpusFEC(false); !errors.Is(err, codec.ErrClosed) {
 		t.Fatalf("SetOpusFEC after Close: %v", err)
 	}
+	if err := p.SetOpusDRED(false); !errors.Is(err, codec.ErrClosed) {
+		t.Fatalf("SetOpusDRED after Close: %v", err)
+	}
 	if err := p.SetOpusPacketLoss(20); !errors.Is(err, codec.ErrClosed) {
 		t.Fatalf("SetOpusPacketLoss after Close: %v", err)
 	}
@@ -584,12 +664,119 @@ func TestOpusSetterAfterClose(t *testing.T) {
 // TestOpusConfigResolve 零值字段回落默认。
 func TestOpusConfigResolve(t *testing.T) {
 	r := ResolveOpusConfig(OpusConfig{})
-	if r.BitrateKbps != 32 || !*r.VBR || !*r.DTX || !*r.FEC || r.PacketLoss != 10 {
+	if r.BitrateKbps != 32 || !*r.VBR || !*r.DTX || !*r.FEC || !*r.DRED || r.PacketLoss != 10 {
 		t.Fatalf("ResolveOpusConfig 零值回落异常: %+v", r)
 	}
-	custom := OpusConfig{BitrateKbps: 48, PacketLoss: 15}
+	off := false
+	custom := OpusConfig{BitrateKbps: 48, PacketLoss: 15, DRED: &off}
 	r = ResolveOpusConfig(custom)
-	if r.BitrateKbps != 48 || r.PacketLoss != 15 || !*r.VBR {
+	if r.BitrateKbps != 48 || r.PacketLoss != 15 || !*r.VBR || *r.DRED {
 		t.Fatalf("ResolveOpusConfig 应保留显式值: %+v", r)
+	}
+}
+
+// TestOpusDREDToggle DRED 默认开：编码器 DRED=20 帧、PLP 抬到 20%；关闭后
+// DRED 归零、PLP 恢复用户值；DRED 开启时用户调低 PLP 仍保留 20% 下限。
+func TestOpusDREDToggle(t *testing.T) {
+	p := newLoopbackPipeline(t, func(c *PipelineConfig) { c.DSP.Denoise = false })
+	if !*p.opus.DRED {
+		t.Fatal("默认 DRED 应为开")
+	}
+	if d, err := p.enc.DREDDuration(); err != nil || d != DREDDurationFrames {
+		t.Fatalf("DREDDuration = %d, %v; want %d", d, err, DREDDurationFrames)
+	}
+	if plp, err := p.enc.PacketLossPerc(); err != nil || plp != DREDMinPacketLoss {
+		t.Fatalf("PacketLossPerc = %d, %v; want %d", plp, err, DREDMinPacketLoss)
+	}
+
+	if err := p.SetOpusDRED(false); err != nil {
+		t.Fatalf("SetOpusDRED(false): %v", err)
+	}
+	if *p.opus.DRED {
+		t.Fatal("关闭后 p.opus.DRED 应为 false")
+	}
+	if d, err := p.enc.DREDDuration(); err != nil || d != 0 {
+		t.Fatalf("关闭后 DREDDuration = %d, %v; want 0", d, err)
+	}
+	if plp, err := p.enc.PacketLossPerc(); err != nil || plp != 10 {
+		t.Fatalf("关闭后 PacketLossPerc = %d, %v; want 用户值 10", plp, err)
+	}
+
+	if err := p.SetOpusDRED(true); err != nil {
+		t.Fatalf("SetOpusDRED(true): %v", err)
+	}
+	if err := p.SetOpusPacketLoss(5); err != nil {
+		t.Fatalf("SetOpusPacketLoss(5): %v", err)
+	}
+	if p.opus.PacketLoss != 5 {
+		t.Fatalf("用户 PLP 配置应保留 5: %+v", p.opus)
+	}
+	if plp, err := p.enc.PacketLossPerc(); err != nil || plp != DREDMinPacketLoss {
+		t.Fatalf("DRED 开启时编码器 PLP = %d, %v; want %d", plp, err, DREDMinPacketLoss)
+	}
+}
+
+// TestFrameMS10 10ms 帧长（#46）：每个 10ms 帧单独编码，包数 = 帧数，
+// 解码返回 480 采样；切回 20ms 恢复两帧一包。
+func TestFrameMS10(t *testing.T) {
+	var packets [][]byte
+	p := newLoopbackPipeline(t, func(c *PipelineConfig) {
+		c.Loopback = false
+		c.DSP.Denoise = false
+		c.OnPacket = func(pkt []byte) {
+			packets = append(packets, append([]byte(nil), pkt...))
+		}
+	})
+	if got := p.FrameMS(); got != FrameMS20 {
+		t.Fatalf("默认帧长 = %d, want %d", got, FrameMS20)
+	}
+	if err := p.SetFrameMS(FrameMS10); err != nil {
+		t.Fatalf("SetFrameMS(10): %v", err)
+	}
+	if err := p.SetFrameMS(15); err == nil {
+		t.Fatal("非法帧长应报错")
+	}
+
+	in := make([]int16, FrameSize)
+	var phase float64
+	var rng uint32 = 0x77
+	for f := 0; f < 4; f++ {
+		sineNoiseFrame(in, &phase, 12000, 2000, &rng)
+		if err := p.ProcessPCM(in); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(packets) != 4 {
+		t.Fatalf("10ms 模式包数 = %d, want 4", len(packets))
+	}
+	dec, err := codec.NewDecoder(SampleRate, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Close()
+	out := make([]int16, OpusFrameSize)
+	for i, pkt := range packets {
+		m, err := dec.Decode(pkt, out, false)
+		if err != nil {
+			t.Fatalf("decode packet %d: %v", i, err)
+		}
+		if m != FrameSize {
+			t.Fatalf("10ms 包解码 %d 采样, want %d", m, FrameSize)
+		}
+	}
+
+	// 切回 20ms：再喂 4 个 10ms 帧应得到 2 个包。
+	if err := p.SetFrameMS(FrameMS20); err != nil {
+		t.Fatalf("SetFrameMS(20): %v", err)
+	}
+	before := len(packets)
+	for f := 0; f < 4; f++ {
+		sineNoiseFrame(in, &phase, 12000, 2000, &rng)
+		if err := p.ProcessPCM(in); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := len(packets) - before; got != 2 {
+		t.Fatalf("切回 20ms 后包数 = %d, want 2", got)
 	}
 }

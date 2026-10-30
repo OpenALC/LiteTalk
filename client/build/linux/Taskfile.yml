@@ -1,7 +1,8 @@
 version: '3'
 
 # Linux 平台构建。gtk3 标签（对应 WebKitGTK 4.1；CLAUDE.md 硬性约束，勿用默认 GTK4）。
-# cgo（libopus 走 pkg-config 系统库）需 libopus-dev + pkg-config（CI 的 apt 步骤同款）。
+# cgo：libopus 静态链接仓库内 third_party/opus-linux-*；热键需 libx11-dev /
+# libxi-dev 与 pkg-config（CI 的 apt 步骤同款）。
 
 includes:
   common: ../Taskfile.yml

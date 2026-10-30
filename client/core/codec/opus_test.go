@@ -196,6 +196,99 @@ func TestFEC(t *testing.T) {
 	}
 }
 
+// TestDREDRecoversLostFrame 深度冗余（DRED）：用后继包里的冗余重建紧邻其前
+// 的丢帧。DRED 只有在预期丢包率足够高时才产出，故编码端 PLP=20。
+func TestDREDRecoversLostFrame(t *testing.T) {
+	enc, err := NewEncoder(testSampleRate, testChannels, AppVoIP)
+	if err != nil {
+		t.Fatalf("NewEncoder: %v", err)
+	}
+	defer enc.Close()
+	if err := enc.SetBitrate(32000); err != nil {
+		t.Fatalf("SetBitrate: %v", err)
+	}
+	if err := enc.SetInBandFEC(false); err != nil {
+		t.Fatalf("SetInBandFEC: %v", err)
+	}
+	if err := enc.SetDRED(20); err != nil {
+		t.Fatalf("SetDRED: %v", err)
+	}
+	if err := enc.SetPacketLossPerc(20); err != nil {
+		t.Fatalf("SetPacketLossPerc: %v", err)
+	}
+	if d, err := enc.DREDDuration(); err != nil || d != 20 {
+		t.Fatalf("DREDDuration = %d, %v; want 20", d, err)
+	}
+	if p, err := enc.PacketLossPerc(); err != nil || p != 20 {
+		t.Fatalf("PacketLossPerc = %d, %v; want 20", p, err)
+	}
+
+	pcm := make([]int16, testFrameSize)
+	out := make([]int16, testFrameSize)
+	buf := make([]byte, 4000)
+	pkts := make([][]byte, 6)
+	for i := range pkts {
+		fillSine(pcm, 8000+1000*float64(i), i*testFrameSize)
+		n, err := enc.Encode(pcm, buf)
+		if err != nil {
+			t.Fatalf("frame %d Encode: %v", i, err)
+		}
+		pkts[i] = append([]byte(nil), buf[:n]...)
+	}
+
+	dec := newTestDecoder(t)
+	dred, err := NewDREDDecoder()
+	if err != nil {
+		t.Fatalf("NewDREDDecoder: %v", err)
+	}
+	defer dred.Close()
+
+	// 丢帧前必须正常解码过若干包，DRED 解码依赖解码器的 warm 状态。
+	for i := 0; i < 3; i++ {
+		if _, err := dec.Decode(pkts[i], out, false); err != nil {
+			t.Fatalf("warm decode %d: %v", i, err)
+		}
+	}
+
+	// 第 3 帧丢失：用后继包 4 的 DRED 恢复。FEC 已关，包内不应有 LBRR
+	// （否则 opus_decode(fec=true) 会先把它当 FEC 用掉）。
+	if HasLBRR(pkts[4]) {
+		t.Fatal("FEC 已关闭，后继包不应携带 LBRR")
+	}
+	n, ok, err := dred.Recover(dec, pkts[4], out, testFrameSize, testSampleRate)
+	if err != nil {
+		t.Fatalf("DRED Recover: %v", err)
+	}
+	if !ok {
+		t.Fatal("后继包不含 DRED（PLP 不足或库未启用 DRED）")
+	}
+	if n != testFrameSize {
+		t.Fatalf("DRED recovered %d samples, want %d", n, testFrameSize)
+	}
+	if r := rms(out); r < 1000 {
+		t.Fatalf("DRED 输出接近静音（RMS %.0f），解码器状态未热或冗余解析失败", r)
+	}
+
+	// DRED 恢复后解码器仍能正常解码后继包。
+	if _, err := dec.Decode(pkts[4], out, false); err != nil {
+		t.Fatalf("post-DRED Decode: %v", err)
+	}
+
+	// 关闭 DRED 后 ctl 归零，PLP 恢复用户值。
+	if err := enc.SetDRED(0); err != nil {
+		t.Fatalf("SetDRED(0): %v", err)
+	}
+	if d, err := enc.DREDDuration(); err != nil || d != 0 {
+		t.Fatalf("DREDDuration after disable = %d, %v; want 0", d, err)
+	}
+	if err := enc.SetPacketLossPerc(10); err != nil {
+		t.Fatalf("SetPacketLossPerc(10): %v", err)
+	}
+	if p, err := enc.PacketLossPerc(); err != nil || p != 10 {
+		t.Fatalf("PacketLossPerc = %d, %v; want 10", p, err)
+	}
+}
+
 // TestSettersAndVersion 杂项 setter 与版本串。
 func TestSettersAndVersion(t *testing.T) {
 	enc := newTestEncoder(t)

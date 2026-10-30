@@ -161,6 +161,43 @@ func TestGateEffectiveSendModeIntegration(t *testing.T) {
 	}
 }
 
+// TestGateForceWhisper 悄悄话旁路（#45）：Force 期间无视模式放行，解除后
+// 回到 PTT 状态；与 Press/Release 互不覆盖（先松 PTT 再松悄悄话不误关麦）。
+func TestGateForceWhisper(t *testing.T) {
+	var g Gate
+	g.SetMode(ModePTT)
+	if g.Allow(false) {
+		t.Fatal("PTT 未按下时应拦住")
+	}
+	g.Force(true)
+	if !g.Allow(false) {
+		t.Fatal("悄悄话按住时即使 PTT 未按也应放行")
+	}
+
+	// PTT 按下 → PTT 松开（开尾包窗）→ 悄悄话仍按住：必须继续放行。
+	g.Press()
+	g.Release(0)
+	if !g.Allow(false) {
+		t.Fatal("悄悄话仍按住时松开 PTT 不得关麦")
+	}
+	g.Force(false)
+	if g.Allow(false) {
+		t.Fatal("悄悄话释放且 PTT 已松开后应恢复拦帧")
+	}
+
+	// 反序：悄悄话先松、PTT 仍按住 → 继续放行。
+	g.Press()
+	g.Force(true)
+	g.Force(false)
+	if !g.Allow(false) {
+		t.Fatal("PTT 仍按住时释放悄悄话不得关麦")
+	}
+	g.Release(0)
+	if g.Allow(false) {
+		t.Fatal("两者都释放后应拦帧")
+	}
+}
+
 func TestGateConcurrentUse(t *testing.T) {
 	var g Gate
 	g.SetMode(ModePTT)

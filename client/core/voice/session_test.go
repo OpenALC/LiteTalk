@@ -1472,7 +1472,7 @@ func TestLateChannelJoinedAfterLeaveIgnored(t *testing.T) {
 			activity.Add(1)
 			selfs <- id
 		},
-		OnPeerJoin: func(uid, nickname, tag string, speaking, mute, deafen bool) {
+		OnPeerJoin: func(uid, nickname, tag string, speaking, mute, deafen, priority bool) {
 			activity.Add(1)
 			peerJoins <- uid
 		},
@@ -1519,7 +1519,7 @@ func TestLateChannelJoinedAfterSwitchIgnored(t *testing.T) {
 	peerJoins := make(chan string, 16)
 	s := newJoinedSession(t, stub, Events{
 		OnSelf: func(id string) { selfs <- id },
-		OnPeerJoin: func(uid, nickname, tag string, speaking, mute, deafen bool) {
+		OnPeerJoin: func(uid, nickname, tag string, speaking, mute, deafen, priority bool) {
 			peerJoins <- uid
 		},
 	})

@@ -5,8 +5,9 @@
 //     / voice.speaking——登录后常驻，按「订阅」下发给该用户全部服务器的相关事件，
 //     与是否在语音房无关；带 seq、断线后可 gateway.resume 补发。例外：voice.speaking
 //     高频且瞬时，即时下行但不进补发环（seq=0），避免挤掉聊天消息的补发窗口。
-//   - voice 语音面：channel.* / rtc.* / voice.state* / session.voice_taken——
-//     进房才产生，瞬时语义，不进环、无 seq（replay 过期状态只会污染客户端）。
+//   - voice 语音面：channel.* / rtc.* / voice.state* / voice.whisper / voice.priority
+//     / session.voice_taken——进房才产生，瞬时语义，不进环、无 seq（replay 过期状态
+//     只会污染客户端）。
 //   - session 连接控制：hello 系 / error / gateway.resume / gateway.invalid_session。
 //
 // 单实例假设：环在进程内存（默认 SQLite 单机部署），续传是**会话粘性**的。
@@ -16,6 +17,7 @@ package signal
 
 import (
 	"encoding/json"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -318,45 +320,73 @@ func (h *Hub) broadcastEvent(uids map[string]bool, msgType string, data any) {
 	}
 }
 
-// broadcastVoiceSpeaking 说话翻转下发（#33）：SFU 按 RFC 6464 电平统一判定后
-// 经此投递网关事件面。按连接协议版本分流（裁定 #5 兼容过渡，一个版本周期）：
-//   - 协议 ≥2：voice.speaking 即时下行、**不进补发环**（seq=0），含本人（自己的
-//     声波球同源）。说话翻转是高频瞬时语义，进环会在十人房里一分钟内把聊天
-//     消息挤出 256 条补发窗口；断线期间错过的说话态本就无回放价值。
-//   - 协议 <2（v1/未协商）：退化为 voice.state{speaking}——老客户端只认这条路，
-//     行为与今天一致（不含本人：v1 的自我指示由本地 DSP 驱动）。
-//
-// 调用方（SFU 判定 ticker）不持任何 SFU 锁；本函数不得反调 SFU。
-func (h *Hub) broadcastVoiceSpeaking(channelID, userID string, speaking bool) {
-	h.mu.Lock()
-	var legacy []*client
-	v2uids := make(map[string]bool)
-	if room := h.rooms[channelID]; room != nil {
-		for uid, m := range room.members {
-			if m.protoVer.Load() >= 2 {
-				v2uids[uid] = true
-			} else {
-				legacy = append(legacy, m)
-			}
-		}
-		// 成员内存态同步：channel.joined 快照里的 speaking 据此回填。
-		if m := room.members[userID]; m != nil {
-			m.mu.Lock()
-			m.state.Speaking = &speaking
-			m.mu.Unlock()
+// speakingRecipientsLocked 悄悄话生效时说话事件的收件 uid 集合（#45）：
+// 目标 + 说话者本人；目标只保留仍在房间里的成员。nil = 未启用悄悄话，保持
+// 原广播范围。调用方须持 h.mu；不得访问 SFU。
+func speakingRecipientsLocked(room *roomState, speakerUID string) map[string]bool {
+	ws, ok := room.whisper[speakerUID]
+	if !ok || !ws.active {
+		return nil
+	}
+	// 实例核对：旧连接残留的悄悄话态不得影响新连接。
+	m := room.members[speakerUID]
+	if m == nil || ws.connID != strconv.FormatUint(m.connID, 10) {
+		return nil
+	}
+	allowed := make(map[string]bool, len(ws.targets)+1)
+	allowed[speakerUID] = true
+	for uid := range ws.targets {
+		if room.members[uid] != nil {
+			allowed[uid] = true
 		}
 	}
-	// 事件面订阅是 uid 级：同 uid 的其他在线 v2 设备也收说话指示（与旧广播一致）。
-	var v2 []*client
-	if len(v2uids) > 0 {
-		for _, c := range h.conns {
-			if v2uids[c.userID] && c.protoVer.Load() >= 2 {
-				v2 = append(v2, c)
-			}
-		}
-	}
-	h.mu.Unlock()
+	return allowed
+}
 
+// allowedEqual 两套收件 uid 集合是否等价（nil = 全房）。
+func allowedEqual(a, b map[string]bool) bool {
+	if (a == nil) != (b == nil) {
+		return false
+	}
+	if a == nil {
+		return true
+	}
+	if len(a) != len(b) {
+		return false
+	}
+	for uid := range a {
+		if !b[uid] {
+			return false
+		}
+	}
+	return true
+}
+
+// collectSpeakingRecipientsLocked 按收件 uid 集合（nil = 全房）收集 v2 连接与
+// legacy 成员。事件面订阅是 uid 级：同 uid 的其他在线 v2 设备也收说话指示。
+// 调用方须持 h.mu。
+func (h *Hub) collectSpeakingRecipientsLocked(room *roomState, allowed map[string]bool) (v2 []*client, legacy []*client) {
+	v2uids := make(map[string]bool, len(room.members))
+	for uid, m := range room.members {
+		if allowed != nil && !allowed[uid] {
+			continue
+		}
+		if m.protoVer.Load() >= 2 {
+			v2uids[uid] = true
+		} else {
+			legacy = append(legacy, m)
+		}
+	}
+	for _, c := range h.conns {
+		if v2uids[c.userID] && c.protoVer.Load() >= 2 {
+			v2 = append(v2, c)
+		}
+	}
+	return v2, legacy
+}
+
+// sendVoiceSpeaking 向已筛好的连接下发一次说话事件（不做成员态更新）。
+func (h *Hub) sendVoiceSpeaking(channelID, userID string, speaking bool, v2, legacy []*client) {
 	if len(v2) > 0 {
 		// 一次序列化、多连接下发（seq=0：不进环、不需去重排序）。
 		payload, err := json.Marshal(VoiceSpeakingData{ChannelID: channelID, UserID: userID, Speaking: speaking})
@@ -380,6 +410,110 @@ func (h *Hub) broadcastVoiceSpeaking(channelID, userID string, speaking bool) {
 		sp := speaking
 		h.sendJSON(c, TypeVoiceState, VoiceStateData{UserID: userID, Speaking: &sp})
 	}
+}
+
+// broadcastVoiceSpeaking 说话翻转下发（#33）：SFU 按 RFC 6464 电平统一判定后
+// 经此投递网关事件面。按连接协议版本分流（裁定 #5 兼容过渡，一个版本周期）：
+//   - 协议 ≥2：voice.speaking 即时下行、**不进补发环**（seq=0），含本人（自己的
+//     声波球同源）。说话翻转是高频瞬时语义，进环会在十人房里一分钟内把聊天
+//     消息挤出 256 条补发窗口；断线期间错过的说话态本就无回放价值。
+//   - 协议 <2（v1/未协商）：退化为 voice.state{speaking}——老客户端只认这条路，
+//     行为与今天一致（不含本人：v1 的自我指示由本地 DSP 驱动）。
+//
+// #45：源处于悄悄话 active 时，收件人收窄为 targets + 说话者本人（按 uid，
+// v2 含其多设备），非目标既不看指示、也不会因优先发言等逻辑被误导。
+// 过滤只读 hub roomState 的 whisper 快照——不得反调 SFU（死锁约定）。
+//
+// 调用方（SFU 判定 ticker）不持任何 SFU 锁；本函数不得反调 SFU。
+func (h *Hub) broadcastVoiceSpeaking(channelID, userID string, speaking bool) {
+	h.mu.Lock()
+	var v2, legacy []*client
+	if room := h.rooms[channelID]; room != nil {
+		allowed := speakingRecipientsLocked(room, userID)
+		v2, legacy = h.collectSpeakingRecipientsLocked(room, allowed)
+		// 成员内存态同步：channel.joined 快照里的 speaking 据此回填。
+		if m := room.members[userID]; m != nil {
+			m.mu.Lock()
+			m.state.Speaking = &speaking
+			m.mu.Unlock()
+		}
+	}
+	h.mu.Unlock()
+	h.sendVoiceSpeaking(channelID, userID, speaking, v2, legacy)
+}
+
+// syncWhisperSpeakingScope 悄悄话收件范围变化时的说话态纠正（#45）：
+// 若说话者当前正在说话，只给「范围变化」的成员补发：
+//   - 新进入接收范围（取消悄悄话、或目标被加入）：补 speaking=true；
+//   - 离开接收范围（启用悄悄话、或目标被移除）：补 speaking=false。
+//
+// 没有这一步时，说话中途开启悄悄话会让非目标一直保留旧的 speaking=true
+// （优先发言者还会继续误导非目标 ducking），直到下一次说话翻转才纠正。
+// old/new 为 nil 表示全房；调用方传入变化前后的集合即可。
+func (h *Hub) syncWhisperSpeakingScope(channelID, userID string, oldAllowed, newAllowed map[string]bool) {
+	if allowedEqual(oldAllowed, newAllowed) {
+		return
+	}
+	h.mu.Lock()
+	room := h.rooms[channelID]
+	if room == nil {
+		h.mu.Unlock()
+		return
+	}
+	m := room.members[userID]
+	if m == nil {
+		h.mu.Unlock()
+		return
+	}
+	m.mu.Lock()
+	speaking := m.state.Speaking != nil && *m.state.Speaking
+	m.mu.Unlock()
+	if !speaking {
+		h.mu.Unlock()
+		return
+	}
+	added := make(map[string]bool)
+	removed := make(map[string]bool)
+	for uid := range room.members {
+		if uid == userID {
+			continue // 本人始终在范围内，不需要纠正
+		}
+		was := oldAllowed == nil || oldAllowed[uid]
+		now := newAllowed == nil || newAllowed[uid]
+		switch {
+		case now && !was:
+			added[uid] = true
+		case was && !now:
+			removed[uid] = true
+		}
+	}
+	h.mu.Unlock()
+	if len(added) > 0 {
+		h.sendSpeakingToUIDSet(channelID, userID, true, added)
+	}
+	if len(removed) > 0 {
+		h.sendSpeakingToUIDSet(channelID, userID, false, removed)
+	}
+}
+
+// sendSpeakingToUIDSet 向指定 uid 集合补发说话态（#45，含其在线 v2 多设备；
+// legacy 只覆盖房间内连接）。不做成员态更新。
+func (h *Hub) sendSpeakingToUIDSet(channelID, userID string, speaking bool, uids map[string]bool) {
+	h.mu.Lock()
+	room := h.rooms[channelID]
+	if room == nil {
+		h.mu.Unlock()
+		return
+	}
+	sel := make(map[string]bool, len(uids))
+	for uid := range uids {
+		if room.members[uid] != nil {
+			sel[uid] = true
+		}
+	}
+	v2, legacy := h.collectSpeakingRecipientsLocked(room, sel)
+	h.mu.Unlock()
+	h.sendVoiceSpeaking(channelID, userID, speaking, v2, legacy)
 }
 
 // handleGatewayResume 处理 C→S gateway.resume{session_id, last_seq}（#32）。

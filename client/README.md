@@ -35,6 +35,14 @@ Go + Wails v3 桌面端：音频采集/降噪/Opus 编解码、WebRTC 通话、V
 设置 → 音频设备下拉即时生效：设备流重启，编解码/混音/通话状态保留。
 设备失效时自动回退系统默认设备。
 
+## 回声消除（Beta）
+
+WebRTC APM（AEC3 回声消除 + AGC2 自动增益 + 高通，参考信号取混音器实际播放输出）
+是 Beta 功能，默认关闭；在设置 → Beta 功能打开「回声消除（WebRTC APM）」后启用。
+开启会增加 CPU 占用；关闭后完全回到 RNNoise/自研 AGC 旧链路。RNNoise 仍是
+「语音」里的独立降噪强度设置。静态库与平台矩阵见
+`third_party/webrtc-apm/README.md`；macOS 未接入，设置页会禁用开关并提示不支持。
+
 ## 服务器地址配置
 
 设置 → 连接：填服务器地址（如 `https://your-domain.com`）→ 测试连接 → 保存后重启生效；WS 信令地址自动推导。

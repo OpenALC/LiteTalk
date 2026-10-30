@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -25,9 +24,11 @@ import (
 	"github.com/OpenALC/LiteTalk/client/core/audio"
 	"github.com/OpenALC/LiteTalk/client/core/config"
 	"github.com/OpenALC/LiteTalk/client/core/hotkey"
+	"github.com/OpenALC/LiteTalk/client/core/netdiag"
 	"github.com/OpenALC/LiteTalk/client/core/signal"
 	"github.com/OpenALC/LiteTalk/client/core/voice"
 	"github.com/OpenALC/LiteTalk/client/desktop"
+	"github.com/OpenALC/LiteTalk/client/desktop/overlay"
 	"github.com/OpenALC/LiteTalk/client/desktop/tray"
 	"github.com/gen2brain/malgo"
 	"github.com/wailsapp/wails/v3/pkg/application"
@@ -108,6 +109,22 @@ type App struct {
 	hkGate    *hotkey.Gate
 	hkQuit    chan struct{}
 	hkQuitOne sync.Once
+
+	// overlayMu 串行化悬浮层开关（Wails 绑定可并发调用）：配置落盘、启动/
+	// 停止窗口必须在同一临界区，否则连点开关会留下「配置开、窗口停」的撕裂态。
+	overlayMu sync.Mutex
+
+	// 悄悄话（#45）：whisperMu 保护 UI 维护的目标选择与按键/生效状态。
+	// whisperHeld 是物理按键态，whisperActive 是「已下发目标且旁路发送门」态
+	// （目标为空时按住键也不开麦、不发信令）。
+	// whisperSeq 是正在等 voice.whisper_ack 的请求序号（0 = 无在途，#116）；
+	// whisperTimer 是等待确认的超时计时器，ack/释放/超时/清理都要停掉。
+	whisperMu      sync.Mutex
+	whisperTargets []string
+	whisperHeld    bool
+	whisperActive  bool
+	whisperSeq     int64
+	whisperTimer   *time.Timer
 
 	// trayMute 托盘「静音」勾选项：前端/热键改静音时同步勾选态（此前只有
 	// 托盘自己的点击会更新，另两条路径改了静音托盘不跟着变）。
@@ -362,6 +379,7 @@ func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) 
 	})
 	a.setupTray()
 	a.startHotkeys()
+	a.startWindowOverlay()
 	// 机密存储模式推一次给前端（契约 §0.6 sys:secret）：回落明文文件存储必须
 	// 让 UI 可感知，不能静默降级。前端也可能主动调 SecretStorageMode 补拉。
 	a.emit("sys:secret", SecretModeEvent{Mode: config.SecretMode()})
@@ -887,28 +905,50 @@ type ConnTestResult struct {
 // TestServerConnection 测试服务器连通性：GET <base>/api/v1/healthz（3s 超时）。
 // 用于设置页「测试连接」，可对未保存的地址直接测试。
 func (a *App) TestServerConnection(baseURL string) *ConnTestResult {
-	if err := config.ValidateBase(baseURL); err != nil {
-		return &ConnTestResult{OK: false, ErrorMsg: err.Error()}
+	r := netdiag.Healthz(context.Background(), baseURL, 3*time.Second)
+	return &ConnTestResult{OK: r.OK, Latency: r.LatencyMS, Version: r.Version, ErrorMsg: r.Error}
+}
+
+// NetworkDiag 一键网络诊断（#49 C）：REST healthz、信令 WS、STUN binding 与
+// TURN allocate 四项并行探测，各带独立超时、互不影响，不修改现有连接。
+// STUN/TURN 取当前 /rtc/credentials 配置；未配置或缺少凭证时标记 skipped。
+func (a *App) NetworkDiag() *netdiag.Result {
+	resolved := a.cfg.Resolve()
+	var servers []netdiag.ICEServer
+	token := ""
+	wsConnected := false
+	a.mu.Lock()
+	sess := a.sess
+	a.mu.Unlock()
+	if a.api != nil {
+		token = a.api.Token()
+		if resp, err := a.api.RTCCredentials(); err == nil && resp != nil {
+			for _, srv := range resp.ICEServers {
+				servers = append(servers, netdiag.ICEServer{
+					URLs:       srv.URLs,
+					Username:   srv.Username,
+					Credential: srv.Credential,
+				})
+			}
+		} else if err != nil {
+			// 无 TURN 的部署本就会 503：诊断里按「未配置」展示，日志留底即可。
+			log.Printf("network diag: rtc credentials: %v", err)
+		}
 	}
-	client := &http.Client{Timeout: 3 * time.Second}
-	start := time.Now()
-	resp, err := client.Get(baseURL + "/api/v1/healthz")
-	if err != nil {
-		return &ConnTestResult{OK: false, ErrorMsg: "连接失败"}
+	if sess != nil {
+		wsConnected = sess.SignalConnected()
 	}
-	defer resp.Body.Close()
-	latency := time.Since(start).Milliseconds()
-	if resp.StatusCode != http.StatusOK {
-		return &ConnTestResult{OK: false, Latency: latency, ErrorMsg: fmt.Sprintf("服务端返回 %d", resp.StatusCode)}
-	}
-	var body struct {
-		Status  string `json:"status"`
-		Version string `json:"version"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return &ConnTestResult{OK: true, Latency: latency} // 可达但响应格式异常：仍算连通
-	}
-	return &ConnTestResult{OK: true, Latency: latency, Version: body.Version}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	res := netdiag.Run(ctx, netdiag.Config{
+		BaseURL:     resolved.BaseURL,
+		WSURL:       resolved.WSURL,
+		Token:       token,
+		ICEServers:  servers,
+		Timeout:     4 * time.Second,
+		WSConnected: wsConnected,
+	})
+	return &res
 }
 
 // ---------- 认证（转发 REST，§5.4） ----------
@@ -1232,14 +1272,17 @@ func (a *App) connectSession(token, nickname string, gen uint64) error {
 func (a *App) connectSessionLocked(token, nickname string) error {
 	a.disconnectSessionLocked()
 	ev := voice.Events{
-		OnPeerJoin: func(userID, nickname, tag string, speaking, mute, deafen bool) {
+		OnPeerJoin: func(userID, nickname, tag string, speaking, mute, deafen, priority bool) {
 			a.emit("voice:peer-join", map[string]any{
 				"user_id": userID, "nickname": nickname, "tag": tag,
-				"speaking": speaking, "mute": mute, "deafen": deafen,
+				"speaking": speaking, "mute": mute, "deafen": deafen, "priority": priority,
 			})
 		},
 		OnPeerLeave: func(userID string) {
 			a.emit("voice:peer-leave", userID)
+		},
+		OnPeerPriority: func(userID string, priority bool) {
+			a.emit("voice:priority", map[string]any{"user_id": userID, "priority": priority})
 		},
 		OnPeerSpeaking: func(userID string, speaking, mute, deafen bool) {
 			a.emit("voice:speaking", map[string]any{
@@ -1280,6 +1323,7 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 		// 此处只把事实转给前端（toast + 清房间态）。同样跑在 ws 读循环
 		// goroutine 上，不得同步断开会话。
 		OnVoiceTaken: func() {
+			a.clearWhisper()
 			a.emit("voice:taken", nil)
 		},
 		// 好友在线状态变化（presence.update，#11/#92）：转给前端刷好友状态点；
@@ -1343,6 +1387,8 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 		// 再重发 join）。前端据 voice:join_failed 清掉 channelId/延迟并提示。
 		// 同一次失败不再走 chat:error（见 ErrorHandlerEx）。
 		OnJoinFailed: func(channelID, code, message string) {
+			// 入房失败后没有语音房可悄悄话：关旁路门并清目标缓存。
+			a.clearWhisper()
 			a.emit("voice:join_failed", map[string]string{
 				"channel_id": channelID, "code": code, "message": message,
 			})
@@ -1354,6 +1400,12 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 		OnResync: func() {
 			a.emit("data:resync", nil)
 		},
+		// 悄悄话目标生效确认（voice.whisper_ack，#116 协议 v4）：只有匹配当前
+		// 按住期间在途 seq 的确认才开麦/关麦，乱序与过期确认直接丢弃。
+		// 回调跑在 ws 读循环 goroutine，分发表状态不阻塞。
+		OnWhisperAck: func(seq int64, active bool) {
+			a.onWhisperAck(seq, active)
+		},
 	}
 	server := a.cfg.Resolve().WSURL
 	sess := voice.NewSession(a.api, token, nickname, ev, log.Default())
@@ -1363,6 +1415,9 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 	// 连接即应用持久化的语音设置（码率/VBR/DTX/FEC/丢包率/降噪/增益/VAD 灵敏度）。
 	if err := sess.ApplyAudio(a.runtimeAudio()); err != nil {
 		log.Printf("apply audio settings: %v", err)
+	}
+	if a.rollbackAPMIfInactive(sess) {
+		log.Printf("WebRTC APM 未启用，已回滚 enable_apm")
 	}
 	// 连接即应用持久化的设备选择（设置页未连接时仅落盘，此处补应用）。
 	c := a.cfg.Get()
@@ -1457,6 +1512,7 @@ func (a *App) disconnectSession() {
 // disconnectSessionLocked 前提：已持 connMu。
 func (a *App) disconnectSessionLocked() {
 	a.statsGen.Add(1) // 旧 ticker 代际失效（S9）
+	a.clearWhisper()
 	a.mu.Lock()
 	s := a.sess
 	a.sess = nil
@@ -1474,6 +1530,8 @@ func (a *App) JoinChannel(channelID string) error {
 	if s == nil {
 		return fmt.Errorf("not connected")
 	}
+	// 切房后旧的悄悄话目标已无意义（成员集合不同），清选择并关旁路门。
+	a.clearWhisper()
 	return s.JoinChannel(channelID)
 }
 
@@ -1486,6 +1544,7 @@ func (a *App) JoinChannelWithPassword(channelID, password string) error {
 	if s == nil {
 		return fmt.Errorf("not connected")
 	}
+	a.clearWhisper()
 	return s.JoinChannelWithPassword(channelID, password)
 }
 
@@ -1494,6 +1553,7 @@ func (a *App) LeaveChannel() error {
 	a.mu.Lock()
 	s := a.sess
 	a.mu.Unlock()
+	a.clearWhisper()
 	if s == nil {
 		return nil
 	}
@@ -1573,10 +1633,11 @@ func (a *App) CreateSubchannel(serverID, name, typ, parentID string) (*api.Chann
 	return a.api.CreateSubchannel(serverID, name, typ, parentID)
 }
 
-// UpdateChannelOptions 更新频道选项（#37 B2）：parentID 空串不改/"0" 顶层；
-// userLimit <0 不改；password 空串不改，clearPassword 清除。
-func (a *App) UpdateChannelOptions(channelID, parentID string, userLimit int, password string, clearPassword bool) (*api.ChannelDTO, error) {
-	return a.api.UpdateChannelOptions(channelID, parentID, userLimit, password, clearPassword)
+// UpdateChannelOptions 更新频道选项（#37 B2、#46）：parentID 空串不改/"0" 顶层；
+// userLimit <0 不改；audioBitrateKbps/audioFrameMS <0 不改（0 = 跟随设置/默认）；
+// password 空串不改，clearPassword 清除。
+func (a *App) UpdateChannelOptions(channelID, parentID string, userLimit, audioBitrateKbps, audioFrameMS int, password string, clearPassword bool) (*api.ChannelDTO, error) {
+	return a.api.UpdateChannelOptions(channelID, parentID, userLimit, audioBitrateKbps, audioFrameMS, password, clearPassword)
 }
 
 // RenameChannel 重命名频道（owner/admin）。
@@ -1982,6 +2043,67 @@ func (a *App) RequestVoiceState(channelID, targetID string, mute, deafen bool) e
 	return s.RequestVoiceState(channelID, targetID, mute, deafen)
 }
 
+// priorityPermBit 频道覆盖里的 PrioritySpeaker 位（与 store.Permission 同值）。
+// 只增删这一位，其余位原样保留（#45）。
+const priorityPermBit uint64 = 1 << 4
+
+// SetPrioritySpeaker 授予/撤销某成员的优先发言（#45，需 ManageChannels）。
+// 读当前 member 覆盖 → 保留其他权限位、只增删 PrioritySpeaker → 空覆盖删除。
+// 撤销只清 allow 位、不写 deny，角色可能已授予该权限，不能反向压制。
+// 服务端权限不足时返回 API 错误（前端提示 403）。
+func (a *App) SetPrioritySpeaker(channelID, userID string, enabled bool) error {
+	if a.api == nil {
+		return fmt.Errorf("not connected")
+	}
+	ows, err := a.api.ListChannelOverwrites(channelID)
+	if err != nil {
+		return err
+	}
+	var cur *api.ChannelOverwriteDTO
+	for i := range ows {
+		if ows[i].TargetType == "member" && ows[i].TargetID.String() == userID {
+			cur = &ows[i]
+			break
+		}
+	}
+	var allow, deny uint64
+	if cur != nil {
+		if allow, err = parsePermBits(cur.Allow); err != nil {
+			return err
+		}
+		if deny, err = parsePermBits(cur.Deny); err != nil {
+			return err
+		}
+	}
+	if enabled {
+		allow |= priorityPermBit
+	} else {
+		// 撤销且无个人覆盖：角色授予保持原样，不必写一条 deny。
+		if cur == nil {
+			return nil
+		}
+		allow &^= priorityPermBit
+	}
+	if cur != nil && allow == 0 && deny == 0 {
+		return a.api.DeleteChannelOverwrite(channelID, "member", userID)
+	}
+	_, err = a.api.SetChannelOverwrite(channelID, "member", userID,
+		strconv.FormatUint(allow, 10), strconv.FormatUint(deny, 10))
+	return err
+}
+
+// parsePermBits 十进制权限位串 → uint64；空串按 0（服务端输出可能省略 0）。
+func parsePermBits(s string) (uint64, error) {
+	if s == "" {
+		return 0, nil
+	}
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("权限位格式非法: %q", s)
+	}
+	return v, nil
+}
+
 // GetVoiceState 当前语音态快照（UI 销毁重载后回填用；channel_id 空=未在频道）。
 func (a *App) GetVoiceState() voice.VoiceStateView {
 	a.mu.Lock()
@@ -2054,6 +2176,7 @@ func (a *App) runtimeAudio() audio.RuntimeSettings {
 		Opus: audio.OpusConfig{
 			BitrateKbps: as.BitrateKbps,
 			VBR:         as.VBR, DTX: as.DTX, FEC: as.FEC,
+			DRED:       as.DRED,
 			PacketLoss: as.PacketLoss,
 		},
 		Denoise:         as.Denoise != nil && *as.Denoise,
@@ -2065,8 +2188,13 @@ func (a *App) runtimeAudio() audio.RuntimeSettings {
 		Complexity:      complexity,
 		InputMode:       audio.ParseInputMode(as.InputMode),
 		PreGainDB:       as.PreGainDB,
+		EnableAPM:       as.EnableAPM,
 	}
 }
+
+// APMSupported 报告当前平台是否提供 WebRTC APM（Beta 开关可用性）。
+// false 的平台（如 macOS stub）设置页应禁用开关并提示不支持。
+func (a *App) APMSupported() bool { return audio.APMSupported() }
 
 // GetAudioSettings 读取持久化语音设置（设置页初始化用；未设置字段回落默认值）。
 func (a *App) GetAudioSettings() config.AudioSettings { return a.cfg.GetAudioSettings() }
@@ -2101,6 +2229,9 @@ func (a *App) SetAudioSettings(s config.AudioSettings) error {
 	if s.PreGainDB < config.PreGainMinDB || s.PreGainDB > config.PreGainMaxDB {
 		return fmt.Errorf("前置增益越界: %.1fdB", s.PreGainDB)
 	}
+	if s.EnableAPM && !audio.APMSupported() {
+		return fmt.Errorf("当前平台不支持 WebRTC APM")
+	}
 	if err := a.cfg.SetAudioSettings(s); err != nil {
 		return err
 	}
@@ -2108,9 +2239,30 @@ func (a *App) SetAudioSettings(s config.AudioSettings) error {
 	sess := a.sess
 	a.mu.Unlock()
 	if sess != nil {
-		return sess.ApplyAudio(a.runtimeAudio())
+		err := sess.ApplyAudio(a.runtimeAudio())
+		if s.EnableAPM && a.rollbackAPMIfInactive(sess) && err == nil {
+			err = fmt.Errorf("启用 WebRTC APM 失败")
+		}
+		return err
 	}
 	return nil
+}
+
+// rollbackAPMIfInactive 会话未能启用 APM 时回滚持久化的 enable_apm，避免
+// 设置页/下次启动显示已开启而实际走旧链路。返回是否发生回滚。
+func (a *App) rollbackAPMIfInactive(sess *voice.Session) bool {
+	if sess != nil && sess.APMActive() {
+		return false
+	}
+	as := a.cfg.GetAudioSettings()
+	if !as.EnableAPM {
+		return false
+	}
+	as.EnableAPM = false
+	if err := a.cfg.SetAudioSettings(as); err != nil {
+		log.Printf("rollback enable_apm: %v", err)
+	}
+	return true
 }
 
 // ---------- 全局热键（v1.2.0：PTT / 闭麦 / 静音 / 全关全开） ----------
@@ -2209,6 +2361,10 @@ func (a *App) handleHotkeyEvent(ev hotkey.Event) {
 		// 尾包窗：松手后补一小段话音，避免末字被硬切。
 		tail := time.Duration(a.cfg.GetHotkeySettings().TailMS) * time.Millisecond
 		a.hkGate.Release(tail)
+	case e.WhisperPress:
+		a.whisperPress()
+	case e.WhisperRelease:
+		a.whisperRelease()
 	case e.Mute:
 		mute, _ := a.voiceMuteState()
 		a.SetMute(!mute)
@@ -2226,6 +2382,341 @@ func (a *App) handleHotkeyEvent(ev hotkey.Event) {
 	if ev.Action == hotkey.ActionPTT {
 		a.emit("hotkey:ptt", map[string]any{"pressed": ev.Pressed})
 	}
+}
+
+// ---------- 游戏内悬浮层（#47，Beta，仅 Windows） ----------
+
+// WindowOverlaySupported 报告当前平台是否提供原生悬浮层（仅 Windows）。
+// false 时设置页禁用开关并提示，不把持久化值当成可用能力。
+func (a *App) WindowOverlaySupported() bool { return overlay.Supported() }
+
+// GetWindowOverlaySettings 读取持久化的悬浮层设置（设置页初始化用）。
+func (a *App) GetWindowOverlaySettings() config.OverlaySettings {
+	return a.cfg.GetWindowOverlaySettings()
+}
+
+// SetWindowOverlaySettings 持久化并热切换悬浮层。启用失败（窗口创建失败）
+// 时回滚为关闭并返回错误，避免设置页显示已开启而实际没有窗口。
+func (a *App) SetWindowOverlaySettings(s config.OverlaySettings) error {
+	if s.Enabled && !overlay.Supported() {
+		return overlay.ErrUnsupportedPlatform
+	}
+	a.overlayMu.Lock()
+	defer a.overlayMu.Unlock()
+	if err := a.cfg.SetWindowOverlaySettings(s); err != nil {
+		return err
+	}
+	if s.Enabled {
+		if err := overlay.Start(a.overlaySnapshot); err != nil {
+			rb := config.OverlaySettings{Enabled: false}
+			if rbErr := a.cfg.SetWindowOverlaySettings(rb); rbErr != nil {
+				log.Printf("rollback window_overlay: %v", rbErr)
+			}
+			return fmt.Errorf("启用游戏内悬浮层失败: %w", err)
+		}
+		return nil
+	}
+	overlay.Stop()
+	return nil
+}
+
+// startWindowOverlay ServiceStartup 调用：按持久化配置启动（Beta 默认关闭）。
+// 平台不支持或窗口创建失败只记日志，不影响主窗口可用性。
+func (a *App) startWindowOverlay() {
+	a.overlayMu.Lock()
+	defer a.overlayMu.Unlock()
+	if !overlay.Supported() || !a.cfg.GetWindowOverlaySettings().Enabled {
+		return
+	}
+	if err := overlay.Start(a.overlaySnapshot); err != nil {
+		log.Printf("overlay start: %v", err)
+	}
+}
+
+// stopWindowOverlay 关闭悬浮层（ServiceShutdown 调用，幂等）。
+func (a *App) stopWindowOverlay() {
+	a.overlayMu.Lock()
+	defer a.overlayMu.Unlock()
+	overlay.Stop()
+}
+
+// overlaySnapshot 悬浮层窗口线程每 100ms 调用：取当前会话成员并过滤正在
+// 说话的人。在 App 侧持锁取会话，overlay 线程只读快照，不直接触碰 App 状态。
+func (a *App) overlaySnapshot() []overlay.Speaker {
+	a.mu.Lock()
+	s := a.sess
+	a.mu.Unlock()
+	if s == nil {
+		return nil
+	}
+	members := s.Members()
+	out := make([]overlay.Speaker, 0, len(members))
+	for _, m := range members {
+		if !m.Speaking {
+			continue
+		}
+		out = append(out, overlay.Speaker{
+			UID: m.UserID, Nickname: m.Nickname, Speaking: true,
+			Mute: m.Mute, Deafen: m.Deafen, Priority: m.Priority,
+		})
+	}
+	return out
+}
+
+// ---------- 同频道悄悄话（#45） ----------
+
+// whisperAckTimeout 等待 voice.whisper_ack 的上限（#116）：超时关麦并提示，
+// 保留按住态供用户松手重按重试。
+const whisperAckTimeout = 300 * time.Millisecond
+
+// WhisperSupported 报告当前会话的服务端协议是否支持同频道悄悄话（#116）。
+// false 时前端禁用目标选择并提示升级服务器；无会话（未登录）同样视为不支持。
+func (a *App) WhisperSupported() bool {
+	a.mu.Lock()
+	s := a.sess
+	a.mu.Unlock()
+	return s != nil && s.SupportsWhisper()
+}
+
+// SetWhisperTargets 更新悄悄话目标选择（UI 维护的同频道成员列表）。
+// 未按住悄悄话键时只保存选择、不产生任何信令；按住期间变化立即生效：
+// 目标清空会马上关旁路门并下发空数组取消，避免继续向全房广播。
+// 协议 v4 下非空变更要等新 seq 的 ack 才重新开麦（#116）。
+func (a *App) SetWhisperTargets(targets []string) error {
+	clean := make([]string, 0, len(targets))
+	seen := make(map[string]bool, len(targets))
+	for _, uid := range targets {
+		if uid == "" || seen[uid] {
+			continue
+		}
+		seen[uid] = true
+		clean = append(clean, uid)
+	}
+	a.mu.Lock()
+	s := a.sess
+	a.mu.Unlock()
+	// 服务端协议 <3 不认 voice.whisper：清空选择并明确报错，不留「选了但
+	// 永远不生效」的假象（正常路径前端已按 WhisperSupported 禁用入口）。
+	if s != nil && !s.SupportsWhisper() {
+		a.whisperMu.Lock()
+		a.whisperTargets = nil
+		a.whisperActive = false
+		a.whisperSeq = 0
+		a.stopWhisperTimerLocked()
+		a.whisperMu.Unlock()
+		a.setWhisperGate(false)
+		return fmt.Errorf("服务器版本不支持悄悄话")
+	}
+
+	a.whisperMu.Lock()
+	a.whisperTargets = clean
+	if !a.whisperHeld {
+		a.whisperMu.Unlock()
+		return nil
+	}
+	// 按住期间的 v4 非空变更：先关麦，等服务端把新目标应用到 SFU peer 后再开。
+	if s != nil && s.SupportsWhisperAck() && len(clean) > 0 {
+		seq, ok := s.SendWhisperTargets(clean)
+		a.whisperActive = false
+		if ok {
+			a.whisperSeq = seq
+			a.armWhisperAckLocked(seq)
+		} else {
+			a.whisperSeq = 0
+			a.stopWhisperTimerLocked()
+		}
+		a.whisperMu.Unlock()
+		a.setWhisperGate(false)
+		if !ok {
+			a.emitWhisperState(true, false, "send_failed")
+			return nil
+		}
+		a.emitWhisperState(true, false)
+		return nil
+	}
+	// v3 路径（无 ack）与 v4 清空目标：直接生效。清空不需要等确认——本地
+	// 关麦后即使取消还在途，也只会让服务端晚一点恢复普通转发。
+	if s != nil {
+		s.SetWhisperTargets(clean) // 空数组 = 取消；会话侧对重复取消去重
+	}
+	active := len(clean) > 0
+	a.whisperActive = active
+	a.whisperSeq = 0
+	a.stopWhisperTimerLocked()
+	a.whisperMu.Unlock()
+	a.setWhisperGate(active)
+	a.emitWhisperState(true, active)
+	return nil
+}
+
+// whisperPress 按住悄悄话键：有目标且在语音房内才下发；协议 v4 等 ack 后才
+// 开麦，v3 立即生效，v<3 完全禁用（不开门、不发信令）。无目标或不在房时按键
+// 无效，也不影响 PTT 的既有状态。
+func (a *App) whisperPress() {
+	a.mu.Lock()
+	s := a.sess
+	a.mu.Unlock()
+	// 已登录但不在语音房：按住悄悄话无对象可发（会话为 nil 时无媒体链路，
+	// 这里放行也只会动一个没有管线的门，便于单元测试直接验证门组合）。
+	if s != nil && !s.InRoom() {
+		a.emitWhisperState(true, false)
+		return
+	}
+	// 旧服务端不认 voice.whisper：开麦只会把音频发给全房，且没有生效确认。
+	if s != nil && !s.SupportsWhisper() {
+		a.emitWhisperState(true, false, "unsupported")
+		return
+	}
+
+	a.whisperMu.Lock()
+	a.whisperHeld = true
+	a.whisperActive = false
+	a.whisperSeq = 0
+	targets := append([]string(nil), a.whisperTargets...)
+	if len(targets) == 0 {
+		a.stopWhisperTimerLocked()
+		a.whisperMu.Unlock()
+		a.emitWhisperState(true, false)
+		return
+	}
+	if s != nil && s.SupportsWhisperAck() {
+		seq, ok := s.SendWhisperTargets(targets)
+		if !ok {
+			a.stopWhisperTimerLocked()
+			a.whisperMu.Unlock()
+			a.setWhisperGate(false)
+			a.emitWhisperState(true, false, "send_failed")
+			return
+		}
+		a.whisperSeq = seq
+		a.armWhisperAckLocked(seq)
+		a.whisperMu.Unlock()
+		// 白名单生效前保持关麦：否则首帧会按普通转发发给全房。
+		a.emitWhisperState(true, false)
+		return
+	}
+	// v3 服务端（或不带会话的单测场景）：无 ack，立即开麦。
+	a.whisperActive = true
+	if s != nil {
+		s.SetWhisperTargets(targets)
+	}
+	a.whisperMu.Unlock()
+	a.setWhisperGate(true)
+	a.emitWhisperState(true, true)
+}
+
+// whisperRelease 松开悄悄话键：关旁路门并下发空数组取消。旁路门与 PTT 的
+// pressed/tail 状态分离，故「先松 PTT 再松悄悄话」或相反都不会误关麦。
+// v4 等 ack 期间松开同样要发取消：服务端可能已经应用了目标集合。
+func (a *App) whisperRelease() {
+	a.mu.Lock()
+	s := a.sess
+	a.mu.Unlock()
+	a.whisperMu.Lock()
+	wasHeld := a.whisperHeld
+	hadPending := a.whisperSeq != 0
+	wasActive := a.whisperActive
+	a.whisperHeld = false
+	a.whisperActive = false
+	a.whisperSeq = 0
+	a.stopWhisperTimerLocked()
+	a.whisperMu.Unlock()
+	a.setWhisperGate(false)
+	if s != nil && s.SupportsWhisper() && (wasHeld || wasActive || hadPending) {
+		s.SetWhisperTargets(nil) // 会话侧对「本就为空」的重复取消去重
+	}
+	a.emitWhisperState(false, false)
+}
+
+// onWhisperAck 处理服务端确认（voice.whisper_ack，#116）：只认当前按住期间、
+// seq 匹配的确认；乱序/过期确认与已松开的确认一律丢弃。
+func (a *App) onWhisperAck(seq int64, active bool) {
+	a.whisperMu.Lock()
+	if !a.whisperHeld || seq <= 0 || seq != a.whisperSeq {
+		a.whisperMu.Unlock()
+		return
+	}
+	a.whisperSeq = 0
+	a.whisperActive = active
+	a.stopWhisperTimerLocked()
+	a.whisperMu.Unlock()
+	a.setWhisperGate(active)
+	a.emitWhisperState(true, active)
+}
+
+// whisperAckTimeout 等确认超时（#116）：关麦并提示，保留按住态——用户松手
+// 重按即可重试，不能因为一次确认丢失把按键态吞掉。
+func (a *App) whisperAckTimeout(seq int64) {
+	a.whisperMu.Lock()
+	if !a.whisperHeld || seq != a.whisperSeq {
+		a.whisperMu.Unlock()
+		return
+	}
+	a.whisperSeq = 0
+	a.whisperActive = false
+	a.whisperTimer = nil
+	a.whisperMu.Unlock()
+	a.setWhisperGate(false)
+	a.emitWhisperState(true, false, "ack_timeout")
+}
+
+// armWhisperAckLocked 启动/重置确认超时计时器（调用方持 whisperMu）。
+func (a *App) armWhisperAckLocked(seq int64) {
+	a.stopWhisperTimerLocked()
+	a.whisperTimer = time.AfterFunc(whisperAckTimeout, func() { a.whisperAckTimeout(seq) })
+}
+
+// stopWhisperTimerLocked 停掉在途确认计时器（调用方持 whisperMu）。
+func (a *App) stopWhisperTimerLocked() {
+	if a.whisperTimer != nil {
+		a.whisperTimer.Stop()
+		a.whisperTimer = nil
+	}
+}
+
+// clearWhisper 退房/断线/被抢占时清理悄悄话状态（#45）：关本地旁路门并让会话
+// 丢掉缓存的目标，但不发 voice.whisper——SFU peer 会随离房销毁，且此刻发送的
+// 取消消息可能被信令层误归属成进房失败（#91 的 pending join 错误归属窗口）。
+// 切房后新房间的 channel.joined 会强制同步一次空目标，清掉服务端残留状态。
+func (a *App) clearWhisper() {
+	a.whisperMu.Lock()
+	was := a.whisperHeld || a.whisperActive
+	a.whisperHeld = false
+	a.whisperActive = false
+	a.whisperTargets = nil
+	a.whisperSeq = 0
+	a.stopWhisperTimerLocked()
+	a.whisperMu.Unlock()
+	a.setWhisperGate(false)
+	a.mu.Lock()
+	s := a.sess
+	a.mu.Unlock()
+	if s != nil {
+		s.ClearWhisperTargets()
+	}
+	if was {
+		a.emitWhisperState(false, false)
+	}
+}
+
+// setWhisperGate 设置发送门旁路位（hkGate 在 ServiceStartup 前为 nil，测试）。
+func (a *App) setWhisperGate(on bool) {
+	if a.hkGate != nil {
+		a.hkGate.Force(on)
+	}
+}
+
+// emitWhisperState 推给前端做轻量指示（pressed=按住，active=有目标且已生效）。
+// errCode 是瞬时失败原因（unsupported/send_failed/ack_timeout），正常态省略；
+// supported 随服务端协议版本变化（#116），前端据此禁用目标选择并提示升级。
+func (a *App) emitWhisperState(pressed, active bool, errCode ...string) {
+	payload := map[string]any{
+		"pressed": pressed, "active": active, "supported": a.WhisperSupported(),
+	}
+	if len(errCode) > 0 && errCode[0] != "" {
+		payload["error"] = errCode[0]
+	}
+	a.emit("hotkey:whisper", payload)
 }
 
 // voiceMuteState 当前闭麦/静音态（无会话时两者皆 false）。
@@ -2420,6 +2911,9 @@ func (a *App) GetVoiceMembers() []voice.PeerView {
 
 // ServiceShutdown v3 服务关闭回调：退出清理。
 func (a *App) ServiceShutdown() error {
+	// 先停悬浮层：Stop 会等待窗口线程退出，保证后续拆会话时没有快照回调
+	// 还在访问 Session。
+	a.stopWindowOverlay()
 	a.disconnectSession()
 	a.stopHotkeys()
 	a.mu.Lock()

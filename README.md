@@ -5,7 +5,8 @@
 ## 特性
 
 - **多人语音**：频道内最多 10 人同聊（可配置），WebRTC/SRTP 加密传输，Opus 编解码
-- **降噪**：客户端 RNNoise 降噪 + 语音检测，说话才发包
+- **降噪与回声消除**：WebRTC APM（Beta，默认关闭；AEC3 回声消除 / AGC2 自动增益 / 高通）+ 可选 RNNoise 强降噪，语音检测，说话才发包
+- **游戏内悬浮层**（Beta，仅 Windows，默认关闭）：原生分层窗口显示正在说话的成员，点击穿透、不抢焦点、不占任务栏/Alt-Tab；不保证在独占全屏（DX exclusive）游戏之上可见，也不兼容所有反作弊
 - **跨平台**：Windows / Linux 桌面端（macOS 产物为实验性，非阻塞发布）
 - **自托管**：单二进制服务端 + MySQL/Redis/coturn，一份部署手册照抄即可
 - **开源可复用**：Auth 支持 full/simple 双模式；验证码邮件可对接任意自有发码平台（Webhook 契约）或 SMTP
@@ -41,7 +42,7 @@
 ### 最低支持发行版
 
 Linux 产物以 **Ubuntu 24.04**（glibc 2.39）为构建基线，CI 校验产物不引用更高版本的 glibc 符号；
-运行环境需提供 WebKitGTK 4.1 与 libopus（deb/rpm 已声明依赖）。中文界面依赖系统 CJK 字体，
+运行环境需提供 WebKitGTK 4.1（libopus 已静态链接进二进制，无系统依赖）。中文界面依赖系统 CJK 字体，
 最小化安装建议补装 `fonts-noto-cjk`，否则界面文字可能显示为方框。
 
 ### 服务端
@@ -99,6 +100,11 @@ cd server && go run ./cmd/server
 cd client/frontend && pnpm install && pnpm run dev
 cd client && set FRONTEND_DEVSERVER_URL=http://localhost:5173 && go run .
 ```
+
+客户端 cgo 依赖的 WebRTC APM 静态库已内置在 `client/third_party/webrtc-apm/`
+（Windows / Linux amd64 / Linux arm64），无需额外安装；WebRTC APM 为 Beta 功能，
+默认关闭，可在设置 → Beta 功能主动开启（AEC/AGC2/高通，CPU 占用增加），
+macOS 暂为 stub。
 
 国内开发建议先配镜像：`go env -w GOPROXY=https://goproxy.cn,direct`（前端镜像已内置）。
 

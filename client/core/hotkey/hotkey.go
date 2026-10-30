@@ -17,18 +17,19 @@ import (
 	"sync"
 )
 
-// Action 可绑定动作。只绑当前已存在的动作；悄悄话属 issue #45，本批不加。
+// Action 可绑定动作。只绑当前已存在的动作。
 type Action string
 
 const (
-	ActionPTT    Action = "ptt"    // 按住说话
-	ActionMute   Action = "mute"   // 切换闭麦
-	ActionDeafen Action = "deafen" // 切换静音（耳聋）
-	ActionDual   Action = "dual"   // 全关 / 全开
+	ActionPTT     Action = "ptt"     // 按住说话
+	ActionWhisper Action = "whisper" // 按住悄悄话（#45）：只发给选中的同频道成员
+	ActionMute    Action = "mute"    // 切换闭麦
+	ActionDeafen  Action = "deafen"  // 切换静音（耳聋）
+	ActionDual    Action = "dual"    // 全关 / 全开
 )
 
 // allActions 的枚举顺序即设置面板里的展示顺序。
-var allActions = []Action{ActionPTT, ActionMute, ActionDeafen, ActionDual}
+var allActions = []Action{ActionPTT, ActionWhisper, ActionMute, ActionDeafen, ActionDual}
 
 // Mode 按键说话模式。
 type Mode uint32
@@ -202,6 +203,7 @@ type Settings struct {
 	Enabled bool   `json:"enabled"`
 	Mode    Mode   `json:"mode"`
 	PTT     string `json:"ptt,omitempty"`
+	Whisper string `json:"whisper,omitempty"`
 	Mute    string `json:"mute,omitempty"`
 	Deafen  string `json:"deafen,omitempty"`
 	Dual    string `json:"dual,omitempty"`
@@ -251,6 +253,8 @@ func (s Settings) specFor(a Action) string {
 	switch a {
 	case ActionPTT:
 		return s.PTT
+	case ActionWhisper:
+		return s.Whisper
 	case ActionMute:
 		return s.Mute
 	case ActionDeafen:
@@ -275,6 +279,7 @@ func (s Settings) Sanitize() Settings {
 		out.TailMS = maxTailMS
 	}
 	out.PTT = normalizeBinding(s.PTT)
+	out.Whisper = normalizeBinding(s.Whisper)
 	out.Mute = normalizeBinding(s.Mute)
 	out.Deafen = normalizeBinding(s.Deafen)
 	out.Dual = normalizeBinding(s.Dual)

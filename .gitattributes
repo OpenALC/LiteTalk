@@ -9,6 +9,10 @@
 *.sum   text eol=lf
 *.sh    text eol=lf
 
+# 客户端非 vendored 的 C++ 源文件（WebRTC APM shim，#43）；
+# third_party/** 的行尾仍随上游，不在这里钉死。
+client/core/**/*.cc text eol=lf
+
 # 配置与数据库迁移
 *.yml   text eol=lf
 *.yaml  text eol=lf

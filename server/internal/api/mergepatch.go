@@ -77,16 +77,19 @@ func (b *PatchServerBody) UnmarshalJSON(data []byte) error {
 }
 
 // PatchChannelBody PATCH /channels/{id} 合并补丁体（name/type/category_id/position/
-// password/user_limit/parent_id，#37）。password 三态：缺省不改、null/"" 清除、
-// 非空设置；parent_id 的 null/0 = 提升顶层；user_limit 的 null 拒 400。
+// password/user_limit/parent_id，#37；audio_bitrate_kbps/audio_frame_ms，#46）。
+// password 三态：缺省不改、null/"" 清除、非空设置；parent_id 的 null/0 = 提升顶层；
+// user_limit 与两个音质字段的 null 拒 400（音质用 0 清零）。
 type PatchChannelBody struct {
-	Name       OptString
-	Type       OptString
-	CategoryID OptID
-	Position   OptInt
-	Password   OptString
-	UserLimit  OptInt
-	ParentID   OptID
+	Name             OptString
+	Type             OptString
+	CategoryID       OptID
+	Position         OptInt
+	Password         OptString
+	UserLimit        OptInt
+	ParentID         OptID
+	AudioBitrateKbps OptInt
+	AudioFrameMs     OptInt
 }
 
 // UnmarshalJSON 三态解码。
@@ -95,6 +98,7 @@ func (b *PatchChannelBody) UnmarshalJSON(data []byte) error {
 		"name": &b.Name, "type": &b.Type,
 		"category_id": &b.CategoryID, "position": &b.Position,
 		"password": &b.Password, "user_limit": &b.UserLimit, "parent_id": &b.ParentID,
+		"audio_bitrate_kbps": &b.AudioBitrateKbps, "audio_frame_ms": &b.AudioFrameMs,
 	})
 }
 

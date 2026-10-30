@@ -23,8 +23,12 @@ const OpusPayloadType = 111
 // opusSDPFmtpLine Opus fmtp：10ms 最小帧长 + 带内 FEC（与服务端一致）。
 const opusSDPFmtpLine = "minptime=10;useinbandfec=1"
 
-// rtpTimestampStep 20ms Opus 帧的 RTP 时戳步进（48kHz × 0.02s）。
+// rtpTimestampStep 默认 20ms Opus 帧的 RTP 时戳步进（48kHz × 0.02s）。
+// 10ms 频道帧长用 SetFrameMS 改成 480（#46）。
 const rtpTimestampStep = 960
+
+// timestampStepForMS 帧长 → RTP 时戳步进（48kHz 采样率）。
+func timestampStepForMS(ms int) uint32 { return uint32(ms * 48) }
 
 // DTXPayloadMax 是 Opus DTX 静音心跳包的最大长度（1~2 字节，仅 TOC/极短载荷）。
 // 发送端照常发送以保持 RTP 时间线连续（接收端 jitter 不判空洞、不重预填）；
@@ -102,6 +106,10 @@ type Peer struct {
 	levelFn       func() uint8
 
 	muted atomic.Bool
+
+	// tsStep 每包 RTP 时戳步进（#46）：默认 960（20ms），10ms 频道为 480。
+	// SendOpus 在管线 goroutine 读取；SetFrameMS 可在任意 goroutine 调用。
+	tsStep atomic.Uint32
 
 	remoteMu      sync.Mutex
 	remoteDescSet bool
@@ -188,6 +196,7 @@ func NewPeer(cfg PeerConfig) (*Peer, error) {
 	}
 
 	p := &Peer{pc: pc, sendTrack: track, sender: sender, cb: cfg.Callbacks, log: cfg.Logger, levelFn: cfg.LevelFn}
+	p.tsStep.Store(rtpTimestampStep)
 
 	// 随机 SSRC / 起始序号与时戳（RFC3550 推荐）。
 	var rnd [8]byte
@@ -354,8 +363,9 @@ func audioLevelExtID(exts []webrtc.RTPHeaderExtensionParameter) (uint8, bool) {
 	return 0, false
 }
 
-// SendOpus 把一个 Opus 包打包为 RTP 发出（seq 自增 1，时戳步进 960）。
-// 用户主动静音时整包丢弃（MutedDropped 计数，恢复后重新预填）。
+// SendOpus 把一个 Opus 包打包为 RTP 发出（seq 自增 1，时戳按当前帧长步进，
+// 默认 960 = 20ms，10ms 频道为 480）。用户主动静音时整包丢弃（MutedDropped
+// 计数，恢复后重新预填）。
 // Opus DTX 在静音期产出的 1~2 字节心跳包照常发送：RTP seq/时戳时间线连续，
 // 对端 jitter 看到的是正常到达的空帧（libopus 解码 DTX 包得到对应长度的
 // 静音），不会判空洞、不会 2×target 后重回预填——此前丢弃心跳包导致每次
@@ -371,7 +381,11 @@ func (p *Peer) SendOpus(payload []byte) error {
 	}
 	p.sendMu.Lock()
 	p.pkt.SequenceNumber++
-	p.pkt.Timestamp += rtpTimestampStep
+	step := p.tsStep.Load()
+	if step == 0 {
+		step = rtpTimestampStep
+	}
+	p.pkt.Timestamp += step
 	p.pkt.Payload = payload
 	// RFC 6464 电平（#33）：只改写预分配的 levelExt[0]，零分配。
 	if p.levelAttached {
@@ -393,6 +407,16 @@ func (p *Peer) SendOpus(payload []byte) error {
 // SetMuted 设置本地静音（停止上行发包）。
 func (p *Peer) SetMuted(m bool) { p.muted.Store(m) }
 
+// SetFrameMS 设置上行 Opus 帧长（10/20ms，#46 频道配置）：决定 RTP 时戳步进。
+// 切换帧长时序列不中断，下一包按新步进推进；接收端按频道配置的帧长弹帧。
+func (p *Peer) SetFrameMS(ms int) error {
+	if ms != 10 && ms != 20 {
+		return fmt.Errorf("rtc: 帧长非法: %d（只支持 10/20ms）", ms)
+	}
+	p.tsStep.Store(timestampStepForMS(ms))
+	return nil
+}
+
 // Muted 当前本地静音状态。
 func (p *Peer) Muted() bool { return p.muted.Load() }
 
@@ -402,35 +426,68 @@ func (p *Peer) ConnectionState() webrtc.PeerConnectionState { return p.pc.Connec
 // LocalSSRC 上行轨 SSRC（调试用）。
 func (p *Peer) LocalSSRC() uint32 { return p.pkt.SSRC }
 
+// InboundStreamStats 单条入站音频 RTP 流的统计快照（#49 B）。
+// Jitter 是 pion stats 拦截器按 RFC3550 计算的到达间隔抖动（秒转时长）。
+type InboundStreamStats struct {
+	SSRC            uint32
+	PacketsReceived uint32
+	PacketsLost     int32
+	Jitter          time.Duration
+}
+
+// LinkSnapshot 一次 GetStats 采集的链路快照：选中 ICE pair 的 RTT 与全部
+// 入站音频流（每路远端轨一个 SSRC）。voice:stats 每 2s 调一次，单独采 RTT
+// 与入站统计会重复拷贝整张统计表，故合并为一次。
+type LinkSnapshot struct {
+	RTT     time.Duration
+	HasRTT  bool
+	Inbound []InboundStreamStats
+}
+
+// LinkSnapshot 采集链路快照（未连接或已关闭时返回零值）。
+func (p *Peer) LinkSnapshot() LinkSnapshot {
+	var out LinkSnapshot
+	if p.closed.Load() {
+		return out
+	}
+	var best float64
+	for _, s := range p.pc.GetStats() {
+		switch st := s.(type) {
+		case webrtc.ICECandidatePairStats:
+			// 只采纳已 nominated 且检查成功的 pair（媒体实际走的通路）
+			if !st.Nominated || st.State != webrtc.StatsICECandidatePairStateSucceeded {
+				continue
+			}
+			if st.CurrentRoundTripTime > 0 && (!out.HasRTT || st.CurrentRoundTripTime < best) {
+				best = st.CurrentRoundTripTime
+				out.HasRTT = true
+			}
+		case webrtc.InboundRTPStreamStats:
+			if st.Kind != "audio" {
+				continue
+			}
+			out.Inbound = append(out.Inbound, InboundStreamStats{
+				SSRC:            uint32(st.SSRC),
+				PacketsReceived: st.PacketsReceived,
+				PacketsLost:     st.PacketsLost,
+				Jitter:          time.Duration(st.Jitter * float64(time.Second)),
+			})
+		}
+	}
+	if out.HasRTT {
+		out.RTT = time.Duration(best * float64(time.Second))
+	}
+	return out
+}
+
 // RTT 返回当前选中 ICE candidate pair 的最新往返时延
 // （WebRTC stats 的 currentRoundTripTime，真实网络 RTT）。
 // 此前 UI 的延迟恒为 0：Session.Stats 取的是管线回环延迟估计，
 // 而回环估计只在 Loopback 模式（M1 试听）有样本，真实通话 Loopback=false。
 // ok=false 表示连接未建立或尚无 RTT 样本（此时调用方应保留上一次值或显示 --）。
 func (p *Peer) RTT() (time.Duration, bool) {
-	if p.closed.Load() {
-		return 0, false
-	}
-	var best float64
-	found := false
-	for _, s := range p.pc.GetStats() {
-		pair, ok := s.(webrtc.ICECandidatePairStats)
-		if !ok {
-			continue
-		}
-		// 只采纳已 nominated 且检查成功的 pair（媒体实际走的通路）
-		if !pair.Nominated || pair.State != webrtc.StatsICECandidatePairStateSucceeded {
-			continue
-		}
-		if pair.CurrentRoundTripTime > 0 && (!found || pair.CurrentRoundTripTime < best) {
-			best = pair.CurrentRoundTripTime
-			found = true
-		}
-	}
-	if !found {
-		return 0, false
-	}
-	return time.Duration(best * float64(time.Second)), true
+	snap := p.LinkSnapshot()
+	return snap.RTT, snap.HasRTT
 }
 
 // Close 关闭 PeerConnection（幂等）。

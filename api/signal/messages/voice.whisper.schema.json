@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litetalk:signal:voice.whisper",
+  "title": "VoiceWhisperData",
+  "x-wire-type": "voice.whisper",
+  "x-go-const": "TypeVoiceWhisper",
+  "x-direction": "C2S",
+  "x-since": 3,
+  "x-namespace": "voice",
+  "description": "同频道悄悄话目标（#45）。瞬时语义，不进补发环：按住悄悄话键时下发当前目标集合，服务端只把这些成员作为该连接上行音频的接收者（绕过活跃门，server_muted 仍优先）；空数组 = 取消。目标必须是同频道成员，服务端去重、排除自己并静默过滤已离房者；过滤后为空时仍保持悄悄话态（谁都不发，不回落全房广播，隐私边界）；上限 100。",
+  "type": "object",
+  "properties": {
+    "targets": {
+      "type": "array",
+      "items": { "type": "string" },
+      "maxItems": 100,
+      "description": "悄悄话目标用户 ID 列表（十进制字符串）；空数组取消悄悄话。"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1,
+      "x-since": 4,
+      "x-go-omitempty": true,
+      "description": "客户端请求序号（协议 v4）：服务端把本 seq 的目标集合应用到该连接的 SFU peer 后，以 voice.whisper_ack 原样回传。旧客户端不发送（缺省 0），服务端不回 ack，行为与 v3 一致。"
+    }
+  },
+  "required": ["targets"],
+  "additionalProperties": false
+}

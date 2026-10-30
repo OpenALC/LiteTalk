@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -412,6 +413,42 @@ func (c *Client) wait(ctx context.Context, d time.Duration) error {
 	case <-t.C:
 		return nil
 	}
+}
+
+// Probe 执行一次信令握手探测（#49 C）：拨号成功即关闭，返回握手耗时。
+// 与 Run 使用同一套令牌 query 语义；错误信息不含 URL（query 里带 token）。
+//
+// 注意：同一 access token 携带同一会话 sid，第二次握手会被服务端当作
+// 「同 sid 半开连接被替换」而 close 4000，顶掉正在使用的连接。调用方在
+// 已有活跃信令连接时必须跳过本次拨号（见 App.NetworkDiag）。
+func Probe(ctx context.Context, rawURL, token string, timeout time.Duration) (time.Duration, error) {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u.Host == "" {
+		return 0, errors.New("信令地址无效")
+	}
+	if token != "" {
+		q := u.Query()
+		q.Set("token", token)
+		u.RawQuery = q.Encode()
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	dctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	start := time.Now()
+	conn, resp, err := websocket.Dial(dctx, u.String(), &websocket.DialOptions{})
+	if err != nil {
+		if dctx.Err() != nil {
+			return 0, errors.New("信令连接超时")
+		}
+		if resp != nil {
+			return 0, fmt.Errorf("信令握手失败（HTTP %d）", resp.StatusCode)
+		}
+		return 0, errors.New("信令连接失败")
+	}
+	_ = conn.Close(websocket.StatusNormalClosure, "probe")
+	return time.Since(start), nil
 }
 
 func (c *Client) wsURL(ctx context.Context) (string, error) {

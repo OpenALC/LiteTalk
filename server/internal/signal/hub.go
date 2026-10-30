@@ -110,6 +110,23 @@ type roomState struct {
 	id       string
 	serverID int64
 	members  map[string]*client // userID → client
+	// whisper uid → 当前生效的悄悄话快照（#45，受 h.mu 保护）。SFU Peer 上也有一份
+	// 同源快照，这里存 hub 侧副本有两个用途：voice.whisper 早于 rtc.offer 到达
+	// （peer 尚不存在）时在 peer 建立后补应用；voice.speaking 收窄收件人时读取
+	// （广播回调不得反调 SFU）。targets 发布后不再原地修改。
+	whisper map[string]whisperState
+}
+
+// whisperState 单个成员生效中的悄悄话目标（#45）。connID 用于实例核对：
+// 同 uid 新连接顶替后，旧连接迟到的状态不得影响新连接。active=false 不存储
+// （取消时直接删除条目）。
+type whisperState struct {
+	connID  string
+	active  bool
+	targets map[string]bool // uid 集合（已按同房成员过滤）
+	// seq 最近一次 voice.whisper 的客户端请求序号（#116，协议 v4）：peer 建立后
+	// 补应用时据此回 voice.whisper_ack；0 = 旧客户端，不回 ack。
+	seq int64
 }
 
 // client 一条 WS 连接。
@@ -737,6 +754,13 @@ func (h *Hub) handleMessage(c *client, data []byte) {
 			return
 		}
 		h.handleVoiceRequestState(c, d)
+	case TypeVoiceWhisper:
+		var d VoiceWhisperData
+		if err := env.Decode(&d); err != nil {
+			h.sendError(c, ErrCodeBadMessage, "voice.whisper 数据格式错误")
+			return
+		}
+		h.handleVoiceWhisper(c, d)
 	case TypeChatSend:
 		var d ChatSendData
 		if err := env.Decode(&d); err != nil {
@@ -932,6 +956,15 @@ func (h *Hub) joinRoom(c *client, channelID, password string) {
 		return
 	}
 
+	// 10ms 帧长能力闸（#116）：proto <3 的客户端不认 10ms 的 frame_size/FEC，
+	// 与 10ms 频道混用会互相干扰，直接拒绝入房（不登记、不广播）。
+	// dev 内置房间没有 store 实体（ch == nil），不受影响；后续把频道改成
+	// 10ms 的 PATCH 会由 RoomHasLegacyClients 拦下，两道门互补。
+	if ch != nil && ch.Type == store.ChannelVoice && ch.AudioFrameMS == 10 && c.protoVer.Load() < 3 {
+		h.sendError(c, ErrCodeProtocolUnsupported, "频道使用 10ms 帧长，请升级客户端")
+		return
+	}
+
 	// 密码（#37）：频道未设密码时忽略携带值；管理员（Administrator/owner）旁路。
 	// 没带密码 → forbidden（老客户端安全回滚）；带错 → bad_password。
 	if ch != nil && ch.PasswordHash != "" {
@@ -1039,17 +1072,37 @@ func (h *Hub) joinRoom(c *client, channelID, password string) {
 
 	h.log.Printf("ws: %s 加入频道 %s（%d 人）", c.userID, channelID, len(members))
 	all := memberInfos(members)
+	// #45 优先发言：MemberInfo.priority 在入房快照里一次算好（owner/Administrator
+	// 由 effective() 自动为 true）。角色/成员角色变更不实时广播，重进房刷新。
+	h.enrichMemberPriority(all, ch)
 	// 在线态从 presence KV 读取（不持 h.mu，逐成员一次 GET）；Self 取同一份快照。
 	byUID := make(map[string]MemberInfo, len(all))
 	for i := range all {
 		all[i].Online = h.presenceOnline(all[i].UserID)
 		byUID[all[i].UserID] = all[i]
 	}
+	// #46 音质配置：语音频道随 joined 下发权威值（0 = 跟随设置/默认 20ms）。
+	// dev 内置房间没有 store 实体（ch == nil），字段缺省，客户端按默认处理。
+	var audioBitrate, audioFrame *int64
+	if ch != nil {
+		b, f := int64(ch.AudioBitrateKbps), int64(ch.AudioFrameMS)
+		audioBitrate, audioFrame = &b, &f
+	}
+	// #45：Members.Speaking 也按收件人收窄——非目标不能从入房快照里拿到
+	// 悄悄话说话者的 speaking=true，否则会误触发优先发言 ducking。
+	// 没有生效中的悄悄话时返回 nil，所有收件人共用同一份切片。
+	scopedMembers := h.scopeJoinedSpeaking(channelID, all, members)
 	for _, m := range members {
+		list := all
+		if scopedMembers != nil {
+			list = scopedMembers[m.userID]
+		}
 		h.sendJSON(m, TypeChannelJoined, ChannelJoinedData{
-			ChannelID: channelID,
-			Members:   all,
-			Self:      byUID[m.userID],
+			ChannelID:        channelID,
+			Members:          list,
+			Self:             byUID[m.userID],
+			AudioBitrateKbps: audioBitrate,
+			AudioFrameMs:     audioFrame,
 		})
 	}
 	// 好友频道 presence（#92）：登记完成才是状态变化点。中途 leaveWork 不单独推，
@@ -1082,6 +1135,9 @@ func (h *Hub) leaveWorkLocked(c *client) *leaveWork {
 	}
 	if room.members[c.userID] == c {
 		delete(room.members, c.userID)
+		// 悄悄话随成员身份一起失效（#45）：离房/被顶号后不得把旧目标留给
+		// 同 uid 的新连接或下一次进房。
+		delete(room.whisper, c.userID)
 		if h.userRooms[c.userID] == roomID {
 			delete(h.userRooms, c.userID)
 		}
@@ -1140,6 +1196,9 @@ func (h *Hub) handleRTCOffer(c *client, sdp string) {
 		h.sendError(c, code, "RTC 协商失败: "+err.Error())
 		return
 	}
+	// peer 已建立：补应用可能早于 rtc.offer 到达的悄悄话目标（#45），
+	// 必须在客户端收到 answer 并发首个上行包之前完成。
+	h.applyRoomWhisper(c, roomID)
 	h.sendJSON(c, TypeRTCAnswer, SDPData{SDP: answer})
 }
 
@@ -1261,6 +1320,219 @@ func (h *Hub) handleVoiceRequestState(c *client, d VoiceRequestStateData) {
 	})
 }
 
+// maxWhisperTargets 悄悄话目标上限（#45）：超出整条拒收，不做静默截断——
+// 截断后的悄悄话会让用户以为对方听得到，实际没发出去。
+const maxWhisperTargets = 100
+
+// handleVoiceWhisper 同频道悄悄话（#45）：发送者必须当前在语音房间；目标去重、
+// 排除自己，只保留当前同房成员（成员可能刚离开，静默过滤）。空数组 = 取消。
+// 目标集合存到 SFU Peer 的不可变快照上，转发路径只做原子读 + 查表。
+// 本函数只做内存操作（成员表快照 + 一次原子替换），不阻塞 WS 读循环。
+func (h *Hub) handleVoiceWhisper(c *client, d VoiceWhisperData) {
+	if d.Targets == nil {
+		h.sendError(c, ErrCodeBadMessage, "voice.whisper 需要 targets 数组")
+		return
+	}
+	if len(d.Targets) > maxWhisperTargets {
+		h.sendError(c, ErrCodeBadMessage, "悄悄话目标最多 100 个")
+		return
+	}
+	roomID := c.roomIDLocked()
+	if roomID == "" {
+		h.sendError(c, ErrCodeNotInChannel, "不在频道中")
+		return
+	}
+	connIDStr := strconv.FormatUint(c.connID, 10)
+	var oldAllowed, newAllowed map[string]bool
+	h.mu.Lock()
+	room := h.rooms[roomID]
+	// 发送者归属核对：同 uid 新连接顶替后，旧连接的迟到信令不得生效。
+	inRoom := room != nil && room.members[c.userID] == c
+	var filtered []string
+	var targetSet map[string]bool
+	if inRoom {
+		// 收件范围变化前/后的快照：若说话者正在说话，需要在下面补发纠正事件。
+		oldAllowed = speakingRecipientsLocked(room, c.userID)
+		filtered = make([]string, 0, len(d.Targets))
+		targetSet = make(map[string]bool, len(d.Targets))
+		for _, uid := range d.Targets {
+			if uid == "" || uid == c.userID || targetSet[uid] || room.members[uid] == nil {
+				continue
+			}
+			targetSet[uid] = true
+			filtered = append(filtered, uid)
+		}
+		// hub 侧快照：rtc.offer 晚于本消息时在 peer 建立后补应用；speaking
+		// 广播据此收窄收件人。空数组 = 取消，直接删条目（不存 inactive）。
+		if room.whisper == nil {
+			room.whisper = make(map[string]whisperState)
+		}
+		if len(d.Targets) > 0 {
+			room.whisper[c.userID] = whisperState{connID: connIDStr, active: true, targets: targetSet, seq: d.Seq}
+		} else {
+			delete(room.whisper, c.userID)
+		}
+		newAllowed = speakingRecipientsLocked(room, c.userID)
+	}
+	h.mu.Unlock()
+	if !inRoom {
+		h.sendError(c, ErrCodeNotInChannel, "不在频道中")
+		return
+	}
+	// 说话中途切换悄悄话范围：给进出范围的成员补发正确的 speaking 态，
+	// 避免非目标保留旧的指示/错误 ducking，或新目标错过当前说话态。
+	h.syncWhisperSpeakingScope(roomID, c.userID, oldAllowed, newAllowed)
+	// active 取客户端意图（targets 非空），而不是过滤后的集合：目标全部离房时
+	// 仍保持悄悄话态（谁都不发），ack 只需确认「意图已生效」。
+	active := len(d.Targets) > 0
+	if !h.sfu.SetWhisperTargets(roomID, c.userID, connIDStr, filtered, active) {
+		// channel.join 与 rtc.offer 之间 SFU peer 尚不存在：hub 已记录快照，
+		// handleRTCOffer 建好 peer 后会补应用并发 ack（#116）。此刻不能 ack——
+		// 白名单尚未生效，客户端提前开麦会泄漏首帧。取消路径同理（无快照，
+		// peer 建好后本就按普通转发）。
+		if active {
+			h.log.Printf("ws: %s 悄悄话目标暂存（频道 %s 的 SFU peer 尚未建立），建 peer 后补应用", c.userID, roomID)
+		} else {
+			h.log.Printf("ws: %s 取消悄悄话（频道 %s 的 SFU peer 尚未建立）", c.userID, roomID)
+		}
+		return
+	}
+	h.sendWhisperAck(c, d.Seq, active)
+	h.log.Printf("ws: 频道 %s 成员 %s 悄悄话目标 %d 人", roomID, c.userID, len(filtered))
+}
+
+// sendWhisperAck 悄悄话生效确认（#116，协议 v4）：只回给发起该 seq 的连接，
+// 直接下发、不进补发环。seq<=0（旧客户端不带序号）或协议 <4 一律不发，
+// 保持 v3 行为——旧客户端不认该消息，也不需要等它开麦。
+func (h *Hub) sendWhisperAck(c *client, seq int64, active bool) {
+	if seq <= 0 || c.protoVer.Load() < 4 {
+		return
+	}
+	h.sendJSON(c, TypeVoiceWhisperAck, VoiceWhisperAckData{Seq: seq, Active: active})
+}
+
+// applyRoomWhisper 把 hub 缓存的悄悄话目标补应用到场内 SFU peer（#45）。
+// voice.whisper 可能早于 rtc.offer 到达（入房后立刻按住），当时 peer 尚不存在；
+// peer 建立后必须在首个上行包之前补上白名单，否则会按普通全房转发。
+// 快照按 connID 核对，旧连接的迟到状态不会写给新连接。
+func (h *Hub) applyRoomWhisper(c *client, roomID string) {
+	connIDStr := strconv.FormatUint(c.connID, 10)
+	h.mu.Lock()
+	room := h.rooms[roomID]
+	found := false
+	var targets []string
+	var seq int64
+	if room != nil && room.members[c.userID] == c {
+		if ws, ok := room.whisper[c.userID]; ok && ws.active && ws.connID == connIDStr {
+			targets = make([]string, 0, len(ws.targets))
+			for uid := range ws.targets {
+				targets = append(targets, uid)
+			}
+			seq = ws.seq
+			found = true
+		}
+	}
+	h.mu.Unlock()
+	if !found {
+		return
+	}
+	if !h.sfu.SetWhisperTargets(roomID, c.userID, connIDStr, targets, true) {
+		h.log.Printf("ws: %s 悄悄话目标补应用失败（频道 %s 的 SFU peer 缺失）", c.userID, roomID)
+		return
+	}
+	// 白名单已生效，再回 ack（#116）：客户端收到后才开麦，首帧不会按全房转发。
+	h.sendWhisperAck(c, seq, true)
+	h.log.Printf("ws: 频道 %s 成员 %s 悄悄话目标补应用 %d 人", roomID, c.userID, len(targets))
+}
+
+// scopeJoinedSpeaking 按收件人收窄 channel.joined 里的 Speaking（#45）：
+// 悄悄话说话者只对 targets + 本人显示为正在说话，非目标拿到 false，避免
+// 入房快照误触发优先发言 ducking。无生效中的悄悄话返回 nil（调用方复用原
+// 切片，不做额外分配）。内部自持 h.mu；不得反调 SFU。
+func (h *Hub) scopeJoinedSpeaking(channelID string, infos []MemberInfo, recipients []*client) map[string][]MemberInfo {
+	h.mu.Lock()
+	room := h.rooms[channelID]
+	if room == nil || len(room.whisper) == 0 {
+		h.mu.Unlock()
+		return nil
+	}
+	allowedBySpeaker := make(map[string]map[string]bool, len(room.whisper))
+	for uid := range room.whisper {
+		if a := speakingRecipientsLocked(room, uid); a != nil {
+			allowedBySpeaker[uid] = a
+		}
+	}
+	h.mu.Unlock()
+	if len(allowedBySpeaker) == 0 {
+		return nil
+	}
+	out := make(map[string][]MemberInfo, len(recipients))
+	for _, r := range recipients {
+		list := append([]MemberInfo(nil), infos...)
+		for i := range list {
+			if a, ok := allowedBySpeaker[list[i].UserID]; ok && !a[r.userID] {
+				list[i].Speaking = false
+			}
+		}
+		out[r.userID] = list
+	}
+	return out
+}
+
+// enrichMemberPriority 填充 MemberInfo.priority（#45）：authz 查询失败按 false，
+// 不阻断入房。dev 内置房间无 store 频道实体（ch == nil）或非语音频道一律 false。
+func (h *Hub) enrichMemberPriority(infos []MemberInfo, ch *store.Channel) {
+	if ch == nil || h.authz == nil || ch.Type != store.ChannelVoice {
+		return
+	}
+	ctx := context.Background()
+	for i := range infos {
+		uid, err := strconv.ParseInt(infos[i].UserID, 10, 64)
+		if err != nil {
+			continue
+		}
+		ok, aerr := h.authz.CanInServer(ctx, uid, ch.ServerID, ch.ID, store.PrioritySpeaker)
+		if aerr != nil {
+			h.log.Printf("ws: 优先发言判定失败（用户 %s 频道 %d）: %v", infos[i].UserID, ch.ID, aerr)
+			continue
+		}
+		infos[i].Priority = ok
+	}
+}
+
+// BroadcastVoicePriority 优先发言状态变更（#45）：REST 频道覆盖变更成功后调用。
+// 只发给该频道语音房成员的全部在线连接（含同 uid 的其他设备），且只发给协议
+// ≥3 的连接（消息 since 3）；角色/成员角色变更不实时广播，重进房由
+// channel.joined 的 MemberInfo.priority 刷新。房间不存在 = 无人可通知。
+func (h *Hub) BroadcastVoicePriority(channelID, userID string, priority bool) {
+	if channelID == "" || userID == "" {
+		return
+	}
+	h.mu.Lock()
+	room := h.rooms[channelID]
+	if room == nil {
+		h.mu.Unlock()
+		return
+	}
+	uids := make(map[string]bool, len(room.members))
+	for uid := range room.members {
+		uids[uid] = true
+	}
+	var targets []*client
+	for _, c := range h.conns {
+		if uids[c.userID] && c.protoVer.Load() >= 3 {
+			targets = append(targets, c)
+		}
+	}
+	h.mu.Unlock()
+
+	data := VoicePriorityData{ChannelID: channelID, UserID: userID, Priority: priority}
+	for _, c := range targets {
+		h.sendJSON(c, TypeVoicePriority, data)
+	}
+	h.log.Printf("ws: 频道 %s 成员 %s 优先发言=%v（%d 个连接已通知）", channelID, userID, priority, len(targets))
+}
+
 // SetServerMuted 服务端强制闭麦/解禁（#36）：SFU 包级丢弃（track 不摘）并向房间
 // 全体广播 voice.state{user_id, server_muted}（目标本人也收，用于状态显示）。
 // 目标不在该频道 → ErrNotInChannel（REST 层映射 404）。与 voice.request_state 的
@@ -1319,6 +1591,24 @@ func (h *Hub) roomMemberCount(channelID string) int {
 		return 0
 	}
 	return len(room.members)
+}
+
+// RoomHasLegacyClients 该房间当前是否有协议 <3 的连接（#116 10ms 帧长能力闸）。
+// 未协商（0）与版本无交集（-1）都按旧客户端计——它们不认 10ms 帧长。
+// 房间不存在（含 dev 内置房间）返回 false。持 h.mu。
+func (h *Hub) RoomHasLegacyClients(channelID string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	room := h.rooms[channelID]
+	if room == nil {
+		return false
+	}
+	for _, m := range room.members {
+		if m.protoVer.Load() < 3 {
+			return true
+		}
+	}
+	return false
 }
 
 // VoiceChannelOf 反查 uid 当前语音房（#92 好友频道 presence，api.VoicePresence 满足）。
