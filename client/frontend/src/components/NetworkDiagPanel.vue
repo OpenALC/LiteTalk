@@ -26,7 +26,8 @@ const rows = computed(() => {
 })
 
 // detail 一行摘要：跳过显示原因；失败显示脱敏错误；成功依次给耗时、
-// 版本/映射地址/relay 地址与补充说明。
+// 版本/映射地址/relay 地址与补充说明。多候选回退成功时note 已说明第几个
+// 候选可用，这里再补上地址本身（#117）。
 function detail(p: NetworkDiagProbe): string {
   if (p.skipped) return p.note || '未配置'
   if (!p.ok) return p.error || '失败'
@@ -35,6 +36,7 @@ function detail(p: NetworkDiagProbe): string {
   const parts = [`${p.latency_ms}ms`]
   if (p.version) parts.push(p.version)
   if (p.address) parts.push(p.address)
+  if (p.candidate) parts.push(p.candidate)
   if (p.note) parts.push(p.note)
   return parts.join(' · ')
 }
