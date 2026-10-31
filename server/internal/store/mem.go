@@ -42,6 +42,11 @@ type Mem struct {
 	auditLogs   map[int64]*AuditLog                                 // id → 审计行
 	apiTokens   map[int64]*APIToken                                 // tokenID → 行（迁移 0018，#51 #54）
 
+	// webhooks 三表（迁移 0019，#52）：出站订阅、入站入口、投递记录。
+	outHooks    map[int64]*OutboundWebhook
+	inHooks     map[int64]*InboundWebhook
+	webhookDels map[int64]*WebhookDelivery
+
 	*MemKV // KV 部分（Get/Set/Del/Incr/IncrCap/Eval 由 MemKV 提供）
 }
 
@@ -74,6 +79,9 @@ func NewMem() *Mem {
 		overwrites:     map[overwriteKey]*ChannelOverwrite{},
 		auditLogs:      map[int64]*AuditLog{},
 		apiTokens:      map[int64]*APIToken{},
+		outHooks:       map[int64]*OutboundWebhook{},
+		inHooks:        map[int64]*InboundWebhook{},
+		webhookDels:    map[int64]*WebhookDelivery{},
 		MemKV:          NewMemKV(),
 	}
 }
@@ -1542,6 +1550,177 @@ func (m *Mem) TouchAPITokenLastUsed(_ context.Context, id int64, at time.Time) e
 	if t, ok := m.apiTokens[id]; ok {
 		t.LastUsedAt = &at
 	}
+	return nil
+}
+
+// ---- webhooks（迁移 0019，#52）----
+
+func (m *Mem) CreateOutboundWebhook(_ context.Context, w *OutboundWebhook) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	w.ID = newID(w.ID)
+	now := time.Now()
+	w.CreatedAt, w.UpdatedAt = now, now
+	cp := *w
+	m.outHooks[w.ID] = &cp
+	return nil
+}
+
+func (m *Mem) OutboundWebhookByID(_ context.Context, id int64) (*OutboundWebhook, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	w, ok := m.outHooks[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	cp := *w
+	return &cp, nil
+}
+
+func (m *Mem) OutboundWebhooksOfServer(_ context.Context, serverID int64) ([]OutboundWebhook, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []OutboundWebhook{}
+	for _, x := range m.outHooks {
+		if x.ServerID == serverID {
+			out = append(out, *x)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+func (m *Mem) HasOutboundWebhooks(_ context.Context) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.outHooks) > 0, nil
+}
+
+func (m *Mem) UpdateOutboundWebhook(_ context.Context, w *OutboundWebhook) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.outHooks[w.ID]
+	if !ok {
+		return ErrNotFound
+	}
+	cur.URL, cur.Secret, cur.Events = w.URL, w.Secret, w.Events
+	cur.Disabled, cur.DisabledReason, cur.FailCount = w.Disabled, w.DisabledReason, w.FailCount
+	cur.UpdatedAt = time.Now()
+	w.UpdatedAt = cur.UpdatedAt
+	return nil
+}
+
+func (m *Mem) DeleteOutboundWebhook(_ context.Context, id int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.outHooks[id]; !ok {
+		return ErrNotFound
+	}
+	delete(m.outHooks, id)
+	return nil
+}
+
+// RecordWebhookDelivery 单锁内完成「落记录 + 推进熔断计数」，语义与 SQL 方言的事务版一致。
+func (m *Mem) RecordWebhookDelivery(_ context.Context, d *WebhookDelivery, breakerAt int, reason string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d.ID = newID(d.ID)
+	d.CreatedAt = time.Now()
+	cp := *d
+	m.webhookDels[d.ID] = &cp
+	if d.WebhookID == 0 {
+		return nil
+	}
+	w, ok := m.outHooks[d.WebhookID]
+	if !ok {
+		return nil // 订阅已删除：投递记录保留，熔断计数无行可推进
+	}
+	if d.OK {
+		w.FailCount = 0
+	} else {
+		w.FailCount++
+		if !w.Disabled && w.FailCount >= breakerAt {
+			w.Disabled = true
+			w.DisabledReason = reason
+		}
+	}
+	return nil
+}
+
+func (m *Mem) WebhookDeliveriesBefore(_ context.Context, before time.Time, limit int) ([]WebhookDelivery, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	out := []WebhookDelivery{}
+	for _, x := range m.webhookDels {
+		if x.CreatedAt.Before(before) {
+			out = append(out, *x)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (m *Mem) DeleteWebhookDeliveries(_ context.Context, ids []int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, id := range ids {
+		delete(m.webhookDels, id)
+	}
+	return nil
+}
+
+func (m *Mem) CreateInboundWebhook(_ context.Context, w *InboundWebhook) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	w.ID = newID(w.ID)
+	if w.CreatedAt.IsZero() {
+		w.CreatedAt = time.Now()
+	}
+	cp := *w
+	m.inHooks[w.ID] = &cp
+	return nil
+}
+
+func (m *Mem) InboundWebhookByID(_ context.Context, id int64) (*InboundWebhook, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	w, ok := m.inHooks[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	cp := *w
+	return &cp, nil
+}
+
+func (m *Mem) InboundWebhooksOfChannel(_ context.Context, channelID int64) ([]InboundWebhook, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []InboundWebhook{}
+	for _, x := range m.inHooks {
+		if x.ChannelID == channelID {
+			out = append(out, *x)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+func (m *Mem) DeleteInboundWebhook(_ context.Context, id int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.inHooks[id]; !ok {
+		return ErrNotFound
+	}
+	delete(m.inHooks, id)
 	return nil
 }
 

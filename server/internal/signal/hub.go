@@ -56,6 +56,10 @@ type Hub struct {
 	// 运行期只读。
 	offline OfflineNotifier
 
+	// webhooks 出站 webhook 事件出口（#52）：SetWebhookOutlet 启动阶段注入一次，
+	// 运行期只读。与 offline 同口径；实现只做非阻塞入队。
+	webhooks WebhookOutlet
+
 	// 心跳参数（默认值见包常量；测试可缩短）
 	heartbeatEvery time.Duration
 	pongWait       time.Duration
@@ -208,6 +212,16 @@ type OfflineNotifier interface {
 	OnUserOffline(uid string)
 }
 
+// WebhookOutlet 出站 webhook 事件出口（#52，internal/webhook.Dispatcher 满足）：
+// 在 broadcastEvent 读快照、放锁之后调用，实现只做一次非阻塞入队——
+// 绝不能持 h.mu 调用（那是在 WS 写路径上），也不做任何网络 I/O。
+type WebhookOutlet interface {
+	// OnWebhookEvent eventType 是白名单事件名（webhook.EventMessageCreated 等），
+	// channelID 为十进制频道 ID（dev 内置房间无 store 实体，由实现方丢弃），
+	// payload 是已序列化的原网关事件载荷。
+	OnWebhookEvent(eventType, channelID string, payload json.RawMessage)
+}
+
 // ChatDeps 聊天持久化与频控依赖（可零值：仅广播不落库、不限流）。
 type ChatDeps struct {
 	Store  ChatStore
@@ -284,6 +298,10 @@ func (h *Hub) SetProtoMax(n int) { h.protoMax = n }
 // SetOfflineNotifier 注册离线边沿接收方（#53 移动推送）。仅限启动阶段调用
 // （ServeWS 开始后并发写有数据竞争），与 SetProtoMax 同口径。
 func (h *Hub) SetOfflineNotifier(n OfflineNotifier) { h.offline = n }
+
+// SetWebhookOutlet 注册出站 webhook 事件出口（#52）。仅限启动阶段调用，
+// 与 SetOfflineNotifier 同口径。
+func (h *Hub) SetWebhookOutlet(n WebhookOutlet) { h.webhooks = n }
 
 // ServeWS 处理 GET /ws?token=<jwt|dev-xxx>。
 func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {

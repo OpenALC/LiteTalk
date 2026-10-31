@@ -20,6 +20,7 @@ import (
 	"github.com/OpenALC/LiteTalk/server/internal/rtcapi"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
 	"github.com/OpenALC/LiteTalk/server/internal/token"
+	"github.com/OpenALC/LiteTalk/server/internal/webhook"
 )
 
 // AuthMode 鉴权模式：full（默认，验证码流程）/ simple（免验证码，适合私域部署）。
@@ -120,6 +121,12 @@ type Server struct {
 	// push 移动推送派发器（#53）。nil = 推送关闭：/config 报 push_enabled=false，
 	// 触发点全部短路（设备注册端点仍可用，注册数据等开启后即生效）。
 	push *push.Broker
+	// webhooks 出站投递器（#52）。nil = 只影响惰性启动（EnsureStarted 变 no-op），
+	// webhook 的 CRUD 与入站投递仍可用。
+	webhooks *webhook.Dispatcher
+	// webhookURLCheck 出站 URL 的 SSRF 校验（New 补默认 linkpreview.CheckDialable；
+	// 测试注入放行桩以对 httptest 目标建订阅）。
+	webhookURLCheck func(string) error
 }
 
 // Config 构造配置。
@@ -176,6 +183,12 @@ type Config struct {
 	// Push 移动推送派发器（#53）。生产由 cmd/server 按 LITETALK_PUSH_* 构造；
 	// nil = 推送关闭（/config push_enabled=false，触发点短路，零后台 goroutine）。
 	Push *push.Broker
+	// Webhooks 出站投递器（#52）。生产由 cmd/server 构造并与 hub 的事件出口共享
+	// 同一实例；nil = 投递器不启动（已建订阅在重启后也不投递），CRUD 与入站不受影响。
+	Webhooks *webhook.Dispatcher
+	// WebhookURLCheck 出站 URL 的 SSRF 校验；nil 用 linkpreview.CheckDialable
+	//（测试注入放行桩，httptest 目标是 127.0.0.1，默认校验会拒绝）。
+	WebhookURLCheck func(string) error
 }
 
 // New 构造 API Server。
@@ -206,6 +219,11 @@ func New(cfg Config) *Server {
 		// 同上：测试/单用方场景自建；生产传入与 WS 鉴权共用的同一实例。
 		toks = token.NewService(cfg.Store, lg)
 	}
+	urlCheck := cfg.WebhookURLCheck
+	if urlCheck == nil {
+		// 出站 URL 的 SSRF 校验默认复用链接预览的黑名单（#52）。
+		urlCheck = linkpreview.CheckDialable
+	}
 	return &Server{
 		store:             cfg.Store,
 		jwt:               cfg.JWT,
@@ -232,6 +250,8 @@ func New(cfg Config) *Server {
 		kv:                cfg.KV,
 		linkPreview:       cfg.LinkPreview,
 		push:              cfg.Push,
+		webhooks:          cfg.Webhooks,
+		webhookURLCheck:   urlCheck,
 	}
 }
 

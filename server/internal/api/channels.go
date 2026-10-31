@@ -7,6 +7,7 @@ import (
 
 	"github.com/OpenALC/LiteTalk/server/internal/signal"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/internal/webhook"
 )
 
 func validChannelName(s string) bool {
@@ -118,6 +119,8 @@ func (s *Server) CreateChannel(ctx context.Context, request CreateChannelRequest
 			"audio_bitrate_kbps": ch.AudioBitrateKbps, "audio_frame_ms": ch.AudioFrameMS,
 		}),
 	})
+	// 出站 webhook 事件出口（#52）：channel.created，落库后入队（非阻塞，不影响请求）。
+	s.notifyWebhookEvent(webhook.EventChannelCreated, ch.ServerID, ch.ID, channelView(ch))
 	return CreateChannel201JSONResponse(channelView(ch)), nil
 }
 
@@ -392,6 +395,9 @@ func (s *Server) DeleteChannel(ctx context.Context, request DeleteChannelRequest
 			}
 		}
 	}
+	// 出站 webhook 事件出口（#52）：channel.deleted，删除事务提交后入队；
+	// ch 是删除前快照（行已不在库，worker 不能经频道反查，serverID 直接给出）。
+	s.notifyWebhookEvent(webhook.EventChannelDeleted, ch.ServerID, ch.ID, channelView(ch))
 	return DeleteChannel200JSONResponse{Status: "ok"}, nil
 }
 

@@ -46,6 +46,8 @@ tags:
     description: 事件续传失败后的聚合快照
   - name: tokens
     description: 个人访问令牌（ltk_pat_*；明文只在创建响应出现一次，#54）
+  - name: webhooks
+    description: 入站与出站 Webhook（#52；出站投递带 HMAC-SHA256 签名，入站走路径 secret）
 paths:
   /api/v1/healthz:
     get:
@@ -2233,6 +2235,256 @@ paths:
           $ref: '#/components/responses/RateLimited'
         default:
           $ref: '#/components/responses/Internal'
+  /api/v1/servers/{id}/webhooks:
+    get:
+      operationId: listServerWebhooks
+      summary: 出站 Webhook 订阅列表（ManageServer）
+      description: >
+        服务器级出站事件订阅（#52）。要求 Bearer 且调用者在该服务器有 ManageServer。
+        响应永不回传 secret（HMAC 签名密钥）；被熔断自动停用的订阅带
+        disabled_reason=consecutive_failures。
+        code：bad_request（路径 ID 非法）；401；403 forbidden；404 not_found；5xx internal。
+      tags: [webhooks]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      responses:
+        '200':
+          description: 订阅数组（可为空数组）
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/OutboundWebhook'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
+    post:
+      operationId: createServerWebhook
+      summary: 创建出站订阅（ManageServer；响应含一次性 secret）
+      description: >
+        url 做 SSRF 校验：拒绝内网段/回环/link-local/云元数据地址与 localhost，
+        域名即时解析并逐 IP 判定，违规 400 bad_url（不回传解析细节）。events 必须
+        非空、不重复且全部在白名单内（message.created / member.joined / member.left /
+        channel.created / channel.deleted），违规 400 bad_events。
+        secret 形如 64 位 hex（HMAC-SHA256 密钥），只在本次响应出现一次。
+        频控键 wh:create:<uid>。
+        code：bad_url、bad_events；401；403；404 not_found；429 rate_limited；5xx internal。
+      tags: [webhooks]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWebhookRequest'
+      responses:
+        '201':
+          description: 已创建（secret 为一次性明文）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutboundWebhook'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/servers/{id}/webhooks/{wid}:
+    patch:
+      operationId: patchServerWebhook
+      summary: 改出站订阅（ManageServer；Merge Patch）
+      description: >
+        JSON Merge Patch（RFC 7396）：url / events / enabled / reset_secret 四个可选键，
+        缺省不改。reset_secret=true 换新 secret 并只在本次响应返回明文，
+        旧 secret 立即失效（URL 泄露的可重置途径）；enabled=true 手动重新启用并
+        清零连续失败计数（熔断停用后的唯一恢复途径），enabled=false 手动停用。
+        url / events 更新与创建同规则校验（bad_url / bad_events）。
+        归属不符（wid 不属于该服务器）与不存在统一 404。
+        频控键 wh:patch:<uid>。code：bad_url、bad_events；401；403；404 not_found；
+        429 rate_limited；5xx internal。
+      tags: [webhooks]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+        - $ref: '#/components/parameters/WebhookIDPath'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/PatchWebhookRequest'
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchWebhookRequest'
+      responses:
+        '200':
+          description: 更新后的订阅（reset_secret 时带一次性 secret）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutboundWebhook'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Internal'
+    delete:
+      operationId: deleteServerWebhook
+      summary: 删除出站订阅（ManageServer）
+      description: >
+        删除后立即不再投递（投递记录保留，随保留期清理）。归属不符与不存在统一 404。
+        频控键 wh:del:<uid>。code：bad_request；401；403；404 not_found；
+        429 rate_limited；5xx internal。
+      tags: [webhooks]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+        - $ref: '#/components/parameters/WebhookIDPath'
+      responses:
+        '200':
+          description: 已删除
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusOk'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/channels/{id}/inbound-webhooks:
+    get:
+      operationId: listInboundWebhooks
+      summary: 频道入站 Webhook 列表（ManageChannels）
+      description: >
+        频道级入站投递入口（#52）。要求 Bearer 且调用者对该频道有 ManageChannels。
+        只支持服务器文字频道（会话/语音频道 400 bad_channel）。
+        响应不含 secret——泄露即重建；投递路径只在创建响应给一次。
+        code：bad_channel、bad_request；401；403；404 not_found；5xx internal。
+      tags: [webhooks]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      responses:
+        '200':
+          description: 入站入口数组（可为空数组）
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/InboundWebhook'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Internal'
+    post:
+      operationId: createInboundWebhook
+      summary: 创建频道入站 Webhook（ManageChannels；响应含一次性投递 URL）
+      description: >
+        创建后响应带 url=/api/v1/webhooks/{id}/{secret}（含一次性 secret 明文，
+        只在本次出现），外部系统直接 POST 该 URL 即可向频道投递消息。
+        频控键 wh:create-inb:<uid>。
+        code：bad_channel、bad_request；401；403；404 not_found；429 rate_limited；
+        5xx internal。
+      tags: [webhooks]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateInboundWebhookRequest'
+      responses:
+        '201':
+          description: 已创建（url 含一次性 secret）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InboundWebhook'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/webhooks/{id}/{secret}:
+    post:
+      operationId: deliverInboundWebhook
+      summary: 入站投递入口（免鉴权；全服务唯一免 Bearer 端点）
+      description: >
+        外部系统向频道投递消息的唯一入口：凭路径 secret 校验（常数时间比对），
+        不区分「id 不存在」与「secret 错」，失败一律 404 not_found（避免枚举；
+        重建/删除入口后旧 URL 即失效）。消息以 webhook 机器人身份落库到频道，
+        内容 1–2000 字符，违规 400 bad_content。频控键 inb:<webhook id>。
+        本端点不需要也无法使用 Bearer——认证就是 URL 里的 secret。
+        code：bad_content；404 not_found；429 rate_limited；5xx internal。
+      tags: [webhooks]
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+        - $ref: '#/components/parameters/SecretPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InboundDeliveryRequest'
+      responses:
+        '200':
+          description: 已落库
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusOk'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Internal'
 components:
   securitySchemes:
     bearerAuth:
@@ -2285,6 +2537,26 @@ components:
         type: integer
         format: int64
         minimum: 1
+    WebhookIDPath:
+      name: wid
+      in: path
+      required: true
+      description: 出站订阅 ID 的十进制数字串（#52）
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    SecretPath:
+      name: secret
+      in: path
+      required: true
+      description: >
+        入站投递密钥（64 位 hex，#52）。校验失败与 id 不存在同样 404，
+        不区分原因（避免枚举）。
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 64
     AttachmentKeyQuery:
       name: key
       in: query
@@ -2554,6 +2826,113 @@ components:
           minLength: 1
           maxLength: 4096
           description: 推送通道设备凭据；服务端只存不回显，日志一律打码。
+    OutboundWebhook:
+      type: object
+      title: OutboundWebhook
+      description: >
+        出站事件订阅（#52）。secret 是出站投递的 HMAC-SHA256 签名密钥（64 位 hex），
+        只在创建响应或 reset_secret 的 PATCH 响应里出现一次，任何其他响应永不回传。
+        接收方校验签名：取 X-LiteTalk-Timestamp（unix 秒），与本地时刻相差超过
+        ±5 分钟即拒绝（防重放）；以共享 secret 为密钥对 "<timestamp>.<原始请求体>"
+        计算 HMAC-SHA256，与 X-LiteTalk-Signature 头的 sha256=<hex> 部分做常数时间比对。
+      required: [id, url, events, disabled, created_at]
+      properties:
+        id:
+          type: string
+          x-go-type: ID
+        url:
+          type: string
+          maxLength: 2048
+          description: 投递目标（POST，application/json）
+        events:
+          type: array
+          items:
+            type: string
+            enum: [message.created, member.joined, member.left, channel.created, channel.deleted]
+          minItems: 1
+          description: 订阅的事件白名单子集
+        disabled:
+          type: boolean
+          description: 是否已停用（熔断自动停用或手动停用）
+        disabled_reason:
+          type: string
+          description: 停用原因（熔断为 consecutive_failures）；正常运行不带
+        secret:
+          type: string
+          description: 一次性明文（仅创建 / reset_secret 的 PATCH 响应）
+        created_at:
+          type: string
+          format: date-time
+          x-go-type: Time
+    CreateWebhookRequest:
+      type: object
+      title: CreateWebhookRequest
+      description: 创建出站订阅（#52）。
+      required: [url, events]
+      properties:
+        url:
+          type: string
+          minLength: 1
+          maxLength: 2048
+          description: 投递目标；服务端做 SSRF 校验（拒绝内网/回环/link-local/云元数据）
+        events:
+          type: array
+          items:
+            type: string
+            enum: [message.created, member.joined, member.left, channel.created, channel.deleted]
+          minItems: 1
+          description: 订阅事件（白名单子集，不重复）
+    PatchWebhookRequest:
+      type: object
+      title: PatchWebhookRequest
+      description: >
+        JSON Merge Patch（RFC 7396，#52）：url / events / enabled / reset_secret 四个
+        可选键，缺省不改。reset_secret=true 换新 secret 并只在本次响应返回明文，
+        旧 secret 立即失效；enabled=true 手动重新启用并清零连续失败计数。
+      x-go-type: PatchWebhookBody
+    InboundWebhook:
+      type: object
+      title: InboundWebhook
+      description: >
+        频道级入站投递入口（#52）。url 形如 /api/v1/webhooks/{id}/{secret}，
+        只在创建响应出现（含一次性 secret）；列表响应不含 secret，
+        泄露即删除重建。
+      required: [id, description, created_at]
+      properties:
+        id:
+          type: string
+          x-go-type: ID
+        description:
+          type: string
+          maxLength: 255
+          description: 用途备注（如「CI 告警」）
+        url:
+          type: string
+          description: 投递路径（含一次性 secret，仅创建响应）
+        created_at:
+          type: string
+          format: date-time
+          x-go-type: Time
+    CreateInboundWebhookRequest:
+      type: object
+      title: CreateInboundWebhookRequest
+      description: 创建频道入站投递入口（#52）。
+      properties:
+        description:
+          type: string
+          maxLength: 255
+          description: 用途备注（可空）
+    InboundDeliveryRequest:
+      type: object
+      title: InboundDeliveryRequest
+      description: 入站投递体（#52）。消息以 webhook 机器人身份落库。
+      required: [content]
+      properties:
+        content:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          description: 消息正文（与频道消息同限）
     User:
       type: object
       title: User
