@@ -505,3 +505,52 @@ func TestBroadcastVoicePriorityNoRoom(t *testing.T) {
 	f := newChatFixture(t)
 	f.hub.BroadcastVoicePriority("424242", "2", true) // 不 panic 即可
 }
+
+// TestVoiceWhisperRateLimit 悄悄话目标下发按 uid 限次（#117）：窗口内超出上限
+// 回 rate_limited，计数跨连接累计（同 uid 换连接不重置），不同 uid 互不影响。
+// 取消（空数组）同样计入——它也是「改目标」的一次下发。
+func TestVoiceWhisperRateLimit(t *testing.T) {
+	f := newChatFixture(t)
+	vchID := strconv.FormatInt(f.vch.ID, 10)
+	a := f.dial("1", "alice")
+	joinAndCapture(t, a, vchID)
+	b := f.dial("2", "bob")
+	joinAndCapture(t, b, vchID)
+
+	// 上限内全部成功：不发 error。用一个必然失败的 request_state 做顺序屏障。
+	for i := 0; i < voiceWhisperRateLimit; i++ {
+		targets := []string{"2"}
+		if i%2 == 1 {
+			targets = []string{}
+		}
+		a.send(TypeVoiceWhisper, VoiceWhisperData{Targets: targets})
+	}
+	mute := true
+	a.send(TypeVoiceRequestState, VoiceRequestStateData{ChannelID: vchID, TargetID: "1", Mute: &mute})
+	env := a.recvUntil(TypeError)
+	var e ErrorData
+	if err := env.Decode(&e); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if e.Code != ErrCodeBadMessage || e.Message != "不能对自己发起请求" {
+		t.Fatalf("上限内不应被限流，收到 %+v", e)
+	}
+
+	// 第 limit+1 次：rate_limited。
+	a.send(TypeVoiceWhisper, VoiceWhisperData{Targets: []string{"2"}})
+	wantError(t, a, ErrCodeRateLimited)
+
+	// 换一条同 uid 的连接：窗口按 uid 累计，仍然受限。
+	a2 := f.dial("1:phone", "alice-phone")
+	joinAndCapture(t, a2, vchID)
+	a2.send(TypeVoiceWhisper, VoiceWhisperData{Targets: []string{"2"}})
+	wantError(t, a2, ErrCodeRateLimited)
+
+	// 另一个 uid 不受影响：其请求照常成功（顺序屏障仍用 request_state）。
+	b.send(TypeVoiceWhisper, VoiceWhisperData{Targets: []string{"1"}})
+	b.send(TypeVoiceRequestState, VoiceRequestStateData{ChannelID: vchID, TargetID: "2", Mute: &mute})
+	var eb ErrorData
+	if env := b.recvUntil(TypeError); env.Decode(&eb) != nil || eb.Message != "不能对自己发起请求" {
+		t.Fatalf("其他 uid 不应被限流，收到 %+v", eb)
+	}
+}
