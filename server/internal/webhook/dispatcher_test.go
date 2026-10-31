@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -518,6 +519,46 @@ func TestOutletDropsWhenNotStarted(t *testing.T) {
 	d.OnWebhookEvent(EventMessageCreated, strconv.FormatInt(channelID, 10), json.RawMessage(`{}`))
 	if d.started.Load() {
 		t.Fatal("出口不应启动 worker")
+	}
+}
+
+// TestResetSecretTakesEffectImmediately reset_secret 后旧 secret 立即失效：
+// 投递器逐次读行，下一次投递即用新 secret 签名（持有旧 secret 的接收方验签必失败）。
+func TestResetSecretTakesEffectImmediately(t *testing.T) {
+	mem := store.NewMem()
+	serverID, channelID := seedServerChannel(t, mem)
+	stub := &hookStub{}
+	hs := httptest.NewServer(stub.handler())
+	defer hs.Close()
+	w := seedHook(t, mem, serverID, hs.URL, EventMessageCreated)
+	d := newTestDispatcher(t, mem, Config{})
+	oldSecret := w.Secret
+
+	deliverTask(d, EventMessageCreated, channelID)
+	if stub.count() != 1 {
+		t.Fatal("第一次投递应到达")
+	}
+	// 模拟 PATCH reset_secret：换新 secret（API 层经 UpdateOutboundWebhook 落库）。
+	newSecret, err := NewSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Secret = newSecret
+	if err := mem.UpdateOutboundWebhook(context.Background(), w); err != nil {
+		t.Fatal(err)
+	}
+	deliverTask(d, EventMessageCreated, channelID)
+	if stub.count() != 2 {
+		t.Fatal("reset 后投递应到达")
+	}
+	// 新投递的签名必须用新 secret 校验通过、旧 secret 校验失败。
+	req := stub.last()
+	ts, _ := strconv.ParseInt(req.timestamp, 10, 64)
+	if req.signature != "sha256="+Sign(newSecret, ts, req.body) {
+		t.Fatal("reset 后应使用新 secret 签名")
+	}
+	if VerifySignature(oldSecret, ts, req.body, strings.TrimPrefix(req.signature, "sha256="), fixedNow) {
+		t.Fatal("旧 secret 校验应失败（已失效）")
 	}
 }
 
