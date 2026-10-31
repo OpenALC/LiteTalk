@@ -172,6 +172,92 @@ func TestAECDisabledPassesEcho(t *testing.T) {
 	}
 }
 
+// TestDSPProcessRenderDoesNotTouchPlayback 参考帧入口不得改写调用方缓冲（#117）。
+// 调用方传的是即将播放的混音输出，而 C 侧 ProcessReverseStream 允许 src==dest
+// 就地处理；本测试把「播放缓冲只读」这条不变量钉住，换库或改 render 子模块
+// 若开始写回输入，CI 会在这里红，而不是在实机上表现为爆音/底噪。
+func TestDSPProcessRenderDoesNotTouchPlayback(t *testing.T) {
+	requireAPM(t)
+
+	cfg := DefaultDSPConfig()
+	cfg.Denoise = false
+	cfg.EnableAPM = true
+	d, err := NewDSP(cfg)
+	if err != nil {
+		t.Fatalf("NewDSP: %v", err)
+	}
+	defer d.Close()
+	if !d.APMActive() {
+		t.Fatal("APM 应已启用")
+	}
+
+	ren := make([]int16, FrameSize)
+	want := make([]int16, FrameSize)
+	in := make([]int16, FrameSize)
+	out := make([]int16, FrameSize)
+	var phase float64
+	var rng uint32 = 0x117
+	for f := 0; f < 30; f++ {
+		aecRenderFrame(ren, f)
+		copy(want, ren)
+		nearEndFrame(in, &phase, 12000, 1000, &rng)
+		d.ProcessRender(ren)
+		if _, err := d.Process(out, in); err != nil {
+			t.Fatalf("Process frame %d: %v", f, err)
+		}
+		for i := range ren {
+			if ren[i] != want[i] {
+				t.Fatalf("第 %d 帧参考缓冲被改写：样本 %d = %d, want %d", f, i, ren[i], want[i])
+			}
+		}
+	}
+
+	// 数字静音帧（混音器耳聋/无人在场时的实际输入）同样不得被改写。
+	clear(ren)
+	copy(want, ren)
+	for f := 0; f < 5; f++ {
+		d.ProcessRender(ren)
+		for i := range ren {
+			if ren[i] != 0 {
+				t.Fatalf("静音参考帧被改写：样本 %d = %d", i, ren[i])
+			}
+		}
+	}
+
+	// 关闭 APM 后同样是 no-op 且不改写。
+	if err := d.SetEnableAPM(false); err != nil {
+		t.Fatalf("SetEnableAPM(false): %v", err)
+	}
+	aecRenderFrame(ren, 1)
+	copy(want, ren)
+	d.ProcessRender(ren)
+	for i := range ren {
+		if ren[i] != want[i] {
+			t.Fatalf("APM 关闭时参考缓冲被改写：样本 %d = %d, want %d", i, ren[i], want[i])
+		}
+	}
+}
+
+// BenchmarkDSPProcessRender 参考帧入口（含拷贝）热路径：必须 0 allocs/op。
+func BenchmarkDSPProcessRender(b *testing.B) {
+	requireAPM(b)
+	cfg := DefaultDSPConfig()
+	cfg.Denoise = false
+	cfg.EnableAPM = true
+	d, err := NewDSP(cfg)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer d.Close()
+	ren := make([]int16, FrameSize)
+	aecRenderFrame(ren, 0)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		d.ProcessRender(ren)
+	}
+}
+
 // BenchmarkAPMRender APM 参考帧处理成本（混音 tick 每 10ms 一次）。
 // 不依赖 Go 堆，allocs 必须为 0。
 func BenchmarkAPMRender(b *testing.B) {
