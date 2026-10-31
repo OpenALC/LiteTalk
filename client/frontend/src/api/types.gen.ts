@@ -53,7 +53,7 @@ export interface paths {
         };
         /**
          * 服务端能力开关
-         * @description 免鉴权。auth_mode=full|simple，mail_configured 为真实发信通道，self_host 一键自托管形态，bootstrap_required 管理员邀请码未消费。
+         * @description 免鉴权。auth_mode=full|simple|oidc，mail_configured 为真实发信通道，self_host 一键自托管形态，bootstrap_required 管理员邀请码未消费，push_enabled/oidc_enabled 对应可选能力开关。
          */
         get: operations["getConfig"];
         put?: never;
@@ -178,6 +178,46 @@ export interface paths {
          * @description 请求体可为空。code：bad_device、bad_request、too_large； 403 guest_disabled；426 client_too_old；429 rate_limited；5xx internal。
          */
         post: operations["guestLogin"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/oidc/authorize": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 发起 OIDC 登录（返回 IdP 授权页 URL）
+         * @description 标准授权码 + PKCE(S256)（#54）。服务端生成 state（5 分钟 TTL、一次性消费） 并把 code_verifier/nonce/设备类型存在服务端；客户端把浏览器重定向到返回的 url，IdP 认证完成后重定向到部署配置的 redirect_url（前端回调页），页面再把 code+state POST 到 /auth/oidc/callback 换取本地令牌对（与本地登录同构）。 未配置 LITETALK_OIDC_* 时 404（功能关闭且零副作用）。 code：bad_device、bad_request、too_large；404 not_found；426 client_too_old； 429 rate_limited（oidc: 频控）；5xx internal。
+         */
+        post: operations["oidcAuthorize"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/oidc/callback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * OIDC 回调（code+state 换本地令牌对）
+         * @description 消费一次性 state → 用 code_verifier 向 IdP 换令牌 → 校验 ID Token （RS256 + iss/aud/exp/nonce）→ 按 (issuer, sub) 绑定或建号 → 返回与本地 登录同构的 TokenPair。账号绑定规则：首次登录且 IdP 声明 email_verified 且 email 与既有用户匹配才自动绑定，否则新建账号（不自动合并，防账号劫持）。 code：bad_state（state 无效/过期/重放）、bad_code（授权码被 IdP 拒绝）、 oidc_upstream（IdP 故障）、account_disabled、bad_request、too_large； 404 not_found（未配置）；426 client_too_old；429 rate_limited（oidc: 频控）； 5xx internal。
+         */
+        post: operations["oidcCallback"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1264,8 +1304,11 @@ export interface components {
         };
         /** ServerConfig */
         ServerConfig: {
-            /** @enum {string} */
-            auth_mode: "full" | "simple";
+            /**
+             * @description full=验证码流程；simple=免验证码（私域）；oidc=仅 OIDC 登录（密码/注册入口全部关闭）
+             * @enum {string}
+             */
+            auth_mode: "full" | "simple" | "oidc";
             /** @description 发信通道为真实投递（非 Console 打印） */
             mail_configured: boolean;
             /** @description 一键自托管形态（SQLite/进程内单机部署） */
@@ -1274,6 +1317,8 @@ export interface components {
             bootstrap_required: boolean;
             /** @description 移动推送已启用（LITETALK_PUSH_PROVIDER 配置了可用通道；false 时 /devices 仍可注册，仅不派发） */
             push_enabled?: boolean;
+            /** @description OIDC 登录已启用（LITETALK_OIDC_* 配置完整；false 时 /auth/oidc/* 返回 404，前端不显示 OIDC 按钮） */
+            oidc_enabled?: boolean;
         };
         /**
          * PushDevice
@@ -1730,6 +1775,26 @@ export interface components {
         /** RefreshRequest */
         RefreshRequest: {
             refresh_token: string;
+        };
+        /**
+         * OidcAuthorizeRequest
+         * @description 请求体可为空（设备类型回落 desktop）。
+         */
+        OidcAuthorizeRequest: {
+            /** @description 设备类型 desktop/mobile；空 = desktop */
+            device?: string;
+        };
+        /** OidcAuthorizeResponse */
+        OidcAuthorizeResponse: {
+            /** @description IdP 授权页 URL（含 state 与 PKCE code_challenge）；直接重定向浏览器 */
+            url: string;
+        };
+        /** OidcCallbackRequest */
+        OidcCallbackRequest: {
+            /** @description IdP 重定向回 redirect_url 时携带的授权码 */
+            code: string;
+            /** @description IdP 原样带回的 state（服务端一次性消费） */
+            state: string;
         };
         /** LogoutRequest */
         LogoutRequest: {
@@ -2409,6 +2474,64 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             403: components["responses"]["Forbidden"];
+            426: components["responses"]["ClientUpgradeRequired"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    oidcAuthorize: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["OidcAuthorizeRequest"];
+            };
+        };
+        responses: {
+            /** @description IdP 授权页 URL（含 state 与 PKCE code_challenge） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OidcAuthorizeResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            426: components["responses"]["ClientUpgradeRequired"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    oidcCallback: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OidcCallbackRequest"];
+            };
+        };
+        responses: {
+            /** @description 登录成功，令牌对与本地登录同构 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenPair"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
             426: components["responses"]["ClientUpgradeRequired"];
             429: components["responses"]["RateLimited"];
             default: components["responses"]["Internal"];

@@ -291,6 +291,19 @@ type PushDevice struct {
 	CreatedAt time.Time `json:"created_at" db:"created_at"`
 }
 
+// OIDCIdentity OIDC 外部身份绑定（迁移 0021，#54）。(Issuer, Sub) 唯一：
+// 同一 IdP 身份只允许绑定一个本地账号。自动绑定只发生在首次登录且 IdP 声明
+// email_verified 的场合（防账号劫持，绝不自动合并账号）。Email 记录绑定/建号
+// 时刻 IdP 声明的邮箱，仅审计用途，任何 API 不回显。
+type OIDCIdentity struct {
+	ID        int64
+	Issuer    string
+	Sub       string
+	UserID    int64
+	Email     string
+	CreatedAt time.Time
+}
+
 // Role 角色（迁移 0010）。BuiltinKey 三值 member/admin/owner 为内置（不可改删、
 // 每服各一条），空串 = 自定义角色（DB 存 NULL）。Permissions 只用低 15 位。
 type Role struct {
@@ -565,6 +578,15 @@ type Store interface {
 	PushDeviceByID(ctx context.Context, id int64) (*PushDevice, error)
 	// DeletePushDevice 删除设备行；未命中 ErrNotFound。
 	DeletePushDevice(ctx context.Context, id int64) error
+
+	// oidc_identities（迁移 0021，#54）：OIDC 外部身份绑定。(issuer, sub) 唯一。
+
+	// OIDCIdentityByIssuerSub 按 (issuer, sub) 查绑定；无命中 ErrNotFound。
+	OIDCIdentityByIssuerSub(ctx context.Context, issuer, sub string) (*OIDCIdentity, error)
+	// CreateOIDCIdentity 写入绑定；ID 未预置时取 Snowflake，回填 CreatedAt；
+	// (issuer, sub) 重复返回 ErrConflict（同一外部身份已绑定其他账号时由调用方
+	// 决定语义——handler 层把它折叠为既有绑定直接登录）。
+	CreateOIDCIdentity(ctx context.Context, i *OIDCIdentity) error
 
 	// webhooks（迁移 0019，#52）：出站订阅 / 入站投递入口 / 投递记录。
 	// Secret 的读写口径见 OutboundWebhook / InboundWebhook 注释：明文只在创建与

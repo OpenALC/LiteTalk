@@ -362,6 +362,7 @@ func (e RegisterDeviceRequestPlatform) Valid() bool {
 // Defines values for ServerConfigAuthMode.
 const (
 	Full   ServerConfigAuthMode = "full"
+	Oidc   ServerConfigAuthMode = "oidc"
 	Simple ServerConfigAuthMode = "simple"
 )
 
@@ -369,6 +370,8 @@ const (
 func (e ServerConfigAuthMode) Valid() bool {
 	switch e {
 	case Full:
+		return true
+	case Oidc:
 		return true
 	case Simple:
 		return true
@@ -965,6 +968,27 @@ type Message struct {
 	UserId         ID      `json:"user_id"`
 }
 
+// OidcAuthorizeRequest 请求体可为空（设备类型回落 desktop）。
+type OidcAuthorizeRequest struct {
+	// Device 设备类型 desktop/mobile；空 = desktop
+	Device *string `json:"device,omitempty"`
+}
+
+// OidcAuthorizeResponse defines model for OidcAuthorizeResponse.
+type OidcAuthorizeResponse struct {
+	// Url IdP 授权页 URL（含 state 与 PKCE code_challenge）；直接重定向浏览器
+	Url string `json:"url"`
+}
+
+// OidcCallbackRequest defines model for OidcCallbackRequest.
+type OidcCallbackRequest struct {
+	// Code IdP 重定向回 redirect_url 时携带的授权码
+	Code string `json:"code"`
+
+	// State IdP 原样带回的 state（服务端一次性消费）
+	State string `json:"state"`
+}
+
 // OutboundWebhook 出站事件订阅（#52）。secret 是出站投递的 HMAC-SHA256 签名密钥（64 位 hex）， 只在创建响应或 reset_secret 的 PATCH 响应里出现一次，任何其他响应永不回传。 接收方校验签名：取 X-LiteTalk-Timestamp（unix 秒），与本地时刻相差超过 ±5 分钟即拒绝（防重放）；以共享 secret 为密钥对 "<timestamp>.<原始请求体>" 计算 HMAC-SHA256，与 X-LiteTalk-Signature 头的 sha256=<hex> 部分做常数时间比对。
 type OutboundWebhook struct {
 	CreatedAt Time `json:"created_at"`
@@ -1153,6 +1177,7 @@ type ServerChannels struct {
 
 // ServerConfig defines model for ServerConfig.
 type ServerConfig struct {
+	// AuthMode full=验证码流程；simple=免验证码（私域）；oidc=仅 OIDC 登录（密码/注册入口全部关闭）
 	AuthMode ServerConfigAuthMode `json:"auth_mode"`
 
 	// BootstrapRequired 管理员邀请码未消费（注册页提示等待管理员邀请）
@@ -1161,6 +1186,9 @@ type ServerConfig struct {
 	// MailConfigured 发信通道为真实投递（非 Console 打印）
 	MailConfigured bool `json:"mail_configured"`
 
+	// OidcEnabled OIDC 登录已启用（LITETALK_OIDC_* 配置完整；false 时 /auth/oidc/* 返回 404，前端不显示 OIDC 按钮）
+	OidcEnabled *bool `json:"oidc_enabled,omitempty"`
+
 	// PushEnabled 移动推送已启用（LITETALK_PUSH_PROVIDER 配置了可用通道；false 时 /devices 仍可注册，仅不派发）
 	PushEnabled *bool `json:"push_enabled,omitempty"`
 
@@ -1168,7 +1196,7 @@ type ServerConfig struct {
 	SelfHost bool `json:"self_host"`
 }
 
-// ServerConfigAuthMode defines model for ServerConfig.AuthMode.
+// ServerConfigAuthMode full=验证码流程；simple=免验证码（私域）；oidc=仅 OIDC 登录（密码/注册入口全部关闭）
 type ServerConfigAuthMode string
 
 // ServerInfo 服务器（群组）。图标为预设 Lucide 图标名 + 颜色，无图片。ID 为十进制字符串（#31）。
@@ -1460,6 +1488,12 @@ type LoginJSONRequestBody = LoginRequest
 // LogoutJSONRequestBody defines body for Logout for application/json ContentType.
 type LogoutJSONRequestBody = LogoutRequest
 
+// OidcAuthorizeJSONRequestBody defines body for OidcAuthorize for application/json ContentType.
+type OidcAuthorizeJSONRequestBody = OidcAuthorizeRequest
+
+// OidcCallbackJSONRequestBody defines body for OidcCallback for application/json ContentType.
+type OidcCallbackJSONRequestBody = OidcCallbackRequest
+
 // ResetPasswordJSONRequestBody defines body for ResetPassword for application/json ContentType.
 type ResetPasswordJSONRequestBody = PasswordResetRequest
 
@@ -1597,6 +1631,12 @@ type ServerInterface interface {
 	// Logout 登出并吊销 refresh_token
 	// (POST /api/v1/auth/logout)
 	Logout(w http.ResponseWriter, r *http.Request)
+	// OidcAuthorize 发起 OIDC 登录（返回 IdP 授权页 URL）
+	// (POST /api/v1/auth/oidc/authorize)
+	OidcAuthorize(w http.ResponseWriter, r *http.Request)
+	// OidcCallback OIDC 回调（code+state 换本地令牌对）
+	// (POST /api/v1/auth/oidc/callback)
+	OidcCallback(w http.ResponseWriter, r *http.Request)
 	// ResetPassword 邮箱验证码重置密码
 	// (POST /api/v1/auth/password/reset)
 	ResetPassword(w http.ResponseWriter, r *http.Request)
@@ -1957,6 +1997,34 @@ func (siw *ServerInterfaceWrapper) Logout(w http.ResponseWriter, r *http.Request
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.Logout(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// OidcAuthorize operation middleware
+func (siw *ServerInterfaceWrapper) OidcAuthorize(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.OidcAuthorize(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// OidcCallback operation middleware
+func (siw *ServerInterfaceWrapper) OidcCallback(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.OidcCallback(w, r)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -3903,6 +3971,8 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/auth/logout", wrapper.Logout)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/auth/email-code", wrapper.SendEmailCode)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/auth/guest", wrapper.GuestLogin)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/auth/oidc/authorize", wrapper.OidcAuthorize)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/auth/oidc/callback", wrapper.OidcCallback)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/auth/password/reset", wrapper.ResetPassword)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/users/me", wrapper.GetMe)
 	m.HandleFunc(http.MethodPatch+" "+options.BaseURL+"/api/v1/users/me", wrapper.PatchMe)
@@ -4673,6 +4743,212 @@ type LogoutdefaultApplicationProblemPlusJSONResponse struct {
 }
 
 func (response LogoutdefaultApplicationProblemPlusJSONResponse) VisitLogoutResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OidcAuthorizeRequestObject struct {
+	Body *OidcAuthorizeJSONRequestBody
+}
+
+type OidcAuthorizeResponseObject interface {
+	VisitOidcAuthorizeResponse(w http.ResponseWriter) error
+}
+
+type OidcAuthorize200JSONResponse OidcAuthorizeResponse
+
+func (response OidcAuthorize200JSONResponse) VisitOidcAuthorizeResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OidcAuthorize400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response OidcAuthorize400ApplicationProblemPlusJSONResponse) VisitOidcAuthorizeResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OidcAuthorize404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response OidcAuthorize404ApplicationProblemPlusJSONResponse) VisitOidcAuthorizeResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OidcAuthorize426ApplicationProblemPlusJSONResponse struct {
+	ClientUpgradeRequiredApplicationProblemPlusJSONResponse
+}
+
+func (response OidcAuthorize426ApplicationProblemPlusJSONResponse) VisitOidcAuthorizeResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(426)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OidcAuthorize429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response OidcAuthorize429ApplicationProblemPlusJSONResponse) VisitOidcAuthorizeResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OidcAuthorizedefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response OidcAuthorizedefaultApplicationProblemPlusJSONResponse) VisitOidcAuthorizeResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OidcCallbackRequestObject struct {
+	Body *OidcCallbackJSONRequestBody
+}
+
+type OidcCallbackResponseObject interface {
+	VisitOidcCallbackResponse(w http.ResponseWriter) error
+}
+
+type OidcCallback200JSONResponse TokenPair
+
+func (response OidcCallback200JSONResponse) VisitOidcCallbackResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OidcCallback400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response OidcCallback400ApplicationProblemPlusJSONResponse) VisitOidcCallbackResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OidcCallback404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response OidcCallback404ApplicationProblemPlusJSONResponse) VisitOidcCallbackResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OidcCallback426ApplicationProblemPlusJSONResponse struct {
+	ClientUpgradeRequiredApplicationProblemPlusJSONResponse
+}
+
+func (response OidcCallback426ApplicationProblemPlusJSONResponse) VisitOidcCallbackResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(426)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OidcCallback429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response OidcCallback429ApplicationProblemPlusJSONResponse) VisitOidcCallbackResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OidcCallbackdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response OidcCallbackdefaultApplicationProblemPlusJSONResponse) VisitOidcCallbackResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
@@ -11205,6 +11481,12 @@ type StrictServerInterface interface {
 	// Logout 登出并吊销 refresh_token
 	// (POST /api/v1/auth/logout)
 	Logout(ctx context.Context, request LogoutRequestObject) (LogoutResponseObject, error)
+	// OidcAuthorize 发起 OIDC 登录（返回 IdP 授权页 URL）
+	// (POST /api/v1/auth/oidc/authorize)
+	OidcAuthorize(ctx context.Context, request OidcAuthorizeRequestObject) (OidcAuthorizeResponseObject, error)
+	// OidcCallback OIDC 回调（code+state 换本地令牌对）
+	// (POST /api/v1/auth/oidc/callback)
+	OidcCallback(ctx context.Context, request OidcCallbackRequestObject) (OidcCallbackResponseObject, error)
 	// ResetPassword 邮箱验证码重置密码
 	// (POST /api/v1/auth/password/reset)
 	ResetPassword(ctx context.Context, request ResetPasswordRequestObject) (ResetPasswordResponseObject, error)
@@ -11655,6 +11937,71 @@ func (sh *strictHandler) Logout(w http.ResponseWriter, r *http.Request) {
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
 	} else if validResponse, ok := response.(LogoutResponseObject); ok {
 		if err := validResponse.VisitLogoutResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// OidcAuthorize operation middleware
+func (sh *strictHandler) OidcAuthorize(w http.ResponseWriter, r *http.Request) {
+	var request OidcAuthorizeRequestObject
+
+	var body OidcAuthorizeJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if !errors.Is(err, io.EOF) {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+	} else {
+		request.Body = &body
+	}
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.OidcAuthorize(ctx, request.(OidcAuthorizeRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "OidcAuthorize")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(OidcAuthorizeResponseObject); ok {
+		if err := validResponse.VisitOidcAuthorizeResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// OidcCallback operation middleware
+func (sh *strictHandler) OidcCallback(w http.ResponseWriter, r *http.Request) {
+	var request OidcCallbackRequestObject
+
+	var body OidcCallbackJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.OidcCallback(ctx, request.(OidcCallbackRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "OidcCallback")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(OidcCallbackResponseObject); ok {
+		if err := validResponse.VisitOidcCallbackResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {
@@ -13726,6 +14073,8 @@ var PublicRoutePatterns = map[string]bool{
 	"POST /api/v1/auth/guest":                true,
 	"POST /api/v1/auth/login":                true,
 	"POST /api/v1/auth/logout":               true,
+	"POST /api/v1/auth/oidc/authorize":       true,
+	"POST /api/v1/auth/oidc/callback":        true,
 	"POST /api/v1/auth/password/reset":       true,
 	"POST /api/v1/auth/refresh":              true,
 	"POST /api/v1/auth/register":             true,

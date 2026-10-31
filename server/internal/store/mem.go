@@ -42,6 +42,9 @@ type Mem struct {
 	auditLogs   map[int64]*AuditLog                                 // id → 审计行
 	apiTokens   map[int64]*APIToken                                 // tokenID → 行（迁移 0018，#51 #54）
 
+	// oidcIdentities OIDC 外部身份绑定（迁移 0021，#54）：(issuer, sub) → 行。
+	oidcIdentities map[oidcIdentityKey]*OIDCIdentity
+
 	// webhooks 三表（迁移 0019，#52）：出站订阅、入站入口、投递记录。
 	outHooks    map[int64]*OutboundWebhook
 	inHooks     map[int64]*InboundWebhook
@@ -79,6 +82,7 @@ func NewMem() *Mem {
 		overwrites:     map[overwriteKey]*ChannelOverwrite{},
 		auditLogs:      map[int64]*AuditLog{},
 		apiTokens:      map[int64]*APIToken{},
+		oidcIdentities: map[oidcIdentityKey]*OIDCIdentity{},
 		outHooks:       map[int64]*OutboundWebhook{},
 		inHooks:        map[int64]*InboundWebhook{},
 		webhookDels:    map[int64]*WebhookDelivery{},
@@ -1551,6 +1555,41 @@ func (m *Mem) TouchAPITokenLastUsed(_ context.Context, id int64, at time.Time) e
 		t.LastUsedAt = &at
 	}
 	return nil
+}
+
+// ---- oidc_identities（迁移 0021，#54）----
+
+// oidcIdentityKey 绑定行主键 (issuer, sub)。与迁移 0021 的唯一索引同口径。
+type oidcIdentityKey struct {
+	issuer string
+	sub    string
+}
+
+func (m *Mem) CreateOIDCIdentity(_ context.Context, i *OIDCIdentity) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := oidcIdentityKey{issuer: i.Issuer, sub: i.Sub}
+	if _, ok := m.oidcIdentities[k]; ok {
+		return ErrConflict
+	}
+	i.ID = newID(i.ID)
+	if i.CreatedAt.IsZero() {
+		i.CreatedAt = time.Now()
+	}
+	cp := *i
+	m.oidcIdentities[k] = &cp
+	return nil
+}
+
+func (m *Mem) OIDCIdentityByIssuerSub(_ context.Context, issuer, sub string) (*OIDCIdentity, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	i, ok := m.oidcIdentities[oidcIdentityKey{issuer: issuer, sub: sub}]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	cp := *i
+	return &cp, nil
 }
 
 // ---- webhooks（迁移 0019，#52）----

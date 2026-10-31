@@ -405,11 +405,22 @@ func main() {
 		}
 	}
 
-	// Auth 模式：full（默认，验证码流程）/ simple（免验证码，私域部署从简）。
-	// 合法性已在 cfg.validate（步骤 2）把关。
+	// Auth 模式：full（默认，验证码流程）/ simple（免验证码，私域部署从简）/
+	// oidc（仅 OIDC 登录，企业部署）。合法性已在 cfg.validate（步骤 2）把关。
 	authMode := cfg.authMode
 	if authMode == "simple" {
 		log.Println("Auth 模式: simple（注册/找回免验证码，仅建议私域部署）")
+	}
+	if authMode == "oidc" {
+		log.Println("Auth 模式: oidc（仅 OIDC 登录，密码登录/注册/找回已禁用）")
+	}
+
+	// OIDC 登录（#54）：LITETALK_OIDC_* 全空 = 功能关闭（/config 报
+	// oidc_enabled=false，端点 404，零后台资源）；配置完整才注入 API 层。
+	var oidcCfg *auth.OIDCConfig
+	if cfg.oidc.Complete() {
+		oidcCfg = &cfg.oidc
+		log.Printf("OIDC 登录: 已启用（issuer=%s）", cfg.oidc.Issuer)
 	}
 
 	// 链接预览（#42 B4）：关闭时为 nil，端点统一 404 no_preview；缓存复用现有 KV。
@@ -464,6 +475,8 @@ func main() {
 		Push: pushBroker,
 		// 出站 Webhook 投递器（#52）：API 层只负责建首个订阅时的惰性启动。
 		Webhooks: webhookDisp,
+		// OIDC 登录（#54）：nil = 未配置（端点 404，零副作用）。
+		OIDC: oidcCfg,
 	})
 
 	mux := http.NewServeMux()

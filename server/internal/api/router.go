@@ -23,10 +23,12 @@ import (
 	"github.com/OpenALC/LiteTalk/server/internal/webhook"
 )
 
-// AuthMode 鉴权模式：full（默认，验证码流程）/ simple（免验证码，适合私域部署）。
+// AuthMode 鉴权模式：full（默认，验证码流程）/ simple（免验证码，适合私域部署）/
+// oidc（外部身份，仅 OIDC 登录——本地密码入口全部关闭，见各入口的门控）。
 const (
 	AuthModeFull   = "full"
 	AuthModeSimple = "simple"
+	AuthModeOIDC   = "oidc"
 )
 
 // Hub abstracts signal.Hub for logout/reset-password session kicking.
@@ -127,6 +129,11 @@ type Server struct {
 	// webhookURLCheck 出站 URL 的 SSRF 校验（New 补默认 linkpreview.CheckDialable；
 	// 测试注入放行桩以对 httptest 目标建订阅）。
 	webhookURLCheck func(string) error
+	// oidc OIDC 依赖方（#54）。nil = 未配置，功能关闭：/auth/oidc/* 一律 404，
+	// 不做 discovery、不建状态表（零副作用）。
+	oidc *auth.OIDCProvider
+	// oidcStates 授权流程 state 的一次性存储（5 分钟 TTL）。oidc 为 nil 时不构造。
+	oidcStates *auth.OIDCStates
 }
 
 // Config 构造配置。
@@ -189,6 +196,9 @@ type Config struct {
 	// WebhookURLCheck 出站 URL 的 SSRF 校验；nil 用 linkpreview.CheckDialable
 	//（测试注入放行桩，httptest 目标是 127.0.0.1，默认校验会拒绝）。
 	WebhookURLCheck func(string) error
+	// OIDC 登录配置（#54）。nil 或不完整 = 功能关闭（端点 404，零副作用）；
+	// 完整性由 cmd/server 启动校验把关，这里对不完整配置只记日志并关闭。
+	OIDC *auth.OIDCConfig
 }
 
 // New 构造 API Server。
@@ -202,8 +212,19 @@ func New(cfg Config) *Server {
 		m = &mailer.Console{Log: lg}
 	}
 	mode := cfg.AuthMode
-	if mode != AuthModeSimple {
+	if mode != AuthModeSimple && mode != AuthModeOIDC {
 		mode = AuthModeFull
+	}
+	// OIDC 登录（#54）：配置完整才构造依赖方与状态表；不完整按关闭处理并明示。
+	var oidcProv *auth.OIDCProvider
+	var oidcSt *auth.OIDCStates
+	if cfg.OIDC != nil {
+		if cfg.OIDC.Complete() {
+			oidcProv = auth.NewOIDCProvider(*cfg.OIDC, lg)
+			oidcSt = auth.NewOIDCStates(cfg.KV)
+		} else {
+			lg.Printf("[config] LITETALK_OIDC_* 配置不完整，OIDC 登录关闭")
+		}
 	}
 	ver := cfg.Version
 	if ver == "" {
@@ -252,6 +273,8 @@ func New(cfg Config) *Server {
 		push:              cfg.Push,
 		webhooks:          cfg.Webhooks,
 		webhookURLCheck:   urlCheck,
+		oidc:              oidcProv,
+		oidcStates:        oidcSt,
 	}
 }
 
@@ -305,6 +328,11 @@ func parseTrustedProxies(lg *log.Logger, entries []string) []*net.IPNet {
 
 // simpleMode 当前是否为简捷模式（免验证码）。
 func (s *Server) simpleMode() bool { return s.authMode == AuthModeSimple }
+
+// oidcOnly 当前是否为仅 OIDC 模式：外部身份是唯一登录途径，本地密码入口
+// （登录/注册/找回）整体关闭。与 simpleMode 语义不同——simple 是「免验证码」，
+// oidc 是「外部身份」，两者不可混为一谈（批次 6 §7 逐点复查）。
+func (s *Server) oidcOnly() bool { return s.authMode == AuthModeOIDC }
 
 // mailConfigured 发信通道是否为真实投递（Console 打印不算）。
 func (s *Server) mailConfigured() bool {

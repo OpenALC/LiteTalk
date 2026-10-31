@@ -2027,6 +2027,30 @@ func (s *SQLite) DeletePushDevice(ctx context.Context, id int64) error {
 	return nil
 }
 
+// ---- oidc_identities（迁移 0021，#54）----
+// SQL 与 MySQL 同形（无 ENUM、无方言 upsert），scanOIDCIdentity 共用 mysql.go 的实现。
+
+func (s *SQLite) CreateOIDCIdentity(ctx context.Context, i *OIDCIdentity) error {
+	i.ID = newID(i.ID)
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO oidc_identities (id, issuer, sub, user_id, email)
+		 VALUES (?, ?, ?, ?, ?)`,
+		i.ID, i.Issuer, i.Sub, i.UserID, i.Email)
+	if err != nil {
+		if isDupSQLite(err) {
+			return ErrConflict
+		}
+		return err
+	}
+	return s.db.QueryRowContext(ctx, `SELECT created_at FROM oidc_identities WHERE id = ?`, i.ID).
+		Scan(&i.CreatedAt)
+}
+
+func (s *SQLite) OIDCIdentityByIssuerSub(ctx context.Context, issuer, sub string) (*OIDCIdentity, error) {
+	return scanOIDCIdentity(s.db.QueryRowContext(ctx,
+		`SELECT `+oidcIdentityCols+` FROM oidc_identities WHERE issuer = ? AND sub = ?`, issuer, sub))
+}
+
 // ---- webhooks（迁移 0019，#52）----
 // CRUD 与投递记录共用 webhooks.go 的 db* 实现；SQL 与 MySQL 同形（无 ENUM、
 // 无方言 upsert），这里只做事务接线。RecordWebhookDelivery 的读-改-写在事务内
