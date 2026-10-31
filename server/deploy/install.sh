@@ -44,6 +44,132 @@ done
 
 log() { echo "[install] $*"; }
 
+# ---- 纯函数区（压缩包校验 / latest 解析）----
+# 与 server/internal/updater/extract.go 的 safeExtract 同口径：只放行普通文件与目录，
+# 拒绝符号链接/硬链接/设备/FIFO 等非常规条目。`tar -tzf` 只列名字、看不出条目类型；
+# 解包后以 root 身份 install 会跟随链接，把 /etc 下的路径变成可控文件。
+# 类型用 `tar -tvzf` 的首字符判定，名字仍从 `tar -tzf` 取：两次列表的条目顺序与条数
+# 必然一致，按序号对齐即可，不必从 verbose 行里剥离名字（带空格的成员也能解析）。
+#
+# 本区内的函数都放在参数解析之前，并留 LITETALK_INSTALL_LIB=1 出口：
+# deploy/install_selftest.sh 以该变量 source 本文件，只取函数、不跑安装主流程
+# （主流程需要 root 与 Linux，CI 检查机两者都不是）。
+archive_names_types() {
+  local tarball="$1"
+  local names types n m
+  ARCH_NAMES=()
+  ARCH_TYPES=()
+  # 显式判 tar 的退出码：包损坏/不存在时不能退化成"空压缩包"这种误导性结论
+  if ! names="$(LC_ALL=C tar -tzf "$tarball")"; then
+    echo "无法列出压缩包成员（包损坏或不存在）" >&2
+    return 1
+  fi
+  if ! types="$(LC_ALL=C tar -tvzf "$tarball" | cut -c1)"; then
+    echo "无法列出压缩包条目类型（包损坏）" >&2
+    return 1
+  fi
+  # 空压缩包时 mapfile 会塞进一个空元素，单独归一为 0 条
+  if [ -n "$names" ]; then
+    mapfile -t ARCH_NAMES <<<"$names"
+  fi
+  if [ -n "$types" ]; then
+    mapfile -t ARCH_TYPES <<<"$types"
+  fi
+  n=${#ARCH_NAMES[@]}
+  m=${#ARCH_TYPES[@]}
+  if [ "$n" -ne "$m" ]; then
+    echo "压缩包条目列表前后不一致（名字 $n 条，类型 $m 条）" >&2
+    return 1
+  fi
+}
+
+# verify_archive <tar.gz>：成员白名单 + 类型闸，任一不符返回 1（原因写 stderr）。
+# 通过时全局数组 ARCH_NAMES 才是可信成员列表；不直接退出——自测脚本要逐个用例取返回值。
+verify_archive() {
+  local tarball="$1"
+  local i name type has_server=0
+  ARCH_NAMES=()
+  ARCH_TYPES=()
+  archive_names_types "$tarball" || return 1
+  if [ "${#ARCH_NAMES[@]}" -eq 0 ]; then
+    echo "压缩包为空" >&2
+    return 1
+  fi
+  for i in "${!ARCH_NAMES[@]}"; do
+    name="${ARCH_NAMES[$i]}"
+    type="${ARCH_TYPES[$i]}"
+    case "$type" in
+      -) ;;
+      d) echo "压缩包含目录条目: $name" >&2; return 1 ;;
+      l) echo "压缩包含符号链接条目: $name" >&2; return 1 ;;
+      h) echo "压缩包含硬链接条目: $name" >&2; return 1 ;;
+      p) echo "压缩包含 FIFO 条目: $name" >&2; return 1 ;;
+      b | c) echo "压缩包含设备条目: $name" >&2; return 1 ;;
+      *) echo "压缩包含非常规条目（type=$type）: $name" >&2; return 1 ;;
+    esac
+    case "$name" in
+      litetalk-server | litetalk-updater | update.sh) ;;
+      *) echo "压缩包含非法成员: $name" >&2; return 1 ;;
+    esac
+  done
+  # 同名两次时后一条会覆盖前一条，与 safeExtract 一样直接拒
+  if [ "$(printf '%s\n' "${ARCH_NAMES[@]}" | sort | uniq -d | wc -l)" -ne 0 ]; then
+    echo "压缩包含重复条目" >&2
+    return 1
+  fi
+  for name in "${ARCH_NAMES[@]}"; do
+    if [ "$name" = "litetalk-server" ]; then
+      has_server=1
+    fi
+  done
+  if [ "$has_server" -ne 1 ]; then
+    echo "压缩包缺少 litetalk-server" >&2
+    return 1
+  fi
+  return 0
+}
+
+# pick_highest_tag <每行一个 tag> <allow_prerelease 0|1>：按 semver 取最高，打印结果（无则空）。
+# 列表按发布时间倒序，补发旧版本（例如打包失败后发的修复 tag）会排在真正最新版之前，
+# 所以不能取第一条：先按通道与形态过滤，再按 semver 比较取最高（与 ResolveLatest 同口径）。
+# 比较用 awk 归一成整数：major*1e9 + minor*1e6 + patch*1e3 + 后缀权重，
+# 后缀权重 alpha<beta<rc<正式版，与 updater 的 pre 常量一致。
+pick_highest_tag() {
+  local list="$1" allow_pre="$2"
+  printf '%s\n' "$list" | awk -v allow_pre="$allow_pre" '
+    function pre_weight(suf) {
+      if (suf == "alpha") return 0
+      if (suf == "beta") return 1
+      if (suf == "rc") return 2
+      return -1                     # 未知后缀：不参与比较
+    }
+    {
+      tag = $0
+      if (tag !~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc))?$/) next
+      pre = 3                       # 3 = 正式版
+      body = tag
+      i = index(tag, "-")
+      if (i > 0) {
+        pre = pre_weight(substr(tag, i + 1))
+        if (pre < 0) next
+        body = substr(tag, 1, i - 1)
+      }
+      if (pre != 3 && allow_pre != 1) next
+      sub(/^v/, "", body)
+      n = split(body, p, ".")
+      if (n != 3) next
+      key = (p[1] + 0) * 1000000000 + (p[2] + 0) * 1000000 + (p[3] + 0) * 1000 + pre
+      # 严格大于才替换：同版本号保留列表里先出现的（发布时间更近）
+      if (!seen || key > best_key) { best_key = key; best = tag; seen = 1 }
+    }
+    END { if (seen) print best }
+  '
+}
+
+if [ "${LITETALK_INSTALL_LIB:-0}" = 1 ]; then
+  return 0
+fi
+
 # ---- 参数与环境校验（fail-closed：形态不合法直接退出）----
 case "$DIR" in
   /*) ;;
@@ -51,6 +177,13 @@ case "$DIR" in
 esac
 if printf '%s' "$DIR" | grep -q '\.\.'; then
   echo "安装目录不得包含 ..: $DIR" >&2; exit 2
+fi
+# 目录会原样写进 systemd 单元（ExecStart=、WorkingDirectory=、ReadWritePaths=），
+# 这些字段按空白分词且不支持引号转义：带空白的路径会把 ExecStart 拆成两段，
+# 服务起不来且报错难懂。直接拒绝，比在各注入点做转义更可靠。
+if printf '%s' "$DIR" | grep -q '[[:space:]]'; then
+  echo "安装目录不得包含空白字符: $DIR" >&2
+  exit 2
 fi
 if ! printf '%s' "$SVC_USER" | grep -Eq '^[A-Za-z_][A-Za-z0-9_-]*$'; then
   echo "用户名形态非法: $SVC_USER" >&2; exit 2
@@ -77,24 +210,17 @@ if [ "$VERSION" != "latest" ] && ! printf '%s' "$VERSION" | grep -Eq "$TAG_RE"; 
   echo "版本 tag 不符合规范: $VERSION" >&2; exit 2
 fi
 
-# ---- 解析 latest：用 releases 列表（releases/latest 不含预发布），按通道策略过滤 ----
+# ---- 解析 latest：用 releases 列表（releases/latest 不含预发布），通道过滤后取最高版本 ----
 if [ "$VERSION" = "latest" ]; then
   log "解析最新发布（通道: $([ "$ALLOW_PRERELEASE" = 1 ] && echo '含预发布' || echo '仅正式版')）"
   tags="$(curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=20" \
     | grep -o '"tag_name": *"[^"]*"' | sed 's/.*"\(v[^"]*\)"/\1/' || true)"
-  VERSION=""
-  for t in $tags; do
-    printf '%s' "$t" | grep -Eq "$TAG_RE" || continue
-    if [ "$ALLOW_PRERELEASE" != 1 ] && printf '%s' "$t" | grep -q '-'; then
-      continue
-    fi
-    VERSION="$t"
-    break
-  done
+  VERSION="$(pick_highest_tag "$tags" "$ALLOW_PRERELEASE")"
   if [ -z "$VERSION" ]; then
     echo "没有符合通道策略的 release（预发布需加 --prerelease）" >&2
     exit 1
   fi
+  log "latest 解析为 $VERSION"
 fi
 # 显式指定的预发布同样要 --prerelease 放行（与更新器通道闸一致）
 if [ "$ALLOW_PRERELEASE" != 1 ] && printf '%s' "$VERSION" | grep -q '-'; then
@@ -141,22 +267,11 @@ else
   log "SHA256 校验通过 $got"
 fi
 
-# ---- 安全解包：成员白名单 + 拒绝路径穿越/符号链接 ----
+# ---- 安全解包：成员白名单 + 条目类型闸（与 safeExtract 同口径）----
 if [ "$DRY_RUN" = 0 ]; then
   mkdir -p "$WORK/x"
-  members="$(tar -tzf "$WORK/$ASSET")"
-  while IFS= read -r m; do
-    case "$m" in
-      litetalk-server|litetalk-updater|update.sh) ;;
-      *) echo "压缩包含非法成员: $m" >&2; exit 1 ;;
-    esac
-    if printf '%s' "$m" | grep -Eq '(^/|\.\.|->)'; then
-      echo "压缩包成员路径非法: $m" >&2
-      exit 1
-    fi
-  done <<<"$members"
-  if ! printf '%s\n' "$members" | grep -qx 'litetalk-server'; then
-    echo "压缩包缺少 litetalk-server" >&2
+  if ! verify_archive "$WORK/$ASSET"; then
+    echo "压缩包校验失败，已中止（未解包、未安装）" >&2
     exit 1
   fi
   tar -xzf "$WORK/$ASSET" -C "$WORK/x"
@@ -164,6 +279,13 @@ if [ "$DRY_RUN" = 0 ]; then
     echo "解包后 litetalk-server 缺失或不可执行" >&2
     exit 1
   fi
+  # 其余成员即使已在白名单内，也必须是普通文件才允许 install（防解出目录后跟随）
+  for m in "${ARCH_NAMES[@]}"; do
+    if [ -d "$WORK/x/$m" ] || { [ -e "$WORK/x/$m" ] && [ ! -f "$WORK/x/$m" ]; }; then
+      echo "解包后成员不是普通文件: $m" >&2
+      exit 1
+    fi
+  done
 fi
 
 # ---- 创建服务用户 / 目录 ----

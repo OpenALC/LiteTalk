@@ -64,7 +64,11 @@ jobs:
       # bash -n 只解析第一个文件（其余会被当作位置参数），必须逐个检查。
       - name: 部署脚本语法检查
         run: |
-          for f in deploy/install.sh deploy/update.sh; do bash -n "$f"; done
+          for f in deploy/install.sh deploy/update.sh deploy/install_selftest.sh; do bash -n "$f"; done
+      # 压缩包成员校验（#102）：符号链接/硬链接/FIFO/目录/白名单外/缺主二进制/重复条目
+      # 都必须被 verify_archive 拒掉。自测脚本 source install.sh 取函数，不需要 root。
+      - name: 部署脚本自测（install.sh 压缩包校验）
+        run: bash deploy/install_selftest.sh
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}

@@ -918,7 +918,9 @@ export interface paths {
         get?: never;
         /**
          * 服务端强制闭麦/解禁（需 MuteMembers，#36）
-         * @description 服务端在 SFU 转发前丢弃目标的上行 RTP（track 保持挂载），目标不配合也无法 绕过；房间成员收到 voice.state{server_muted}。仅语音频道；不能对自己操作； 非 owner 只能对角色层级严格低于自己的成员操作（与角色管理同口径）。 code：bad_channel、bad_request、路径参数不合法；401；403 forbidden； 404 not_found（频道不存在、目标不是成员或不在该频道语音房）；5xx internal。
+         * @description 服务端在 SFU 转发前丢弃目标的上行 RTP（track 保持挂载），目标不配合也无法 绕过；房间成员收到 voice.state{server_muted}。仅语音频道；不能对自己操作； 非 owner 只能对角色层级严格低于自己的成员操作（与角色管理同口径）。
+         *     闭麦状态的**生命周期是房间实例级的**：只存在于该频道语音房的内存里，不落库、 不跨房间延续。目标换频道、房间被回收（最后一人离开）或服务重启后即自动解除； 同一房间内换连接/断线重入则保持闭麦。这不是"该服务器成员被闭麦"的持久管理 状态——需要跨房间持久闭麦时要另设接口与迁移。
+         *     code：bad_channel、bad_request、路径参数不合法；401；403 forbidden； 404 not_found（频道不存在、目标不是成员或不在该频道语音房）；5xx internal。
          */
         put: operations["setServerMuted"];
         post?: never;

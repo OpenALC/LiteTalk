@@ -487,16 +487,30 @@ func startHTTP(cfg *config, mux http.Handler, stop context.CancelFunc) []*http.S
 		httpsSrv := newServer(cfg.addr, mux)
 		httpsSrv.TLSConfig = mgr.TLSConfig()
 		httpSrv := newServer(":80", mgr.HTTPHandler())
-		// ACME 部署不占 8077，但 updater 默认按 loopback 8077 断言版本（#101）：
-		// 单独起一个只暴露 healthz 的监听，不把完整管理 API 带到回环面。
-		healthSrv := newServer(acmeHealthAddr, healthOnlyHandler(version))
 		log.Printf("ACME: 单域 %s 自动签发（TLS-ALPN-01 + HTTP-01），证书缓存 %s", cfg.domain, cfg.acmeCache)
-		log.Printf("ACME: loopback health http://%s/api/v1/healthz", acmeHealthAddr)
 		listen("HTTPS "+cfg.addr, httpsSrv, func() error { return httpsSrv.ListenAndServeTLS("", "") }, true)
 		listen("HTTP :80", httpSrv, httpSrv.ListenAndServe, true)
-		// 端口冲突/无权限走上面统一的失败路径：打日志并 stop()，不静默吞掉。
-		listen("health "+acmeHealthAddr, healthSrv, healthSrv.ListenAndServe, false)
-		return []*http.Server{httpsSrv, httpSrv, healthSrv}
+		servers := []*http.Server{httpsSrv, httpSrv}
+
+		// ACME 部署默认不占 8077，但 updater 默认按 loopback 8077 断言版本（#101）：
+		// 单独起一个只暴露 healthz 的监听，不把完整管理 API 带到回环面。
+		// 两种情况不启这一路（#102）：
+		//   1. LITETALK_ADDR 显式配成了 8077——主 mux 已在该端口提供 /api/v1/healthz；
+		//   2. 端口已被别的进程占用——更新器的 healthz 断言会失败回滚，但这不该让
+		//      整个服务退出（443/80 与 SFU 都还正常工作）。降级为告警，healthz 走配置地址。
+		if acmeHealthCovered(cfg.addr) {
+			log.Printf("ACME: %s 已覆盖 loopback healthz 端口，跳过额外监听", cfg.addr)
+		} else {
+			healthSrv := newServer(acmeHealthAddr, healthOnlyHandler(version))
+			if err := listenOptional("health "+acmeHealthAddr, healthSrv); err != nil {
+				log.Printf("ACME: loopback health %s 未启动: %v；healthz 请改用 %s（更新器需相应设置 LITETALK_UPDATER_HEALTH_URL）",
+					acmeHealthAddr, err, cfg.addr)
+			} else {
+				log.Printf("ACME: loopback health http://%s/api/v1/healthz", acmeHealthAddr)
+				servers = append(servers, healthSrv)
+			}
+		}
+		return servers
 	}
 
 	srv := newServer(cfg.addr, mux)
@@ -512,6 +526,37 @@ func startHTTP(cfg *config, mux http.Handler, stop context.CancelFunc) []*http.S
 	}
 	listen("HTTP "+cfg.addr, srv, srv.ListenAndServe, false)
 	return []*http.Server{srv}
+}
+
+// acmeHealthCovered 主监听地址是否已覆盖 acmeHealthAddr 的端口。
+// 成立时主 mux 本身就在该端口上提供 /api/v1/healthz，再起回环监听必然绑定冲突。
+// 地址形态无法解析时返回 false（照常尝试起回环面，起不来也只是告警）。
+func acmeHealthCovered(mainAddr string) bool {
+	_, port, err := net.SplitHostPort(mainAddr)
+	if err != nil {
+		return false
+	}
+	_, healthPort, err := net.SplitHostPort(acmeHealthAddr)
+	if err != nil {
+		return false
+	}
+	return port == healthPort
+}
+
+// listenOptional 启动一个"失败不影响主服务"的监听：**先绑定**再 serve，
+// 绑定失败立即可见并作为返回值交给调用方记录，而不是丢进 goroutine 里悄悄退出。
+func listenOptional(name string, srv *http.Server) error {
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		return err
+	}
+	go func() {
+		// 绑定成功后 serve 只会因关闭或运行期错误返回；两种情况都不该终止主服务。
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("%s 服务异常退出: %v", name, err)
+		}
+	}()
+	return nil
 }
 
 // healthOnlyHandler ACME 模式的回环探活面：只提供 GET /api/v1/healthz。

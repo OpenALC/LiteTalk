@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -24,7 +25,13 @@ type Result struct {
 	RolledBack bool
 	Duration   time.Duration
 	DryRun     bool
+	// Skipped 本次是空操作（latest 解析结果不新于已装版本），未下载未替换未写状态。
+	Skipped bool
 }
+
+// ErrLatestNotNewer latest 解析出的 tag 不新于状态里记录的已装版本：
+// 与 webhook 的防降级闸同口径，空操作而非失败（不写失败状态）。
+var ErrLatestNotNewer = errors.New("latest 不新于已装版本")
 
 // Updater 更新流水线。依赖全部经接口/函数注入，测试不碰网络与 systemd。
 type Updater struct {
@@ -103,6 +110,11 @@ func (u *Updater) runOnce(ctx context.Context, tag, delivery string) (Result, er
 	start := u.now()
 	res, err := u.Execute(ctx, tag)
 	res.Duration = u.now().Sub(start)
+	// latest 不新于已装版本是"已是最新"的空操作，不是更新失败：不写失败状态。
+	// 放在 dry-run 早退之前，--dry-run --tag latest 也不会被当成失败（退出码 0）。
+	if errors.Is(err, ErrLatestNotNewer) {
+		return res, nil
+	}
 	if u.st == nil || u.cfg.DryRun {
 		return res, err
 	}
@@ -136,6 +148,13 @@ func (u *Updater) Execute(ctx context.Context, tag string) (Result, error) {
 		tag = t
 		res.Tag = tag
 		u.logf("latest 解析为 %s", tag)
+		// 与 webhook 的防降级闸同口径：latest 是"跟到最新"，不是回退通道。
+		// 显式指定 tag（--tag v1.2.3）仍可降级——那是运维显式回退，不在这里拦。
+		if cur := u.recordedVersion(); cur != "" && !tagNewerThan(tag, cur) {
+			res.Skipped = true
+			u.logf("latest 解析结果 %s 不新于已装版本 %s，跳过（防降级）", tag, cur)
+			return res, fmt.Errorf("%w: %s <= %s", ErrLatestNotNewer, tag, cur)
+		}
 	}
 	if _, ok := parseTag(tag); !ok {
 		return res, fmt.Errorf("tag 不符合白名单形态: %q", tag)
@@ -359,6 +378,22 @@ func (u *Updater) currentVersion() string {
 		return "unknown"
 	}
 	return ver
+}
+
+// recordedVersion 状态文件里记的已装版本（latest 防降级用）。
+// 先 best-effort 重读：webhook 进程或另一个 --once 可能已推进，用过期快照会误判降级。
+// 没有状态（--dry-run、首次安装、st 为 nil）返回空串，表示"无从比较，放行"。
+func (u *Updater) recordedVersion() string {
+	if u.st == nil {
+		return ""
+	}
+	if err := u.st.Reload(); err != nil {
+		// 文件不存在属正常（首次安装）；其他错误沿用内存快照
+		if !os.IsNotExist(err) {
+			u.logf("重读状态失败（沿用内存快照）: %v", err)
+		}
+	}
+	return u.st.Get().CurrentVersion
 }
 
 func (u *Updater) checkDisk(path string) error {

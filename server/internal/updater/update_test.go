@@ -369,3 +369,159 @@ func TestLatestResolvesAndApplies(t *testing.T) {
 		t.Fatalf("解析 tag = %q", res.Tag)
 	}
 }
+
+// TestLatestPicksHighestAcrossList latest 走 fakeGitHub 的 releases 列表（map 遍历顺序随机），
+// 必须取 semver 最高者而不是"列表第一条"。
+func TestLatestPicksHighestAcrossList(t *testing.T) {
+	gh := newFakeGitHub(t)
+	health := &fakeHealthz{ver: "v1.0.0-alpha"}
+	cfg, _ := newTestConfig(t, gh.srv.URL, health.start(t))
+	for _, tag := range []string{"v1.2.0-alpha", "v1.9.0-alpha", "v1.10.0-alpha", "v1.3.1-alpha"} {
+		gh.publish(t, tag, "BIN-"+tag, true)
+	}
+	up := New(cfg, &fakeRunner{onRun: func(string, []string) { health.set("v1.10.0-alpha") }}, nil, testLogger(), nil)
+	up.FreeDisk = func(string) (uint64, error) { return 1 << 30, nil }
+
+	// 多跑几轮：map 遍历顺序每轮不同，若实现依赖顺序会间歇性失败
+	for i := 0; i < 8; i++ {
+		res, err := up.Execute(context.Background(), "latest")
+		if err != nil {
+			t.Fatalf("第 %d 轮 latest 解析失败: %v", i, err)
+		}
+		if res.Tag != "v1.10.0-alpha" {
+			t.Fatalf("第 %d 轮解析 tag = %q, want v1.10.0-alpha", i, res.Tag)
+		}
+		health.set("v1.0.0-alpha") // 复位，下一轮从头开始
+	}
+}
+
+// TestOnceLatestDoesNotDowngrade 已装更高版本时 --once --tag latest 不降级：
+// 空操作（Skipped），不下载不替换不重启，也不写失败状态。
+func TestOnceLatestDoesNotDowngrade(t *testing.T) {
+	gh := newFakeGitHub(t)
+	health := &fakeHealthz{ver: "v2.0.0-alpha"}
+	cfg, _ := newTestConfig(t, gh.srv.URL, health.start(t))
+	writeFile(t, filepath.Join(cfg.InstallDir, "litetalk-server"), "CURRENT-BINARY")
+	gh.publish(t, "v1.9.0-alpha", "OLDER-BINARY", true)
+
+	st, _ := OpenState(cfg.StateDir)
+	// 状态记录的已装版本高于 release 列表里的最高版本
+	if err := st.Update(func(s *State) { s.CurrentVersion = "v3.0.0-alpha" }); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeRunner{}
+	up := New(cfg, runner, st, testLogger(), nil)
+	up.FreeDisk = func(string) (uint64, error) { return 1 << 30, nil }
+
+	res, err := up.RunOnce(context.Background(), "latest", "")
+	if err != nil {
+		t.Fatalf("latest 不降级应是空操作而非失败: %v", err)
+	}
+	if !res.Skipped {
+		t.Fatalf("应标记 Skipped: %+v", res)
+	}
+	if res.Tag != "v1.9.0-alpha" {
+		t.Fatalf("应记录解析出的 tag: %q", res.Tag)
+	}
+	if got := mustRead(t, filepath.Join(cfg.InstallDir, "litetalk-server")); got != "CURRENT-BINARY" {
+		t.Fatalf("不得替换二进制: %q", got)
+	}
+	if calls := runner.snapshot(); len(calls) != 0 {
+		t.Fatalf("不得重启: %v", calls)
+	}
+	// 不写失败状态：LastResult 保持空
+	s := st.Get()
+	if s.CurrentVersion != "v3.0.0-alpha" {
+		t.Fatalf("已装版本不得被改写: %+v", s)
+	}
+	if s.LastResult != "" {
+		t.Fatalf("防降级是空操作，不应写状态: %+v", s)
+	}
+}
+
+// TestOnceLatestAppliesWhenNewer 已装版本更低时 latest 正常更新（闸不误伤）。
+func TestOnceLatestAppliesWhenNewer(t *testing.T) {
+	gh := newFakeGitHub(t)
+	health := &fakeHealthz{ver: "v1.9.0-alpha"}
+	cfg, _ := newTestConfig(t, gh.srv.URL, health.start(t))
+	writeFile(t, filepath.Join(cfg.InstallDir, "litetalk-server"), "OLD-BINARY")
+	gh.publish(t, "v1.10.0-alpha", "NEW-BINARY", true)
+
+	st, _ := OpenState(cfg.StateDir)
+	if err := st.Update(func(s *State) { s.CurrentVersion = "v1.9.0-alpha" }); err != nil {
+		t.Fatal(err)
+	}
+	up := New(cfg, &fakeRunner{onRun: func(string, []string) { health.set("v1.10.0-alpha") }}, st, testLogger(), nil)
+	up.FreeDisk = func(string) (uint64, error) { return 1 << 30, nil }
+
+	res, err := up.RunOnce(context.Background(), "latest", "")
+	if err != nil {
+		t.Fatalf("有更新的 latest 应正常更新: %v", err)
+	}
+	if res.Skipped {
+		t.Fatalf("不应跳过: %+v", res)
+	}
+	if res.Tag != "v1.10.0-alpha" {
+		t.Fatalf("解析 tag = %q", res.Tag)
+	}
+	if st.Get().CurrentVersion != "v1.10.0-alpha" {
+		t.Fatalf("状态应推进: %+v", st.Get())
+	}
+}
+
+// TestOnceSameVersionLatestIsNoop 同版本号的 latest 也是空操作（不算降级但无需重装）。
+func TestOnceSameVersionLatestIsNoop(t *testing.T) {
+	gh := newFakeGitHub(t)
+	health := &fakeHealthz{ver: "v1.6.2-alpha"}
+	cfg, _ := newTestConfig(t, gh.srv.URL, health.start(t))
+	writeFile(t, filepath.Join(cfg.InstallDir, "litetalk-server"), "CURRENT-BINARY")
+	gh.publish(t, "v1.6.2-alpha", "SAME-BINARY", true)
+
+	st, _ := OpenState(cfg.StateDir)
+	if err := st.Update(func(s *State) { s.CurrentVersion = "v1.6.2-alpha" }); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeRunner{}
+	up := New(cfg, runner, st, testLogger(), nil)
+	up.FreeDisk = func(string) (uint64, error) { return 1 << 30, nil }
+
+	res, err := up.RunOnce(context.Background(), "latest", "")
+	if err != nil {
+		t.Fatalf("同版本 latest 应是空操作: %v", err)
+	}
+	if !res.Skipped {
+		t.Fatalf("应标记 Skipped: %+v", res)
+	}
+	if calls := runner.snapshot(); len(calls) != 0 {
+		t.Fatalf("不得重启: %v", calls)
+	}
+}
+
+// TestOnceLatestDryRunDoesNotFail 已是最新时 --dry-run --tag latest 也是 0 退出：
+// 空操作判定放在 dry-run 早退之前，否则 cron/SSH 兜底的 dry-run 会被误报为失败。
+func TestOnceLatestDryRunDoesNotFail(t *testing.T) {
+	gh := newFakeGitHub(t)
+	health := &fakeHealthz{ver: "v2.0.0-alpha"}
+	cfg, _ := newTestConfig(t, gh.srv.URL, health.start(t))
+	cfg.DryRun = true
+	writeFile(t, filepath.Join(cfg.InstallDir, "litetalk-server"), "CURRENT-BINARY")
+	gh.publish(t, "v1.9.0-alpha", "OLDER-BINARY", true)
+
+	st, _ := OpenState(cfg.StateDir)
+	if err := st.Update(func(s *State) { s.CurrentVersion = "v3.0.0-alpha" }); err != nil {
+		t.Fatal(err)
+	}
+	up := New(cfg, &fakeRunner{}, st, testLogger(), nil)
+	up.FreeDisk = func(string) (uint64, error) { return 1 << 30, nil }
+
+	res, err := up.RunOnce(context.Background(), "latest", "")
+	if err != nil {
+		t.Fatalf("dry-run + latest 不降级应是空操作: %v", err)
+	}
+	if !res.Skipped {
+		t.Fatalf("应标记 Skipped: %+v", res)
+	}
+	if st.Get().LastResult != "" {
+		t.Fatalf("dry-run 不得写状态: %+v", st.Get())
+	}
+}
