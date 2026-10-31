@@ -619,7 +619,9 @@ func (h *Hub) filterReplayByPerm(c *client, events []Event) ([]Event, int) {
 		}
 		state, ok := cache[idStr]
 		if !ok {
-			state = h.replayChannelVisible(context.Background(), uid, idStr)
+			// 续传复核是「连接本人」的可见性判定（#102）：api_token 连接经 authCtx
+			// 携带 Principal，scope 缺 ViewChannel（messages.read）时扣留事件（#51）。
+			state = h.replayChannelVisible(c.authCtx(), uid, idStr)
 			cache[idStr] = state
 		}
 		if state.visible {

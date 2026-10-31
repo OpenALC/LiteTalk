@@ -293,6 +293,10 @@ func main() {
 		// 每会话事件环条数（#32）：断线续传窗口 = min(环容量, 30min 空闲 TTL)。
 		Backlog: cfg.gatewayBacklog,
 		Authz:   authzInst,
+		// api_token 主体（#51）：hub 握手据此把 Principal 挂到连接会话，发送类
+		// 权限检查经 authCtx 汇聚到 authz.CanInServer 的 scope 交集点。与 REST
+		// 中间件、握手 authenticator 是同一个 token.Service 实例。
+		Tokens: apiTokenSvc,
 	})
 	// LITETALK_PROTOCOL_MAX：服务端宣布的协议版本上限（#29 逃生阀）。
 	// 0/缺省 = 构建期 ProtocolVersionMax；调小可临时挡住过新的客户端区间。
