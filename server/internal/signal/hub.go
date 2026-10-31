@@ -52,6 +52,10 @@ type Hub struct {
 	// authz 权限判定（#35 B3）：与 api.Server 共享实例；nil 时权限门 fail-closed。
 	authz Authz
 
+	// offline 离线边沿接收方（#53）：SetOfflineNotifier 启动阶段注入一次，
+	// 运行期只读。
+	offline OfflineNotifier
+
 	// 心跳参数（默认值见包常量；测试可缩短）
 	heartbeatEvery time.Duration
 	pongWait       time.Duration
@@ -198,6 +202,12 @@ type Authz interface {
 	InvalidateServer(serverID int64)
 }
 
+// OfflineNotifier 离线边沿接收方（#53 移动推送）：该用户最后一个连接实例关闭后
+// 回调。实现必须快速返回（仅内存操作），不得阻塞 cleanup 路径。
+type OfflineNotifier interface {
+	OnUserOffline(uid string)
+}
+
 // ChatDeps 聊天持久化与频控依赖（可零值：仅广播不落库、不限流）。
 type ChatDeps struct {
 	Store  ChatStore
@@ -270,6 +280,10 @@ func NewHub(s *sfu.SFU, authn Authenticator, sess *auth.SessionIndex, logger *lo
 // SetProtoMax 设置服务端宣布的协议版本上限（LITETALK_PROTOCOL_MAX 逃生阀）。
 // n <= 0 恢复默认（构建期 ProtocolVersionMax）。仅限启动阶段调用。
 func (h *Hub) SetProtoMax(n int) { h.protoMax = n }
+
+// SetOfflineNotifier 注册离线边沿接收方（#53 移动推送）。仅限启动阶段调用
+// （ServeWS 开始后并发写有数据竞争），与 SetProtoMax 同口径。
+func (h *Hub) SetOfflineNotifier(n OfflineNotifier) { h.offline = n }
 
 // ServeWS 处理 GET /ws?token=<jwt|dev-xxx>。
 func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
@@ -668,6 +682,12 @@ func (h *Hub) cleanup(c *client) {
 	h.leaveRoom(c)
 	if becameOffline {
 		h.syncPresence(c.userID)
+		// 离线检测挂钩（#53）：unregister 已核对同一连接实例（conns[key]==c），
+		// becameOffline 即「该用户最后一个连接实例已关闭」的权威边沿；
+		// 按 uid 盲判的旧连接 cleanup 在 unregister 里已被挡下，到不了这里。
+		if h.offline != nil {
+			h.offline.OnUserOffline(c.userID)
+		}
 	}
 	h.log.Printf("ws: %s 已断开", c.userID)
 }
@@ -1689,6 +1709,15 @@ func (h *Hub) connCount(uid string) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.connCountLocked(uid)
+}
+
+// UserOnline 该 uid 当前是否在本进程持有至少一条 WS 连接（#53 移动推送的
+// 全设备离线判定用，与 connCount 同源实时查询；presence KV 有 90s 级过期延迟，
+// 不能做离线判定）。持 h.mu。
+func (h *Hub) UserOnline(uid string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.connCountLocked(uid) > 0
 }
 
 // connQuotaOK 单 uid 连接数配额（#20）：同 uid+dev 的重连是顶替（净增 0），
