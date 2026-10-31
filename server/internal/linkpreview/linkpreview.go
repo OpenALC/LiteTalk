@@ -9,6 +9,7 @@
 package linkpreview
 
 import (
+	"context"
 	"errors"
 	"net"
 	"net/url"
@@ -116,6 +117,46 @@ func isBlockedIP(ip net.IP) bool {
 	}
 	return false
 }
+
+// CheckDialable 校验 rawURL 是否允许服务端出站访问（#52 webhook 等场景复用链接
+// 预览的 SSRF 防护）：只允许 http/https、拒绝 userinfo 与 localhost、字面量 IP
+// 不在私网/回环/链路本地/云元数据黑名单；域名会即时解析并逐 IP 校验，任一解析
+// 结果被禁即拒绝（宁可误伤多 A 记录，不给攻击者挑中内网记录的机会），解析失败
+// 视为不可用（fail-closed）。返回的错误可用 errors.Is 区分 ErrBlocked。
+// 注意：本函数校验的是「此刻」的解析结果，只覆盖创建/更新时的静态判定；真正的
+// 投递还应在拨号前对实际解析出的 IP 再校验一次（DNS 可能在创建后被改指内网）。
+func CheckDialable(rawURL string) error {
+	u, err := validateURL(rawURL)
+	if err != nil {
+		return err
+	}
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	if i := strings.LastIndexByte(host, '%'); i >= 0 {
+		host = host[:i] // IPv6 zone 与 IP 判定无关
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if isBlockedIP(ip) {
+			return ErrBlocked
+		}
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil || len(ips) == 0 {
+		return ErrBlocked
+	}
+	for _, ipAddr := range ips {
+		if isBlockedIP(ipAddr.IP) {
+			return ErrBlocked
+		}
+	}
+	return nil
+}
+
+// lookupTimeout CheckDialable 域名解析的超时：校验是请求路径上的同步动作，
+// 不能让一个不响应的解析器拖住创建/更新请求。
+const lookupTimeout = 5 * time.Second
 
 // validateURL 校验并解析原始 URL：只允许 http/https、拒绝 userinfo、host 必填、
 // 长度 ≤ MaxURLLength、端口合法、字面量 IP 不在黑名单、host 不是 localhost。
