@@ -22,6 +22,8 @@ prototype/
 # Node / 前端
 node_modules/
 client/frontend/dist/
+# Web 客户端构建产物（#50，base=/ 独立目录，桌面构建的 dist/ 不受影响）
+client/frontend/dist-web/
 
 # Go / Wails 构建产物
 client/build/bin/

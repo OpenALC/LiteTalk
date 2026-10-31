@@ -8,7 +8,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "build:web": "vite build --mode web",
+    "build:web": "vite build --mode web --outDir dist-web --emptyOutDir",
     "type-check": "vue-tsc --noEmit",
     "test": "vitest run",
     "gen:types": "openapi-typescript ../../api/openapi.yaml -o src/api/types.gen.ts"
