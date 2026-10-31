@@ -106,12 +106,12 @@ func TestStaticEmptyDist(t *testing.T) {
 	}
 }
 
-// TestRegisterStaticMountsRoot RegisterStatic 落位在 "GET /" 兜底槽位且幂等：
-// 重复注册不 panic，占位 embed 下所有路径 404（不冒充可用前端）。
+// TestRegisterStaticMountsRoot RegisterStatic 落位在 "/" 兜底槽位：
+// 与 main.go 同一注册形态（/api/v1/ 与 /ws 更具体，照常优先）。
+// 不测重复注册——ServeMux 对同型模式本来就 panic（注册点唯一，非幂等场景）。
 func TestRegisterStaticMountsRoot(t *testing.T) {
 	mux := http.NewServeMux()
 	RegisterStatic(mux, log.Default())
-	RegisterStatic(mux, log.Default()) // 幂等
 	rec := get(t, mux, "/join/abc")
 	// 仓库常态 dist 只有 .gitkeep：404；若本地把产物拷进了 dist，这里会是
 	// 200——两种状态都合法，只断言不 panic 且不把 /api/v1/ 吞掉。
