@@ -737,27 +737,26 @@ func (s *Session) registerHandlers() {
 		// 仅在无存活 peer 时建连（他人入房广播不动媒体链路）。与网络恢复/
 		// ICE 重建互斥：已有重建在途时由那条路径负责建新 PC，读循环不并发
 		// 再建一条（否则两次 rtc.offer 互相顶替）。
+		alive := false
 		if p := s.peerRef.Load(); p != nil &&
 			p.ConnectionState() != webrtc.PeerConnectionStateClosed &&
 			p.ConnectionState() != webrtc.PeerConnectionStateFailed {
-			return
+			alive = true
 		}
-		if !s.roomRebuildMu.TryLock() {
-			return
+		if !alive {
+			// 建 peer 与下面的状态补发解耦（#117）：拿不到锁说明已有重建在途，
+			// 那条路径会用新的 channel.join 再触发一次本处理器；但补发本身不依赖
+			// 本地 PC——服务端按房间内存状态处理，白名单在 peer 建立后补应用
+			// （handleRTCOffer → applyRoomWhisper）。早退会让 whisper 目标与
+			// voice.state 与服务端长期不一致，所以只在拿到锁时才建 peer。
+			if s.roomRebuildMu.TryLock() {
+				s.setupPeer()
+				s.roomRebuildMu.Unlock()
+			} else {
+				s.log.Printf("session: 入房 %s 时已有重建在途，跳过建 peer，仍补发语音状态与悄悄话目标", d.ChannelID)
+			}
+			s.syncVoiceStateAfterJoin()
 		}
-		s.setupPeer()
-		s.roomRebuildMu.Unlock()
-		// 补发完整语音状态（muted+deafened 现值）：重连/重入房后服务端内存里的
-		// 旧状态可能已丢，peer 又是新建（默认不静音）——不发则「UI 显示已闭麦但声音照传」。
-		if s.ws != nil {
-			_ = s.ws.Send(signal.TypeVoiceState, signal.VoiceStateData{
-				Mute:   signal.Bool(s.muted.Load()),
-				Deafen: signal.Bool(s.deafened.Load()),
-			})
-		}
-		// 重连/重入房后 SFU peer 是新的：把当前目标同步过去。即使 want 为空
-		// 也发一条空数组，清掉服务端可能残留的旧目标（切房前在途发送的兜底）。
-		s.syncWhisperOnJoin()
 	})
 	// channel.audio 音质热更新（#46）：只对当前房间生效；其他频道（例如管理员
 	// 在别处改了配置）忽略，等入房时的 channel.joined 拿权威值。
@@ -1580,6 +1579,26 @@ func (s *Session) pendingWhisper() ([]string, int64, bool) {
 		want = []string{} // voice.whisper 的 targets 是 required 数组，不能下发 null
 	}
 	return want, seq, send
+}
+
+// syncVoiceStateAfterJoin 入房/重连后的状态补发（#117）：voice.state 现值 +
+// 悄悄话目标同步。与建 peer 解耦——两者都只依赖服务端房间内存状态，不依赖
+// 本地 PC（白名单在 peer 建立后由 handleRTCOffer → applyRoomWhisper 补应用），
+// 所以即使重建在途（拿不到 roomRebuildMu）也必须执行；否则 UI 显示已闭麦而
+// 服务端照传、或悄悄话目标停在旧集合。
+// 跑在 ws 读循环上：只投递两条信令，不做额外等待。
+func (s *Session) syncVoiceStateAfterJoin() {
+	// 补发完整语音状态（muted+deafened 现值）：重连/重入房后服务端内存里的
+	// 旧状态可能已丢，peer 又是新建（默认不静音）——不发则「UI 显示已闭麦但声音照传」。
+	if s.ws != nil {
+		_ = s.ws.Send(signal.TypeVoiceState, signal.VoiceStateData{
+			Mute:   signal.Bool(s.muted.Load()),
+			Deafen: signal.Bool(s.deafened.Load()),
+		})
+	}
+	// 重连/重入房后 SFU peer 是新的：把当前目标同步过去。即使 want 为空
+	// 也发一条空数组，清掉服务端可能残留的旧目标（切房前在途发送的兜底）。
+	s.syncWhisperOnJoin()
 }
 
 // syncWhisperOnJoin 入房/重连后把当前目标同步到新建的 SFU peer（#45）。
