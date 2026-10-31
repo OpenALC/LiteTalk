@@ -35,3 +35,9 @@ dist/
 # 服务端默认数据目录（SQLite、证书缓存、自动生成的 jwt.secret）
 /data/
 /server/data/
+
+# Web 客户端产物（#50）：占位 .gitkeep 必须进仓库（go:embed 的前提），
+# 真实产物由 CI 在 package-server 编译前解到该目录，不进 git。
+# 例外必须写在上面 dist/ 规则之后（父目录先放行，子文件才可能被放行）。
+!server/internal/webui/dist/
+!server/internal/webui/dist/.gitkeep
