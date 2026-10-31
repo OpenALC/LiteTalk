@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/internal/webhook"
 )
 
 // Event 事件环条目（#32）。Payload 在 Append 前已序列化——环内不放活对象，
@@ -320,6 +321,15 @@ func (h *Hub) broadcastEvent(uids map[string]bool, msgType string, data any) {
 	h.mu.Unlock()
 	for _, c := range targets {
 		h.deliverEvent(c, msgType, payload, ts, seqs[c.sid])
+	}
+	// 出站 webhook 事件出口（#52）：hub 的事件流里只看得到五类白名单事件中的
+	// message.created（chat.message）；此时已读快照、不持 h.mu，OnWebhookEvent
+	// 只做一次非阻塞入队，绝不阻塞 WS 写路径。其余四类事件源在 REST 层，
+	// 由各 handler 直接派发。
+	if h.webhooks != nil && msgType == TypeChatMessage {
+		if cd, ok := data.(ChatMessageData); ok {
+			h.webhooks.OnWebhookEvent(webhook.EventMessageCreated, cd.ChannelID, payload)
+		}
 	}
 }
 
