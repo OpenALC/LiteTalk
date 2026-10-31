@@ -76,6 +76,10 @@ func (s *Server) CreateFriendRequest(ctx context.Context, request CreateFriendRe
 	if err != nil {
 		return nil, errf(http.StatusNotFound, "not_found", "用户不存在")
 	}
+	// bot 不进好友候选（#51）：与「用户不存在」同形，不泄露名字是否被 bot 占用。
+	if e := rejectBotTarget(target); e != nil {
+		return nil, e
+	}
 	if target.ID == c.UserID {
 		return nil, errf(http.StatusBadRequest, "bad_target", "不能添加自己为好友")
 	}

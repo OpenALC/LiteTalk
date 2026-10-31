@@ -598,6 +598,11 @@ func (s *Server) ListMentionCandidates(ctx context.Context, request ListMentionC
 		if err != nil {
 			return nil, s.writeStoreErr(ctx, err)
 		}
+		// bot 不进 @提及候选（#51）。
+		members, err = filterBots(ctx, s.store, members, func(m store.ChannelMember) int64 { return m.UserID })
+		if err != nil {
+			return nil, s.writeStoreErr(ctx, err)
+		}
 		out := make([]MentionCandidate, 0, len(members))
 		for _, m := range members {
 			out = append(out, mentionCandidateView(m.UserID, m.Nickname, m.Tag))
@@ -609,6 +614,11 @@ func (s *Server) ListMentionCandidates(ctx context.Context, request ListMentionC
 		return nil, errf(http.StatusInternalServerError, "internal", "权限服务未就绪")
 	}
 	members, err := s.store.MembersOfServer(ctx, ch.ServerID)
+	if err != nil {
+		return nil, s.writeStoreErr(ctx, err)
+	}
+	// bot 不进 @提及候选（#51）：@bot 无意义，@提及只面向人对人。
+	members, err = filterBots(ctx, s.store, members, func(m store.ServerMember) int64 { return m.UserID })
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
