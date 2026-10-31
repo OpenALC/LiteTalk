@@ -1,9 +1,14 @@
+import { readFileSync } from 'node:fs'
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
 // wails3 dev 经 WAILS_VITE_PORT 注入 vite 端口（wails v3 dev.go 默认 9245）；
 // strictPort 防止端口被占用时 vite 静默换端口、导致 Go 侧连不上 dev server。
 const port = process.env.WAILS_VITE_PORT ? Number(process.env.WAILS_VITE_PORT) : 9245
+
+// Web 客户端版本（#50）：单一事实源是本 package.json 的 version 字段，经
+// define 注入 src/api/web/version.ts——发版只递增这一处，不再有手写常量漂移。
+const pkgVersion = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version as string
 
 // CSP 头（#50）：只注入 web 构建（--mode web）。桌面构建由 Wails 资产通道
 // 加载，注入 meta CSP 反而可能拦掉 webview 内部资源，所以桌面路径原样返回。
@@ -40,6 +45,9 @@ function webOnlyCSP(): import('vite').Plugin {
 // 必须绝对根路径 base（SPA 深链 /join/<code> 才能解析到 /assets/*）。
 export default defineConfig(({ mode }) => ({
   plugins: [vue(), webOnlyCSP()],
+  define: {
+    __LITETALK_WEB_VERSION__: JSON.stringify(pkgVersion),
+  },
   base: mode === 'web' ? '/' : './',
   server: {
     port,

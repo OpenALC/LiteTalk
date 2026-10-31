@@ -1,10 +1,10 @@
 {
   "name": "litetalk-frontend",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.9.0",
   "type": "module",
   "packageManager": "pnpm@12.10.1",
-  "//": "typescript 锁 5.9 次版本：TS 7 为原生移植版，与 vue-tsc 3.x 不兼容（ERR_PACKAGE_PATH_NOT_EXPORTED），勿升到 ^ 浮动",
+  "//": "typescript 锁 5.9 次版本：TS 7 为原生移植版，与 vue-tsc 3.x 不兼容（ERR_PACKAGE_PATH_NOT_EXPORTED），勿升到 ^ 浮动。version 是 Web 客户端升级门上报值的单一事实源（vite define 注入 src/api/web/version.ts），发版随批次递增",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
