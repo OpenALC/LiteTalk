@@ -76,7 +76,7 @@ func main() {
 
 // runOnce 手工路径：不看 Enabled（运维显式操作即授权），完整流水线后按结果退出。
 func runOnce(cfg updater.Config, tag string, logger *log.Logger) int {
-	st, err := updater.OpenState(cfg.StateDir)
+	st, err := updater.OpenStateWithLogger(cfg.StateDir, logger)
 	if err != nil {
 		logger.Printf("打开状态目录失败: %v", err)
 		return 1
@@ -116,7 +116,7 @@ func dryNote(cfg updater.Config) string {
 }
 
 func runService(cfg updater.Config, logger *log.Logger) {
-	st, err := updater.OpenState(cfg.StateDir)
+	st, err := updater.OpenStateWithLogger(cfg.StateDir, logger)
 	if err != nil {
 		logger.Fatalf("打开状态目录失败: %v", err)
 	}
