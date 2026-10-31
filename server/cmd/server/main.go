@@ -446,6 +446,9 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/api/v1/", apiSrv.Handler())
 	mux.HandleFunc("GET /ws", hub.ServeWS)
+	// Web 客户端静态托管（#50）：dist 无产物时全部 404（纯 API 形态）；
+	// /api/v1/ 与 /ws 模式更具体，ServeMux 最长匹配优先，不会被 fallback 吞掉。
+	api.RegisterStatic(mux, log.Default())
 
 	// ---- bootstrap（§0.6 步骤 8）：首启生成管理员邀请码并打印（幂等）；#27 T4 填实现 ----
 	bootstrap.Ensure(context.Background(), kv, st, cfg.jwtSecret, log.Default())

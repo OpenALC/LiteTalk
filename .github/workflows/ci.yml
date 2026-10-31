@@ -181,6 +181,17 @@ jobs:
           name: frontend-dist
           path: client/frontend/dist
           retention-days: 3
+      # ---- #50 Web 客户端构建：base 绝对路径（服务端托管），产物 dist-web 独立
+      # 目录，不覆盖上面的桌面构建。仍在本 job 构建（前端只在一个 job 构建）。
+      # 发布包的 Web 客户端不能直接用 frontend-dist：桌面产物 base './' 是给
+      # Wails 相对路径的，SPA 深链会解析错误。
+      - name: 构建 Web 版
+        run: pnpm run build:web
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: client/frontend/dist-web
+          retention-days: 3
 
   # Linux：gtk3 标签（v3 内部 cgo 包不受 server 标签豁免，勿用 server 标签做检查）
   check-client-linux:
@@ -356,10 +367,17 @@ jobs:
   package-server:
     name: 服务端打包（linux amd64 / arm64）
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [check-tag, check-server]
+    # #50：check-frontend 产出 web-dist（base=/ 的 Web 客户端构建），编译前
+    # 解到 server/internal/webui/dist/ 一起 embed。check-server 不下载——
+    # 它编译 .gitkeep 占位版本，只验证 //go:embed 与静态路由可编译。
+    needs: [check-tag, check-server, check-frontend]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: server/internal/webui/dist
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
