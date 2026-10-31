@@ -79,6 +79,11 @@ func (s *Server) Register(ctx context.Context, request RegisterRequestObject) (R
 	if e := s.allowRate(ctx, "register:"+reqIP(ctx), 10, time.Hour, "操作过于频繁，请稍后再试"); e != nil {
 		return nil, e
 	}
+	// 仅 OIDC 模式（#54）：账号由身份提供方建，本地注册入口整体关闭——
+	// 放开它只会造出无法密码登录的死号（注册频控先行，防刷语义不变）。
+	if s.oidcOnly() {
+		return nil, errf(http.StatusForbidden, "register_disabled", "当前服务仅支持 OIDC 登录，账号由身份提供方创建")
+	}
 	if request.Body == nil {
 		return nil, bodyMissing()
 	}
@@ -224,6 +229,10 @@ func (s *Server) Login(ctx context.Context, request LoginRequestObject) (LoginRe
 	if e := s.allowRate(ctx, "login:"+reqIP(ctx), 5, time.Minute, "登录过于频繁，请稍后再试"); e != nil {
 		return nil, e
 	}
+	// 仅 OIDC 模式（#54，企业部署硬需求）：密码登录明确拒绝并提示替代途径。
+	if s.oidcOnly() {
+		return nil, errf(http.StatusForbidden, "password_login_disabled", "当前服务仅支持 OIDC 登录，请使用企业账号登录")
+	}
 	if request.Body == nil {
 		return nil, bodyMissing()
 	}
@@ -333,6 +342,10 @@ func (s *Server) SendEmailCode(ctx context.Context, request SendEmailCodeRequest
 	if s.simpleMode() {
 		return nil, errf(http.StatusBadRequest, "verification_not_required", "当前服务未启用邮箱验证，无需验证码")
 	}
+	// 仅 OIDC 模式：验证码只服务注册/找回，两个入口都已关闭，不再对外发信。
+	if s.oidcOnly() {
+		return nil, errf(http.StatusBadRequest, "verification_not_required", "当前服务未启用邮箱验证，无需验证码")
+	}
 	if e := s.allowRate(ctx, "emailcode:"+reqIP(ctx), 10, time.Hour, "操作过于频繁，请稍后再试"); e != nil {
 		return nil, e
 	}
@@ -377,6 +390,10 @@ func (s *Server) ResetPassword(ctx context.Context, request ResetPasswordRequest
 	// 故该模式整体禁用找回密码；确有需求的部署应改用 full 模式。
 	if s.simpleMode() {
 		return nil, errf(http.StatusForbidden, "reset_unavailable", "当前服务端未开启邮件功能，无法找回密码")
+	}
+	// 仅 OIDC 模式：本地密码登录已关闭，重置密码没有可服务的入口。
+	if s.oidcOnly() {
+		return nil, errf(http.StatusForbidden, "reset_unavailable", "当前服务仅支持 OIDC 登录，无法找回密码")
 	}
 	// 限流 10 次/h/IP：防对批量邮箱尝试爆破验证码。
 	if e := s.allowRate(ctx, "reset:"+reqIP(ctx), 10, time.Hour, "操作过于频繁，请稍后再试"); e != nil {
