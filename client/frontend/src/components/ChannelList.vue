@@ -17,6 +17,7 @@ import { useVoiceStore } from '../stores/voice'
 import { useAuthStore } from '../stores/auth'
 import { useNotifyStore } from '../stores/notify'
 import { goApp } from '../api/bridge'
+import { shouldRepromptPassword } from '../utils/joinPrompt'
 import type { AudioSettings } from '../api/types'
 import ContextMenu, { type CtxItem } from './ContextMenu.vue'
 import PromptDialog from './PromptDialog.vue'
@@ -134,11 +135,14 @@ function onPwdConfirm(value: string) {
   joinChannel(p.id, value)
 }
 
-// 入房失败 forbidden/bad_password → 重新弹密码框（#37 B2）：
-// 覆盖 hasPassword 过期（本地以为无密码）或输错密码的情况。
+// 入房失败 → 是否重弹密码框（#102）：bad_password 一定重弹；forbidden 只有频道
+// 确实有密码时才算「缺密码」，否则是无 View/Connect 权限——弹密码框只会让用户
+// 反复输一个永远不对的密码。无权限的提示由 voice store 的 toast 负责。
 watch(() => voice.lastJoinFailed, (f) => {
   if (!f) return
-  if (f.code === 'bad_password' || f.code === 'forbidden') {
+  const ch = servers.currentServer?.channels.find((c) => c.id === f.channelId)
+  // 频道可能已不在本地快照（被删/刚切服）：按无密码处理，不弹框。
+  if (shouldRepromptPassword(f.code, !!ch?.hasPassword)) {
     pwdPrompt.value = { id: f.channelId }
   }
 })
