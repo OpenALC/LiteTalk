@@ -269,6 +269,42 @@ func (e MemberInfoRole) Valid() bool {
 	}
 }
 
+// Defines values for PushDevicePlatform.
+const (
+	PushDevicePlatformAndroid PushDevicePlatform = "android"
+	PushDevicePlatformIos     PushDevicePlatform = "ios"
+)
+
+// Valid indicates whether the value is a known member of the PushDevicePlatform enum.
+func (e PushDevicePlatform) Valid() bool {
+	switch e {
+	case PushDevicePlatformAndroid:
+		return true
+	case PushDevicePlatformIos:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for RegisterDeviceRequestPlatform.
+const (
+	RegisterDeviceRequestPlatformAndroid RegisterDeviceRequestPlatform = "android"
+	RegisterDeviceRequestPlatformIos     RegisterDeviceRequestPlatform = "ios"
+)
+
+// Valid indicates whether the value is a known member of the RegisterDeviceRequestPlatform enum.
+func (e RegisterDeviceRequestPlatform) Valid() bool {
+	switch e {
+	case RegisterDeviceRequestPlatformAndroid:
+		return true
+	case RegisterDeviceRequestPlatformIos:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for ServerConfigAuthMode.
 const (
 	Full   ServerConfigAuthMode = "full"
@@ -900,10 +936,37 @@ type PublicUser struct {
 	UpdatedAt Time   `json:"updated_at"`
 }
 
+// PushDevice 已注册的移动推送设备（#53）。不含 push_token——生产凭据等价物一律不回显。
+type PushDevice struct {
+	CreatedAt  Time               `json:"created_at"`
+	Id         ID                 `json:"id"`
+	LastSeenAt Time               `json:"last_seen_at"`
+	Platform   PushDevicePlatform `json:"platform"`
+}
+
+// PushDevicePlatform defines model for PushDevice.Platform.
+type PushDevicePlatform string
+
+// PushDeviceList defines model for PushDeviceList.
+type PushDeviceList struct {
+	Devices []PushDevice `json:"devices"`
+}
+
 // RefreshRequest defines model for RefreshRequest.
 type RefreshRequest struct {
 	RefreshToken string `json:"refresh_token"`
 }
+
+// RegisterDeviceRequest 设备注册（#53）。push_token 是推送通道设备凭据（FCM token / APNs token / ntfy topic）。
+type RegisterDeviceRequest struct {
+	Platform RegisterDeviceRequestPlatform `json:"platform"`
+
+	// PushToken 推送通道设备凭据；服务端只存不回显，日志一律打码。
+	PushToken string `json:"push_token"`
+}
+
+// RegisterDeviceRequestPlatform defines model for RegisterDeviceRequest.Platform.
+type RegisterDeviceRequestPlatform string
 
 // RegisterRequest defines model for RegisterRequest.
 type RegisterRequest struct {
@@ -980,6 +1043,9 @@ type ServerConfig struct {
 
 	// MailConfigured 发信通道为真实投递（非 Console 打印）
 	MailConfigured bool `json:"mail_configured"`
+
+	// PushEnabled 移动推送已启用（LITETALK_PUSH_PROVIDER 配置了可用通道；false 时 /devices 仍可注册，仅不派发）
+	PushEnabled *bool `json:"push_enabled,omitempty"`
 
 	// SelfHost 一键自托管形态（SQLite/进程内单机部署）
 	SelfHost bool `json:"self_host"`
@@ -1319,6 +1385,9 @@ type PatchConversationApplicationMergePatchPlusJSONRequestBody = PatchConversati
 // AddConversationMembersJSONRequestBody defines body for AddConversationMembers for application/json ContentType.
 type AddConversationMembersJSONRequestBody = AddConversationMembersRequest
 
+// RegisterDeviceJSONRequestBody defines body for RegisterDevice for application/json ContentType.
+type RegisterDeviceJSONRequestBody = RegisterDeviceRequest
+
 // CreateFriendRequestJSONRequestBody defines body for CreateFriendRequest for application/json ContentType.
 type CreateFriendRequestJSONRequestBody = AddFriendRequest
 
@@ -1468,6 +1537,15 @@ type ServerInterface interface {
 	// RemoveConversationMember 移除/退出群聊成员
 	// (DELETE /api/v1/conversations/{id}/members/{user_id})
 	RemoveConversationMember(w http.ResponseWriter, r *http.Request, id IDPath, userId UserIDPath)
+	// ListDevices 列出自己的推送设备
+	// (GET /api/v1/devices)
+	ListDevices(w http.ResponseWriter, r *http.Request)
+	// RegisterDevice 注册推送设备（同 push_token 幂等更新）
+	// (POST /api/v1/devices)
+	RegisterDevice(w http.ResponseWriter, r *http.Request)
+	// DeleteDevice 注销推送设备
+	// (DELETE /api/v1/devices/{id})
+	DeleteDevice(w http.ResponseWriter, r *http.Request, id IDPath)
 	// ListFriends 好友与好友请求列表
 	// (GET /api/v1/friends)
 	ListFriends(w http.ResponseWriter, r *http.Request)
@@ -2485,6 +2563,60 @@ func (siw *ServerInterfaceWrapper) RemoveConversationMember(w http.ResponseWrite
 	handler.ServeHTTP(w, r)
 }
 
+// ListDevices operation middleware
+func (siw *ServerInterfaceWrapper) ListDevices(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListDevices(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// RegisterDevice operation middleware
+func (siw *ServerInterfaceWrapper) RegisterDevice(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.RegisterDevice(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// DeleteDevice operation middleware
+func (siw *ServerInterfaceWrapper) DeleteDevice(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.DeleteDevice(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 // ListFriends operation middleware
 func (siw *ServerInterfaceWrapper) ListFriends(w http.ResponseWriter, r *http.Request) {
 
@@ -3458,7 +3590,10 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/attachments/{id}/thumbnail", wrapper.DownloadAttachmentThumbnail)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/tokens", wrapper.ListTokens)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/tokens", wrapper.CreateToken)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/devices", wrapper.ListDevices)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/devices", wrapper.RegisterDevice)
 	m.HandleFunc(http.MethodDelete+" "+options.BaseURL+"/api/v1/tokens/{id}", wrapper.RevokeToken)
+	m.HandleFunc(http.MethodDelete+" "+options.BaseURL+"/api/v1/devices/{id}", wrapper.DeleteDevice)
 
 	return m
 }
@@ -6864,6 +6999,216 @@ func (response RemoveConversationMemberdefaultApplicationProblemPlusJSONResponse
 	return err
 }
 
+type ListDevicesRequestObject struct {
+}
+
+type ListDevicesResponseObject interface {
+	VisitListDevicesResponse(w http.ResponseWriter) error
+}
+
+type ListDevices200JSONResponse PushDeviceList
+
+func (response ListDevices200JSONResponse) VisitListDevicesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListDevicesdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response ListDevicesdefaultApplicationProblemPlusJSONResponse) VisitListDevicesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RegisterDeviceRequestObject struct {
+	Body *RegisterDeviceJSONRequestBody
+}
+
+type RegisterDeviceResponseObject interface {
+	VisitRegisterDeviceResponse(w http.ResponseWriter) error
+}
+
+type RegisterDevice200JSONResponse PushDevice
+
+func (response RegisterDevice200JSONResponse) VisitRegisterDeviceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RegisterDevice201JSONResponse PushDevice
+
+func (response RegisterDevice201JSONResponse) VisitRegisterDeviceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(201)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RegisterDevice400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response RegisterDevice400ApplicationProblemPlusJSONResponse) VisitRegisterDeviceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RegisterDevice429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response RegisterDevice429ApplicationProblemPlusJSONResponse) VisitRegisterDeviceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RegisterDevicedefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response RegisterDevicedefaultApplicationProblemPlusJSONResponse) VisitRegisterDeviceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteDeviceRequestObject struct {
+	Id IDPath `json:"id"`
+}
+
+type DeleteDeviceResponseObject interface {
+	VisitDeleteDeviceResponse(w http.ResponseWriter) error
+}
+
+type DeleteDevice200JSONResponse StatusOk
+
+func (response DeleteDevice200JSONResponse) VisitDeleteDeviceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteDevice400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteDevice400ApplicationProblemPlusJSONResponse) VisitDeleteDeviceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteDevice404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteDevice404ApplicationProblemPlusJSONResponse) VisitDeleteDeviceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteDevice429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteDevice429ApplicationProblemPlusJSONResponse) VisitDeleteDeviceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteDevicedefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response DeleteDevicedefaultApplicationProblemPlusJSONResponse) VisitDeleteDeviceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
 type ListFriendsRequestObject struct {
 }
 
@@ -9786,6 +10131,15 @@ type StrictServerInterface interface {
 	// RemoveConversationMember 移除/退出群聊成员
 	// (DELETE /api/v1/conversations/{id}/members/{user_id})
 	RemoveConversationMember(ctx context.Context, request RemoveConversationMemberRequestObject) (RemoveConversationMemberResponseObject, error)
+	// ListDevices 列出自己的推送设备
+	// (GET /api/v1/devices)
+	ListDevices(ctx context.Context, request ListDevicesRequestObject) (ListDevicesResponseObject, error)
+	// RegisterDevice 注册推送设备（同 push_token 幂等更新）
+	// (POST /api/v1/devices)
+	RegisterDevice(ctx context.Context, request RegisterDeviceRequestObject) (RegisterDeviceResponseObject, error)
+	// DeleteDevice 注销推送设备
+	// (DELETE /api/v1/devices/{id})
+	DeleteDevice(ctx context.Context, request DeleteDeviceRequestObject) (DeleteDeviceResponseObject, error)
 	// ListFriends 好友与好友请求列表
 	// (GET /api/v1/friends)
 	ListFriends(ctx context.Context, request ListFriendsRequestObject) (ListFriendsResponseObject, error)
@@ -10933,6 +11287,87 @@ func (sh *strictHandler) RemoveConversationMember(w http.ResponseWriter, r *http
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
 	} else if validResponse, ok := response.(RemoveConversationMemberResponseObject); ok {
 		if err := validResponse.VisitRemoveConversationMemberResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// ListDevices operation middleware
+func (sh *strictHandler) ListDevices(w http.ResponseWriter, r *http.Request) {
+	var request ListDevicesRequestObject
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ListDevices(ctx, request.(ListDevicesRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ListDevices")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ListDevicesResponseObject); ok {
+		if err := validResponse.VisitListDevicesResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// RegisterDevice operation middleware
+func (sh *strictHandler) RegisterDevice(w http.ResponseWriter, r *http.Request) {
+	var request RegisterDeviceRequestObject
+
+	var body RegisterDeviceJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.RegisterDevice(ctx, request.(RegisterDeviceRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "RegisterDevice")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(RegisterDeviceResponseObject); ok {
+		if err := validResponse.VisitRegisterDeviceResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// DeleteDevice operation middleware
+func (sh *strictHandler) DeleteDevice(w http.ResponseWriter, r *http.Request, id IDPath) {
+	var request DeleteDeviceRequestObject
+
+	request.Id = id
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.DeleteDevice(ctx, request.(DeleteDeviceRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "DeleteDevice")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(DeleteDeviceResponseObject); ok {
+		if err := validResponse.VisitDeleteDeviceResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {
