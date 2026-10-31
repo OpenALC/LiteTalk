@@ -2026,3 +2026,68 @@ func (s *SQLite) DeletePushDevice(ctx context.Context, id int64) error {
 	}
 	return nil
 }
+
+// ---- webhooks（迁移 0019，#52）----
+// CRUD 与投递记录共用 webhooks.go 的 db* 实现；SQL 与 MySQL 同形（无 ENUM、
+// 无方言 upsert），这里只做事务接线。RecordWebhookDelivery 的读-改-写在事务内
+// 完成，并发投递同一订阅不会越过熔断阈值。
+
+func (s *SQLite) CreateOutboundWebhook(ctx context.Context, w *OutboundWebhook) error {
+	return dbCreateOutboundWebhook(ctx, s.db, w)
+}
+
+func (s *SQLite) OutboundWebhookByID(ctx context.Context, id int64) (*OutboundWebhook, error) {
+	return dbOutboundWebhookByID(ctx, s.db, id)
+}
+
+func (s *SQLite) OutboundWebhooksOfServer(ctx context.Context, serverID int64) ([]OutboundWebhook, error) {
+	return dbOutboundWebhooksOfServer(ctx, s.db, serverID)
+}
+
+func (s *SQLite) HasOutboundWebhooks(ctx context.Context) (bool, error) {
+	return dbHasOutboundWebhooks(ctx, s.db)
+}
+
+func (s *SQLite) UpdateOutboundWebhook(ctx context.Context, w *OutboundWebhook) error {
+	return dbUpdateOutboundWebhook(ctx, s.db, w)
+}
+
+func (s *SQLite) DeleteOutboundWebhook(ctx context.Context, id int64) error {
+	return dbDeleteOutboundWebhook(ctx, s.db, id)
+}
+
+func (s *SQLite) RecordWebhookDelivery(ctx context.Context, d *WebhookDelivery, breakerAt int, reason string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := dbRecordWebhookDelivery(ctx, tx, d, breakerAt, reason); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *SQLite) WebhookDeliveriesBefore(ctx context.Context, before time.Time, limit int) ([]WebhookDelivery, error) {
+	return dbWebhookDeliveriesBefore(ctx, s.db, before, limit)
+}
+
+func (s *SQLite) DeleteWebhookDeliveries(ctx context.Context, ids []int64) error {
+	return dbDeleteWebhookDeliveries(ctx, s.db, ids)
+}
+
+func (s *SQLite) CreateInboundWebhook(ctx context.Context, w *InboundWebhook) error {
+	return dbCreateInboundWebhook(ctx, s.db, w)
+}
+
+func (s *SQLite) InboundWebhookByID(ctx context.Context, id int64) (*InboundWebhook, error) {
+	return dbInboundWebhookByID(ctx, s.db, id)
+}
+
+func (s *SQLite) InboundWebhooksOfChannel(ctx context.Context, channelID int64) ([]InboundWebhook, error) {
+	return dbInboundWebhooksOfChannel(ctx, s.db, channelID)
+}
+
+func (s *SQLite) DeleteInboundWebhook(ctx context.Context, id int64) error {
+	return dbDeleteInboundWebhook(ctx, s.db, id)
+}

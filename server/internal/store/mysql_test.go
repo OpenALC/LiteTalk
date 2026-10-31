@@ -44,6 +44,7 @@ func TestMySQLMigrateAndCRUD(t *testing.T) {
 		"servers", "friendships", "users", "user_sessions", "kv", "schema_migrations",
 		"audit_log", "channel_overwrites", "member_roles", "roles", "api_tokens",
 		"push_devices",
+		"webhook_deliveries", "inbound_webhooks", "webhooks",
 	} {
 		_, _ = m.DB().ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl)
 	}

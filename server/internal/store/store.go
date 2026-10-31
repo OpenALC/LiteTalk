@@ -558,6 +558,40 @@ type Store interface {
 	// DeletePushDevice 删除设备行；未命中 ErrNotFound。
 	DeletePushDevice(ctx context.Context, id int64) error
 
+	// webhooks（迁移 0019，#52）：出站订阅 / 入站投递入口 / 投递记录。
+	// Secret 的读写口径见 OutboundWebhook / InboundWebhook 注释：明文只在创建与
+	// reset_secret 的响应里出现一次，任何查询路径不回传。
+
+	// CreateOutboundWebhook 写入一行；ID 未预置时取 Snowflake，回填 CreatedAt/UpdatedAt。
+	CreateOutboundWebhook(ctx context.Context, w *OutboundWebhook) error
+	// OutboundWebhookByID 单条回读；无命中 ErrNotFound。
+	OutboundWebhookByID(ctx context.Context, id int64) (*OutboundWebhook, error)
+	// OutboundWebhooksOfServer 该服全部出站订阅，按 id 升序（含停用的，列表要标原因）。
+	OutboundWebhooksOfServer(ctx context.Context, serverID int64) ([]OutboundWebhook, error)
+	// HasOutboundWebhooks 库内是否存在任一出站订阅（启动期判定是否需要投递 worker）。
+	HasOutboundWebhooks(ctx context.Context) (bool, error)
+	// UpdateOutboundWebhook 全行写（url/secret/events/熔断状态）；调用方读-改-写，
+	// 不动 created_at/server_id。未命中 ErrNotFound。
+	UpdateOutboundWebhook(ctx context.Context, w *OutboundWebhook) error
+	// DeleteOutboundWebhook 删除订阅行；未命中 ErrNotFound。
+	DeleteOutboundWebhook(ctx context.Context, id int64) error
+	// RecordWebhookDelivery 落一条投递记录并在同一事务推进熔断计数：成功清零
+	// fail_count；失败自增，达到 breakerAt 时置 disabled=1 与 disabled_reason
+	// （已停用的保持停用）。回填 d.ID/CreatedAt。
+	RecordWebhookDelivery(ctx context.Context, d *WebhookDelivery, breakerAt int, reason string) error
+	// WebhookDeliveriesBefore 早于 before 的投递记录（清理扫描），按 id 升序；limit 夹到 [1,500]。
+	WebhookDeliveriesBefore(ctx context.Context, before time.Time, limit int) ([]WebhookDelivery, error)
+	// DeleteWebhookDeliveries 批量删除投递记录；空入参 no-op，不存在的 id 忽略。
+	DeleteWebhookDeliveries(ctx context.Context, ids []int64) error
+	// CreateInboundWebhook 写入频道级投递入口；ID 未预置时取 Snowflake，回填 CreatedAt。
+	CreateInboundWebhook(ctx context.Context, w *InboundWebhook) error
+	// InboundWebhookByID 单条回读；无命中 ErrNotFound。
+	InboundWebhookByID(ctx context.Context, id int64) (*InboundWebhook, error)
+	// InboundWebhooksOfChannel 该频道的全部入站入口，按 id 升序。
+	InboundWebhooksOfChannel(ctx context.Context, channelID int64) ([]InboundWebhook, error)
+	// DeleteInboundWebhook 删除入站入口；未命中 ErrNotFound。
+	DeleteInboundWebhook(ctx context.Context, id int64) error
+
 	// roles / member_roles / channel_overwrites / audit_log（迁移 0010，#35 B1）。
 	// 「不属于该服务器」与「不存在」统一返回 ErrNotFound，不泄露跨服资源是否存在。
 

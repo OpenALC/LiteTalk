@@ -2060,3 +2060,67 @@ func (m *MySQL) DeletePushDevice(ctx context.Context, id int64) error {
 	}
 	return checkAffected(res)
 }
+
+// ---- webhooks（迁移 0019，#52）----
+// CRUD 与投递记录共用 webhooks.go 的 db* 实现；RecordWebhookDelivery 的
+// 读-改-写在事务内完成，并发投递同一订阅不会越过熔断阈值。
+
+func (m *MySQL) CreateOutboundWebhook(ctx context.Context, w *OutboundWebhook) error {
+	return dbCreateOutboundWebhook(ctx, m.db, w)
+}
+
+func (m *MySQL) OutboundWebhookByID(ctx context.Context, id int64) (*OutboundWebhook, error) {
+	return dbOutboundWebhookByID(ctx, m.db, id)
+}
+
+func (m *MySQL) OutboundWebhooksOfServer(ctx context.Context, serverID int64) ([]OutboundWebhook, error) {
+	return dbOutboundWebhooksOfServer(ctx, m.db, serverID)
+}
+
+func (m *MySQL) HasOutboundWebhooks(ctx context.Context) (bool, error) {
+	return dbHasOutboundWebhooks(ctx, m.db)
+}
+
+func (m *MySQL) UpdateOutboundWebhook(ctx context.Context, w *OutboundWebhook) error {
+	return dbUpdateOutboundWebhook(ctx, m.db, w)
+}
+
+func (m *MySQL) DeleteOutboundWebhook(ctx context.Context, id int64) error {
+	return dbDeleteOutboundWebhook(ctx, m.db, id)
+}
+
+func (m *MySQL) RecordWebhookDelivery(ctx context.Context, d *WebhookDelivery, breakerAt int, reason string) error {
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := dbRecordWebhookDelivery(ctx, tx, d, breakerAt, reason); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (m *MySQL) WebhookDeliveriesBefore(ctx context.Context, before time.Time, limit int) ([]WebhookDelivery, error) {
+	return dbWebhookDeliveriesBefore(ctx, m.db, before, limit)
+}
+
+func (m *MySQL) DeleteWebhookDeliveries(ctx context.Context, ids []int64) error {
+	return dbDeleteWebhookDeliveries(ctx, m.db, ids)
+}
+
+func (m *MySQL) CreateInboundWebhook(ctx context.Context, w *InboundWebhook) error {
+	return dbCreateInboundWebhook(ctx, m.db, w)
+}
+
+func (m *MySQL) InboundWebhookByID(ctx context.Context, id int64) (*InboundWebhook, error) {
+	return dbInboundWebhookByID(ctx, m.db, id)
+}
+
+func (m *MySQL) InboundWebhooksOfChannel(ctx context.Context, channelID int64) ([]InboundWebhook, error) {
+	return dbInboundWebhooksOfChannel(ctx, m.db, channelID)
+}
+
+func (m *MySQL) DeleteInboundWebhook(ctx context.Context, id int64) error {
+	return dbDeleteInboundWebhook(ctx, m.db, id)
+}
