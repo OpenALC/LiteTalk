@@ -145,7 +145,10 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 	}
 	// #116 10ms 帧长能力闸的「修改前」值：必须在应用 body 之前取，用于判断
 	// 本次是否真的把帧长启用为 10ms（值不变或 10→20 不触发）。
+	// #117：码率同理留一份「修改前」值，作为 channel.audio 广播的兜底判定——客户
+	// 端已经按快照差下发，这里再挡一层「Set 了但最终值没变」的请求。
 	prevFrameMS := ch.AudioFrameMS
+	prevBitrate := ch.AudioBitrateKbps
 	// 有子频道时禁改 category/type/挂父（#37）：子树的分类/类型/层级跟着父走，
 	// 半改会造成树形漂移；先于任何字段应用判，避免半写。
 	if req.CategoryID.Set || req.Type.Set || req.ParentID.Set {
@@ -226,7 +229,9 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 	}
 	// #46 音质三态：缺省不改、0 = 清零（跟随设置/默认帧长）、null 拒 400。
 	// 校验用上方定稿的频道类型：同一次 PATCH 改成 text 时非零音质会被拒。
-	audioChanged := req.AudioBitrateKbps.Set || req.AudioFrameMs.Set
+	// #117：Set 只说明「客户端发了」，还不足以广播——最终值没变（重复提交同一
+	// 份配置）也要跳过，否则全房间会白重跑一次音质应用。判定放在 normalizeChannelAudio
+	// 之后，拿归一后的最终值和修改前的值比。
 	if req.AudioBitrateKbps.Set {
 		if req.AudioBitrateKbps.Clearing() {
 			return nil, errf(http.StatusBadRequest, "bad_channel_option", "audio_bitrate_kbps 不可清除，0 表示不限制")
@@ -264,6 +269,10 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 	}
 	// 类型改成 text 时清掉旧音质（text 恒 0/0）；校验已在各字段应用时按最终类型完成。
 	normalizeChannelAudio(ch)
+	// #117 音质广播的兜底判定：请求里 Set 了且最终值（归一后）确实与修改前不同。
+	// 逐字段判——只改码率的请求不应因帧长字段被带上而算作帧长变更。
+	audioChanged := (req.AudioBitrateKbps.Set && ch.AudioBitrateKbps != prevBitrate) ||
+		(req.AudioFrameMs.Set && ch.AudioFrameMS != prevFrameMS)
 	// #102：类型改成 text 时一并清掉密码与人数上限——否则切回 voice 会复活旧密码。
 	// 放在全部字段应用之后按最终类型判定：同一次 PATCH 里显式改密码 + 改成 text
 	// 会在上方的 checkChannelPassword 先被拒，走到这里的一定是「切类型」本身。

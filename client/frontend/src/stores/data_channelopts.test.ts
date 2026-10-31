@@ -12,7 +12,7 @@ const mockGoApp = vi.hoisted(() => ({
 }))
 vi.mock('../api/bridge', () => ({ goApp: () => mockGoApp, eventsOn: () => () => {} }))
 
-import { useServersStore, channelTree, normalizeChannelAudioOptions, type Channel } from './data'
+import { useServersStore, channelTree, diffChannelAudioOptions, normalizeChannelAudioOptions, type Channel } from './data'
 
 function ch(id: string, name: string, parentId?: string, extra?: Partial<Channel>): Channel {
   return { id, name, type: 'voice', group: '甲组', parentId, ...extra }
@@ -172,5 +172,70 @@ describe('normalizeChannelAudioOptions', () => {
     expect(normalizeChannelAudioOptions(129, 20)).toEqual({ bitrateKbps: 0, frameMS: 0 })
     expect(normalizeChannelAudioOptions(-1, -10)).toEqual({ bitrateKbps: 0, frameMS: 0 })
     expect(normalizeChannelAudioOptions(Number.NaN, Number.NaN)).toEqual({ bitrateKbps: 0, frameMS: 0 })
+  })
+})
+
+// #117 只下发真正变化的音质字段：未变的发 -1（= 不改，bridge/Go 侧同约定），
+// 否则纯改名也会让服务端广播 channel.audio，全房间重跑一次音质应用。
+describe('diffChannelAudioOptions', () => {
+  const snap = (bitrateKbps: number, frameMS: number) => ({ bitrateKbps, frameMS })
+
+  it('只改名字：两个音质字段都不下发', () => {
+    expect(diffChannelAudioOptions(snap(32, 10), snap(32, 10)))
+      .toEqual({ bitrateKbps: -1, frameMS: -1 })
+  })
+
+  it('改码率：只下发码率，帧长保持不变', () => {
+    expect(diffChannelAudioOptions(snap(32, 10), snap(48, 10)))
+      .toEqual({ bitrateKbps: 48, frameMS: -1 })
+  })
+
+  it('改帧长：只下发帧长', () => {
+    expect(diffChannelAudioOptions(snap(32, 10), snap(32, 0)))
+      .toEqual({ bitrateKbps: -1, frameMS: 0 })
+  })
+
+  it('码率清零下发 0（0 是有效值，不是「未变」）', () => {
+    expect(diffChannelAudioOptions(snap(32, 0), snap(0, 0)))
+      .toEqual({ bitrateKbps: 0, frameMS: -1 })
+  })
+
+  it('原本就是 0 再保存 0 视为未变', () => {
+    expect(diffChannelAudioOptions(snap(0, 0), snap(0, 0)))
+      .toEqual({ bitrateKbps: -1, frameMS: -1 })
+  })
+})
+
+// 弹层把 diff 结果直接交给 store → bridge（-1 由 Go 侧解释成「不发该字段」）。
+describe('updateChannelOptions 透传音质差量', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    mockGoApp.ListServers.mockReset()
+    mockGoApp.ListChannels.mockReset()
+    mockGoApp.UpdateChannelOptions.mockReset()
+    mockGoApp.ListFriends.mockReset().mockResolvedValue([])
+  })
+
+  it('只改名字时 bridge 收到 -1/-1', async () => {
+    mockGoApp.ListServers.mockResolvedValue([
+      { id: 1, name: '服一', owner_id: 1, icon_name: 'music', icon_color: '#4FA4F3' },
+    ])
+    mockGoApp.ListChannels.mockResolvedValue({
+      categories: [],
+      channels: [
+        { id: 11, server_id: 1, name: '语音', type: 'voice', category_id: 0, position: 0, user_limit: 0, audio_bitrate_kbps: 32, audio_frame_ms: 10 },
+      ],
+    })
+    mockGoApp.UpdateChannelOptions.mockResolvedValue({
+      id: '11', server_id: '1', name: '语音', type: 'voice', category_id: null,
+      position: 0, created_at: '2026-01-01T00:00:00Z', parent_id: null,
+      has_password: false, user_limit: 0, audio_bitrate_kbps: 32, audio_frame_ms: 10,
+    })
+    const s = useServersStore()
+    await s.loadRemoteServers()
+    const audio = diffChannelAudioOptions(
+      { bitrateKbps: 32, frameMS: 10 }, normalizeChannelAudioOptions(32, 10))
+    await s.updateChannelOptions('1', '11', '0', 0, audio.bitrateKbps, audio.frameMS, '', false)
+    expect(mockGoApp.UpdateChannelOptions).toHaveBeenCalledWith('11', '0', 0, -1, -1, '', false)
   })
 })
