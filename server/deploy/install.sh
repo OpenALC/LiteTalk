@@ -44,14 +44,14 @@ done
 
 log() { echo "[install] $*"; }
 
-# ---- 压缩包成员校验 ----
+# ---- 纯函数区（压缩包校验 / latest 解析）----
 # 与 server/internal/updater/extract.go 的 safeExtract 同口径：只放行普通文件与目录，
 # 拒绝符号链接/硬链接/设备/FIFO 等非常规条目。`tar -tzf` 只列名字、看不出条目类型；
 # 解包后以 root 身份 install 会跟随链接，把 /etc 下的路径变成可控文件。
 # 类型用 `tar -tvzf` 的首字符判定，名字仍从 `tar -tzf` 取：两次列表的条目顺序与条数
 # 必然一致，按序号对齐即可，不必从 verbose 行里剥离名字（带空格的成员也能解析）。
 #
-# 下面两个函数放在参数解析之前，并留 LITETALK_INSTALL_LIB=1 出口：
+# 本区内的函数都放在参数解析之前，并留 LITETALK_INSTALL_LIB=1 出口：
 # deploy/install_selftest.sh 以该变量 source 本文件，只取函数、不跑安装主流程
 # （主流程需要 root 与 Linux，CI 检查机两者都不是）。
 archive_names_types() {
