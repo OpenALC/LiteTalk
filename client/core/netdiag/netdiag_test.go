@@ -294,7 +294,167 @@ func TestTURNDialFailure(t *testing.T) {
 	}
 }
 
+// TestSTUNFallsBackToSecondCandidate 首个候选不可达时继续试后续候选，
+// 第二个成功即判 STUN 可用，并在 Candidate 里标出实际成功的地址（#117）。
+func TestSTUNFallsBackToSecondCandidate(t *testing.T) {
+	dead := blackholeUDP(t) // 收包不回：首条候选超时
+	good := fakeSTUNServer(t)
+	servers := []ICEServer{{URLs: []string{
+		"stun:" + dead,
+		"stun:" + good,
+	}}}
+	start := time.Now()
+	res := probeSTUNConfig(context.Background(), servers, 600*time.Millisecond)
+	elapsed := time.Since(start)
+
+	if !res.OK || res.Address == "" {
+		t.Fatalf("第二条候选可用时应判定 STUN 可用: %+v", res)
+	}
+	if res.Candidate != good {
+		t.Fatalf("应标出实际成功的候选 %q，实际 %q", good, res.Candidate)
+	}
+	if res.Error != "" {
+		t.Fatalf("成功后不应残留错误: %q", res.Error)
+	}
+	if !strings.Contains(res.Note, "第 2 个候选") {
+		t.Fatalf("应注明回退到第几个候选: %q", res.Note)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("候选回退未受控: %v", elapsed)
+	}
+}
+
+// TestSTUNAllCandidatesFail 全部候选失败：报首个错误并注明尝试次数，总耗时
+// 不超过总预算量级。
+func TestSTUNAllCandidatesFail(t *testing.T) {
+	a, b := blackholeUDP(t), blackholeUDP(t)
+	start := time.Now()
+	res := probeSTUNConfig(context.Background(), []ICEServer{{URLs: []string{
+		"stun:" + a, "stun:" + b,
+	}}}, 600*time.Millisecond)
+	elapsed := time.Since(start)
+
+	if res.OK || res.Skipped || res.Error == "" {
+		t.Fatalf("全部候选失败应报错: %+v", res)
+	}
+	if !strings.Contains(res.Note, "已尝试 2 个候选") {
+		t.Fatalf("应注明已尝试的候选数: %q", res.Note)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("总耗时未受控: %v", elapsed)
+	}
+}
+
+// TestCandidatesDedupAndCap 同一 URL 重复出现只试一次；超过上限的候选被截断。
+func TestCandidatesDedupAndCap(t *testing.T) {
+	servers := []ICEServer{
+		{URLs: []string{"stun:a:3478", "STUN:a:3478", "stun:b:3478", "turn:c:3478"}},
+		{URLs: []string{"stun:d:3478", "stun:e:3478", "stun:f:3478"}},
+	}
+	got := iceCandidates(servers, "stun")
+	if len(got) != maxCandidates {
+		t.Fatalf("候选数 = %d，应有上限 %d", len(got), maxCandidates)
+	}
+	want := []string{"stun:a:3478", "stun:b:3478", "stun:d:3478", "stun:e:3478"}
+	for i := range want {
+		if got[i].raw != want[i] {
+			t.Fatalf("候选[%d] = %q，want %q", i, got[i].raw, want[i])
+		}
+	}
+	// scheme 过滤：turn: 不在 stun 候选里。
+	for _, c := range got {
+		if strings.HasPrefix(strings.ToLower(c.raw), "turn:") {
+			t.Fatalf("turn: 不应出现在 stun 候选里: %q", c.raw)
+		}
+	}
+	// 带凭证的 TURN 候选保留其所属条目（凭证随条目走）。
+	turns := iceCandidates([]ICEServer{{
+		URLs:       []string{"turn:x:3478"},
+		Username:   "u",
+		Credential: "p",
+	}}, "turn", "turns")
+	if len(turns) != 1 || turns[0].srv.Username != "u" || turns[0].srv.Credential != "p" {
+		t.Fatalf("TURN 候选未携带凭证: %+v", turns)
+	}
+}
+
+// TestCandidateBudget 预算分配：平均分、有下限、不超过剩余；耗尽返回 0。
+func TestCandidateBudget(t *testing.T) {
+	cases := []struct {
+		name      string
+		total     time.Duration
+		elapsed   time.Duration
+		remaining int
+		want      time.Duration
+	}{
+		{"平均分", 4 * time.Second, 0, 2, 2 * time.Second},
+		{"四项平摊", 4 * time.Second, 0, 4, time.Second},
+		{"下限抬升", 1 * time.Second, 0, 4, minCandidateBudget},
+		{"不超过剩余", 4 * time.Second, 3900 * time.Millisecond, 2, 100 * time.Millisecond},
+		{"预算耗尽", 4 * time.Second, 4 * time.Second, 2, 0},
+		{"无候选", 4 * time.Second, 0, 0, 0},
+	}
+	for _, c := range cases {
+		if got := candidateBudget(c.total, c.elapsed, c.remaining); got != c.want {
+			t.Errorf("%s: candidateBudget = %v，want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestTURNFallsBackToSecondCandidate 首个 TURN 候选不可达时继续试后续候选
+// （#117）：主备配置的第一条挂掉不应让整类 TURN 判失败。
+func TestTURNFallsBackToSecondCandidate(t *testing.T) {
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen packet: %v", err)
+	}
+	const realm = "litetalk-test"
+	srv, err := turn.NewServer(turn.ServerConfig{
+		Realm: realm,
+		AuthHandler: func(ra *turn.RequestAttributes) (string, []byte, bool) {
+			if ra.Username != "agent" {
+				return "", nil, false
+			}
+			return ra.Username, turn.GenerateAuthKey(ra.Username, ra.Realm, "pass-1"), true
+		},
+		PacketConnConfigs: []turn.PacketConnConfig{{
+			PacketConn: pc,
+			RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{
+				RelayAddress: net.ParseIP("127.0.0.1"),
+				Address:      "127.0.0.1",
+			},
+		}},
+		LoggerFactory: quietLoggerFactory(),
+	})
+	if err != nil {
+		_ = pc.Close()
+		t.Fatalf("turn server: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = srv.Close()
+		_ = pc.Close()
+	})
+
+	// 首条候选：候选顺序与认证无关，用一个确定失败的地址（域名解析失败）。
+	servers := []ICEServer{{
+		URLs:       []string{"turn:invalid.invalid:3478", "turn:" + pc.LocalAddr().String()},
+		Username:   "agent",
+		Credential: "pass-1",
+	}}
+	res := probeTURNConfig(context.Background(), servers, 3*time.Second)
+	if !res.OK || res.Address == "" {
+		t.Fatalf("第二条 TURN 候选可用时应判定该类可用: %+v", res)
+	}
+	if res.Candidate != pc.LocalAddr().String() {
+		t.Fatalf("应标出实际成功的候选 %q，实际 %q", pc.LocalAddr().String(), res.Candidate)
+	}
+	if strings.Contains(res.Error, "pass-1") || strings.Contains(res.Error, "agent") {
+		t.Fatalf("结果不得泄露凭证: %q", res.Error)
+	}
+}
+
 func TestHealthzFailures(t *testing.T) {
+
 	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "down", http.StatusServiceUnavailable)
 	}))

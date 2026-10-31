@@ -27,6 +27,17 @@ import (
 // 的「诊断中」超过用户耐心）。
 const defaultTimeout = 4 * time.Second
 
+// 候选回退（#117）：配置里常有多条 STUN / TURN URL（主备、IPv4/IPv6 双栈），
+// 旧实现只看第一条，首条不可用就误报该类不可用。
+const (
+	// maxCandidates 单类别最多尝试的候选数：再多就是配置问题，诊断不该
+	// 陪着把所有地址轮一遍。
+	maxCandidates = 4
+	// minCandidateBudget 单个候选的最短预算。预算不足时宁可少试几个候选，
+	// 也不要给每个候选几十毫秒的假超时。
+	minCandidateBudget = 400 * time.Millisecond
+)
+
 // ICEServer 与 core/api.ICEServer 同构；netdiag 不依赖 api 包，便于单测。
 type ICEServer struct {
 	URLs       []string
@@ -54,10 +65,11 @@ type ProbeResult struct {
 	OK        bool   `json:"ok"`
 	Skipped   bool   `json:"skipped,omitempty"`
 	LatencyMS int64  `json:"latency_ms"`
-	Version   string `json:"version,omitempty"` // healthz 版本
-	Address   string `json:"address,omitempty"` // STUN 映射地址 / TURN relay 地址
-	Note      string `json:"note,omitempty"`    // 补充说明（如「信令已连接」）
-	Error     string `json:"error,omitempty"`   // 已脱敏的短错误
+	Version   string `json:"version,omitempty"`   // healthz 版本
+	Address   string `json:"address,omitempty"`   // STUN 映射地址 / TURN relay 地址
+	Candidate string `json:"candidate,omitempty"` // 实际成功的候选（脱敏 host:port）
+	Note      string `json:"note,omitempty"`      // 补充说明（如「信令已连接」）
+	Error     string `json:"error,omitempty"`     // 已脱敏的短错误
 }
 
 // Result 一次诊断的完整结果。OK 只统计实际执行的探测：未配置（Skipped）
@@ -70,8 +82,8 @@ type Result struct {
 	TURN ProbeResult `json:"turn"`
 }
 
-// Run 并行执行四项探测（各带独立超时，互不影响）。STUN/TURN 取 ICE 配置里
-// 第一个匹配协议的 URL；没有对应配置时返回 Skipped。
+// Run 并行执行四项探测（各带独立超时，互不影响）。STUN/TURN 按配置顺序逐个
+// 尝试候选，任一成功即判该类可用（#117）；没有对应配置时返回 Skipped。
 func Run(ctx context.Context, cfg Config) Result {
 	timeout := cfg.Timeout
 	if timeout <= 0 {
@@ -146,66 +158,175 @@ func probeSignal(ctx context.Context, cfg Config, timeout time.Duration) ProbeRe
 	return res
 }
 
-// probeSTUNConfig 取第一个 stun: URL 做 binding 探测。只有 stuns:（TLS）时
+// probeSTUNConfig 按候选顺序逐个尝试 stun: binding 探测，任一成功即算该类
+// 可用，并在 Candidate 里标出实际成功的地址（#117）。只有 stuns:（TLS）时
 // 不视为未配置——明确报告不支持，避免用户误以为 STUN 正常。
 func probeSTUNConfig(ctx context.Context, servers []ICEServer, timeout time.Duration) ProbeResult {
-	srv, raw, ok := findICE(servers, "stun")
-	if !ok {
-		if _, rawTLS, hasTLS := findICE(servers, "stuns"); hasTLS {
-			return ProbeResult{Error: "暂不支持 stuns: 探测（" + hostOnly(rawTLS) + "）"}
-		}
-		return ProbeResult{Skipped: true, Note: "未配置"}
+	if timeout <= 0 {
+		timeout = defaultTimeout
 	}
-	start := time.Now()
-	addr, err := stunBinding(ctx, raw, timeout)
-	res := ProbeResult{LatencyMS: time.Since(start).Milliseconds()}
-	if err != nil {
-		res.Error = sanitize(err.Error(), srv)
-		return res
+	out := probeableCandidates(ctx, iceCandidates(servers, "stun"), timeout,
+		func(c iceCandidate, budget time.Duration) (string, error) {
+			return stunBinding(ctx, c.raw, budget)
+		})
+	if out.attempted > 0 {
+		return out.result
 	}
-	res.OK = true
-	res.Address = addr
-	return res
+	if _, rawTLS, hasTLS := firstICE(servers, "stuns"); hasTLS {
+		return ProbeResult{Error: "暂不支持 stuns: 探测（" + hostOnly(rawTLS) + "）"}
+	}
+	return ProbeResult{Skipped: true, Note: "未配置"}
 }
 
-// probeTURNConfig 取第一个 turn:/turns: URL 做 allocate 探测。无凭证或
-// 无 TURN 配置都报「未配置」而不是 panic。
+// probeTURNConfig 按候选顺序逐个尝试 turn:/turns: allocate 探测，任一成功
+// 即算该类可用（#117）。无凭证或缺配置照旧明确说明，不当作可用。
 func probeTURNConfig(ctx context.Context, servers []ICEServer, timeout time.Duration) ProbeResult {
-	srv, raw, ok := findICE(servers, "turn", "turns")
-	if !ok {
+	if timeout <= 0 {
+		timeout = defaultTimeout
+	}
+	all := iceCandidates(servers, "turn", "turns")
+	if len(all) == 0 {
 		return ProbeResult{Skipped: true, Note: "未配置"}
 	}
-	if srv.Username == "" || srv.Credential == "" {
+	// 缺凭证的条目无法 allocate，直接剔除；全部缺凭证才报「未配置凭证」。
+	withCred := make([]iceCandidate, 0, len(all))
+	for _, c := range all {
+		if c.srv.Username != "" && c.srv.Credential != "" {
+			withCred = append(withCred, c)
+		}
+	}
+	if len(withCred) == 0 {
 		return ProbeResult{Skipped: true, Note: "未配置凭证"}
 	}
-	start := time.Now()
-	addr, err := turnAllocate(ctx, raw, srv.Username, srv.Credential, timeout)
-	res := ProbeResult{LatencyMS: time.Since(start).Milliseconds()}
-	if err != nil {
-		res.Error = sanitize(err.Error(), srv)
-		return res
-	}
-	res.OK = true
-	res.Address = addr
-	return res
+	out := probeableCandidates(ctx, withCred, timeout,
+		func(c iceCandidate, budget time.Duration) (string, error) {
+			return turnAllocate(ctx, c.raw, c.srv.Username, c.srv.Credential, budget)
+		})
+	return out.result
 }
 
-// findICE 在 ICE 配置中找第一个指定 scheme 的 URL（按配置顺序）。
-func findICE(servers []ICEServer, schemes ...string) (ICEServer, string, bool) {
+// probeOutcome 候选回退的结果：已尝试过的候选数与探测结果。
+type probeOutcome struct {
+	attempted int
+	result    ProbeResult
+}
+
+// probeableCandidates 依次尝试候选直到成功或预算耗尽。成功与失败的判定都
+// 归集到同一个 ProbeResult：成功带 Address/Candidate，失败带首个错误摘要。
+//
+// 总耗时受 timeout 约束：每个候选按 candidateBudget 分配预算，且该预算同时
+// 写进 ctx deadline 与探测实现自身（两条路径都生效，不会出现外层不守时）。
+func probeableCandidates(ctx context.Context, cands []iceCandidate, timeout time.Duration,
+	probe func(c iceCandidate, budget time.Duration) (string, error)) probeOutcome {
+	var out probeOutcome
+	start := time.Now()
+	var firstErr string
+	for i, c := range cands {
+		budget := candidateBudget(timeout, time.Since(start), len(cands)-i)
+		if budget <= 0 {
+			break
+		}
+		out.attempted++
+		addr, err := probe(c, budget)
+		if err != nil {
+			if firstErr == "" {
+				firstErr = sanitize(err.Error(), c.srv)
+			}
+			continue
+		}
+		out.result = ProbeResult{
+			OK:        true,
+			LatencyMS: time.Since(start).Milliseconds(),
+			Address:   addr,
+			Candidate: hostOnly(c.raw),
+		}
+		if out.attempted > 1 {
+			out.result.Note = fmt.Sprintf("第 %d 个候选可用", out.attempted)
+		}
+		return out
+	}
+	out.result = ProbeResult{
+		LatencyMS: time.Since(start).Milliseconds(),
+		Error:     firstErr,
+	}
+	if out.attempted > 1 {
+		out.result.Note = fmt.Sprintf("已尝试 %d 个候选", out.attempted)
+	}
+	return out
+}
+
+// firstICE 找第一个指定 scheme 的候选（仅用于给出诊断文案）。
+func firstICE(servers []ICEServer, schemes ...string) (ICEServer, string, bool) {
+	cands := iceCandidates(servers, schemes...)
+	if len(cands) == 0 {
+		return ICEServer{}, "", false
+	}
+	return cands[0].srv, cands[0].raw, true
+}
+
+// iceCandidate 一个待探测的 ICE 地址（附它所属的服务器条目，TURN 需要凭证）。
+type iceCandidate struct {
+	srv ICEServer
+	raw string
+}
+
+// iceCandidates 按配置顺序收集指定 scheme 的 URL，去重并截断到 maxCandidates。
+// 同一条目内的多个 URL 与多个条目间的 URL 一视同仁：主备配置通常写在同一条
+// ICEServer 里。
+func iceCandidates(servers []ICEServer, schemes ...string) []iceCandidate {
+	out := make([]iceCandidate, 0, len(servers))
+	seen := make(map[string]struct{}, len(servers))
 	for _, srv := range servers {
 		for _, raw := range srv.URLs {
-			u, err := url.Parse(strings.TrimSpace(raw))
+			raw = strings.TrimSpace(raw)
+			u, err := url.Parse(raw)
 			if err != nil {
 				continue
 			}
+			matched := false
 			for _, scheme := range schemes {
 				if strings.EqualFold(u.Scheme, scheme) {
-					return srv, raw, true
+					matched = true
+					break
 				}
+			}
+			if !matched {
+				continue
+			}
+			// 去重按完整 URL：同一服务器写成 stun:a 与 stun:a?transport=udp 时
+			// 只保留先出现的那条。
+			key := strings.ToLower(raw)
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, iceCandidate{srv: srv, raw: raw})
+			if len(out) >= maxCandidates {
+				return out
 			}
 		}
 	}
-	return ICEServer{}, "", false
+	return out
+}
+
+// candidateBudget 单个候选的预算：把总预算平均分给剩余候选，不少于
+// minCandidateBudget，也不超过剩余总预算。返回 0 表示剩余预算已经不够再试。
+//
+// 分配是动态的：首条快速失败（连接被拒/域名解析失败）时剩余候选自动拿到
+// 更多时间，总耗时不会超过总预算。
+func candidateBudget(total, elapsed time.Duration, remaining int) time.Duration {
+	left := total - elapsed
+	if left <= 0 || remaining <= 0 {
+		return 0
+	}
+	per := total / time.Duration(remaining)
+	if per < minCandidateBudget {
+		per = minCandidateBudget
+	}
+	if per > left {
+		per = left
+	}
+	return per
 }
 
 // iceHostPort 从 stun:/turn: URL 取 host:port。Go 的 url.Parse 对无 // 的
