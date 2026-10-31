@@ -33,9 +33,10 @@ const (
 	whInboundWindow   = time.Minute
 	inboundDescMax    = 255
 	inboundContentMax = 2000
-	// inboundBotEmail 占位机器人身份的固定邮箱（bots.invalid 保留域，无法收信、
+	// inboundBotEmail webhook 机器人身份的固定邮箱（bots.invalid 保留域，无法收信、
 	// 无法密码登录——password_hash 落空串，CheckPassword 对空哈希恒 false）。
-	// T4（bot 账号模型）合入后需把该占位接线为真正的 bot 用户（is_bot=1）。
+	// 该用户 is_bot=1（#51 bot 账号模型）：不进好友候选/@提及候选/成员管理列表，
+	// 也不作 presence 广播主体。
 	inboundBotEmail = "webhook@bots.invalid"
 	// disabledReasonManual 手动停用写入 disabled_reason 的值。
 	disabledReasonManual = "manual"
@@ -451,11 +452,20 @@ func joinEvents(events []string) string {
 	return strings.Join(out, " ")
 }
 
-// inboundBotUser 占位机器人身份（懒创建，见 inboundBotEmail 注释）：按固定邮箱
-// 回读，不存在则建号（随机 4 位 tag 防撞唯一索引，撞了重摇并回读）。并发首投递
-// 的唯一键竞争由重试覆盖；头像与邮箱验证字段保持缺省。
+// inboundBotUser webhook 机器人身份（懒创建，见 inboundBotEmail 注释）：按固定
+// 邮箱回读，不存在则建号（is_bot=1；随机 4 位 tag 防撞唯一索引，撞了重摇并回读）。
+// 已存在但 is_bot=0 的是 T5 占位期建出的旧行——同段 ensure 里补一次 is_bot=1
+// 纠偏（幂等；v1.9 批次的迁移性纠偏，让旧库的 webhook 机器人同样被 bot 过滤
+// 覆盖）。并发首投递的唯一键竞争由重试覆盖；头像与邮箱验证字段保持缺省。
 func (s *Server) inboundBotUser(ctx context.Context) (*store.User, error) {
 	if u, err := s.store.UserByEmail(ctx, inboundBotEmail); err == nil {
+		if u.IsBot {
+			return u, nil
+		}
+		u.IsBot = true
+		if err := s.store.UpdateUser(ctx, u); err != nil {
+			return nil, err
+		}
 		return u, nil
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return nil, err
@@ -471,6 +481,7 @@ func (s *Server) inboundBotUser(ctx context.Context) (*store.User, error) {
 			Tag:      tag,
 			// password_hash 空串：CheckPassword 对空哈希恒 false，无法密码登录。
 			PasswordHash: "",
+			IsBot:        true,
 		}
 		err = s.store.CreateUser(ctx, u)
 		if err == nil {

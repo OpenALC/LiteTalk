@@ -232,9 +232,9 @@ func (s *SQLite) UserByNicknameTag(ctx context.Context, nickname, tag string) (*
 // checkAffected 不会把「原样保存」误报成 ErrNotFound。
 func (s *SQLite) UpdateUser(ctx context.Context, u *User) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE users SET nickname = ?, tag = ?, password_hash = ?, email_verified = ?, status = ?,
+		`UPDATE users SET nickname = ?, tag = ?, password_hash = ?, email_verified = ?, is_bot = ?, status = ?,
 		 updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-		u.Nickname, u.Tag, u.PasswordHash, u.EmailVerified, u.Status, u.ID)
+		u.Nickname, u.Tag, u.PasswordHash, u.EmailVerified, u.IsBot, u.Status, u.ID)
 	if err != nil {
 		if isDupSQLite(err) {
 			return ErrConflict

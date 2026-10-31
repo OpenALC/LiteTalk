@@ -158,3 +158,61 @@ func TestBotTokenRESTScopeAndRevoke(t *testing.T) {
 	}
 	getJSON(t, f.h, url, f.plain, http.StatusUnauthorized)
 }
+
+// assertWebhookBotIsBot webhook 机器人（inboundBotEmail）的统一断言体：
+// is_bot=1、空哈希；强行写进成员表后仍不出现在成员管理列表（bot 过滤覆盖
+// webhook 机器人，与 litetalkctl 建的 bot 同一口径）。
+func assertWebhookBotIsBot(t *testing.T, h http.Handler, srv *Server, mem *store.Mem, serverID int64, access string) {
+	t.Helper()
+	ctx := context.Background()
+	bot, err := mem.UserByEmail(ctx, inboundBotEmail)
+	if err != nil {
+		t.Fatalf("UserByEmail(%s): %v", inboundBotEmail, err)
+	}
+	if !bot.IsBot {
+		t.Fatal("投递后 webhook 机器人应 is_bot=1")
+	}
+	if bot.PasswordHash != "" {
+		t.Fatalf("webhook 机器人 password_hash 必须为空串: %q", bot.PasswordHash)
+	}
+	// bot 过滤覆盖 webhook 机器人：直接补成员行使断言非平凡（投递路径本身
+	// 不建成员关系），成员管理列表仍不得出现它。
+	if err := mem.AddMember(ctx, &store.ServerMember{ServerID: serverID, UserID: bot.ID, Role: store.RoleMember}); err != nil {
+		t.Fatalf("AddMember webhook bot: %v", err)
+	}
+	srv.authz.InvalidateServer(serverID)
+	ids := idsOf(t, getJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/members", serverID), access, http.StatusOK))
+	if ids[bot.ID] {
+		t.Fatalf("webhook 机器人 %d 不应出现在成员管理列表", bot.ID)
+	}
+}
+
+// TestInboundWebhookBotIsBot 入站投递接线 bot 模型（#51 收尾）：
+//   - 全新库：首次投递懒创建的 webhook 机器人即 is_bot=1；
+//   - 旧库：T5 占位期（is_bot=0）建的旧行在投递时被幂等纠偏为 bot。
+func TestInboundWebhookBotIsBot(t *testing.T) {
+	t.Run("新建即bot", func(t *testing.T) {
+		srv, mem := newTestServerWithWebhooks(t)
+		h := srv.Handler()
+		access, serverID, chID := mkServerChannel(t, h, mem, "inb-bot-a@ex.com", "inbBotA")
+		created := postJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/inbound-webhooks", chID), access,
+			map[string]string{}, http.StatusCreated)
+		postJSON(t, h, created["url"].(string), "", map[string]string{"content": "hello"}, http.StatusOK)
+		assertWebhookBotIsBot(t, h, srv, mem, serverID, access)
+	})
+	t.Run("旧占位行纠偏", func(t *testing.T) {
+		srv, mem := newTestServerWithWebhooks(t)
+		h := srv.Handler()
+		access, serverID, chID := mkServerChannel(t, h, mem, "inb-bot-b@ex.com", "inbBotB")
+		// T5 占位期形状：is_bot 尚未置位的旧行。
+		if err := mem.CreateUser(context.Background(), &store.User{
+			Email: inboundBotEmail, Nickname: "Webhook", Tag: "0000",
+		}); err != nil {
+			t.Fatalf("预置旧占位行: %v", err)
+		}
+		created := postJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/inbound-webhooks", chID), access,
+			map[string]string{}, http.StatusCreated)
+		postJSON(t, h, created["url"].(string), "", map[string]string{"content": "hello"}, http.StatusOK)
+		assertWebhookBotIsBot(t, h, srv, mem, serverID, access)
+	})
+}
