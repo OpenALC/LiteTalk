@@ -47,3 +47,7 @@ server/deploy/sudoers/*  text eol=lf
 
 # 第三方 vendored 代码不设规则：行尾随上游，不为统一格式制造无意义 diff
 # （client/third_party/** 保持原样）
+#
+# 例外：产物清单是纯文本校验文件，sha256sum -c 会因行尾 \r 解析失败，
+# 且 CI 在 Linux 上校验、本机在 Windows 上生成，必须钉死 LF（#117）。
+client/third_party/SHA256SUMS text eol=lf
