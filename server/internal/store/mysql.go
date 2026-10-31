@@ -1773,6 +1773,95 @@ func (m *MySQL) DeleteAllUserSessions(ctx context.Context, userID int64) error {
 	return err
 }
 
+// ---- api_tokens（迁移 0018，#51 #54）----
+
+const apiTokenCols = `id, user_id, name, prefix, secret_hash, kind, scopes, expires_at, last_used_at, revoked_at, created_at`
+
+func (m *MySQL) CreateAPIToken(ctx context.Context, t *APIToken) error {
+	t.ID = newID(t.ID)
+	_, err := m.db.ExecContext(ctx,
+		`INSERT INTO api_tokens (id, user_id, name, prefix, secret_hash, kind, scopes, expires_at, last_used_at, revoked_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.UserID, t.Name, t.Prefix, t.SecretHash, t.Kind, t.Scopes,
+		t.ExpiresAt, t.LastUsedAt, t.RevokedAt)
+	if err != nil {
+		if isDup(err) {
+			return ErrConflict
+		}
+		return err
+	}
+	return m.db.QueryRowContext(ctx, `SELECT created_at FROM api_tokens WHERE id = ?`, t.ID).
+		Scan(&t.CreatedAt)
+}
+
+func (m *MySQL) scanAPIToken(row interface{ Scan(...any) error }) (*APIToken, error) {
+	var t APIToken
+	var exp, lastUsed, revoked sql.NullTime
+	err := row.Scan(&t.ID, &t.UserID, &t.Name, &t.Prefix, &t.SecretHash, &t.Kind,
+		&t.Scopes, &exp, &lastUsed, &revoked, &t.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if exp.Valid {
+		v := exp.Time
+		t.ExpiresAt = &v
+	}
+	if lastUsed.Valid {
+		v := lastUsed.Time
+		t.LastUsedAt = &v
+	}
+	if revoked.Valid {
+		v := revoked.Time
+		t.RevokedAt = &v
+	}
+	return &t, nil
+}
+
+func (m *MySQL) APITokenByPrefix(ctx context.Context, prefix string) (*APIToken, error) {
+	return m.scanAPIToken(m.db.QueryRowContext(ctx,
+		`SELECT `+apiTokenCols+` FROM api_tokens WHERE prefix = ?`, prefix))
+}
+
+func (m *MySQL) APITokenByID(ctx context.Context, id int64) (*APIToken, error) {
+	return m.scanAPIToken(m.db.QueryRowContext(ctx,
+		`SELECT `+apiTokenCols+` FROM api_tokens WHERE id = ?`, id))
+}
+
+func (m *MySQL) APITokensOfUser(ctx context.Context, userID int64) ([]APIToken, error) {
+	rows, err := m.db.QueryContext(ctx,
+		`SELECT `+apiTokenCols+` FROM api_tokens WHERE user_id = ? ORDER BY created_at, id`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []APIToken{}
+	for rows.Next() {
+		t, err := m.scanAPIToken(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *t)
+	}
+	return out, rows.Err()
+}
+
+func (m *MySQL) RevokeAPIToken(ctx context.Context, id int64, at time.Time) error {
+	res, err := m.db.ExecContext(ctx, `UPDATE api_tokens SET revoked_at = ? WHERE id = ?`, at, id)
+	if err != nil {
+		return err
+	}
+	return checkAffected(res)
+}
+
+// TouchAPITokenLastUsed 尽力而为：行已不存在（并发删除）不报错，异步路径不该失败。
+func (m *MySQL) TouchAPITokenLastUsed(ctx context.Context, id int64, at time.Time) error {
+	_, err := m.db.ExecContext(ctx, `UPDATE api_tokens SET last_used_at = ? WHERE id = ?`, at, id)
+	return err
+}
+
 // ---- roles / member_roles / channel_overwrites / audit_log（迁移 0010，#35 B1） ----
 // 语义实现与 SQLite 共用 roles.go 的 db* 函数，这里只做方言接线。
 

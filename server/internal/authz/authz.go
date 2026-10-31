@@ -7,6 +7,7 @@ import (
 	"context"
 
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/internal/token"
 )
 
 // Can 判断 uid 对频道的权限。channelID 必须是真实频道（不存在返回 store.ErrNotFound）；
@@ -23,9 +24,17 @@ func (a *Authorizer) Can(ctx context.Context, uid, channelID int64, perm store.P
 // channelID == 0 视为服务器级（不看频道覆盖）；perm 含频道位时同样按服务器级
 // 处理，不报错。channelID 属于 serverID 由调用方保证，这里不回查（错配时该频道
 // 在本服快照里没有覆盖，退化为服务器级结果）。
+//
+// #54 scope 上限的唯一交集点：ctx 里带 api_token 的 Principal（pat/bot）时，
+// 最终权限 = 角色权限 ∩ scope 映射位。检查的权限位超出 scope 上限直接拒绝、
+// 不查角色——scope 绝不授予只收紧，角色降级后令牌自动失去对应权限。
+// ctx 无 Principal（WS 旧路径）或 JWT 主体时不受限，行为与之前完全一致。
 func (a *Authorizer) CanInServer(ctx context.Context, uid, serverID, channelID int64, perm store.Permission) (bool, error) {
 	if ok, err := precheck(perm); err != nil || ok {
 		return ok, err
+	}
+	if limit, ok := token.ScopeLimitFromContext(ctx); ok && perm&^limit != 0 {
+		return false, nil
 	}
 	snap, err := a.policyFor(ctx, serverID)
 	if err != nil {

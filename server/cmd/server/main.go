@@ -35,6 +35,7 @@ import (
 	"github.com/OpenALC/LiteTalk/server/internal/sfu"
 	"github.com/OpenALC/LiteTalk/server/internal/signal"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/internal/token"
 	"github.com/OpenALC/LiteTalk/server/internal/turn"
 	"github.com/OpenALC/LiteTalk/server/migrations"
 )
@@ -177,6 +178,9 @@ func main() {
 	codes := auth.NewEmailCodes(kv)
 	limits := auth.NewRateLimit(kv)
 	sessIndex := auth.NewSessionIndex(st, kv)
+	// api_token（#54）校验服务：REST 中间件与 WS 握手共用同一实例——
+	// 一条实现（token.Service.Verify），last_used 节流表也只在这一份。
+	apiTokenSvc := token.NewService(st, log.Default())
 
 	// SFU：ICE-Lite + 单 UDP mux（§5.2）+ 可选 ICE-TCP mux（#25）
 	sfuUDPPort := envInt("LITETALK_SFU_UDP", 7845)
@@ -239,25 +243,39 @@ func main() {
 	}
 	var authenticator signal.Authenticator
 	if devAuth {
-		authenticator = func(token string) (signal.Identity, error) {
-			if !strings.HasPrefix(token, "dev-") {
-				if claims, err := jwtSigner.ParseAccess(token); err == nil {
+		authenticator = func(t string) (signal.Identity, error) {
+			// api_token（#54）：与 REST 同一条校验实现，先于 JWT 解析判定。
+			if id, handled, err := apiTokenIdentity(apiTokenSvc, t); handled {
+				if err != nil {
+					return signal.Identity{}, signal.ErrUnauthorized
+				}
+				return id, nil
+			}
+			if !strings.HasPrefix(t, "dev-") {
+				if claims, err := jwtSigner.ParseAccess(t); err == nil {
 					return identityFromClaims(claims), nil
 				}
 			}
 			// dev- 令牌无会话概念：SkipSessionCheck 跳过握手 sid 比对（仅 dev 构建可达）。
-			return signal.DevAuthenticator(token)
+			return signal.DevAuthenticator(t)
 		}
-		log.Println("WS 鉴权: JWT + dev-token 兜底（开发模式）")
+		log.Println("WS 鉴权: JWT + api_token + dev-token 兜底（开发模式）")
 	} else {
-		authenticator = func(token string) (signal.Identity, error) {
-			claims, err := jwtSigner.ParseAccess(token)
+		authenticator = func(t string) (signal.Identity, error) {
+			// api_token（#54）：与 REST 同一条校验实现，先于 JWT 解析判定。
+			if id, handled, err := apiTokenIdentity(apiTokenSvc, t); handled {
+				if err != nil {
+					return signal.Identity{}, signal.ErrUnauthorized
+				}
+				return id, nil
+			}
+			claims, err := jwtSigner.ParseAccess(t)
 			if err != nil {
 				return signal.Identity{}, signal.ErrUnauthorized
 			}
 			return identityFromClaims(claims), nil
 		}
-		log.Println("WS 鉴权: JWT")
+		log.Println("WS 鉴权: JWT + api_token")
 	}
 	// 权限判定唯一实例（#35 B3）：REST 与 WS 共用，写后失效（InvalidateServer）
 	// 才能同时作用于两侧的缓存——两个实例会各自缓存、互相看不到失效。
@@ -278,20 +296,30 @@ func main() {
 	// 0/缺省 = 构建期 ProtocolVersionMax；调小可临时挡住过新的客户端区间。
 	hub.SetProtoMax(envInt("LITETALK_PROTOCOL_MAX", 0))
 
-	// TURN 短期凭证签发（coturn use-auth-secret，§5.4）
+	// TURN 短期凭证签发（coturn use-auth-secret，§5.4）。api_token（#54）同样受理：
+	// 凭证只含 uid 身份（scope 不参与），入房权限由 channel.join 的 authz 判定把关。
 	var rtcAuth rtcapi.UserFromToken
 	if devAuth {
-		rtcAuth = func(token string) (string, error) {
-			if !strings.HasPrefix(token, "dev-") {
-				if claims, err := jwtSigner.ParseAccess(token); err == nil {
+		rtcAuth = func(t string) (string, error) {
+			if !strings.HasPrefix(t, token.PlainPrefix) {
+				if claims, err := jwtSigner.ParseAccess(t); err == nil {
 					return strconv.FormatInt(claims.UserID, 10), nil
 				}
+			} else if p, err := apiTokenSvc.Verify(context.Background(), t); err == nil {
+				return strconv.FormatInt(p.UserID, 10), nil
 			}
-			return devUserID(token)
+			return devUserID(t)
 		}
 	} else {
-		rtcAuth = func(token string) (string, error) {
-			claims, err := jwtSigner.ParseAccess(token)
+		rtcAuth = func(t string) (string, error) {
+			if strings.HasPrefix(t, token.PlainPrefix) {
+				p, err := apiTokenSvc.Verify(context.Background(), t)
+				if err != nil {
+					return "", err
+				}
+				return strconv.FormatInt(p.UserID, 10), nil
+			}
+			claims, err := jwtSigner.ParseAccess(t)
 			if err != nil {
 				return "", err
 			}
@@ -382,6 +410,8 @@ func main() {
 		RTCAuth: rtcAuth,
 		// 权限判定与信令 hub 共用同一实例（#35 B3）。
 		Authz: authzInst,
+		// api_token 校验与 WS 握手共用同一实例（#54，一条实现）。
+		Tokens: apiTokenSvc,
 		// 附件存储与校验（#41 B2）：上传/下载端点；MaxDimension 显式收紧到 4096。
 		Blob: blobStore,
 		Upload: attachment.Config{
@@ -606,6 +636,25 @@ func identityFromClaims(claims *auth.Claims) signal.Identity {
 func devUserID(token string) (string, error) {
 	id, err := signal.DevAuthenticator(token)
 	return id.UserID, err
+}
+
+// apiTokenIdentity ltk_ 前缀令牌 → 信令身份（#54）：与 REST 中间件共用同一条
+// token.Service.Verify（一条实现，不两套）。SkipSessionCheck——api_token 没有
+// 会话概念，吊销/过期即失效，无 sid 可比对。handled=false 表示不是 ltk_ 令牌
+// （交给调用方走 JWT/dev 路径）；handled=true 且 err 非空即校验失败（401 口径）。
+func apiTokenIdentity(svc *token.Service, plain string) (id signal.Identity, handled bool, err error) {
+	if !strings.HasPrefix(plain, token.PlainPrefix) {
+		return signal.Identity{}, false, nil
+	}
+	p, verr := svc.Verify(context.Background(), plain)
+	if verr != nil {
+		return signal.Identity{}, true, verr
+	}
+	return signal.Identity{
+		UserID:           strconv.FormatInt(p.UserID, 10),
+		Username:         p.Nickname,
+		SkipSessionCheck: true,
+	}, true, nil
 }
 
 // ---- 环境变量小工具 ----
