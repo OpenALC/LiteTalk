@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OpenALC/LiteTalk/server/internal/auth"
 	"github.com/OpenALC/LiteTalk/server/internal/blob"
 )
 
@@ -27,6 +28,9 @@ func clearConfigEnv(t *testing.T) {
 		"LITETALK_S3_ENDPOINT", "LITETALK_S3_BUCKET", "LITETALK_S3_ACCESS_KEY",
 		"LITETALK_S3_SECRET_KEY", "LITETALK_S3_REGION", "LITETALK_S3_USE_SSL",
 		"LITETALK_S3_PATH_STYLE",
+		"LITETALK_OIDC_ISSUER", "LITETALK_OIDC_CLIENT_ID",
+		"LITETALK_OIDC_CLIENT_SECRET", "LITETALK_OIDC_REDIRECT_URL",
+		"LITETALK_OIDC_SCOPES",
 	} {
 		t.Setenv(k, "")
 	}
@@ -349,10 +353,22 @@ func TestConfigValidate(t *testing.T) {
 	}
 	cfg.sfuIP = "8.8.8.8"
 
-	// auth mode 只认 full/simple。
+	// auth mode 只认 full/simple/oidc（#54 扩到三种）。
 	cfg.authMode = "weird"
 	if err := cfg.validate(true); err == nil {
 		t.Fatal("非法 auth mode 应拒绝")
+	}
+	// 仅 OIDC 模式必须配齐 IdP，否则没有任何登录途径（#54）。
+	cfg.authMode = "oidc"
+	if err := cfg.validate(true); err == nil || !strings.Contains(err.Error(), "LITETALK_OIDC") {
+		t.Fatalf("oidc 模式缺 IdP 配置应拒绝，实际 %v", err)
+	}
+	cfg.oidc = auth.OIDCConfig{
+		Issuer: "https://sso.example.com", ClientID: "litetalk",
+		ClientSecret: "s3cret", RedirectURL: "https://app.example.com/oidc/callback",
+	}
+	if err := cfg.validate(true); err != nil {
+		t.Fatalf("oidc 模式配置齐备应放行: %v", err)
 	}
 	cfg.authMode = "full"
 
@@ -366,6 +382,40 @@ func TestConfigValidate(t *testing.T) {
 	cfg.domain = "voice.example.com"
 	if err := cfg.validate(true); err != nil {
 		t.Fatalf("合法域名应放行: %v", err)
+	}
+}
+
+// TestParseOIDCConfig LITETALK_OIDC_*（#54）：全空 = 功能关闭；写一半拒绝启动；
+// scopes 空回落标准三件。
+func TestParseOIDCConfig(t *testing.T) {
+	clearConfigEnv(t)
+
+	// 全空 = 关闭（零值，不报错）。
+	cfg, err := parseOIDCConfig()
+	if err != nil || cfg.Complete() {
+		t.Fatalf("全空应关闭无错: %+v err=%v", cfg, err)
+	}
+	// 写一半：缺 REDIRECT_URL 直接报错（fail-fast，不带病运行）。
+	t.Setenv("LITETALK_OIDC_ISSUER", "https://sso.example.com")
+	t.Setenv("LITETALK_OIDC_CLIENT_ID", "litetalk")
+	t.Setenv("LITETALK_OIDC_CLIENT_SECRET", "s3cret")
+	if _, err := parseOIDCConfig(); err == nil || !strings.Contains(err.Error(), "LITETALK_OIDC_REDIRECT_URL") {
+		t.Fatalf("缺 REDIRECT_URL 应报错，实际 %v", err)
+	}
+	// 配齐：完整且 scopes 回落默认三件。
+	t.Setenv("LITETALK_OIDC_REDIRECT_URL", "https://app.example.com/oidc/callback")
+	cfg, err = parseOIDCConfig()
+	if err != nil || !cfg.Complete() {
+		t.Fatalf("配齐应完整: %+v err=%v", cfg, err)
+	}
+	if len(cfg.Scopes) != 3 || cfg.Scopes[0] != "openid" {
+		t.Fatalf("scopes 空应回落默认三件: %v", cfg.Scopes)
+	}
+	// scopes 显式配置：逗号分隔。
+	t.Setenv("LITETALK_OIDC_SCOPES", "openid,email")
+	cfg, err = parseOIDCConfig()
+	if err != nil || len(cfg.Scopes) != 2 || cfg.Scopes[1] != "email" {
+		t.Fatalf("scopes 显式配置应生效: %v err=%v", cfg.Scopes, err)
 	}
 }
 
