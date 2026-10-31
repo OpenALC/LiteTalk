@@ -541,6 +541,14 @@ func TestChannelAudioBroadcast(t *testing.T) {
 		t.Fatalf("广播收件人不应为空: %+v", ev)
 	}
 
+	// 再提交同一份音质（Set 了但最终值没变）不广播（#117 兜底）：客户端已经按
+	// 快照差下发，这里挡住重复提交同一份配置的旧客户端/第三方调用方。
+	doJSON(t, rt, http.MethodPatch, voicePath, w.owner,
+		map[string]any{"audio_bitrate_kbps": 32, "audio_frame_ms": 10}, http.StatusOK)
+	if got := len(w.hub.audioLog()); got != 1 {
+		t.Fatalf("最终值未变不应重复广播，实际累计 %d", got)
+	}
+
 	// 仅改名不广播。
 	doJSON(t, rt, http.MethodPatch, voicePath, w.owner,
 		map[string]any{"name": "改名"}, http.StatusOK)
