@@ -263,8 +263,8 @@ const mockApp: GoApp = {
   async SetAudioSettings() {},
   // 浏览器预览没有 C++ APM，但保持 Beta 区可见可操作（落盘为 no-op）。
   async APMSupported() { return true },
-  // 悬浮层 mock：默认关闭；浏览器预览没有原生窗口，仍报告支持以便联调 UI，
-  // 保存为 no-op（真实平台能力由 Go 侧 Supported 报告）。
+  // 浏览器预览没有原生窗口：仍报告支持以便联调 UI，保存为 no-op，
+  // 也不会有 sys:overlay 回滚事件（真实能力由 Go 侧 Supported 报告）。
   async WindowOverlaySupported() { return true },
   async GetWindowOverlaySettings() { return { enabled: false } },
   async SetWindowOverlaySettings() {},

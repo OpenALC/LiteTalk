@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { useWindowOverlay, type WindowOverlayBridge } from './windowOverlay'
+import { useWindowOverlay, type OverlayState, type WindowOverlayBridge } from './windowOverlay'
 
 function fakeBridge(over: Partial<WindowOverlayBridge> = {}): WindowOverlayBridge {
   return {
@@ -45,6 +45,8 @@ describe('useWindowOverlay', () => {
     const err = await o.setEnabled(true)
     expect(err).toBe('disk full')
     expect(o.enabled.value).toBe(false)
+    // 失败原因同时挂到 note，设置页在没有 toast 时也能看到（#117）。
+    expect(o.note.value).toBe('disk full')
   })
 
   it('保存成功保持勾选', async () => {
@@ -66,5 +68,53 @@ describe('useWindowOverlay', () => {
     await o.load()
     expect(o.supported.value).toBe(false)
     expect(o.enabled.value).toBe(false)
+  })
+
+  // #117：ServiceStartup 里启用失败时 Go 侧回滚配置并推 sys:overlay，
+  // 开关必须跟着变回关闭并给出原因。
+  it('启动失败回滚事件把开关关掉并记录原因', async () => {
+    const holder: { emit: ((s: OverlayState) => void) | null } = { emit: null }
+    const bridge = fakeBridge({
+      GetWindowOverlaySettings: vi.fn(async () => ({ enabled: true })),
+      Subscribe: vi.fn((cb: (s: OverlayState) => void) => {
+        holder.emit = cb
+        return () => {
+          holder.emit = null
+        }
+      }),
+    })
+    const o = useWindowOverlay(bridge)
+    const cancel = await o.load()
+    expect(o.enabled.value).toBe(true)
+    expect(bridge.Subscribe).toHaveBeenCalledTimes(1)
+
+    holder.emit?.({ enabled: false, error: 'overlay: CreateWindowExW: 拒绝访问' })
+    expect(o.enabled.value).toBe(false)
+    expect(o.note.value).toContain('CreateWindowExW')
+
+    // 取消订阅后事件不再影响状态。
+    cancel()
+    expect(holder.emit).toBeNull()
+  })
+
+  it('平台不支持时回滚事件也保持关闭', async () => {
+    const holder: { emit: ((s: OverlayState) => void) | null } = { emit: null }
+    const bridge = fakeBridge({
+      WindowOverlaySupported: vi.fn(async () => false),
+      Subscribe: vi.fn((cb: (s: OverlayState) => void) => {
+        holder.emit = cb
+        return () => {}
+      }),
+    })
+    const o = useWindowOverlay(bridge)
+    await o.load()
+    holder.emit?.({ enabled: true })
+    expect(o.enabled.value).toBe(false)
+  })
+
+  it('没有 Subscribe 时 load 返回可安全调用的取消函数', async () => {
+    const o = useWindowOverlay(fakeBridge())
+    const cancel = await o.load()
+    expect(() => cancel()).not.toThrow()
   })
 })

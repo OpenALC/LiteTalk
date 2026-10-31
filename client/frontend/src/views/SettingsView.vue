@@ -17,7 +17,7 @@ import {
 } from '../utils/hotkeySpec'
 import { cleanErrorText } from '../utils/errorText'
 import { withAudioDefaults } from '../utils/audioSettings'
-import { useWindowOverlay } from '../utils/windowOverlay'
+import { useWindowOverlay, type OverlayState } from '../utils/windowOverlay'
 import ServerConnPanel from '../components/ServerConnPanel.vue'
 import NetworkDiagPanel from '../components/NetworkDiagPanel.vue'
 import Toast from '../components/Toast.vue'
@@ -68,6 +68,8 @@ const lvlMark = computed(() =>
 const lvlText = computed(() =>
   lvl.value.rms <= -59.5 ? '—' : `${lvl.value.rms.toFixed(0)} dB`)
 let cancelLevel: (() => void) | null = null
+// sys:overlay 订阅的取消函数（悬浮层启动失败回滚，#117）。
+let cancelOverlay: (() => void) | null = null
 
 // LevelBridge Go 侧 Start/StopLevelMonitor（bridge.ts 类型未含，本地扩展；
 // 浏览器 mock 桩无此方法 → 可选调用静默跳过）。
@@ -118,13 +120,21 @@ async function setEnableAPM(on: boolean) {
 }
 
 // 游戏内悬浮层（#47，Beta，仅 Windows）：默认关闭；平台不支持时开关禁用。
-// 保存失败回滚勾选（逻辑在 useWindowOverlay 内，见单测）。
+// 保存失败回滚勾选（逻辑在 useWindowOverlay 内，见单测）。启动失败由 Go 侧
+// 回滚配置并推 sys:overlay，这里同步开关与提示（#117）。
 const {
   enabled: overlayEnabled,
   supported: overlaySupported,
+  note: overlayNote,
   load: loadWindowOverlay,
   setEnabled: applyWindowOverlay,
-} = useWindowOverlay(goApp())
+} = useWindowOverlay({
+  // 每次调用现取 goApp()：原生标志可能在 setup 之后才就绪，提前缓存会拿到桩。
+  WindowOverlaySupported: () => goApp().WindowOverlaySupported(),
+  GetWindowOverlaySettings: () => goApp().GetWindowOverlaySettings(),
+  SetWindowOverlaySettings: (s) => goApp().SetWindowOverlaySettings(s),
+  Subscribe: (cb) => eventsOn('sys:overlay', (d) => cb(d as OverlayState)),
+})
 async function setWindowOverlay(on: boolean) {
   const err = await applyWindowOverlay(on)
   if (err) toast.value?.show(`悬浮层设置保存失败：${err}`, true)
@@ -153,7 +163,8 @@ onMounted(async () => {
   audio.value = withAudioDefaults(await goApp().GetAudioSettings())
   apmSupported.value = await goApp().APMSupported().catch(() => false)
   if (!apmSupported.value) audio.value.enable_apm = false
-  await loadWindowOverlay()
+  // 启动失败回滚事件（sys:overlay）：取消函数随组件卸载注销。
+  cancelOverlay = await loadWindowOverlay()
   // 热键读取单独兜异常：Go 侧绑定缺失时只回落默认值，不连带弄崩下面设备列表的加载。
   try {
     hk.value = await goApp().GetHotkeySettings()
@@ -238,6 +249,8 @@ async function testMic() {
 onUnmounted(() => {
   cancelLevel?.()
   cancelLevel = null
+  cancelOverlay?.()
+  cancelOverlay = null
   stopRecord()
   cancelHkAvail?.()
   cancelHkAvail = null
@@ -608,6 +621,9 @@ function bindRecording(spec: string) {
         <p class="s-note">显示正在说话的成员；独占全屏游戏可能不可见</p>
         <p v-if="!overlaySupported" class="s-note s-warn">
           <CircleAlert :size="13" />仅 Windows 支持游戏内悬浮层
+        </p>
+        <p v-else-if="overlayNote" class="s-note s-warn">
+          <CircleAlert :size="13" />游戏内悬浮层启用失败，已关闭：{{ overlayNote }}
         </p>
       </section>
 

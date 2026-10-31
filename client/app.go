@@ -2421,16 +2421,36 @@ func (a *App) SetWindowOverlaySettings(s config.OverlaySettings) error {
 }
 
 // startWindowOverlay ServiceStartup 调用：按持久化配置启动（Beta 默认关闭）。
-// 平台不支持或窗口创建失败只记日志，不影响主窗口可用性。
+//
+// 启动失败与 APM / DRED 同口径回滚：把 window_overlay.enabled 落盘改回 false，
+// 再把错误经 sys:overlay 事件推给前端——否则用户下次启动仍会失败却没有任何
+// 提示，设置页还显示「已开启」（#117）。启动阶段前端可能尚未订阅，事件可能
+// 丢失，因此 GetWindowOverlaySettings 读到的已是回滚后的 false，UI 首屏即一致。
 func (a *App) startWindowOverlay() {
 	a.overlayMu.Lock()
 	defer a.overlayMu.Unlock()
-	if !overlay.Supported() || !a.cfg.GetWindowOverlaySettings().Enabled {
+	if !a.cfg.GetWindowOverlaySettings().Enabled {
+		return
+	}
+	if !overlay.Supported() {
+		// 持久化值来自别的平台（配置随账号/机器同步）：本平台无能为力，
+		// 保留原值不当作失败，只记日志。
 		return
 	}
 	if err := overlay.Start(a.overlaySnapshot); err != nil {
-		log.Printf("overlay start: %v", err)
+		log.Printf("overlay start: %v（已回滚 window_overlay.enabled）", err)
+		rb := config.OverlaySettings{Enabled: false}
+		if rbErr := a.cfg.SetWindowOverlaySettings(rb); rbErr != nil {
+			log.Printf("rollback window_overlay: %v", rbErr)
+		}
+		a.emit("sys:overlay", OverlayStateEvent{Enabled: false, Error: err.Error()})
 	}
+}
+
+// OverlayStateEvent sys:overlay 事件载荷：启动失败时前端据此提示并关掉开关。
+type OverlayStateEvent struct {
+	Enabled bool   `json:"enabled"`
+	Error   string `json:"error,omitempty"`
 }
 
 // stopWindowOverlay 关闭悬浮层（ServiceShutdown 调用，幂等）。
