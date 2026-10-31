@@ -16,6 +16,7 @@ import (
 	"github.com/OpenALC/LiteTalk/server/internal/blob"
 	"github.com/OpenALC/LiteTalk/server/internal/linkpreview"
 	"github.com/OpenALC/LiteTalk/server/internal/mailer"
+	"github.com/OpenALC/LiteTalk/server/internal/push"
 	"github.com/OpenALC/LiteTalk/server/internal/rtcapi"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
 	"github.com/OpenALC/LiteTalk/server/internal/token"
@@ -116,6 +117,9 @@ type Server struct {
 	kv store.KV
 	// linkPreview 链接预览抓取器（nil=功能关闭，端点统一 404 no_preview）。
 	linkPreview LinkPreviewFetcher
+	// push 移动推送派发器（#53）。nil = 推送关闭：/config 报 push_enabled=false，
+	// 触发点全部短路（设备注册端点仍可用，注册数据等开启后即生效）。
+	push *push.Broker
 }
 
 // Config 构造配置。
@@ -169,6 +173,9 @@ type Config struct {
 	// LinkPreview 链接预览抓取器（#42 B4）。生产由 cmd/server 按
 	// LITETALK_LINK_PREVIEW* 构造；nil = 功能关闭，端点一律 404 no_preview。
 	LinkPreview LinkPreviewFetcher
+	// Push 移动推送派发器（#53）。生产由 cmd/server 按 LITETALK_PUSH_* 构造；
+	// nil = 推送关闭（/config push_enabled=false，触发点短路，零后台 goroutine）。
+	Push *push.Broker
 }
 
 // New 构造 API Server。
@@ -224,6 +231,7 @@ func New(cfg Config) *Server {
 		upload:            normalizeUploadConfig(cfg.Upload),
 		kv:                cfg.KV,
 		linkPreview:       cfg.LinkPreview,
+		push:              cfg.Push,
 	}
 }
 

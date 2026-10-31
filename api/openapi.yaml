@@ -2127,6 +2127,57 @@ paths:
           $ref: '#/components/responses/RateLimited'
         default:
           $ref: '#/components/responses/Internal'
+  /api/v1/devices:
+    get:
+      operationId: listDevices
+      summary: 列出自己的推送设备
+      description: >
+        当前用户已注册的移动推送设备（#53）。响应不含 push_token（生产凭据等价物，
+        一律不回显）。code：401 unauthorized；5xx internal。
+      tags: [devices]
+      responses:
+        '200':
+          description: 设备列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PushDeviceList'
+        default:
+          $ref: '#/components/responses/Internal'
+    post:
+      operationId: registerDevice
+      summary: 注册推送设备（同 push_token 幂等更新）
+      description: >
+        幂等：同一用户重复上报同一 push_token 时更新 platform 与 last_seen（返回 200
+        与既有设备），新设备返回 201。频控键 push:reg:<uid>。
+        code：bad_device（platform 非法）、bad_token（push_token 非法）、bad_request、
+        too_large；429 rate_limited；5xx internal。
+      tags: [devices]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterDeviceRequest'
+      responses:
+        '200':
+          description: 设备已更新（重复注册）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PushDevice'
+        '201':
+          description: 设备已注册
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PushDevice'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Internal'
   /api/v1/tokens/{id}:
     delete:
       operationId: revokeToken
@@ -2150,6 +2201,32 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Internal'
+  /api/v1/devices/{id}:
+    delete:
+      operationId: deleteDevice
+      summary: 注销推送设备
+      description: >
+        只能删除自己的设备：他人设备与不存在的设备统一 404，不泄露存在性。
+        频控键 push:del:<uid>。code：bad_request（路径 ID 非法）；404 not_found；
+        429 rate_limited；5xx internal。
+      tags: [devices]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+      responses:
+        '200':
+          description: 已注销
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusOk'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
         '429':
@@ -2431,6 +2508,52 @@ components:
         bootstrap_required:
           type: boolean
           description: 管理员邀请码未消费（注册页提示等待管理员邀请）
+        push_enabled:
+          type: boolean
+          description: 移动推送已启用（LITETALK_PUSH_PROVIDER 配置了可用通道；false 时 /devices 仍可注册，仅不派发）
+    PushDevice:
+      type: object
+      title: PushDevice
+      description: 已注册的移动推送设备（#53）。不含 push_token——生产凭据等价物一律不回显。
+      required: [id, platform, created_at, last_seen_at]
+      properties:
+        id:
+          type: string
+          x-go-type: ID
+        platform:
+          type: string
+          enum: [ios, android]
+        created_at:
+          type: string
+          format: date-time
+          x-go-type: Time
+        last_seen_at:
+          type: string
+          format: date-time
+          x-go-type: Time
+    PushDeviceList:
+      type: object
+      title: PushDeviceList
+      required: [devices]
+      properties:
+        devices:
+          type: array
+          items:
+            $ref: '#/components/schemas/PushDevice'
+    RegisterDeviceRequest:
+      type: object
+      title: RegisterDeviceRequest
+      description: 设备注册（#53）。push_token 是推送通道设备凭据（FCM token / APNs token / ntfy topic）。
+      required: [platform, push_token]
+      properties:
+        platform:
+          type: string
+          enum: [ios, android]
+        push_token:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: 推送通道设备凭据；服务端只存不回显，日志一律打码。
     User:
       type: object
       title: User

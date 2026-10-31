@@ -31,6 +31,7 @@ import (
 	"github.com/OpenALC/LiteTalk/server/internal/bootstrap"
 	"github.com/OpenALC/LiteTalk/server/internal/linkpreview"
 	"github.com/OpenALC/LiteTalk/server/internal/mailer"
+	"github.com/OpenALC/LiteTalk/server/internal/push"
 	"github.com/OpenALC/LiteTalk/server/internal/rtcapi"
 	"github.com/OpenALC/LiteTalk/server/internal/sfu"
 	"github.com/OpenALC/LiteTalk/server/internal/signal"
@@ -358,6 +359,22 @@ func main() {
 	}, log.Default())
 	log.Printf("发信通道: %s", mailName)
 
+	// 移动推送（#53）：LITETALK_PUSH_PROVIDER 未配置 = 功能关闭——Noop、不启
+	// worker、零外部副作用，/config 报 push_enabled=false，触发点全部短路。
+	pusher, pushName := push.New(push.FromEnv())
+	log.Printf("推送通道: %s", pushName)
+	pushBroker := push.NewBroker(push.BrokerConfig{
+		Pusher: pusher,
+		Store:  st,
+		Online: hub, // 连接表实时在线判定 + 离线边沿（cleanup 挂钩）
+		Limits: limits,
+		Log:    log.Default(),
+	})
+	if pushBroker != nil {
+		hub.SetOfflineNotifier(pushBroker)
+		defer pushBroker.Close()
+	}
+
 	// 附件二进制存储（#41 B2）：local（默认，$DATA_DIR/uploads）或 S3 兼容对象存储。
 	// 只校验配置不探测连通性：S3 暂时不可达不应挡住整个服务启动。
 	blobStore, blobDriver, err := blob.New(cfg.upload, log.Default())
@@ -422,6 +439,8 @@ func main() {
 		// 链接预览（#42 B4）：KV 缓存 + 抓取器；关闭时 LinkPreview=nil。
 		KV:          kv,
 		LinkPreview: linkPreview,
+		// 移动推送派发器（#53）：nil = 关闭（见上方推送通道构造）。
+		Push: pushBroker,
 	})
 
 	mux := http.NewServeMux()

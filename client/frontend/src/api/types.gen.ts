@@ -1014,6 +1014,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/devices": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 列出自己的推送设备
+         * @description 当前用户已注册的移动推送设备（#53）。响应不含 push_token（生产凭据等价物， 一律不回显）。code：401 unauthorized；5xx internal。
+         */
+        get: operations["listDevices"];
+        put?: never;
+        /**
+         * 注册推送设备（同 push_token 幂等更新）
+         * @description 幂等：同一用户重复上报同一 push_token 时更新 platform 与 last_seen（返回 200 与既有设备），新设备返回 201。频控键 push:reg:<uid>。 code：bad_device（platform 非法）、bad_token（push_token 非法）、bad_request、 too_large；429 rate_limited；5xx internal。
+         */
+        post: operations["registerDevice"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/tokens/{id}": {
         parameters: {
             query?: never;
@@ -1029,6 +1053,26 @@ export interface paths {
          * @description 置 revoked_at，该令牌的下一次请求即 401（服务端不缓存校验结果）。 跨用户访问他人令牌与不存在同样返回 404（不可区分，避免枚举）。 重复吊销幂等（同样 200）。 code：bad_request；401；404 not_found；429 rate_limited；5xx internal。
          */
         delete: operations["revokeToken"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/devices/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * 注销推送设备
+         * @description 只能删除自己的设备：他人设备与不存在的设备统一 404，不泄露存在性。 频控键 push:del:<uid>。code：bad_request（路径 ID 非法）；404 not_found； 429 rate_limited；5xx internal。
+         */
+        delete: operations["deleteDevice"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1136,6 +1180,35 @@ export interface components {
             self_host: boolean;
             /** @description 管理员邀请码未消费（注册页提示等待管理员邀请） */
             bootstrap_required: boolean;
+            /** @description 移动推送已启用（LITETALK_PUSH_PROVIDER 配置了可用通道；false 时 /devices 仍可注册，仅不派发） */
+            push_enabled?: boolean;
+        };
+        /**
+         * PushDevice
+         * @description 已注册的移动推送设备（#53）。不含 push_token——生产凭据等价物一律不回显。
+         */
+        PushDevice: {
+            id: string;
+            /** @enum {string} */
+            platform: "ios" | "android";
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            last_seen_at: string;
+        };
+        /** PushDeviceList */
+        PushDeviceList: {
+            devices: components["schemas"]["PushDevice"][];
+        };
+        /**
+         * RegisterDeviceRequest
+         * @description 设备注册（#53）。push_token 是推送通道设备凭据（FCM token / APNs token / ntfy topic）。
+         */
+        RegisterDeviceRequest: {
+            /** @enum {string} */
+            platform: "ios" | "android";
+            /** @description 推送通道设备凭据；服务端只存不回显，日志一律打码。 */
+            push_token: string;
         };
         /**
          * User
@@ -3855,6 +3928,63 @@ export interface operations {
             default: components["responses"]["Internal"];
         };
     };
+    listDevices: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 设备列表 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PushDeviceList"];
+                };
+            };
+            default: components["responses"]["Internal"];
+        };
+    };
+    registerDevice: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RegisterDeviceRequest"];
+            };
+        };
+        responses: {
+            /** @description 设备已更新（重复注册） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PushDevice"];
+                };
+            };
+            /** @description 设备已注册 */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PushDevice"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Internal"];
+        };
+    };
     revokeToken: {
         parameters: {
             query?: never;
@@ -3878,6 +4008,33 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    deleteDevice: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 已注销 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StatusOk"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             429: components["responses"]["RateLimited"];
             default: components["responses"]["Internal"];

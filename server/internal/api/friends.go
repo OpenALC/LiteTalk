@@ -94,6 +94,8 @@ func (s *Server) CreateFriendRequest(ctx context.Context, request CreateFriendRe
 	if err := s.store.CreateFriendship(ctx, f); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
+	// 推送触发点（#53）：通知被请求方（离线判定/节流在 Broker worker，异步）。
+	s.notifyFriendRequest(ctx, target.ID, c.UserID, c.Nickname)
 	return CreateFriendRequest201JSONResponse{
 		Id: idOf(f.ID), Status: FriendEntryStatus(f.Status), Incoming: false,
 		// 新建的是 pending 关系：不回在线态（#11 P2）。
