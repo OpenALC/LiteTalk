@@ -28,45 +28,125 @@ const (
 	networkRecoverCooldown = 15 * time.Second
 )
 
-// networkSignature 计算本机网络接口签名：只关心「能用哪些地址出网」。
-// 忽略回环、down 与 link-local（后者每次切换都会变，不是有效通路）。
-// ok=false 表示枚举失败——本次采样作废，不能把瞬时错误当成「网络变了」。
-func networkSignature() (string, bool) {
-	ifaces, err := net.Interfaces()
-	if err != nil {
+// ifaceAddrs 一次接口枚举的纯数据快照。判定逻辑只吃这份快照，单测才能
+// 用判定表覆盖真实网卡枚举不到的形态（VPN、虚拟交换机、隐私地址轮换）。
+type ifaceAddrs struct {
+	name  string
+	up    bool
+	loop  bool
+	addrs []net.IP
+}
+
+// virtualIfacePrefixes 不参与出网的接口名前缀（已小写）。这些接口要么是
+// 本机内部通路（Hyper-V 虚拟交换机、容器网桥、WSL），要么是隧道型 VPN——
+// 它们的地址会随隧道重连、DHCP 租约和隐私地址轮换反复变化，纳进签名会让
+// 「网络没有真的变」也触发一次 PC 重建（#117）。
+//
+// 物理网卡名（Ethernet / Wi-Fi / en0 / eth0 / wlan0 / enp3s0 / ppp0）不与
+// 任何前缀相交；匹配是前缀式，因此 vEthernet (WSL) 这类带空格的名字也能
+// 命中 "vethernet"。
+var virtualIfacePrefixes = []string{
+	"vethernet", "virbr", "veth", "docker", "br-", "cni", "flannel",
+	"vmnet", "vboxnet", "lxc", "lxd", "hns", "wsl",
+	"tun", "tap", "utun", "wg", "wireguard", "openvpn", "vpn",
+	"tailscale", "zerotier", "hamachi", "clash", "mihomo",
+	"isatap", "teredo", "6to4", "npcap",
+}
+
+// isVirtualIface 判断接口名是否属于上表。大小写不敏感。
+func isVirtualIface(name string) bool {
+	n := strings.ToLower(name)
+	for _, p := range virtualIfacePrefixes {
+		if strings.HasPrefix(n, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// signatureAddr 把单个地址折算成签名分量。第二个返回值为 false 表示该地址
+// 与连通性无关，丢弃。
+//
+// IPv6 只取 /64 前缀：RFC 4941 隐私地址与 SLAAC 会在同一前缀下轮换接口
+// 标识符，按完整地址入签会让签名每隔几小时就变一次；前缀变化才是真正的
+// 网络变化。
+func signatureAddr(ip net.IP) (string, bool) {
+	if ip == nil || ip.IsLoopback() || ip.IsUnspecified() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() {
 		return "", false
 	}
+	if v4 := ip.To4(); v4 != nil {
+		return v4.String(), true
+	}
+	v6 := ip.To16()
+	if v6 == nil {
+		return "", false
+	}
+	mask := net.CIDRMask(64, 128)
+	return (&net.IPNet{IP: v6.Mask(mask), Mask: mask}).String(), true
+}
+
+// signatureFrom 由接口快照算签名：只保留 up、非回环、非虚拟接口上的有效
+// 全局地址，按接口名与地址排序后拼成稳定字符串。没有任何可用接口时返回
+// 空串——这是合法状态（离网），调用方照常按「签名变了」处理。
+func signatureFrom(ifaces []ifaceAddrs) string {
 	entries := make([]string, 0, len(ifaces))
 	for _, ifi := range ifaces {
-		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagLoopback != 0 {
+		if !ifi.up || ifi.loop || isVirtualIface(ifi.name) {
 			continue
 		}
-		addrs, err := ifi.Addrs()
-		if err != nil {
-			continue
-		}
-		ips := make([]string, 0, len(addrs))
-		for _, a := range addrs {
-			var ip net.IP
-			switch v := a.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-			if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		ips := make([]string, 0, len(ifi.addrs))
+		seen := make(map[string]struct{}, len(ifi.addrs))
+		for _, ip := range ifi.addrs {
+			s, ok := signatureAddr(ip)
+			if !ok {
 				continue
 			}
-			ips = append(ips, ip.String())
+			if _, dup := seen[s]; dup {
+				continue
+			}
+			seen[s] = struct{}{}
+			ips = append(ips, s)
 		}
 		if len(ips) == 0 {
 			continue
 		}
 		sort.Strings(ips)
-		entries = append(entries, ifi.Name+"="+strings.Join(ips, ","))
+		entries = append(entries, ifi.name+"="+strings.Join(ips, ","))
 	}
 	sort.Strings(entries)
-	return strings.Join(entries, ";"), true
+	return strings.Join(entries, ";")
+}
+
+// networkSignature 采样真实接口列表并算签名。ok=false 表示枚举失败——本次
+// 采样作废，不能把瞬时错误当成「网络变了」。
+func networkSignature() (string, bool) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", false
+	}
+	snap := make([]ifaceAddrs, 0, len(ifaces))
+	for _, ifi := range ifaces {
+		s := ifaceAddrs{
+			name: ifi.Name,
+			up:   ifi.Flags&net.FlagUp != 0,
+			loop: ifi.Flags&net.FlagLoopback != 0,
+		}
+		addrs, err := ifi.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			switch v := a.(type) {
+			case *net.IPNet:
+				s.addrs = append(s.addrs, v.IP)
+			case *net.IPAddr:
+				s.addrs = append(s.addrs, v.IP)
+			}
+		}
+		snap = append(snap, s)
+	}
+	return signatureFrom(snap), true
 }
 
 // networkWatcher 接口签名轮询器。时间源与采样函数可注入，便于单测。

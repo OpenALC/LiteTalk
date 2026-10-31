@@ -268,8 +268,8 @@ const mockApp: GoApp = {
   async APMSupported() { return true },
   // 浏览器预览没有真实编码器：报告支持，让 DRED 开关保持可操作（落盘为 no-op）。
   async DREDSupported() { return true },
-  // 悬浮层 mock：默认关闭；浏览器预览没有原生窗口，仍报告支持以便联调 UI，
-  // 保存为 no-op（真实平台能力由 Go 侧 Supported 报告）。
+  // 浏览器预览没有原生窗口：仍报告支持以便联调 UI，保存为 no-op，
+  // 也不会有 sys:overlay 回滚事件（真实能力由 Go 侧 Supported 报告）。
   async WindowOverlaySupported() { return true },
   async GetWindowOverlaySettings() { return { enabled: false } },
   async SetWindowOverlaySettings() {},

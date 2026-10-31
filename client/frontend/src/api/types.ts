@@ -185,6 +185,9 @@ export interface NetworkDiagProbe {
   latency_ms: number
   version?: string
   address?: string
+  // candidate 实际成功的候选（host:port，不含凭证）：多候选回退时标出
+  // 是哪一条可用（#117）。
+  candidate?: string
   note?: string
   error?: string
 }
