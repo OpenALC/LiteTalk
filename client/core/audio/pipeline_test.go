@@ -716,6 +716,56 @@ func TestOpusDREDToggle(t *testing.T) {
 	}
 }
 
+// TestDREDUnsupportedDoesNotReportEnabled 不支持 DRED 的编码器（旧库/stub）上
+// 开启必须返回错误且不把配置记成「已开启」（#117）：设置页据此回滚开关。
+// 用可替换的 ctl 钩子模拟不支持的库——Windows/Linux 的真库都支持 DRED，
+// 不能靠 t.Skip 掩盖（平台能力缺失应让测试失败，而不是跳过）。
+func TestDREDUnsupportedDoesNotReportEnabled(t *testing.T) {
+	p := newLoopbackPipeline(t, func(c *PipelineConfig) { c.DSP.Denoise = false })
+	if !p.DREDActive() {
+		t.Fatal("测试前置：真库上 DRED 应已启用")
+	}
+
+	prev := dredCtl
+	dredCtl = func(*codec.Encoder, int) error { return codec.ErrUnsupportedPlatform }
+	t.Cleanup(func() { dredCtl = prev })
+
+	if err := p.SetOpusDRED(true); err == nil {
+		t.Fatal("不支持的库上开启 DRED 必须返回错误")
+	}
+	if p.DREDActive() {
+		t.Fatal("开启失败后 DREDActive 必须为 false")
+	}
+	if p.opus.DRED == nil || *p.opus.DRED {
+		t.Fatalf("开启失败后生效配置不应显示已开启: %+v", p.opus.DRED)
+	}
+	// 关闭方向永远成功（不支持时本来就是关闭态）。
+	if err := p.SetOpusDRED(false); err != nil {
+		t.Fatalf("关闭 DRED 不应报错: %v", err)
+	}
+}
+
+// TestDREDSupported 能力探测（#117）：与真编码器的 SetDRED 结果一致，且重复
+// 调用返回同一结果（探测结果缓存）。
+func TestDREDSupported(t *testing.T) {
+	if !codec.Supported() {
+		t.Fatal("Windows/Linux 上 codec 必须可用")
+	}
+	enc, err := codec.NewEncoder(SampleRate, 1, codec.AppVoIP)
+	if err != nil {
+		t.Fatalf("NewEncoder: %v", err)
+	}
+	want := enc.SetDRED(DREDDurationFrames) == nil
+	enc.Close()
+
+	if got := DREDSupported(); got != want {
+		t.Fatalf("DREDSupported() = %v, want %v（应等于真编码器的 SetDRED 结果）", got, want)
+	}
+	if DREDSupported() != DREDSupported() {
+		t.Fatal("DREDSupported 同一进程内结果必须稳定")
+	}
+}
+
 // TestFrameMS10 10ms 帧长（#46）：每个 10ms 帧单独编码，包数 = 帧数，
 // 解码返回 480 采样；切回 20ms 恢复两帧一包。
 func TestFrameMS10(t *testing.T) {
