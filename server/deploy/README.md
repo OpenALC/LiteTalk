@@ -214,11 +214,16 @@ sudo systemctl start litetalk
   ```bash
   sudo -u www /www/wwwroot/LiteTalk/update.sh --tag v1.6.2-alpha --allow-prerelease   # 手工升级
   sudo -u www /www/wwwroot/LiteTalk/update.sh --tag v1.6.2-alpha --dry-run --allow-prerelease  # 只校验不落地
+  sudo -u www /www/wwwroot/LiteTalk/update.sh --tag latest --allow-prerelease         # 跟到通道内最新
   ```
 
   用 `sudo -u www`（服务用户）执行：root 落下的 `state.json`/锁文件属主会让以 www 运行的
   更新器读不到状态、拿不到锁（EACCES）。退出码：0 成功、1 更新失败（已回滚）、2 参数错误、
   **75 已有更新在运行**（webhook 或另一个 `--once` 持锁，等它结束再重试）。
+
+  `latest` 按 **semver 取通道内最高**（不是 release 列表第一条：补发的旧版本 tag 会排在最前），
+  并且与 webhook 同一条防降级闸——解析结果不新于已装版本时只打印"已是最新"并 **退出 0**，
+  不下载、不替换、不写状态。显式指定 `--tag vX.Y.Z` 不受此闸限制，可用来手工回退。
 
 ## 8. 一键安装（#97）
 

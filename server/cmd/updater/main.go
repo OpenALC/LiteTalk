@@ -95,6 +95,11 @@ func runOnce(cfg updater.Config, tag string, logger *log.Logger) int {
 		logger.Printf("更新失败 tag=%s 回滚=%v 耗时=%s: %v", res.Tag, res.RolledBack, res.Duration.Round(time.Millisecond), err)
 		return 1
 	}
+	// latest 不新于已装版本：已是最新，不算失败也不改状态，退出码 0（cron/SSH 兜底不算错）
+	if res.Skipped {
+		logger.Printf("已是最新 tag=%s，未更新", res.Tag)
+		return 0
+	}
 	logger.Printf("更新完成 tag=%s 校验和=%s 耗时=%s%s", res.Tag, res.Checksum,
 		res.Duration.Round(time.Millisecond), dryNote(cfg))
 	return 0

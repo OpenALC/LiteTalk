@@ -129,6 +129,43 @@ verify_archive() {
   return 0
 }
 
+# pick_highest_tag <每行一个 tag> <allow_prerelease 0|1>：按 semver 取最高，打印结果（无则空）。
+# 列表按发布时间倒序，补发旧版本（例如打包失败后发的修复 tag）会排在真正最新版之前，
+# 所以不能取第一条：先按通道与形态过滤，再按 semver 比较取最高（与 ResolveLatest 同口径）。
+# 比较用 awk 归一成整数：major*1e9 + minor*1e6 + patch*1e3 + 后缀权重，
+# 后缀权重 alpha<beta<rc<正式版，与 updater 的 pre 常量一致。
+pick_highest_tag() {
+  local list="$1" allow_pre="$2"
+  printf '%s\n' "$list" | awk -v allow_pre="$allow_pre" '
+    function pre_weight(suf) {
+      if (suf == "alpha") return 0
+      if (suf == "beta") return 1
+      if (suf == "rc") return 2
+      return -1                     # 未知后缀：不参与比较
+    }
+    {
+      tag = $0
+      if (tag !~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc))?$/) next
+      pre = 3                       # 3 = 正式版
+      body = tag
+      i = index(tag, "-")
+      if (i > 0) {
+        pre = pre_weight(substr(tag, i + 1))
+        if (pre < 0) next
+        body = substr(tag, 1, i - 1)
+      }
+      if (pre != 3 && allow_pre != 1) next
+      sub(/^v/, "", body)
+      n = split(body, p, ".")
+      if (n != 3) next
+      key = (p[1] + 0) * 1000000000 + (p[2] + 0) * 1000000 + (p[3] + 0) * 1000 + pre
+      # 严格大于才替换：同版本号保留列表里先出现的（发布时间更近）
+      if (!seen || key > best_key) { best_key = key; best = tag; seen = 1 }
+    }
+    END { if (seen) print best }
+  '
+}
+
 if [ "${LITETALK_INSTALL_LIB:-0}" = 1 ]; then
   return 0
 fi
@@ -173,24 +210,17 @@ if [ "$VERSION" != "latest" ] && ! printf '%s' "$VERSION" | grep -Eq "$TAG_RE"; 
   echo "版本 tag 不符合规范: $VERSION" >&2; exit 2
 fi
 
-# ---- 解析 latest：用 releases 列表（releases/latest 不含预发布），按通道策略过滤 ----
+# ---- 解析 latest：用 releases 列表（releases/latest 不含预发布），通道过滤后取最高版本 ----
 if [ "$VERSION" = "latest" ]; then
   log "解析最新发布（通道: $([ "$ALLOW_PRERELEASE" = 1 ] && echo '含预发布' || echo '仅正式版')）"
   tags="$(curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=20" \
     | grep -o '"tag_name": *"[^"]*"' | sed 's/.*"\(v[^"]*\)"/\1/' || true)"
-  VERSION=""
-  for t in $tags; do
-    printf '%s' "$t" | grep -Eq "$TAG_RE" || continue
-    if [ "$ALLOW_PRERELEASE" != 1 ] && printf '%s' "$t" | grep -q '-'; then
-      continue
-    fi
-    VERSION="$t"
-    break
-  done
+  VERSION="$(pick_highest_tag "$tags" "$ALLOW_PRERELEASE")"
   if [ -z "$VERSION" ]; then
     echo "没有符合通道策略的 release（预发布需加 --prerelease）" >&2
     exit 1
   fi
+  log "latest 解析为 $VERSION"
 fi
 # 显式指定的预发布同样要 --prerelease 放行（与更新器通道闸一致）
 if [ "$ALLOW_PRERELEASE" != 1 ] && printf '%s' "$VERSION" | grep -q '-'; then

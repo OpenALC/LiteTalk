@@ -134,7 +134,41 @@ echo x >"$d/lit etalk-updater"
 tar -C "$d" -czf "$WORK/space.tgz" litetalk-server update.sh "lit etalk-updater"
 expect_reject "带空格的成员名" "$WORK/space.tgz" "非法成员"
 
-# ---- 10. --dir 含空白：必须 reject（路径会原样写进 systemd 的 ExecStart）----
+# ---- 10. latest 解析：列表顺序打乱时取 semver 最高（与 ResolveLatest 同口径）----
+expect_pick() {
+  local what="$1" list="$2" allow="$3" want="$4" got
+  got="$(pick_highest_tag "$list" "$allow")"
+  if [ "$got" = "$want" ]; then
+    ok "$what（$got）"
+  else
+    ng "$what（得到「$got」，want「$want」）"
+  fi
+}
+
+# 补发旧版本排在列表最前：朴素"取第一条"会选错
+expect_pick "latest 取最高（乱序）" "v1.5.1-alpha
+v1.10.0-alpha
+v1.9.3-alpha
+v1.6.0-alpha" 1 "v1.10.0-alpha"
+expect_pick "latest 按数值而非字符串比较" "v1.9.0
+v1.10.0
+v1.2.0" 0 "v1.10.0"
+expect_pick "正式版高于同号预发布" "v1.10.0-alpha
+v1.10.0
+v1.10.0-rc" 1 "v1.10.0"
+expect_pick "rc 高于 beta 高于 alpha" "v1.10.0-beta
+v1.10.0-rc
+v1.10.0-alpha" 1 "v1.10.0-rc"
+expect_pick "未放行预发布时回落正式版" "v2.0.0-alpha
+v1.6.2
+v1.6.0" 0 "v1.6.2"
+expect_pick "全部预发布且未放行得到空" "v2.0.0-alpha" 0 ""
+expect_pick "白名单外 tag 不参与" "nightly
+v1.2.3-rc.1
+v1.2.3" 1 "v1.2.3"
+expect_pick "空列表得到空" "" 1 ""
+
+# ---- 11. --dir 含空白：必须 reject（路径会原样写进 systemd 的 ExecStart）----
 # 直接跑安装脚本的参数闸：这些检查在 root/Linux 判定之前，--dry-run 又跳过 root 要求，
 # 所以 Linux CI 与本机 Git Bash 都能跑到。
 expect_dir_reject() {
