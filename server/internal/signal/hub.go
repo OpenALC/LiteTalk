@@ -1324,6 +1324,13 @@ func (h *Hub) handleVoiceRequestState(c *client, d VoiceRequestStateData) {
 // 截断后的悄悄话会让用户以为对方听得到，实际没发出去。
 const maxWhisperTargets = 100
 
+// voiceWhisperRateLimit 悄悄话目标下发频控（#117）：每次改目标都要分配 map、
+// 算改动前后收件人快照、写日志并替换 SFU 上的原子快照，客户端可以在一个连接上
+// 高频刷。与 voice.request_state 同套路按 uid 计数（跨连接累计），复用现有
+// rate_limited 错误码，不新增契约。上限比目标选择宽松：按住悄悄话时逐个增减
+// 目标是正常操作。
+const voiceWhisperRateLimit, voiceWhisperRateWindow = 30, time.Minute
+
 // handleVoiceWhisper 同频道悄悄话（#45）：发送者必须当前在语音房间；目标去重、
 // 排除自己，只保留当前同房成员（成员可能刚离开，静默过滤）。空数组 = 取消。
 // 目标集合存到 SFU Peer 的不可变快照上，转发路径只做原子读 + 查表。
@@ -1336,6 +1343,15 @@ func (h *Hub) handleVoiceWhisper(c *client, d VoiceWhisperData) {
 	if len(d.Targets) > maxWhisperTargets {
 		h.sendError(c, ErrCodeBadMessage, "悄悄话目标最多 100 个")
 		return
+	}
+	// 频控放在廉价校验之后、任何分配之前：被限流的请求不再分配 map/切片，
+	// 也不写日志。h.limits 为 nil 时按连接计数（测试/过渡路径）。
+	if h.limits != nil {
+		ok, err := h.limits.Allow(context.Background(), "whisper:"+c.userID, voiceWhisperRateLimit, voiceWhisperRateWindow)
+		if err != nil || !ok {
+			h.sendError(c, ErrCodeRateLimited, "悄悄话切换过于频繁")
+			return
+		}
 	}
 	roomID := c.roomIDLocked()
 	if roomID == "" {

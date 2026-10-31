@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/OpenALC/LiteTalk/client/core/api"
 	"github.com/OpenALC/LiteTalk/client/core/audio"
@@ -230,6 +231,11 @@ type Session struct {
 	whisperSeq     int64
 	whisperSendSeq int64
 	whisperWake    chan struct{}
+	// whisperFails 本次下发已失败的次数（#117）：用于指数退避与上限，成功即清零。
+	whisperFails int
+	// whisperRetryTimer 退避重试的定时器（#117）：到点敲一次 wake，由发送循环
+	// 重读最新目标。成功/会话关闭时停掉。
+	whisperRetryTimer *time.Timer
 
 	// #46 频道音质配置：audioCfgMu 串行化「用户设置 + 当前频道上限/帧长」的
 	// 读取与应用（ApplyAudio 在 Wails 绑定线程、channel.audio 在 WS 读循环）。
@@ -731,27 +737,26 @@ func (s *Session) registerHandlers() {
 		// 仅在无存活 peer 时建连（他人入房广播不动媒体链路）。与网络恢复/
 		// ICE 重建互斥：已有重建在途时由那条路径负责建新 PC，读循环不并发
 		// 再建一条（否则两次 rtc.offer 互相顶替）。
+		alive := false
 		if p := s.peerRef.Load(); p != nil &&
 			p.ConnectionState() != webrtc.PeerConnectionStateClosed &&
 			p.ConnectionState() != webrtc.PeerConnectionStateFailed {
-			return
+			alive = true
 		}
-		if !s.roomRebuildMu.TryLock() {
-			return
+		if !alive {
+			// 建 peer 与下面的状态补发解耦（#117）：拿不到锁说明已有重建在途，
+			// 那条路径会用新的 channel.join 再触发一次本处理器；但补发本身不依赖
+			// 本地 PC——服务端按房间内存状态处理，白名单在 peer 建立后补应用
+			// （handleRTCOffer → applyRoomWhisper）。早退会让 whisper 目标与
+			// voice.state 与服务端长期不一致，所以只在拿到锁时才建 peer。
+			if s.roomRebuildMu.TryLock() {
+				s.setupPeer()
+				s.roomRebuildMu.Unlock()
+			} else {
+				s.log.Printf("session: 入房 %s 时已有重建在途，跳过建 peer，仍补发语音状态与悄悄话目标", d.ChannelID)
+			}
+			s.syncVoiceStateAfterJoin()
 		}
-		s.setupPeer()
-		s.roomRebuildMu.Unlock()
-		// 补发完整语音状态（muted+deafened 现值）：重连/重入房后服务端内存里的
-		// 旧状态可能已丢，peer 又是新建（默认不静音）——不发则「UI 显示已闭麦但声音照传」。
-		if s.ws != nil {
-			_ = s.ws.Send(signal.TypeVoiceState, signal.VoiceStateData{
-				Mute:   signal.Bool(s.muted.Load()),
-				Deafen: signal.Bool(s.deafened.Load()),
-			})
-		}
-		// 重连/重入房后 SFU peer 是新的：把当前目标同步过去。即使 want 为空
-		// 也发一条空数组，清掉服务端可能残留的旧目标（切房前在途发送的兜底）。
-		s.syncWhisperOnJoin()
 	})
 	// channel.audio 音质热更新（#46）：只对当前房间生效；其他频道（例如管理员
 	// 在别处改了配置）忽略，等入房时的 channel.joined 拿权威值。
@@ -1423,7 +1428,16 @@ func (s *Session) queueWhisperLocked(cp []string, seq int64) {
 		s.whisperNeedSend = true
 	}
 	if s.whisperNeedSend {
+		// 到达这里的一定是新的下发意图（用户改目标 / 入房同步），重试预算从零
+		// 开始。重试自身的置脏走 onWhisperSendFail，不经过本函数（#117）。
+		s.whisperFails = 0
 		s.whisperSendSeq = seq
+		// 旧版本的重试计时器已作废：它只会敲一次空唤醒（读到的 send 为 false）。
+		// 主动停掉，避免在旧 timer 与新意图的退避之间来回多敲。
+		if s.whisperRetryTimer != nil {
+			s.whisperRetryTimer.Stop()
+			s.whisperRetryTimer = nil
+		}
 	}
 }
 
@@ -1447,6 +1461,12 @@ func (s *Session) ClearWhisperTargets() {
 	s.whisperWant = nil
 	s.whisperNeedSend = false
 	s.whisperSendSeq = 0
+	// 退房会销毁 peer，在途重试没有意义：停掉计时器、清空重试预算（#117）。
+	if s.whisperRetryTimer != nil {
+		s.whisperRetryTimer.Stop()
+		s.whisperRetryTimer = nil
+	}
+	s.whisperFails = 0
 	s.whisperMu.Unlock()
 }
 
@@ -1458,10 +1478,36 @@ func (s *Session) wakeWhisper() {
 	}
 }
 
+// 悄悄话下发重试参数（#117）。发送失败时服务端仍按旧目标集合转发，正是
+// 「以为在悄悄话、其实全房能听到」（或反之）的来源，必须重试到成功或放弃：
+// 立即重试会与断线重连的抖动抢同一段网络，故指数退避。
+const (
+	whisperRetryBase    = 100 * time.Millisecond
+	whisperRetryMax     = 2 * time.Second
+	whisperSendMaxTries = 6
+)
+
+// whisperRetryDelay 第 n 次失败后的等待时长：100ms 起翻倍，封顶 2s。
+func whisperRetryDelay(fails int) time.Duration {
+	d := whisperRetryBase
+	for i := 1; i < fails && d < whisperRetryMax; i++ {
+		d *= 2
+	}
+	if d > whisperRetryMax {
+		d = whisperRetryMax
+	}
+	return d
+}
+
 // whisperLoop 悄悄话目标发送循环（#45，Connect 启动；测试可直接跑）。
 // 每次唤醒读最新目标；协议 <3 时静默丢弃（v2 服务端不认 voice.whisper）。
-// 发送失败不重试（#117 已登记）：等下一次目标变化或入房同步再兜底。
+// 发送失败重新置脏并按指数退避排一次唤醒重试（#117）：失败期间服务端可能
+// 仍按旧目标集合转发，不重试就留下「本地以为在悄悄话、服务端按全房发」的
+// 分歧。重试用尽仍失败则放弃本次下发——保留 whisperMaybe（服务端状态未知），
+// 由下一次目标变化或入房同步兜底，不能让一条永远发不出去的消息把 goroutine
+// 钉死。重试同样走本 goroutine 的 wake 队列，不占用音频回调线程。
 func (s *Session) whisperLoop(ctx context.Context) {
+	defer s.stopWhisperRetry()
 	for {
 		select {
 		case <-ctx.Done():
@@ -1471,15 +1517,69 @@ func (s *Session) whisperLoop(ctx context.Context) {
 			if !send || s.protoVer.Load() < 3 || s.ws == nil {
 				continue
 			}
-			if err := s.ws.Send(signal.TypeVoiceWhisper, signal.VoiceWhisperData{Targets: targets, Seq: seq}); err == nil {
-				// 发送成功才更新「服务端可能有非空目标」：失败时间线未知，
-				// 保守保留原值，下次入房同步会再兜一次。
-				s.whisperMu.Lock()
-				s.whisperMaybe = len(targets) > 0
-				s.whisperMu.Unlock()
+			if err := s.ws.Send(signal.TypeVoiceWhisper, signal.VoiceWhisperData{Targets: targets, Seq: seq}); err != nil {
+				s.onWhisperSendFail(seq, err)
+			} else {
+				s.onWhisperSendOK(targets)
 			}
 		}
 	}
+}
+
+// onWhisperSendOK 发送成功：清重试计数与在途计时器，并更新「服务端可能有非空
+// 目标」。失败时不能更新该标记——时间线未知，保守保留原值等入房同步兜底。
+func (s *Session) onWhisperSendOK(targets []string) {
+	s.stopWhisperRetry()
+	s.whisperMu.Lock()
+	s.whisperFails = 0
+	s.whisperMaybe = len(targets) > 0
+	s.whisperMu.Unlock()
+}
+
+// onWhisperSendFail 发送失败的处理（#117）。
+// pendingWhisper 在发送前就把 whisperNeedSend/whisperSendSeq 清空，而 ws.Send
+// 在锁外进行——这期间用户可能又改了目标（queueWhisperLocked 写入新 seq 并重置
+// 失败预算）。此时若把 seq 写回自己这一版，新请求就被降级成旧请求的重试：
+// 客户端等的是新 seq 的 ack，服务端回的旧 seq 会被 onWhisperAck 丢弃，300ms 后
+// 误判 ack 超时关麦，而服务端其实已经应用了新目标。
+// 因此：已有更新意图在排队时一个字段都不碰，失败交由那条意图重发；只有没有
+// 更新意图时才重排自己这一版并排一次指数退避唤醒。
+func (s *Session) onWhisperSendFail(seq int64, err error) {
+	s.whisperMu.Lock()
+	if s.whisperNeedSend {
+		// queueWhisperLocked 已经写好新 seq、重置了失败预算，本次失败就此作废。
+		s.whisperMu.Unlock()
+		s.log.Printf("session: 悄悄话目标下发失败（%v），已有更新目标在途，本次失败交由新意图重发", err)
+		return
+	}
+	s.whisperFails++
+	fails := s.whisperFails
+	if fails >= whisperSendMaxTries {
+		s.whisperMu.Unlock()
+		s.log.Printf("session: 悄悄话目标下发重试 %d 次仍失败（%v），交给下次目标变化/入房同步", fails, err)
+		return
+	}
+	// 置脏让退避到点的唤醒重发同一版本。期间用户再改目标时 queueWhisperLocked
+	// 会覆盖成更新的版本，唤醒总是读最新值。
+	s.whisperNeedSend = true
+	s.whisperSendSeq = seq
+	delay := whisperRetryDelay(fails)
+	if s.whisperRetryTimer != nil {
+		s.whisperRetryTimer.Stop()
+	}
+	s.whisperRetryTimer = time.AfterFunc(delay, s.wakeWhisper)
+	s.whisperMu.Unlock()
+	s.log.Printf("session: 悄悄话目标下发失败（第 %d 次，%v），%s 后重试", fails, err, delay)
+}
+
+// stopWhisperRetry 停掉在途重试计时器（成功、会话关闭时）。调用方不得持 whisperMu。
+func (s *Session) stopWhisperRetry() {
+	s.whisperMu.Lock()
+	if s.whisperRetryTimer != nil {
+		s.whisperRetryTimer.Stop()
+		s.whisperRetryTimer = nil
+	}
+	s.whisperMu.Unlock()
 }
 
 // pendingWhisper 取当前待下发快照并清掉脏标记。空目标也要返回（显式取消），
@@ -1499,6 +1599,26 @@ func (s *Session) pendingWhisper() ([]string, int64, bool) {
 	return want, seq, send
 }
 
+// syncVoiceStateAfterJoin 入房/重连后的状态补发（#117）：voice.state 现值 +
+// 悄悄话目标同步。与建 peer 解耦——两者都只依赖服务端房间内存状态，不依赖
+// 本地 PC（白名单在 peer 建立后由 handleRTCOffer → applyRoomWhisper 补应用），
+// 所以即使重建在途（拿不到 roomRebuildMu）也必须执行；否则 UI 显示已闭麦而
+// 服务端照传、或悄悄话目标停在旧集合。
+// 跑在 ws 读循环上：只投递两条信令，不做额外等待。
+func (s *Session) syncVoiceStateAfterJoin() {
+	// 补发完整语音状态（muted+deafened 现值）：重连/重入房后服务端内存里的
+	// 旧状态可能已丢，peer 又是新建（默认不静音）——不发则「UI 显示已闭麦但声音照传」。
+	if s.ws != nil {
+		_ = s.ws.Send(signal.TypeVoiceState, signal.VoiceStateData{
+			Mute:   signal.Bool(s.muted.Load()),
+			Deafen: signal.Bool(s.deafened.Load()),
+		})
+	}
+	// 重连/重入房后 SFU peer 是新的：把当前目标同步过去。即使 want 为空
+	// 也发一条空数组，清掉服务端可能残留的旧目标（切房前在途发送的兜底）。
+	s.syncWhisperOnJoin()
+}
+
 // syncWhisperOnJoin 入房/重连后把当前目标同步到新建的 SFU peer（#45）。
 // want 为空但服务端可能残留旧目标（切房前在途发送）时强制下发一次空数组；
 // 从未用过悄悄话则不发，避免每次入房都产生无意义信令。同步走 seq=0 的 v3
@@ -1516,6 +1636,11 @@ func (s *Session) syncWhisperOnJoin() {
 	need := len(s.whisperWant) > 0 || s.whisperMaybe
 	s.whisperNeedSend = need
 	s.whisperSendSeq = 0
+	if need {
+		// 入房重建是一次新的下发意图（新 peer 需要重新应用白名单），重试预算
+		// 从零开始（#117）。
+		s.whisperFails = 0
+	}
 	s.whisperMu.Unlock()
 	if need {
 		s.wakeWhisper()
