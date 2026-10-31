@@ -2061,6 +2061,44 @@ func (m *MySQL) DeletePushDevice(ctx context.Context, id int64) error {
 	return checkAffected(res)
 }
 
+// ---- oidc_identities（迁移 0021，#54） ----
+
+// oidcIdentityCols 查询列集（SQLite 实现共用同形 SQL）。
+const oidcIdentityCols = `id, issuer, sub, user_id, email, created_at`
+
+func scanOIDCIdentity(row interface{ Scan(...any) error }) (*OIDCIdentity, error) {
+	var i OIDCIdentity
+	err := row.Scan(&i.ID, &i.Issuer, &i.Sub, &i.UserID, &i.Email, &i.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &i, nil
+}
+
+func (m *MySQL) CreateOIDCIdentity(ctx context.Context, i *OIDCIdentity) error {
+	i.ID = newID(i.ID)
+	_, err := m.db.ExecContext(ctx,
+		`INSERT INTO oidc_identities (id, issuer, sub, user_id, email)
+		 VALUES (?, ?, ?, ?, ?)`,
+		i.ID, i.Issuer, i.Sub, i.UserID, i.Email)
+	if err != nil {
+		if isDup(err) {
+			return ErrConflict
+		}
+		return err
+	}
+	return m.db.QueryRowContext(ctx, `SELECT created_at FROM oidc_identities WHERE id = ?`, i.ID).
+		Scan(&i.CreatedAt)
+}
+
+func (m *MySQL) OIDCIdentityByIssuerSub(ctx context.Context, issuer, sub string) (*OIDCIdentity, error) {
+	return scanOIDCIdentity(m.db.QueryRowContext(ctx,
+		`SELECT `+oidcIdentityCols+` FROM oidc_identities WHERE issuer = ? AND sub = ?`, issuer, sub))
+}
+
 // ---- webhooks（迁移 0019，#52）----
 // CRUD 与投递记录共用 webhooks.go 的 db* 实现；RecordWebhookDelivery 的
 // 读-改-写在事务内完成，并发投递同一订阅不会越过熔断阈值。
