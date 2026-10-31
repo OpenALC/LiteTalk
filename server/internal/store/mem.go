@@ -37,6 +37,7 @@ type Mem struct {
 	memberRoles map[int64]map[int64]map[int64]*MemberRoleAssignment // serverID → userID → roleID → 分配
 	overwrites  map[overwriteKey]*ChannelOverwrite                  // (channel,targetType,targetID) → 覆盖
 	auditLogs   map[int64]*AuditLog                                 // id → 审计行
+	apiTokens   map[int64]*APIToken                                 // tokenID → 行（迁移 0018，#51 #54）
 
 	*MemKV // KV 部分（Get/Set/Del/Incr/IncrCap/Eval 由 MemKV 提供）
 }
@@ -68,6 +69,7 @@ func NewMem() *Mem {
 		memberRoles:    map[int64]map[int64]map[int64]*MemberRoleAssignment{},
 		overwrites:     map[overwriteKey]*ChannelOverwrite{},
 		auditLogs:      map[int64]*AuditLog{},
+		apiTokens:      map[int64]*APIToken{},
 		MemKV:          NewMemKV(),
 	}
 }
@@ -1456,6 +1458,86 @@ func (m *Mem) DeleteAllUserSessions(_ context.Context, userID int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.sessions, userID)
+	return nil
+}
+
+// ---- api_tokens（迁移 0018，#51 #54）----
+
+func (m *Mem) CreateAPIToken(_ context.Context, t *APIToken) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t.ID = newID(t.ID)
+	for _, x := range m.apiTokens {
+		if x.Prefix == t.Prefix {
+			return ErrConflict
+		}
+	}
+	if t.CreatedAt.IsZero() {
+		t.CreatedAt = time.Now()
+	}
+	cp := *t
+	m.apiTokens[t.ID] = &cp
+	return nil
+}
+
+func (m *Mem) APITokenByPrefix(_ context.Context, prefix string) (*APIToken, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, x := range m.apiTokens {
+		if x.Prefix == prefix {
+			cp := *x
+			return &cp, nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
+func (m *Mem) APITokenByID(_ context.Context, id int64) (*APIToken, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, ok := m.apiTokens[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	cp := *t
+	return &cp, nil
+}
+
+func (m *Mem) APITokensOfUser(_ context.Context, userID int64) ([]APIToken, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []APIToken{}
+	for _, x := range m.apiTokens {
+		if x.UserID == userID {
+			out = append(out, *x)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out, nil
+}
+
+func (m *Mem) RevokeAPIToken(_ context.Context, id int64, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, ok := m.apiTokens[id]
+	if !ok {
+		return ErrNotFound
+	}
+	t.RevokedAt = &at
+	return nil
+}
+
+func (m *Mem) TouchAPITokenLastUsed(_ context.Context, id int64, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if t, ok := m.apiTokens[id]; ok {
+		t.LastUsedAt = &at
+	}
 	return nil
 }
 

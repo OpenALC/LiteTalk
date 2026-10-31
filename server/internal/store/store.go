@@ -242,6 +242,25 @@ type UserSession struct {
 	UpdatedAt  time.Time `json:"updated_at" db:"updated_at"`
 }
 
+// APIToken 个人访问令牌/机器人令牌（迁移 0018，#51 #54）。一张表两种 kind：
+// pat 挂普通用户，bot 挂 is_bot 用户（创建入口属 #51）。
+// SecretHash 是 SHA-256(secret) 的十六进制（为什么不用 bcrypt 见 internal/token 注释）；
+// Prefix 有意公开（UI 展示与日志关联），不是秘密也不做鉴权要素。
+// 明文只在创建响应里出现一次，任何读路径都不回传。
+type APIToken struct {
+	ID         int64
+	UserID     int64
+	Name       string // 用户可见备注（"CI 机器人"）
+	Prefix     string // 明文前缀 8 位小写 hex，检索与展示用
+	SecretHash string // SHA-256(secret) 十六进制（64 字符）
+	Kind       string // "pat" | "bot"
+	Scopes     string // 空格分隔的 scope 白名单子集；空 = 无任何权限
+	ExpiresAt  *time.Time
+	LastUsedAt *time.Time
+	RevokedAt  *time.Time
+	CreatedAt  time.Time
+}
+
 // Role 角色（迁移 0010）。BuiltinKey 三值 member/admin/owner 为内置（不可改删、
 // 每服各一条），空串 = 自定义角色（DB 存 NULL）。Permissions 只用低 15 位。
 type Role struct {
@@ -483,6 +502,23 @@ type Store interface {
 	DeleteUserSession(ctx context.Context, userID int64, deviceType string) error
 	// DeleteAllUserSessions 删除该用户全部设备会话（重置密码用）。
 	DeleteAllUserSessions(ctx context.Context, userID int64) error
+
+	// api_tokens（迁移 0018，#51 #54）。prefix 唯一（uk_api_tokens_prefix）。
+
+	// CreateAPIToken 写入一行；ID 未预置时取 Snowflake，回填 CreatedAt；
+	// prefix 重复返回 ErrConflict。
+	CreateAPIToken(ctx context.Context, t *APIToken) error
+	// APITokenByPrefix 按 8 位明文前缀检索（校验热路径，走唯一索引）；无命中 ErrNotFound。
+	APITokenByPrefix(ctx context.Context, prefix string) (*APIToken, error)
+	// APITokenByID 单条回读（吊销前的归属校验用）；无命中 ErrNotFound。
+	APITokenByID(ctx context.Context, id int64) (*APIToken, error)
+	// APITokensOfUser 该用户全部令牌，按 created_at、id 升序（列表端点，只回元数据）。
+	APITokensOfUser(ctx context.Context, userID int64) ([]APIToken, error)
+	// RevokeAPIToken 置 revoked_at（读路径每次实时查库，吊销立即生效）；未命中 ErrNotFound。
+	RevokeAPIToken(ctx context.Context, id int64, at time.Time) error
+	// TouchAPITokenLastUsed 更新 last_used_at（60s 节流后的异步落库，尽力而为：
+	// 行已不存在时静默忽略，不参与错误路径）。
+	TouchAPITokenLastUsed(ctx context.Context, id int64, at time.Time) error
 
 	// roles / member_roles / channel_overwrites / audit_log（迁移 0010，#35 B1）。
 	// 「不属于该服务器」与「不存在」统一返回 ErrNotFound，不泄露跨服资源是否存在。
