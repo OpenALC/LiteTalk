@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"testing"
@@ -159,12 +160,29 @@ func TestNicknameCaseMigrationSQLite(t *testing.T) {
 	assertNicknameMigrationState(t, m, "0009_users_nickname_bin", true)
 }
 
+// lookupUserByNicknameRaw 迁移测试专用的裸 SQL 读取：迁移用例固定停在旧 schema
+// 上，不能用带 is_bot 全列的 store 读取器（部署序上总是先迁移后启动，代码与
+// schema 版本一致才有 store 读取可言）；裸 SELECT 同样经过 nickname 列的
+// 真实排序规则，断言语义不变。
+func lookupUserByNicknameRaw(t *testing.T, m *SQLite, nickname, tag string) (int64, bool) {
+	t.Helper()
+	var id int64
+	err := m.DB().QueryRowContext(context.Background(),
+		`SELECT id FROM users WHERE nickname = ? AND tag = ?`, nickname, tag).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false
+	}
+	if err != nil {
+		t.Fatalf("读 users(%s#%s): %v", nickname, tag, err)
+	}
+	return id, true
+}
+
 // assertNicknameMigrationState 两行老数据在 0009 前后都可读；SQLite 语义始终敏感。
 func assertNicknameMigrationState(t *testing.T, m *SQLite, version string, applied bool) {
 	t.Helper()
-	ctx := context.Background()
 	var n int
-	if err := m.DB().QueryRowContext(ctx,
+	if err := m.DB().QueryRowContext(context.Background(),
 		`SELECT COUNT(*) FROM schema_migrations WHERE version = ?`, version).Scan(&n); err != nil {
 		t.Fatalf("读 schema_migrations: %v", err)
 	}
@@ -175,13 +193,13 @@ func assertNicknameMigrationState(t *testing.T, m *SQLite, version string, appli
 		nickname string
 		wantID   int64
 	}{{"Alice", 8001}, {"alice", 8002}} {
-		got, err := m.UserByNicknameTag(ctx, tc.nickname, "0001")
-		if err != nil || got.ID != tc.wantID {
-			t.Fatalf("老数据 %s#0001 应可读: %+v %v", tc.nickname, got, err)
+		id, ok := lookupUserByNicknameRaw(t, m, tc.nickname, "0001")
+		if !ok || id != tc.wantID {
+			t.Fatalf("老数据 %s#0001 应可读: id=%d ok=%v", tc.nickname, id, ok)
 		}
 	}
-	if _, err := m.UserByNicknameTag(ctx, "ALICE", "0001"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("SQLite 大小写变体不应命中，实际 %v", err)
+	if _, hit := lookupUserByNicknameRaw(t, m, "ALICE", "0001"); hit {
+		t.Fatal("SQLite 大小写变体不应命中")
 	}
 }
 
@@ -202,8 +220,8 @@ func TestNicknameCaseMigrationMySQL(t *testing.T) {
 		t.Fatalf("预置旧数据失败: %v", err)
 	}
 	// 旧语义：alice 命中 Alice，证明测试起点确实是 unicode_ci。
-	if u, err := m.UserByNicknameTag(ctx, "alice", "0001"); err != nil || u.ID != 8101 {
-		t.Fatalf("迁移前 alice 应命中 Alice: %+v %v", u, err)
+	if id, ok := mysqlLookupUser(t, m, "alice", "0001"); !ok || id != 8101 {
+		t.Fatalf("迁移前 alice 应命中 Alice: id=%d ok=%v", id, ok)
 	}
 
 	if err := m.Migrate(ctx, until0009); err != nil {
@@ -212,20 +230,21 @@ func TestNicknameCaseMigrationMySQL(t *testing.T) {
 	if coll := nicknameCollation(t, m); coll != "utf8mb4_bin" {
 		t.Fatalf("迁移后 nickname 排序规则应为 utf8mb4_bin，实际 %s", coll)
 	}
-	if u, err := m.UserByNicknameTag(ctx, "Alice", "0001"); err != nil || u.ID != 8101 {
-		t.Fatalf("迁移后旧数据应可读: %+v %v", u, err)
+	if id, ok := mysqlLookupUser(t, m, "Alice", "0001"); !ok || id != 8101 {
+		t.Fatalf("迁移后旧数据应可读: id=%d ok=%v", id, ok)
 	}
-	if _, err := m.UserByNicknameTag(ctx, "alice", "0001"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("迁移后大小写变体不应命中，实际 %v", err)
+	if _, hit := mysqlLookupUser(t, m, "alice", "0001"); hit {
+		t.Fatal("迁移后大小写变体不应命中")
 	}
 
-	// 迁移后大小写变体 + 同 tag 可以共存。
-	lower := &User{Email: "mig-lower@ex.com", Nickname: "alice", Tag: "0001"}
-	if err := m.CreateUser(ctx, lower); err != nil {
+	// 迁移后大小写变体 + 同 tag 可以共存（唯一索引在 bin 排序规则下不再拦截）。
+	if _, err := m.DB().ExecContext(ctx,
+		`INSERT INTO users (id, email, nickname, tag, password_hash) VALUES
+		 (8102, 'mig-lower@ex.com', 'alice', '0001', '')`); err != nil {
 		t.Fatalf("迁移后创建 alice 失败: %v", err)
 	}
-	if u, err := m.UserByNicknameTag(ctx, "alice", "0001"); err != nil || u.ID != lower.ID {
-		t.Fatalf("精确 alice 应命中新账号: %+v %v", u, err)
+	if id, ok := mysqlLookupUser(t, m, "alice", "0001"); !ok || id != 8102 {
+		t.Fatalf("精确 alice 应命中新账号: id=%d ok=%v", id, ok)
 	}
 
 	// down 在存在大小写变体时按文档失败（唯一索引重建撞 Duplicate entry）。
@@ -243,8 +262,8 @@ func TestNicknameCaseMigrationMySQL(t *testing.T) {
 	if coll := nicknameCollation(t, m); coll != "utf8mb4_unicode_ci" {
 		t.Fatalf("回滚后 nickname 排序规则应为 utf8mb4_unicode_ci，实际 %s", coll)
 	}
-	if u, err := m.UserByNicknameTag(ctx, "alice", "0001"); err != nil || u.ID != 8101 {
-		t.Fatalf("回滚后应恢复大小写不敏感语义: %+v %v", u, err)
+	if id, ok := mysqlLookupUser(t, m, "alice", "0001"); !ok || id != 8101 {
+		t.Fatalf("回滚后应恢复大小写不敏感语义: id=%d ok=%v", id, ok)
 	}
 	// 再次迁移确认可重入。
 	if err := m.Migrate(ctx, until0009); err != nil {
@@ -253,6 +272,21 @@ func TestNicknameCaseMigrationMySQL(t *testing.T) {
 	if coll := nicknameCollation(t, m); coll != "utf8mb4_bin" {
 		t.Fatalf("二次迁移后排序规则应为 utf8mb4_bin，实际 %s", coll)
 	}
+}
+
+// mysqlLookupUser MySQL 版裸 SQL 读取（同 lookupUserByNicknameRaw 的理由）。
+func mysqlLookupUser(t *testing.T, m *MySQL, nickname, tag string) (int64, bool) {
+	t.Helper()
+	var id int64
+	err := m.DB().QueryRowContext(context.Background(),
+		`SELECT id FROM users WHERE nickname = ? AND tag = ?`, nickname, tag).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false
+	}
+	if err != nil {
+		t.Fatalf("读 users(%s#%s): %v", nickname, tag, err)
+	}
+	return id, true
 }
 
 // nicknameCollation 读 users.nickname 的当前排序规则。
