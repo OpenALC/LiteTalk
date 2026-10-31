@@ -101,6 +101,20 @@ func normalizeChannelAudio(ch *store.Channel) {
 	}
 }
 
+// normalizeChannelOptions text 频道不适用密码与人数上限（#102）：类型从 voice
+// 改成 text 时清掉旧值，否则切回 voice 会复活早已不该生效的旧密码/上限。
+// 与 normalizeChannelAudio 同一口径——只在落库前归一最终值，不信任调用方是否
+// 显式给了这些字段。返回是否有字段被清，供审计记录。
+func normalizeChannelOptions(ch *store.Channel) bool {
+	if ch.Type == store.ChannelVoice {
+		return false
+	}
+	changed := ch.PasswordHash != "" || ch.UserLimit != 0
+	ch.PasswordHash = ""
+	ch.UserLimit = 0
+	return changed
+}
+
 // channelChildren 收集某频道的直接子频道（#37：不新增 Store 方法，走 ChannelsOfServer 过滤）。
 func (s *Server) channelChildren(ctx context.Context, serverID, parentID int64) ([]store.Channel, error) {
 	all, err := s.store.ChannelsOfServer(ctx, serverID)

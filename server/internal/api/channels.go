@@ -264,6 +264,16 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 	}
 	// 类型改成 text 时清掉旧音质（text 恒 0/0）；校验已在各字段应用时按最终类型完成。
 	normalizeChannelAudio(ch)
+	// #102：类型改成 text 时一并清掉密码与人数上限——否则切回 voice 会复活旧密码。
+	// 放在全部字段应用之后按最终类型判定：同一次 PATCH 里显式改密码 + 改成 text
+	// 会在上方的 checkChannelPassword 先被拒，走到这里的一定是「切类型」本身。
+	if normalizeChannelOptions(ch) {
+		// 审计仍只记「密码变了」，不落哈希本身。
+		detail["password_changed"] = true
+		if _, ok := detail["user_limit"]; !ok {
+			detail["user_limit"] = 0
+		}
+	}
 	// 子频道自身改 type/category 也必须与父一致（#101 P2）：上方 409 只拦
 	// 「有子频道的父频道」，子频道此前可以单方面漂移出父的类型/分类，破坏
 	// 两级树的不变量。字段应用完成后统一核对最终值，避免半写。
