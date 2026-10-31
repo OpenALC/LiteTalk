@@ -18,18 +18,20 @@ const WEB_CSP = [
 ].join('; ')
 
 function webOnlyCSP(): import('vite').Plugin {
+  // transformIndexHtml 的 ctx 不带 mode：从 configResolved 捕获后再判别。
+  let isWeb = false
   return {
     name: 'web-only-csp',
     apply: 'build',
-    transformIndexHtml: {
-      order: 'pre',
-      handler(html, ctx) {
-        if (ctx.mode !== 'web') return html
-        return html.replace(
-          '<head>',
-          `<head>\n    <meta http-equiv="Content-Security-Policy" content="${WEB_CSP}">`,
-        )
-      },
+    configResolved(cfg) {
+      isWeb = cfg.mode === 'web'
+    },
+    transformIndexHtml(html) {
+      if (!isWeb) return html
+      return html.replace(
+        '<head>',
+        `<head>\n    <meta http-equiv="Content-Security-Policy" content="${WEB_CSP}">`,
+      )
     },
   }
 }

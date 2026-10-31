@@ -229,11 +229,14 @@ export class SignalSession {
   }
 
   // joinChannel 进房（乐观写 roomID 供断线重连恢复；服务端拒绝是异步 error 帧）。
+  // 采集**不阻塞**进房：getUserMedia 在权限弹窗期间永不 settle，await 它会让
+  // 入房挂死且无反馈。这里只发 channel.join；采集并行推进，channel.joined 的
+  // ensurePeer 给弹窗一个有限窗口，明确失败经 voice:unavailable 上报并降级只收。
   async joinChannel(channelID: string, password: string): Promise<void> {
-    await this.peer.startCapture()
     await this.prefetchICE()
     this.roomPassword = password
     this.beginJoin(channelID)
+    void this.peer.startCapture()
     if (!this.send(Sig.ChannelJoin, { channel_id: channelID, password })) {
       this.abortJoin(channelID, true)
       throw new Error('信令未连接，进房请求未发出')

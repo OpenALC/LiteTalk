@@ -43,17 +43,26 @@ export class VoicePeer {
   private remoteAudio = new Map<string, RemoteAudio>() // uid → 播放元素
   private muted = false
   private deafened = false
-  // available 采集可用性（false 时 JoinChannel 报错，语义对齐 Go voiceUnavailable）。
+  // available 采集可用性（false = 采集已明确失败；join 不再因此报错，
+  // peer 降级 recvonly 只收不发——「能听」与「能说」解耦）。
   available = true
   unavailableError = ''
+  // capturePromise 单飞采集：权限弹窗可能长时间挂起，必须可等待、可超时。
+  private capturePromise: Promise<boolean> | null = null
 
   constructor(callbacks: RTCCallbacks) {
     this.callbacks = callbacks
   }
 
-  // startCapture 打开麦克风（入房前调用；失败置 available=false 并上报事件）。
-  async startCapture(): Promise<boolean> {
-    if (this.localStream) return true
+  // startCapture 打开麦克风（幂等单飞）。失败置 available=false 并上报
+  // voice:unavailable；**不抛错**——采集失败不阻断入房。
+  startCapture(): Promise<boolean> {
+    if (this.localStream) return Promise.resolve(true)
+    if (!this.capturePromise) this.capturePromise = this.doCapture()
+    return this.capturePromise
+  }
+
+  private async doCapture(): Promise<boolean> {
     try {
       this.localStream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -75,6 +84,17 @@ export class VoicePeer {
     }
   }
 
+  // captureSettled 等采集落定，最多 timeoutMs。getUserMedia 在权限弹窗期间
+  // 永不 settle：到点放行，让 ensurePeer 按当前状态建链（有流 sendrecv，
+  // 无流 recvonly），不给弹窗挂死建连路径的机会。
+  async captureSettled(timeoutMs: number): Promise<void> {
+    if (!this.capturePromise) return
+    await Promise.race([
+      this.capturePromise.catch(() => false),
+      new Promise<void>((r) => setTimeout(r, timeoutMs)),
+    ])
+  }
+
   // ensurePeer 建立对 SFU 的 PeerConnection（无存活实例时）。已有实例时复用，
   // 下行轨由 SFU 重协商补发（与 Go channel.joined 处理器的 alive 判定一致）。
   async ensurePeer(iceServers: ICEServerLike[]): Promise<void> {
@@ -83,6 +103,8 @@ export class VoicePeer {
     if (pc) this.teardown()
     this.initialOffered = false
     this.pendingRemoteICE = []
+    // 采集在途时给权限弹窗一个有限窗口（20s），到点按现状建链。
+    await this.captureSettled(20_000)
     const conn = new RTCPeerConnection({ iceServers })
     this.pc = conn
 
@@ -113,8 +135,9 @@ export class VoicePeer {
         conn.addTrack(track, this.localStream)
       }
     } else {
-      // 采集不可用仍允许只收：sendrecv 降级 recvonly（Go 侧无此路径——
-      // 那边 JoinChannel 直接失败；浏览器把「能听」与「能说」解耦是净收益）。
+      // 采集不可用/仍在弹窗：只收不发（recvonly）。Go 侧无此路径——那边
+      // JoinChannel 直接失败；浏览器把「能听」与「能说」解耦是净收益，
+      // 用户重入房（届时已有权限/流）即恢复 sendrecv。
       conn.addTransceiver('audio', { direction: 'recvonly' })
     }
   }

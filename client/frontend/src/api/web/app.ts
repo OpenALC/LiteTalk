@@ -363,13 +363,18 @@ export const webApp: GoApp = {
   },
 
   async GetSavedCredentials(): Promise<{ email: string; password: string; saved: boolean }> {
-    // 密码记忆是桌面 keyring 能力；web 登录态走 token 持久化，不存密码。
+    // 密码记忆是桌面 keyring 能力。web 无 keyring 且**密码永不落盘**——
+    // 登录态由 token 持久化维持（localStorage 的 litetalk.web.token/refresh），
+    // 这里恒 saved:false。SetSavedCredentials 必须是 no-op 而不是报错：
+    // LoginView 默认勾选「记住密码」，登录成功路径会无条件调用它。
     return { email: '', password: '', saved: false }
   },
   async SetSavedCredentials(_email: string, _password: string): Promise<void> {
-    throw new Error(DESKTOP_ONLY)
+    // no-op：见 GetSavedCredentials 注释。
   },
-  async ClearSavedCredentials(): Promise<void> {},
+  async ClearSavedCredentials(): Promise<void> {
+    // no-op：web 本就不存密码。
+  },
   async SecretStorageMode(): Promise<string> {
     return 'web' // 展示口径：web 构建登录态存 localStorage（设置页显示原始串）
   },
