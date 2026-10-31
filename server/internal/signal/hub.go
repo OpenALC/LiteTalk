@@ -81,10 +81,10 @@ type Hub struct {
 	// presenceChanPublished 好友频道 presence 的去抖缓存（#92）：uid → 上次推送的
 	// 语音房状态。无键 = 尚未推过（离线边沿清空，重进同一频道必须重推）。
 	presenceChanPublished map[string]presenceChanState
-	// presenceChanRetry 好友频道 presence 待重试标记（#102）：权限查询故障导致
-	// 部分接收者被跳过时置位，下一次心跳/状态变化重算，不得当作「已发送」。
-	// 与 presenceChanPublished 同受 presenceMu 保护。
-	presenceChanRetry map[string]bool
+	// presenceChanRetry 好友频道 presence 待重试集合（#102）：权限查询故障导致
+	// 部分接收者被跳过时记录他们，下一次心跳/状态变化只补发这部分人，
+	// 不把「部分失败」当成「已发送」。与 presenceChanPublished 同受 presenceMu 保护。
+	presenceChanRetry map[string]presenceChanPending
 
 	// 频道密码限流（#102）：pwFails 为 uid+频道 → 最近失败时间戳（滑动窗），
 	// pwSem 限制同时进行的 bcrypt 校验数。见 channelpw.go。
