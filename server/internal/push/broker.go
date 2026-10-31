@@ -259,6 +259,16 @@ func (b *Broker) deliver(ctx context.Context, kind, actor, target string, n Noti
 	if !b.userOffline(target) {
 		return false
 	}
+	// 设备查询先于节流：节流的是「推送」而非「事件」——无设备用户的事件
+	// 不烧节流配额（否则先到的无设备事件会吞掉 10 分钟内后续可推送事件）。
+	devices, err := b.store.PushDevicesOfUser(ctx, parseUID(target))
+	if err != nil {
+		b.log.Printf("[push] 设备查询失败（%s）: %v", target, err)
+		return false
+	}
+	if len(devices) == 0 {
+		return false
+	}
 	// 同一接收者 10 分钟最多 1 条（节流键 push:<uid>）；KV 故障 fail-closed，
 	// 宁可不推也不刷屏。
 	if b.limits != nil {
@@ -270,14 +280,6 @@ func (b *Broker) deliver(ctx context.Context, kind, actor, target string, n Noti
 		if !ok {
 			return false
 		}
-	}
-	devices, err := b.store.PushDevicesOfUser(ctx, parseUID(target))
-	if err != nil {
-		b.log.Printf("[push] 设备查询失败（%s）: %v", target, err)
-		return false
-	}
-	if len(devices) == 0 {
-		return false
 	}
 	list := make([]Device, 0, len(devices))
 	for _, d := range devices {

@@ -221,6 +221,9 @@ func (s *Server) CreateMessage(ctx context.Context, request CreateMessageRequest
 		return nil, s.writeStoreErr(ctx, err)
 	}
 	msg.SenderNickname, msg.SenderTag = c.Nickname, c.Tag
+	// 推送触发点（#53）：落库成功后异步派发（@提及/私聊判定在 Broker worker），
+	// 推送关闭时零开销。绝不因推送失败影响消息发送。
+	s.notifyMessageCreate(ctx, ch, msg, c.Nickname)
 	return s.createdMessage(ctx, msg, http.StatusCreated)
 }
 
