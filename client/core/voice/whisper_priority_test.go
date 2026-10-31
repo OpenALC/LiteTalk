@@ -387,6 +387,202 @@ func (s *joinReplyStub) awaitType(want string, timeout time.Duration) bool {
 	return s.sawType(want)
 }
 
+// whisperWireRecorder 只记录 voice.whisper 载荷的 WS 桩（重试用例用）。
+type whisperWireRecorder struct {
+	*httptest.Server
+
+	mu   sync.Mutex
+	sent []signal.VoiceWhisperData
+}
+
+func newWhisperWireRecorder(t *testing.T) *whisperWireRecorder {
+	t.Helper()
+	s := &whisperWireRecorder{}
+	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			_, raw, err := conn.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var env signal.Envelope
+			if json.Unmarshal(raw, &env) != nil || env.Type != signal.TypeVoiceWhisper {
+				continue
+			}
+			var d signal.VoiceWhisperData
+			if env.Decode(&d) != nil {
+				continue
+			}
+			s.mu.Lock()
+			s.sent = append(s.sent, d)
+			s.mu.Unlock()
+		}
+	}))
+	t.Cleanup(s.Server.Close)
+	return s
+}
+
+func (s *whisperWireRecorder) wsURL() string {
+	return "ws" + strings.TrimPrefix(s.URL, "http") + "/ws"
+}
+
+func (s *whisperWireRecorder) whispers() []signal.VoiceWhisperData {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]signal.VoiceWhisperData(nil), s.sent...)
+}
+
+// waitWhisperFails 等失败计数达到期望下界（重试是异步的）。
+func waitWhisperFails(t *testing.T, s *Session, atLeast int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		s.whisperMu.Lock()
+		fails := s.whisperFails
+		s.whisperMu.Unlock()
+		if fails >= atLeast {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("失败计数未在 5s 内达到 %d", atLeast)
+}
+
+// TestWhisperRetryDelay 退避曲线：100ms 起翻倍，封顶 2s（#117）。
+func TestWhisperRetryDelay(t *testing.T) {
+	cases := []struct {
+		fails int
+		want  time.Duration
+	}{
+		{1, 100 * time.Millisecond},
+		{2, 200 * time.Millisecond},
+		{3, 400 * time.Millisecond},
+		{4, 800 * time.Millisecond},
+		{5, 1600 * time.Millisecond},
+		{6, 2 * time.Second},
+		{9, 2 * time.Second},
+	}
+	for _, tc := range cases {
+		if got := whisperRetryDelay(tc.fails); got != tc.want {
+			t.Fatalf("whisperRetryDelay(%d) = %v，期望 %v", tc.fails, got, tc.want)
+		}
+	}
+}
+
+// TestWhisperSendRetryUntilSuccess 首次下发时信令尚未连上（ws.Send 返回
+// ErrNotConnected，确定性失败），连上后退避重试应把同一目标集合送出去，
+// 成功即清零失败计数并刷新 whisperMaybe（#117）。
+func TestWhisperSendRetryUntilSuccess(t *testing.T) {
+	stub := newWhisperWireRecorder(t)
+	s := NewSession(api.NewAPIClient(stub.wsURL()), "tok", "n", Events{}, nil)
+	s.ws = signal.NewClient(signal.Config{URL: stub.wsURL(), ReconnectMin: 20 * time.Millisecond})
+	defer s.ws.Close()
+	s.protoVer.Store(3)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.whisperLoop(ctx)
+
+	s.SetWhisperTargets([]string{"bob"})
+	waitWhisperFails(t, s, 1)
+	if got := stub.whispers(); len(got) != 0 {
+		t.Fatalf("无连接时不应投递成功，收到 %+v", got)
+	}
+
+	go s.ws.Run(ctx)
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := stub.whispers(); len(got) > 0 {
+			if len(got[0].Targets) != 1 || got[0].Targets[0] != "bob" {
+				t.Fatalf("重试后下发的目标 = %+v", got[0])
+			}
+			s.whisperMu.Lock()
+			fails, maybe := s.whisperFails, s.whisperMaybe
+			s.whisperMu.Unlock()
+			if fails != 0 || !maybe {
+				t.Fatalf("成功后应清零失败计数并置 maybe：fails=%d maybe=%v", fails, maybe)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("未在 10s 内重试成功，收到 %d 条", len(stub.whispers()))
+}
+
+// TestWhisperSendRetryGivesUp 持续失败时重试有上限：达到 whisperSendMaxTries
+// 后停止重试（不再置脏），whisperMaybe 保持未知态，交给下一次目标变化或
+// 入房同步兜底（#117）——不能让一条永远发不出去的消息把 goroutine 钉死。
+func TestWhisperSendRetryGivesUp(t *testing.T) {
+	stub := newWhisperWireRecorder(t)
+	s := NewSession(api.NewAPIClient(stub.wsURL()), "tok", "n", Events{}, nil)
+	s.ws = signal.NewClient(signal.Config{URL: stub.wsURL()}) // 从不 Run：Send 恒失败
+	defer s.ws.Close()
+	s.protoVer.Store(3)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.whisperLoop(ctx)
+
+	s.SetWhisperTargets([]string{"bob"})
+
+	// 退避总和约 100+200+400+800+1600 ≈ 3.1s，留足余量。
+	waitWhisperFails(t, s, whisperSendMaxTries)
+	// 放弃后不得再置脏：否则同一条消息会无限重试。
+	time.Sleep(300 * time.Millisecond)
+	s.whisperMu.Lock()
+	stillNeed, fails := s.whisperNeedSend, s.whisperFails
+	s.whisperMu.Unlock()
+	if stillNeed {
+		t.Fatal("放弃后不应继续置脏重试")
+	}
+	if fails != whisperSendMaxTries {
+		t.Fatalf("放弃后失败计数应停在 %d，实际 %d", whisperSendMaxTries, fails)
+	}
+	if got := stub.whispers(); len(got) != 0 {
+		t.Fatalf("失败场景不应有成功投递，收到 %+v", got)
+	}
+}
+
+// TestWhisperSendRetryResetOnNewTarget 重试期间改目标：新意图重置重试预算，
+// 下发的是最新目标而不是失败时的旧版本（#117）。
+func TestWhisperSendRetryResetOnNewTarget(t *testing.T) {
+	stub := newWhisperWireRecorder(t)
+	s := NewSession(api.NewAPIClient(stub.wsURL()), "tok", "n", Events{}, nil)
+	s.ws = signal.NewClient(signal.Config{URL: stub.wsURL(), ReconnectMin: 20 * time.Millisecond})
+	defer s.ws.Close()
+	s.protoVer.Store(4)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.whisperLoop(ctx)
+
+	s.SetWhisperTargets([]string{"bob"})
+	waitWhisperFails(t, s, 1)
+	// 失败后立刻改目标（重试尚未到点）：预算清零，最新目标被送出。
+	s.SetWhisperTargets([]string{"carol"})
+	s.whisperMu.Lock()
+	fails := s.whisperFails
+	s.whisperMu.Unlock()
+	if fails != 0 {
+		t.Fatalf("新目标应重置重试预算，实际 fails=%d", fails)
+	}
+	go s.ws.Run(ctx)
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := stub.whispers(); len(got) > 0 {
+			if len(got[0].Targets) != 1 || got[0].Targets[0] != "carol" {
+				t.Fatalf("应下发最新目标 carol，实际 %+v", got[0])
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("未在 10s 内下发最新目标")
+}
+
 // TestUpdateDuckingPrioritySpeaker 远端优先发言者说话时压其他远端；自己
 // （即使也是优先发言）不触发；用户手动音量不被覆盖。
 func TestUpdateDuckingPrioritySpeaker(t *testing.T) {
