@@ -202,3 +202,6 @@ response-property-became-optional	PATCH	/api/v1/users/me	the response property `
 
 # ---- request-parameter-min-set（#31：游标 fail-closed，before_id 最小值 1）（1 条）----
 request-parameter-min-set	GET	/api/v1/channels/{id}/messages	for the `query` request parameter `before_id`, the min was set to `1.00`
+
+# ---- response-property-enum-value-added（#54：auth_mode 枚举扩到 full|simple|oidc，企业部署形态）（1 条）----
+response-property-enum-value-added	GET	/api/v1/config	added the new `oidc` enum value to the `auth_mode` response property for the response status `200`
