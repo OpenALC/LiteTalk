@@ -2049,7 +2049,9 @@ const priorityPermBit uint64 = 1 << 4
 
 // SetPrioritySpeaker 授予/撤销某成员的优先发言（#45，需 ManageChannels）。
 // 读当前 member 覆盖 → 保留其他权限位、只增删 PrioritySpeaker → 空覆盖删除。
-// 撤销只清 allow 位、不写 deny，角色可能已授予该权限，不能反向压制。
+// 授予同时清掉个人 deny 位（同层 deny 胜于 allow，残留 deny 会让授予静默失效）。
+// 撤销只清 allow 位、不写 deny；若成员的有效权限仍来自角色/@everyone，撤销
+// 不可能生效，返回 ErrPriorityFromRole 让 UI 明示，而不是静默成功（#117）。
 // 服务端权限不足时返回 API 错误（前端提示 403）。
 func (a *App) SetPrioritySpeaker(channelID, userID string, enabled bool) error {
 	if a.api == nil {
@@ -2077,7 +2079,17 @@ func (a *App) SetPrioritySpeaker(channelID, userID string, enabled bool) error {
 	}
 	if enabled {
 		allow |= priorityPermBit
+		// 同层 deny 胜于 allow（authz.mergeChannel：member 层 (p|allow)&^deny）：
+		// 残留的个人 deny 会让「授予」变成静默空操作，必须一并清掉。
+		deny &^= priorityPermBit
 	} else {
+		hadPersonal := cur != nil && allow&priorityPermBit != 0
+		// 个人覆盖里没有该位、成员却仍是优先发言：授予只可能来自角色/@everyone
+		// 或 owner/Administrator 旁路，此处撤销改不了 effective 结果——不写库里
+		// 注定无效的覆盖，直接明确报错让 UI 说明原因（#117）。
+		if !hadPersonal && a.memberPriority(userID) {
+			return ErrPriorityFromRole
+		}
 		// 撤销且无个人覆盖：角色授予保持原样，不必写一条 deny。
 		if cur == nil {
 			return nil
@@ -2090,6 +2102,27 @@ func (a *App) SetPrioritySpeaker(channelID, userID string, enabled bool) error {
 	_, err = a.api.SetChannelOverwrite(channelID, "member", userID,
 		strconv.FormatUint(allow, 10), strconv.FormatUint(deny, 10))
 	return err
+}
+
+// ErrPriorityFromRole 撤销优先发言无效：该权限由角色或更高层授予（#117）。
+// 前端把它当提示文案展示，不与网络/权限错误混为一谈。
+var ErrPriorityFromRole = errors.New("该权限由角色授予，无法在此撤销")
+
+// memberPriority 成员当前生效的优先发言标记（不在房/无会话时为 false）。
+// 取值来自会话侧成员表，已由 channel.joined 快照与 voice.priority 广播维持。
+func (a *App) memberPriority(userID string) bool {
+	a.mu.Lock()
+	s := a.sess
+	a.mu.Unlock()
+	if s == nil {
+		return false
+	}
+	for _, m := range s.Members() {
+		if m.UserID == userID {
+			return m.Priority
+		}
+	}
+	return false
 }
 
 // parsePermBits 十进制权限位串 → uint64；空串按 0（服务端输出可能省略 0）。
