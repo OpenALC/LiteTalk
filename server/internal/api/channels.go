@@ -264,6 +264,16 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 	}
 	// 类型改成 text 时清掉旧音质（text 恒 0/0）；校验已在各字段应用时按最终类型完成。
 	normalizeChannelAudio(ch)
+	// #102：类型改成 text 时一并清掉密码与人数上限——否则切回 voice 会复活旧密码。
+	// 放在全部字段应用之后按最终类型判定：同一次 PATCH 里显式改密码 + 改成 text
+	// 会在上方的 checkChannelPassword 先被拒，走到这里的一定是「切类型」本身。
+	if normalizeChannelOptions(ch) {
+		// 审计仍只记「密码变了」，不落哈希本身。
+		detail["password_changed"] = true
+		if _, ok := detail["user_limit"]; !ok {
+			detail["user_limit"] = 0
+		}
+	}
 	// 子频道自身改 type/category 也必须与父一致（#101 P2）：上方 409 只拦
 	// 「有子频道的父频道」，子频道此前可以单方面漂移出父的类型/分类，破坏
 	// 两级树的不变量。字段应用完成后统一核对最终值，避免半写。
@@ -378,7 +388,8 @@ func (s *Server) DeleteChannel(ctx context.Context, request DeleteChannelRequest
 
 // ListChannels GET /api/v1/servers/{id}/channels（v0.1.2 补缺口）。
 // 返回分类与频道两个数组，频道带 category_id；前端按分类归组渲染。
-// 成员可读，但只返回其有 ViewChannel 的频道（#35 B3）；categories 不因空分类过滤。
+// 成员可读，但只返回其有 ViewChannel 的频道（#35 B3）；分类按「至少有一个可见
+// 频道」过滤（#102），持 ManageChannels 时保留空分类以便管理。
 func (s *Server) ListChannels(ctx context.Context, request ListChannelsRequestObject) (ListChannelsResponseObject, error) {
 	if e := checkID(request.Id); e != nil {
 		return nil, e
@@ -405,6 +416,12 @@ func (s *Server) ListChannels(ctx context.Context, request ListChannelsRequestOb
 	}
 	if categories == nil {
 		categories = []store.Category{}
+	}
+	// 分类名按频道可见性过滤（#102）：无可见频道的分类不返回，
+	// 否则无权限成员仍能看到分类名。与频道同一口径。
+	categories, err = s.visibleCategories(ctx, c.UserID, request.Id, categories, channels)
+	if err != nil {
+		return nil, s.writeStoreErr(ctx, err)
 	}
 	// ETag 协商（#31）：内容哈希弱标签，命中 If-None-Match 回 304。
 	out := ServerChannels{Categories: categoryViews(categories), Channels: channelViews(channels)}

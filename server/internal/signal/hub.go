@@ -81,6 +81,21 @@ type Hub struct {
 	// presenceChanPublished 好友频道 presence 的去抖缓存（#92）：uid → 上次推送的
 	// 语音房状态。无键 = 尚未推过（离线边沿清空，重进同一频道必须重推）。
 	presenceChanPublished map[string]presenceChanState
+	// presenceChanRetry 好友频道 presence 待重试集合（#102）：权限查询故障导致
+	// 部分接收者被跳过时记录他们，下一次心跳/状态变化只补发这部分人，
+	// 不把「部分失败」当成「已发送」。与 presenceChanPublished 同受 presenceMu 保护。
+	presenceChanRetry map[string]presenceChanPending
+
+	// 频道密码限流（#102）：pwFails 为 uid+频道 → 最近失败时间戳（滑动窗），
+	// pwSem 限制同时进行的 bcrypt 校验数。见 channelpw.go。
+	pwMu    sync.Mutex
+	pwFails map[pwFailKey][]time.Time
+	pwSem   chan struct{}
+	// pwCheck 密码校验函数（默认 auth.CheckPassword；测试可替换以断言
+	// 限流期间确实没有调用 bcrypt）。
+	pwCheck func(hash, plain string) bool
+	// pwWait 拿不到校验信号量时的最长等待（默认 channelPwWait，测试可缩短）。
+	pwWait time.Duration
 
 	// evlog 事件面每会话事件环（#32）：seq 分配与断线续传补发。
 	// 实现为进程内环形队列（单实例假设，见 gateway.go 头注释）。
@@ -243,6 +258,9 @@ func NewHub(s *sfu.SFU, authn Authenticator, sess *auth.SessionIndex, logger *lo
 		userRooms:         make(map[string]string),
 		evlog:             newMemEventLog(chat.Backlog),
 		presencePublished: make(map[string]bool),
+		// #102 频道密码限流：失败窗口按需建，信号量容量固定。
+		pwFails: make(map[pwFailKey][]time.Time, 8),
+		pwSem:   make(chan struct{}, channelPwConcurrency),
 	}
 	// SFU 说话翻转 → 网关事件面（#33）：判定在 SFU ticker，下发在 WS 层。
 	s.SetOnSpeaking(h.broadcastVoiceSpeaking)
@@ -987,10 +1005,25 @@ func (h *Hub) joinRoom(c *client, channelID, password string) {
 				h.sendError(c, ErrCodeForbidden, "该频道需要密码")
 				return
 			}
-			if !auth.CheckPassword(ch.PasswordHash, password) {
+			// #102：失败限流先于 bcrypt——超限的尝试一次哈希都不跑。
+			failKey := makePwFailKey(c.userID, channelID)
+			now := time.Now()
+			if !h.pwAttemptAllowed(failKey, now) {
+				h.sendError(c, ErrCodeRateLimited, "密码尝试过于频繁")
+				return
+			}
+			ok, admitted := h.pwVerify(ch.PasswordHash, password)
+			if !admitted {
+				// 全局并发闸已满：同样不跑 bcrypt，等价于限流。
+				h.sendError(c, ErrCodeRateLimited, "密码尝试过于频繁")
+				return
+			}
+			if !ok {
+				h.pwRecordFailure(failKey, now)
 				h.sendError(c, ErrCodeBadPassword, "频道密码错误")
 				return
 			}
+			h.pwClearFailures(failKey)
 		}
 	}
 
