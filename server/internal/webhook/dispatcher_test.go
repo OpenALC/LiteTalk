@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -64,8 +65,7 @@ func (s *hookStub) handler() http.HandlerFunc {
 			code = http.StatusOK
 		}
 		s.mu.Unlock()
-		body := make([]byte, r.ContentLength)
-		_, _ = r.Body.Read(body)
+		body, _ := io.ReadAll(r.Body) // 读全量：单次 Read 不保证填满，签名断言会抖
 		s.mu.Lock()
 		s.got = append(s.got, recordedRequest{
 			event:     r.Header.Get("X-LiteTalk-Event"),
