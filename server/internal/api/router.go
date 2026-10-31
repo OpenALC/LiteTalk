@@ -18,6 +18,7 @@ import (
 	"github.com/OpenALC/LiteTalk/server/internal/mailer"
 	"github.com/OpenALC/LiteTalk/server/internal/rtcapi"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/internal/token"
 )
 
 // AuthMode 鉴权模式：full（默认，验证码流程）/ simple（免验证码，适合私域部署）。
@@ -96,6 +97,9 @@ type Server struct {
 	selfHost bool               // 一键自托管形态（GET /api/v1/config 自描述，#26）
 	// authz 权限判定（#35 B3）：与 signal.Hub 共享同一实例，缓存失效才同步。
 	authz *authz.Authorizer
+	// apiTokens api_token（pat/bot）校验服务（#54）：REST 中间件与 WS 握手共用
+	// 同一条实现。nil 时按 Store 自建（测试兼容）；生产传与 WS 同一实例。
+	apiTokens *token.Service
 	// bootstrapRequired 管理员邀请码是否未消费（#27 T4 接线；nil=恒 false）。
 	bootstrapRequired func() bool
 	// version 服务端构建版本（GET /api/v1/healthz 回显，#77）。
@@ -150,6 +154,9 @@ type Config struct {
 	// Authz 权限判定（#35 B3）。nil 时用 Store 自建默认实例（测试兼容）；
 	// 生产必须传入与 signal.Hub 共享的同一实例，否则写后失效不同步。
 	Authz *authz.Authorizer
+	// Tokens api_token 校验服务（#54）。nil 时用 Store 自建（测试兼容）；
+	// 生产建议显式传入与 WS 鉴权共用的同一实例（last_used 节流表按实例记）。
+	Tokens *token.Service
 	// Blob 附件二进制存储（#41 B2）。生产由 cmd/server 按 LITETALK_UPLOAD_* 构造；
 	// nil 时上传/下载端点返回 500（测试未注入 blob 的旧用例不受影响）。
 	Blob blob.Store
@@ -187,6 +194,11 @@ func New(cfg Config) *Server {
 		// 测试/单用方场景自建；生产（main.go）注入与 Hub 共享的实例。
 		az = authz.New(cfg.Store, authz.Options{})
 	}
+	toks := cfg.Tokens
+	if toks == nil && cfg.Store != nil {
+		// 同上：测试/单用方场景自建；生产传入与 WS 鉴权共用的同一实例。
+		toks = token.NewService(cfg.Store, lg)
+	}
 	return &Server{
 		store:             cfg.Store,
 		jwt:               cfg.JWT,
@@ -203,6 +215,7 @@ func New(cfg Config) *Server {
 		voice:             cfg.VoicePresence,
 		selfHost:          cfg.SelfHost,
 		authz:             az,
+		apiTokens:         toks,
 		bootstrapRequired: cfg.BootstrapRequired,
 		version:           ver,
 		rtcCfg:            cfg.RTC,
@@ -295,49 +308,66 @@ func (s *Server) Handler() http.Handler {
 
 // ---- 上下文 ----
 
-type ctxKey int
-
-const userKey ctxKey = 1
-
 // legacyTokenGrace 旧版本令牌（无 sid）过渡期：与 signal 侧同值同时长，
 // 服务端升级后已签发令牌在有效期内仍可用，给用户留重新登录窗口（P1-3）。
 const legacyTokenGrace = 2*time.Hour + 5*time.Minute
 
-// auth 鉴权中间件：Authorization: Bearer <access_jwt>。
+// auth 鉴权中间件：Authorization: Bearer <access_jwt | ltk_pat_...|ltk_bot_...>。
+// api_token（#54）按明文前缀分流：ltk_ 开头走 token.Service 校验，**先于** JWT
+// 解析判定——别让 JWT 解析器对非法串抛错刷日志。两条路径产出同一个
+// token.Principal（内嵌 auth.Claims），handler 与 authz 的口径不变。
 // 多设备会话（v1.1.0）：比对 claims.Sid 与当前会话 sid；不符 → 401 session_replaced。
 // 旧版本令牌（sid 空）在 legacyTokenGrace 过渡期内放行（兼容 v1.0.x 客户端）；
 // sess 为 nil 时整段跳过（测试/降级路径，生产不可达）。
+// 令牌路径不做会话比对：api_token 没有会话概念，吊销/过期即失效
+// （每次实时查库，绝不缓存 Principal），属主被删/停用同样失效。
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		h := r.Header.Get("Authorization")
-		token := strings.TrimPrefix(h, "Bearer ")
-		if token == "" || token == h {
+		bearer := strings.TrimPrefix(h, "Bearer ")
+		if bearer == "" || bearer == h {
 			writeErr(w, http.StatusUnauthorized, "unauthorized", "缺少访问令牌")
 			return
 		}
-		claims, err := s.jwt.ParseAccess(token)
-		if err != nil {
-			writeErr(w, http.StatusUnauthorized, "unauthorized", "访问令牌无效或已过期")
-			return
-		}
-		if s.sess != nil {
-			if claims.Sid == "" {
-				// 旧版本令牌：过渡期内放行，超期拒绝。
-				if claims.IssuedAt == nil || time.Since(claims.IssuedAt.Time) >= legacyTokenGrace {
-					w.Header().Set("X-LiteTalk-Auth", "session_replaced")
-					writeErr(w, http.StatusUnauthorized, "session_replaced", "登录状态已过期，请重新登录")
-					return
-				}
-			} else {
-				curSid, err := s.sess.Get(r.Context(), claims.UserID, claims.Dev)
-				if err != nil || curSid == "" || claims.Sid != curSid {
-					w.Header().Set("X-LiteTalk-Auth", "session_replaced")
-					writeErr(w, http.StatusUnauthorized, "session_replaced", "账号已在其他设备登录")
-					return
+		var principal *token.Principal
+		if strings.HasPrefix(bearer, token.PlainPrefix) {
+			// api_token（pat/bot）：独立于密码登录的凭据路径，不进 JWT 解析。
+			if s.apiTokens == nil { // 无 Store 的极端构造（fail-closed）
+				writeErr(w, http.StatusUnauthorized, "unauthorized", "访问令牌无效或已过期")
+				return
+			}
+			p, err := s.apiTokens.Verify(r.Context(), bearer)
+			if err != nil {
+				writeErr(w, http.StatusUnauthorized, "unauthorized", "访问令牌无效或已过期")
+				return
+			}
+			principal = p
+		} else {
+			claims, err := s.jwt.ParseAccess(bearer)
+			if err != nil {
+				writeErr(w, http.StatusUnauthorized, "unauthorized", "访问令牌无效或已过期")
+				return
+			}
+			if s.sess != nil {
+				if claims.Sid == "" {
+					// 旧版本令牌：过渡期内放行，超期拒绝。
+					if claims.IssuedAt == nil || time.Since(claims.IssuedAt.Time) >= legacyTokenGrace {
+						w.Header().Set("X-LiteTalk-Auth", "session_replaced")
+						writeErr(w, http.StatusUnauthorized, "session_replaced", "登录状态已过期，请重新登录")
+						return
+					}
+				} else {
+					curSid, err := s.sess.Get(r.Context(), claims.UserID, claims.Dev)
+					if err != nil || curSid == "" || claims.Sid != curSid {
+						w.Header().Set("X-LiteTalk-Auth", "session_replaced")
+						writeErr(w, http.StatusUnauthorized, "session_replaced", "账号已在其他设备登录")
+						return
+					}
 				}
 			}
+			principal = &token.Principal{Claims: claims, Kind: token.KindJWT}
 		}
-		next(w, r.WithContext(context.WithValue(r.Context(), userKey, claims)))
+		next(w, r.WithContext(token.WithPrincipal(r.Context(), principal)))
 	}
 }
 

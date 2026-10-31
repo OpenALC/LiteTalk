@@ -20,6 +20,24 @@ import (
 	openapi_types "github.com/oapi-codegen/runtime/types"
 )
 
+// Defines values for ApiTokenKind.
+const (
+	ApiTokenKindBot ApiTokenKind = "bot"
+	ApiTokenKindPat ApiTokenKind = "pat"
+)
+
+// Valid indicates whether the value is a known member of the ApiTokenKind enum.
+func (e ApiTokenKind) Valid() bool {
+	switch e {
+	case ApiTokenKindBot:
+		return true
+	case ApiTokenKindPat:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for ChannelInfoType.
 const (
 	ChannelInfoTypeText  ChannelInfoType = "text"
@@ -122,6 +140,54 @@ func (e CreateConversationRequestKind) Valid() bool {
 	case CreateConversationRequestKindDirect:
 		return true
 	case CreateConversationRequestKindGroup:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for CreateTokenRequestScopes.
+const (
+	AdminRead        CreateTokenRequestScopes = "admin.read"
+	AttachmentsWrite CreateTokenRequestScopes = "attachments.write"
+	GuildManage      CreateTokenRequestScopes = "guild.manage"
+	MessagesRead     CreateTokenRequestScopes = "messages.read"
+	MessagesWrite    CreateTokenRequestScopes = "messages.write"
+	VoiceConnect     CreateTokenRequestScopes = "voice.connect"
+)
+
+// Valid indicates whether the value is a known member of the CreateTokenRequestScopes enum.
+func (e CreateTokenRequestScopes) Valid() bool {
+	switch e {
+	case AdminRead:
+		return true
+	case AttachmentsWrite:
+		return true
+	case GuildManage:
+		return true
+	case MessagesRead:
+		return true
+	case MessagesWrite:
+		return true
+	case VoiceConnect:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for CreatedTokenKind.
+const (
+	CreatedTokenKindBot CreatedTokenKind = "bot"
+	CreatedTokenKindPat CreatedTokenKind = "pat"
+)
+
+// Valid indicates whether the value is a known member of the CreatedTokenKind enum.
+func (e CreatedTokenKind) Valid() bool {
+	switch e {
+	case CreatedTokenKindBot:
+		return true
+	case CreatedTokenKindPat:
 		return true
 	default:
 		return false
@@ -301,6 +367,36 @@ type AddFriendRequest struct {
 	Nickname string  `json:"nickname"`
 	Tag      *string `json:"tag,omitempty"`
 }
+
+// ApiToken 个人访问令牌元数据（#54）。**永不包含明文与 secret_hash**——明文只在创建 响应出现一次。ID 为十进制字符串；prefix 为明文前缀 8 位小写 hex （有意公开，用于 UI 展示与日志关联，不是鉴权要素）。
+type ApiToken struct {
+	CreatedAt Time `json:"created_at"`
+
+	// ExpiresAt 过期时刻；null = 长期有效
+	ExpiresAt *Time `json:"expires_at,omitempty"`
+	Id        ID    `json:"id"`
+
+	// Kind pat=个人访问令牌；bot=机器人令牌（创建入口属
+	Kind ApiTokenKind `json:"kind"`
+
+	// LastUsedAt 最近使用时刻（60s 节流异步落库）
+	LastUsedAt *Time `json:"last_used_at,omitempty"`
+
+	// Name 用户可见备注（"CI 机器人"）
+	Name string `json:"name"`
+
+	// Prefix 明文前缀 8 位小写 hex（ltk_pat_<prefix>…****）
+	Prefix string `json:"prefix"`
+
+	// RevokedAt 吊销时刻；null = 未吊销
+	RevokedAt *Time `json:"revoked_at,omitempty"`
+
+	// Scopes 授权 scope 白名单子集；权限 = 角色权限 ∩ scope 映射位
+	Scopes []string `json:"scopes"`
+}
+
+// ApiTokenKind pat=个人访问令牌；bot=机器人令牌（创建入口属
+type ApiTokenKind string
 
 // Attachment 附件元数据（#41）。二进制内容不在 JSON 中；url 与 thumbnail_url 是带下载 能力凭证（key）的相对路径（/api/v1/attachments/{id}?key=...），可直接放进 img 标签，不需要 Authorization。宽高仅图片非零；thumbnail_url 仅图片给出。
 type Attachment struct {
@@ -530,6 +626,38 @@ type CreateServerRequest struct {
 	// Name 2–32 字符
 	Name string `json:"name"`
 }
+
+// CreateTokenRequest defines model for CreateTokenRequest.
+type CreateTokenRequest struct {
+	// ExpiresAt 过期时刻；缺省/ null = 长期有效；须晚于当前时刻
+	ExpiresAt *Time `json:"expires_at,omitempty"`
+
+	// Name 用户可见备注
+	Name string `json:"name"`
+
+	// Scopes 授权 scope 列表；非空且不重复（空 = 无权限，明确拒绝）
+	Scopes []CreateTokenRequestScopes `json:"scopes"`
+}
+
+// CreateTokenRequestScopes defines model for CreateTokenRequest.Scopes.
+type CreateTokenRequestScopes string
+
+// CreatedToken 创建响应：元数据 + 一次性明文 token。**明文此后任何接口都不再返回**。
+type CreatedToken struct {
+	CreatedAt Time             `json:"created_at"`
+	ExpiresAt *Time            `json:"expires_at,omitempty"`
+	Id        ID               `json:"id"`
+	Kind      CreatedTokenKind `json:"kind"`
+	Name      string           `json:"name"`
+	Prefix    string           `json:"prefix"`
+	Scopes    []string         `json:"scopes"`
+
+	// Token 一次性明文 ltk_pat_<prefix8hex>_<secret>；仅此一次
+	Token string `json:"token"`
+}
+
+// CreatedTokenKind defines model for CreatedToken.Kind.
+type CreatedTokenKind string
 
 // EditMessageRequest defines model for EditMessageRequest.
 type EditMessageRequest struct {
@@ -1230,6 +1358,9 @@ type SetMemberRolesJSONRequestBody = SetMemberRolesRequest
 // CreateRoleJSONRequestBody defines body for CreateRole for application/json ContentType.
 type CreateRoleJSONRequestBody = CreateRoleRequest
 
+// CreateTokenJSONRequestBody defines body for CreateToken for application/json ContentType.
+type CreateTokenJSONRequestBody = CreateTokenRequest
+
 // PatchMeJSONRequestBody defines body for PatchMe for application/json ContentType.
 type PatchMeJSONRequestBody = PatchMeRequest
 
@@ -1415,6 +1546,15 @@ type ServerInterface interface {
 	// GetSync 事件续传失败后的聚合快照
 	// (GET /api/v1/sync)
 	GetSync(w http.ResponseWriter, r *http.Request)
+	// ListTokens 当前用户的令牌列表（只含元数据）
+	// (GET /api/v1/tokens)
+	ListTokens(w http.ResponseWriter, r *http.Request)
+	// CreateToken 创建个人访问令牌（响应含一次性明文）
+	// (POST /api/v1/tokens)
+	CreateToken(w http.ResponseWriter, r *http.Request)
+	// RevokeToken 吊销令牌（立即生效）
+	// (DELETE /api/v1/tokens/{id})
+	RevokeToken(w http.ResponseWriter, r *http.Request, id IDPath)
 	// ListUnreads 全部可见频道与服务器的未读/提及计数
 	// (GET /api/v1/unreads)
 	ListUnreads(w http.ResponseWriter, r *http.Request)
@@ -3038,6 +3178,60 @@ func (siw *ServerInterfaceWrapper) GetSync(w http.ResponseWriter, r *http.Reques
 	handler.ServeHTTP(w, r)
 }
 
+// ListTokens operation middleware
+func (siw *ServerInterfaceWrapper) ListTokens(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListTokens(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// CreateToken operation middleware
+func (siw *ServerInterfaceWrapper) CreateToken(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.CreateToken(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// RevokeToken operation middleware
+func (siw *ServerInterfaceWrapper) RevokeToken(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.RevokeToken(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 // ListUnreads operation middleware
 func (siw *ServerInterfaceWrapper) ListUnreads(w http.ResponseWriter, r *http.Request) {
 
@@ -3262,6 +3456,9 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/attachments", wrapper.UploadAttachment)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/attachments/{id}", wrapper.DownloadAttachment)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/attachments/{id}/thumbnail", wrapper.DownloadAttachmentThumbnail)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/tokens", wrapper.ListTokens)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/tokens", wrapper.CreateToken)
+	m.HandleFunc(http.MethodDelete+" "+options.BaseURL+"/api/v1/tokens/{id}", wrapper.RevokeToken)
 
 	return m
 }
@@ -9032,6 +9229,250 @@ func (response GetSyncdefaultApplicationProblemPlusJSONResponse) VisitGetSyncRes
 	return err
 }
 
+type ListTokensRequestObject struct {
+}
+
+type ListTokensResponseObject interface {
+	VisitListTokensResponse(w http.ResponseWriter) error
+}
+
+type ListTokens200JSONResponse []ApiToken
+
+func (response ListTokens200JSONResponse) VisitListTokensResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListTokens401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response ListTokens401ApplicationProblemPlusJSONResponse) VisitListTokensResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListTokensdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response ListTokensdefaultApplicationProblemPlusJSONResponse) VisitListTokensResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateTokenRequestObject struct {
+	Body *CreateTokenJSONRequestBody
+}
+
+type CreateTokenResponseObject interface {
+	VisitCreateTokenResponse(w http.ResponseWriter) error
+}
+
+type CreateToken201JSONResponse CreatedToken
+
+func (response CreateToken201JSONResponse) VisitCreateTokenResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(201)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateToken400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response CreateToken400ApplicationProblemPlusJSONResponse) VisitCreateTokenResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateToken401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response CreateToken401ApplicationProblemPlusJSONResponse) VisitCreateTokenResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateToken429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response CreateToken429ApplicationProblemPlusJSONResponse) VisitCreateTokenResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateTokendefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response CreateTokendefaultApplicationProblemPlusJSONResponse) VisitCreateTokenResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RevokeTokenRequestObject struct {
+	Id IDPath `json:"id"`
+}
+
+type RevokeTokenResponseObject interface {
+	VisitRevokeTokenResponse(w http.ResponseWriter) error
+}
+
+type RevokeToken200JSONResponse StatusOk
+
+func (response RevokeToken200JSONResponse) VisitRevokeTokenResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RevokeToken400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response RevokeToken400ApplicationProblemPlusJSONResponse) VisitRevokeTokenResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RevokeToken401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response RevokeToken401ApplicationProblemPlusJSONResponse) VisitRevokeTokenResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RevokeToken404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response RevokeToken404ApplicationProblemPlusJSONResponse) VisitRevokeTokenResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RevokeToken429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response RevokeToken429ApplicationProblemPlusJSONResponse) VisitRevokeTokenResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RevokeTokendefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response RevokeTokendefaultApplicationProblemPlusJSONResponse) VisitRevokeTokenResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
 type ListUnreadsRequestObject struct {
 }
 
@@ -9423,6 +9864,15 @@ type StrictServerInterface interface {
 	// GetSync 事件续传失败后的聚合快照
 	// (GET /api/v1/sync)
 	GetSync(ctx context.Context, request GetSyncRequestObject) (GetSyncResponseObject, error)
+	// ListTokens 当前用户的令牌列表（只含元数据）
+	// (GET /api/v1/tokens)
+	ListTokens(ctx context.Context, request ListTokensRequestObject) (ListTokensResponseObject, error)
+	// CreateToken 创建个人访问令牌（响应含一次性明文）
+	// (POST /api/v1/tokens)
+	CreateToken(ctx context.Context, request CreateTokenRequestObject) (CreateTokenResponseObject, error)
+	// RevokeToken 吊销令牌（立即生效）
+	// (DELETE /api/v1/tokens/{id})
+	RevokeToken(ctx context.Context, request RevokeTokenRequestObject) (RevokeTokenResponseObject, error)
 	// ListUnreads 全部可见频道与服务器的未读/提及计数
 	// (GET /api/v1/unreads)
 	ListUnreads(ctx context.Context, request ListUnreadsRequestObject) (ListUnreadsResponseObject, error)
@@ -11250,6 +11700,87 @@ func (sh *strictHandler) GetSync(w http.ResponseWriter, r *http.Request) {
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
 	} else if validResponse, ok := response.(GetSyncResponseObject); ok {
 		if err := validResponse.VisitGetSyncResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// ListTokens operation middleware
+func (sh *strictHandler) ListTokens(w http.ResponseWriter, r *http.Request) {
+	var request ListTokensRequestObject
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ListTokens(ctx, request.(ListTokensRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ListTokens")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ListTokensResponseObject); ok {
+		if err := validResponse.VisitListTokensResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// CreateToken operation middleware
+func (sh *strictHandler) CreateToken(w http.ResponseWriter, r *http.Request) {
+	var request CreateTokenRequestObject
+
+	var body CreateTokenJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.CreateToken(ctx, request.(CreateTokenRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "CreateToken")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(CreateTokenResponseObject); ok {
+		if err := validResponse.VisitCreateTokenResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// RevokeToken operation middleware
+func (sh *strictHandler) RevokeToken(w http.ResponseWriter, r *http.Request, id IDPath) {
+	var request RevokeTokenRequestObject
+
+	request.Id = id
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.RevokeToken(ctx, request.(RevokeTokenRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "RevokeToken")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(RevokeTokenResponseObject); ok {
+		if err := validResponse.VisitRevokeTokenResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {

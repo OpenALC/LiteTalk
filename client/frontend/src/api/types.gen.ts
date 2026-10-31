@@ -990,6 +990,50 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/tokens": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 当前用户的令牌列表（只含元数据）
+         * @description 只返回本人令牌的元数据（name/prefix/kind/scopes 与各时间戳）。 响应里没有 token 字段——明文只在创建响应出现一次，任何接口都不再回传。 prefix 为 8 位小写 hex（UI 展示 ltk_pat_<prefix>…**** 用，有意公开）。 401；5xx internal。
+         */
+        get: operations["listTokens"];
+        put?: never;
+        /**
+         * 创建个人访问令牌（响应含一次性明文）
+         * @description 响应的 token 字段形如 ltk_pat_<prefix8hex>_<secret>，**只在本次响应出现 一次**，关闭页面后无法再查看。scopes 必须非空且全部在白名单内：空 scope = 无任何权限（明确拒绝，不当全权限），未知 scope 拒绝，重复 scope 拒绝。 expires_at 缺省 = 长期有效；传过去时刻拒绝。令牌权限 = 角色权限 ∩ scope 映射位（scope 只是上限，不是授予）。 code：bad_name、bad_scopes、bad_expires；401；429 rate_limited（tok: 频控）； 5xx internal。
+         */
+        post: operations["createToken"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tokens/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * 吊销令牌（立即生效）
+         * @description 置 revoked_at，该令牌的下一次请求即 401（服务端不缓存校验结果）。 跨用户访问他人令牌与不存在同样返回 404（不可区分，避免枚举）。 重复吊销幂等（同样 200）。 code：bad_request；401；404 not_found；429 rate_limited；5xx internal。
+         */
+        delete: operations["revokeToken"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -1705,6 +1749,71 @@ export interface components {
         ServerMuteRequest: {
             /** @description true=服务端强制闭麦；false=解禁恢复转发 */
             muted: boolean;
+        };
+        /**
+         * ApiToken
+         * @description 个人访问令牌元数据（#54）。**永不包含明文与 secret_hash**——明文只在创建 响应出现一次。ID 为十进制字符串；prefix 为明文前缀 8 位小写 hex （有意公开，用于 UI 展示与日志关联，不是鉴权要素）。
+         */
+        ApiToken: {
+            id: string;
+            /** @description 用户可见备注（"CI 机器人"） */
+            name: string;
+            /** @description 明文前缀 8 位小写 hex（ltk_pat_<prefix>…****） */
+            prefix: string;
+            /**
+             * @description pat=个人访问令牌；bot=机器人令牌（创建入口属
+             * @enum {string}
+             */
+            kind: "pat" | "bot";
+            /** @description 授权 scope 白名单子集；权限 = 角色权限 ∩ scope 映射位 */
+            scopes: string[];
+            /**
+             * Format: date-time
+             * @description 过期时刻；null = 长期有效
+             */
+            expires_at?: string | null;
+            /**
+             * Format: date-time
+             * @description 最近使用时刻（60s 节流异步落库）
+             */
+            last_used_at?: string | null;
+            /**
+             * Format: date-time
+             * @description 吊销时刻；null = 未吊销
+             */
+            revoked_at?: string | null;
+            /** Format: date-time */
+            created_at: string;
+        };
+        /** CreateTokenRequest */
+        CreateTokenRequest: {
+            /** @description 用户可见备注 */
+            name: string;
+            /** @description 授权 scope 列表；非空且不重复（空 = 无权限，明确拒绝） */
+            scopes: ("messages.read" | "messages.write" | "attachments.write" | "voice.connect" | "guild.manage" | "admin.read")[];
+            /**
+             * Format: date-time
+             * @description 过期时刻；缺省/ null = 长期有效；须晚于当前时刻
+             */
+            expires_at?: string | null;
+        };
+        /**
+         * CreatedToken
+         * @description 创建响应：元数据 + 一次性明文 token。**明文此后任何接口都不再返回**。
+         */
+        CreatedToken: {
+            id: string;
+            name: string;
+            prefix: string;
+            /** @enum {string} */
+            kind: "pat" | "bot";
+            scopes: string[];
+            /** Format: date-time */
+            expires_at?: string | null;
+            /** Format: date-time */
+            created_at: string;
+            /** @description 一次性明文 ltk_pat_<prefix8hex>_<secret>；仅此一次 */
+            token: string;
         };
     };
     responses: {
@@ -3691,6 +3800,84 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    listTokens: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 令牌元数据数组（可为空数组） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiToken"][];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    createToken: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateTokenRequest"];
+            };
+        };
+        responses: {
+            /** @description 已创建（token 为一次性明文） */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreatedToken"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    revokeToken: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 已吊销（或本就处于吊销态） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StatusOk"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
             429: components["responses"]["RateLimited"];
             default: components["responses"]["Internal"];
