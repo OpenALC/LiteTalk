@@ -122,6 +122,9 @@ func (h *Hub) presenceOnline(uid string) bool {
 // 单向好友（pending/blocked）不推；好友数量小，逐个查关系即可。
 // 目标是好友的**全部会话**（在线实时投递 + 断线续传窗口内进环），不只在线连接。
 func (h *Hub) pushPresence(uid string, online bool) {
+	if h.uidIsBot(uid) {
+		return // bot 不进 presence 广播（#51）：不作为事件主体出现
+	}
 	ctx := context.Background()
 	id, err := parseUID(uid)
 	if err != nil {
@@ -194,6 +197,9 @@ type presenceChanPending struct {
 func (h *Hub) syncPresenceChannel(uid string) {
 	if h.presence == nil {
 		return
+	}
+	if h.uidIsBot(uid) {
+		return // bot 不进 presence 广播（#51）：语音房变化不作为事件主体推送
 	}
 	h.presenceMu.Lock()
 	defer h.presenceMu.Unlock()

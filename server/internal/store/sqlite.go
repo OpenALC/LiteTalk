@@ -186,9 +186,9 @@ func (s *SQLite) RollbackLast(ctx context.Context, fsys fs.FS) error {
 func (s *SQLite) CreateUser(ctx context.Context, u *User) error {
 	u.ID = newID(u.ID)
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO users (id, email, nickname, tag, password_hash, email_verified, is_guest, status)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		u.ID, u.Email, u.Nickname, u.Tag, u.PasswordHash, u.EmailVerified, u.IsGuest, u.Status)
+		`INSERT INTO users (id, email, nickname, tag, password_hash, email_verified, is_guest, is_bot, status)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		u.ID, u.Email, u.Nickname, u.Tag, u.PasswordHash, u.EmailVerified, u.IsGuest, u.IsBot, u.Status)
 	if err != nil {
 		if isDupSQLite(err) {
 			return ErrConflict
@@ -202,7 +202,7 @@ func (s *SQLite) CreateUser(ctx context.Context, u *User) error {
 func (s *SQLite) scanUser(row interface{ Scan(...any) error }) (*User, error) {
 	var u User
 	err := row.Scan(&u.ID, &u.Email, &u.Nickname, &u.Tag, &u.PasswordHash,
-		&u.EmailVerified, &u.IsGuest, &u.Status, &u.CreatedAt, &u.UpdatedAt)
+		&u.EmailVerified, &u.IsGuest, &u.IsBot, &u.Status, &u.CreatedAt, &u.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -212,7 +212,7 @@ func (s *SQLite) scanUser(row interface{ Scan(...any) error }) (*User, error) {
 	return &u, nil
 }
 
-const sqUserCols = `id, email, nickname, tag, password_hash, email_verified, is_guest, status, created_at, updated_at`
+const sqUserCols = `id, email, nickname, tag, password_hash, email_verified, is_guest, is_bot, status, created_at, updated_at`
 
 func (s *SQLite) UserByID(ctx context.Context, id int64) (*User, error) {
 	return s.scanUser(s.db.QueryRowContext(ctx, `SELECT `+sqUserCols+` FROM users WHERE id = ?`, id))
@@ -232,9 +232,9 @@ func (s *SQLite) UserByNicknameTag(ctx context.Context, nickname, tag string) (*
 // checkAffected 不会把「原样保存」误报成 ErrNotFound。
 func (s *SQLite) UpdateUser(ctx context.Context, u *User) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE users SET nickname = ?, tag = ?, password_hash = ?, email_verified = ?, status = ?,
+		`UPDATE users SET nickname = ?, tag = ?, password_hash = ?, email_verified = ?, is_bot = ?, status = ?,
 		 updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-		u.Nickname, u.Tag, u.PasswordHash, u.EmailVerified, u.Status, u.ID)
+		u.Nickname, u.Tag, u.PasswordHash, u.EmailVerified, u.IsBot, u.Status, u.ID)
 	if err != nil {
 		if isDupSQLite(err) {
 			return ErrConflict

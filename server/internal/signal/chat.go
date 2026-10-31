@@ -90,6 +90,11 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 		return
 	}
 	ctx := context.Background()
+	// sendCtx 携带连接会话的令牌主体（#51）：只给「发送者本人」的权限检查用，
+	// scope 交集在 authz.CanInServer 的唯一汇聚点生效（messages.write →
+	// SendMessages 位）。提及目标可见性（resolveChatMentions）与广播收件人过滤
+	// 是跨主体检查，必须留在 background ctx——发送者的 scope 不得收窄别人的权限。
+	sendCtx := c.authCtx()
 
 	// 权限二选一：当前在该房间（M2 dev 房间场景）；
 	// 或 channel_id 为数字频道且本人有该频道的发送资格（服务器文字频道 / 会话成员）。
@@ -151,9 +156,10 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 	}
 	// B3 权限：store 服务器频道需 ViewChannel+SendMessages（在幂等回读之前）；
 	// 会话频道成员即拥有权限；dev 内置房间维持原语义（无频道实体，进房即可见）。
+	// 用 sendCtx：api_token 连接受 scope 收窄（messages.write 缺失即拒，#51）。
 	if persist && convMembers == nil {
 		for _, perm := range []store.Permission{store.ViewChannel, store.SendMessages} {
-			if code, msg := h.checkPerm(ctx, uid, serverID, chID, perm, "无权向该频道发送消息"); code != "" {
+			if code, msg := h.checkPerm(sendCtx, uid, serverID, chID, perm, "无权向该频道发送消息"); code != "" {
 				h.sendError(c, code, msg)
 				return
 			}

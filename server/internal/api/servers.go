@@ -247,6 +247,11 @@ func (s *Server) ListServerMembers(ctx context.Context, request ListServerMember
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
+	// bot 不进成员管理列表（#51）：bot 是合法成员可收发消息，但列表只面向人对人。
+	members, err = filterBots(ctx, s.store, members, func(m store.ServerMember) int64 { return m.UserID })
+	if err != nil {
+		return nil, s.writeStoreErr(ctx, err)
+	}
 	// ETag 协商（#31）：内容哈希弱标签，命中 If-None-Match 回 304。
 	// 在线态是视图的一部分：presence 变化会让 ETag 变化（#11）。
 	view := s.serverMemberViews(ctx, members)

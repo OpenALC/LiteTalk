@@ -16,6 +16,7 @@ import (
 	"github.com/OpenALC/LiteTalk/server/internal/authz"
 	"github.com/OpenALC/LiteTalk/server/internal/sfu"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/internal/token"
 	"github.com/coder/websocket"
 	"github.com/pion/webrtc/v4"
 )
@@ -51,6 +52,10 @@ type Hub struct {
 	presence  PresenceStore // 在线状态（presence:{uid}，#11）；nil=不做 presence
 	// authz 权限判定（#35 B3）：与 api.Server 共享实例；nil 时权限门 fail-closed。
 	authz Authz
+
+	// tokens ltk_ 令牌校验（#51）：ChatDeps.Tokens 启动期注入，运行期只读。
+	// nil = 不做 WS 侧 scope 收窄。
+	tokens TokenVerifier
 
 	// offline 离线边沿接收方（#53）：SetOfflineNotifier 启动阶段注入一次，
 	// 运行期只读。
@@ -162,6 +167,9 @@ type client struct {
 	sid      string // 会话 ID（握手比对后的声明值；dev 令牌为空）
 	dev      string // 设备类型（desktop/…）
 	connID   uint64 // Hub 自增连接标识；SFU peer 挂此值做归属核对（§0.9）
+	// principal 连接的令牌主体（#51）：握手以 ltk_ 令牌建立时由 TokenVerifier
+	// 产出，含 Scopes。JWT/dev 连接为 nil。只读字段——建连时写入，之后无并发写。
+	principal *token.Principal
 
 	send       chan []byte // 下行队列（单写者 goroutine 消费）
 	readCancel context.CancelFunc
@@ -195,6 +203,17 @@ func (c *client) closeNow() {
 		c.readCancel()
 	}
 	_ = c.conn.CloseNow()
+}
+
+// authCtx 本连接的权限检查上下文（#51）：api_token 连接把 Principal 注入 ctx，
+// WS 侧与 REST 侧汇聚到 authz.CanInServer 的同一个 scope 交集点
+// （token.ScopeLimitFromContext）——不是给 bot 单开一条分支。JWT/dev 连接
+// principal 为 nil，注入后行为不变。
+//
+// 只用于「连接本人」的权限判定。跨主体检查（提及目标可见性、广播收件人过滤、
+// 成员快照）必须用 background ctx：发送者的 scope 不得收窄别人的权限。
+func (c *client) authCtx() context.Context {
+	return token.WithPrincipal(context.Background(), c.principal)
 }
 
 // Authz 频道权限判定（#35 B3，*authz.Authorizer 满足；测试可注入故障假实现）。
@@ -241,6 +260,18 @@ type ChatDeps struct {
 	// Authz 权限判定（#35 B3）。nil 且 Store 是 store.Store 时自建默认实例（测试兼容）；
 	// 生产必须注入与 api 共享的同一实例，否则写后失效不同步。
 	Authz Authz
+	// Tokens ltk_ 明文令牌校验（#51）：与 REST 中间件、WS 握手 authenticator 共用
+	// 同一 *token.Service 实例（一条实现，不另建）。nil 时不做 WS 侧 scope 收窄
+	// （JWT/dev 连接本就不受限，旧行为不变）。
+	Tokens TokenVerifier
+}
+
+// TokenVerifier 校验 ltk_ 明文令牌并返回主体（#51）。*token.Service 满足。
+// 握手 authenticator 只回 Identity（不含 scope），hub 拿到同一明文再 Verify 一次
+// 取 Principal 挂会话——握手是低频路径，多一次按前缀的索引点查可忽略；换来的是
+// 无共享可变登记表（不同令牌不同连接不会串）+ 吊销在握手时刻再核一遍。
+type TokenVerifier interface {
+	Verify(ctx context.Context, plain string) (*token.Principal, error)
 }
 
 // NewHub 构造信令 hub。maxMembers <= 0 时取 SFU 的上限。
@@ -274,6 +305,7 @@ func NewHub(s *sfu.SFU, authn Authenticator, sess *auth.SessionIndex, logger *lo
 		joinRate:          chat.JoinRate,
 		offerRate:         chat.OfferRate,
 		authz:             az,
+		tokens:            chat.Tokens,
 		heartbeatEvery:    defaultHeartbeatEvery,
 		pongWait:          defaultPongWait,
 		readIdle:          defaultReadIdle,
@@ -321,6 +353,17 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	// ltk_ 令牌连接（#51）：再取一次 Principal 挂会话，发送类权限检查据此做
+	// scope 收窄。同一条 TokenVerifier（与握手 authenticator 共用 token.Service），
+	// 校验失败同样 401——不区分「哪一步失败」，不给探测信息。
+	var principal *token.Principal
+	if raw := r.URL.Query().Get("token"); h.tokens != nil && strings.HasPrefix(raw, token.PlainPrefix) {
+		principal, err = h.tokens.Verify(r.Context(), raw)
+		if err != nil {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
 	// 握手比对会话 sid（§0.4）：不符 → 401 + X-LiteTalk-Auth: session_replaced（body code 同值）。
 	if !h.sessionOK(r.Context(), id) {
 		w.Header().Set("X-LiteTalk-Auth", "session_replaced")
@@ -360,6 +403,7 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 		username:   id.Username,
 		sid:        id.Sid,
 		dev:        id.Dev,
+		principal:  principal,
 		send:       make(chan []byte, 256),
 		readCancel: cancel,
 	}
@@ -913,7 +957,9 @@ func (h *Hub) serverMax() int64 {
 // 非成员→forbidden，然后才是权限不足。
 // 校验含 store 查询，调用方不得持有 hub.mu。
 func (h *Hub) authorizeChannelJoin(c *client, channelID string) (code, msg string) {
-	ctx := context.Background()
+	// 进房是连接本人的权限判定：api_token 连接经 authCtx 携带 Principal，
+	// scope 缺 voice.connect 对应位（ViewChannel/ConnectVoice）时在此拒绝（#51）。
+	ctx := c.authCtx()
 	chID, err := strconv.ParseInt(channelID, 10, 64)
 	if err != nil {
 		if h.dev {
@@ -1031,7 +1077,9 @@ func (h *Hub) joinRoom(c *client, channelID, password string) {
 		bypass := false
 		if h.authz != nil {
 			var aerr error
-			bypass, aerr = h.authz.CanServer(context.Background(), uid, ch.ServerID, store.Administrator)
+			// 密码旁路同属连接本人的权限：api_token 连接受 scope 收窄约束
+			// （guild.manage 之外的令牌不得旁路频道密码，#51）。
+			bypass, aerr = h.authz.CanServer(c.authCtx(), uid, ch.ServerID, store.Administrator)
 			if aerr != nil {
 				h.log.Printf("ws: 密码旁路查询失败（用户 %d 频道 %d）: %v", uid, ch.ID, aerr)
 				h.sendError(c, ErrCodeInternal, "权限查询失败")

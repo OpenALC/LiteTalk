@@ -48,16 +48,20 @@ const pushDeviceCols = `id, user_id, platform, push_token, last_seen_at, created
 
 // User 用户（§6.1 users 表）。无头像字段。
 type User struct {
-	ID            int64     `json:"id" db:"id"`
-	Email         string    `json:"email" db:"email"`
-	Nickname      string    `json:"nickname" db:"nickname"`
-	Tag           string    `json:"tag" db:"tag"`
-	PasswordHash  string    `json:"-" db:"password_hash"`
-	EmailVerified bool      `json:"email_verified" db:"email_verified"`
-	IsGuest       bool      `json:"is_guest" db:"is_guest"`
-	Status        int8      `json:"status" db:"status"`
-	CreatedAt     time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at" db:"updated_at"`
+	ID            int64  `json:"id" db:"id"`
+	Email         string `json:"email" db:"email"`
+	Nickname      string `json:"nickname" db:"nickname"`
+	Tag           string `json:"tag" db:"tag"`
+	PasswordHash  string `json:"-" db:"password_hash"`
+	EmailVerified bool   `json:"email_verified" db:"email_verified"`
+	IsGuest       bool   `json:"is_guest" db:"is_guest"`
+	// IsBot 机器人账号（迁移 0018，#51）：password_hash 落空串（无法密码登录）、
+	// email 用 <prefix>@bots.invalid；对用户不可见（好友候选/@提及候选/成员管理
+	// 列表过滤），仅经 api_token 连 WS/REST。
+	IsBot     bool      `json:"is_bot" db:"is_bot"`
+	Status    int8      `json:"status" db:"status"`
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt time.Time `json:"updated_at" db:"updated_at"`
 }
 
 // FriendshipStatus 好友关系状态。
@@ -354,6 +358,10 @@ type Store interface {
 	UserByEmail(ctx context.Context, email string) (*User, error)
 	UserByNicknameTag(ctx context.Context, nickname, tag string) (*User, error)
 	UpdateUser(ctx context.Context, u *User) error
+	// BotsAmong uids 中是 bot 账号的子集合（#51）：好友候选/@提及候选/成员管理
+	// 列表的统一 bot 过滤辅助——调用方一次集合查询做差，不各自拼 WHERE is_bot=0。
+	// 空入参返回空 map 不查库；查询故障上抛，调用方决定放行或拒绝。
+	BotsAmong(ctx context.Context, uids []int64) (map[int64]bool, error)
 	// HasUsers 库内是否已有用户（首启探测用；UserByID(1) 随 Snowflake 失效）。
 	HasUsers(ctx context.Context) (bool, error)
 	// HasServers 库内是否已有服务器（#27：实例是否已被认领的持久判据，
