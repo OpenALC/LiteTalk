@@ -104,11 +104,14 @@ type Store interface {
 	DeleteWebhookDeliveries(ctx context.Context, ids []int64) error
 }
 
-// outboundTask 一次入队单元：出口只给事件与频道上下文，服务器归属、订阅匹配
-// 与投递全在 worker（绝不阻塞广播路径）。
+// outboundTask 一次入队单元：出口只给事件与上下文，订阅匹配与投递全在 worker
+// （绝不阻塞广播/请求路径）。serverID 非 0 时直接采用（REST 事件源已归属到服，
+// 且 channel.deleted 的频道行此刻已删，不能走频道反查）；为 0 时 worker 经
+// channelID 反查（hub 的 message.created 路径）。
 type outboundTask struct {
 	event     string
 	channelID string
+	serverID  int64
 	payload   json.RawMessage
 }
 
@@ -254,6 +257,25 @@ func (d *Dispatcher) OnWebhookEvent(eventType, channelID string, payload json.Ra
 	}
 }
 
+// OnServerEvent REST 层出站事件派发（#52）：member/channel 事件的触发点在 REST
+// 成功路径上，不在 hub 事件流里，由各成功点直接调用。服务器归属由调用方给出
+// （member 事件没有频道；channel.deleted 的行已删，反查会丢事件）；channelID 为
+// 0 表示事件无频道维度（投递体不带 channel_id）。入队语义与 OnWebhookEvent 相同。
+func (d *Dispatcher) OnServerEvent(eventType string, serverID, channelID int64, payload json.RawMessage) {
+	if d == nil || !d.started.Load() {
+		return
+	}
+	chID := ""
+	if channelID != 0 {
+		chID = strconv.FormatInt(channelID, 10)
+	}
+	select {
+	case d.ch <- outboundTask{event: eventType, serverID: serverID, channelID: chID, payload: payload}:
+	default:
+		d.log.Printf("[webhook] 派发队列已满（%d），丢弃 %s 事件", cap(d.ch), eventType)
+	}
+}
+
 // worker 消费派发队列。
 func (d *Dispatcher) worker(ctx context.Context) {
 	defer d.wg.Done()
@@ -267,27 +289,31 @@ func (d *Dispatcher) worker(ctx context.Context) {
 	}
 }
 
-// process 单个事件的完整投递链：频道归属解析 → 订阅匹配 → 逐订阅带退避投递。
+// process 单个事件的完整投递链：服务器归属解析 → 订阅匹配 → 逐订阅带退避投递。
 func (d *Dispatcher) process(ctx context.Context, t outboundTask) {
-	chID, err := strconv.ParseInt(t.channelID, 10, 64)
-	if err != nil {
-		return // dev 内置房间无 store 实体，不出站
+	serverID := t.serverID
+	if serverID == 0 {
+		chID, err := strconv.ParseInt(t.channelID, 10, 64)
+		if err != nil {
+			return // dev 内置房间无 store 实体，不出站
+		}
+		ch, err := d.store.ChannelByID(ctx, chID)
+		if err != nil {
+			return // 频道不存在（并发删除）或 store 故障：丢弃
+		}
+		serverID = ch.ServerID
 	}
-	ch, err := d.store.ChannelByID(ctx, chID)
-	if err != nil {
-		return // 频道不存在（并发删除）或 store 故障：丢弃
-	}
-	if ch.ServerID == 0 {
+	if serverID == 0 {
 		return // 私聊/群聊会话无服务器归属，出站订阅只挂服务器
 	}
-	hooks, err := d.store.OutboundWebhooksOfServer(ctx, ch.ServerID)
+	hooks, err := d.store.OutboundWebhooksOfServer(ctx, serverID)
 	if err != nil {
-		d.log.Printf("[webhook] 读取服务器 %d 订阅失败: %v", ch.ServerID, err)
+		d.log.Printf("[webhook] 读取服务器 %d 订阅失败: %v", serverID, err)
 		return
 	}
 	body, err := json.Marshal(outboundEnvelope{
 		Event:     t.event,
-		ServerID:  strconv.FormatInt(ch.ServerID, 10),
+		ServerID:  strconv.FormatInt(serverID, 10),
 		ChannelID: t.channelID,
 		Data:      t.payload,
 	})

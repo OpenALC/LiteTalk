@@ -546,3 +546,21 @@ func inboundWebhookWire(w *store.InboundWebhook, urlOut string) InboundWebhook {
 func inboundDeliveryPath(id int64, secret string) string {
 	return "/api/v1/webhooks/" + strconv.FormatInt(id, 10) + "/" + secret
 }
+
+// notifyWebhookEvent REST 层出站事件派发（#52）：hub 事件流只看得到
+// message.created，member/channel 事件的触发点在 REST 成功路径上（事务提交后），
+// 由这里入队。webhooks 为 nil（测试/降级）或投递器未启动（零订阅）时丢弃，
+// 只做一次非阻塞入队，绝不阻塞请求路径。serverID 由调用方直接给出——
+// member 事件没有频道维度；channel.deleted 的频道行此刻已删，不能经频道反查。
+// member.left 触发源暂缺：store.RemoveMember 目前无 REST 调用方（无删除成员
+// 入口），有了之后在对应成功点补一行本函数调用即点亮。
+func (s *Server) notifyWebhookEvent(eventType string, serverID, channelID int64, payload any) {
+	if s.webhooks == nil {
+		return
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	s.webhooks.OnServerEvent(eventType, serverID, channelID, raw)
+}

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/internal/webhook"
 )
 
 // 服务器名称与图标校验（§5.4：图标为预设 Lucide 图标+颜色）。
@@ -224,6 +225,11 @@ func (s *Server) JoinServer(ctx context.Context, request JoinServerRequestObject
 	s.authz.InvalidateServer(inv.ServerID)
 	// 新成员以当前最新消息为已读水位，避免把全部历史看成未读（#40）。
 	s.initServerReadStates(ctx, c.UserID, inv.ServerID)
+	// 出站 webhook 事件出口（#52）：member.joined，仅在真实插入路径派发——
+	// 上面 ErrConflict 的并发幂等重放不重复发事件。
+	s.notifyWebhookEvent(webhook.EventMemberJoined, inv.ServerID, 0, map[string]any{
+		"user_id": idOf(c.UserID), "role": string(store.RoleMember),
+	})
 	return JoinServer200JSONResponse(serverView(srv)), nil
 }
 

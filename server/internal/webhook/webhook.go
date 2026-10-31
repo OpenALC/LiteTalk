@@ -27,9 +27,15 @@ import (
 )
 
 // 事件白名单（批次 6 契约）：订阅时校验，事件出口只挂这五类，新增需改契约。
+// 事件源：message.created 在 hub 事件流（signal 包 broadcastEvent 尾部的出口）；
+// member.joined / channel.created / channel.deleted 由 REST 成功点（事务提交后）
+// 经 api.Server.notifyWebhookEvent 派发；member.left 触发源暂缺（见常量注释）。
 const (
 	EventMessageCreated = "message.created"
 	EventMemberJoined   = "member.joined"
+	// EventMemberLeft 目前休眠：store.RemoveMember 没有 REST 调用方（无删除成员
+	// 入口）。有了之后在对应成功点经 notifyWebhookEvent 派发一行即点亮，投递
+	// 链路（订阅校验/签名/重试/熔断）已就绪。
 	EventMemberLeft     = "member.left"
 	EventChannelCreated = "channel.created"
 	EventChannelDeleted = "channel.deleted"

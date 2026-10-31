@@ -6,13 +6,20 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/OpenALC/LiteTalk/server/internal/auth"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/internal/webhook"
 )
 
 // newTestServerWithWebhooks webhook 管理端点的测试服务器：
@@ -214,4 +221,202 @@ func TestInboundWebhookDelivery(t *testing.T) {
 		t.Fatal("第二个入口应有独立 id 与 secret")
 	}
 	postJSON(t, h, created2["url"].(string), "", map[string]string{"content": "新入口可用"}, http.StatusOK)
+}
+
+// ---- REST 事件源挂钩测试（#52）：member.joined / channel.created / channel.deleted ----
+// hub 事件流只有 message.created；这三类由 REST 成功点经 notifyWebhookEvent 派发，
+// 这里走真实投递器 + httptest 桩做端到端断言（REST 动作 → 桩收到对应事件）。
+
+// hookTarget 出站投递桩：记录事件名与投递体（api 侧最小桩）。
+type hookTarget struct {
+	mu     sync.Mutex
+	events []string
+	bodies [][]byte
+}
+
+func (t *hookTarget) handler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		t.mu.Lock()
+		t.events = append(t.events, r.Header.Get("X-LiteTalk-Event"))
+		t.bodies = append(t.bodies, body)
+		t.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
+// waitEvent 等待指定事件到达（异步投递的确定性等待），返回其投递体。
+func waitEvent(t *testing.T, target *hookTarget, event string) []byte {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		target.mu.Lock()
+		for i, e := range target.events {
+			if e == event {
+				body := target.bodies[i]
+				target.mu.Unlock()
+				return body
+			}
+		}
+		target.mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatalf("等待 %s 事件超时（收到 %v）", event, target.events)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// newTestServerWithDispatch 出站全链路测试服务器：投递器接 httptest 桩（SSRF 放行）
+// 且已启动（REST 挂钩路径不做 EnsureStarted——订阅由测试直插 store）。
+func newTestServerWithDispatch(t *testing.T, mem *store.Mem, target *hookTarget) *Server {
+	t.Helper()
+	disp := webhook.New(webhook.Config{CheckURL: func(string) error { return nil }}, mem)
+	disp.Start(nil)
+	t.Cleanup(disp.Close)
+	return New(Config{
+		Store:           mem,
+		JWT:             auth.NewJWT("test-secret"),
+		Refresh:         auth.NewRefreshStore(mem),
+		Codes:           auth.NewEmailCodes(mem),
+		Limits:          auth.NewRateLimit(mem),
+		Session:         auth.NewSessionIndex(mem, mem),
+		Presence:        mem,
+		Webhooks:        disp,
+		WebhookURLCheck: func(string) error { return nil },
+	})
+}
+
+// seedOutbound 直插一条出站订阅（订阅全部事件，测试只断言关心的那类）。
+func seedOutbound(t *testing.T, mem *store.Mem, serverID int64, url string) {
+	t.Helper()
+	w := &store.OutboundWebhook{
+		ServerID: serverID, URL: url,
+		Secret: "secret0123456789abcdef0123456789abcdef",
+		Events: "message.created member.joined member.left channel.created channel.deleted",
+	}
+	if err := mem.CreateOutboundWebhook(context.Background(), w); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestChannelCreatedHook 建频道 → 订阅者收到 channel.created，归属与载荷正确。
+func TestChannelCreatedHook(t *testing.T) {
+	mem := store.NewMem()
+	target := &hookTarget{}
+	hs := httptest.NewServer(target.handler())
+	defer hs.Close()
+	srv := newTestServerWithDispatch(t, mem, target)
+	h := srv.Handler()
+	access, _ := registerUser(t, h, mem, "hook-cc@ex.com", "hookCC", "password123")
+	serverID := asID(postJSON(t, h, "/api/v1/servers", access, map[string]string{
+		"name": "hookCC的服", "icon_name": "music", "icon_color": "#4FA4F3",
+	}, http.StatusCreated)["id"])
+	seedOutbound(t, mem, serverID, hs.URL)
+
+	ch := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/channels", serverID), access,
+		map[string]any{"name": "hooked", "type": "text"}, http.StatusCreated)
+	body := waitEvent(t, target, "channel.created")
+	var env struct {
+		Event     string         `json:"event"`
+		ServerID  string         `json:"server_id"`
+		ChannelID string         `json:"channel_id"`
+		Data      map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Event != "channel.created" || env.ServerID != strconv.FormatInt(serverID, 10) {
+		t.Fatalf("事件头不符: %s server=%s", env.Event, env.ServerID)
+	}
+	if env.ChannelID != ch["id"] || env.Data["name"] != "hooked" {
+		t.Fatalf("载荷与新建频道不一致: channel_id=%v data=%v", env.ChannelID, env.Data)
+	}
+}
+
+// TestChannelDeletedHook 删频道 → channel.deleted，频道行已删仍带删除前快照与归属。
+func TestChannelDeletedHook(t *testing.T) {
+	mem := store.NewMem()
+	target := &hookTarget{}
+	hs := httptest.NewServer(target.handler())
+	defer hs.Close()
+	srv := newTestServerWithDispatch(t, mem, target)
+	h := srv.Handler()
+	access, _ := registerUser(t, h, mem, "hook-cd@ex.com", "hookCD", "password123")
+	serverID := asID(postJSON(t, h, "/api/v1/servers", access, map[string]string{
+		"name": "hookCD的服", "icon_name": "music", "icon_color": "#4FA4F3",
+	}, http.StatusCreated)["id"])
+	seedOutbound(t, mem, serverID, hs.URL)
+	ch := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/channels", serverID), access,
+		map[string]any{"name": "doomed", "type": "text"}, http.StatusCreated)
+	waitEvent(t, target, "channel.created") // 建频道事件先落袋，避免干扰计数
+
+	delJSON(t, h, fmt.Sprintf("/api/v1/channels/%v", ch["id"]), access, http.StatusOK)
+	body := waitEvent(t, target, "channel.deleted")
+	var env struct {
+		Event     string         `json:"event"`
+		ServerID  string         `json:"server_id"`
+		ChannelID string         `json:"channel_id"`
+		Data      map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Event != "channel.deleted" || env.ServerID != strconv.FormatInt(serverID, 10) {
+		t.Fatalf("事件头不符: %s server=%s", env.Event, env.ServerID)
+	}
+	if env.ChannelID != ch["id"] || env.Data["name"] != "doomed" {
+		t.Fatalf("载荷应携带删除前快照: channel_id=%v data=%v", env.ChannelID, env.Data)
+	}
+}
+
+// TestMemberJoinedHook 邀请入服 → member.joined（无频道维度），并发幂等重放不重复发。
+func TestMemberJoinedHook(t *testing.T) {
+	mem := store.NewMem()
+	target := &hookTarget{}
+	hs := httptest.NewServer(target.handler())
+	defer hs.Close()
+	srv := newTestServerWithDispatch(t, mem, target)
+	h := srv.Handler()
+	access, _ := registerUser(t, h, mem, "hook-mj@ex.com", "hookMJ", "password123")
+	serverID := asID(postJSON(t, h, "/api/v1/servers", access, map[string]string{
+		"name": "hookMJ的服", "icon_name": "music", "icon_color": "#4FA4F3",
+	}, http.StatusCreated)["id"])
+	seedOutbound(t, mem, serverID, hs.URL)
+	inv := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/invites", serverID), access,
+		map[string]any{}, http.StatusCreated)
+
+	bAccess, _ := registerUser(t, h, mem, "hook-mj-b@ex.com", "hookMJB", "password123")
+	postJSON(t, h, "/api/v1/servers/join", bAccess, map[string]string{
+		"code": inv["code"].(string),
+	}, http.StatusOK)
+	body := waitEvent(t, target, "member.joined")
+	var env struct {
+		Event    string         `json:"event"`
+		ServerID string         `json:"channel_id,omitempty"`
+		Data     map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Event != "member.joined" {
+		t.Fatalf("事件名不符: %s", env.Event)
+	}
+	if env.Data["user_id"] == nil || env.Data["role"] != "member" {
+		t.Fatalf("载荷应含新成员 user_id 与 role: %v", env.Data)
+	}
+	// 同一邀请码重复 POST（已成员幂等路径）不再触发 member.joined。
+	time.Sleep(30 * time.Millisecond)
+	target.mu.Lock()
+	n := len(target.events)
+	target.mu.Unlock()
+	postJSON(t, h, "/api/v1/servers/join", bAccess, map[string]string{
+		"code": inv["code"].(string),
+	}, http.StatusOK)
+	time.Sleep(30 * time.Millisecond)
+	target.mu.Lock()
+	after := len(target.events)
+	target.mu.Unlock()
+	if after != n {
+		t.Fatalf("幂等重放不应再触发事件（%d → %d）", n, after)
+	}
 }
