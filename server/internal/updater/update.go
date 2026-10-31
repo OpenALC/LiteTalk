@@ -110,14 +110,15 @@ func (u *Updater) runOnce(ctx context.Context, tag, delivery string) (Result, er
 	start := u.now()
 	res, err := u.Execute(ctx, tag)
 	res.Duration = u.now().Sub(start)
+	// latest 不新于已装版本是"已是最新"的空操作，不是更新失败：不写失败状态。
+	// 放在 dry-run 早退之前，--dry-run --tag latest 也不会被当成失败（退出码 0）。
+	if errors.Is(err, ErrLatestNotNewer) {
+		return res, nil
+	}
 	if u.st == nil || u.cfg.DryRun {
 		return res, err
 	}
 	if err != nil {
-		// latest 不新于已装版本是"已是最新"的空操作，不是更新失败：不写失败状态。
-		if errors.Is(err, ErrLatestNotNewer) {
-			return res, nil
-		}
 		if recErr := u.st.RecordFailure(res.Tag, delivery, err, res.Duration); recErr != nil {
 			u.logf("写失败状态出错: %v", recErr)
 		}

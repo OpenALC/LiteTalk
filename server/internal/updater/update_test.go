@@ -496,3 +496,32 @@ func TestOnceSameVersionLatestIsNoop(t *testing.T) {
 		t.Fatalf("不得重启: %v", calls)
 	}
 }
+
+// TestOnceLatestDryRunDoesNotFail 已是最新时 --dry-run --tag latest 也是 0 退出：
+// 空操作判定放在 dry-run 早退之前，否则 cron/SSH 兜底的 dry-run 会被误报为失败。
+func TestOnceLatestDryRunDoesNotFail(t *testing.T) {
+	gh := newFakeGitHub(t)
+	health := &fakeHealthz{ver: "v2.0.0-alpha"}
+	cfg, _ := newTestConfig(t, gh.srv.URL, health.start(t))
+	cfg.DryRun = true
+	writeFile(t, filepath.Join(cfg.InstallDir, "litetalk-server"), "CURRENT-BINARY")
+	gh.publish(t, "v1.9.0-alpha", "OLDER-BINARY", true)
+
+	st, _ := OpenState(cfg.StateDir)
+	if err := st.Update(func(s *State) { s.CurrentVersion = "v3.0.0-alpha" }); err != nil {
+		t.Fatal(err)
+	}
+	up := New(cfg, &fakeRunner{}, st, testLogger(), nil)
+	up.FreeDisk = func(string) (uint64, error) { return 1 << 30, nil }
+
+	res, err := up.RunOnce(context.Background(), "latest", "")
+	if err != nil {
+		t.Fatalf("dry-run + latest 不降级应是空操作: %v", err)
+	}
+	if !res.Skipped {
+		t.Fatalf("应标记 Skipped: %+v", res)
+	}
+	if st.Get().LastResult != "" {
+		t.Fatalf("dry-run 不得写状态: %+v", st.Get())
+	}
+}
