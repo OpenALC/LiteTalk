@@ -1966,3 +1966,97 @@ func checkAffected(res sql.Result) error {
 
 // 编译期断言：MySQL 是 Store 的完整实现。
 var _ Store = (*MySQL)(nil)
+
+// ---- push_devices（迁移 0020，#53） ----
+
+func scanPushDevice(row *sql.Row) (*PushDevice, error) {
+	d := &PushDevice{}
+	err := row.Scan(&d.ID, &d.UserID, &d.Platform, &d.Token, &d.LastSeen, &d.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return d, nil
+}
+
+// UpsertPushDevice 按 (user_id, token_hash) 幂等：命中更新 platform/last_seen 并
+// 回填既有 ID 返回 false；未命中插入返回 true。并发首插撞唯一键时退回更新，
+// 不把竞态暴露成 ErrConflict——重复注册语义上就是更新。
+func (m *MySQL) UpsertPushDevice(ctx context.Context, d *PushDevice) (bool, error) {
+	hash := pushTokenHash(d.Token)
+	now := time.Now()
+	var id int64
+	err := m.db.QueryRowContext(ctx,
+		`SELECT id FROM push_devices WHERE user_id = ? AND token_hash = ?`, d.UserID, hash).Scan(&id)
+	if err == nil {
+		if _, err = m.db.ExecContext(ctx,
+			`UPDATE push_devices SET platform = ?, push_token = ?, last_seen_at = ? WHERE id = ?`,
+			d.Platform, d.Token, now, id); err != nil {
+			return false, err
+		}
+		d.ID, d.LastSeen = id, now
+		return false, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	d.ID = newID(d.ID)
+	if _, err = m.db.ExecContext(ctx,
+		`INSERT INTO push_devices (id, user_id, platform, push_token, token_hash, last_seen_at, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		d.ID, d.UserID, d.Platform, d.Token, hash, now, now); err != nil {
+		if !isDup(err) {
+			return false, err
+		}
+		// 并发首插：另一连接已写入同一 (user_id, token_hash)，退回更新既有行。
+		if e := m.db.QueryRowContext(ctx,
+			`SELECT id FROM push_devices WHERE user_id = ? AND token_hash = ?`, d.UserID, hash).Scan(&id); e != nil {
+			return false, e
+		}
+		if _, e := m.db.ExecContext(ctx,
+			`UPDATE push_devices SET platform = ?, push_token = ?, last_seen_at = ? WHERE id = ?`,
+			d.Platform, d.Token, now, id); e != nil {
+			return false, e
+		}
+		d.ID, d.LastSeen = id, now
+		return false, nil
+	}
+	d.CreatedAt = now
+	return true, nil
+}
+
+// PushDevicesOfUser 该用户全部设备，按 id 升序。
+func (m *MySQL) PushDevicesOfUser(ctx context.Context, userID int64) ([]PushDevice, error) {
+	rows, err := m.db.QueryContext(ctx,
+		`SELECT `+pushDeviceCols+` FROM push_devices WHERE user_id = ? ORDER BY id`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []PushDevice{}
+	for rows.Next() {
+		var d PushDevice
+		if err := rows.Scan(&d.ID, &d.UserID, &d.Platform, &d.Token, &d.LastSeen, &d.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// PushDeviceByID 单台设备；无命中 ErrNotFound。
+func (m *MySQL) PushDeviceByID(ctx context.Context, id int64) (*PushDevice, error) {
+	return scanPushDevice(m.db.QueryRowContext(ctx,
+		`SELECT `+pushDeviceCols+` FROM push_devices WHERE id = ?`, id))
+}
+
+// DeletePushDevice 删除设备行；未命中 ErrNotFound。
+func (m *MySQL) DeletePushDevice(ctx context.Context, id int64) error {
+	res, err := m.db.ExecContext(ctx, `DELETE FROM push_devices WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	return checkAffected(res)
+}

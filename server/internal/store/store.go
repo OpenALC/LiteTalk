@@ -5,6 +5,8 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"time"
 
@@ -32,6 +34,17 @@ func newID(id int64) int64 {
 	}
 	return snowflake.Next()
 }
+
+// pushTokenHash push_token 的幂等派生键：SHA-256 十六进制（64 定长）。
+// token 明文可达 4KB 放不进唯一索引，且哈希派生收在 Store 内部，
+// 调用方无法落一行哈希与明文不一致的脏数据。
+func pushTokenHash(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+// pushDeviceCols push_devices 行的查询列集（MySQL 与 SQLite 实现共用）。
+const pushDeviceCols = `id, user_id, platform, push_token, last_seen_at, created_at`
 
 // User 用户（§6.1 users 表）。无头像字段。
 type User struct {
@@ -259,6 +272,19 @@ type APIToken struct {
 	LastUsedAt *time.Time
 	RevokedAt  *time.Time
 	CreatedAt  time.Time
+}
+
+// PushDevice 移动推送设备（迁移 0020，#53）。push_token 是生产凭据的等价物：
+// 明文仅供推送通道投递使用——不进任何 API 响应，日志一律打码（只留前 8 位）。
+// TokenHash 由 Store 在 Upsert 时按 SHA-256(push_token) 派生，调用方不得自行赋值；
+// 幂等键 (user_id, token_hash) 见迁移 0020（token 可达 4KB，超出索引长度上限）。
+type PushDevice struct {
+	ID        int64     `json:"id" db:"id"`
+	UserID    int64     `json:"user_id" db:"user_id"`
+	Platform  string    `json:"platform" db:"platform"` // ios / android（CHECK 约束同口径）
+	Token     string    `json:"-" db:"push_token"`
+	LastSeen  time.Time `json:"last_seen_at" db:"last_seen_at"`
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
 }
 
 // Role 角色（迁移 0010）。BuiltinKey 三值 member/admin/owner 为内置（不可改删、
@@ -519,6 +545,18 @@ type Store interface {
 	// TouchAPITokenLastUsed 更新 last_used_at（60s 节流后的异步落库，尽力而为：
 	// 行已不存在时静默忽略，不参与错误路径）。
 	TouchAPITokenLastUsed(ctx context.Context, id int64, at time.Time) error
+
+	// push_devices（迁移 0020，#53）：移动推送设备注册表。
+	// UpsertPushDevice 按 (user_id, SHA-256(push_token)) 幂等：命中更新
+	// platform/last_seen 并回填 d.ID 返回 false；未命中插入返回 true。
+	// TokenHash 由实现派生（见 PushDevice 注释），d.ID 未预置时取 Snowflake。
+	UpsertPushDevice(ctx context.Context, d *PushDevice) (bool, error)
+	// PushDevicesOfUser 该用户全部设备，按 id 升序。
+	PushDevicesOfUser(ctx context.Context, userID int64) ([]PushDevice, error)
+	// PushDeviceByID 单台设备；无命中 ErrNotFound。归属校验（user_id 比对）由调用方负责。
+	PushDeviceByID(ctx context.Context, id int64) (*PushDevice, error)
+	// DeletePushDevice 删除设备行；未命中 ErrNotFound。
+	DeletePushDevice(ctx context.Context, id int64) error
 
 	// roles / member_roles / channel_overwrites / audit_log（迁移 0010，#35 B1）。
 	// 「不属于该服务器」与「不存在」统一返回 ErrNotFound，不泄露跨服资源是否存在。

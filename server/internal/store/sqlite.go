@@ -1937,3 +1937,92 @@ func isDupSQLite(err error) bool {
 
 // 编译期断言：SQLite 是 Store 的完整实现，无降级方法。
 var _ Store = (*SQLite)(nil)
+
+// ---- push_devices（迁移 0020，#53） ----
+
+// UpsertPushDevice 按 (user_id, token_hash) 幂等：命中更新 platform/last_seen 并
+// 回填既有 ID 返回 false；未命中插入返回 true。并发首插撞唯一键时退回更新，
+// 不把竞态暴露成 ErrConflict——重复注册语义上就是更新。
+func (s *SQLite) UpsertPushDevice(ctx context.Context, d *PushDevice) (bool, error) {
+	hash := pushTokenHash(d.Token)
+	now := time.Now()
+	var id int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id FROM push_devices WHERE user_id = ? AND token_hash = ?`, d.UserID, hash).Scan(&id)
+	if err == nil {
+		if _, err = s.db.ExecContext(ctx,
+			`UPDATE push_devices SET platform = ?, push_token = ?, last_seen_at = ? WHERE id = ?`,
+			d.Platform, d.Token, now, id); err != nil {
+			return false, err
+		}
+		d.ID, d.LastSeen = id, now
+		return false, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	d.ID = newID(d.ID)
+	if _, err = s.db.ExecContext(ctx,
+		`INSERT INTO push_devices (id, user_id, platform, push_token, token_hash, last_seen_at, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		d.ID, d.UserID, d.Platform, d.Token, hash, now, now); err != nil {
+		if !isDupSQLite(err) {
+			return false, err
+		}
+		// 并发首插：另一连接已写入同一 (user_id, token_hash)，退回更新既有行。
+		if e := s.db.QueryRowContext(ctx,
+			`SELECT id FROM push_devices WHERE user_id = ? AND token_hash = ?`, d.UserID, hash).Scan(&id); e != nil {
+			return false, e
+		}
+		if _, e := s.db.ExecContext(ctx,
+			`UPDATE push_devices SET platform = ?, push_token = ?, last_seen_at = ? WHERE id = ?`,
+			d.Platform, d.Token, now, id); e != nil {
+			return false, e
+		}
+		d.ID, d.LastSeen = id, now
+		return false, nil
+	}
+	d.CreatedAt = now
+	return true, nil
+}
+
+// PushDevicesOfUser 该用户全部设备，按 id 升序。
+func (s *SQLite) PushDevicesOfUser(ctx context.Context, userID int64) ([]PushDevice, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+pushDeviceCols+` FROM push_devices WHERE user_id = ? ORDER BY id`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []PushDevice{}
+	for rows.Next() {
+		var d PushDevice
+		if err := rows.Scan(&d.ID, &d.UserID, &d.Platform, &d.Token, &d.LastSeen, &d.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// PushDeviceByID 单台设备；无命中 ErrNotFound。
+func (s *SQLite) PushDeviceByID(ctx context.Context, id int64) (*PushDevice, error) {
+	return scanPushDevice(s.db.QueryRowContext(ctx,
+		`SELECT `+pushDeviceCols+` FROM push_devices WHERE id = ?`, id))
+}
+
+// DeletePushDevice 删除设备行；未命中 ErrNotFound。
+func (s *SQLite) DeletePushDevice(ctx context.Context, id int64) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM push_devices WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}

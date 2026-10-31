@@ -32,6 +32,9 @@ type Mem struct {
 	readStates map[int64]map[int64]int64
 	// attachments 附件元数据（迁移 0015，#41）：attachmentID → 行。
 	attachments map[int64]*Attachment
+	// pushDevices 推送设备（迁移 0020，#53）：deviceID → 行。幂等键
+	// (user_id, pushTokenHash) 线性扫——内存实现只服务测试，量小。
+	pushDevices map[int64]*PushDevice
 
 	roles       map[int64]*Role                                     // roleID → role（迁移 0010）
 	memberRoles map[int64]map[int64]map[int64]*MemberRoleAssignment // serverID → userID → roleID → 分配
@@ -65,6 +68,7 @@ func NewMem() *Mem {
 		channelMembers: map[int64]map[int64]*ChannelMember{},
 		readStates:     map[int64]map[int64]int64{},
 		attachments:    map[int64]*Attachment{},
+		pushDevices:    map[int64]*PushDevice{},
 		roles:          map[int64]*Role{},
 		memberRoles:    map[int64]map[int64]map[int64]*MemberRoleAssignment{},
 		overwrites:     map[overwriteKey]*ChannelOverwrite{},
@@ -1879,4 +1883,67 @@ func (m *Mem) AuditLogBefore(_ context.Context, serverID, beforeID int64, limit 
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+// ---- push_devices（迁移 0020，#53） ----
+
+// UpsertPushDevice 按 (user_id, pushTokenHash) 幂等：命中更新 platform/last_seen
+// 并回填 d.ID 返回 false；未命中插入返回 true。
+func (m *Mem) UpsertPushDevice(_ context.Context, d *PushDevice) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	hash := pushTokenHash(d.Token)
+	now := time.Now()
+	for _, x := range m.pushDevices {
+		if x.UserID == d.UserID && pushTokenHash(x.Token) == hash {
+			x.Platform = d.Platform
+			x.Token = d.Token
+			x.LastSeen = now
+			d.ID = x.ID
+			d.LastSeen = now
+			return false, nil
+		}
+	}
+	d.ID = newID(d.ID)
+	d.LastSeen = now
+	d.CreatedAt = now
+	cp := *d
+	m.pushDevices[d.ID] = &cp
+	return true, nil
+}
+
+// PushDevicesOfUser 该用户全部设备，按 id 升序。
+func (m *Mem) PushDevicesOfUser(_ context.Context, userID int64) ([]PushDevice, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []PushDevice{}
+	for _, d := range m.pushDevices {
+		if d.UserID == userID {
+			out = append(out, *d)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+// PushDeviceByID 单台设备；无命中 ErrNotFound。
+func (m *Mem) PushDeviceByID(_ context.Context, id int64) (*PushDevice, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if d := m.pushDevices[id]; d != nil {
+		cp := *d
+		return &cp, nil
+	}
+	return nil, ErrNotFound
+}
+
+// DeletePushDevice 删除设备行；未命中 ErrNotFound。
+func (m *Mem) DeletePushDevice(_ context.Context, id int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.pushDevices[id]; !ok {
+		return ErrNotFound
+	}
+	delete(m.pushDevices, id)
+	return nil
 }
