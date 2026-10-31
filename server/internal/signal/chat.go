@@ -28,6 +28,8 @@ type ChatStore interface {
 	MembersOfServer(ctx context.Context, serverID int64) ([]store.ServerMember, error)
 	// ChannelMembers 会话成员（#38）：私聊/群聊的可见性与广播范围都以成员表为准。
 	ChannelMembers(ctx context.Context, channelID int64) ([]store.ChannelMember, error)
+	// ChannelMember 单个会话成员（#102 续传权限复核：会话频道的可见性只看成员表）。
+	ChannelMember(ctx context.Context, channelID, userID int64) (*store.ChannelMember, error)
 	// UnreadCountsForUsers 单频道多用户未读/提及计数（#40）：chat.message 广播后
 	// 给每个收件人推自己的 channel.unread。store.Store 满足。
 	UnreadCountsForUsers(ctx context.Context, channelID int64, userIDs []int64) (map[int64]store.Unread, error)

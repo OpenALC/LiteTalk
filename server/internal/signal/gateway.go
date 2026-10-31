@@ -16,10 +16,13 @@
 package signal
 
 import (
+	"context"
 	"encoding/json"
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/OpenALC/LiteTalk/server/internal/store"
 )
 
 // Event 事件环条目（#32）。Payload 在 Append 前已序列化——环内不放活对象，
@@ -546,8 +549,171 @@ func (h *Hub) handleGatewayResume(c *client, d GatewayResumeData) {
 		})
 		return
 	}
-	for _, ev := range events {
+	out, withheld := h.filterReplayByPerm(c, events)
+	if withheld > 0 {
+		// #102：环里留着失去 ViewChannel 之后不该再补发的频道事件。扣掉它们会留下
+		// seq 空洞——客户端只投递 lastSeq+1 起的连续段，空一条就把后续全压进乱序
+		// 缓冲直到溢出。所以不补发半截流：直接 invalid_session，让客户端走 REST
+		// 全量补拉（那条路径本身按当前权限过滤）。
+		h.log.Printf("ws: %s resume %s 扣留 %d 条无权事件，转全量补拉", c.userID, d.SessionID, withheld)
+		h.sendJSON(c, TypeGatewayInvalidSession, GatewayInvalidSessionData{
+			Reason: "seq_expired", LatestSeq: h.evlog.LatestSeq(c.sid),
+		})
+		return
+	}
+	for _, ev := range out {
 		h.deliverEvent(c, ev.Type, ev.Payload, ev.TS, ev.Seq)
 	}
-	h.log.Printf("ws: %s resume %s 补发 %d 条（last_seq=%d）", c.userID, d.SessionID, len(events), d.LastSeq)
+	h.log.Printf("ws: %s resume %s 补发 %d 条（last_seq=%d）", c.userID, d.SessionID, len(out), d.LastSeq)
+}
+
+// replayChannel 补发事件的频道可见性判定结果（#102）。
+type replayChannel struct {
+	channelID int64
+	serverID  int64
+	conv      bool // 私聊/群聊：可见性以 channel_members 为准
+	visible   bool
+}
+
+// filterReplayByPerm 续传补发前按**当前**权限二次过滤（#102）。
+//
+// 事件环记录的是「当时可见」的广播对象，权限撤销（角色/覆盖变更、被移出服务器、
+// 频道可见性变化）之后环里的旧条目仍然指向该频道。这里逐条重算：
+//   - 带 channel_id 的事件（chat.message / message.edited / message.deleted /
+//     channel.unread / channel.audio）按当前 ViewChannel 判定，不可见即扣留；
+//   - presence.update 的频道字段是「好友所在房」，与查看者权限无关（发送时已按
+//     收件人过滤），但为稳妥起见同样在丢失可见性时降级成 online-only 载荷；
+//   - 其它类型（session.kicked / server.shutdown / conversation.changed）无频道
+//     维度，原样放过。
+//
+// 返回过滤后的事件与被扣留条数。同一频道的结果在本次调用内缓存，避免环里几十条
+// 同频道消息重复查权限。查询故障一律按不可见处理（fail closed）：扣留的代价是
+// 客户端多做一次全量补拉，放过的代价是泄露已撤销权限的频道内容。
+func (h *Hub) filterReplayByPerm(c *client, events []Event) ([]Event, int) {
+	if len(events) == 0 {
+		return events, 0
+	}
+	uid, err := strconv.ParseInt(c.userID, 10, 64)
+	if err != nil {
+		// dev 令牌（非数字 uid）没有真实权限体系：原样补发，与实时路径一致。
+		return events, 0
+	}
+	cache := make(map[string]replayChannel, 4)
+	out := make([]Event, 0, len(events))
+	withheld := 0
+	for _, ev := range events {
+		idStr := replayChannelID(ev)
+		if idStr == "" {
+			out = append(out, ev)
+			continue
+		}
+		state, ok := cache[idStr]
+		if !ok {
+			state = h.replayChannelVisible(context.Background(), uid, idStr)
+			cache[idStr] = state
+		}
+		if state.visible {
+			out = append(out, ev)
+			continue
+		}
+		if ev.Type == TypePresenceUpdate {
+			// 降级成 online-only 而不是扣留：presence 事件的频道字段是对方的隐私
+			// 快照，去掉频道键仍然有意义（在线状态照旧）。
+			if downgraded, ok := stripPresenceChannel(ev); ok {
+				out = append(out, downgraded)
+				continue
+			}
+		}
+		withheld++
+	}
+	return out, withheld
+}
+
+// replayChannelID 事件载荷里的频道键（无频道维度返回空串）。
+func replayChannelID(ev Event) string {
+	switch ev.Type {
+	case TypeChatMessage:
+		var d ChatMessageData
+		if json.Unmarshal(ev.Payload, &d) == nil {
+			return d.ChannelID
+		}
+	case TypeMessageEdited:
+		var d MessageEditedData
+		if json.Unmarshal(ev.Payload, &d) == nil {
+			return d.ChannelID
+		}
+	case TypeMessageDeleted:
+		var d MessageDeletedData
+		if json.Unmarshal(ev.Payload, &d) == nil {
+			return d.ChannelID
+		}
+	case TypeChannelUnread:
+		var d ChannelUnreadData
+		if json.Unmarshal(ev.Payload, &d) == nil {
+			return d.ChannelID
+		}
+	case TypeChannelAudio:
+		var d ChannelAudioData
+		if json.Unmarshal(ev.Payload, &d) == nil {
+			return d.ChannelID
+		}
+	case TypePresenceUpdate:
+		var d PresenceUpdateData
+		if json.Unmarshal(ev.Payload, &d) == nil {
+			return d.ChannelID
+		}
+	}
+	return ""
+}
+
+// stripPresenceChannel presence.update 去掉频道键（降级为 online-only）。
+// 返回 ok=false 表示载荷解不开或本就没有频道字段。
+func stripPresenceChannel(ev Event) (Event, bool) {
+	var d PresenceUpdateData
+	if err := json.Unmarshal(ev.Payload, &d); err != nil || d.ChannelID == "" {
+		return ev, false
+	}
+	d.ChannelID, d.ServerID = "", ""
+	payload, err := json.Marshal(d)
+	if err != nil {
+		return ev, false
+	}
+	ev.Payload = payload
+	return ev, true
+}
+
+// replayChannelVisible 查看者当前是否仍可见该频道（#102）。
+// 会话频道（私聊/群聊）以成员表为准，服务器频道按 ViewChannel。
+// 频道不存在（已删除）按不可见处理：环里的旧条目不再有可发送的意义。
+func (h *Hub) replayChannelVisible(ctx context.Context, uid int64, idStr string) replayChannel {
+	chID, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		return replayChannel{}
+	}
+	state := replayChannel{channelID: chID}
+	if h.chatStore == nil {
+		return state
+	}
+	ch, err := h.chatStore.ChannelByID(ctx, chID)
+	if err != nil {
+		return state
+	}
+	state.serverID = ch.ServerID
+	if ch.Scope == store.ChannelScopeDirect || ch.Scope == store.ChannelScopeGroup {
+		state.conv = true
+		if _, err := h.chatStore.ChannelMember(ctx, chID, uid); err == nil {
+			state.visible = true
+		}
+		return state
+	}
+	if h.authz == nil {
+		return state
+	}
+	ok, err := h.authz.CanInServer(ctx, uid, ch.ServerID, chID, store.ViewChannel)
+	if err != nil {
+		h.log.Printf("ws: 续传权限复核失败（用户 %d 频道 %d）: %v", uid, chID, err)
+		return state
+	}
+	state.visible = ok
+	return state
 }
