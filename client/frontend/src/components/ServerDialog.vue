@@ -8,13 +8,16 @@ import { useConversationsStore } from '../stores/conversations'
 import { useNotifyStore } from '../stores/notify'
 
 const emit = defineEmits<{ (e: 'close'): void }>()
+// initialTab/initialCode 邀请深链预填（#50，web/deeplink.ts）：/join/<code>
+// 打开时宿主把加入页签与码带进来，确认仍由用户在本弹层完成。
+const props = defineProps<{ initialTab?: 'create' | 'join'; initialCode?: string }>()
 const servers = useServersStore()
 const conversations = useConversationsStore()
 const notify = useNotifyStore()
 
-const tab = ref<'create' | 'join'>('create')
+const tab = ref<'create' | 'join'>(props.initialTab ?? 'create')
 const name = ref('')
-const code = ref('')
+const code = ref(props.initialCode ?? '')
 const busy = ref(false)
 
 async function submit() {
