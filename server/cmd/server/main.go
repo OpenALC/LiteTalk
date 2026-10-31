@@ -38,6 +38,7 @@ import (
 	"github.com/OpenALC/LiteTalk/server/internal/store"
 	"github.com/OpenALC/LiteTalk/server/internal/token"
 	"github.com/OpenALC/LiteTalk/server/internal/turn"
+	"github.com/OpenALC/LiteTalk/server/internal/webhook"
 	"github.com/OpenALC/LiteTalk/server/migrations"
 )
 
@@ -384,6 +385,22 @@ func main() {
 	log.Printf("附件存储: %s（单文件上限 %d MiB，图片单边上限 %d 像素）",
 		blobDriver, cfg.uploadMax>>20, serverUploadMaxDimension)
 
+	// 出站 Webhook 投递器（#52）：参数全部有默认值。零订阅部署不启动任何后台
+	// goroutine（§0.8）——启动期库内无订阅则不 Start，首个订阅创建时由 API 层
+	// EnsureStarted 惰性拉起；已有订阅则 Start 在服务端 shutdown ctx 上，
+	// 清理 goroutine 随进程退出干净停止。
+	webhookDisp := webhookFromEnv(st, log.Default())
+	startWebhookWorkers := false
+	if webhookDisp != nil {
+		hub.SetWebhookOutlet(webhookDisp)
+		defer webhookDisp.Close()
+		if has, herr := st.HasOutboundWebhooks(context.Background()); herr != nil {
+			log.Printf("出站 Webhook: 读取订阅存在性失败（%v），按无订阅处理", herr)
+		} else if has {
+			startWebhookWorkers = true
+		}
+	}
+
 	// Auth 模式：full（默认，验证码流程）/ simple（免验证码，私域部署从简）。
 	// 合法性已在 cfg.validate（步骤 2）把关。
 	authMode := cfg.authMode
@@ -441,6 +458,8 @@ func main() {
 		LinkPreview: linkPreview,
 		// 移动推送派发器（#53）：nil = 关闭（见上方推送通道构造）。
 		Push: pushBroker,
+		// 出站 Webhook 投递器（#52）：API 层只负责建首个订阅时的惰性启动。
+		Webhooks: webhookDisp,
 	})
 
 	mux := http.NewServeMux()
@@ -473,6 +492,12 @@ func main() {
 		go attGC.Run(ctx)
 	} else {
 		log.Println("附件回收: 关闭（LITETALK_ATTACHMENT_GC）")
+	}
+
+	// 出站 Webhook worker 与投递记录清理（#52）：ctx 接服务端 shutdown，
+	// 优雅关闭时干净停止。库内无订阅则整段跳过（零后台 goroutine）。
+	if startWebhookWorkers {
+		webhookDisp.Start(ctx)
 	}
 
 	// ---- 起 HTTP（§0.6 步骤 9）：ACME TLS + :80 挑战，或纯 HTTP ----
@@ -856,6 +881,40 @@ func splitList(s string) []string {
 		}
 	}
 	return out
+}
+
+// webhookFromEnv 按环境变量构造出站 Webhook 投递器（#52）。
+// 参数全部有安全默认；解析失败拒绝启动（配置错误不能静默吞掉）。
+// worker 数与重试上限夹到区间：误配既不能拖垮投递，也不能把退避拖到天级。
+func webhookFromEnv(st store.Store, lg *log.Logger) *webhook.Dispatcher {
+	retryMax := envInt("LITETALK_WEBHOOK_RETRY_MAX", webhook.DefaultRetryMax)
+	retryMax = min(max(retryMax, 0), 20)
+	backoffBase, err := parseGCDuration("LITETALK_WEBHOOK_BACKOFF_BASE",
+		os.Getenv("LITETALK_WEBHOOK_BACKOFF_BASE"), webhook.DefaultBackoffBase,
+		100*time.Millisecond, time.Minute)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	timeout, err := parseGCDuration("LITETALK_WEBHOOK_TIMEOUT",
+		os.Getenv("LITETALK_WEBHOOK_TIMEOUT"), webhook.DefaultTimeout,
+		time.Second, time.Minute)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	workers := envInt("LITETALK_WEBHOOK_WORKERS", webhook.DefaultWorkers)
+	workers = min(max(workers, 1), 32)
+	d := webhook.New(webhook.Config{
+		RetryMax:    retryMax,
+		BackoffBase: backoffBase,
+		Timeout:     timeout,
+		Workers:     workers,
+		Log:         lg,
+	}, st)
+	if d != nil {
+		lg.Printf("出站 Webhook: 就绪（workers=%d，retry_max=%d，backoff_base=%s，timeout=%s；零订阅时不启动后台协程）",
+			workers, retryMax, backoffBase, timeout)
+	}
+	return d
 }
 
 // pickStoreKind 决定存储后端（§0.3）：LITETALK_STORE 显式指定 > LITETALK_MYSQL_DSN
