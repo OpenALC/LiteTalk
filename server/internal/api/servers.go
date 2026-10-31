@@ -339,8 +339,9 @@ func (s *Server) requireChannelPerm(ctx context.Context, ch *store.Channel, user
 	return nil
 }
 
-// visibleChannels 过滤出 uid 有 ViewChannel 的频道（#35 B3；categories 不过滤）。
+// visibleChannels 过滤出 uid 有 ViewChannel 的频道（#35 B3）。
 // 单频道判定故障直接上抛 500——静默丢频道会把可用性问题伪装成权限问题。
+// 分类不再「原样返回」：由 visibleCategories 按同一口径过滤（#102）。
 func (s *Server) visibleChannels(ctx context.Context, uid, serverID int64, chans []store.Channel) ([]store.Channel, error) {
 	if s.authz == nil {
 		return nil, errf(http.StatusInternalServerError, "internal", "权限服务未就绪")
@@ -353,6 +354,48 @@ func (s *Server) visibleChannels(ctx context.Context, uid, serverID int64, chans
 		}
 		if ok {
 			out = append(out, ch)
+		}
+	}
+	return out, nil
+}
+
+// visibleCategories 分类名过滤（#102）：只返回「至少有一个可见频道」的分类。
+//
+// 分类本身没有独立的查看权限，它的可见性完全由归属频道决定——只过滤频道、
+// 分类原样返回时，一个没有任何可见频道的服务器也会把分类名（往往写着「指挥部」
+// 「内鬼专用」这类信息）暴露给无权限成员。
+//
+// visible 是调用方已按 ViewChannel 过滤后的频道列表，这里只做归并，不重复查权限：
+// 与频道过滤同一口径，两处结果不可能互相矛盾。
+//
+// ManageChannels 持有人在响应里保留空分类（否则管理端点创建的新分类在列表里
+// 看不见，无法往里面挂频道）；该判定按服务器级做一次，不随分类数线性放大。
+func (s *Server) visibleCategories(ctx context.Context, uid, serverID int64, cats []store.Category, visible []store.Channel) ([]store.Category, error) {
+	if len(cats) == 0 {
+		return cats, nil
+	}
+	keep := make(map[int64]bool, len(visible))
+	for _, ch := range visible {
+		if ch.CategoryID != nil {
+			keep[*ch.CategoryID] = true
+		}
+	}
+	out := make([]store.Category, 0, len(cats))
+	// 只有存在空分类时才需要问 ManageChannels：一次额外权限查询。
+	emptyAllowed := false
+	if len(keep) < len(cats) {
+		if s.authz == nil {
+			return nil, errf(http.StatusInternalServerError, "internal", "权限服务未就绪")
+		}
+		ok, err := s.authz.CanServer(ctx, uid, serverID, store.ManageChannels)
+		if err != nil {
+			return nil, err
+		}
+		emptyAllowed = ok
+	}
+	for _, cat := range cats {
+		if keep[cat.ID] || emptyAllowed {
+			out = append(out, cat)
 		}
 	}
 	return out, nil

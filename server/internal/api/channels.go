@@ -378,7 +378,8 @@ func (s *Server) DeleteChannel(ctx context.Context, request DeleteChannelRequest
 
 // ListChannels GET /api/v1/servers/{id}/channels（v0.1.2 补缺口）。
 // 返回分类与频道两个数组，频道带 category_id；前端按分类归组渲染。
-// 成员可读，但只返回其有 ViewChannel 的频道（#35 B3）；categories 不因空分类过滤。
+// 成员可读，但只返回其有 ViewChannel 的频道（#35 B3）；分类按「至少有一个可见
+// 频道」过滤（#102），持 ManageChannels 时保留空分类以便管理。
 func (s *Server) ListChannels(ctx context.Context, request ListChannelsRequestObject) (ListChannelsResponseObject, error) {
 	if e := checkID(request.Id); e != nil {
 		return nil, e
@@ -405,6 +406,12 @@ func (s *Server) ListChannels(ctx context.Context, request ListChannelsRequestOb
 	}
 	if categories == nil {
 		categories = []store.Category{}
+	}
+	// 分类名按频道可见性过滤（#102）：无可见频道的分类不返回，
+	// 否则无权限成员仍能看到分类名。与频道同一口径。
+	categories, err = s.visibleCategories(ctx, c.UserID, request.Id, categories, channels)
+	if err != nil {
+		return nil, s.writeStoreErr(ctx, err)
 	}
 	// ETag 协商（#31）：内容哈希弱标签，命中 If-None-Match 回 304。
 	out := ServerChannels{Categories: categoryViews(categories), Channels: channelViews(channels)}
