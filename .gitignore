@@ -25,6 +25,8 @@ client/frontend/dist/
 
 # Go / Wails 构建产物
 client/build/bin/
+# 第三方许可证随附目录（build/third-party-licenses.sh 的产物，打包时现生成）
+client/build/third-party/
 # go-task（wails3 task）的 sources/generates 校验缓存
 .task/
 dist/

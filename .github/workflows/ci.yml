@@ -221,6 +221,11 @@ jobs:
           if [ -n "$out" ]; then echo "::error::以下文件未 gofmt："; echo "$out"; exit 1; fi
       - name: go mod tidy
         run: go mod tidy -diff
+      # 第三方静态库产物校验（#117）：third_party/SHA256SUMS 记录每个 .a 的
+      # SHA256 与来源（上游版本 + 构建参数）。库被替换/重建却没同步清单就红，
+      # 避免发布出去的是来源不明的产物。清单本身钉死 LF（.gitattributes）。
+      - name: 第三方库产物校验（SHA256SUMS）
+        run: cd third_party && sha256sum -c SHA256SUMS
       - name: go vet
         run: go vet -tags gtk3 ./...
       - name: go test（-race）
@@ -252,6 +257,9 @@ jobs:
           echo "glibc 检查通过（最高 $max）"
       - name: 安装 nfpm（锁版本）
         run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@${NFPM_VERSION}
+      # 本 job 也跑 nfpm（安装冒烟），所以同样需要许可证目录（#117）。
+      - name: 生成第三方许可证目录
+        run: bash build/third-party-licenses.sh build
       - name: 打 deb 并安装
         run: |
           export VERSION=0.0.0
@@ -270,6 +278,14 @@ jobs:
           grep -qx 'StartupWMClass=io.github.openalc.LiteTalk' "$desktop"
           grep -qx 'Icon=io.github.openalc.LiteTalk' "$desktop"
           desktop-file-validate "$desktop"
+          # 第三方许可证必须真的进了包（#117）：静态链接 opus / APM 的二进制
+          # 分发需要随附各许可证全文，缺一个就是合规漏发。
+          doc=/usr/share/doc/litetalk/third-party
+          test -f "$doc/THIRD-PARTY.md"
+          for f in opus/COPYING opusfile/COPYING ogg/COPYING \
+                   webrtc-apm/COPYING webrtc-apm/LICENSE.abseil; do
+            test -f "$doc/$f" || { echo "::error::安装包缺少许可证 $f"; exit 1; }
+          done
       - name: 启动冒烟（Xvfb，10 秒）
         env:
           # 无 GPU 的 Xvfb 下关闭 WebKit 合成/DMABUF，避免软件渲染初始化失败
@@ -322,6 +338,10 @@ jobs:
           cache-dependency-path: client/go.sum
       - name: go vet
         run: go vet ./...
+      # 与 Linux 侧同一份清单（#117）：Windows 检查是真实 cgo 链接唯一被测试的
+      # 地方，产物校验也必须在这里跑一次。
+      - name: 第三方库产物校验（SHA256SUMS）
+        run: cd third_party && sha256sum -c SHA256SUMS
       - name: go test（-race）
         run: go test -race -count=1 ./...
       - name: go build（production + GUI 子系统）
@@ -399,6 +419,16 @@ jobs:
         run: |
           go build -tags production -trimpath -ldflags "-s -w -X main.version=${{ github.ref_name }} -H=windowsgui" `
             -o build/bin/LiteTalk.exe .
+      # 第三方许可证（#117）：安装器与绿色版 zip 都在 client 目录下取
+      # build/third-party，必须先于 makensis 生成。
+      - name: 生成第三方许可证目录
+        working-directory: client
+        shell: pwsh
+        run: |
+          bash build/third-party-licenses.sh build
+          if (-not (Test-Path "build/third-party/THIRD-PARTY.md")) {
+            throw "第三方许可证目录未生成"
+          }
       # 安装器版本从标签注入（去 v 前缀与测试标志，VIProductVersion 只接受纯数字）
       - name: 制作 NSIS 安装器
         working-directory: client/build/windows/installer
@@ -415,7 +445,30 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item build/bin/LiteTalk-amd64-installer.exe dist/LiteTalk-windows-amd64-setup.exe
-          Compress-Archive -Path build/bin/LiteTalk.exe -DestinationPath dist/LiteTalk-windows-amd64-portable.zip
+          # 第三方许可证（#117）：与安装器同源生成，解开 zip 即在
+          # third-party\ 下得到各组件许可证全文。
+          bash build/third-party-licenses.sh build
+          # 绿色版：exe 与 third-party\ 同级打包，解压即可用、许可随之分发。
+          $stage = "dist/portable"
+          Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item build/bin/LiteTalk.exe $stage
+          Copy-Item -Recurse build/third-party $stage/third-party
+          Remove-Item -Force dist/LiteTalk-windows-amd64-portable.zip -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$stage/*" -DestinationPath dist/LiteTalk-windows-amd64-portable.zip
+          Remove-Item -Recurse -Force $stage
+          # 许可证确实进包（#117）：zip 内保留 third-party\ 子目录。
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead("$PWD/dist/LiteTalk-windows-amd64-portable.zip")
+          try {
+            $names = $zip.Entries | ForEach-Object { $_.FullName -replace '\\','/' }
+            if (-not ($names -contains 'third-party/THIRD-PARTY.md')) {
+              throw "绿色版 zip 缺少 third-party/THIRD-PARTY.md"
+            }
+            if (-not ($names -contains 'third-party/webrtc-apm/LICENSE.abseil')) {
+              throw "绿色版 zip 缺少 abseil 许可证"
+            }
+          } finally { $zip.Dispose() }
       - uses: actions/upload-artifact@v4
         with:
           name: dist-client-windows
@@ -461,11 +514,27 @@ jobs:
           go build -tags gtk3,production -trimpath \
             -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
             -o build/bin/LiteTalk .
+      # 第三方许可证随附目录（#117）：绿色版 tar 与 deb/rpm 共用这一份，
+      # 由 build/third-party-licenses.sh 从 third_party/*/COPYING 生成。
+      # 漏发许可证就是分发合规问题，所以生成失败直接中断打包。
+      - name: 生成第三方许可证目录
+        working-directory: client
+        run: bash build/third-party-licenses.sh build
       - name: 绿色版 tar.gz
         working-directory: client
         run: |
-          mkdir -p dist
-          tar -C build/bin -czf dist/LiteTalk-linux-${ARCH}-portable.tar.gz LiteTalk
+          # 树内布局与 deb 安装后的路径一致：可执行文件在根，许可证在
+          # share/doc/litetalk/third-party（#117）。
+          rm -rf dist/staging
+          mkdir -p dist/staging/share/doc/litetalk
+          cp build/bin/LiteTalk dist/staging/litetalk
+          cp -r build/third-party dist/staging/share/doc/litetalk/third-party
+          tar -C dist/staging -czf dist/LiteTalk-linux-${ARCH}-portable.tar.gz \
+            litetalk share/doc/litetalk/third-party
+          rm -rf dist/staging
+          # 许可证确实进包（#117）：tar 内布局与 deb 安装路径一致。
+          tar -tzf dist/LiteTalk-linux-${ARCH}-portable.tar.gz | grep -qx \
+            'share/doc/litetalk/third-party/THIRD-PARTY.md'
       # nfpm 的 ${ARCH} / ${VERSION} 从环境变量注入；deb/rpm 版本号去掉 v 前缀
       - name: deb / rpm（nfpm）
         working-directory: client
