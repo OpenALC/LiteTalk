@@ -134,6 +134,30 @@ echo x >"$d/lit etalk-updater"
 tar -C "$d" -czf "$WORK/space.tgz" litetalk-server update.sh "lit etalk-updater"
 expect_reject "带空格的成员名" "$WORK/space.tgz" "非法成员"
 
+# ---- 10. --dir 含空白：必须 reject（路径会原样写进 systemd 的 ExecStart）----
+# 直接跑安装脚本的参数闸：这些检查在 root/Linux 判定之前，--dry-run 又跳过 root 要求，
+# 所以 Linux CI 与本机 Git Bash 都能跑到。
+expect_dir_reject() {
+  local what="$1" dir="$2" out rc
+  # 参数闸以退出码 2 结束，set -e 会在赋值时就终止脚本；临时关掉以便读回退出码。
+  set +e
+  out="$(bash "$HERE/install.sh" --dry-run --dir "$dir" 2>&1)"
+  rc=$?
+  set -e
+  if [ "$rc" -ne 2 ]; then
+    ng "$what（退出码 $rc，want 2：$out）"
+    return
+  fi
+  if ! printf '%s' "$out" | grep -q '空白'; then
+    ng "$what（报错信息未说明空白字符：$out）"
+    return
+  fi
+  ok "$what"
+}
+
+expect_dir_reject "--dir 含空格" "/opt/lite talk"
+expect_dir_reject "--dir 含制表符" "/opt/lite	talk"
+
 echo
 echo "install.sh 校验自测：通过 $pass，失败 $fail"
 if [ "$fail" -ne 0 ]; then

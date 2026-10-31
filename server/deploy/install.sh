@@ -141,6 +141,13 @@ esac
 if printf '%s' "$DIR" | grep -q '\.\.'; then
   echo "安装目录不得包含 ..: $DIR" >&2; exit 2
 fi
+# 目录会原样写进 systemd 单元（ExecStart=、WorkingDirectory=、ReadWritePaths=），
+# 这些字段按空白分词且不支持引号转义：带空白的路径会把 ExecStart 拆成两段，
+# 服务起不来且报错难懂。直接拒绝，比在各注入点做转义更可靠。
+if printf '%s' "$DIR" | grep -q '[[:space:]]'; then
+  echo "安装目录不得包含空白字符: $DIR" >&2
+  exit 2
+fi
 if ! printf '%s' "$SVC_USER" | grep -Eq '^[A-Za-z_][A-Za-z0-9_-]*$'; then
   echo "用户名形态非法: $SVC_USER" >&2; exit 2
 fi
