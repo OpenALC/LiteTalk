@@ -349,6 +349,7 @@ curl -fsS http://127.0.0.1:8077/api/v1/healthz             # 主服务版本应�
 | 症状 | 原因与处置 |
 |---|---|
 | webhook 401 | secret 不一致；重新同步 GitHub webhook 的 secret 与 `/etc/litetalk-updater.webhook.secret` |
+| webhook 429 | 同一来源 IP 一分钟内签名失败超过 20 次：超限后**在读 body 之前**直接 429（含正确签名）。等窗口过期（≤1 分钟）自动恢复；正常投递达不到阈值，反复 429 说明有来源在猜 secret |
 | ping/发布后无动作、日志 `忽略：预发布` | 当前 tag 带 `-alpha` 等后缀，`LITETALK_UPDATER_ALLOW_PRERELEASE=0`（默认）；接受预发布就显式设 `1` |
 | 日志 `忽略：更新器已关闭` | `LITETALK_UPDATER_ENABLED=0`；排障完成改回 `1` |
 | 更新失败 `sudo ... : exit status 1` | sudoers 缺失/未 `chmod 440`，或单元开了 `NoNewPrivileges`（见 §9.1 注） |
