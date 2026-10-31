@@ -185,17 +185,24 @@ func NewRemoteManager(m *Mixer, logger *log.Logger) *RemoteManager {
 }
 
 // SetFrameMS 热切换下行帧长（10/20ms，#46 频道配置）：后续弹帧节拍与 PLC
-// 帧长随之改变。切换不重置抖动缓冲——已缓冲的旧帧按包内时长解码，过渡期
-// 最多一拍的节拍偏差。
+// 帧长随之改变。真正变化时冲刷每路已排队的旧帧长采样与抖动缓冲并重新预填
+// （#117）：20→10 时旧 20ms 帧会持续把延迟垫高 10ms/包，10→20 时每拍只凑得出
+// 半帧而持续欠载。代价是重新预填的短静默（60–120ms），比残留延迟可接受。
+// 帧长未变时不冲刷——每次保存设置都会走到这里。
 func (rm *RemoteManager) SetFrameMS(ms int) error {
 	if ms != FrameMS10 && ms != FrameMS20 {
 		return fmt.Errorf("帧长非法: %d（只支持 10/20ms）", ms)
 	}
-	rm.frameMS.Store(int32(ms))
+	if int(rm.frameMS.Swap(int32(ms))) == ms {
+		return nil
+	}
 	rm.mu.Lock()
 	for _, rp := range rm.peers {
 		rp.frameMS.Store(int32(ms))
 		_ = rp.jb.SetFrameMS(ms) // 帧长同时决定抖动估计的 transit 基准与预填目标
+		if rp.input != nil {
+			rp.input.RequestFlush() // 旧帧长的已解码采样由混音 tick 丢弃
+		}
 	}
 	rm.mu.Unlock()
 	return nil

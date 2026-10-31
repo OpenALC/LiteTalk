@@ -187,6 +187,39 @@ func TestRingBufferSPSC(t *testing.T) {
 	}
 }
 
+// TestRingBufferDiscard 丢弃只推进读指针（#117）：已排队的采样被整体跳过，
+// 写者进度与容量不受影响，之后写入的数据正常可读。
+func TestRingBufferDiscard(t *testing.T) {
+	r := NewRingBuffer(8192)
+	in := make([]int16, 960)
+	for i := range in {
+		in[i] = int16(i + 1)
+	}
+	r.Write(in)
+	r.Write(in)
+
+	if got := r.Available(); got != 1920 {
+		t.Fatalf("Available = %d, want 1920", got)
+	}
+	r.Discard()
+	if got := r.Available(); got != 0 {
+		t.Fatalf("Discard 后 Available = %d, want 0", got)
+	}
+	back := make([]int16, 960)
+	if n := r.Read(back); n != 0 {
+		t.Fatalf("Discard 后 Read = %d, want 0", n)
+	}
+
+	// 丢弃后写者继续写，新数据必须原样可读（不因 tail 前跳而错位）。
+	r.Write(in)
+	if n := r.Read(back); n != 960 {
+		t.Fatalf("Read = %d, want 960", n)
+	}
+	if back[0] != 1 || back[959] != 960 {
+		t.Fatalf("丢弃后数据错位: first=%d last=%d", back[0], back[959])
+	}
+}
+
 // BenchmarkRingBuffer 稳态 480 采样写+读：必须 0 allocs/op。
 func BenchmarkRingBuffer(b *testing.B) {
 	r := NewRingBuffer(16384)

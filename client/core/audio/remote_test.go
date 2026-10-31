@@ -534,6 +534,64 @@ func TestRemoteDecode10ms(t *testing.T) {
 	}
 }
 
+// TestRemoteManagerFrameSwitchFlush 帧长热切换冲刷（#117）：真正切换时抖动槽与
+// 每路混音输入环都要清掉旧帧长采样并回到预填；帧长不变时不得冲刷（每次保存
+// 设置都会走到 SetFrameMS）。
+func TestRemoteManagerFrameSwitchFlush(t *testing.T) {
+	m, _ := newTestMixer()
+	rm := NewRemoteManager(m, nil)
+	rp := newTestRemotePeer(t, "a", m)
+	rm.peers["a"] = rp
+
+	pkts := encodeSinePackets(t, 6)
+	for i := 0; i < 6; i++ {
+		rp.jb.Push(uint16(100+i), pkts[i], remoteArrival(100+i))
+	}
+	for i := 0; i < 3; i++ {
+		rp.decodeOnce()
+	}
+	if st := rp.jb.Stats(); st.Buffered == 0 {
+		t.Fatal("测试前置：抖动槽内应有未消费的旧帧")
+	}
+	if rp.input.BufferedSamples() == 0 {
+		t.Fatal("测试前置：混音输入环应有旧帧长采样")
+	}
+
+	// 同帧长重复设置：不得冲刷。
+	rm.SetFrameMS(FrameMS20)
+	if rp.input.BufferedSamples() == 0 {
+		t.Fatal("帧长未变却冲刷了输入环")
+	}
+
+	if err := rm.SetFrameMS(FrameMS10); err != nil {
+		t.Fatalf("SetFrameMS(10): %v", err)
+	}
+	if st := rp.jb.Stats(); st.Buffered != 0 || st.Started {
+		t.Fatalf("切换后抖动缓冲 = %+v, want 已清空并回到预填", st)
+	}
+	// 输入环由消费侧（混音 tick）丢弃，验证请求已挂上：下一拍后归零。
+	m.Tick()
+	if got := rp.input.BufferedSamples(); got != 0 {
+		t.Fatalf("切换后输入环残留 %d 采样，want 0", got)
+	}
+	if rp.frameMSValue() != FrameMS10 {
+		t.Fatalf("peer 帧长 = %d, want %d", rp.frameMSValue(), FrameMS10)
+	}
+	// 切换后按新帧长重新预填：6 包（60ms）即可出 480 采样帧。
+	pkts10 := encode10msPackets(t, 6)
+	arrival10 := func(seq int) time.Time {
+		return remoteArrivalBase.Add(time.Duration(seq) * 10 * time.Millisecond)
+	}
+	for i := 0; i < 6; i++ {
+		rp.jb.Push(uint16(200+i), pkts10[i], arrival10(200+i))
+	}
+	before := rp.input.BufferedSamples()
+	rp.decodeOnce()
+	if rp.input.BufferedSamples()-before != FrameSize {
+		t.Fatalf("切换后首帧写出 %d 采样, want %d", rp.input.BufferedSamples()-before, FrameSize)
+	}
+}
+
 // TestRemoteManagerFrameMS 管理器帧长写入与热切换；非法值拒绝。
 func TestRemoteManagerFrameMS(t *testing.T) {
 	m, _ := newTestMixer()
