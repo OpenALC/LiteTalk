@@ -39,11 +39,13 @@ contents:
   # 第三方许可证（#117）：客户端静态链接 libopus / opusfile / ogg / WebRTC APM
   # （内含 abseil），二进制分发必须随附各许可证全文。目录由
   # build/third-party-licenses.sh 生成（CI 在打包前执行，产物落在 build/third-party）。
+  #
+  # 不要给 tree 加 file_info.mode：nfpm 会把该模式套到目录条目上，目录变成
+  # 0644 后不可进入，非 root 用户 test -f 子文件会直接失败。留空即沿用源文件
+  # 模式（文件 0644、目录 0755），与 git 检出的权限一致。
   - src: ./build/third-party
     dst: /usr/share/doc/litetalk/third-party
     type: tree
-    file_info:
-      mode: 0644
 # 依赖对齐 WebKitGTK 4.1（gtk3 构建标签）：不再备选 webkit2gtk-4.0，去 portaudio。
 # 音频后端 miniaudio 在运行时 dlopen alsa / pulse，故仍声明为依赖保证面板可用。
 # libopus 已静态链接进二进制（third_party/opus-linux-*），不再声明运行时依赖。
