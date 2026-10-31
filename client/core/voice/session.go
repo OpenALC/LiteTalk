@@ -1432,6 +1432,12 @@ func (s *Session) queueWhisperLocked(cp []string, seq int64) {
 		// 开始。重试自身的置脏走 onWhisperSendFail，不经过本函数（#117）。
 		s.whisperFails = 0
 		s.whisperSendSeq = seq
+		// 旧版本的重试计时器已作废：它只会敲一次空唤醒（读到的 send 为 false）。
+		// 主动停掉，避免在旧 timer 与新意图的退避之间来回多敲。
+		if s.whisperRetryTimer != nil {
+			s.whisperRetryTimer.Stop()
+			s.whisperRetryTimer = nil
+		}
 	}
 }
 
@@ -1530,10 +1536,22 @@ func (s *Session) onWhisperSendOK(targets []string) {
 	s.whisperMu.Unlock()
 }
 
-// onWhisperSendFail 发送失败：未达上限则重新置脏并排一次退避唤醒；达上限放弃
-// 本次（脏标记保持已消费，避免同一条消息无限循环），交给下次目标变化/入房同步。
+// onWhisperSendFail 发送失败的处理（#117）。
+// pendingWhisper 在发送前就把 whisperNeedSend/whisperSendSeq 清空，而 ws.Send
+// 在锁外进行——这期间用户可能又改了目标（queueWhisperLocked 写入新 seq 并重置
+// 失败预算）。此时若把 seq 写回自己这一版，新请求就被降级成旧请求的重试：
+// 客户端等的是新 seq 的 ack，服务端回的旧 seq 会被 onWhisperAck 丢弃，300ms 后
+// 误判 ack 超时关麦，而服务端其实已经应用了新目标。
+// 因此：已有更新意图在排队时一个字段都不碰，失败交由那条意图重发；只有没有
+// 更新意图时才重排自己这一版并排一次指数退避唤醒。
 func (s *Session) onWhisperSendFail(seq int64, err error) {
 	s.whisperMu.Lock()
+	if s.whisperNeedSend {
+		// queueWhisperLocked 已经写好新 seq、重置了失败预算，本次失败就此作废。
+		s.whisperMu.Unlock()
+		s.log.Printf("session: 悄悄话目标下发失败（%v），已有更新目标在途，本次失败交由新意图重发", err)
+		return
+	}
 	s.whisperFails++
 	fails := s.whisperFails
 	if fails >= whisperSendMaxTries {
@@ -1541,8 +1559,8 @@ func (s *Session) onWhisperSendFail(seq int64, err error) {
 		s.log.Printf("session: 悄悄话目标下发重试 %d 次仍失败（%v），交给下次目标变化/入房同步", fails, err)
 		return
 	}
-	// 置脏让唤醒后重发同一版本；期间用户再改目标时 queueWhisperLocked 会覆盖
-	// 成更新的版本，本次重试自然作废（唤醒总是读最新值）。
+	// 置脏让退避到点的唤醒重发同一版本。期间用户再改目标时 queueWhisperLocked
+	// 会覆盖成更新的版本，唤醒总是读最新值。
 	s.whisperNeedSend = true
 	s.whisperSendSeq = seq
 	delay := whisperRetryDelay(fails)
