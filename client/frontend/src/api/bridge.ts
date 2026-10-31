@@ -1,10 +1,19 @@
 // bridge 封装 Wails v3 Go 绑定（@wailsio/runtime 的 Call.ByName("main.App.*")）。
 // 浏览器独立开发（vite dev 无 Go 后端）时走 mock 桩，行为可联调 UI。
+// Web 构建（vite build --mode web，服务端托管）：走 src/api/web 的浏览器实现层，
+// REST + WS + WebRTC 全在 TS 侧（#50）。
 // 原生环境判定：Go 在 webview 启动时注入 window._wails.flags（浏览器环境恒无）。
 import { Call, Events } from '@wailsio/runtime'
 import type { AttachmentView, AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ChatMessage, ConnConfigView, ConnTestResult, Conversation, FriendDTO, HotkeySettings, LinkPreview, MentionCandidate, NetworkDiagResult, PeerView, ServerChannels, ServerConfig, ServerDTO, UnreadChannel, Unreads, UserProfile, VoiceStateView, WindowOverlaySettings } from './types'
+import { webApp } from './web/app'
+import { webEventsOff, webEventsOn } from './web/events'
 
-type GoApp = {
+// IS_WEB_BUILD web 构建判别（构建期常量，桌面构建被 tree-shake 成 false）。
+// web 构建只由服务端托管给浏览器，永不进 webview——isNative 恒 false，
+// 依赖 window._wails 注入时序的一切等待/降级逻辑都必须在此短路。
+const IS_WEB_BUILD = import.meta.env.MODE === 'web'
+
+export type GoApp = {
   GetVersion(): Promise<string>
   GetAuthConfig(): Promise<ServerConfig>
   GetHibernateMode(): Promise<string> // off / hibernate / destroy
@@ -411,6 +420,9 @@ const nativeApp = new Proxy({} as GoApp, {
 
 export function goApp(): GoApp {
   if (isNative()) return nativeApp
+  // Web 构建（服务端托管的浏览器端）：直接走浏览器实现层。必须在 mock 分支
+  // 之前——web 生产构建 DEV=false，落到底部 nativeApp 只会响亮失败。
+  if (IS_WEB_BUILD) return webApp
   if (import.meta.env.DEV) return mockApp
   // 生产环境原生初始化失败：mock 会让「登录一律成功」，是安全事故——
   // 宁可调用原生绑定报错（响亮失败），也不静默走桩。
@@ -443,6 +455,8 @@ export function __resetBridgeForTest(): void {
 // 生产环境 WebView2 冷启动可能数秒，等待延长到 10s，超时判为原生初始化失败并
 // 置 nativeInitFailed——生产静默落 mock 是安全事故，绝不发生。
 export function whenNativeReady(timeoutMs?: number): Promise<void> {
+  // Web 构建永不注入 window._wails：必须短路，否则首屏白等满超时才挂载。
+  if (IS_WEB_BUILD) return Promise.resolve()
   if (isNative() || typeof window === 'undefined') return Promise.resolve()
   const timeout = timeoutMs ?? (import.meta.env.DEV ? 800 : 10_000)
   return new Promise((resolve) => {
@@ -465,9 +479,11 @@ export function whenNativeReady(timeoutMs?: number): Promise<void> {
   })
 }
 
-// eventsOn Wails 事件订阅。v3 回调收 WailsEvent 对象，取 .data 对齐 v2 的直载荷语义。
-// 浏览器环境静默（mock 不产事件）。
+// eventsOn 事件订阅。Web 构建路由到 web 事件总线（signal 层以同名同形事件
+// 驱动 stores）；v3 回调收 WailsEvent 对象，取 .data 对齐 v2 的直载荷语义。
+// 浏览器预览环境静默（mock 不产事件）。
 export function eventsOn(name: string, cb: (...args: unknown[]) => void): () => void {
+  if (IS_WEB_BUILD) return webEventsOn(name, cb)
   if (!isNative()) return () => {}
   // v3 的 Events.On 返回按监听器的取消函数：卸载时逐个注销，
   // 不许用 eventsOff 按事件名清（会把别人注册的同名监听一并清掉）。
@@ -476,6 +492,10 @@ export function eventsOn(name: string, cb: (...args: unknown[]) => void): () => 
 
 // eventsOff 取消事件订阅（休眠态清理用；v3 按事件名清掉全部监听）。
 export function eventsOff(name: string) {
+  if (IS_WEB_BUILD) {
+    webEventsOff(name)
+    return
+  }
   if (!isNative()) return
   Events.Off(name)
 }
