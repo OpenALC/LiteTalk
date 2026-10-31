@@ -157,11 +157,11 @@ type DSP struct {
 	vadExitBits  atomic.Uint64 // math.Float32bits(VADExit)，热可调
 	agcOn        atomic.Bool   // 自动增益开关（v1.1 默认开，nil→true 见 config 层）
 
-	// apmMu 保护 APM 句柄的生命周期：Process/ProcessRender 每帧持读锁，
-	// SetEnableAPM/Close 持写锁换指针；旧句柄在写锁释放后销毁，避免音频
+	// apmMu 保护 APM 句柄的生命周期：Process/ProcessRender 每帧持读锁贯穿整个
+	// C 调用，SetEnableAPM/Close 持写锁换指针；旧句柄在写锁释放后销毁，避免音频
 	// 处理中使用已释放的 C++ 对象。
 	apmMu sync.RWMutex
-	apm   *apmHandle
+	apm   apmProcessor
 	// apmSwitchMu 串行化 APM 创建/销毁与运行期重配置，避免并发 toggle 与
 	// SetAGC 的 ApplyConfig 交错；closed 也由它保护（Close 后禁止再创建句柄，
 	// 否则并发的设置调用会在管线销毁后重建 APM 造成泄漏）。
@@ -171,6 +171,16 @@ type DSP struct {
 
 	// preBuf 前置增益的预分配 scratch（Process 里 in→preBuf→RNNoise/APM，不改调用方 in）。
 	preBuf [FrameSize]int16
+
+	// renderBuf 送 APM 的参考帧副本（#117）。调用方（混音 tick）传进来的是即将
+	// 播放的缓冲，而 C 侧 ProcessReverseStream 允许 src==dest 就地处理——把播放
+	// 数据直接交出去，一旦 APM 在参考路径上写回（换库版本、开新的 render 子模块
+	// 都会发生），播放音频就被污染且极难定位。这里先拷到自留缓冲，与采集侧的
+	// preBuf 同一口径：调用方的缓冲只读。
+	// renderMu 串行化「拷贝 + Process」：混音 tick 与测试可能有多个调用者，
+	// 共用一块 scratch 就必须互斥；无竞争时开销为一次原子加。
+	renderBuf [FrameSize]int16
+	renderMu  sync.Mutex
 
 	// noise minimum-statistics 底噪（说话门限与 AGC 门控共用；Process goroutine 私有）。
 	noise noiseTracker
@@ -313,6 +323,15 @@ func (d *DSP) SetEnableAPM(on bool) error {
 // ProcessRender 送入一帧播放参考（混音器实际输出，480 采样）。APM 关闭时
 // no-op；失败只留一次日志，不影响播放——调用方在混音 tick 上，不能阻塞。
 // 必须在对应近端帧之前喂入；数字静音也要送，AEC 需要连续时间轴。
+//
+// 调用方的 pcm 是即将播放的数据，这里先拷进自留缓冲再交给 C（#117）：C 侧
+// ProcessReverseStream 允许 src 与 dest 同址，直接喂等于把播放缓冲交给 APM
+// 任意处置。拷贝到预分配 renderBuf，热路径仍为 0 allocs/op。
+//
+// 读锁必须贯穿「拷贝 + processRender」整帧，与 Process 同一条不变量：写锁只在
+// 没有读者时拿到，之后 SetEnableAPM/Close 才会 close() 已摘下的句柄；读锁一旦
+// 提前释放，混音 tick 仍停在 C 调用里而句柄已被 lt_apm_destroy 释放 → C 堆 UAF。
+// 锁序固定 apmMu → renderMu（renderMu 只在本函数出现，无反向路径）。
 func (d *DSP) ProcessRender(pcm []int16) {
 	if len(pcm) < FrameSize {
 		return
@@ -323,7 +342,10 @@ func (d *DSP) ProcessRender(pcm []int16) {
 		d.apmMu.RUnlock()
 		return
 	}
-	err := a.processRender(pcm[:FrameSize])
+	d.renderMu.Lock()
+	copy(d.renderBuf[:], pcm[:FrameSize])
+	err := a.processRender(d.renderBuf[:])
+	d.renderMu.Unlock()
 	d.apmMu.RUnlock()
 	if err != nil {
 		d.apmErrOnce.Do(func() {
@@ -581,7 +603,7 @@ func (d *DSP) processLegacy(out, in []int16) (float32, error) {
 //   - 数字静音帧也必须进 APM（AEC 自适应按帧推进，跳帧会破坏采集/参考时间轴）；
 //   - APM 内部 AGC2 负责自动增益，这里不再跑自研 AGC，避免两级 AGC 串联；
 //   - APM 就地处理，先把（含前置增益的）输入落到 preBuf，绝不改调用方的 in。
-func (d *DSP) processAPM(a *apmHandle, out, in []int16) (float32, error) {
+func (d *DSP) processAPM(a apmProcessor, out, in []int16) (float32, error) {
 	rawSilent := peakAbs(in[:FrameSize]) <= 1
 
 	// 底噪观察取原始输入（pre-gain 之前），与旧链路一致；数字静音没有可估底噪。

@@ -105,6 +105,12 @@ func (a *apmHandle) processRender(pcm []int16) error {
 }
 
 // close 释放句柄。幂等；调用后不得再 Process。
+//
+// 这里直接写 a.h 而不持任何锁——安全性完全依赖 DSP 的用法约定：调用方只在
+// apmMu 写锁下摘除句柄，且 Process/ProcessRender 持读锁贯穿整帧的 C 调用，
+// 所以拿到写锁时必定没有读者，此后也不会再有新读者拿到这个已摘下的句柄。
+// 不要为了「更安全」把读锁改短或让 Process 里缓存句柄指针跨帧使用——那会让
+// a.h 变成与 lt_apm_destroy 并发访问的悬垂指针（C 堆 UAF）。
 func (a *apmHandle) close() {
 	if a == nil || a.h == nil {
 		return

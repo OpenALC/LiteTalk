@@ -3,7 +3,9 @@ package audio
 import (
 	"math"
 	"runtime"
+	"sync"
 	"testing"
+	"time"
 )
 
 // requireAPM APM 测试前置：darwin 未接入（stub），是唯一允许跳过的平台；
@@ -170,6 +172,227 @@ func TestAECDisabledPassesEcho(t *testing.T) {
 	if ratio < 0.95 {
 		t.Fatalf("全关时 APM 不应衰减信号：能量比 %.4f < 0.95", ratio)
 	}
+}
+
+// TestDSPProcessRenderDoesNotTouchPlayback 参考帧入口不得改写调用方缓冲（#117）。
+// 调用方传的是即将播放的混音输出，而 C 侧 ProcessReverseStream 允许 src==dest
+// 就地处理；本测试把「播放缓冲只读」这条不变量钉住，换库或改 render 子模块
+// 若开始写回输入，CI 会在这里红，而不是在实机上表现为爆音/底噪。
+func TestDSPProcessRenderDoesNotTouchPlayback(t *testing.T) {
+	requireAPM(t)
+
+	cfg := DefaultDSPConfig()
+	cfg.Denoise = false
+	cfg.EnableAPM = true
+	d, err := NewDSP(cfg)
+	if err != nil {
+		t.Fatalf("NewDSP: %v", err)
+	}
+	defer d.Close()
+	if !d.APMActive() {
+		t.Fatal("APM 应已启用")
+	}
+
+	ren := make([]int16, FrameSize)
+	want := make([]int16, FrameSize)
+	in := make([]int16, FrameSize)
+	out := make([]int16, FrameSize)
+	var phase float64
+	var rng uint32 = 0x117
+	for f := 0; f < 30; f++ {
+		aecRenderFrame(ren, f)
+		copy(want, ren)
+		nearEndFrame(in, &phase, 12000, 1000, &rng)
+		d.ProcessRender(ren)
+		if _, err := d.Process(out, in); err != nil {
+			t.Fatalf("Process frame %d: %v", f, err)
+		}
+		for i := range ren {
+			if ren[i] != want[i] {
+				t.Fatalf("第 %d 帧参考缓冲被改写：样本 %d = %d, want %d", f, i, ren[i], want[i])
+			}
+		}
+	}
+
+	// 数字静音帧（混音器耳聋/无人在场时的实际输入）同样不得被改写。
+	clear(ren)
+	copy(want, ren)
+	for f := 0; f < 5; f++ {
+		d.ProcessRender(ren)
+		for i := range ren {
+			if ren[i] != 0 {
+				t.Fatalf("静音参考帧被改写：样本 %d = %d", i, ren[i])
+			}
+		}
+	}
+
+	// 关闭 APM 后同样是 no-op 且不改写。
+	if err := d.SetEnableAPM(false); err != nil {
+		t.Fatalf("SetEnableAPM(false): %v", err)
+	}
+	aecRenderFrame(ren, 1)
+	copy(want, ren)
+	d.ProcessRender(ren)
+	for i := range ren {
+		if ren[i] != want[i] {
+			t.Fatalf("APM 关闭时参考缓冲被改写：样本 %d = %d, want %d", i, ren[i], want[i])
+		}
+	}
+}
+
+// BenchmarkDSPProcessRender 参考帧入口（含拷贝）热路径：必须 0 allocs/op。
+func BenchmarkDSPProcessRender(b *testing.B) {
+	requireAPM(b)
+	cfg := DefaultDSPConfig()
+	cfg.Denoise = false
+	cfg.EnableAPM = true
+	d, err := NewDSP(cfg)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer d.Close()
+	ren := make([]int16, FrameSize)
+	aecRenderFrame(ren, 0)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		d.ProcessRender(ren)
+	}
+}
+
+// fakeAPM 可控的 APM 替身：processRender 阻塞到 release 关闭为止，用来精确
+// 复现「混音 tick 还停在 C 调用里」的时刻，断言句柄销毁不会与之重叠。
+type fakeAPM struct {
+	started chan struct{} // 进入 processRender 时关闭一次
+	release chan struct{} // 测试关闭以放行 processRender
+	once    sync.Once
+
+	mu                  sync.Mutex
+	inFlight            bool
+	closedWhileInFlight bool
+	closes              int
+}
+
+func newFakeAPM() *fakeAPM {
+	return &fakeAPM{started: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (f *fakeAPM) configure(apmOptions) error { return nil }
+
+func (f *fakeAPM) processCapture([]int16) error { return nil }
+
+func (f *fakeAPM) processRender([]int16) error {
+	f.mu.Lock()
+	f.inFlight = true
+	f.mu.Unlock()
+	f.once.Do(func() { close(f.started) })
+	<-f.release
+	f.mu.Lock()
+	f.inFlight = false
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *fakeAPM) close() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.inFlight {
+		f.closedWhileInFlight = true
+	}
+	f.closes++
+}
+
+// TestProcessRenderLockSpansFrame ProcessRender 的读锁必须贯穿整帧（#117 回归）：
+// 若在读锁提前释放后销毁句柄，混音 tick 仍停在 C 调用里而 C++ 对象已被释放，
+// 就是 C 堆 UAF。这里让 render 阻塞在帧内，同时从另一 goroutine 关掉 APM，
+// 断言关闭操作必须等到 render 返回才完成、且 close 从未在在途帧期间发生。
+// 与是否支持真 APM 无关（用替身），所有平台都真实执行。
+func TestProcessRenderLockSpansFrame(t *testing.T) {
+	d, err := NewDSP(DefaultDSPConfig())
+	if err != nil {
+		t.Fatalf("NewDSP: %v", err)
+	}
+	defer d.Close()
+
+	fake := newFakeAPM()
+	d.apmMu.Lock()
+	d.apm = fake
+	d.apmMu.Unlock()
+
+	renderDone := make(chan struct{})
+	go func() {
+		defer close(renderDone)
+		d.ProcessRender(make([]int16, FrameSize))
+	}()
+
+	select {
+	case <-fake.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ProcessRender 未进入 processRender")
+	}
+
+	toggleDone := make(chan error, 1)
+	go func() { toggleDone <- d.SetEnableAPM(false) }()
+
+	// 关闭在 render 未放行时不得完成：写锁被读锁挡住。
+	select {
+	case err := <-toggleDone:
+		t.Fatalf("render 仍在进行时 SetEnableAPM(false) 就返回了（err=%v）——读锁没有贯穿整帧", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(fake.release)
+	select {
+	case err := <-toggleDone:
+		if err != nil {
+			t.Fatalf("SetEnableAPM(false): %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("render 放行后 SetEnableAPM(false) 仍未完成（死锁）")
+	}
+	<-renderDone
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.closedWhileInFlight {
+		t.Fatal("句柄在 processRender 在途时被 close：C 堆 UAF")
+	}
+	if fake.closes != 1 {
+		t.Fatalf("close 调用 %d 次, want 1", fake.closes)
+	}
+}
+
+// TestProcessRenderToggleRace -race 下的并发压力：混音 tick 持续送参考帧的同时
+// 反复启停 APM。真 APM 从未启用（每次都失败或替换替身），只验证 DSP 层的锁与
+// 生命周期不出现数据竞争或 UAF 序（配 -race 运行）。
+func TestProcessRenderToggleRace(t *testing.T) {
+	d, err := NewDSP(DefaultDSPConfig())
+	if err != nil {
+		t.Fatalf("NewDSP: %v", err)
+	}
+	defer d.Close()
+
+	ren := make([]int16, FrameSize)
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				d.ProcessRender(ren)
+			}
+		}
+	}()
+
+	for i := 0; i < 200; i++ {
+		_ = d.SetEnableAPM(i%2 == 0)
+	}
+	close(stop)
+	wg.Wait()
 }
 
 // BenchmarkAPMRender APM 参考帧处理成本（混音 tick 每 10ms 一次）。

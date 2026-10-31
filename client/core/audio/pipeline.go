@@ -582,12 +582,18 @@ func (p *Pipeline) applyOpusConfig(enc *codec.Encoder, c OpusConfig) error {
 		frames = DREDDurationFrames
 	}
 	p.dredActive = false
-	if err := enc.SetDRED(frames); err != nil {
+	if err := dredCtl(enc, frames); err != nil {
 		if dred { // 关闭时旧库报「不支持 DRED」无须吓唬用户
 			p.warnDREDOnce(err)
 		}
 	} else {
 		p.dredActive = dred
+	}
+	if !p.dredActive {
+		// 构造期就启用失败（旧库/不支持平台）：生效配置不能停在「已开启」，
+		// 否则设置页显示与实际链路不符（#117）。c 是值拷贝，改它传不回去，
+		// 必须落到 p.opus（调用方在构造期传入的就是它）。
+		p.opus.DRED = boolPtr(false)
 	}
 	plp := p.effectivePacketLoss(c.PacketLoss)
 	for name, fn := range map[string]func() error{
@@ -680,8 +686,16 @@ func (p *Pipeline) SetOpusFEC(on bool) error {
 	return nil
 }
 
+// dredCtl 编码器 DRED 能力入口。默认直连 codec.Encoder.SetDRED；测试可替换它
+// 模拟「不支持 DRED 的旧库」，无需真去搞一份旧 libopus。
+var dredCtl = func(e *codec.Encoder, frames int) error { return e.SetDRED(frames) }
+
 // SetOpusDRED 热调深度冗余开关（#44）：开启 20 帧（200ms）冗余，关闭恢复
 // 用户配置的 PLP。旧库不支持 DRED 时只记一次日志并保持音频可用。
+//
+// 开启失败会返回错误（#117）：调用方（App）据此回滚持久化配置并把错误报给
+// 前端，否则设置页会一直显示「已开启」而实际走普通模式。与 APM 的
+// SetEnableAPM 同一口径。关闭永远成功——不支持时本来就是关闭态。
 func (p *Pipeline) SetOpusDRED(on bool) error {
 	p.encMu.Lock()
 	defer p.encMu.Unlock()
@@ -692,17 +706,62 @@ func (p *Pipeline) SetOpusDRED(on bool) error {
 	if on {
 		frames = DREDDurationFrames
 	}
-	if err := p.enc.SetDRED(frames); err != nil {
+	if err := dredCtl(p.enc, frames); err != nil {
+		p.dredActive = false
+		p.opus.DRED = boolPtr(false) // 生效值才是真相，配置侧不再显示「已开启」
 		if on {
 			p.warnDREDOnce(err)
+			return fmt.Errorf("启用 DRED: %w", err)
 		}
-		p.dredActive = false
-	} else {
-		p.dredActive = on
+		return p.enc.SetPacketLossPerc(p.effectivePacketLoss(p.opus.PacketLoss))
 	}
+	p.dredActive = on
 	p.opus.DRED = boolPtr(on)
 	return p.enc.SetPacketLossPerc(p.effectivePacketLoss(p.opus.PacketLoss))
 }
+
+// DREDActive 编码器是否实际启用了 DRED（设置回滚/诊断用）。旧库/不支持平台
+// 返回 false。
+func (p *Pipeline) DREDActive() bool {
+	p.encMu.Lock()
+	defer p.encMu.Unlock()
+	return p.dredActive
+}
+
+// DREDSupported 报告当前平台与 libopus 是否支持深度冗余（#117）。与 APM 的
+// APMSupported 同一口径：false 的平台/构建不应把 DRED 显示为可用。
+//
+// 平台层面 codec stub 直接给 false；真实 libopus 用一次建编码器 + SetDRED 探测
+// （旧版本库没有 OPUS_HAVE_DRED，ctl 返回 OPUS_UNIMPLEMENTED），结果缓存——
+// 该能力在一次进程内不会变，不应每帧/每次设置都建编码器。
+func DREDSupported() bool {
+	return dredSupportProbe()
+}
+
+// dredSupportProbe 能力探测的实现入口。测试替换它来模拟不支持 DRED 的平台，
+// 让「不支持」分支在 Windows/Linux 的 CI 上也能被真实执行（不能用 t.Skip
+// 把平台分支藏起来）。
+var dredSupportProbe = probeDREDSupport
+
+func probeDREDSupport() bool {
+	if !codec.Supported() {
+		return false
+	}
+	dredSupportOnce.Do(func() {
+		enc, err := codec.NewEncoder(SampleRate, 1, codec.AppVoIP)
+		if err != nil {
+			return // 拿不到编码器：管线本身会失败，UI 由 voiceUnavailable 提示
+		}
+		defer enc.Close()
+		dredSupport = enc.SetDRED(DREDDurationFrames) == nil
+	})
+	return dredSupport
+}
+
+var (
+	dredSupportOnce sync.Once
+	dredSupport     bool
+)
 
 // SetOpusPacketLoss 热调告知编码器的预期丢包率 %（5–20）。DRED 开启时实际
 // 下发给编码器的值不会低于 DREDMinPacketLoss，用户设置原样保留。

@@ -99,3 +99,10 @@ func (r *RingBuffer) Reset() {
 	r.tail.Store(0)
 	r.head.Store(0)
 }
+
+// Discard 丢弃当前全部可读采样（保留容量与写者的进度）。只允许消费者调用：
+// 只推进 tail，不动 head，不破坏 SPSC 语义——与 Reset 不同，可以在写者
+// 并发运行时安全使用（写者已写入的数据在下一次 Read 前被整体跳过）。
+func (r *RingBuffer) Discard() {
+	r.tail.Store(r.head.Load())
+}

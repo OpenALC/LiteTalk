@@ -117,6 +117,17 @@ async function setEnableAPM(on: boolean) {
   }
 }
 
+// DRED（#117）：平台/构建不支持时（如 macOS stub、旧 libopus）把开关置为关闭
+// 并禁用；开启失败（Go 侧回滚并返回错误）同样回滚勾选。
+const dredSupported = ref(true)
+async function setDRED(on: boolean) {
+  if (on && !dredSupported.value) return
+  audio.value.dred = on
+  if (!(await applyAudio())) {
+    audio.value.dred = !on
+  }
+}
+
 // 游戏内悬浮层（#47，Beta，仅 Windows）：默认关闭；平台不支持时开关禁用。
 // 保存失败回滚勾选（逻辑在 useWindowOverlay 内，见单测）。
 const {
@@ -153,6 +164,8 @@ onMounted(async () => {
   audio.value = withAudioDefaults(await goApp().GetAudioSettings())
   apmSupported.value = await goApp().APMSupported().catch(() => false)
   if (!apmSupported.value) audio.value.enable_apm = false
+  dredSupported.value = await goApp().DREDSupported().catch(() => false)
+  if (!dredSupported.value) audio.value.dred = false
   await loadWindowOverlay()
   // 热键读取单独兜异常：Go 侧绑定缺失时只回落默认值，不连带弄崩下面设备列表的加载。
   try {
@@ -577,11 +590,15 @@ function bindRecording(spec: string) {
         <!-- 深度冗余：突发丢包时用后续包里的 200ms 冗余恢复，FEC 不可用时兜底 -->
         <div class="s-row">
           <div class="k">弱网深度冗余（DRED）</div>
-          <label class="switch">
-            <input v-model="audio.dred" type="checkbox" @change="applyAudio"><i />
+          <label class="switch" :class="{ disabled: !dredSupported }">
+            <input :checked="audio.dred" type="checkbox" :disabled="!dredSupported"
+                   @change="setDRED(($event.target as HTMLInputElement).checked)"><i />
           </label>
         </div>
         <p class="s-note">提高突发丢包恢复，码率略增</p>
+        <p v-if="!dredSupported" class="s-note s-warn">
+          <CircleAlert :size="13" />当前平台不支持深度冗余
+        </p>
       </section>
 
       <section class="s-sec">

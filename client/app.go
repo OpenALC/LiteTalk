@@ -134,6 +134,9 @@ type App struct {
 	// emitHook 测试专用的事件观察口（emit 广播前同步回调，生产恒为 nil）。
 	// 事件是跨层唯一可观测输出；没有它，测试只能断言状态副作用、断不到 reason。
 	emitHook func(name string, data any)
+
+	// dredSupportFn 测试专用的 DRED 能力覆盖（见 dredSupport；生产恒为 nil）。
+	dredSupportFn func() bool
 }
 
 // NewApp 创建应用实例
@@ -2196,6 +2199,21 @@ func (a *App) runtimeAudio() audio.RuntimeSettings {
 // false 的平台（如 macOS stub）设置页应禁用开关并提示不支持。
 func (a *App) APMSupported() bool { return audio.APMSupported() }
 
+// DREDSupported 报告当前平台与 libopus 是否支持深度冗余（#117）。false 的
+// 平台/构建设置页应把开关置为关闭并提示，避免配置显示「已开启」而实际走
+// 普通模式。与 APMSupported 同一口径。
+func (a *App) DREDSupported() bool { return a.dredSupport() }
+
+// dredSupport DRED 能力探测入口。生产实现是 audio.DREDSupported、结果由其后
+// 缓存；测试整体替换它来驱动「不支持」分支，使该分支在 Windows/Linux 的 CI
+// 上也被真实执行（不能用 t.Skip 把平台分支藏起来）。
+func (a *App) dredSupport() bool {
+	if a.dredSupportFn != nil {
+		return a.dredSupportFn()
+	}
+	return audio.DREDSupported()
+}
+
 // GetAudioSettings 读取持久化语音设置（设置页初始化用；未设置字段回落默认值）。
 func (a *App) GetAudioSettings() config.AudioSettings { return a.cfg.GetAudioSettings() }
 
@@ -2232,6 +2250,12 @@ func (a *App) SetAudioSettings(s config.AudioSettings) error {
 	if s.EnableAPM && !audio.APMSupported() {
 		return fmt.Errorf("当前平台不支持 WebRTC APM")
 	}
+	// DRED 默认开启：不支持 DRED 的平台/构建上，保存设置本身不算错，但配置里
+	// 不能再留着「已开启」。这里明确拒绝把 DRED 打开，前端据此回滚开关并提示
+	// （#117）。关闭方向永远放行。
+	if s.DRED != nil && *s.DRED && !a.dredSupport() {
+		return fmt.Errorf("当前平台不支持深度冗余（DRED）")
+	}
 	if err := a.cfg.SetAudioSettings(s); err != nil {
 		return err
 	}
@@ -2242,6 +2266,9 @@ func (a *App) SetAudioSettings(s config.AudioSettings) error {
 		err := sess.ApplyAudio(a.runtimeAudio())
 		if s.EnableAPM && a.rollbackAPMIfInactive(sess) && err == nil {
 			err = fmt.Errorf("启用 WebRTC APM 失败")
+		}
+		if a.rollbackDREDIfInactive(sess) && err == nil {
+			err = fmt.Errorf("启用深度冗余（DRED）失败")
 		}
 		return err
 	}
@@ -2263,6 +2290,42 @@ func (a *App) rollbackAPMIfInactive(sess *voice.Session) bool {
 		log.Printf("rollback enable_apm: %v", err)
 	}
 	return true
+}
+
+// rollbackDREDIfInactive 未能启用 DRED 时回滚持久化的 dred（#117），口径与
+// rollbackAPMIfInactive 一致：macOS/stub 平台与不支持 DRED 的旧 libopus 上，
+// 配置不能一直显示「已开启」而实际走普通模式。
+//
+// 无会话（未连接/音频降级）时只按平台能力判断：平台本身支持就先不动，等
+// 连接后真正应用失败再回滚——否则「断网时点一下保存」会把支持平台的 DRED 清掉。
+func (a *App) rollbackDREDIfInactive(sess *voice.Session) bool {
+	as := a.cfg.GetAudioSettings()
+	requested := as.DRED != nil && *as.DRED
+	haveSession := sess != nil
+	active := haveSession && sess.DREDActive()
+	if !dredRollbackNeeded(requested, haveSession, active, a.dredSupport()) {
+		return false
+	}
+	off := false
+	as.DRED = &off
+	if err := a.cfg.SetAudioSettings(as); err != nil {
+		log.Printf("rollback dred: %v", err)
+	}
+	return true
+}
+
+// dredRollbackNeeded 判断是否需要把持久化的 dred 回滚为关闭（#117），纯函数
+// 便于穷举组合测试。有会话时以「编码器是否真的启用」为准；无会话（未连接/
+// 音频降级）时只看平台能力——支持 DRED 的平台要等连接后应用失败再回滚，
+// 否则「断网时点一下保存」会把支持的平台白白关掉。
+func dredRollbackNeeded(requested, haveSession, active, supported bool) bool {
+	if !requested {
+		return false
+	}
+	if haveSession {
+		return !active
+	}
+	return !supported
 }
 
 // ---------- 全局热键（v1.2.0：PTT / 闭麦 / 静音 / 全关全开） ----------

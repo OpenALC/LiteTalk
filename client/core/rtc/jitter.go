@@ -59,6 +59,11 @@ type JitterBuffer struct {
 	nextPop uint64 // 下一个应弹出的扩展序号
 	starved int    // 连续断流拍数
 
+	// flushFloor 帧长切换后的丢弃下界（含）：切换前已在途的旧包序号 ≤ 它，
+	// 到达后直接算迟到丢弃，不能重新拉起一轮以旧帧长为准的预填。
+	flushFloor    uint64
+	hasFlushFloor bool
+
 	frameMS     int     // 当前包时长（10/20ms，#46）
 	lastTransit float64 // 上一包 transit（到达时刻 - seq×frameMS，ms）
 	hasTransit  bool
@@ -87,8 +92,13 @@ func NewJitterBuffer() *JitterBuffer {
 	return &JitterBuffer{frameMS: JitterFrameMS, targetPackets: jitterMinMS / JitterFrameMS}
 }
 
-// SetFrameMS 切换每包媒体时长（10/20ms，#46 频道配置）。切换时清掉 transit
-// 基准，避免帧长变化被误判成一次抖动尖峰；目标深度按新帧长重算。
+// SetFrameMS 切换每包媒体时长（10/20ms，#46 频道配置）。切换会冲刷槽内的旧帧
+// 并回到预填态（#117）：旧帧按旧帧长解码后写进混音会持续垫高延迟（20→10 每包
+// 多出 10ms），或让每拍输出不足一半（10→20 持续欠载）。代价是一次重新预填的
+// 静默（60–120ms），比残留延迟/持续欠载可接受。
+//
+// headSeq 保留为序号连续性的基准（extendSeq 依赖它），预填起点取 headSeq+1：
+// 冲刷前到达的旧包一律算迟到，不再参与新预填。
 func (b *JitterBuffer) SetFrameMS(ms int) error {
 	if ms != 10 && ms != 20 {
 		return fmt.Errorf("rtc: jitter 帧长非法: %d（只支持 10/20ms）", ms)
@@ -99,9 +109,28 @@ func (b *JitterBuffer) SetFrameMS(ms int) error {
 		return nil
 	}
 	b.frameMS = ms
-	b.hasTransit = false
+	b.flushLocked()
 	b.adaptTargetLocked()
 	return nil
+}
+
+// flushLocked 清空槽位并回到预填态，保留 headSeq 作为序号基准。
+func (b *JitterBuffer) flushLocked() {
+	for i := range b.slots {
+		b.slots[i].present = false
+	}
+	b.count = 0
+	b.started = false
+	b.starved = 0
+	b.nextPop = 0
+	if b.init {
+		b.firstSeq = b.headSeq + 1
+		b.flushFloor = b.headSeq
+		b.hasFlushFloor = true
+	}
+	// transit 基准作废：帧长变化本身会被当成一次抖动尖峰。jitterMs 估计保留
+	// ——它是到达间隔抖动，与帧长无关，只是换算成包数时按新帧长取整。
+	b.hasTransit = false
 }
 
 // frameMSValue 当前包时长（零值按默认 20ms，测试可直接构造 JitterBuffer）。
@@ -127,6 +156,12 @@ func (b *JitterBuffer) Push(seq uint16, payload []byte, arrival time.Time) {
 		b.firstSeq = ext
 	} else {
 		switch {
+		case b.hasFlushFloor && ext <= b.flushFloor:
+			// 帧长切换前已在途的旧帧：内容按旧帧长编码，留着只会垫高延迟，或
+			// 乱序晚到把预填基准拉回旧帧。flushFloor 是切换时刻见过的最大序号，
+			// 之后的合法包不可能落在它之前，所以这条门禁可以一直保留。
+			b.droppedLate++
+			return
 		case b.started && ext < b.nextPop:
 			b.droppedLate++ // 已消费过的序号（含重放/重复）
 			return
@@ -280,6 +315,7 @@ func (b *JitterBuffer) resetLocked(ext uint64) {
 	b.headSeq = ext
 	b.firstSeq = ext
 	b.hasTransit = false
+	b.hasFlushFloor = false
 	b.resets++
 }
 

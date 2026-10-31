@@ -42,6 +42,9 @@ type GoApp = {
   SetAudioSettings(s: AudioSettings): Promise<void>
   // WebRTC APM（Beta）可用性：false 的平台（如 macOS stub）设置页禁用开关。
   APMSupported(): Promise<boolean>
+  // DRED（深度冗余）可用性（#117）：false 的平台/构建设置页把开关置为关闭并
+  // 提示，避免配置显示「已开启」而实际走普通模式。
+  DREDSupported(): Promise<boolean>
   // 游戏内悬浮层（#47，Beta，仅 Windows）：Supported 为 false 时设置页禁用开关。
   WindowOverlaySupported(): Promise<boolean>
   GetWindowOverlaySettings(): Promise<WindowOverlaySettings>
@@ -263,6 +266,8 @@ const mockApp: GoApp = {
   async SetAudioSettings() {},
   // 浏览器预览没有 C++ APM，但保持 Beta 区可见可操作（落盘为 no-op）。
   async APMSupported() { return true },
+  // 浏览器预览没有真实编码器：报告支持，让 DRED 开关保持可操作（落盘为 no-op）。
+  async DREDSupported() { return true },
   // 悬浮层 mock：默认关闭；浏览器预览没有原生窗口，仍报告支持以便联调 UI，
   // 保存为 no-op（真实平台能力由 Go 侧 Supported 报告）。
   async WindowOverlaySupported() { return true },
