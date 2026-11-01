@@ -1663,7 +1663,9 @@ func (m *Mem) DeleteOutboundWebhook(_ context.Context, id int64) error {
 	return nil
 }
 
-// RecordWebhookDelivery 单锁内完成「落记录 + 推进熔断计数」，语义与 SQL 方言的事务版一致。
+// RecordWebhookDelivery 单锁内完成「落记录 + 推进熔断计数」，语义与 SQL 方言的
+// 原子 UPDATE 版一致。整处在 m.mu 临界区内，天然无读-改-写竞态；并发用例仍与
+// 两种 SQL 方言共用同一断言，防止实现漂移。
 func (m *Mem) RecordWebhookDelivery(_ context.Context, d *WebhookDelivery, breakerAt int, reason string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

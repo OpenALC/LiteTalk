@@ -2102,8 +2102,8 @@ func (m *MySQL) OIDCIdentityByIssuerSub(ctx context.Context, issuer, sub string)
 }
 
 // ---- webhooks（迁移 0019，#52）----
-// CRUD 与投递记录共用 webhooks.go 的 db* 实现；RecordWebhookDelivery 的
-// 读-改-写在事务内完成，并发投递同一订阅不会越过熔断阈值。
+// CRUD 与投递记录共用 webhooks.go 的 db* 实现；RecordWebhookDelivery 的熔断
+// 计数是单条原子 UPDATE，多连接并发投递同一订阅不会丢更新。
 
 func (m *MySQL) CreateOutboundWebhook(ctx context.Context, w *OutboundWebhook) error {
 	return dbCreateOutboundWebhook(ctx, m.db, w)

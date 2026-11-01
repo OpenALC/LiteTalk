@@ -2062,8 +2062,8 @@ func (s *SQLite) OIDCIdentityByIssuerSub(ctx context.Context, issuer, sub string
 
 // ---- webhooks（迁移 0019，#52）----
 // CRUD 与投递记录共用 webhooks.go 的 db* 实现；SQL 与 MySQL 同形（无 ENUM、
-// 无方言 upsert），这里只做事务接线。RecordWebhookDelivery 的读-改-写在事务内
-// 完成，并发投递同一订阅不会越过熔断阈值。
+// 无方言 upsert），这里只做事务接线。RecordWebhookDelivery 的熔断计数是单条
+// 原子 UPDATE（语义与 MySQL 同一条 SQL），事务只负责记录与计数同进同退。
 
 func (s *SQLite) CreateOutboundWebhook(ctx context.Context, w *OutboundWebhook) error {
 	return dbCreateOutboundWebhook(ctx, s.db, w)
