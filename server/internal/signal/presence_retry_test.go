@@ -143,3 +143,43 @@ func TestPresenceChannelOfflineClearsRetry(t *testing.T) {
 		t.Fatal("离线边沿应清掉待重试标记")
 	}
 }
+
+// TestPresenceOfflineEdgeClearsChannelCaches 离线边沿（最后一条连接摘除）与
+// connCount 归零必须原子：unregister 返回后观测者已看到离线，就不能再读到
+// 残留的频道去抖/待重试缓存；之后迟到的频道同步也不得把标记写回来（#117）。
+func TestPresenceOfflineEdgeClearsChannelCaches(t *testing.T) {
+	h, _, _ := newPresenceHub(t)
+	alice := &client{hub: h, userID: "1", dev: "desktop"}
+	if _, became := h.register(alice); !became {
+		t.Fatal("首连应判定为 0→1 边沿")
+	}
+	h.presenceMu.Lock()
+	h.presenceChanPublished = map[string]presenceChanState{
+		"1": {channelID: "7", serverID: "1"},
+	}
+	h.presenceChanRetry = map[string]presenceChanPending{
+		"1": {viewers: map[string]bool{"2": true}},
+	}
+	h.presenceMu.Unlock()
+
+	if !h.unregister(alice) {
+		t.Fatal("最后一条连接断开应判定为 1→0 边沿")
+	}
+	// unregister 返回即 connCount==0 已对外可见，此时缓存必须已经清空。
+	h.presenceMu.Lock()
+	_, published := h.presenceChanPublished["1"]
+	_, retry := h.presenceChanRetry["1"]
+	h.presenceMu.Unlock()
+	if published || retry {
+		t.Fatalf("离线边沿不得残留频道缓存：published=%v retry=%v", published, retry)
+	}
+
+	// 迟到的频道同步：连接已不在，直接返回，不能写回待重试标记。
+	h.syncPresenceChannel("1")
+	h.presenceMu.Lock()
+	_, retry = h.presenceChanRetry["1"]
+	h.presenceMu.Unlock()
+	if retry {
+		t.Fatal("离线后的频道同步不得留下待重试标记")
+	}
+}

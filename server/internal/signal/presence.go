@@ -65,11 +65,8 @@ func (h *Hub) syncPresence(uid string) {
 		h.pushPresence(uid, true)
 		return
 	}
-	// 离线边沿（#92）：先无条件清频道去抖缓存——不能依赖 KV DEL 成功，
-	// 否则重连再进同一频道会被当成「状态未变」而不重推。
-	// #102：待重试标记一并清掉，离线时没人再需要这次频道推送。
-	delete(h.presenceChanPublished, uid)
-	delete(h.presenceChanRetry, uid)
+	// 频道去抖/待重试缓存不在这里清：离线边沿已在 unregister 摘除最后一条连接
+	// 的同一临界区无条件清掉（#117），与 connCount==0 对外可见保持原子。
 	if err := h.presence.Del(ctx, presenceKey(uid)); err != nil {
 		h.log.Printf("presence: DEL %s 失败: %v", uid, err)
 		return
@@ -188,7 +185,8 @@ type presenceChanPending struct {
 // 成功、leaveRoom、KickChannel 摘除、断线 cleanup 的离房；失败路径不推。
 //
 //   - 最后一条连接断开时跳过：离线由 syncPresence 的 offline 载荷表达，
-//     频道去抖缓存也在那个边沿被无条件清空。
+//     频道去抖/待重试缓存已在 unregister 的离线边沿无条件清空（#117），
+//     迟到的同步在这里按 connCount==0 直接返回，不会把标记写回。
 //   - 与去抖缓存比较，状态未变不推；无频道只推 online=true（不带频道键）。
 //   - 有频道时逐个接收者按其 ViewChannel 过滤：通过推带 channel_id/server_id
 //     的载荷，不通过推 online-only，查询故障跳过该接收者并记日志。

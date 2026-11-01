@@ -541,7 +541,15 @@ func (h *Hub) register(c *client) (old *client, becameOnline bool) {
 // unregister 仅当 conns[key] 仍是本连接时摘除（被顶替的旧连接不得误删新连接，§0.8）。
 // 返回该 uid 是否由 1 条连接变为 0 条（becameOffline，#11 的下线边沿）；
 // 与删除在同一临界区判定，避免「先查后删」race。
+//
+// #117：离线边沿同时清掉好友频道去抖/待重试缓存，且与 conns 摘除同处一个
+// h.mu 临界区。connCount 是「是否离线」的对外事实——任何在 h.mu 内看到 0 条
+// 连接的观测者（waitOffline、心跳）都不能再看到残留的待重试标记；把清理留在
+// 更晚的 syncPresence 会让观测者读到「已离线但标记仍在」的中间态。缓存受
+// presenceMu 保护，故先取 presenceMu（锁序 presenceMu → h.mu）。
 func (h *Hub) unregister(c *client) (becameOffline bool) {
+	h.presenceMu.Lock()
+	defer h.presenceMu.Unlock()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	key := makeConnKey(c.userID, c.dev)
@@ -549,7 +557,12 @@ func (h *Hub) unregister(c *client) (becameOffline bool) {
 		return false // 已被顶替：新连接仍在同一 uid 下，状态未变
 	}
 	delete(h.conns, key)
-	return h.connCountLocked(c.userID) == 0
+	if h.connCountLocked(c.userID) != 0 {
+		return false
+	}
+	delete(h.presenceChanPublished, c.userID)
+	delete(h.presenceChanRetry, c.userID)
+	return true
 }
 
 // connCountLocked 调用方须持 h.mu。
