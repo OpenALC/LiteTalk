@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -41,6 +42,10 @@ type fakeIdP struct {
 	codes map[string]fakeCode
 	// discoveryIssuer 置非空时 discovery 返回它（issuer 不一致用例）。
 	discoveryIssuer string
+	// jwksHits JWKS 端点被拉取的次数（负缓存放大用例断言）。
+	jwksHits atomic.Int64
+	// jwksDelay 拉取响应延迟，用于把并发请求都卡在首次拉取之前。
+	jwksDelay time.Duration
 }
 
 type fakeCode struct {
@@ -130,6 +135,10 @@ func newFakeIdP(t *testing.T) *fakeIdP {
 		})
 	})
 	mux.HandleFunc("/jwks.json", func(w http.ResponseWriter, r *http.Request) {
+		f.jwksHits.Add(1)
+		if f.jwksDelay > 0 {
+			time.Sleep(f.jwksDelay)
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"keys": []map[string]string{{
 				"kty": "RSA", "kid": f.kid,
@@ -458,6 +467,70 @@ func TestOIDCExchangeTimeout(t *testing.T) {
 	// 超时 250ms + 调度余量；永久阻塞的旧实现到不了这里的断言。
 	if elapsed > 3*time.Second {
 		t.Fatalf("Exchange %v 才返回，未在超时内失败", elapsed)
+	}
+}
+
+// TestOIDCUnknownKidNegativeCache 未知 kid 在负缓存窗口内只触发一次 JWKS
+// 重拉；窗口过期后允许再拉一次；已知 kid 不受影响。
+func TestOIDCUnknownKidNegativeCache(t *testing.T) {
+	f := newFakeIdP(t)
+	p := newTestProvider(t, f)
+	now := time.Now()
+	p.now = func() time.Time { return now }
+	ctx := context.Background()
+
+	if _, err := p.publicKey(ctx, "forged-kid"); !errors.Is(err, ErrOIDCUpstream) {
+		t.Fatalf("未知 kid 应 ErrOIDCUpstream，实际 %v", err)
+	}
+	if got := f.jwksHits.Load(); got != 1 {
+		t.Fatalf("首次未知 kid 应拉取 JWKS 1 次，实际 %d", got)
+	}
+	if _, err := p.publicKey(ctx, "forged-kid"); !errors.Is(err, ErrOIDCUpstream) {
+		t.Fatalf("窗口内重复未知 kid 应失败，实际 %v", err)
+	}
+	if got := f.jwksHits.Load(); got != 1 {
+		t.Fatalf("负缓存窗口内不应重拉 JWKS，实际 %d 次", got)
+	}
+	if _, err := p.publicKey(ctx, f.kid); err != nil {
+		t.Fatalf("已知 kid 应命中缓存: %v", err)
+	}
+	if got := f.jwksHits.Load(); got != 1 {
+		t.Fatalf("已知 kid 命中不应重拉，实际 %d 次", got)
+	}
+
+	now = now.Add(oidcKidMissTTL + time.Second)
+	if _, err := p.publicKey(ctx, "forged-kid"); !errors.Is(err, ErrOIDCUpstream) {
+		t.Fatalf("窗口过期后仍应失败，实际 %v", err)
+	}
+	if got := f.jwksHits.Load(); got != 2 {
+		t.Fatalf("负缓存过期后应允许重拉一次，实际 %d 次", got)
+	}
+}
+
+// TestOIDCUnknownKidNegativeCacheConcurrent 并发伪造同一未知 kid 只放大成一次
+// JWKS 拉取（fetchMu 串行化 + 锁后复查负缓存）。
+func TestOIDCUnknownKidNegativeCacheConcurrent(t *testing.T) {
+	f := newFakeIdP(t)
+	f.jwksDelay = 50 * time.Millisecond // 让并发请求在首次拉取返回前都完成检查
+	p := newTestProvider(t, f)
+	const n = 8
+	start := make(chan struct{})
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			<-start
+			_, err := p.publicKey(context.Background(), "forged-kid")
+			errs <- err
+		}()
+	}
+	close(start)
+	for i := 0; i < n; i++ {
+		if err := <-errs; !errors.Is(err, ErrOIDCUpstream) {
+			t.Fatalf("并发未知 kid 应 ErrOIDCUpstream，实际 %v", err)
+		}
+	}
+	if got := f.jwksHits.Load(); got != 1 {
+		t.Fatalf("并发未知 kid 应只拉取 JWKS 1 次，实际 %d 次", got)
 	}
 }
 
