@@ -16,6 +16,9 @@ import (
 // 路径都不得回传。Events 为空格分隔的事件白名单子集（校验在 internal/webhook）。
 // Disabled/DisabledReason/FailCount 是熔断状态：连续失败达阈值由
 // RecordWebhookDelivery 原子置位，手动重新启用时由 API 层清零。
+// CreatorID 是创建订阅的用户（迁移 0022，P1-5）：投递侧按其当前频道可见性收窄；
+// 仅创建时写入、之后不可变（PATCH/熔断不改），0 = 旧行（NULL 列，0022 回填因
+// 服务器已删落空）——投递时按服务器 owner 代持判定，见 internal/webhook。
 type OutboundWebhook struct {
 	ID             int64
 	ServerID       int64
@@ -25,6 +28,7 @@ type OutboundWebhook struct {
 	Disabled       bool
 	DisabledReason string
 	FailCount      int
+	CreatorID      int64
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 }
@@ -54,7 +58,7 @@ type WebhookDelivery struct {
 
 // 出站/入站/投递记录的查询列集（MySQL 与 SQLite 实现共用）。
 const (
-	outboundWebhookCols = `id, server_id, url, secret, events, disabled, disabled_reason, fail_count, created_at, updated_at`
+	outboundWebhookCols = `id, server_id, url, secret, events, disabled, disabled_reason, fail_count, created_at, updated_at, creator_id`
 	inboundWebhookCols  = `id, channel_id, secret, description, created_at`
 	webhookDeliveryCols = `id, webhook_id, event, attempts, ok, status_code, error, created_at`
 )
@@ -65,23 +69,27 @@ func dbCreateOutboundWebhook(ctx context.Context, q sqlExecer, w *OutboundWebhoo
 	now := time.Now()
 	w.CreatedAt, w.UpdatedAt = now, now
 	_, err := q.ExecContext(ctx,
-		`INSERT INTO webhooks (id, server_id, url, secret, events, disabled, disabled_reason, fail_count, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		w.ID, w.ServerID, w.URL, w.Secret, w.Events, w.Disabled, w.DisabledReason, w.FailCount, now, now)
+		`INSERT INTO webhooks (id, server_id, url, secret, events, disabled, disabled_reason, fail_count, created_at, updated_at, creator_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		w.ID, w.ServerID, w.URL, w.Secret, w.Events, w.Disabled, w.DisabledReason, w.FailCount, now, now, w.CreatorID)
 	return err
 }
 
 // dbScanOutboundWebhook 行扫描（TINYINT(1)/INTEGER 存的布尔两方言都可 Scan 进 bool）。
+// creator_id 列可空（0022 之前的旧行）：NULL 扫进 sql.NullInt64 后归零——
+// 零值语义是「owner 代持」，由投递侧处理，Store 不做判定。
 func dbScanOutboundWebhook(row interface{ Scan(...any) error }) (*OutboundWebhook, error) {
 	var w OutboundWebhook
+	var creator sql.NullInt64
 	err := row.Scan(&w.ID, &w.ServerID, &w.URL, &w.Secret, &w.Events,
-		&w.Disabled, &w.DisabledReason, &w.FailCount, &w.CreatedAt, &w.UpdatedAt)
+		&w.Disabled, &w.DisabledReason, &w.FailCount, &w.CreatedAt, &w.UpdatedAt, &creator)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	w.CreatorID = creator.Int64
 	return &w, nil
 }
 

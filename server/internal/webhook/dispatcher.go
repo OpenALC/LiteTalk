@@ -39,6 +39,11 @@ type Config struct {
 	// CheckURL 出站目标 SSRF 校验：创建/更新时与投递（含每一跳重定向）前调用。
 	// nil 用 linkpreview.CheckDialable。
 	CheckURL func(rawURL string) error
+	// Visibility 投递前频道可见性判定（P1-5）：频道维度事件只投给「订阅创建者
+	// 当前对该频道有 ViewChannel」的订阅。nil = fail-closed（频道维度事件一律
+	// 跳过）——生产装配（cmd/server）恒注入 authz.Authorizer；nil 只应出现在
+	// 未接线的测试里，绝不允许以 nil 上线。
+	Visibility VisibilityChecker
 	// Now 时钟；nil 用 time.Now。
 	Now func() time.Time
 	// Wait 退避等待；nil 用真实 timer。返回非 nil（含 ctx 取消）即放弃重试。
@@ -98,10 +103,19 @@ func defaultWait(ctx context.Context, d time.Duration) error {
 // Store 投递器依赖的存储窄接口（*store.Store 满足；测试注入 Mem）。
 type Store interface {
 	ChannelByID(ctx context.Context, id int64) (*store.Channel, error)
+	ServerByID(ctx context.Context, id int64) (*store.Server, error)
 	OutboundWebhooksOfServer(ctx context.Context, serverID int64) ([]store.OutboundWebhook, error)
 	RecordWebhookDelivery(ctx context.Context, d *store.WebhookDelivery, breakerAt int, reason string) error
 	WebhookDeliveriesBefore(ctx context.Context, before time.Time, limit int) ([]store.WebhookDelivery, error)
 	DeleteWebhookDeliveries(ctx context.Context, ids []int64) error
+}
+
+// VisibilityChecker 投递前频道可见性判定的窄接口（*authz.Authorizer 满足）。
+// 走纯角色判定（RoleCanInServer）而非 CanInServer：订阅创建者是账号而非凭据，
+// 其频道可见性只由角色/覆盖决定——scope 交集是令牌主体的 API 能力上限，对
+// 「谁会看到这条消息的投递」没有意义（PR118 P1-5）。
+type VisibilityChecker interface {
+	RoleCanInServer(ctx context.Context, uid, serverID, channelID int64, perm store.Permission) (bool, error)
 }
 
 // outboundTask 一次入队单元：出口只给事件与上下文，订阅匹配与投递全在 worker
@@ -320,13 +334,78 @@ func (d *Dispatcher) process(ctx context.Context, t outboundTask) {
 	if err != nil {
 		return
 	}
+	// 投递前按创建者频道可见性过滤（P1-5）。ownerID 懒加载：仅存在 creator_id
+	// 为空的旧行时才回查服务器行，单次 process 至多查一次，多个空 creator 订阅共享。
+	var ownerID int64
 	for i := range hooks {
 		w := hooks[i]
 		if w.Disabled || !subscribed(w.Events, t.event) {
 			continue
 		}
+		if !d.creatorVisible(ctx, t, w, serverID, &ownerID) {
+			continue
+		}
 		d.deliver(ctx, w, t.event, body)
 	}
+}
+
+// creatorVisible 投递前可见性闸（PR118 P1-5）。频道维度的白名单事件
+// （message.created / channel.created / channel.deleted）只投给「判定主体当前
+// 对该频道有 ViewChannel」的订阅；member.* 无频道维度且载荷不含频道内容，不过此闸。
+//
+// 判定主体：订阅创建者（CreatorID）；0 = 旧行/未记创建者——按服务器 owner 代持
+// （0022 已把存量行回填成 owner_id，这里是兜底：回填时服务器已删的孤儿行），
+// owner 也不可考（服务器行已删）时 fail-closed 跳过。
+//
+// 判定口径：纯角色（RoleCanInServer，不做 scope 交集）——创建者是账号而非凭据，
+// 可见性随角色/频道覆盖实时变化，因此每条事件现查而不缓存结论；authz 快照有
+// TTL 缓存与单飞，同服多订阅、同服高频事件共享一次加载，无 N+1（量级：每事件
+// 每订阅一次纯内存合并，至多每 TTL 每服务器一次 Store 快照加载）。
+//
+// 跳过语义：判定不过或不可判（含判定器故障、fail-closed）一律静默跳过——不算
+// 投递失败、不进重试、不推熔断计数；只留一条日志（仅 id 级信息，不含消息内容）。
+func (d *Dispatcher) creatorVisible(ctx context.Context, t outboundTask, w store.OutboundWebhook, serverID int64, ownerID *int64) bool {
+	if t.channelID == "" {
+		return true // member.* 无频道维度：无可判定的可见性
+	}
+	chID, err := strconv.ParseInt(t.channelID, 10, 64)
+	if err != nil {
+		// serverID != 0 的路径 channelID 必为十进制（OnServerEvent/OnWebhookEvent
+		// 都从 int64 格式化）；到不了这里说明上游改了契约，按 fail-closed 处理。
+		d.log.Printf("[webhook] 跳过订阅 %d：事件 %s 的频道 id 非法 %q", w.ID, t.event, t.channelID)
+		return false
+	}
+	uid := w.CreatorID
+	if uid == 0 {
+		if *ownerID == 0 {
+			srv, err := d.store.ServerByID(ctx, serverID)
+			if err != nil {
+				d.log.Printf("[webhook] 跳过订阅 %d：creator 为空且服务器 %d 不可考: %v", w.ID, serverID, err)
+				return false
+			}
+			*ownerID = srv.OwnerID
+		}
+		uid = *ownerID
+	}
+	if uid == 0 {
+		d.log.Printf("[webhook] 跳过订阅 %d：creator 与服务器 %d 的 owner 均不可考", w.ID, serverID)
+		return false
+	}
+	if d.cfg.Visibility == nil {
+		d.log.Printf("[webhook] 跳过订阅 %d：可见性判定器未注入（fail-closed）", w.ID)
+		return false
+	}
+	ok, err := d.cfg.Visibility.RoleCanInServer(ctx, uid, serverID, chID, store.ViewChannel)
+	if err != nil {
+		// 判定故障按「不可判」处理：绝不把故障伪装成有权限（与 authz 同取向）。
+		d.log.Printf("[webhook] 跳过订阅 %d：可见性判定失败（channel %d）: %v", w.ID, chID, err)
+		return false
+	}
+	if !ok {
+		d.log.Printf("[webhook] 跳过订阅 %d：创建者 %d 对频道 %d 无查看权限，%s 不投递", w.ID, uid, chID, t.event)
+		return false
+	}
+	return true
 }
 
 // deliver 单订阅投递：2xx 成功；4xx（除 429）立即放弃；5xx 与超时/网络错误按

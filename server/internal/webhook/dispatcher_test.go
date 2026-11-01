@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OpenALC/LiteTalk/server/internal/authz"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
 )
 
@@ -27,10 +28,16 @@ var fixedNow = time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 func allowAll(string) error { return nil }
 
 // newTestDispatcher 常用装配：注入时钟与放行校验，其余用默认值。
+// Visibility 默认给真实 authz（与生产同构）：存量测试直插的订阅 CreatorID 为空，
+// 走 owner 代持判定（owner 旁路恒可见），投递行为与过滤上线前一致；要测过滤本身
+// 的用例自行传 cfg.Visibility 或置显式判定器。
 func newTestDispatcher(t *testing.T, mem *store.Mem, cfg Config) *Dispatcher {
 	t.Helper()
 	cfg.CheckURL = allowAll
 	cfg.Now = func() time.Time { return fixedNow }
+	if cfg.Visibility == nil {
+		cfg.Visibility = authz.New(mem, authz.Options{})
+	}
 	d := New(cfg, mem)
 	t.Cleanup(d.Close)
 	return d
@@ -466,6 +473,9 @@ type sweepStore struct {
 func (s *sweepStore) ChannelByID(context.Context, int64) (*store.Channel, error) {
 	return nil, store.ErrNotFound
 }
+func (s *sweepStore) ServerByID(context.Context, int64) (*store.Server, error) {
+	return nil, store.ErrNotFound
+}
 func (s *sweepStore) OutboundWebhooksOfServer(context.Context, int64) ([]store.OutboundWebhook, error) {
 	return nil, nil
 }
@@ -582,5 +592,172 @@ func TestOutletEndToEnd(t *testing.T) {
 	}
 	if stub.last().event != EventMessageCreated {
 		t.Fatal("异步投递事件类型不符")
+	}
+}
+
+// seedVisibleFixture 可见性过滤的公共夹具：服务器（owner=1）+ 成员 uid=2 的一个
+// 文字频道。返回 (serverID, channelID, deny)；deny() 给 uid=2 装成员级 deny
+// ViewChannel 覆盖（恢复可见由用例直接删覆盖 + 失效 authz 快照）。
+func seedVisibleFixture(t *testing.T, mem *store.Mem) (int64, int64, func()) {
+	t.Helper()
+	ctx := context.Background()
+	srv := &store.Server{Name: "srv", OwnerID: 1}
+	if err := mem.CreateServer(ctx, srv); err != nil {
+		t.Fatal(err)
+	}
+	ch := &store.Channel{ServerID: srv.ID, Name: "secret", Type: store.ChannelText, Scope: store.ChannelScopeServer}
+	if err := mem.CreateChannel(ctx, ch); err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.AddMember(ctx, &store.ServerMember{ServerID: srv.ID, UserID: 2, Role: store.RoleMember}); err != nil {
+		t.Fatal(err)
+	}
+	deny := func() {
+		if err := mem.SetChannelOverwrite(ctx, &store.ChannelOverwrite{
+			ChannelID: ch.ID, TargetType: store.OverwriteTargetMember, TargetID: 2,
+			Deny: store.ViewChannel,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return srv.ID, ch.ID, deny
+}
+
+// TestCreatorVisibilityFilterSkipsDeniedChannel P1-5：创建者被 deny ViewChannel 的
+// 频道消息不投递到其订阅；同服 NULL creator 旧行按 owner 代持判定照常投递；
+// 重新授予后恢复。跳过不产生投递记录、不推熔断计数。
+func TestCreatorVisibilityFilterSkipsDeniedChannel(t *testing.T) {
+	mem := store.NewMem()
+	az := authz.New(mem, authz.Options{})
+	ctx := context.Background()
+	serverID, channelID, deny := seedVisibleFixture(t, mem)
+	deny()
+
+	stubDenied := &hookStub{}
+	hsDenied := httptest.NewServer(stubDenied.handler())
+	defer hsDenied.Close()
+	// 创建者订阅：uid=2，对频道被 deny。
+	wDenied := &store.OutboundWebhook{ServerID: serverID, URL: hsDenied.URL,
+		Secret: "secret0123456789abcdef0123456789abcdef", Events: EventMessageCreated, CreatorID: 2}
+	if err := mem.CreateOutboundWebhook(ctx, wDenied); err != nil {
+		t.Fatal(err)
+	}
+	stubOwner := &hookStub{}
+	hsOwner := httptest.NewServer(stubOwner.handler())
+	defer hsOwner.Close()
+	// 旧行（迁移 0022 前的 NULL creator 语义）：按 owner（uid=1，旁路恒可见）代持。
+	wLegacy := &store.OutboundWebhook{ServerID: serverID, URL: hsOwner.URL,
+		Secret: "secret0123456789abcdef0123456789abcdef", Events: EventMessageCreated, CreatorID: 0}
+	if err := mem.CreateOutboundWebhook(ctx, wLegacy); err != nil {
+		t.Fatal(err)
+	}
+
+	d := newTestDispatcher(t, mem, Config{Visibility: az})
+	deliverTask(d, EventMessageCreated, channelID)
+	if stubDenied.count() != 0 {
+		t.Fatal("创建者被 deny 的频道消息不得投递到其订阅")
+	}
+	if stubOwner.count() != 1 {
+		t.Fatal("NULL creator 旧行应按 owner 代持判定照常投递")
+	}
+	// 跳过不算失败：无投递记录、连败计数不动（熔断不受影响）。
+	// before 用真实时钟（落库时间取 store 侧 time.Now，不走注入时钟）。
+	dl, err := mem.WebhookDeliveriesBefore(ctx, time.Now().Add(time.Hour), 500)
+	if err != nil || len(dl) != 1 {
+		t.Fatalf("只应有一条投递记录（owner 行的成功记录）: %v %v", err, dl)
+	}
+	row, err := mem.OutboundWebhookByID(ctx, wDenied.ID)
+	if err != nil || row.FailCount != 0 || row.Disabled {
+		t.Fatalf("跳过不得推进熔断: %v %+v", err, row)
+	}
+	// 连续多条消息持续跳过，计数仍不动。
+	deliverTask(d, EventMessageCreated, channelID)
+	deliverTask(d, EventMessageCreated, channelID)
+	if stubDenied.count() != 0 {
+		t.Fatal("deny 期间应持续跳过")
+	}
+	row, _ = mem.OutboundWebhookByID(ctx, wDenied.ID)
+	if row.FailCount != 0 {
+		t.Fatalf("多次跳过后计数仍应为 0，实际 %d", row.FailCount)
+	}
+
+	// 重新授予（删覆盖 + 失效快照）后恢复投递。
+	if err := mem.DeleteChannelOverwrite(ctx, channelID, store.OverwriteTargetMember, 2); err != nil {
+		t.Fatal(err)
+	}
+	az.InvalidateServer(serverID)
+	deliverTask(d, EventMessageCreated, channelID)
+	if stubDenied.count() != 1 {
+		t.Fatal("重新授予 ViewChannel 后应恢复投递")
+	}
+}
+
+// TestCreatorVisibilityMemberEventsUnfiltered member.* 事件无频道维度：创建者对
+// 频道被 deny 也不影响其 member.joined 订阅投递（载荷不含频道内容）。
+func TestCreatorVisibilityMemberEventsUnfiltered(t *testing.T) {
+	mem := store.NewMem()
+	az := authz.New(mem, authz.Options{})
+	ctx := context.Background()
+	serverID, _, deny := seedVisibleFixture(t, mem)
+	deny()
+	stub := &hookStub{}
+	hs := httptest.NewServer(stub.handler())
+	defer hs.Close()
+	w := &store.OutboundWebhook{ServerID: serverID, URL: hs.URL,
+		Secret: "secret0123456789abcdef0123456789abcdef", Events: EventMemberJoined, CreatorID: 2}
+	if err := mem.CreateOutboundWebhook(ctx, w); err != nil {
+		t.Fatal(err)
+	}
+	d := newTestDispatcher(t, mem, Config{Visibility: az})
+	// REST 派发形态：serverID 直给、channelID 为 0（member 事件无频道）。
+	d.process(ctx, outboundTask{event: EventMemberJoined, serverID: serverID, payload: json.RawMessage(`{}`)})
+	if stub.count() != 1 {
+		t.Fatal("无频道维度事件不应被可见性闸拦下")
+	}
+}
+
+// TestCreatorVisibilityFailClosed 不可判即不投：服务器行已删（NULL creator 无从
+// 代持、有 creator 也无快照可查）时 fail-closed 跳过，且不产生失败记录。
+func TestCreatorVisibilityFailClosed(t *testing.T) {
+	mem := store.NewMem()
+	az := authz.New(mem, authz.Options{})
+	ctx := context.Background()
+	for _, creator := range []int64{0, 2} {
+		stub := &hookStub{}
+		hs := httptest.NewServer(stub.handler())
+		defer hs.Close()
+		w := &store.OutboundWebhook{ServerID: 999, URL: hs.URL,
+			Secret: "secret0123456789abcdef0123456789abcdef", Events: EventChannelCreated, CreatorID: creator}
+		if err := mem.CreateOutboundWebhook(ctx, w); err != nil {
+			t.Fatal(err)
+		}
+		d := newTestDispatcher(t, mem, Config{Visibility: az})
+		// OnServerEvent 形态：服务器行不存在（999），频道 id 形式合法。
+		d.process(ctx, outboundTask{event: EventChannelCreated, serverID: 999,
+			channelID: "123", payload: json.RawMessage(`{}`)})
+		if stub.count() != 0 {
+			t.Fatalf("creator=%d：服务器不可考时必须 fail-closed 跳过", creator)
+		}
+		dl, err := mem.WebhookDeliveriesBefore(ctx, time.Now().Add(time.Hour), 500)
+		if err != nil || len(dl) != 0 {
+			t.Fatalf("fail-closed 跳过不得落失败记录: %v %v", err, dl)
+		}
+	}
+}
+
+// TestCreatorVisibilityNilCheckerFailClosed 未注入判定器（配置缺位）：频道维度
+// 事件一律跳过——绝不以「无判定能力」放行投递。
+func TestCreatorVisibilityNilCheckerFailClosed(t *testing.T) {
+	mem := store.NewMem()
+	serverID, channelID, _ := seedVisibleFixture(t, mem)
+	stub := &hookStub{}
+	hs := httptest.NewServer(stub.handler())
+	defer hs.Close()
+	seedHook(t, mem, serverID, hs.URL, EventMessageCreated) // CreatorID=0
+	d := newTestDispatcher(t, mem, Config{})
+	d.cfg.Visibility = nil // 显式回到未接线装配
+	deliverTask(d, EventMessageCreated, channelID)
+	if stub.count() != 0 {
+		t.Fatal("判定器未注入时频道维度事件必须 fail-closed 跳过")
 	}
 }
