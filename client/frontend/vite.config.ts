@@ -9,11 +9,13 @@ const port = process.env.WAILS_VITE_PORT ? Number(process.env.WAILS_VITE_PORT) :
 // Web 客户端版本（#50）：默认源是本 package.json 的 version 字段，经 define
 // 注入 src/api/web/version.ts。CI 标签构建（#119）用 LITELTALK_VERSION 覆盖，
 // 让浏览器版版本号与发布标签一致；缺失/空值回落 package.json。导出供单测覆盖。
+// 注入值剥掉前导 v/V：服务端版本门按主/次版本解析且要求数字开头，不能依赖
+// 下游的 TrimPrefix 兜底（version.ts 的约束注释同此）。
 export function resolveWebVersion(
   pkgVersion: string,
   env: { LITELTALK_VERSION?: string } = process.env,
 ): string {
-  return env.LITELTALK_VERSION?.trim() || pkgVersion
+  return env.LITELTALK_VERSION?.trim().replace(/^[vV]/, '') || pkgVersion
 }
 
 const pkgVersion = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version as string

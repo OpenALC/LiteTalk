@@ -12,8 +12,9 @@ const pkgVersion = (
 ).version
 
 describe('resolveWebVersion', () => {
-  it('LITELTALK_VERSION 存在时采用注入值', () => {
-    expect(resolveWebVersion(pkgVersion, { LITELTALK_VERSION: 'v1.9.8-alpha' })).toBe('v1.9.8-alpha')
+  it('LITELTALK_VERSION 存在时采用注入值，并剥掉前导 v/V', () => {
+    expect(resolveWebVersion(pkgVersion, { LITELTALK_VERSION: 'v1.9.8-alpha' })).toBe('1.9.8-alpha')
+    expect(resolveWebVersion(pkgVersion, { LITELTALK_VERSION: 'V1.9.8-alpha' })).toBe('1.9.8-alpha')
   })
 
   it('LITELTALK_VERSION 缺失或为空时回落 package.json', () => {
