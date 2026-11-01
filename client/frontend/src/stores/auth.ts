@@ -64,6 +64,11 @@ export const useAuthStore = defineStore('auth', () => {
   // 服务端能力开关（启动时拉取一次，注册/找回页据此适配 UI）。
   const serverCfg = ref<ServerConfig>({ auth_mode: 'full', mail_configured: false, self_host: false, bootstrap_required: false })
   const simpleMode = computed(() => serverCfg.value.auth_mode === 'simple')
+  // OIDC（#118 P2-5）：oidc_enabled 决定是否显示「使用 OIDC 登录」按钮（服务端
+  // 未配置完整时 /auth/oidc/* 一律 404，不显示）；oidcOnly（auth_mode=oidc）时
+  // 密码/注册入口整体关闭——服务端对密码登录直接 403，UI 不能让用户去撞。
+  const oidcEnabled = computed(() => serverCfg.value.oidc_enabled === true)
+  const oidcOnly = computed(() => serverCfg.value.auth_mode === 'oidc')
   const mailConfigured = computed(() => serverCfg.value.mail_configured)
   // 自托管引导（#27）：self_host 或邀请码未消费时注册页显示可选邀请码输入。
   const showInviteField = computed(() => !!serverCfg.value.self_host || !!serverCfg.value.bootstrap_required)
@@ -102,6 +107,19 @@ export const useAuthStore = defineStore('auth', () => {
   // 游客一键进入（simple 模式）。Go 侧负责复用已记住的游客身份（refresh 轮换）。
   async function guest() {
     const r = await goApp().LoginAsGuest()
+    resetSessionStores()
+    user.value = r.user
+    loggedIn.value = true
+    signalOk.value = r.session_ok !== false
+    clearKickedReason() // 新登录覆盖被踢态，下次进登录页不残留横幅
+    clearShutdown() // 同理：连上的是新会话，旧的「服务端已关闭」不该带过来
+  }
+
+  // loginWithOidcCode OIDC 回调交换（web 回调页专用，#118 P2-5）：IdP 重定向回
+  // redirect_url 后，回调页把 code+state 交到这里换令牌对。失败原样上抛——
+  // state 无效/交换失败的文案区分由回调页按错误码处理，store 不吞。
+  async function loginWithOidcCode(code: string, state: string) {
+    const r = await goApp().OidcExchange(code, state)
     resetSessionStores()
     user.value = r.user
     loggedIn.value = true
@@ -192,9 +210,10 @@ export const useAuthStore = defineStore('auth', () => {
 
   return {
     user, loggedIn, signalOk, serverCfg, simpleMode, mailConfigured,
+    oidcEnabled, oidcOnly,
     showInviteField, bootstrapRequired,
     kickedReason, shutdown,
-    loadConfig, login, register, guest, sendEmailCode, resetPassword, logout, fetchMe,
+    loadConfig, login, register, guest, loginWithOidcCode, sendEmailCode, resetPassword, logout, fetchMe,
     setSignalOk, setKickedReason, clearKickedReason, setShutdown, clearShutdown,
   }
 })

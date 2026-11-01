@@ -40,6 +40,12 @@ export type GoApp = {
   LoginAsGuest(): Promise<AuthResult>
   Register(nickname: string, email: string, password: string, code: string, bootstrap: string): Promise<AuthResult>
   ResetPassword(email: string, code: string, newPassword: string): Promise<void>
+  // OidcAuthorize 发起 OIDC 登录（#118 P2-5）：返回 IdP 授权页 URL。web 端由
+  // 调用方当前窗口跳转；桌面端 Go 侧已用系统浏览器打开，返回值仅作展示兜底。
+  OidcAuthorize(): Promise<string>
+  // OidcExchange 回调页专用：code+state 换令牌对并建立会话。仅 web 回调链路
+  // 调用——桌面会话落在系统浏览器里的服务端托管 Web 客户端，不经过本方法。
+  OidcExchange(code: string, state: string): Promise<AuthResult>
   Logout(): Promise<void>
   GetMe(): Promise<UserProfile>
   ListAudioDevices(): Promise<{ capture: AudioDeviceDTO[]; playback: AudioDeviceDTO[] }>
@@ -241,6 +247,10 @@ const mockApp: GoApp = {
     return mockApp.Login(email, "mock")
   },
   async ResetPassword() {},
+  // OIDC 桩（#118 P2-5）：浏览器开发返回假授权 URL（不导航，联调 UI），
+  // 交换复用登录桩（dev 可手工进 #/oidc/callback?code=x&state=y 看回调页）。
+  async OidcAuthorize() { return 'https://idp.example/authorize?state=mock' },
+  async OidcExchange() { return mockApp.Login('dev@example.com', 'mock') },
   async Logout() {},
   async LoginAsGuest() {
     return {
@@ -431,6 +441,12 @@ export function goApp(): GoApp {
 
 export function isNative(): boolean {
   return !!window._wails?.flags
+}
+
+// isWebBuild 当前是否为服务端托管的 web 构建（构建期常量）。OIDC 登录据此
+// 分流：web 用当前窗口跳 IdP，桌面由 Go 侧开系统浏览器。
+export function isWebBuild(): boolean {
+  return IS_WEB_BUILD
 }
 
 // nativeInitFailed 生产环境等待原生标志超时仍未就绪时置位（模块级单例）。
