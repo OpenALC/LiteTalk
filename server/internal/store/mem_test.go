@@ -225,3 +225,21 @@ func TestCategoryUpdateAndReorder(t *testing.T) {
 		t.Fatalf("不存在 id 应 ErrNotFound，实际 %v", err)
 	}
 }
+
+// TestMemUserByEmailCaseInsensitive 内存实现与两种 SQL 方言同语义：存量混合
+// 大小写行可被规范化邮箱命中，大小写不同的同一邮箱重复建号必须冲突。
+func TestMemUserByEmailCaseInsensitive(t *testing.T) {
+	ctx := context.Background()
+	m := NewMem()
+	u := &User{Email: "Legacy.Mixed@Example.COM", Nickname: "legacy", Tag: "0001"}
+	if err := m.CreateUser(ctx, u); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	got, err := m.UserByEmail(ctx, "legacy.mixed@example.com")
+	if err != nil || got.ID != u.ID {
+		t.Fatalf("规范化邮箱应命中存量混合大小写行: %+v %v", got, err)
+	}
+	if err := m.CreateUser(ctx, &User{Email: "legacy.mixed@example.com", Nickname: "dup", Tag: "0002"}); err != ErrConflict {
+		t.Fatalf("大小写不同的同一邮箱应 ErrConflict，实际 %v", err)
+	}
+}
