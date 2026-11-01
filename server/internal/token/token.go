@@ -136,6 +136,19 @@ func ScopeAllows(ctx context.Context, name string) bool {
 	return p.HasScope(name)
 }
 
+// CanReadConversation 令牌主体能否读会话频道（私聊/群聊）内容（P1-6）。
+// 会话没有角色位可交，authz.CanInServer 的「ViewChannel ∩ scope 映射位」覆盖
+// 不到这条路径；这里按同一标准补上：scope 映射位并集含 ViewChannel 才放行
+// （messages.read / messages.write / voice.connect 过，guild.manage / admin.read /
+// attachments.write 等不含 View 的拒绝），与服务器频道的读口径一致。
+// 判定基于 ScopeLimitFromContext：JWT 与无 Principal（WS dev 令牌/测试直调）
+// 不受限恒 true；空 scope 令牌 limit=0 → false（fail-closed）。
+// REST 各读面与 WS 续传共用本函数，不要在调用处另写 scope 名字白名单。
+func CanReadConversation(ctx context.Context) bool {
+	limit, limited := ScopeLimitFromContext(ctx)
+	return !limited || limit&store.ViewChannel != 0
+}
+
 // TokenStore Service 依赖的最小存储面（*store.Mem / *store.MySQL / *store.SQLite 均满足）。
 type TokenStore interface {
 	APITokenByPrefix(ctx context.Context, prefix string) (*store.APIToken, error)

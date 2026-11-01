@@ -33,6 +33,10 @@ func (s *Server) ListMessages(ctx context.Context, request ListMessagesRequestOb
 			}
 			return nil, s.writeStoreErr(ctx, err)
 		}
+		// 成员判定之后补读 scope 门（P1-6）。
+		if e := requireConversationRead(ctx); e != nil {
+			return nil, e
+		}
 	} else if e := s.requireChannelPerm(ctx, ch, c.UserID, store.ViewChannel); e != nil {
 		return nil, e
 	}
@@ -99,6 +103,18 @@ func requireConversationScope(ctx context.Context, scopes ...string) *apiErr {
 		if token.ScopeAllows(ctx, sc) {
 			return nil
 		}
+	}
+	return errf(http.StatusForbidden, "forbidden", "权限不足")
+}
+
+// requireConversationRead 会话频道读内容的 scope 门（P1-6）。
+// P1-3 只给写路径加了门，读路径只查成员，guild.manage / admin.read 等不含
+// ViewChannel 的令牌曾能读私聊全文。口径与服务器频道读一致（scope 映射位含
+// ViewChannel），判定见 token.CanReadConversation；调用时机同
+// requireConversationScope：成员判定之后，非成员仍先 404 不泄露存在性。
+func requireConversationRead(ctx context.Context) *apiErr {
+	if token.CanReadConversation(ctx) {
+		return nil
 	}
 	return errf(http.StatusForbidden, "forbidden", "权限不足")
 }
@@ -357,6 +373,11 @@ func (s *Server) visibleChannelFor(ctx context.Context, channelID, uid int64) (*
 				return nil, errf(http.StatusNotFound, "not_found", "资源不存在")
 			}
 			return nil, s.writeStoreErr(ctx, err)
+		}
+		// 读 scope 门（P1-6）：GetMessage / MarkChannelRead / 编辑 / 删除 /
+		// mention-candidates 都经这里，一处补齐；写路径另有 messages.write 门。
+		if e := requireConversationRead(ctx); e != nil {
+			return nil, e
 		}
 		return ch, nil
 	}
