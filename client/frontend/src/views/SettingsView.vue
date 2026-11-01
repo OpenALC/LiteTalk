@@ -48,6 +48,15 @@ async function doLogout() {
 const HIB_LABELS = ['不休眠', '休眠界面', '彻底卸载（推荐省内存）'] as const
 const HIB_MODES = ['off', 'hibernate', 'destroy'] as const
 const hibMode = ref<'off' | 'hibernate' | 'destroy'>('off')
+// destroy 选项可用性：GTK4 构建（Linux 默认路径）在 wails beta.30 上销毁窗口
+// 泄漏 WebKitWebProcess（#5），Go 侧读路径已强降 hibernate 并报 false——
+// 这里据此裁掉该选项并明示一句，gtk3/Windows/macOS 构建不受影响。
+const hibDestroyAvailable = ref(true)
+const hibOptions = computed(() =>
+  HIB_LABELS.map((label, i) => ({ label, mode: HIB_MODES[i] })).filter(
+    (o) => hibDestroyAvailable.value || o.mode !== 'destroy',
+  ),
+)
 const closeToTray = ref(true)
 const caps = ref<AudioDeviceDTO[]>([])
 const plays = ref<AudioDeviceDTO[]>([])
@@ -164,6 +173,7 @@ function applyDenoiseIdx(i: number) {
 onMounted(async () => {
   version.value = await goApp().GetVersion()
   hibMode.value = (await goApp().GetHibernateMode()) as typeof hibMode.value
+  hibDestroyAvailable.value = await goApp().HibernateDestroyAvailable().catch(() => true)
   closeToTray.value = await goApp().GetCloseToTray()
   // 机密存储模式：先订阅（ServiceStartup 已推过也能兜到后续变化），再补拉当前值。
   cancelSecret = eventsOn('sys:secret', (d) => {
@@ -456,14 +466,18 @@ function bindRecording(spec: string) {
         <div class="s-row">
           <div class="k">最小化时</div>
           <div class="seg-mini">
-            <button v-for="(label, i) in HIB_LABELS" :key="HIB_MODES[i]"
-                    :class="{ on: hibMode === HIB_MODES[i] }"
-                    @click="setHibernateMode(HIB_MODES[i])">{{ label }}</button>
+            <button v-for="o in hibOptions" :key="o.mode"
+                    :class="{ on: hibMode === o.mode }"
+                    @click="setHibernateMode(o.mode)">{{ o.label }}</button>
           </div>
         </div>
         <!-- 休眠界面=卸载界面组件（webview 进程保留）；彻底卸载=销毁渲染进程。
-             两种模式都由托盘「显示主界面」唤醒，语音通话等后台不受影响。 -->
-        <p class="s-note">休眠界面保留 webview 进程（内存下降有限）；彻底卸载销毁渲染进程，唤醒时自动重建</p>
+             两种模式都由托盘「显示主界面」唤醒，语音通话等后台不受影响。
+             GTK4 构建下 destroy 被裁剪（上游窗口销毁泄漏，#5），换一句明示。 -->
+        <p v-if="hibDestroyAvailable" class="s-note">休眠界面保留 webview 进程（内存下降有限）；彻底卸载销毁渲染进程，唤醒时自动重建</p>
+        <p v-else class="s-note">
+          <CircleAlert :size="13" />彻底卸载暂不可用：销毁窗口有内存泄漏，已自动改用休眠界面
+        </p>
         <!-- 关闭窗口时：最小化到托盘（默认）/ 退出程序（问题 4b，用户可选） -->
         <div class="s-row">
           <div class="k">关闭窗口时</div>

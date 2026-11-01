@@ -733,6 +733,13 @@ func (a *App) ShowMainWindow() {
 // 前端监听 sys:hibernate / sys:wake 事件切换休眠态（见 stores/hibernate.ts）。
 func (a *App) GetHibernateMode() string { return a.cfg.HibernateMode() }
 
+// HibernateDestroyAvailable 当前构建是否允许 destroy 休眠模式：设置页据此
+// 裁剪「彻底卸载」选项。GTK4 构建（Linux 默认路径）在 Wails v3.0.0-beta.30
+// 上销毁/重建窗口会滞留 WebKitWebProcess（实测 20 轮 +348MiB/轮、7.4GiB，
+// 见 core/config 的 downgradeDestroyForGTK4），destroy 读路径已被强降为
+// hibernate，选项必须一并隐藏；gtk3 legacy 与 Windows/macOS 不变。
+func (a *App) HibernateDestroyAvailable() bool { return config.HibernateDestroyAvailable() }
+
 // SetHibernateMode 持久化休眠模式（校验 off/hibernate/destroy）。
 func (a *App) SetHibernateMode(mode string) error { return a.cfg.SetHibernateMode(mode) }
 
