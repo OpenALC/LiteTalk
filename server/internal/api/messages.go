@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/internal/token"
 )
 
 // ListMessages GET /api/v1/channels/{id}/messages?before=&after=&limit=（游标分页 50 条，#31）
@@ -86,6 +87,22 @@ func (s *Server) ListMessages(ctx context.Context, request ListMessagesRequestOb
 	return ListMessages200JSONResponse(views), nil
 }
 
+// requireConversationScope 会话频道（私聊/群聊）的 scope 门（P1-3）。
+// 会话没有角色位可交（成员即全权），scope 上限在 authz.CanInServer 的唯一交集点
+// 覆盖不到这条路径——messages.read 令牌曾因此在会话里写消息。调用时机：成员判定
+// 之后、落库之前；scopes 任一命中即过（JWT 主体经 token.ScopeAllows 恒过，行为
+// 不变）。服务器频道路径不走这里：它的同位判定已在 CanInServer 的 scope 交集
+// 生效（角色位 ∩ scope 位），两条路径要求的能力相同（如写 = messages.write），
+// 只是机制不同——服务器频道有角色位可交，会话只能按主体显式判定。
+func requireConversationScope(ctx context.Context, scopes ...string) *apiErr {
+	for _, sc := range scopes {
+		if token.ScopeAllows(ctx, sc) {
+			return nil
+		}
+	}
+	return errf(http.StatusForbidden, "forbidden", "权限不足")
+}
+
 // 消息发送频控：20 条/分钟/用户。
 const msgRateLimit = 20
 
@@ -140,12 +157,16 @@ func (s *Server) CreateMessage(ctx context.Context, request CreateMessageRequest
 	}
 	// VIEW+SEND 双门（#35 B3），且在 nonce 幂等回读之前——无权者连回显都拿不到。
 	// 会话频道（#38 B2）：成员同时拥有 View/Send，跳过服务器 authz；非成员 404。
+	// 成员判定之后补 scope 门（P1-3）：会话写入要求 messages.write。
 	if conversationScoped(ch) {
 		if _, err := s.store.ChannelMember(ctx, ch.ID, c.UserID); err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				return nil, errf(http.StatusNotFound, "not_found", "资源不存在")
 			}
 			return nil, s.writeStoreErr(ctx, err)
+		}
+		if e := requireConversationScope(ctx, token.ScopeMessagesWrite); e != nil {
+			return nil, e
 		}
 	} else {
 		if e := s.requireChannelPerm(ctx, ch, c.UserID, store.ViewChannel); e != nil {
@@ -402,6 +423,12 @@ func (s *Server) EditMessage(ctx context.Context, request EditMessageRequestObje
 	if e != nil {
 		return nil, e
 	}
+	// 会话分支补 scope 门（P1-3）：编辑自己的消息同样要求 messages.write。
+	if conversationScoped(ch) {
+		if e := requireConversationScope(ctx, token.ScopeMessagesWrite); e != nil {
+			return nil, e
+		}
+	}
 	msg, e := s.messageInChannel(ctx, ch, request.MessageId)
 	if e != nil {
 		return nil, e
@@ -494,6 +521,13 @@ func (s *Server) DeleteMessage(ctx context.Context, request DeleteMessageRequest
 	ch, e := s.visibleChannelFor(ctx, request.Id, c.UserID)
 	if e != nil {
 		return nil, e
+	}
+	// 会话分支补 scope 门（P1-3）：删除自己的消息同样要求 messages.write
+	// （会话没有管理员删除路径，门在作者判定之前等价覆盖）。
+	if conversationScoped(ch) {
+		if e := requireConversationScope(ctx, token.ScopeMessagesWrite); e != nil {
+			return nil, e
+		}
 	}
 	msg, e := s.messageInChannel(ctx, ch, request.MessageId)
 	if e != nil {
@@ -594,6 +628,11 @@ func (s *Server) ListMentionCandidates(ctx context.Context, request ListMentionC
 		return nil, e
 	}
 	if conversationScoped(ch) {
+		// 会话 compose 面的读口径（P1-3）：messages.read 或 messages.write 任一
+		// 即可拉候选——只有 messages.write 的令牌也要能在输入框组合 @ 提及。
+		if e := requireConversationScope(ctx, token.ScopeMessagesRead, token.ScopeMessagesWrite); e != nil {
+			return nil, e
+		}
 		members, err := s.store.ChannelMembers(ctx, ch.ID)
 		if err != nil {
 			return nil, s.writeStoreErr(ctx, err)

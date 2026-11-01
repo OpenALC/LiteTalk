@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/internal/token"
 )
 
 // #38 B2：私聊/群私聊 REST、成员管理与消息鉴权。
@@ -510,4 +511,72 @@ func TestConversationChangeEvents(t *testing.T) {
 	doJSON(t, w.h, http.MethodDelete, fmt.Sprintf("/api/v1/conversations/%d/members/%d", gid, w.carolID),
 		w.carol, nil, http.StatusNoContent)
 	wantConvEvent(t, hub, gid, "deleted", w.carolID)
+}
+
+// patFor 为既有用户直落一张 PAT（绕过 REST 签发口——P1-1 后管理面仅限 JWT，
+// 这里不走 REST 是为了显式控制 scope 组合）。
+func patFor(t *testing.T, mem *store.Mem, uid int64, scopes ...string) string {
+	t.Helper()
+	p, err := token.NewPlain(token.KindPAT)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.CreateAPIToken(context.Background(), &store.APIToken{
+		UserID: uid, Name: "scope 测试", Prefix: p.Prefix, SecretHash: p.Hash,
+		Kind: token.KindPAT, Scopes: strings.Join(scopes, " "),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return p.Token
+}
+
+// TestConversationMessagesRequireWriteScope 会话频道的 scope 门（P1-3）：
+// 会话成员判定不查服务器 authz，曾是 scope 的绕过点——messages.read 令牌在
+// 自己所在的私聊里 POST/PATCH/DELETE 一律 403，mention-candidates 按
+// messages.read 或 messages.write 放行（compose 场景）；messages.write 全通；
+// JWT 主体不受影响（其余会话用例即回归）。
+func TestConversationMessagesRequireWriteScope(t *testing.T) {
+	w := newConvWorld(t)
+	h := w.h
+
+	created := postJSON(t, h, "/api/v1/conversations", w.alice,
+		map[string]any{"kind": "direct", "user_ids": uidList(w.bobID)}, http.StatusCreated)
+	convID := asID(created["id"])
+	msgPath := fmt.Sprintf("/api/v1/channels/%d/messages", convID)
+	candPath := fmt.Sprintf("/api/v1/channels/%d/mention-candidates", convID)
+
+	ro := patFor(t, w.mem, w.aliceID, "messages.read")
+	rw := patFor(t, w.mem, w.aliceID, "messages.write")
+	vo := patFor(t, w.mem, w.aliceID, "voice.connect")
+
+	// JWT 发一条原文，供只读令牌尝试 PATCH/DELETE。
+	msgID := sendMsg(t, h, w.alice, convID, "原文")
+	msgIDPath := fmt.Sprintf("%s/%d", msgPath, msgID)
+
+	// messages.read：写三连全 403（探针场景——修前 POST 会 201 落库）。
+	if resp := postJSON(t, h, msgPath, ro, map[string]string{"content": "越权"}, http.StatusForbidden); resp["code"] != "forbidden" {
+		t.Fatalf("只读令牌会话发消息应 403，实际 %v", resp)
+	}
+	if resp := doJSON(t, h, http.MethodPatch, msgIDPath, ro, map[string]string{"content": "改"}, http.StatusForbidden); resp["code"] != "forbidden" {
+		t.Fatalf("只读令牌会话编辑应 403，实际 %v", resp)
+	}
+	if resp := delJSON(t, h, msgIDPath, ro, http.StatusForbidden); resp["code"] != "forbidden" {
+		t.Fatalf("只读令牌会话删除应 403，实际 %v", resp)
+	}
+	// 无读写 scope（voice.connect）的令牌同样 403，读候选也拒。
+	postJSON(t, h, msgPath, vo, map[string]string{"content": "越权"}, http.StatusForbidden)
+	getJSON(t, h, candPath, vo, http.StatusForbidden)
+
+	// compose 读面：messages.read 或 messages.write 任一即过。
+	getJSON(t, h, candPath, ro, http.StatusOK)
+
+	// messages.write：发/改/删全通；仅写令牌也能拉 @ 候选。
+	rwID := sendMsg(t, h, rw, convID, "受权发言")
+	doJSON(t, h, http.MethodPatch, fmt.Sprintf("%s/%d", msgPath, rwID), rw,
+		map[string]string{"content": "受权修改"}, http.StatusOK)
+	delJSON(t, h, fmt.Sprintf("%s/%d", msgPath, rwID), rw, http.StatusNoContent)
+	getJSON(t, h, candPath, rw, http.StatusOK)
+
+	// JWT 不受影响。
+	sendMsg(t, h, w.alice, convID, "JWT 照常")
 }

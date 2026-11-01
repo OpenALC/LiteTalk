@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/internal/token"
 	"github.com/OpenALC/LiteTalk/server/internal/webhook"
 )
 
@@ -713,6 +714,14 @@ func (h *Hub) replayChannelVisible(ctx context.Context, uid int64, idStr string)
 	state.serverID = ch.ServerID
 	if ch.Scope == store.ChannelScopeDirect || ch.Scope == store.ChannelScopeGroup {
 		state.conv = true
+		// 会话读的 scope 口径（P1-3）：服务器频道的续传复核经 CanInServer 做
+		// ViewChannel ∩ scope 交集；会话没有角色位可交，改按主体显式判定——
+		// messages.read / messages.write（写令牌的映射含 ViewChannel，与服务器
+		// 频道读口径一致）照常续传，其余 scope 扣留转全量补拉。JWT/dev 不受限。
+		if !token.ScopeAllows(ctx, token.ScopeMessagesRead) &&
+			!token.ScopeAllows(ctx, token.ScopeMessagesWrite) {
+			return state
+		}
 		if _, err := h.chatStore.ChannelMember(ctx, chID, uid); err == nil {
 			state.visible = true
 		}
