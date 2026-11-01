@@ -5,8 +5,10 @@ package api
 // 全设备离线才推（部分在线不推）、@提及/私聊/好友请求三条触发链的 api 侧接线。
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -130,6 +132,45 @@ func TestDeviceRegistrationIdempotent(t *testing.T) {
 		map[string]string{"platform": "windows", "push_token": "tok"}, http.StatusBadRequest)
 	postJSON(t, h, "/api/v1/devices", access,
 		map[string]string{"platform": "ios", "push_token": ""}, http.StatusBadRequest)
+}
+
+// TestDeviceLimitEvictsOldest 每用户设备上限：新增第 maxDevicesPerUser+1 台时
+// 淘汰最久未更新的那台，而不是拒绝注册；淘汰记一条日志。
+func TestDeviceLimitEvictsOldest(t *testing.T) {
+	srv, mem, _, _ := newTestServerWithPush(t)
+	var buf bytes.Buffer
+	srv.log = log.New(&buf, "", 0)
+	h := srv.Handler()
+	access, _ := registerUser(t, h, mem, "cap@ex.com", "deviceCap", "password123")
+
+	ids := make([]any, 0, maxDevicesPerUser+1)
+	for i := 0; i <= maxDevicesPerUser; i++ {
+		dev := postJSON(t, h, "/api/v1/devices", access,
+			map[string]string{"platform": "ios", "push_token": fmt.Sprintf("tok-cap-%040d", i)}, http.StatusCreated)
+		ids = append(ids, dev["id"])
+	}
+	list := getJSON(t, h, "/api/v1/devices", access, http.StatusOK).(map[string]any)
+	devs := list["devices"].([]any)
+	if len(devs) != maxDevicesPerUser {
+		t.Fatalf("设备数应裁到上限 %d，实际 %d", maxDevicesPerUser, len(devs))
+	}
+	has := func(id any) bool {
+		for _, it := range devs {
+			if it.(map[string]any)["id"] == id {
+				return true
+			}
+		}
+		return false
+	}
+	if has(ids[0]) {
+		t.Fatal("最久未更新的设备应被淘汰")
+	}
+	if !has(ids[len(ids)-1]) {
+		t.Fatal("最新注册的设备不应被淘汰")
+	}
+	if !strings.Contains(buf.String(), "淘汰最久未更新设备") {
+		t.Fatalf("超出上限应记一条淘汰日志，实际: %q", buf.String())
+	}
 }
 
 // TestDeviceDeleteOwnershipOnlyMine 删他人设备 404（与不存在同响应）；
