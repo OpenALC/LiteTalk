@@ -388,6 +388,53 @@ func TestOIDCStatesConcurrentReplay(t *testing.T) {
 	}
 }
 
+// TestOIDCExchangeTimeout token 端点挂住时 Exchange 必须在超时内返回错误而不是
+// 永久阻塞（PR118 P2-4）：x/oauth2 的 Exchange 缺省退回 http.DefaultClient（无超时），
+// 修法是把 provider 的带超时 client 注入 ctx 并套同值 deadline。生产 client 超时
+// 10s，这里注入 250ms 短超时同步缩短整条链路（ctx deadline 取 p.http.Timeout），
+// 断言秒级内以 ErrOIDCUpstream 失败——无超时的旧实现会阻塞到测试超时。
+func TestOIDCExchangeTimeout(t *testing.T) {
+	hang := make(chan struct{}) // 关闭后挂住的 handler 才返回，让 srv.Close 不卡
+	var issuer string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"issuer":                 issuer,
+			"authorization_endpoint": issuer + "/authorize",
+			"token_endpoint":         issuer + "/token",
+			"jwks_uri":               issuer + "/jwks.json",
+		})
+	})
+	mux.HandleFunc("/token", func(http.ResponseWriter, *http.Request) {
+		<-hang // 模拟 IdP token 端点无响应
+	})
+	srv := httptest.NewServer(mux)
+	defer func() {
+		close(hang)
+		srv.Close()
+	}()
+	issuer = srv.URL
+
+	p := NewOIDCProvider(OIDCConfig{
+		Issuer: srv.URL, ClientID: "c", ClientSecret: "s", RedirectURL: "https://app.test/cb",
+	}, nil)
+	p.http = &http.Client{Timeout: 250 * time.Millisecond}
+
+	start := time.Now()
+	_, err := p.Exchange(context.Background(), "code", "verifier", "nonce")
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("token 端点挂住时 Exchange 应返回错误")
+	}
+	if !errors.Is(err, ErrOIDCUpstream) {
+		t.Fatalf("err = %v, want ErrOIDCUpstream", err)
+	}
+	// 超时 250ms + 调度余量；永久阻塞的旧实现到不了这里的断言。
+	if elapsed > 3*time.Second {
+		t.Fatalf("Exchange %v 才返回，未在超时内失败", elapsed)
+	}
+}
+
 func mustVerifier(t *testing.T) string {
 	t.Helper()
 	v, _, err := NewOIDCPKCE()

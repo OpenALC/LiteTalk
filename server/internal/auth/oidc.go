@@ -186,11 +186,25 @@ func (p *OIDCProvider) AuthorizeURL(ctx context.Context, state, codeVerifier, no
 
 // Exchange 授权码换令牌并校验 ID Token。nonce 必须与发起授权时一致
 // （正常流程恒非空；空 nonce 仅兼容没有存 nonce 的历史 state）。
+//
+// 超时（PR118 P2-4）：x/oauth2 的 Exchange 不看 provider 的 client 配置，缺省退回
+// http.DefaultClient（无超时）——IdP token 端点挂住时，回调 handler 的 goroutine
+// 被永久占用。修法双层：把与 discovery/JWKS 同一条带超时的 client 注入 ctx，再给
+// 整次交换（含 id_token 校验的 JWKS 拉取）套同值 deadline，client 超时与 ctx 截止
+// 先到者生效。deadline 取 p.http.Timeout（测试注入短超时 client 时整条链路同步
+// 缩短）；client 未设超时（异常构造）回落 oidcHTTPTimeout，保证恒有界。
 func (p *OIDCProvider) Exchange(ctx context.Context, code, verifier, nonce string) (*OIDCClaims, error) {
 	d, err := p.endpoints(ctx)
 	if err != nil {
 		return nil, err
 	}
+	ctx = context.WithValue(ctx, oauth2.HTTPClient, p.http)
+	timeout := p.http.Timeout
+	if timeout <= 0 {
+		timeout = oidcHTTPTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	tok, err := p.oauthConf(d).Exchange(ctx, code, oauth2.VerifierOption(verifier))
 	if err != nil {
 		var re *oauth2.RetrieveError
