@@ -93,6 +93,10 @@ func TestBrokerDirectAndFriendRequest(t *testing.T) {
 	if rec.Notif.Route != "conversation:55" {
 		t.Fatalf("私聊 route 不符: %q", rec.Notif.Route)
 	}
+	// 标题口径与群/频道推送一致：发送者昵称（空标题在锁屏上无法区分来源）。
+	if rec.Notif.Title != "私聊发送者" {
+		t.Fatalf("私聊推送标题应为发送者昵称，实际 %q", rec.Notif.Title)
+	}
 	// 好友请求：100 → 300。
 	b.NotifyFriendRequest(ctx, 300, 100, "请求者")
 	waitForPush(t, pusher, 2)

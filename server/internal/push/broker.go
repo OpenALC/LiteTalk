@@ -136,7 +136,8 @@ func (b *Broker) NotifyMessage(ctx context.Context, ch *store.Channel, msg *stor
 	if ch.Scope == store.ChannelScopeDirect {
 		// 私聊：接收者是对端成员，worker 里反查（发送路径零额外查询）。
 		b.enqueue(task{kind: "direct", actor: strconv.FormatInt(msg.UserID, 10),
-			route: "conversation:" + strconv.FormatInt(ch.ID, 10), channelID: ch.ID})
+			actorNick: senderNick,
+			route:     "conversation:" + strconv.FormatInt(ch.ID, 10), channelID: ch.ID})
 		return
 	}
 	if len(msg.Mentions) == 0 {
