@@ -406,6 +406,19 @@ export const webApp: GoApp = {
     await apiPost('/auth/password/reset', { email, code, password: newPassword }, { auth: false })
   },
 
+  // OIDC 登录（#118 P2-5）：authorize 换 IdP 授权页 URL（当前窗口跳转由调用方
+  // 做）；callback 用 code+state 换与本地登录同构的令牌对——state/PKCE 都在
+  // 服务端，前端只搬运参数，令牌装配与信令启动复用登录三入口同一条路径。
+  async OidcAuthorize(): Promise<string> {
+    const r = await apiPost<{ url: string }>('/auth/oidc/authorize', {}, { auth: false })
+    return r.url
+  },
+
+  async OidcExchange(code: string, state: string): Promise<AuthResult> {
+    const r = await apiPost<TokenPairResponse>('/auth/oidc/callback', { code, state }, { auth: false })
+    return startSessionWithTokens(r.access_token, r.refresh_token, r.user)
+  },
+
   async Logout(): Promise<void> {
     // 离线登出语义（#14）：吊销请求失败不阻断本地清理。
     try {

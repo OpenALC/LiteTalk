@@ -597,10 +597,13 @@ func retryAfterFromHeader(h http.Header) int {
 
 // ServerConfig 服务端能力开关（GET /api/v1/config，免鉴权）。
 type ServerConfig struct {
-	AuthMode          string `json:"auth_mode"`          // full | simple
+	AuthMode          string `json:"auth_mode"`          // full | simple | oidc（oidc=仅 OIDC 登录，密码入口关闭）
 	MailConfigured    bool   `json:"mail_configured"`    // 发信是否为真实投递
 	SelfHost          bool   `json:"self_host"`          // 一键自托管形态（#26/#27）
 	BootstrapRequired bool   `json:"bootstrap_required"` // 管理员邀请码未消费（#27）
+	// OidcEnabled OIDC 登录已配置完整（#54；false 时 /auth/oidc/* 一律 404，
+	// 前端据此隐藏 OIDC 按钮）。服务端 omitempty 下发，缺省即 false。
+	OidcEnabled bool `json:"oidc_enabled,omitempty"`
 }
 
 // GetServerConfig 获取服务端 Auth 模式与发信配置（客户端适配 UI 用）。

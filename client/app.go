@@ -1053,6 +1053,31 @@ func (a *App) ResetPassword(email, code, newPassword string) error {
 	return a.api.ResetPassword(email, code, newPassword)
 }
 
+// OidcAuthorize 发起 OIDC 登录（#118 P2-5）：REST 换授权 URL 后用系统浏览器
+// 打开（同 OpenAttachment 的 OpenURL 口径，仅放行 http/https）。返回 URL 供
+// 前端展示兜底。code/state 的令牌交换不经桌面端：IdP 重定向到部署配置的
+// redirect_url，会话落在服务端托管的 Web 客户端里——桌面深度链接回跳留后续任务。
+func (a *App) OidcAuthorize() (string, error) {
+	u, err := a.api.OidcAuthorize(context.Background())
+	if err != nil {
+		return "", err
+	}
+	parsed, perr := url.Parse(strings.TrimSpace(u))
+	if perr != nil || parsed.Host == "" {
+		return "", fmt.Errorf("授权地址无效")
+	}
+	if !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
+		return "", fmt.Errorf("仅支持打开 http/https 授权地址")
+	}
+	if a.wails == nil {
+		return "", fmt.Errorf("浏览器不可用：桌面环境未就绪")
+	}
+	if err := a.wails.Browser.OpenURL(parsed.String()); err != nil {
+		return "", err
+	}
+	return parsed.String(), nil
+}
+
 // Logout 注销：断信令、吊销 refresh，清空本地用户档案。
 func (a *App) Logout() error {
 	a.loginGen.Add(1) // 使进行中的信令重试循环退出
