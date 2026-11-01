@@ -19,6 +19,7 @@ import (
 // 的唯一性在 SQLite 上是二进制比较，Mem 的 EqualFold 语义会掩盖这里的缺陷。
 func newSQLiteTestServer(t *testing.T) (*Server, *store.SQLite) {
 	t.Helper()
+	t.Setenv("LITETALK_SQLITE_PATH", "") // 避免环境变量覆盖 TempDir 路径
 	sq, err := store.OpenSQLite(filepath.Join(t.TempDir(), "api-email-case.db"))
 	if err != nil {
 		t.Fatalf("OpenSQLite: %v", err)
