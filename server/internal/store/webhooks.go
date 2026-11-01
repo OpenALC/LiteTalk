@@ -16,9 +16,12 @@ import (
 // 路径都不得回传。Events 为空格分隔的事件白名单子集（校验在 internal/webhook）。
 // Disabled/DisabledReason/FailCount 是熔断状态：连续失败达阈值由
 // RecordWebhookDelivery 原子置位，手动重新启用时由 API 层清零。
-// CreatorID 是创建订阅的用户（迁移 0022，P1-5）：投递侧按其当前频道可见性收窄；
-// 仅创建时写入、之后不可变（PATCH/熔断不改），0 = 旧行（NULL 列，0022 回填因
-// 服务器已删落空）——投递时按服务器 owner 代持判定，见 internal/webhook。
+// CreatorID 是控制投递去向的用户（迁移 0022，P1-5）：投递侧按其当前频道可见性收窄。
+// 创建时写入创建者；PATCH 改 url 时改绑为改址者（P1-8，内容流向谁的地址就按谁的
+// 可见性收窄，否则 ManageServer 管理者可借他人订阅收到自己看不到的频道）。
+// events/enabled/reset_secret 不改变投递去向、不改绑；熔断状态推进也不改。
+// 0 = 旧行（NULL 列，0022 回填因服务器已删落空）——投递时按服务器 owner 代持判定，
+// 见 internal/webhook。
 type OutboundWebhook struct {
 	ID             int64
 	ServerID       int64
@@ -131,13 +134,19 @@ func dbHasOutboundWebhooks(ctx context.Context, q sqlExecer) (bool, error) {
 	return true, nil
 }
 
-// dbUpdateOutboundWebhook 全行写（url/secret/events/熔断状态）；调用方读-改-写，
-// 不动 created_at/server_id。未命中 ErrNotFound。
+// dbUpdateOutboundWebhook 全行写（url/secret/events/熔断状态/creator_id）；调用方
+// 读-改-写，不动 created_at/server_id。未命中 ErrNotFound。
+// url 与 creator_id 必须落在同一条 UPDATE（P1-8）：拆成两条语句会出现「新 url 配
+// 旧创建者」的中间态——投递按旧创建者的可见性放行，正是改址越权要堵的窗口。
+// 读-改-写之间的并发 PATCH 以后写者为准，但每次写入的 (url, creator_id) 都来自同一
+// 次读取加上同一次改绑判定，不会写出从未存在过的组合。
+// 熔断计数走 dbRecordWebhookDelivery 的独立 UPDATE，只动 fail_count/disabled*，
+// 不会回写这里读到的旧 creator_id。
 func dbUpdateOutboundWebhook(ctx context.Context, q sqlExecer, w *OutboundWebhook) error {
 	w.UpdatedAt = time.Now()
 	res, err := q.ExecContext(ctx,
-		`UPDATE webhooks SET url = ?, secret = ?, events = ?, disabled = ?, disabled_reason = ?, fail_count = ?, updated_at = ? WHERE id = ?`,
-		w.URL, w.Secret, w.Events, w.Disabled, w.DisabledReason, w.FailCount, w.UpdatedAt, w.ID)
+		`UPDATE webhooks SET url = ?, secret = ?, events = ?, disabled = ?, disabled_reason = ?, fail_count = ?, creator_id = ?, updated_at = ? WHERE id = ?`,
+		w.URL, w.Secret, w.Events, w.Disabled, w.DisabledReason, w.FailCount, w.CreatorID, w.UpdatedAt, w.ID)
 	if err != nil {
 		return err
 	}
