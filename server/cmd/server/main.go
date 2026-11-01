@@ -297,41 +297,18 @@ func main() {
 		// 权限检查经 authCtx 汇聚到 authz.CanInServer 的 scope 交集点。与 REST
 		// 中间件、握手 authenticator 是同一个 token.Service 实例。
 		Tokens: apiTokenSvc,
+		// 令牌会话复查（PR118 P2-2）：PAT/bot 连接心跳时按 tokenID 复查吊销/过期，
+		// 失效即断连（60s 节流，见 signal.hub）。复用同一 store 的只读点查。
+		SessionChecks: apitokenSessionChecker{st: st},
 	})
 	// LITETALK_PROTOCOL_MAX：服务端宣布的协议版本上限（#29 逃生阀）。
 	// 0/缺省 = 构建期 ProtocolVersionMax；调小可临时挡住过新的客户端区间。
 	hub.SetProtoMax(envInt("LITETALK_PROTOCOL_MAX", 0))
 
-	// TURN 短期凭证签发（coturn use-auth-secret，§5.4）。api_token（#54）同样受理：
-	// 凭证只含 uid 身份（scope 不参与），入房权限由 channel.join 的 authz 判定把关。
-	var rtcAuth rtcapi.UserFromToken
-	if devAuth {
-		rtcAuth = func(t string) (string, error) {
-			if !strings.HasPrefix(t, token.PlainPrefix) {
-				if claims, err := jwtSigner.ParseAccess(t); err == nil {
-					return strconv.FormatInt(claims.UserID, 10), nil
-				}
-			} else if p, err := apiTokenSvc.Verify(context.Background(), t); err == nil {
-				return strconv.FormatInt(p.UserID, 10), nil
-			}
-			return devUserID(t)
-		}
-	} else {
-		rtcAuth = func(t string) (string, error) {
-			if strings.HasPrefix(t, token.PlainPrefix) {
-				p, err := apiTokenSvc.Verify(context.Background(), t)
-				if err != nil {
-					return "", err
-				}
-				return strconv.FormatInt(p.UserID, 10), nil
-			}
-			claims, err := jwtSigner.ParseAccess(t)
-			if err != nil {
-				return "", err
-			}
-			return strconv.FormatInt(claims.UserID, 10), nil
-		}
-	}
+	// TURN 短期凭证签发（coturn use-auth-secret，§5.4）。api_token（#54）同样受理，
+	// 但令牌主体必须显式携带 voice.connect scope（PR118 P2-3）；JWT 主体不变
+	// （角色权限由 channel.join 的 authz 判定把关）。
+	rtcAuth := newRTCAuth(jwtSigner, apiTokenSvc, devAuth)
 	// TURN 短期凭证签发 URLs（§0.4）：显式 env 优先；未设且内置 TURN 启用则按
 	// host（LITETALK_DOMAIN，否则 LITETALK_SFU_IP）回填。生产模式在内置 TURN
 	// 关闭且未配置外部 TURN 时不再回落 loopback（#13 P2），见 resolveCredentialURLs。
@@ -719,6 +696,74 @@ func apiTokenIdentity(svc *token.Service, plain string) (id signal.Identity, han
 		Username:         p.Nickname,
 		SkipSessionCheck: true,
 	}, true, nil
+}
+
+// newRTCAuth TURN 凭证签发的鉴权闭包（§5.4；PR118 P2-3）：JWT 主体原样放行
+// （入房权限由 authz 判定）；令牌主体（Kind != jwt）必须 HasScope("voice.connect")
+// 才签发 12h 中继凭证，否则返回 rtcapi.ErrScopeForbidden——api/rtc.go 据此回 403
+// scope_forbidden，与「凭据无效」的 401 分开。dev 兜底（dev- 令牌映射 uid）保持
+// 原口径：非 ltk_ 令牌两类解析都失败时走 devUserID。
+func newRTCAuth(jwtSigner *auth.JWT, apiTokenSvc *token.Service, dev bool) rtcapi.UserFromToken {
+	if dev {
+		return func(t string) (string, error) {
+			if !strings.HasPrefix(t, token.PlainPrefix) {
+				if claims, err := jwtSigner.ParseAccess(t); err == nil {
+					return strconv.FormatInt(claims.UserID, 10), nil
+				}
+			} else if p, err := apiTokenSvc.Verify(context.Background(), t); err == nil {
+				if !p.HasScope(token.ScopeVoiceConnect) {
+					return "", rtcapi.ErrScopeForbidden
+				}
+				return strconv.FormatInt(p.UserID, 10), nil
+			}
+			return devUserID(t)
+		}
+	}
+	return func(t string) (string, error) {
+		if strings.HasPrefix(t, token.PlainPrefix) {
+			p, err := apiTokenSvc.Verify(context.Background(), t)
+			if err != nil {
+				return "", err
+			}
+			if !p.HasScope(token.ScopeVoiceConnect) {
+				return "", rtcapi.ErrScopeForbidden
+			}
+			return strconv.FormatInt(p.UserID, 10), nil
+		}
+		claims, err := jwtSigner.ParseAccess(t)
+		if err != nil {
+			return "", err
+		}
+		return strconv.FormatInt(claims.UserID, 10), nil
+	}
+}
+
+// apitokenSessionChecker 把 store 的令牌行只读查询适配成 hub 的
+// signal.TokenSessionChecker（PR118 P2-2）：WS 心跳按 tokenID 复查令牌吊销/过期，
+// 泄漏的 PAT/bot 凭据吊销后不再长期持有连接。只判 revoked_at/expires_at——属主
+// 停用等其余失效路径仍由握手 Verify 与 REST 实时校验兜底，复查不做重复判定。
+type apitokenSessionChecker struct {
+	st store.Store
+}
+
+// SessionValid 满足 signal.TokenSessionChecker。行已删（并发删除窗口）按失效处理；
+// 查询故障原样上抛，由 hub 侧 fail-open（心跳复查不断在线会话）。
+func (c apitokenSessionChecker) SessionValid(ctx context.Context, tokenID int64) (bool, error) {
+	row, err := c.st.APITokenByID(ctx, tokenID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	now := time.Now()
+	if row.RevokedAt != nil && !now.Before(*row.RevokedAt) {
+		return false, nil
+	}
+	if row.ExpiresAt != nil && !now.Before(*row.ExpiresAt) {
+		return false, nil
+	}
+	return true, nil
 }
 
 // ---- 环境变量小工具 ----
