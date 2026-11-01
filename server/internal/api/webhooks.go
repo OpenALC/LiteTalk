@@ -222,12 +222,28 @@ func (s *Server) PatchServerWebhook(ctx context.Context, request PatchServerWebh
 		// 归属不符与不存在同响应：不泄露跨服资源存在性。
 		return nil, errf(http.StatusNotFound, "not_found", "资源不存在")
 	}
+	// 改址改绑（P1-8）：投递按订阅创建者的可见性收窄，而 ManageServer 允许改任意
+	// 订阅的 url——不改绑的话，看不到私有频道的管理者可以把他人订阅改到自己的地址，
+	// 借他人的可见性收到私有频道全文。内容流向谁的地址就按谁的可见性收窄：改绑为
+	// 改址者，并过与创建相同的可见性门（否则改绑成对所有频道都不可见的账号会让订阅
+	// 永久空转）。改绑后即便可见面变宽，也是改址者自己账号的实时可见性，且留审计。
+	// 只在 url 真的变化时改绑：值未变的重发（自动化回放完整对象）不改变投递去向；
+	// events/enabled/reset_secret 同样不改绑——reset_secret 由其他管理者执行时只会
+	// 影响原接收端的验签，不泄露内容。
 	secretOut := ""
+	urlChanged := body.Url.Set && body.Url.Val != w.URL
 	if body.Url.Set {
 		if e := s.checkWebhookURL(ctx, body.Url.Val); e != nil {
 			return nil, e
 		}
 		w.URL = body.Url.Val
+	}
+	oldCreatorID := w.CreatorID
+	if urlChanged {
+		if e := s.requireAnyChannelView(ctx, request.Id, c.UserID); e != nil {
+			return nil, e
+		}
+		w.CreatorID = c.UserID
 	}
 	if body.Events.Set {
 		if body.Events.Null || !webhook.ValidEvents(body.Events.Val) {
@@ -257,6 +273,16 @@ func (s *Server) PatchServerWebhook(ctx context.Context, request PatchServerWebh
 	}
 	if err := s.store.UpdateOutboundWebhook(ctx, w); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
+	}
+	if urlChanged {
+		// 只记控制投递去向的账号变更；url 与 secret 是敏感凭证，一律不落审计。
+		s.audit(ctx, store.AuditLog{
+			ServerID: request.Id, ActorID: c.UserID, Action: "webhook.update_url",
+			TargetType: "webhook", TargetID: ptrID(w.ID),
+			Detail: auditDetail(map[string]any{
+				"old_creator_id": idOf(oldCreatorID), "new_creator_id": idOf(w.CreatorID),
+			}),
+		})
 	}
 	if secretOut != "" {
 		s.audit(ctx, store.AuditLog{
@@ -508,9 +534,9 @@ func (s *Server) DeliverInboundWebhook(ctx context.Context, request DeliverInbou
 
 // ---- 辅助 ----
 
-// requireAnyChannelView 创建出站订阅的前置门（P1-5）：创建者对服务器内**至少一个**
-// 频道有 ViewChannel，否则订阅对所有频道维度事件（message.created 等）都会被投递侧
-// 的创建者可见性闸拦下、永远空转，创建即 403。
+// requireAnyChannelView 出站订阅的可见性门：创建（P1-5）与改址改绑（P1-8）共用。
+// 调用者对服务器内**至少一个**频道有 ViewChannel，否则订阅对所有频道维度事件
+// （message.created 等）都会被投递侧的创建者可见性闸拦下、永远空转，创建/改址即 403。
 // 口径与投递过滤一致走纯角色判定（RoleCanInServer，不做 scope 交集）：订阅按创建者
 // **账号**的实时角色可见性收窄，PAT/bot 令牌的 scope 只限制令牌主体自身的 API 能力，
 // 不改变其账号的频道可见性；若这里用 scope 交集，持有 ManageServer scope 而无
@@ -532,7 +558,7 @@ func (s *Server) requireAnyChannelView(ctx context.Context, serverID, userID int
 			return nil
 		}
 	}
-	return errf(http.StatusForbidden, "forbidden", "创建者对服务器内所有频道均无查看权限，无法创建出站订阅")
+	return errf(http.StatusForbidden, "forbidden", "调用者对服务器内所有频道均无查看权限，无法创建或改址出站订阅")
 }
 
 // inboundChannel 入站管理的频道门：频道存在（404）、服务器作用域且为文字频道

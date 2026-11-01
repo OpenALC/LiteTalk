@@ -564,3 +564,341 @@ func TestOutboundWebhookCreateRequiresVisibleChannel(t *testing.T) {
 		t.Fatalf("owner 的 creator_id 应为 %d，实际 %d", uidA, rowOwner.CreatorID)
 	}
 }
+
+// ---- P1-8：改址改绑创建者 ----
+// 投递按订阅创建者的频道可见性收窄（P1-5），但 PATCH 改 url 若不改绑创建者，
+// 持 ManageServer 而看不到私有频道的管理者就能把服主的订阅改到自己的地址，
+// 借服主的可见性收到私有频道全文。
+
+// p18Marker 机密频道消息里的哨兵串：出现在无权接收端即证明全文泄漏。
+const p18Marker = "TOP-SECRET-P18"
+
+// rebindFixture 审查场景：服主 O 看得见全部频道；管理者 M 持 ManageServer，但对
+// #secret 有成员级 deny ViewChannel。投递器与 API 共享同一个 authz（与生产装配
+// 同构），权限数据改动后失效一次快照即对两侧生效。
+type rebindFixture struct {
+	h        http.Handler
+	mem      *store.Mem
+	az       *authz.Authorizer
+	disp     *webhook.Dispatcher
+	serverID int64
+	pubID    int64 // M 可见
+	secretID int64 // 对 M deny ViewChannel
+	accO     string
+	accM     string
+	uidO     int64
+	uidM     int64
+}
+
+func newRebindFixture(t *testing.T) *rebindFixture {
+	t.Helper()
+	mem := store.NewMem()
+	az := authz.New(mem, authz.Options{})
+	disp := webhook.New(webhook.Config{CheckURL: func(string) error { return nil }, Visibility: az}, mem)
+	disp.Start(nil)
+	t.Cleanup(disp.Close)
+	srv := New(Config{
+		Store:           mem,
+		JWT:             auth.NewJWT("test-secret"),
+		Refresh:         auth.NewRefreshStore(mem),
+		Codes:           auth.NewEmailCodes(mem),
+		Limits:          auth.NewRateLimit(mem),
+		Session:         auth.NewSessionIndex(mem, mem),
+		Presence:        mem,
+		Authz:           az,
+		Webhooks:        disp,
+		WebhookURLCheck: func(string) error { return nil },
+	})
+	h := srv.Handler()
+	ctx := context.Background()
+
+	accO, serverID, pubID := mkServerChannel(t, h, mem, "p18-o@ex.com", "p18O")
+	secretID := asID(postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/channels", serverID), accO,
+		map[string]any{"name": "secret", "type": "text"}, http.StatusCreated)["id"])
+	accM, _ := registerUser(t, h, mem, "p18-m@ex.com", "p18M", "password123")
+	inv := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/invites", serverID), accO,
+		map[string]any{"max_uses": 5}, http.StatusCreated)
+	postJSON(t, h, "/api/v1/servers/join", accM, map[string]string{"code": inv["code"].(string)}, http.StatusOK)
+	uidO := asID(getJSON(t, h, "/api/v1/users/me", accO, http.StatusOK).(map[string]any)["id"])
+	uidM := asID(getJSON(t, h, "/api/v1/users/me", accM, http.StatusOK).(map[string]any)["id"])
+
+	role := &store.Role{ServerID: serverID, Name: "mgr", Permissions: store.ManageServer}
+	if err := mem.CreateRole(ctx, role); err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.SetMemberRoles(ctx, serverID, uidM, []int64{role.ID}, 0); err != nil {
+		t.Fatal(err)
+	}
+	f := &rebindFixture{
+		h: h, mem: mem, az: az, disp: disp, serverID: serverID,
+		pubID: pubID, secretID: secretID, accO: accO, accM: accM, uidO: uidO, uidM: uidM,
+	}
+	f.setViewDeny(t, secretID, true)
+	return f
+}
+
+// setViewDeny 给 M 装/撤指定频道的成员级 deny ViewChannel 覆盖，并失效快照。
+func (f *rebindFixture) setViewDeny(t *testing.T, channelID int64, deny bool) {
+	t.Helper()
+	ctx := context.Background()
+	if deny {
+		if err := f.mem.SetChannelOverwrite(ctx, &store.ChannelOverwrite{
+			ChannelID: channelID, TargetType: store.OverwriteTargetMember, TargetID: f.uidM,
+			Deny: store.ViewChannel,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	} else if err := f.mem.DeleteChannelOverwrite(ctx, channelID, store.OverwriteTargetMember, f.uidM); err != nil {
+		t.Fatal(err)
+	}
+	f.az.InvalidateServer(f.serverID)
+}
+
+func (f *rebindFixture) hookPath(hookID int64) string {
+	return fmt.Sprintf("/api/v1/servers/%d/webhooks/%d", f.serverID, hookID)
+}
+
+// createHook 以 acc 的身份经 REST 建 message.created 订阅，返回 (订阅 id, 一次性 secret)。
+func (f *rebindFixture) createHook(t *testing.T, acc, url string) (int64, string) {
+	t.Helper()
+	created := postJSON(t, f.h, fmt.Sprintf("/api/v1/servers/%d/webhooks", f.serverID), acc,
+		map[string]any{"url": url, "events": []string{"message.created"}}, http.StatusCreated)
+	return asID(created["id"]), created["secret"].(string)
+}
+
+func (f *rebindFixture) row(t *testing.T, hookID int64) *store.OutboundWebhook {
+	t.Helper()
+	row, err := f.mem.OutboundWebhookByID(context.Background(), hookID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return row
+}
+
+// fire 模拟 hub 的出站出口：对频道推一条 message.created（唯一入口，REST 发消息的
+// 管线同样经 hub.AfterMessagePersisted 汇入这里；api 测试里 hub 为 nil，直呼出口）。
+func (f *rebindFixture) fire(channelID int64, content string) {
+	ch := strconv.FormatInt(channelID, 10)
+	payload, _ := json.Marshal(map[string]string{"channel_id": ch, "content": content})
+	f.disp.OnWebhookEvent(webhook.EventMessageCreated, ch, payload)
+}
+
+// hits 目标已收到的投递条数。
+func (t *hookTarget) hits() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.bodies)
+}
+
+// snapshot 目标已收到的全部投递体（拷贝）。
+func (t *hookTarget) snapshot() [][]byte {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([][]byte(nil), t.bodies...)
+}
+
+// waitHits 等目标累计收到 n 条投递。金丝雀栅栏的等待端：同服订阅按 id 升序在同一个
+// worker 里串行投递，id 更大的金丝雀收到事件，即说明 id 更小的目标订阅对该事件的
+// 放行/跳过判定已经落定，可以确定性地断言「没收到」，不靠 sleep。
+func waitHits(t *testing.T, target *hookTarget, n int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for target.hits() < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("等待 %d 条投递超时（实收 %d）", n, target.hits())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// deliveredChannels 投递体里的 channel_id 列表（按到达顺序）。
+func deliveredChannels(t *testing.T, bodies [][]byte) []string {
+	t.Helper()
+	out := make([]string, 0, len(bodies))
+	for _, b := range bodies {
+		var env struct {
+			ChannelID string `json:"channel_id"`
+		}
+		if err := json.Unmarshal(b, &env); err != nil {
+			t.Fatalf("投递体不是合法 JSON: %v", err)
+		}
+		out = append(out, env.ChannelID)
+	}
+	return out
+}
+
+// TestWebhookPatchURLRebindsCreator 审查场景主线：M 把服主订阅的 url 改到自己的
+// 地址后，订阅按 M 的可见性收窄——#secret 的消息不再投到 M 的地址，M 可见的
+// 频道照常投递，原地址不再收到。
+func TestWebhookPatchURLRebindsCreator(t *testing.T) {
+	f := newRebindFixture(t)
+	oT, mT, cT := &hookTarget{}, &hookTarget{}, &hookTarget{}
+	oSrv := httptest.NewServer(oT.handler())
+	defer oSrv.Close()
+	mSrv := httptest.NewServer(mT.handler())
+	defer mSrv.Close()
+	cSrv := httptest.NewServer(cT.handler())
+	defer cSrv.Close()
+
+	// O 建目标订阅，再建金丝雀（id 更大 ⇒ 同一次 process 里排在后面）。
+	hookID, _ := f.createHook(t, f.accO, oSrv.URL)
+	canaryID, _ := f.createHook(t, f.accO, cSrv.URL)
+
+	// M 把 O 的订阅改到自己的地址：ManageServer 允许，且 M 对 #general 可见 ⇒ 过门。
+	patched := patchJSON(t, f.h, f.hookPath(hookID), f.accM, map[string]any{"url": mSrv.URL}, http.StatusOK)
+	if patched["url"] != mSrv.URL {
+		t.Fatalf("PATCH 响应应带新 url，实际 %v", patched["url"])
+	}
+
+	f.fire(f.secretID, p18Marker+" 机密内容")
+	f.fire(f.pubID, "公开内容")
+	waitHits(t, cT, 2) // 金丝雀栅栏：此刻目标订阅对两条事件的判定都已落定
+
+	got := mT.snapshot()
+	for _, b := range got {
+		if strings.Contains(string(b), p18Marker) {
+			t.Fatalf("机密频道消息全文泄漏到管理者 M 的地址: %s", b)
+		}
+	}
+	if chs := deliveredChannels(t, got); len(chs) != 1 || chs[0] != strconv.FormatInt(f.pubID, 10) {
+		t.Fatalf("M 的地址应只收到其可见频道 %d 的 1 条，实际 %v", f.pubID, chs)
+	}
+	if n := oT.hits(); n != 0 {
+		t.Fatalf("改址后原地址不应再收到投递，实际 %d", n)
+	}
+	// 内部状态：创建者改绑为改址者；未改址的金丝雀保持 O。
+	if row := f.row(t, hookID); row.CreatorID != f.uidM {
+		t.Errorf("改址后 creator_id 应改绑为 M(%d)，实际 %d", f.uidM, row.CreatorID)
+	}
+	if row := f.row(t, canaryID); row.CreatorID != f.uidO {
+		t.Errorf("未改址的订阅 creator_id 应保持 O(%d)，实际 %d", f.uidO, row.CreatorID)
+	}
+}
+
+// TestWebhookPatchURLByCreatorKeepsDelivery 创建者自己改址：改绑到自己等于不变，
+// 对其可见的私有频道仍然投递，且只投新地址。
+func TestWebhookPatchURLByCreatorKeepsDelivery(t *testing.T) {
+	f := newRebindFixture(t)
+	oldT, newT := &hookTarget{}, &hookTarget{}
+	oldSrv := httptest.NewServer(oldT.handler())
+	defer oldSrv.Close()
+	newSrv := httptest.NewServer(newT.handler())
+	defer newSrv.Close()
+
+	hookID, _ := f.createHook(t, f.accO, oldSrv.URL)
+	patchJSON(t, f.h, f.hookPath(hookID), f.accO, map[string]any{"url": newSrv.URL}, http.StatusOK)
+	if row := f.row(t, hookID); row.CreatorID != f.uidO || row.URL != newSrv.URL {
+		t.Fatalf("O 自己改址应保持创建者 O 并写入新 url: %+v", row)
+	}
+
+	f.fire(f.secretID, p18Marker)
+	body := waitEvent(t, newT, "message.created")
+	if !strings.Contains(string(body), p18Marker) {
+		t.Fatalf("O 对 #secret 可见，改址后新地址应收到全文: %s", body)
+	}
+	// 一个订阅一个 url：新地址已收到该订阅唯一的一次投递，旧地址不可能再有。
+	if n := oldT.hits(); n != 0 {
+		t.Fatalf("改址后旧地址不应收到投递，实际 %d", n)
+	}
+}
+
+// TestWebhookPatchWithoutURLKeepsCreator 不改变投递去向的 PATCH 不改绑：events、
+// enabled、reset_secret，以及重发值未变的 url（自动化回放完整对象不应意外改绑）。
+// 订阅仍按 O 的可见性投递到原地址。
+func TestWebhookPatchWithoutURLKeepsCreator(t *testing.T) {
+	f := newRebindFixture(t)
+	oT := &hookTarget{}
+	oSrv := httptest.NewServer(oT.handler())
+	defer oSrv.Close()
+	hookID, _ := f.createHook(t, f.accO, oSrv.URL)
+
+	for _, body := range []map[string]any{
+		{"events": []string{"message.created", "channel.created"}},
+		{"enabled": false},
+		{"enabled": true},
+		{"reset_secret": true},
+		{"url": oSrv.URL, "events": []string{"message.created"}},
+	} {
+		patchJSON(t, f.h, f.hookPath(hookID), f.accM, body, http.StatusOK)
+		if row := f.row(t, hookID); row.CreatorID != f.uidO || row.URL != oSrv.URL {
+			t.Fatalf("PATCH %v 不应改绑或改址: creator=%d url=%s", body, row.CreatorID, row.URL)
+		}
+	}
+
+	f.fire(f.secretID, p18Marker)
+	if body := waitEvent(t, oT, "message.created"); !strings.Contains(string(body), p18Marker) {
+		t.Fatalf("仍按 O 的可见性投递，原地址应收到 #secret 全文: %s", body)
+	}
+}
+
+// TestWebhookPatchURLRequiresChannelView 改址与创建同一道门：调用者对服务器内所有
+// 频道都无 ViewChannel 时，改址 403 且行不变；不改址的 PATCH 不受门影响；
+// 恢复可见后改址成功并改绑。
+func TestWebhookPatchURLRequiresChannelView(t *testing.T) {
+	f := newRebindFixture(t)
+	oT, mT := &hookTarget{}, &hookTarget{}
+	oSrv := httptest.NewServer(oT.handler())
+	defer oSrv.Close()
+	mSrv := httptest.NewServer(mT.handler())
+	defer mSrv.Close()
+	hookID, _ := f.createHook(t, f.accO, oSrv.URL)
+
+	f.setViewDeny(t, f.pubID, true) // M 现在对所有频道都不可见
+	patchJSON(t, f.h, f.hookPath(hookID), f.accM, map[string]any{"url": mSrv.URL}, http.StatusForbidden)
+	if row := f.row(t, hookID); row.URL != oSrv.URL || row.CreatorID != f.uidO {
+		t.Fatalf("被拒的改址不得落库: %+v", row)
+	}
+	patchJSON(t, f.h, f.hookPath(hookID), f.accM, map[string]any{"enabled": false}, http.StatusOK)
+
+	f.setViewDeny(t, f.pubID, false)
+	patchJSON(t, f.h, f.hookPath(hookID), f.accM, map[string]any{"url": mSrv.URL}, http.StatusOK)
+	if row := f.row(t, hookID); row.URL != mSrv.URL || row.CreatorID != f.uidM {
+		t.Fatalf("恢复可见后改址应成功并改绑为 M: %+v", row)
+	}
+}
+
+// TestWebhookPatchURLWritesAudit 改址写审计 webhook.update_url：记旧/新创建者，
+// 不记 url 与 secret；不改址的 PATCH 不产生该审计。
+func TestWebhookPatchURLWritesAudit(t *testing.T) {
+	f := newRebindFixture(t)
+	oT, mT := &hookTarget{}, &hookTarget{}
+	oSrv := httptest.NewServer(oT.handler())
+	defer oSrv.Close()
+	mSrv := httptest.NewServer(mT.handler())
+	defer mSrv.Close()
+
+	// M 建订阅（过门），O 再改址：改绑到 O 是显式的可见性拓宽，必须留痕。
+	hookID, secret := f.createHook(t, f.accM, mSrv.URL)
+	patchJSON(t, f.h, f.hookPath(hookID), f.accO, map[string]any{"url": oSrv.URL}, http.StatusOK)
+	patchJSON(t, f.h, f.hookPath(hookID), f.accO, map[string]any{"enabled": false}, http.StatusOK)
+
+	logs, err := f.mem.AuditLogBefore(context.Background(), f.serverID, 0, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found []store.AuditLog
+	for _, l := range logs {
+		if l.Action == "webhook.update_url" {
+			found = append(found, l)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("应恰有 1 条 webhook.update_url 审计，实际 %d（%v）", len(found), logs)
+	}
+	l := found[0]
+	if l.ActorID != f.uidO || l.TargetType != "webhook" || l.TargetID == nil || *l.TargetID != hookID {
+		t.Fatalf("审计主体/目标不符: %+v", l)
+	}
+	var detail map[string]any
+	if err := json.Unmarshal([]byte(l.Detail), &detail); err != nil {
+		t.Fatalf("detail 应为 JSON: %v (%s)", err, l.Detail)
+	}
+	if detail["old_creator_id"] != strconv.FormatInt(f.uidM, 10) || detail["new_creator_id"] != strconv.FormatInt(f.uidO, 10) {
+		t.Fatalf("detail 应记旧/新创建者（字符串 id）: %s", l.Detail)
+	}
+	for _, leak := range []string{oSrv.URL, mSrv.URL, secret} {
+		if strings.Contains(l.Detail, leak) {
+			t.Fatalf("审计 detail 不得含 url/secret: %s", l.Detail)
+		}
+	}
+}

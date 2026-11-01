@@ -40,6 +40,50 @@ func assertOutboundWebhookCreatorRoundTrip(t *testing.T, st Store, ctx context.C
 	if err != nil || len(rows) != 2 || rows[0].CreatorID != 42 || rows[1].CreatorID != 0 {
 		t.Fatalf("OfServer 应带出 creator_id: %v %+v", err, rows)
 	}
+
+	// P1-8：UPDATE 同时写 creator_id——改址改绑后读回新创建者，url 与 creator 在同一
+	// 条语句里落库，不会出现「新 url 配旧创建者」的中间态。
+	got.URL = "https://hooks.example.com/a-rebound"
+	got.CreatorID = 77
+	if err := st.UpdateOutboundWebhook(ctx, got); err != nil {
+		t.Fatalf("UpdateOutboundWebhook: %v", err)
+	}
+	got3, err := st.OutboundWebhookByID(ctx, w.ID)
+	if err != nil || got3.CreatorID != 77 || got3.URL != "https://hooks.example.com/a-rebound" {
+		t.Fatalf("UPDATE 应一并写入 creator_id 与 url: %v %+v", err, got3)
+	}
+	// 读-改-写的非改址更新（只动 events）带着读回的 creator 原样写回，创建者不变。
+	got3.Events = "member.joined"
+	if err := st.UpdateOutboundWebhook(ctx, got3); err != nil {
+		t.Fatalf("UpdateOutboundWebhook(events): %v", err)
+	}
+	got4, err := st.OutboundWebhookByID(ctx, w.ID)
+	if err != nil || got4.CreatorID != 77 || got4.Events != "member.joined" {
+		t.Fatalf("非改址更新不应改动 creator_id: %v %+v", err, got4)
+	}
+	// 同服其它订阅不受影响。
+	other, err := st.OutboundWebhookByID(ctx, w2.ID)
+	if err != nil || other.CreatorID != 0 || other.URL != "https://hooks.example.com/b" {
+		t.Fatalf("UPDATE 只作用于目标订阅: %v %+v", err, other)
+	}
+}
+
+// assertNullCreatorRowRebind 真实 NULL creator_id 的旧行（0022 前、服务器已删的孤儿
+// 行）经 UPDATE 改绑：NULL → 具体 uid 必须落库（P1-8 改址后旧行第一次获得创建者）。
+func assertNullCreatorRowRebind(t *testing.T, st Store, ctx context.Context, id int64) {
+	t.Helper()
+	got, err := st.OutboundWebhookByID(ctx, id)
+	if err != nil || got.CreatorID != 0 {
+		t.Fatalf("前提：NULL creator_id 应扫描为 0: %v %+v", err, got)
+	}
+	got.CreatorID = 5
+	if err := st.UpdateOutboundWebhook(ctx, got); err != nil {
+		t.Fatalf("UpdateOutboundWebhook(NULL 行): %v", err)
+	}
+	after, err := st.OutboundWebhookByID(ctx, id)
+	if err != nil || after.CreatorID != 5 {
+		t.Fatalf("NULL 行应能改绑为具体 uid: %v %+v", err, after)
+	}
 }
 
 // TestOutboundWebhookCreatorRoundTrip 内存与 SQLite 后端（无条件跑，外部服务零依赖）。
@@ -63,6 +107,7 @@ func TestOutboundWebhookCreatorRoundTrip(t *testing.T) {
 		if err != nil || got.CreatorID != 0 {
 			t.Fatalf("NULL creator_id 应扫描为 0: %v %+v", err, got)
 		}
+		assertNullCreatorRowRebind(t, sq, ctx, 999)
 	})
 }
 
@@ -101,4 +146,5 @@ func TestOutboundWebhookCreatorRoundTripMySQL(t *testing.T) {
 	if err != nil || got.CreatorID != 0 {
 		t.Fatalf("NULL creator_id 应扫描为 0: %v %+v", err, got)
 	}
+	assertNullCreatorRowRebind(t, m, ctx, 999)
 }

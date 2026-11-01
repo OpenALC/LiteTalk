@@ -600,8 +600,8 @@ type Store interface {
 	OutboundWebhooksOfServer(ctx context.Context, serverID int64) ([]OutboundWebhook, error)
 	// HasOutboundWebhooks 库内是否存在任一出站订阅（启动期判定是否需要投递 worker）。
 	HasOutboundWebhooks(ctx context.Context) (bool, error)
-	// UpdateOutboundWebhook 全行写（url/secret/events/熔断状态）；调用方读-改-写，
-	// 不动 created_at/server_id。未命中 ErrNotFound。
+	// UpdateOutboundWebhook 全行写（url/secret/events/熔断状态/creator_id）；调用方
+	// 读-改-写，不动 created_at/server_id。未命中 ErrNotFound。
 	UpdateOutboundWebhook(ctx context.Context, w *OutboundWebhook) error
 	// DeleteOutboundWebhook 删除订阅行；未命中 ErrNotFound。
 	DeleteOutboundWebhook(ctx context.Context, id int64) error

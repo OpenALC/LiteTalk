@@ -1644,6 +1644,7 @@ func (m *Mem) UpdateOutboundWebhook(_ context.Context, w *OutboundWebhook) error
 	}
 	cur.URL, cur.Secret, cur.Events = w.URL, w.Secret, w.Events
 	cur.Disabled, cur.DisabledReason, cur.FailCount = w.Disabled, w.DisabledReason, w.FailCount
+	cur.CreatorID = w.CreatorID // P1-8：与 SQL 方言同口径，改址改绑随全行写落库
 	cur.UpdatedAt = time.Now()
 	w.UpdatedAt = cur.UpdatedAt
 	return nil
