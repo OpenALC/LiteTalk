@@ -57,13 +57,19 @@ case "$PKG_TYPE" in
         launch_wrapper=(xvfb-run -a)
         ;;
       rocky|almalinux|rhel|ol)
-        # RHEL 10 系：WebKitGTK 6.0（webkitgtk6.0）与 cage 都只在 EPEL 10；
-        # RHEL 10 已移除 Xorg/Xvfb，无头显示走 xwayland-run（AppStream）+ cage。
-        echo "启用 EPEL 10（webkitgtk6.0 / cage 的来源，RHEL 10 系用户同样需要）"
+        # RHEL 10 系：WebKitGTK 6.0（webkitgtk6.0）只在 EPEL 10。
+        echo "启用 EPEL 10（webkitgtk6.0 的来源，RHEL 10 系用户同样需要）"
         dnf install -y epel-release
-        # 冒烟环境补齐：同 Fedora，显示栈换成 xwayland-run + cage。
-        dnf install -y xwayland-run cage dbus-daemon dejavu-sans-fonts mesa-dri-drivers
-        launch_wrapper=(xwfb-run -c cage)
+        # 显示栈：RHEL 10 移除了 Xorg 服务器本体，但 Xvfb（含 xvfb-run）仍由
+        # 发行版 devel 仓库提供。优先直装，不在 AppStream 时开 devel——与其他
+        # 三个发行版共用同一 xvfb-run 路径。实测 xwfb-run + Xwayland/cage 栈下
+        # GTK4 应用卡在窗口创建、到不了 ServiceStartup（WebKit 2.48–2.54 在
+        # Xvfb 下均正常，排除版本因素），故不采用 xwayland-run。
+        if ! dnf install -y xorg-x11-server-Xvfb dbus-daemon dejavu-sans-fonts mesa-dri-drivers; then
+          echo "AppStream 无 xorg-x11-server-Xvfb，启用 devel 仓库重试"
+          dnf install -y --enablerepo=devel xorg-x11-server-Xvfb dbus-daemon dejavu-sans-fonts mesa-dri-drivers
+        fi
+        launch_wrapper=(xvfb-run -a)
         ;;
       *)
         echo "ERROR: 未覆盖的 rpm 发行版 $ID，请在脚本 case 中补充"
