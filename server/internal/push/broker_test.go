@@ -187,6 +187,38 @@ func TestBrokerOfflineEdgeFallback(t *testing.T) {
 	}
 }
 
+// TestBrokerOfflineEdgeTTLCleanup offlineAt 由 worker 节拍按 offlineEdgeTTL 清理：
+// 过期条目消失，TTL 内的条目保留。清理只能来自 worker（OnUserOffline 只写）。
+func TestBrokerOfflineEdgeTTLCleanup(t *testing.T) {
+	old := offlineSweepInterval
+	offlineSweepInterval = 5 * time.Millisecond
+	defer func() { offlineSweepInterval = old }()
+
+	b, _, _ := newBroker(t, map[string]bool{})
+	b.OnUserOffline("fresh")
+	b.mu.Lock()
+	b.offlineAt["stale"] = time.Now().Add(-offlineEdgeTTL - time.Second)
+	b.mu.Unlock()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		b.mu.Lock()
+		_, stale := b.offlineAt["stale"]
+		_, fresh := b.offlineAt["fresh"]
+		b.mu.Unlock()
+		if !stale {
+			if !fresh {
+				t.Fatal("TTL 内的离线边沿不应被清理")
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("过期离线边沿未被 worker 节拍清理")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // TestBrokerNoDeviceNoPush 未注册设备的用户不推（无 I/O 对象）。
 func TestBrokerNoDeviceNoPush(t *testing.T) {
 	b, pusher, _ := newBroker(t, map[string]bool{"600": false})
