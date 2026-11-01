@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/mail"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/OpenALC/LiteTalk/server/internal/auth"
@@ -63,16 +62,9 @@ func fmtTag(n int) string {
 	return s
 }
 
-// normalizeEmail 邮箱小写去空白。
-func normalizeEmail(s string) string {
-	out := make([]rune, 0, len(s))
-	for _, r := range s {
-		if r != ' ' && r != '\t' {
-			out = append(out, r)
-		}
-	}
-	return strings.ToLower(string(out))
-}
+// normalizeEmail 邮箱小写去空白（唯一实现在 auth 包，注册/登录/验证码/OIDC
+// 共用同一口径）。
+func normalizeEmail(s string) string { return auth.NormalizeEmail(s) }
 
 // Register POST /api/v1/auth/register（限流 10 次/h/IP：防批量注册与 bcrypt CPU 放大）
 func (s *Server) Register(ctx context.Context, request RegisterRequestObject) (RegisterResponseObject, error) {
@@ -115,6 +107,11 @@ func (s *Server) Register(ctx context.Context, request RegisterRequestObject) (R
 		if err := s.codes.Verify(ctx, auth.PurposeRegister, email, deref(req.Code)); err != nil {
 			return nil, errf(http.StatusBadRequest, "bad_code", "验证码无效或已过期")
 		}
+	}
+	// 存量大小写混合账号兜底：SQLite 唯一索引区分大小写，旧库里的 Mixed@Case
+	// 不会与新小写邮箱撞键；不先查库就会建出重复账号（MySQL ci 排序无此问题）。
+	if _, err := s.store.UserByEmail(ctx, email); err == nil {
+		return nil, errf(http.StatusConflict, "email_taken", "邮箱已注册")
 	}
 
 	hash, err := auth.HashPassword(req.Password)

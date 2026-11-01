@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -41,6 +42,10 @@ type fakeIdP struct {
 	codes map[string]fakeCode
 	// discoveryIssuer 置非空时 discovery 返回它（issuer 不一致用例）。
 	discoveryIssuer string
+	// jwksHits JWKS 端点被拉取的次数（负缓存放大用例断言）。
+	jwksHits atomic.Int64
+	// jwksDelay 拉取响应延迟，用于把并发请求都卡在首次拉取之前。
+	jwksDelay time.Duration
 }
 
 type fakeCode struct {
@@ -52,6 +57,12 @@ type fakeCode struct {
 	email         string
 	emailVerified bool
 	used          bool
+
+	// aud/azp/iat 覆盖载荷声明（零值 = 标准形态：aud=clientID、无 azp、iat=当前）。
+	aud     any
+	azp     *string
+	iat     int64
+	omitIAT bool
 }
 
 func newFakeIdP(t *testing.T) *fakeIdP {
@@ -124,6 +135,10 @@ func newFakeIdP(t *testing.T) *fakeIdP {
 		})
 	})
 	mux.HandleFunc("/jwks.json", func(w http.ResponseWriter, r *http.Request) {
+		f.jwksHits.Add(1)
+		if f.jwksDelay > 0 {
+			time.Sleep(f.jwksDelay)
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"keys": []map[string]string{{
 				"kty": "RSA", "kid": f.kid,
@@ -151,10 +166,15 @@ func bigE(e int) []byte {
 // mintCode 模拟「用户在 IdP 授权页同意」：IdP 签发绑定 challenge/nonce/claims
 // 的授权码。signKey 置 nil 用正常密钥；exp 非 0 覆盖过期时间。
 func (f *fakeIdP) mintCode(challenge, nonce, sub string, exp int64, signKey *rsa.PrivateKey) string {
+	return f.mintCodeWith(fakeCode{challenge: challenge, nonce: nonce, sub: sub, exp: exp, signKey: signKey})
+}
+
+// mintCodeWith 同上，额外载荷声明由调用方直接指定。
+func (f *fakeIdP) mintCodeWith(c fakeCode) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	code := "code-" + randHex8()
-	f.codes[code] = fakeCode{challenge: challenge, nonce: nonce, sub: sub, exp: exp, signKey: signKey}
+	f.codes[code] = c
 	return code
 }
 
@@ -175,13 +195,28 @@ func (f *fakeIdP) signIDToken(c fakeCode) string {
 		exp = time.Now().Add(time.Hour).Unix()
 	}
 	header, _ := json.Marshal(map[string]string{"alg": "RS256", "kid": f.kid})
-	payload, _ := json.Marshal(map[string]any{
-		"iss": f.issuer, "sub": c.sub, "aud": f.clientID,
-		"exp": exp, "iat": time.Now().Unix(),
+	aud := c.aud
+	if aud == nil {
+		aud = f.clientID
+	}
+	iat := c.iat
+	if iat == 0 {
+		iat = time.Now().Unix()
+	}
+	claims := map[string]any{
+		"iss": f.issuer, "sub": c.sub, "aud": aud,
+		"exp": exp, "iat": iat,
 		"nonce": c.nonce,
 		"email": "oidc-user@example.com", "email_verified": true,
 		"name": "OIDC 用户", "preferred_username": "oidcuser",
-	})
+	}
+	if c.azp != nil {
+		claims["azp"] = *c.azp
+	}
+	if c.omitIAT {
+		delete(claims, "iat")
+	}
+	payload, _ := json.Marshal(claims)
 	signingInput := base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(payload)
 	digest := sha256.Sum256([]byte(signingInput))
 	sig, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, digest[:])
@@ -432,6 +467,152 @@ func TestOIDCExchangeTimeout(t *testing.T) {
 	// 超时 250ms + 调度余量；永久阻塞的旧实现到不了这里的断言。
 	if elapsed > 3*time.Second {
 		t.Fatalf("Exchange %v 才返回，未在超时内失败", elapsed)
+	}
+}
+
+// TestOIDCUnknownKidNegativeCache 未知 kid 在负缓存窗口内只触发一次 JWKS
+// 重拉；窗口过期后允许再拉一次；已知 kid 不受影响。
+func TestOIDCUnknownKidNegativeCache(t *testing.T) {
+	f := newFakeIdP(t)
+	p := newTestProvider(t, f)
+	now := time.Now()
+	p.now = func() time.Time { return now }
+	ctx := context.Background()
+
+	if _, err := p.publicKey(ctx, "forged-kid"); !errors.Is(err, ErrOIDCUpstream) {
+		t.Fatalf("未知 kid 应 ErrOIDCUpstream，实际 %v", err)
+	}
+	if got := f.jwksHits.Load(); got != 1 {
+		t.Fatalf("首次未知 kid 应拉取 JWKS 1 次，实际 %d", got)
+	}
+	if _, err := p.publicKey(ctx, "forged-kid"); !errors.Is(err, ErrOIDCUpstream) {
+		t.Fatalf("窗口内重复未知 kid 应失败，实际 %v", err)
+	}
+	if got := f.jwksHits.Load(); got != 1 {
+		t.Fatalf("负缓存窗口内不应重拉 JWKS，实际 %d 次", got)
+	}
+	if _, err := p.publicKey(ctx, f.kid); err != nil {
+		t.Fatalf("已知 kid 应命中缓存: %v", err)
+	}
+	if got := f.jwksHits.Load(); got != 1 {
+		t.Fatalf("已知 kid 命中不应重拉，实际 %d 次", got)
+	}
+
+	now = now.Add(oidcKidMissTTL + time.Second)
+	if _, err := p.publicKey(ctx, "forged-kid"); !errors.Is(err, ErrOIDCUpstream) {
+		t.Fatalf("窗口过期后仍应失败，实际 %v", err)
+	}
+	if got := f.jwksHits.Load(); got != 2 {
+		t.Fatalf("负缓存过期后应允许重拉一次，实际 %d 次", got)
+	}
+}
+
+// TestOIDCUnknownKidNegativeCacheConcurrent 并发伪造同一未知 kid 只放大成一次
+// JWKS 拉取（fetchMu 串行化 + 锁后复查负缓存）。
+func TestOIDCUnknownKidNegativeCacheConcurrent(t *testing.T) {
+	f := newFakeIdP(t)
+	f.jwksDelay = 50 * time.Millisecond // 让并发请求在首次拉取返回前都完成检查
+	p := newTestProvider(t, f)
+	const n = 8
+	start := make(chan struct{})
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			<-start
+			_, err := p.publicKey(context.Background(), "forged-kid")
+			errs <- err
+		}()
+	}
+	close(start)
+	for i := 0; i < n; i++ {
+		if err := <-errs; !errors.Is(err, ErrOIDCUpstream) {
+			t.Fatalf("并发未知 kid 应 ErrOIDCUpstream，实际 %v", err)
+		}
+	}
+	if got := f.jwksHits.Load(); got != 1 {
+		t.Fatalf("并发未知 kid 应只拉取 JWKS 1 次，实际 %d 次", got)
+	}
+}
+
+// exchangeWith 用给定载荷声明走一次完整交换（每次生成独立 verifier/授权码，
+// 授权码在 IdP 侧一次性消费）。
+func exchangeWith(t *testing.T, f *fakeIdP, p *OIDCProvider, c fakeCode) (*OIDCClaims, error) {
+	t.Helper()
+	verifier, challenge, err := NewOIDCPKCE()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.challenge = challenge
+	code := f.mintCodeWith(c)
+	return p.Exchange(context.Background(), code, verifier, c.nonce)
+}
+
+// TestOIDCIDTokenAZP azp 与多 aud 的对应关系：azp 出现时必须等于 client_id；
+// 多个 aud 时 azp 必须出现；单 aud 无 azp 合规。
+func TestOIDCIDTokenAZP(t *testing.T) {
+	f := newFakeIdP(t)
+	p := newTestProvider(t, f)
+	ptr := func(s string) *string { return &s }
+	for _, tc := range []struct {
+		name    string
+		aud     any
+		azp     *string
+		wantErr bool
+	}{
+		{"单 aud 无 azp 允许", nil, nil, false},
+		{"单 aud 数组无 azp 允许", []any{f.clientID}, nil, false},
+		{"单 aud azp 正确", nil, ptr(f.clientID), false},
+		{"单 aud azp 错误", nil, ptr("other-client"), true},
+		{"多 aud 无 azp 拒绝", []any{f.clientID, "other-client"}, nil, true},
+		{"多 aud azp 正确", []any{f.clientID, "other-client"}, ptr(f.clientID), false},
+		{"多 aud azp 错误", []any{f.clientID, "other-client"}, ptr("other-client"), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := exchangeWith(t, f, p, fakeCode{sub: "sub-azp", aud: tc.aud, azp: tc.azp})
+			if tc.wantErr {
+				if !errors.Is(err, ErrOIDCToken) {
+					t.Fatalf("应 ErrOIDCToken，实际 %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("应通过，实际 %v", err)
+			}
+		})
+	}
+}
+
+// TestOIDCIDTokenIAT iat 合理性：缺失/未来超时钟偏差/过旧一律拒绝，
+// 时钟偏差内的未来时间放行（IdP 与本机时钟可能有小幅漂移）。
+func TestOIDCIDTokenIAT(t *testing.T) {
+	now := time.Now()
+	f := newFakeIdP(t)
+	p := newTestProvider(t, f)
+	p.now = func() time.Time { return now }
+	for _, tc := range []struct {
+		name    string
+		iat     int64
+		omit    bool
+		wantErr bool
+	}{
+		{"正常", now.Unix(), false, false},
+		{"时钟偏差内的未来", now.Add(oidcClockSkew / 2).Unix(), false, false},
+		{"未来超出偏差", now.Add(2 * oidcClockSkew).Unix(), false, true},
+		{"过旧超出上限", now.Add(-oidcIATMaxAge - time.Minute).Unix(), false, true},
+		{"缺失 iat", 0, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := exchangeWith(t, f, p, fakeCode{sub: "sub-iat", iat: tc.iat, omitIAT: tc.omit})
+			if tc.wantErr {
+				if !errors.Is(err, ErrOIDCToken) {
+					t.Fatalf("应 ErrOIDCToken，实际 %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("应通过，实际 %v", err)
+			}
+		})
 	}
 }
 

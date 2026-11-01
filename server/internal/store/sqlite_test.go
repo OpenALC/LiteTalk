@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -680,5 +681,35 @@ func TestSQLiteUseInviteAndAddMember(t *testing.T) {
 	}
 	if _, err := m.UseInviteAndAddMember(ctx, "missing", u3.ID, RoleMember); err != ErrNotFound {
 		t.Fatalf("不存在应 ErrNotFound，实际 %v", err)
+	}
+}
+
+// TestSQLiteUserByEmailCaseInsensitive 存量大小写混合账号：规范化邮箱经
+// lower() 兜底脚本仍能命中；等值查询必须走唯一索引 uk_users_email。
+func TestSQLiteUserByEmailCaseInsensitive(t *testing.T) {
+	ctx := context.Background()
+	m := openTestSQLite(t)
+	if err := m.Migrate(ctx, findMigrationsSQLite(t)); err != nil {
+		t.Fatalf("迁移失败: %v", err)
+	}
+	// 模拟本改动之前写入的混合大小写行（不经过入口归一）。
+	legacy := &User{Email: "Legacy.Mixed@Example.COM", Nickname: "legacy", Tag: "0001", PasswordHash: "h"}
+	if err := m.CreateUser(ctx, legacy); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	got, err := m.UserByEmail(ctx, "legacy.mixed@example.com")
+	if err != nil || got.ID != legacy.ID {
+		t.Fatalf("lower() 兜底未命中存量混合大小写行: %+v %v", got, err)
+	}
+	// 常规路径（等值命中）必须走唯一索引；lower() 只在未命中时兜底扫描。
+	var id, parent, notused int
+	var detail string
+	if err := m.DB().QueryRowContext(ctx,
+		`EXPLAIN QUERY PLAN SELECT `+sqUserCols+` FROM users WHERE email = ?`, "legacy.mixed@example.com").
+		Scan(&id, &parent, &notused, &detail); err != nil {
+		t.Fatalf("EXPLAIN QUERY PLAN: %v", err)
+	}
+	if !strings.Contains(detail, "uk_users_email") {
+		t.Fatalf("等值查询未走唯一索引 uk_users_email: %s", detail)
 	}
 }

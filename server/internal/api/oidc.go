@@ -128,7 +128,9 @@ func (s *Server) oidcUpstreamErr(err error) *apiErr {
 // 首次登录时 email_verified 且邮箱命中既有用户才自动绑定（防账号劫持），
 // 其余一律新建账号（绝不自动合并）。并发撞邮箱/绑定键时限轮重查收敛。
 func (s *Server) oidcEnsureAccount(ctx context.Context, claims *auth.OIDCClaims, issuer string) (*store.User, error) {
-	email := strings.ToLower(strings.TrimSpace(claims.Email))
+	// 与本地注册/登录同一口径（auth.NormalizeEmail）：绑定既有账号和新建账号
+	// 都用规范化邮箱，SQLite 下不会因大小写差异建出重复账号。
+	email := auth.NormalizeEmail(claims.Email)
 	for i := 0; i < oidcCreateRetries; i++ {
 		// 1) 已有绑定：直接登录。属主被删/停用 → 拒绝（与令牌路径同一 status 口径）。
 		idn, err := s.store.OIDCIdentityByIssuerSub(ctx, issuer, claims.Sub)

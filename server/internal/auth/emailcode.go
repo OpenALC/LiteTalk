@@ -3,8 +3,22 @@ package auth
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 )
+
+// NormalizeEmail 邮箱统一口径：去掉空格/制表符并转小写。用户查询、验证码键、
+// OIDC 绑定都必须先过这里——MySQL 的 utf8mb4_unicode_ci 唯一索引本就大小写
+// 不敏感，SQLite 的二进制索引不是，入口口径不一致会建出重复账号。
+func NormalizeEmail(s string) string {
+	out := make([]rune, 0, len(s))
+	for _, r := range s {
+		if r != ' ' && r != '\t' {
+			out = append(out, r)
+		}
+	}
+	return strings.ToLower(string(out))
+}
 
 // 验证码策略（§8）：6 位 / 10min 有效 / 错误 5 次作废 / 60s 重发间隔 / 同邮箱 5 次每日。
 const (
@@ -50,6 +64,9 @@ func dailyKey(purpose, email string) string { return "rl:code:daily:" + purpose 
 // Send 生成并存储验证码。返回明文验证码（由 mailer 发出）。
 // 频控：60s 间隔 + 同用途同邮箱每日 5 次。
 func (e *EmailCodes) Send(ctx context.Context, purpose, email string) (string, error) {
+	// 键统一用规范化邮箱：发码与验码的调用方可能传入不同大小写的同一地址，
+	// 不归一会出现「码明明正确却验不过」。
+	email = NormalizeEmail(email)
 	// 60s 间隔检查。
 	if _, err := e.kv.Get(ctx, intervalKey(purpose, email)); err == nil {
 		return "", ErrCodeTooFrequent
@@ -81,6 +98,7 @@ func (e *EmailCodes) Send(ctx context.Context, purpose, email string) (string, e
 
 // Verify 校验验证码。成功后立即销毁，防重放；错误累计 5 次作废重发。
 func (e *EmailCodes) Verify(ctx context.Context, purpose, email, code string) error {
+	email = NormalizeEmail(email)
 	stored, err := e.kv.Get(ctx, codeKey(purpose, email))
 	if err != nil {
 		return ErrCodeExpired

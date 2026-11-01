@@ -288,6 +288,8 @@ func (m *MySQL) UserByID(ctx context.Context, id int64) (*User, error) {
 	return m.scanUser(m.db.QueryRowContext(ctx, `SELECT `+userCols+` FROM users WHERE id = ?`, id))
 }
 
+// UserByEmail 依赖 utf8mb4_unicode_ci（0001 迁移）：等值比较本身大小写不敏感，
+// 存量大小写混合账号无需 lower() 也能命中，且走唯一索引 uk_users_email。
 func (m *MySQL) UserByEmail(ctx context.Context, email string) (*User, error) {
 	return m.scanUser(m.db.QueryRowContext(ctx, `SELECT `+userCols+` FROM users WHERE email = ?`, email))
 }
