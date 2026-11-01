@@ -1181,7 +1181,7 @@ export interface paths {
         put?: never;
         /**
          * 创建频道入站 Webhook（ManageChannels；响应含一次性投递 URL）
-         * @description 创建后响应带 url=/api/v1/webhooks/{id}/{secret}（含一次性 secret 明文， 只在本次出现），外部系统直接 POST 该 URL 即可向频道投递消息。 频控键 wh:create-inb:<uid>。 code：bad_channel、bad_request；401；403；404 not_found；429 rate_limited； 5xx internal。
+         * @description 创建后响应带 url=/api/v1/webhooks/{id}/{secret}（含一次性 secret 明文， 只在本次出现）。**url 是相对路径**，调用方自行拼服务器地址 （scheme + host + port）后再 POST，即可向频道投递消息。 频控键 wh:create-inb:<uid>。 code：bad_channel、bad_request；401；403；404 not_found；429 rate_limited； 5xx internal。
          */
         post: operations["createInboundWebhook"];
         delete?: never;
@@ -1407,13 +1407,13 @@ export interface components {
         PatchWebhookRequest: Record<string, never>;
         /**
          * InboundWebhook
-         * @description 频道级入站投递入口（#52）。url 形如 /api/v1/webhooks/{id}/{secret}， 只在创建与 reset_secret（PATCH）响应出现（含一次性 secret）；列表响应 不含 secret，泄露即 PATCH reset_secret 轮换或删除重建。
+         * @description 频道级入站投递入口（#52）。url 形如 /api/v1/webhooks/{id}/{secret}， 只在创建与 reset_secret（PATCH）响应出现（含一次性 secret）；列表响应 不含 secret，泄露即 PATCH reset_secret 轮换或删除重建。 **url 是相对路径**，不含服务器地址，调用方自行拼上 scheme + host + port 后使用。
          */
         InboundWebhook: {
             id: string;
             /** @description 用途备注（如「CI 告警」） */
             description: string;
-            /** @description 投递路径（含一次性 secret，仅创建响应） */
+            /** @description 投递路径（相对路径，含一次性 secret，仅创建 / reset_secret 响应）。 调用方自行拼服务器地址后使用。 */
             url?: string;
             /** Format: date-time */
             created_at: string;

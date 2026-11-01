@@ -846,7 +846,7 @@ type InboundDeliveryRequest struct {
 	Content string `json:"content"`
 }
 
-// InboundWebhook 频道级入站投递入口（#52）。url 形如 /api/v1/webhooks/{id}/{secret}， 只在创建与 reset_secret（PATCH）响应出现（含一次性 secret）；列表响应 不含 secret，泄露即 PATCH reset_secret 轮换或删除重建。
+// InboundWebhook 频道级入站投递入口（#52）。url 形如 /api/v1/webhooks/{id}/{secret}， 只在创建与 reset_secret（PATCH）响应出现（含一次性 secret）；列表响应 不含 secret，泄露即 PATCH reset_secret 轮换或删除重建。 **url 是相对路径**，不含服务器地址，调用方自行拼上 scheme + host + port 后使用。
 type InboundWebhook struct {
 	CreatedAt Time `json:"created_at"`
 
@@ -854,7 +854,7 @@ type InboundWebhook struct {
 	Description string `json:"description"`
 	Id          ID     `json:"id"`
 
-	// Url 投递路径（含一次性 secret，仅创建响应）
+	// Url 投递路径（相对路径，含一次性 secret，仅创建 / reset_secret 响应）。 调用方自行拼服务器地址后使用。
 	Url *string `json:"url,omitempty"`
 }
 
