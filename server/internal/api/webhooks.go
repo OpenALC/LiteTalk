@@ -389,6 +389,10 @@ func (s *Server) DeliverInboundWebhook(ctx context.Context, request DeliverInbou
 	if err := s.store.CreateMessage(ctx, msg); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
+	// 创建后处理单一管线（P2-1）：入站投递与 WS/REST 同一后处理——机器人消息
+	// 同样实时广播、计未读、走出站 webhook（服务器频道无提及且非私聊，推送
+	// 自然短路）。管线尽力而为，投递响应不受后处理失败影响。
+	s.afterMessageCreate(ctx, ch, msg, bot.ID, bot.Nickname)
 	return DeliverInboundWebhook200JSONResponse{Status: StatusOkStatusOk}, nil
 }
 

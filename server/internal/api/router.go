@@ -60,6 +60,12 @@ type Hub interface {
 	// RoomHasLegacyClients 该房间当前是否有协议 <3 的连接（#116）：PATCH 启用
 	// 10ms 帧长前检查，避免与不认识 10ms 的旧客户端混用；房间不存在返回 false。
 	RoomHasLegacyClients(channelID string) bool
+	// AfterMessagePersisted 消息创建后处理单一管线（P1-4/P2-1）：落库成功后的
+	// 广播 → 未读 → 推送 → 出站 webhook（webhook 由广播内的 T5 出口挂钩派发，
+	// REST/入站不另直发）。WS chat.send / REST CreateMessage / 入站 webhook 投递
+	// 三条入口共用同一实现。尽力而为：失败只记日志，不返回错误，绝不把已落库
+	// 的消息拖成发送失败。senderUID 为十进制 uid，senderNick 为发送者昵称。
+	AfterMessagePersisted(ctx context.Context, ch *store.Channel, msg *store.Message, senderUID, senderNick string)
 }
 
 // PresenceReader 在线状态读取（#11）：presence:{uid} 存在 = 在线。
