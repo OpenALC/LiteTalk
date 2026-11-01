@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/internal/token"
 )
 
 // #35 B4：审计查询与写入。写入 best-effort——失败只记日志，绝不影响业务响应。
@@ -52,13 +53,21 @@ func auditView(a *store.AuditLog) AuditLogEntry {
 	return out
 }
 
-// ListAuditLog GET /api/v1/servers/{id}/audit-log（需 ManageServer）
+// ListAuditLog GET /api/v1/servers/{id}/audit-log（P1-2 双判定）。
+// scope 腿：JWT 主体不受 scope 上限约束（行为不变）；令牌主体必须显式持有
+// admin.read——审计面是 admin.read 的消费端点，guild.manage 不再顺带可读。
+// 角色腿：纯角色 ManageServer（authz.RoleCanInServer，不做 scope 交集）。
+// 两腿缺一不可：admin.read 归零后借位过门的路已断，只读令牌拿不到审计，
+// 角色不够的管理令牌同样拿不到。
 func (s *Server) ListAuditLog(ctx context.Context, request ListAuditLogRequestObject) (ListAuditLogResponseObject, error) {
 	if e := checkID(request.Id); e != nil {
 		return nil, e
 	}
+	if !token.ScopeAllows(ctx, token.ScopeAdminRead) {
+		return nil, errf(http.StatusForbidden, "forbidden", "权限不足")
+	}
 	c := currentUser(ctx)
-	if e := s.requirePerm(ctx, request.Id, c.UserID, store.ManageServer); e != nil {
+	if e := s.requireRolePerm(ctx, request.Id, c.UserID, store.ManageServer); e != nil {
 		return nil, e
 	}
 	before := int64(0)

@@ -48,6 +48,22 @@ func (a *Authorizer) CanServer(ctx context.Context, uid, serverID int64, perm st
 	return a.CanInServer(ctx, uid, serverID, 0, perm)
 }
 
+// RoleCanInServer 纯角色判定：与 CanInServer 同一套策略快照与合并语义，但**不做**
+// scope 上限交集。给「scope 腿由端点显式判定」的双判定场合用（P1-2：审计读取 =
+// 主体持有 admin.read + 纯角色 ManageServer）——若走 CanInServer，scope 交集会与
+// 显式 scope 腿重复裁决，且 admin.read 归零后映射位凑不齐，角色腿永远过不去。
+// channelID == 0 视为服务器级，与 CanInServer 相同；(false, nil) 统一 403。
+func (a *Authorizer) RoleCanInServer(ctx context.Context, uid, serverID, channelID int64, perm store.Permission) (bool, error) {
+	if ok, err := precheck(perm); err != nil || ok {
+		return ok, err
+	}
+	snap, err := a.policyFor(ctx, serverID)
+	if err != nil {
+		return false, err
+	}
+	return snap.effective(uid, channelID, perm), nil
+}
+
 // IsMember 成员判断（纯成员表；owner 不旁路——归属判断用 Can*）。
 func (a *Authorizer) IsMember(ctx context.Context, uid, serverID int64) (bool, error) {
 	snap, err := a.policyFor(ctx, serverID)

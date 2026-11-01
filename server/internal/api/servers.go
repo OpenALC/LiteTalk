@@ -320,6 +320,23 @@ func (s *Server) requirePerm(ctx context.Context, serverID, userID int64, perm s
 	return nil
 }
 
+// requireRolePerm 纯角色权限门（P1-2）：与 requirePerm 同一套快照语义，但**不做**
+// scope 上限交集——给「scope 腿已由端点显式判定」的双判定端点用（审计读取）。
+// 404/403/500 口径与 requirePerm 一致。
+func (s *Server) requireRolePerm(ctx context.Context, serverID, userID int64, perm store.Permission) *apiErr {
+	if s.authz == nil {
+		return errf(http.StatusInternalServerError, "internal", "权限服务未就绪")
+	}
+	ok, err := s.authz.RoleCanInServer(ctx, userID, serverID, 0, perm)
+	if err != nil {
+		return s.writeStoreErr(ctx, err)
+	}
+	if !ok {
+		return errf(http.StatusForbidden, "forbidden", "权限不足")
+	}
+	return nil
+}
+
 // requireMember 成员门（#35 B3）：服务器不存在 404，非成员 403，故障 500。
 func (s *Server) requireMember(ctx context.Context, serverID, userID int64) *apiErr {
 	if s.authz == nil {

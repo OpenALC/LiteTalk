@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/internal/token"
 )
 
 // ChatStore chat 持久化最小接口（store.Store 满足；nil 时仅广播不落库）。
@@ -124,6 +125,15 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 				}
 				if !hasChannelMember(members, u) {
 					h.sendError(c, ErrCodeNotFound, "会话不存在")
+					return
+				}
+				// 会话 scope 门（P1-3）：成员判定不查服务器 authz，曾是 scope 判定
+				// 的绕过点——服务器频道的写入经 CanInServer 的 scope 交集要求
+				// messages.write 位，会话没有角色位可交，这里按连接主体显式要求
+				// messages.write（sendCtx 携带 api_token 的 Principal；JWT/dev
+				// 连接不受限）。两条路径要求的能力相同，机制不同的原因同 REST 侧。
+				if !token.ScopeAllows(sendCtx, token.ScopeMessagesWrite) {
+					h.sendError(c, ErrCodeForbidden, "无权向该频道发送消息")
 					return
 				}
 				// 类型检查放在成员判定之后——非成员统一 not_found，不泄露频道类型。

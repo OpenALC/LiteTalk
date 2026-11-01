@@ -273,8 +273,8 @@ func TestScopes(t *testing.T) {
 	if ScopeBits([]string{ScopeGuildManage}) != store.ManageChannels|store.ManageRoles|store.ManageServer {
 		t.Fatal("guild.manage → ManageChannels|ManageRoles|ManageServer")
 	}
-	if ScopeBits([]string{ScopeAdminRead}) != store.ManageServer {
-		t.Fatal("admin.read → ManageServer")
+	if ScopeBits([]string{ScopeAdminRead}) != 0 {
+		t.Fatal("admin.read 应为零权限位（纯只读，审计读取走端点内显式双判定）")
 	}
 	if ScopeBits([]string{ScopeAttachmentsWrite}) != store.AttachFiles {
 		t.Fatal("attachments.write → AttachFiles")
@@ -304,5 +304,35 @@ func TestScopeLimitFromContext(t *testing.T) {
 	limit, ok = ScopeLimitFromContext(WithPrincipal(ctx, empty))
 	if !ok || limit != 0 {
 		t.Fatalf("空 scope 令牌 = 无任何权限：limit=%v ok=%v", limit, ok)
+	}
+}
+
+// TestScopeAllows 显式 scope 门槛（P1-2/P1-3 双判定的 scope 腿）：
+// 无 Principal 与 JWT 主体恒过（权限只由角色决定），令牌主体按名字精确匹配。
+func TestScopeAllows(t *testing.T) {
+	ctx := context.Background()
+	if !ScopeAllows(ctx, ScopeAdminRead) {
+		t.Fatal("无 Principal 不受限")
+	}
+	jwt := &Principal{Kind: KindJWT}
+	jctx := WithPrincipal(ctx, jwt)
+	if !ScopeAllows(jctx, ScopeAdminRead) || !ScopeAllows(jctx, ScopeMessagesWrite) {
+		t.Fatal("JWT 主体恒过")
+	}
+	pat := &Principal{Kind: KindPAT, Scopes: []string{ScopeAdminRead, ScopeMessagesRead}}
+	pctx := WithPrincipal(ctx, pat)
+	if !ScopeAllows(pctx, ScopeAdminRead) {
+		t.Fatal("持有 admin.read 应过")
+	}
+	if ScopeAllows(pctx, ScopeMessagesWrite) {
+		t.Fatal("未持有 messages.write 应拒")
+	}
+	// 位级推导不得放大：messages.read 不因映射含 ViewChannel 而通过 admin.read。
+	if ScopeAllows(WithPrincipal(ctx, &Principal{Kind: KindPAT, Scopes: []string{ScopeMessagesRead}}), ScopeAdminRead) {
+		t.Fatal("scope 门槛按名字判定，不做位级推导")
+	}
+	empty := &Principal{Kind: KindPAT}
+	if ScopeAllows(WithPrincipal(ctx, empty), ScopeMessagesRead) {
+		t.Fatal("空 scope 令牌什么都不过")
 	}
 }

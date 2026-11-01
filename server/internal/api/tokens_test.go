@@ -49,8 +49,12 @@ func TestTokenLifecycle(t *testing.T) {
 	}
 	tokenID := asID(created["id"])
 
-	// 明文可直接调 REST（替代 JWT）。
-	list := getJSON(t, h, "/api/v1/tokens", plain, http.StatusOK).([]any)
+	// 明文可直接调 REST（替代 JWT）——令牌管理面例外（P1-1）：列表仅限 JWT，
+	// 令牌主体 403（token_management_forbidden）。
+	if resp := getJSON(t, h, "/api/v1/tokens", plain, http.StatusForbidden).(map[string]any); resp["code"] != "token_management_forbidden" {
+		t.Fatalf("令牌主体列列表应 403 token_management_forbidden，实际 %v", resp)
+	}
+	list := getJSON(t, h, "/api/v1/tokens", aAccess, http.StatusOK).([]any)
 	if len(list) != 1 {
 		t.Fatalf("本人列表应 1 条，实际 %d", len(list))
 	}
@@ -217,7 +221,8 @@ func TestTokenCreateValidation(t *testing.T) {
 }
 
 // TestTokenLastUsedThrottleREST 60s 节流在 REST 路径同样生效：同一令牌两次请求
-// 只落库一次 last_used_at。
+// 只落库一次 last_used_at。（last_used 在中间件校验路径更新，端点选令牌可用的
+// /servers——令牌管理面已收窄为 JWT-only，P1-1。）
 func TestTokenLastUsedThrottleREST(t *testing.T) {
 	srv, mem := newTestServer(t)
 	h := srv.Handler()
@@ -231,7 +236,7 @@ func TestTokenLastUsedThrottleREST(t *testing.T) {
 	ctx := context.Background()
 
 	// 第一次使用：异步落库一次。
-	getJSON(t, h, "/api/v1/tokens", plain, http.StatusOK)
+	getJSON(t, h, "/api/v1/servers", plain, http.StatusOK)
 	srv.apiTokens.WaitIdle()
 	first, err := mem.APITokenByID(ctx, tokenID)
 	if err != nil {
@@ -242,10 +247,137 @@ func TestTokenLastUsedThrottleREST(t *testing.T) {
 	}
 
 	// 立即再用（60s 窗口内）：不重复写库。
-	getJSON(t, h, "/api/v1/tokens", plain, http.StatusOK)
+	getJSON(t, h, "/api/v1/servers", plain, http.StatusOK)
 	srv.apiTokens.WaitIdle()
 	second, _ := mem.APITokenByID(ctx, tokenID)
 	if !second.LastUsedAt.Equal(*first.LastUsedAt) {
 		t.Fatalf("60s 窗口内不应重复落库：%v → %v", *first.LastUsedAt, *second.LastUsedAt)
 	}
+}
+
+// TestTokenManagementJWTOnly 令牌管理面收窄（P1-1）：签发/列举仅限 JWT 主体，
+// 只读 PAT 不可自签更宽 scope 的令牌（探针复现的提权链：messages.read →
+// guild.manage）；吊销立即生效且签出的令牌不随原令牌失效——所以必须在签发口
+// 堵死。任何主体可吊销自己（TokenID 匹配，泄露自毁通道）；PAT 管理本人其它
+// 令牌同样拒绝；跨用户仍 404 不可区分。
+func TestTokenManagementJWTOnly(t *testing.T) {
+	srv, mem := newTestServer(t)
+	h := srv.Handler()
+	aAccess, _ := registerUser(t, h, mem, "tj@ex.com", "tokJ", "password123")
+	bAccess, _ := registerUser(t, h, mem, "tj2@ex.com", "tokJ2", "password123")
+
+	ro := postJSON(t, h, "/api/v1/tokens", aAccess, map[string]any{
+		"name": "只读", "scopes": []string{"messages.read"},
+	}, http.StatusCreated)
+	roPlain, roID := ro["token"].(string), asID(ro["id"])
+	other := postJSON(t, h, "/api/v1/tokens", aAccess, map[string]any{
+		"name": "另一张", "scopes": []string{"messages.read"},
+	}, http.StatusCreated)
+	otherID := asID(other["id"])
+	bTokenID := asID(postJSON(t, h, "/api/v1/tokens", bAccess, map[string]any{
+		"name": "B 的", "scopes": []string{"messages.read"},
+	}, http.StatusCreated)["id"])
+
+	// 提权链：只读 PAT 调 POST /tokens 签 guild.manage → 403；列表同样 403。
+	for _, body := range []any{
+		map[string]any{"name": "提权", "scopes": []string{"guild.manage"}},
+		map[string]any{"name": "再一张", "scopes": []string{"messages.read"}},
+	} {
+		resp := postJSON(t, h, "/api/v1/tokens", roPlain, body, http.StatusForbidden)
+		if resp["code"] != "token_management_forbidden" {
+			t.Fatalf("只读 PAT 签发应 403 token_management_forbidden，实际 %v", resp)
+		}
+	}
+	if resp := getJSON(t, h, "/api/v1/tokens", roPlain, http.StatusForbidden).(map[string]any); resp["code"] != "token_management_forbidden" {
+		t.Fatalf("只读 PAT 列举应 403，实际 %v", resp)
+	}
+
+	// bot 令牌同口径：CLI 直落一行（与 litetalkctl 同形状）。
+	ctx := context.Background()
+	u, err := mem.UserByEmail(ctx, "tj@ex.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bp, err := token.NewPlain(token.KindBot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.CreateAPIToken(ctx, &store.APIToken{UserID: u.ID, Name: "bot",
+		Prefix: bp.Prefix, SecretHash: bp.Hash, Kind: token.KindBot, Scopes: "messages.read"}); err != nil {
+		t.Fatal(err)
+	}
+	resp := postJSON(t, h, "/api/v1/tokens", bp.Token, map[string]any{
+		"name": "bot 提权", "scopes": []string{"guild.manage"},
+	}, http.StatusForbidden)
+	if resp["code"] != "token_management_forbidden" {
+		t.Fatalf("bot 签发应 403，实际 %v", resp)
+	}
+	getJSON(t, h, "/api/v1/tokens", bp.Token, http.StatusForbidden)
+
+	// PAT 删本人其它令牌 → 403；删他人令牌 → 404（跨用户口径不变）。
+	if resp := delJSON(t, h, fmt.Sprintf("/api/v1/tokens/%d", otherID), roPlain, http.StatusForbidden); resp["code"] != "token_management_forbidden" {
+		t.Fatalf("PAT 删本人其它令牌应 403，实际 %v", resp)
+	}
+	delJSON(t, h, fmt.Sprintf("/api/v1/tokens/%d", bTokenID), roPlain, http.StatusNotFound)
+
+	// 自毁通道：PAT 吊销自己（TokenID 匹配）→ 200，明文下一次请求立即 401。
+	delJSON(t, h, fmt.Sprintf("/api/v1/tokens/%d", roID), roPlain, http.StatusOK)
+	getJSON(t, h, "/api/v1/servers", roPlain, http.StatusUnauthorized)
+	// JWT 管理本人令牌不受影响：已吊销的只读 + 另一张 + 直落的 bot 行都还在列表里。
+	if list := getJSON(t, h, "/api/v1/tokens", aAccess, http.StatusOK).([]any); len(list) != 3 {
+		t.Fatalf("JWT 列表应 3 条（含已吊销与 bot 行），实际 %d", len(list))
+	}
+}
+
+// TestAdminReadTokenReadOnly admin.read 纯只读（P1-2）：映射归零后改不了服务器、
+// 建不了出站 webhook；审计读取走双判定（持有 admin.read + 纯角色 ManageServer），
+// 无 admin.read 的令牌（messages.read）与角色不够的主体都拿不到审计；成员列表
+// 保持成员可读口径（admin.read 令牌作为成员照常可读）。
+func TestAdminReadTokenReadOnly(t *testing.T) {
+	srv, mem := newTestServer(t)
+	h := srv.Handler()
+	aAccess, _ := registerUser(t, h, mem, "tar@ex.com", "tokAR", "password123")
+	serverID := asID(postJSON(t, h, "/api/v1/servers", aAccess, map[string]string{
+		"name": "审计服", "icon_name": "music", "icon_color": "#4FA4F3",
+	}, http.StatusCreated)["id"])
+
+	mk := func(scopes []string) string {
+		return postJSON(t, h, "/api/v1/tokens", aAccess, map[string]any{
+			"name": "scope 测试", "scopes": scopes,
+		}, http.StatusCreated)["token"].(string)
+	}
+	audit := mk([]string{"admin.read"})
+	readOnly := mk([]string{"messages.read"})
+	guild := mk([]string{"guild.manage"})
+
+	// JWT 改名仍 200（owner），并落一条审计行供查询。
+	patchJSON(t, h, fmt.Sprintf("/api/v1/servers/%d", serverID), aAccess,
+		map[string]any{"name": "审计服二号"}, http.StatusOK)
+
+	// 审计读取双判定：
+	//   - admin.read + 角色够（owner）→ 200；
+	//   - 无 admin.read（messages.read / guild.manage）→ 403（guild.manage 位级映射归零后不再顺带可读）。
+	getJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/audit-log", serverID), audit, http.StatusOK)
+	if resp := getJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/audit-log", serverID), readOnly, http.StatusForbidden).(map[string]any); resp["code"] != "forbidden" {
+		t.Fatalf("messages.read 读审计应 403，实际 %v", resp)
+	}
+	if resp := getJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/audit-log", serverID), guild, http.StatusForbidden).(map[string]any); resp["code"] != "forbidden" {
+		t.Fatalf("guild.manage 读审计应 403（admin.read 归零后位级映射不再放行），实际 %v", resp)
+	}
+
+	// 写面：admin.read 令牌 PATCH 服务器、创建出站 webhook 一律 403（此前改名
+	// 探针实测 200、webhook 可建——外泄私有频道的入口）。
+	if resp := patchJSON(t, h, fmt.Sprintf("/api/v1/servers/%d", serverID), audit,
+		map[string]any{"name": "越权改名"}, http.StatusForbidden); resp["code"] != "forbidden" {
+		t.Fatalf("admin.read 改服务器名应 403，实际 %v", resp)
+	}
+	if resp := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/webhooks", serverID), audit,
+		map[string]any{"url": "https://hooks.example.com/x", "events": []string{"message.created"}}, http.StatusForbidden); resp["code"] != "forbidden" {
+		t.Fatalf("admin.read 建出站 webhook 应 403，实际 %v", resp)
+	}
+
+	// 成员列表保持成员可读：admin.read / messages.read 令牌作为成员都 200。
+	getJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/members", serverID), audit, http.StatusOK)
+	getJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/members", serverID), readOnly, http.StatusOK)
+
 }

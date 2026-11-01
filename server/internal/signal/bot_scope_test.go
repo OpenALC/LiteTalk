@@ -215,3 +215,50 @@ func TestUIDIsBot(t *testing.T) {
 		t.Fatal("非数字 uid 不应命中")
 	}
 }
+
+// TestBotScopeNarrowsConversationSend 会话频道的 scope 门（P1-3）：会话分支只查
+// 成员表（成员即全权），曾是 scope 判定的绕过点——messages.read 的 bot 在自己
+// 是成员的私聊里 chat.send 也被拒；换 messages.write 的令牌放行并广播给全部成员。
+func TestBotScopeNarrowsConversationSend(t *testing.T) {
+	f := newBotHub(t)
+	ctx := context.Background()
+
+	readPlain, botUID, _ := f.issueBotToken(t, []string{token.ScopeMessagesRead})
+	// 会话成员 = alice(1) + bot；bot 已是服务器成员（夹具），会话不看服务器身份。
+	conv := &store.Channel{Scope: store.ChannelScopeDirect}
+	if err := f.st.CreateConversation(ctx, conv, []int64{1, botUID}); err != nil {
+		t.Fatalf("CreateConversation: %v", err)
+	}
+	convID := strconv.FormatInt(conv.ID, 10)
+
+	// 同一 bot 的写令牌：issueBotToken 每次建新 bot（会话成员随之变化），
+	// 这里给既有 bot 直落一行 kind=bot 令牌。
+	p, err := token.NewPlain(token.KindBot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.st.CreateAPIToken(ctx, &store.APIToken{UserID: botUID, Name: "write",
+		Prefix: p.Prefix, SecretHash: p.Hash, Kind: token.KindBot, Scopes: token.ScopeMessagesWrite}); err != nil {
+		t.Fatal(err)
+	}
+
+	// messages.read：成员但无写 scope → forbidden（修前消息会落库并广播）。
+	bot := f.dialBot(t, readPlain)
+	bot.send(TypeChatSend, ChatSendData{ChannelID: convID, Type: "text", Content: "越权"})
+	wantError(t, bot, ErrCodeForbidden)
+
+	// messages.write：放行，广播目标是全部会话成员（alice 也在内）。
+	a := f.dial("1", "alice")
+	bot2 := f.dialBot(t, p.Token)
+	bot2.send(TypeChatSend, ChatSendData{ChannelID: convID, Type: "text", Content: "bot 受权"})
+	for _, c := range []*wsClient{bot2, a} {
+		env := c.recvUntil(TypeChatMessage)
+		var msg ChatMessageData
+		if err := env.Decode(&msg); err != nil {
+			t.Fatalf("decode chat.message: %v", err)
+		}
+		if msg.Content != "bot 受权" || msg.ChannelID != convID {
+			t.Fatalf("%s 收到的会话载荷不符: %+v", c.user, msg)
+		}
+	}
+}

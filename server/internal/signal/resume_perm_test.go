@@ -7,7 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OpenALC/LiteTalk/server/internal/auth"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/internal/token"
 )
 
 // #102 事件环重放与权限撤销：失去 ViewChannel 之后，续传窗口内不得再补发
@@ -201,5 +203,45 @@ func TestFilterReplayByPermSourceOnError(t *testing.T) {
 	out, withheld := f.hub.filterReplayByPerm(&client{userID: "2"}, []Event{ev})
 	if withheld != 1 || len(out) != 0 {
 		t.Fatalf("故障时应扣留（withheld=%d len=%d）", withheld, len(out))
+	}
+}
+
+// TestResumeConversationReadScope 会话读的续传口径（P1-3）：服务器频道的续传复核
+// 经 CanInServer 做 ViewChannel ∩ scope 交集；会话没有角色位可交，改按主体判定——
+// messages.read / messages.write 持有者照常补发，其余 scope 扣留转全量补拉；
+// JWT 与无 Principal（dev 令牌）不受限。
+func TestResumeConversationReadScope(t *testing.T) {
+	f := newChatFixture(t)
+	conv := &store.Channel{Scope: store.ChannelScopeDirect}
+	if err := f.st.CreateConversation(context.Background(), conv, []int64{1, 2}); err != nil {
+		t.Fatalf("CreateConversation: %v", err)
+	}
+	ev := Event{Seq: 1, Type: TypeChatMessage,
+		Payload: mustMarshal(t, ChatMessageData{ChannelID: strconv.FormatInt(conv.ID, 10), Content: "dm"})}
+
+	mk := func(kind string, scopes []string) *client {
+		return &client{userID: "1", principal: &token.Principal{
+			Claims: &auth.Claims{UserID: 1}, Kind: kind, TokenID: 42, Scopes: scopes,
+		}}
+	}
+	for _, scopes := range [][]string{
+		{token.ScopeMessagesRead},
+		{token.ScopeMessagesWrite},
+		{token.ScopeMessagesRead, token.ScopeMessagesWrite},
+	} {
+		if out, withheld := f.hub.filterReplayByPerm(mk(token.KindPAT, scopes), []Event{ev}); withheld != 0 || len(out) != 1 {
+			t.Fatalf("scope %v 应照常补发：withheld=%d len(out)=%d", scopes, withheld, len(out))
+		}
+	}
+	// 无读写消息能力的 scope：扣留（调用方转 invalid_session → REST 全量补拉）。
+	if out, withheld := f.hub.filterReplayByPerm(mk(token.KindPAT, []string{token.ScopeAttachmentsWrite}), []Event{ev}); withheld != 1 || len(out) != 0 {
+		t.Fatalf("attachments.write 应扣留会话事件：withheld=%d len(out)=%d", withheld, len(out))
+	}
+	// JWT 主体与无 Principal（dev 令牌）不受限。
+	if out, withheld := f.hub.filterReplayByPerm(mk(token.KindJWT, nil), []Event{ev}); withheld != 0 || len(out) != 1 {
+		t.Fatalf("JWT 应照常补发：withheld=%d len(out)=%d", withheld, len(out))
+	}
+	if out, withheld := f.hub.filterReplayByPerm(&client{userID: "1"}, []Event{ev}); withheld != 0 || len(out) != 1 {
+		t.Fatalf("dev 令牌应照常补发：withheld=%d len(out)=%d", withheld, len(out))
 	}
 }

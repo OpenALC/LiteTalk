@@ -22,8 +22,24 @@ const (
 	tokenRevokeLimit = 30
 )
 
-// ListTokens GET /api/v1/tokens（只回元数据，无 token 字段）。
+// requireJWTPrincipal 令牌管理面的主体门（P1-1）：签发/列举只认 JWT 主体。
+// 令牌（pat/bot）的 scope 是上限而不是授予，任何非空集合都拦不住「先换
+// guild.manage 再行事」的自签提权——签出的新令牌还不随原令牌吊销而失效，
+// 等于给每个受限令牌留了持久化后门。PAT/bot 一律 403；JWT 行为不变。
+func requireJWTPrincipal(ctx context.Context) *apiErr {
+	p := token.PrincipalFromContext(ctx)
+	if p == nil || p.Kind == token.KindJWT {
+		return nil
+	}
+	return errf(http.StatusForbidden, "token_management_forbidden",
+		"令牌管理仅限登录会话（JWT），访问令牌不可签发或列举其它令牌")
+}
+
+// ListTokens GET /api/v1/tokens（只回元数据，无 token 字段；仅限 JWT 主体，P1-1）。
 func (s *Server) ListTokens(ctx context.Context, request ListTokensRequestObject) (ListTokensResponseObject, error) {
+	if e := requireJWTPrincipal(ctx); e != nil {
+		return nil, e
+	}
 	c := currentUser(ctx)
 	rows, err := s.store.APITokensOfUser(ctx, c.UserID)
 	if err != nil {
@@ -36,10 +52,13 @@ func (s *Server) ListTokens(ctx context.Context, request ListTokensRequestObject
 	return ListTokens200JSONResponse(out), nil
 }
 
-// CreateToken POST /api/v1/tokens：校验 scope 白名单 → 生成明文 → 落库 →
-// 响应带一次性明文。空 scopes 明确 400（空 scope = 无权限，不是全权限）；
-// 未知/重复 scope 同样 400。
+// CreateToken POST /api/v1/tokens：仅限 JWT 主体（P1-1，先于频控与 body 校验）。
+// 校验 scope 白名单 → 生成明文 → 落库 → 响应带一次性明文。空 scopes 明确 400
+// （空 scope = 无权限，不是全权限）；未知/重复 scope 同样 400。
 func (s *Server) CreateToken(ctx context.Context, request CreateTokenRequestObject) (CreateTokenResponseObject, error) {
+	if e := requireJWTPrincipal(ctx); e != nil {
+		return nil, e
+	}
 	c := currentUser(ctx)
 	if e := s.allowRate(ctx, "tok:create:"+strconv.FormatInt(c.UserID, 10),
 		tokenCreateLimit, time.Hour, "操作过于频繁，请稍后再试"); e != nil {
@@ -106,6 +125,8 @@ func (s *Server) CreateToken(ctx context.Context, request CreateTokenRequestObje
 }
 
 // RevokeToken DELETE /api/v1/tokens/{id}：吊销立即生效（校验路径不缓存 Principal）。
+// 主体口径（P1-1）：任何主体都可吊销**自己握着的那张**令牌（pat/bot 按 TokenID
+// 匹配——凭据泄露后的自毁通道）；管理其它令牌（含本人的其它令牌）仅限 JWT。
 // 跨用户访问他人令牌与不存在统一 404（不可区分，避免枚举）；重复吊销幂等 200。
 func (s *Server) RevokeToken(ctx context.Context, request RevokeTokenRequestObject) (RevokeTokenResponseObject, error) {
 	c := currentUser(ctx)
@@ -125,6 +146,11 @@ func (s *Server) RevokeToken(ctx context.Context, request RevokeTokenRequestObje
 	}
 	if row.UserID != c.UserID {
 		return nil, errf(http.StatusNotFound, "not_found", "令牌不存在")
+	}
+	// 令牌主体只能自毁（TokenID 匹配）；签发/列举的门在 requireJWTPrincipal。
+	if p := token.PrincipalFromContext(ctx); p != nil && p.Kind != token.KindJWT && p.TokenID != row.ID {
+		return nil, errf(http.StatusForbidden, "token_management_forbidden",
+			"访问令牌只能吊销自身（泄露自毁），管理其它令牌需登录会话（JWT）")
 	}
 	if row.RevokedAt == nil {
 		if err := s.store.RevokeAPIToken(ctx, row.ID, time.Now()); err != nil {
