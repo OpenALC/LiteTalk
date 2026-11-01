@@ -6,9 +6,18 @@ import vue from '@vitejs/plugin-vue'
 // strictPort 防止端口被占用时 vite 静默换端口、导致 Go 侧连不上 dev server。
 const port = process.env.WAILS_VITE_PORT ? Number(process.env.WAILS_VITE_PORT) : 9245
 
-// Web 客户端版本（#50）：单一事实源是本 package.json 的 version 字段，经
-// define 注入 src/api/web/version.ts——发版只递增这一处，不再有手写常量漂移。
+// Web 客户端版本（#50）：默认源是本 package.json 的 version 字段，经 define
+// 注入 src/api/web/version.ts。CI 标签构建（#119）用 LITELTALK_VERSION 覆盖，
+// 让浏览器版版本号与发布标签一致；缺失/空值回落 package.json。导出供单测覆盖。
+export function resolveWebVersion(
+  pkgVersion: string,
+  env: { LITELTALK_VERSION?: string } = process.env,
+): string {
+  return env.LITELTALK_VERSION?.trim() || pkgVersion
+}
+
 const pkgVersion = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version as string
+const webClientVersion = resolveWebVersion(pkgVersion)
 
 // CSP 头（#50）：只注入 web 构建（--mode web）。桌面构建由 Wails 资产通道
 // 加载，注入 meta CSP 反而可能拦掉 webview 内部资源，所以桌面路径原样返回。
@@ -46,7 +55,7 @@ function webOnlyCSP(): import('vite').Plugin {
 export default defineConfig(({ mode }) => ({
   plugins: [vue(), webOnlyCSP()],
   define: {
-    __LITETALK_WEB_VERSION__: JSON.stringify(pkgVersion),
+    __LITETALK_WEB_VERSION__: JSON.stringify(webClientVersion),
   },
   base: mode === 'web' ? '/' : './',
   server: {
