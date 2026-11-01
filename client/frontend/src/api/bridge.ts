@@ -17,6 +17,10 @@ export type GoApp = {
   GetVersion(): Promise<string>
   GetAuthConfig(): Promise<ServerConfig>
   GetHibernateMode(): Promise<string> // off / hibernate / destroy
+  // HibernateDestroyAvailable 当前构建是否允许 destroy（彻底卸载）：
+  // GTK4 构建（Linux 默认路径）因 wails beta.30 上游窗口销毁泄漏报 false（#5），
+  // 设置页据此裁剪该选项；gtk3/Windows/macOS 恒 true。
+  HibernateDestroyAvailable(): Promise<boolean>
   SetHibernateMode(mode: string): Promise<void>
   GetServerConfig(): Promise<ConnConfigView>
   SetServerConfig(baseURL: string): Promise<void>
@@ -204,6 +208,8 @@ const mockApp: GoApp = {
     return { auth_mode: 'full' as const, mail_configured: false, self_host: true, bootstrap_required: true }
   },
   async GetHibernateMode() { return 'off' },
+  // 浏览器开发环境无 GTK4 概念：保持三态选项全部可见，便于联调 UI。
+  async HibernateDestroyAvailable() { return true },
   async SetHibernateMode() {},
   async QuitApp() {},
   async TrayReady() { return true },

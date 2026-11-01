@@ -296,6 +296,11 @@ export const webApp: GoApp = {
     return 'off' // 浏览器无休眠概念，设置页只读展示
   },
 
+  // 浏览器托管构建没有 GTK4 泄漏问题：保持三态选项全部可见（实际保存 DESKTOP_ONLY）。
+  async HibernateDestroyAvailable(): Promise<boolean> {
+    return true
+  },
+
   async SetHibernateMode(_mode: string): Promise<void> {
     throw new Error(DESKTOP_ONLY)
   },
