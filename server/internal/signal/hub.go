@@ -30,6 +30,12 @@ const (
 	// session.kicked 发送窗口（§0.6：300~500ms）
 	writeTimeout = 10 * time.Second // 单条下行写超时
 
+	// 令牌会话复查（PR118 P2-2）：PAT/bot 连接在心跳时按 tokenID 复查吊销/过期。
+	// 复查间隔与 last_used_at 落库节流同量级（60s）——25s 一拍的心跳不该每次都打库；
+	// 单次复查查询的时限独立于心跳超时，卡住的 store 查询不能拖死心跳节拍。
+	defaultTokenRecheckEvery = 60 * time.Second
+	tokenRecheckTimeout      = 5 * time.Second
+
 	// 优雅关闭（#21）：server.shutdown 的发送窗口、等待 cleanup 的上限与轮询间隔。
 	// 超时后打日志继续关闭——不能因为个别连接卡住就拖住进程退出。
 	shutdownSendWindow  = 150 * time.Millisecond
@@ -57,6 +63,11 @@ type Hub struct {
 	// nil = 不做 WS 侧 scope 收窄。
 	tokens TokenVerifier
 
+	// sessionChecks 令牌主体会话存续复查（PR118 P2-2）：ChatDeps.SessionChecks
+	// 启动期注入，运行期只读。PAT/bot 连接在心跳时按 tokenID 复查吊销/过期，
+	// 失效即断连。nil = 不复查（测试/过渡，旧行为）。
+	sessionChecks TokenSessionChecker
+
 	// offline 离线边沿接收方（#53）：SetOfflineNotifier 启动阶段注入一次，
 	// 运行期只读。
 	offline OfflineNotifier
@@ -66,11 +77,12 @@ type Hub struct {
 	webhooks WebhookOutlet
 
 	// 心跳参数（默认值见包常量；测试可缩短）
-	heartbeatEvery time.Duration
-	pongWait       time.Duration
-	readIdle       time.Duration
-	presenceTTL    time.Duration // 在线态 TTL（默认 defaultPresenceTTL，测试可缩短）
-	shutdownWait   time.Duration // Shutdown 等待 cleanup 的上限（默认 defaultShutdownWait，测试可缩短）
+	heartbeatEvery    time.Duration
+	pongWait          time.Duration
+	readIdle          time.Duration
+	tokenRecheckEvery time.Duration // 令牌会话复查最小间隔（P2-2，测试可缩短）
+	presenceTTL       time.Duration // 在线态 TTL（默认 defaultPresenceTTL，测试可缩短）
+	shutdownWait      time.Duration // Shutdown 等待 cleanup 的上限（默认 defaultShutdownWait，测试可缩短）
 
 	// shuttingDown 关闭标记（#21）：在 Shutdown 广播/断连之前置位，ServeWS 据此
 	// 拒绝新连接，杜绝「广播之后仍有新 WS 接入」的窗口。
@@ -175,6 +187,9 @@ type client struct {
 	readCancel context.CancelFunc
 	lastAct    atomic.Int64 // 最近活动（UnixNano）：数据读或心跳 pong
 	closing    atomic.Bool  // CloseNow 幂等
+	// lastSessionCheck 上次令牌会话复查时刻（UnixNano，P2-2）：握手 Verify 记为
+	// 首次复查点，之后与 tokenRecheckEvery 比较节流。只有心跳 goroutine 读写。
+	lastSessionCheck atomic.Int64
 
 	mu     sync.Mutex
 	roomID string // 当前所在频道（空 = 未加入）
@@ -264,6 +279,10 @@ type ChatDeps struct {
 	// 同一 *token.Service 实例（一条实现，不另建）。nil 时不做 WS 侧 scope 收窄
 	// （JWT/dev 连接本就不受限，旧行为不变）。
 	Tokens TokenVerifier
+	// SessionChecks 令牌主体会话存续复查（P2-2）：PAT/bot 连接在心跳时按 tokenID
+	// 复查吊销/过期，失效即断连（泄漏凭据不再长期持有连接）。nil 不复查。
+	// 生产注入 main 侧基于 store.APITokenByID 的适配实现。
+	SessionChecks TokenSessionChecker
 }
 
 // TokenVerifier 校验 ltk_ 明文令牌并返回主体（#51）。*token.Service 满足。
@@ -272,6 +291,15 @@ type ChatDeps struct {
 // 无共享可变登记表（不同令牌不同连接不会串）+ 吊销在握手时刻再核一遍。
 type TokenVerifier interface {
 	Verify(ctx context.Context, plain string) (*token.Principal, error)
+}
+
+// TokenSessionChecker 令牌会话存续复查（PR118 P2-2）：按 tokenID 查询令牌是否
+// 仍然有效（未吊销、未过期）。与 TokenVerifier 互补——连接建立后 hub 手里只剩
+// Principal.TokenID，没有明文可重放；JWT/dev 主体无 TokenID 不复查（exp 由握手
+// 与旧令牌过渡期兜底）。生产由 main 用 store 的令牌行只读查询适配注入；
+// nil = 不复查（测试/过渡，旧行为：吊销只对新连接与 REST 生效）。
+type TokenSessionChecker interface {
+	SessionValid(ctx context.Context, tokenID int64) (bool, error)
 }
 
 // NewHub 构造信令 hub。maxMembers <= 0 时取 SFU 的上限。
@@ -306,9 +334,11 @@ func NewHub(s *sfu.SFU, authn Authenticator, sess *auth.SessionIndex, logger *lo
 		offerRate:         chat.OfferRate,
 		authz:             az,
 		tokens:            chat.Tokens,
+		sessionChecks:     chat.SessionChecks,
 		heartbeatEvery:    defaultHeartbeatEvery,
 		pongWait:          defaultPongWait,
 		readIdle:          defaultReadIdle,
+		tokenRecheckEvery: defaultTokenRecheckEvery,
 		rooms:             make(map[string]*roomState),
 		conns:             make(map[connKey]*client),
 		userRooms:         make(map[string]string),
@@ -408,6 +438,9 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 		readCancel: cancel,
 	}
 	c.lastAct.Store(time.Now().UnixNano())
+	// 握手 Verify 即首次会话复查点（P2-2）：从此刻起算 tokenRecheckEvery 的节流窗，
+	// 首次心跳复查落在建连 ≥60s 之后，不给热路径加压。
+	c.lastSessionCheck.Store(time.Now().UnixNano())
 
 	// 注册（§0.6 踢人序）：先登记新连接，再处理被顶替的旧连接。
 	// becameOnline 是 register 在 h.mu 内判定的 0→1 边沿（#11）：只有真正
@@ -731,7 +764,54 @@ func (h *Hub) heartbeatLoop(ctx context.Context, c *client) {
 			// 会永久保住断线旧 sid 的环），没有这一拍，30 分钟没消息的在线会话
 			// 会被 sweep 误淘汰、之后 resume 得到 unknown_session。
 			h.evlog.Touch(c.sid)
+			h.recheckTokenSession(ctx, c) // 令牌主体会话复查（P2-2），节流见函数注释
 		}
+	}
+}
+
+// recheckTokenSession 令牌主体会话存续复查（PR118 P2-2）：PAT/bot 令牌在连接建立
+// 后被吊销/过期时，最迟在复查点之后的下一次心跳断开——「吊销立即生效」此前只对
+// REST 与新连接成立，泄漏的凭据可长期持有 WS 连接。
+//
+// 节流：每个连接记上次复查时刻（握手 Verify 记为首个复查点），距它不足
+// tokenRecheckEvery（默认 60s，与 last_used_at 落库节流同量级）不查库——25s 一拍
+// 的心跳不该每拍都打库。节流判定用 CAS 抢占：同一连接只有心跳一个 goroutine
+// 进来，CAS 只是防御性的。
+// 实例纪律：复查跑在本连接自己的心跳 goroutine 上，closeNow 关的就是这条连接，
+// 不做按 uid/tokenID 的盲扫，无跨实例误伤面。
+// fail-open（查询故障不断连）：store 抖动不应误杀在线会话——JWT 主体被吊销不了，
+// 令牌误断同样代价高；下一个复查点会再查，吊销最多多存活一个复查周期。仅
+// 「确认失效」才关连接。
+func (h *Hub) recheckTokenSession(ctx context.Context, c *client) {
+	if h.sessionChecks == nil || c.principal == nil || c.principal.Kind == token.KindJWT {
+		return // JWT/dev 连接无 TokenID，不复查
+	}
+	tokenID := c.principal.TokenID
+	if tokenID <= 0 {
+		return
+	}
+	every := h.tokenRecheckEvery
+	if every <= 0 {
+		every = defaultTokenRecheckEvery
+	}
+	now := time.Now()
+	last := c.lastSessionCheck.Load()
+	if now.Sub(time.Unix(0, last)) < every {
+		return
+	}
+	if !c.lastSessionCheck.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+	cctx, ccancel := context.WithTimeout(ctx, tokenRecheckTimeout)
+	valid, err := h.sessionChecks.SessionValid(cctx, tokenID)
+	ccancel()
+	if err != nil {
+		h.log.Printf("ws: %s 令牌 %d 会话复查失败（fail-open 保留连接，下个复查点再查）: %v", c.userID, tokenID, err)
+		return
+	}
+	if !valid {
+		h.log.Printf("ws: %s 令牌 %d 已吊销/过期，关闭连接", c.userID, tokenID)
+		c.closeNow()
 	}
 }
 

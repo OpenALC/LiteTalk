@@ -297,6 +297,9 @@ func main() {
 		// 权限检查经 authCtx 汇聚到 authz.CanInServer 的 scope 交集点。与 REST
 		// 中间件、握手 authenticator 是同一个 token.Service 实例。
 		Tokens: apiTokenSvc,
+		// 令牌会话复查（PR118 P2-2）：PAT/bot 连接心跳时按 tokenID 复查吊销/过期，
+		// 失效即断连（60s 节流，见 signal.hub）。复用同一 store 的只读点查。
+		SessionChecks: apitokenSessionChecker{st: st},
 	})
 	// LITETALK_PROTOCOL_MAX：服务端宣布的协议版本上限（#29 逃生阀）。
 	// 0/缺省 = 构建期 ProtocolVersionMax；调小可临时挡住过新的客户端区间。
@@ -719,6 +722,34 @@ func apiTokenIdentity(svc *token.Service, plain string) (id signal.Identity, han
 		Username:         p.Nickname,
 		SkipSessionCheck: true,
 	}, true, nil
+}
+
+// apitokenSessionChecker 把 store 的令牌行只读查询适配成 hub 的
+// signal.TokenSessionChecker（PR118 P2-2）：WS 心跳按 tokenID 复查令牌吊销/过期，
+// 泄漏的 PAT/bot 凭据吊销后不再长期持有连接。只判 revoked_at/expires_at——属主
+// 停用等其余失效路径仍由握手 Verify 与 REST 实时校验兜底，复查不做重复判定。
+type apitokenSessionChecker struct {
+	st store.Store
+}
+
+// SessionValid 满足 signal.TokenSessionChecker。行已删（并发删除窗口）按失效处理；
+// 查询故障原样上抛，由 hub 侧 fail-open（心跳复查不断在线会话）。
+func (c apitokenSessionChecker) SessionValid(ctx context.Context, tokenID int64) (bool, error) {
+	row, err := c.st.APITokenByID(ctx, tokenID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	now := time.Now()
+	if row.RevokedAt != nil && !now.Before(*row.RevokedAt) {
+		return false, nil
+	}
+	if row.ExpiresAt != nil && !now.Before(*row.ExpiresAt) {
+		return false, nil
+	}
+	return true, nil
 }
 
 // ---- 环境变量小工具 ----
