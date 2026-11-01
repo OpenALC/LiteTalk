@@ -200,6 +200,12 @@ func (s *Service) Verify(ctx context.Context, plain string) (*Principal, error) 
 	if subtle.ConstantTimeCompare([]byte(HashSecret(secret)), []byte(row.SecretHash)) != 1 {
 		return nil, ErrInvalidToken
 	}
+	// 明文里的 kind 只是形态标签（检索/展示用），不能当作凭据内容：它必须与
+	// 落库行的 kind 一致。不一致与「令牌不存在」返回同一个错误，避免让持有
+	// 合法 secret 的人借错误差异推断行的种类。
+	if kind != row.Kind {
+		return nil, ErrInvalidToken
+	}
 	now := s.now()
 	if row.RevokedAt != nil && !now.Before(*row.RevokedAt) {
 		return nil, ErrInvalidToken
@@ -268,6 +274,15 @@ func WithPrincipal(ctx context.Context, p *Principal) context.Context {
 func PrincipalFromContext(ctx context.Context) *Principal {
 	p, _ := ctx.Value(principalCtxKey{}).(*Principal)
 	return p
+}
+
+// WithoutPrincipal 返回不带 Principal 的 ctx（其余值、取消与截止时间保留）。
+// 跨主体权限判定专用：CanInServer 会把 ctx 里令牌的 scope 上限与角色权限求交集，
+// 判定收件人/被提及者的可见性时不能带当前请求的主体，否则发送者凭据会裁别人
+// 的权限。实现是写入一个类型化 nil——PrincipalFromContext 断言出 nil 指针，
+// 与「无 Principal」走同一路径；不用 context.Background() 是为了不丢取消信号。
+func WithoutPrincipal(ctx context.Context) context.Context {
+	return context.WithValue(ctx, principalCtxKey{}, (*Principal)(nil))
 }
 
 // ScopeLimitFromContext 供 authz 的集中判定点取 scope 上限：
