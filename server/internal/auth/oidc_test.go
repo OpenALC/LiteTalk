@@ -52,6 +52,12 @@ type fakeCode struct {
 	email         string
 	emailVerified bool
 	used          bool
+
+	// aud/azp/iat 覆盖载荷声明（零值 = 标准形态：aud=clientID、无 azp、iat=当前）。
+	aud     any
+	azp     *string
+	iat     int64
+	omitIAT bool
 }
 
 func newFakeIdP(t *testing.T) *fakeIdP {
@@ -151,10 +157,15 @@ func bigE(e int) []byte {
 // mintCode 模拟「用户在 IdP 授权页同意」：IdP 签发绑定 challenge/nonce/claims
 // 的授权码。signKey 置 nil 用正常密钥；exp 非 0 覆盖过期时间。
 func (f *fakeIdP) mintCode(challenge, nonce, sub string, exp int64, signKey *rsa.PrivateKey) string {
+	return f.mintCodeWith(fakeCode{challenge: challenge, nonce: nonce, sub: sub, exp: exp, signKey: signKey})
+}
+
+// mintCodeWith 同上，额外载荷声明由调用方直接指定。
+func (f *fakeIdP) mintCodeWith(c fakeCode) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	code := "code-" + randHex8()
-	f.codes[code] = fakeCode{challenge: challenge, nonce: nonce, sub: sub, exp: exp, signKey: signKey}
+	f.codes[code] = c
 	return code
 }
 
@@ -175,13 +186,28 @@ func (f *fakeIdP) signIDToken(c fakeCode) string {
 		exp = time.Now().Add(time.Hour).Unix()
 	}
 	header, _ := json.Marshal(map[string]string{"alg": "RS256", "kid": f.kid})
-	payload, _ := json.Marshal(map[string]any{
-		"iss": f.issuer, "sub": c.sub, "aud": f.clientID,
-		"exp": exp, "iat": time.Now().Unix(),
+	aud := c.aud
+	if aud == nil {
+		aud = f.clientID
+	}
+	iat := c.iat
+	if iat == 0 {
+		iat = time.Now().Unix()
+	}
+	claims := map[string]any{
+		"iss": f.issuer, "sub": c.sub, "aud": aud,
+		"exp": exp, "iat": iat,
 		"nonce": c.nonce,
 		"email": "oidc-user@example.com", "email_verified": true,
 		"name": "OIDC 用户", "preferred_username": "oidcuser",
-	})
+	}
+	if c.azp != nil {
+		claims["azp"] = *c.azp
+	}
+	if c.omitIAT {
+		delete(claims, "iat")
+	}
+	payload, _ := json.Marshal(claims)
 	signingInput := base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(payload)
 	digest := sha256.Sum256([]byte(signingInput))
 	sig, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, digest[:])
@@ -432,6 +458,88 @@ func TestOIDCExchangeTimeout(t *testing.T) {
 	// 超时 250ms + 调度余量；永久阻塞的旧实现到不了这里的断言。
 	if elapsed > 3*time.Second {
 		t.Fatalf("Exchange %v 才返回，未在超时内失败", elapsed)
+	}
+}
+
+// exchangeWith 用给定载荷声明走一次完整交换（每次生成独立 verifier/授权码，
+// 授权码在 IdP 侧一次性消费）。
+func exchangeWith(t *testing.T, f *fakeIdP, p *OIDCProvider, c fakeCode) (*OIDCClaims, error) {
+	t.Helper()
+	verifier, challenge, err := NewOIDCPKCE()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.challenge = challenge
+	code := f.mintCodeWith(c)
+	return p.Exchange(context.Background(), code, verifier, c.nonce)
+}
+
+// TestOIDCIDTokenAZP azp 与多 aud 的对应关系：azp 出现时必须等于 client_id；
+// 多个 aud 时 azp 必须出现；单 aud 无 azp 合规。
+func TestOIDCIDTokenAZP(t *testing.T) {
+	f := newFakeIdP(t)
+	p := newTestProvider(t, f)
+	ptr := func(s string) *string { return &s }
+	for _, tc := range []struct {
+		name    string
+		aud     any
+		azp     *string
+		wantErr bool
+	}{
+		{"单 aud 无 azp 允许", nil, nil, false},
+		{"单 aud 数组无 azp 允许", []any{f.clientID}, nil, false},
+		{"单 aud azp 正确", nil, ptr(f.clientID), false},
+		{"单 aud azp 错误", nil, ptr("other-client"), true},
+		{"多 aud 无 azp 拒绝", []any{f.clientID, "other-client"}, nil, true},
+		{"多 aud azp 正确", []any{f.clientID, "other-client"}, ptr(f.clientID), false},
+		{"多 aud azp 错误", []any{f.clientID, "other-client"}, ptr("other-client"), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := exchangeWith(t, f, p, fakeCode{sub: "sub-azp", aud: tc.aud, azp: tc.azp})
+			if tc.wantErr {
+				if !errors.Is(err, ErrOIDCToken) {
+					t.Fatalf("应 ErrOIDCToken，实际 %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("应通过，实际 %v", err)
+			}
+		})
+	}
+}
+
+// TestOIDCIDTokenIAT iat 合理性：缺失/未来超时钟偏差/过旧一律拒绝，
+// 时钟偏差内的未来时间放行（IdP 与本机时钟可能有小幅漂移）。
+func TestOIDCIDTokenIAT(t *testing.T) {
+	now := time.Now()
+	f := newFakeIdP(t)
+	p := newTestProvider(t, f)
+	p.now = func() time.Time { return now }
+	for _, tc := range []struct {
+		name    string
+		iat     int64
+		omit    bool
+		wantErr bool
+	}{
+		{"正常", now.Unix(), false, false},
+		{"时钟偏差内的未来", now.Add(oidcClockSkew / 2).Unix(), false, false},
+		{"未来超出偏差", now.Add(2 * oidcClockSkew).Unix(), false, true},
+		{"过旧超出上限", now.Add(-oidcIATMaxAge - time.Minute).Unix(), false, true},
+		{"缺失 iat", 0, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := exchangeWith(t, f, p, fakeCode{sub: "sub-iat", iat: tc.iat, omitIAT: tc.omit})
+			if tc.wantErr {
+				if !errors.Is(err, ErrOIDCToken) {
+					t.Fatalf("应 ErrOIDCToken，实际 %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("应通过，实际 %v", err)
+			}
+		})
 	}
 }
 
