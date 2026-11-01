@@ -332,12 +332,15 @@ func (h *Hub) broadcastEventCh(uids map[string]bool, channelID, msgType string, 
 	ts := time.Now().UnixMilli()
 
 	// P1-7：写环之前先判定令牌连接，才知道哪些 sid 要跳过。
+	// P1-7 P3：tokenConns 为 0 时整段跳过（不扫 conns、不分配 visCache/hidden）。这只是
+	// 性能短路，不决定正确性：计数读到 0 之后才注册的令牌连接，由下面目标循环里逐连接
+	// 的 isTokenConn 判定兜底，实时侧仍 fail-closed。
 	var (
 		visCache map[string]bool
 		hidden   map[string]bool // 不可见令牌连接持有的 sid
 		degraded json.RawMessage // presence.update 对不可见连接的降级载荷
 	)
-	if channelID != "" {
+	if channelID != "" && h.tokenConns.Load() > 0 {
 		visCache = make(map[string]bool)
 		for _, c := range h.tokenConnsOf(uids) {
 			if c.sid != "" && !h.tokenConnVisible(c, channelID, visCache) {
@@ -376,12 +379,20 @@ func (h *Hub) broadcastEventCh(uids map[string]bool, channelID, msgType string, 
 	}
 	h.mu.Unlock()
 	for _, c := range targets {
-		if channelID != "" && isTokenConn(c) && !h.tokenConnVisible(c, channelID, visCache) {
-			// 快照之后才注册的令牌连接也在这里补判（命中缓存或锁外查询）。
-			if degraded != nil {
-				h.deliverEvent(c, msgType, degraded, ts, seqs[c.sid])
+		if channelID != "" && isTokenConn(c) {
+			// 快照之后才注册的令牌连接（或计数短路时的任意令牌连接）在这里补判，
+			// 命中缓存或锁外查询。短路时 visCache 尚未分配，惰性建。
+			// 该窗口里 degraded 没有预先算出，不可见连接的 presence.update 会被丢弃而不是降级；
+			// 生产里令牌连接没有 sid、不进环，所以不会产生 seq 空洞。
+			if visCache == nil {
+				visCache = make(map[string]bool, 1)
 			}
-			continue
+			if !h.tokenConnVisible(c, channelID, visCache) {
+				if degraded != nil {
+					h.deliverEvent(c, msgType, degraded, ts, seqs[c.sid])
+				}
+				continue
+			}
 		}
 		h.deliverEvent(c, msgType, payload, ts, seqs[c.sid])
 	}
