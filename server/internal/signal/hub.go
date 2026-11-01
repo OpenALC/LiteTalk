@@ -65,6 +65,10 @@ type Hub struct {
 	// 运行期只读。与 offline 同口径；实现只做非阻塞入队。
 	webhooks WebhookOutlet
 
+	// push 消息推送派发器（P1-4，#53）：SetPushNotifier 启动阶段注入一次，
+	// 运行期只读。与 offline/webhooks 同口径；实现只做非阻塞入队。
+	push PushNotifier
+
 	// 心跳参数（默认值见包常量；测试可缩短）
 	heartbeatEvery time.Duration
 	pongWait       time.Duration
@@ -241,6 +245,15 @@ type WebhookOutlet interface {
 	OnWebhookEvent(eventType, channelID string, payload json.RawMessage)
 }
 
+// PushNotifier 消息推送派发器（P1-4，#53，internal/push.Broker 满足）：
+// 创建管线的推送步经它派发。实现只做一次非阻塞入队（带缓冲 channel + worker），
+// 离线判定、节流与设备查询全在 worker——广播路径绝不阻塞。
+type PushNotifier interface {
+	// NotifyMessage 频道消息触发（@提及/私聊判定在实现内部）。ch 与 msg 由
+	// 调用方保证此后不再修改。
+	NotifyMessage(ctx context.Context, ch *store.Channel, msg *store.Message, senderNick string)
+}
+
 // ChatDeps 聊天持久化与频控依赖（可零值：仅广播不落库、不限流）。
 type ChatDeps struct {
 	Store  ChatStore
@@ -334,6 +347,10 @@ func (h *Hub) SetOfflineNotifier(n OfflineNotifier) { h.offline = n }
 // SetWebhookOutlet 注册出站 webhook 事件出口（#52）。仅限启动阶段调用，
 // 与 SetOfflineNotifier 同口径。
 func (h *Hub) SetWebhookOutlet(n WebhookOutlet) { h.webhooks = n }
+
+// SetPushNotifier 注册消息推送派发器（P1-4，#53）。仅限启动阶段调用，
+// 与 SetOfflineNotifier 同口径。
+func (h *Hub) SetPushNotifier(n PushNotifier) { h.push = n }
 
 // ServeWS 处理 GET /ws?token=<jwt|dev-xxx>。
 func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {

@@ -377,6 +377,10 @@ func main() {
 	})
 	if pushBroker != nil {
 		hub.SetOfflineNotifier(pushBroker)
+		// 消息创建管线（P1-4/P2-1）：推送派发器注入 hub——WS/REST/入站三条入口
+		// 的消息后处理都经 hub 的单一管线，推送在管线的最后一步异步派发。
+		// 启动阶段注入一次，运行期只读（与 SetOfflineNotifier 同口径）。
+		hub.SetPushNotifier(pushBroker)
 		defer pushBroker.Close()
 	}
 
