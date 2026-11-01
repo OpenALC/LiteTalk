@@ -81,7 +81,7 @@ func (h *Hub) AfterMessagePersisted(ctx context.Context, ch *store.Channel, msg 
 	if err != nil {
 		h.log.Printf("chat: 消息 %d 广播载荷补全失败: %v", msg.ID, err)
 	}
-	h.broadcastEvent(uids, TypeChatMessage, out)
+	h.broadcastEventCh(uids, strconv.FormatInt(ch.ID, 10), TypeChatMessage, out)
 	// 未读计数（#40）：广播之后给每个收件人推自己的精确计数，失败只记日志。
 	h.broadcastChatUnread(ctx, ch.ID, uids)
 	// 推送（#53）：@提及/私聊判定在 Broker worker（全设备离线才推），未注入
@@ -378,7 +378,7 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 		}
 	}
 	h.mu.Unlock()
-	h.broadcastEvent(uids, TypeChatMessage, out)
+	h.broadcastEventCh(uids, d.ChannelID, TypeChatMessage, out)
 }
 
 // broadcastChatUnread 计算并推送 chat.send 落库后各收件人的未读/提及计数。
@@ -449,7 +449,7 @@ func (h *Hub) BroadcastMessageEdited(uids []string, channelID, messageID, conten
 	if len(targets) == 0 {
 		return
 	}
-	h.broadcastEvent(targets, TypeMessageEdited, MessageEditedData{
+	h.broadcastEventCh(targets, channelID, TypeMessageEdited, MessageEditedData{
 		ChannelID: channelID,
 		MessageID: messageID,
 		Content:   content,
@@ -465,7 +465,7 @@ func (h *Hub) BroadcastMessageDeleted(uids []string, channelID, messageID string
 	if len(targets) == 0 {
 		return
 	}
-	h.broadcastEvent(targets, TypeMessageDeleted, MessageDeletedData{
+	h.broadcastEventCh(targets, channelID, TypeMessageDeleted, MessageDeletedData{
 		ChannelID: channelID,
 		MessageID: messageID,
 	})
@@ -482,7 +482,7 @@ func (h *Hub) BroadcastChannelUnread(channelID string, counts map[string]store.U
 		if uid == "" {
 			continue
 		}
-		h.broadcastEvent(map[string]bool{uid: true}, TypeChannelUnread, ChannelUnreadData{
+		h.broadcastEventCh(map[string]bool{uid: true}, channelID, TypeChannelUnread, ChannelUnreadData{
 			ChannelID:    channelID,
 			UnreadCount:  int64(u.UnreadCount),
 			MentionCount: int64(u.MentionCount),
@@ -508,7 +508,7 @@ func (h *Hub) BroadcastChannelAudio(uids []string, channelID string, bitrateKbps
 	if len(targets) == 0 || channelID == "" {
 		return
 	}
-	h.broadcastEvent(targets, TypeChannelAudio, ChannelAudioData{
+	h.broadcastEventCh(targets, channelID, TypeChannelAudio, ChannelAudioData{
 		ChannelID:        channelID,
 		AudioBitrateKbps: int64(bitrateKbps),
 		AudioFrameMs:     int64(frameMS),

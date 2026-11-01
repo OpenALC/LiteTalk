@@ -95,6 +95,12 @@ type Hub struct {
 	mu    sync.Mutex
 	rooms map[string]*roomState
 	conns map[connKey]*client // uid+"\x00"+dev → 当前连接（§0.8）
+	// tokenConns conns 中令牌（pat/bot）连接的条数（P1-7 P3）。**只是广播路径的性能
+	// 短路**：为 0 时 broadcastEventCh 不必扫描 conns 找令牌连接。它不决定正确性——
+	// 广播目标循环对每条连接仍逐个判 isTokenConn，快照之后才注册的令牌连接靠那里兜底。
+	// 增减只发生在 register/unregister，与 conns 的改动处于同一把 h.mu 的同一临界区，
+	// 读侧无锁 Load。principal 构造后不变，所以 isTokenConn 对同一连接前后一致。
+	tokenConns atomic.Int64
 	// userRooms uid → 当前语音房 ID（#92 好友频道 presence 反查）。
 	// 只在成员真正写入 room.members[uid] 的同一临界区设置；leaveWorkLocked
 	// 核对 members[uid]==c 且映射值等于本次 roomID 才删除，旧连接迟到的
@@ -535,6 +541,13 @@ func (h *Hub) register(c *client) (old *client, becameOnline bool) {
 	// 插入后数连接数会得到 1，误判成 0→1（P2 重复推送 online）。
 	hadAny := h.connCountLocked(c.userID) > 0
 	h.conns[key] = c
+	// P1-7 P3：计数与 conns 同临界区同步。被顶替的旧连接离开 conns，是令牌连接就要减。
+	if old != nil && isTokenConn(old) {
+		h.tokenConns.Add(-1)
+	}
+	if isTokenConn(c) {
+		h.tokenConns.Add(1)
+	}
 	return old, !hadAny
 }
 
@@ -549,6 +562,10 @@ func (h *Hub) unregister(c *client) (becameOffline bool) {
 		return false // 已被顶替：新连接仍在同一 uid 下，状态未变
 	}
 	delete(h.conns, key)
+	// P1-7 P3：已核对 conns[key]==c 才会走到这里，被顶替的旧连接不会重复减。
+	if isTokenConn(c) {
+		h.tokenConns.Add(-1)
+	}
 	return h.connCountLocked(c.userID) == 0
 }
 
