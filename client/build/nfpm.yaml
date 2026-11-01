@@ -11,7 +11,7 @@ homepage: https://github.com/OpenALC/LiteTalk
 vendor: OpenALC
 description: |
   轻音 LiteTalk 桌面语音联机客户端。
-  基于 Wails v3 构建，运行时依赖 WebKitGTK 4.1（libopus 静态内置）。
+  基于 Wails v3 构建，运行时依赖 GTK4 + WebKitGTK 6.0（libopus 静态内置）。
 contents:
   - src: ./build/bin/LiteTalk
     dst: /usr/bin/litetalk
@@ -46,22 +46,25 @@ contents:
   - src: ./build/third-party
     dst: /usr/share/doc/litetalk/third-party
     type: tree
-# 依赖对齐 WebKitGTK 4.1（gtk3 构建标签）：不再备选 webkit2gtk-4.0，去 portaudio。
+# 依赖对齐默认 GTK4 + WebKitGTK 6.0 路径（v1.10.0 迁移，#5）。
+# 包名按四发行版容器实测闭包写定（CI 的 smoke-client-linux-install 矩阵）：
+# deb 系（Ubuntu 24.04 / Debian 13）两个包同名；rpm 系 Fedora 40 起名为
+# webkitgtk6.0，RHEL 10 系本体不带、需 EPEL 10（见 README 支持矩阵）。
 # 音频后端 miniaudio 在运行时 dlopen alsa / pulse，故仍声明为依赖保证面板可用。
 # libopus 已静态链接进二进制（third_party/opus-linux-*），不再声明运行时依赖。
 overrides:
   deb:
     depends:
-      - libwebkit2gtk-4.1-0
-      - libgtk-3-0
+      - libwebkitgtk-6.0-4
+      - libgtk-4-1
       # WebRTC APM 静态库用 C++ 编写，允许动态依赖系统 libstdc++（#43）。
       - libstdc++6
       - libasound2 | libasound2t64
       - libpulse0 | pipewire-pulse
   rpm:
     depends:
-      - webkit2gtk4.1
-      - gtk3
+      - webkitgtk6.0
+      - gtk4
       # 同上：APM 的静态库需要系统 libstdc++（#43）。
       - libstdc++
       - alsa-lib
