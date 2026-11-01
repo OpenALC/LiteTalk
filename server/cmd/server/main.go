@@ -305,36 +305,10 @@ func main() {
 	// 0/缺省 = 构建期 ProtocolVersionMax；调小可临时挡住过新的客户端区间。
 	hub.SetProtoMax(envInt("LITETALK_PROTOCOL_MAX", 0))
 
-	// TURN 短期凭证签发（coturn use-auth-secret，§5.4）。api_token（#54）同样受理：
-	// 凭证只含 uid 身份（scope 不参与），入房权限由 channel.join 的 authz 判定把关。
-	var rtcAuth rtcapi.UserFromToken
-	if devAuth {
-		rtcAuth = func(t string) (string, error) {
-			if !strings.HasPrefix(t, token.PlainPrefix) {
-				if claims, err := jwtSigner.ParseAccess(t); err == nil {
-					return strconv.FormatInt(claims.UserID, 10), nil
-				}
-			} else if p, err := apiTokenSvc.Verify(context.Background(), t); err == nil {
-				return strconv.FormatInt(p.UserID, 10), nil
-			}
-			return devUserID(t)
-		}
-	} else {
-		rtcAuth = func(t string) (string, error) {
-			if strings.HasPrefix(t, token.PlainPrefix) {
-				p, err := apiTokenSvc.Verify(context.Background(), t)
-				if err != nil {
-					return "", err
-				}
-				return strconv.FormatInt(p.UserID, 10), nil
-			}
-			claims, err := jwtSigner.ParseAccess(t)
-			if err != nil {
-				return "", err
-			}
-			return strconv.FormatInt(claims.UserID, 10), nil
-		}
-	}
+	// TURN 短期凭证签发（coturn use-auth-secret，§5.4）。api_token（#54）同样受理，
+	// 但令牌主体必须显式携带 voice.connect scope（PR118 P2-3）；JWT 主体不变
+	// （角色权限由 channel.join 的 authz 判定把关）。
+	rtcAuth := newRTCAuth(jwtSigner, apiTokenSvc, devAuth)
 	// TURN 短期凭证签发 URLs（§0.4）：显式 env 优先；未设且内置 TURN 启用则按
 	// host（LITETALK_DOMAIN，否则 LITETALK_SFU_IP）回填。生产模式在内置 TURN
 	// 关闭且未配置外部 TURN 时不再回落 loopback（#13 P2），见 resolveCredentialURLs。
@@ -722,6 +696,46 @@ func apiTokenIdentity(svc *token.Service, plain string) (id signal.Identity, han
 		Username:         p.Nickname,
 		SkipSessionCheck: true,
 	}, true, nil
+}
+
+// newRTCAuth TURN 凭证签发的鉴权闭包（§5.4；PR118 P2-3）：JWT 主体原样放行
+// （入房权限由 authz 判定）；令牌主体（Kind != jwt）必须 HasScope("voice.connect")
+// 才签发 12h 中继凭证，否则返回 rtcapi.ErrScopeForbidden——api/rtc.go 据此回 403
+// scope_forbidden，与「凭据无效」的 401 分开。dev 兜底（dev- 令牌映射 uid）保持
+// 原口径：非 ltk_ 令牌两类解析都失败时走 devUserID。
+func newRTCAuth(jwtSigner *auth.JWT, apiTokenSvc *token.Service, dev bool) rtcapi.UserFromToken {
+	if dev {
+		return func(t string) (string, error) {
+			if !strings.HasPrefix(t, token.PlainPrefix) {
+				if claims, err := jwtSigner.ParseAccess(t); err == nil {
+					return strconv.FormatInt(claims.UserID, 10), nil
+				}
+			} else if p, err := apiTokenSvc.Verify(context.Background(), t); err == nil {
+				if !p.HasScope(token.ScopeVoiceConnect) {
+					return "", rtcapi.ErrScopeForbidden
+				}
+				return strconv.FormatInt(p.UserID, 10), nil
+			}
+			return devUserID(t)
+		}
+	}
+	return func(t string) (string, error) {
+		if strings.HasPrefix(t, token.PlainPrefix) {
+			p, err := apiTokenSvc.Verify(context.Background(), t)
+			if err != nil {
+				return "", err
+			}
+			if !p.HasScope(token.ScopeVoiceConnect) {
+				return "", rtcapi.ErrScopeForbidden
+			}
+			return strconv.FormatInt(p.UserID, 10), nil
+		}
+		claims, err := jwtSigner.ParseAccess(t)
+		if err != nil {
+			return "", err
+		}
+		return strconv.FormatInt(claims.UserID, 10), nil
+	}
 }
 
 // apitokenSessionChecker 把 store 的令牌行只读查询适配成 hub 的
