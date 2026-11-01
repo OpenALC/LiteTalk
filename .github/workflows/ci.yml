@@ -251,7 +251,7 @@ jobs:
       # ---- issue #6/#5：安装后启动冒烟（非 tag 也跑） ----
       # nfpm 打包此前只在 tag 时执行，PR 上从未验证过「装得上、起得来」。
       # 前端产物复用 check-frontend 的 artifact，这里不再构建前端。
-      # 跨发行版（Debian 13 / Fedora 40 / Rocky 10）的依赖闭包实测在下面的
+      # 跨发行版（Debian 13 / Fedora 40 / AlmaLinux 10）的依赖闭包实测在下面的
       # smoke-client-linux-install 矩阵，产物经 artifact 传下去。
       - name: 构建 production 二进制（供 nfpm 安装包）
         run: go build -tags production -trimpath -ldflags "-s -w -X main.version=smoke" -o build/bin/LiteTalk .
@@ -285,9 +285,9 @@ jobs:
           mkdir -p dist
           nfpm package --config build/nfpm.yaml --packager deb --target dist/
           # rpm 一并产出（nfpm 原生写 rpm，无需 rpmbuild）：供下面的
-          # smoke-client-linux-install 矩阵在 Debian 13 / Fedora 40 / Rocky 10
-          # 容器里实测依赖闭包。与发版打包 job 同一份 nfpm 配置，仅内嵌版本号
-          # 不同（这里固定 0.0.0），安装与启动行为一致。
+          # smoke-client-linux-install 矩阵在 Debian 13 / Fedora 40 /
+          # AlmaLinux 10 容器里实测依赖闭包。与发版打包 job 同一份 nfpm 配置，
+          # 仅内嵌版本号不同（这里固定 0.0.0），安装与启动行为一致。
           nfpm package --config build/nfpm.yaml --packager rpm --target dist/
           mv dist/*.rpm "dist/litetalk_${VERSION}_${ARCH}.rpm"
           deb="$(ls dist/litetalk_${VERSION}_${ARCH}.deb)"
@@ -377,8 +377,10 @@ jobs:
           - distro: fedora-40
             image: fedora:40
             pkg-type: rpm
-          - distro: rockylinux-10
-            image: rockylinux:10
+          # RHEL 10 系代理选 almalinux:10：rockylinux 的 Docker Hub 官方镜像
+          # 没有 10 这个 tag（manifest unknown，实测），almalinux 有 10/10.x。
+          - distro: almalinux-10
+            image: almalinux:10
             pkg-type: rpm
     steps:
       - uses: actions/checkout@v4
