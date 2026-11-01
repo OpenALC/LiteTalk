@@ -1,5 +1,6 @@
-# 构建上下文只需 server/，外加 client 的 go.mod/go.sum（server 测试通过
-# replace ../client 引用真实客户端 Tracker）；客户端源码、文档与本地材料不进镜像。
+# 构建上下文：server/ 全部 + client 的 go.mod/go.sum（server 测试 replace ../client
+# 引用真实客户端 Tracker）+ client/frontend 源码（P2-8：Web 客户端构建阶段）。
+# 文档、本地材料与前端依赖/产物不进镜像。
 .git
 .github
 .claude
@@ -8,8 +9,14 @@
 client/**
 !client/go.mod
 !client/go.sum
+# 放行前端源码（P2-8）；连带放行目录本身，保证经典 builder 也正确下钻
+!client/frontend
+!client/frontend/**
+# 后置规则覆盖前面的放行：依赖与构建产物仍排除（含本地产物不入上下文，
+# 镜像内的 dist-web 由 webui 阶段现场构建产出）
+client/frontend/node_modules
+client/frontend/dist
+client/frontend/dist-web
 docs
 prototype
-**/node_modules
-**/dist
 **/data
