@@ -91,6 +91,11 @@ export WEBKIT_DISABLE_DMABUF_RENDERER=1
 export LIBGL_ALWAYS_SOFTWARE=1
 export WEBKIT_FORCE_SANDBOX=0
 export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
+# 统一固定 X11 后端：xvfb-run 只有 X11，而 xwfb-run 会同时导出 WAYLAND_DISPLAY，
+# GTK4 会优先选 Wayland——Wails beta.30 的 GTK4 Wayland 路径在 cage 无头栈里
+# 卡在窗口创建、到不了 ServiceStartup（AlmaLinux 10 实测）。固定后四个发行版
+# 走同一 X11 路径，判定口径一致。
+export GDK_BACKEND=x11
 
 set +e
 "${launch_wrapper[@]}" dbus-run-session -- timeout 10 litetalk > "$LOG" 2>&1
