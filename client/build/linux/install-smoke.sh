@@ -82,10 +82,15 @@ case "$PKG_TYPE" in
 esac
 
 # 启动冒烟：与 check-client-linux 同口径。WEBKIT_* / LIBGL_* 同宿主 job：
-# 无 GPU 的虚拟显示下关闭 WebKit 合成/DMABUF，避免软件渲染初始化失败。
+# 无 GPU 的虚拟显示下关闭 WebKit 合成/DMABUF，避免软件渲染初始化失败；
+# bwrap 沙箱在无头 CI（无特权 user namespace）上建立失败会直接崩掉进程
+# （bwrap: setting up uid map: Permission denied → dbus-proxy 失败 → g_error），
+# 冒烟只验证安装闭包与启动存活，沙箱由用户真实桌面环境提供。
 export WEBKIT_DISABLE_COMPOSITING_MODE=1
 export WEBKIT_DISABLE_DMABUF_RENDERER=1
 export LIBGL_ALWAYS_SOFTWARE=1
+export WEBKIT_FORCE_SANDBOX=0
+export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
 
 set +e
 "${launch_wrapper[@]}" dbus-run-session -- timeout 10 litetalk > "$LOG" 2>&1

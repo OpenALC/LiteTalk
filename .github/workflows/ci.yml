@@ -316,6 +316,13 @@ jobs:
           WEBKIT_DISABLE_COMPOSITING_MODE: '1'
           WEBKIT_DISABLE_DMABUF_RENDERER: '1'
           LIBGL_ALWAYS_SOFTWARE: '1'
+          # WebKitGTK 6.0 的 bwrap 沙箱在无头 CI 上无法建立（无特权 user
+          # namespace，bwrap 报 setting up uid map: Permission denied，xdg-dbus-proxy
+          # 随之启动失败并 g_error 崩掉进程，退出码 2）。冒烟只验证安装闭包与
+          # 启动存活，沙箱由用户真实桌面环境提供；GTK3 时代的 webkit2gtk-4.1
+          # 无此问题（对比 dev 分支绿色冒烟日志）。
+          WEBKIT_FORCE_SANDBOX: '0'
+          WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS: '1'
         run: |
           set +e
           # dbus-run-session 必需：v3 单实例锁走会话总线，无总线时
