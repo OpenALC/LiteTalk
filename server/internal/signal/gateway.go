@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -296,7 +297,30 @@ func (h *Hub) enqueueRaw(c *client, raw []byte, msgType string) {
 // 订阅模型：环存活期内（断线续传窗口）的会话都收到事件留存，reconnect+resume 补发；
 // 无会话连接（dev 令牌/旧版本令牌）只收实时投递，与老客户端行为一致。
 // 调用方不得持有 h.mu（内含 store 查询与锁内索引访问）。
+//
+// 本变体用于没有频道维度的事件（conversation.changed、不带频道键的 presence.update），
+// 不按连接主体过滤；带频道键的事件走 broadcastEventCh。
 func (h *Hub) broadcastEvent(uids map[string]bool, msgType string, data any) {
+	h.broadcastEventCh(uids, "", msgType, data)
+}
+
+// broadcastEventCh 带频道键的事件面广播（P1-7）。channelID 由调用方在序列化前给出
+// （十进制频道 ID；dev 内置房间为非数字房间名），不从载荷反解；空串 = 不过滤。
+//
+// 令牌主体（pat/bot）的 WS 连接按与断线续传完全相同的口径复核频道可见性
+// （replayChannelVisible：服务器频道 ViewChannel ∩ scope，会话频道
+// CanReadConversation 加成员表）。否则 guild.manage / admin.read 这类不含读位的
+// 令牌连接能实时收到 chat.message 全文，而续传路径却会扣留，两条路径口径相反。
+// JWT/dev 连接不做任何额外判定，也不查库。
+//
+// 不可见的令牌连接，事件环写入与实时投递必须一起跳过：只跳投递会让该 sid 的
+// seq 出现空洞，客户端只投递 lastSeq+1 起的连续段，空一个后面全部压进乱序缓冲
+// 直到溢出再全量补拉。presence.update 例外：降级为不带频道键的载荷，仍写入该 sid 的
+// 环并投递，seq 保持连续。离线 sid（环里有、当前无连接）照常写环，续传时复核。
+//
+// 锁顺序：h.mu 内只取连接快照，权限判定（store 查询）全部在锁外。同一次广播内按
+// uid+令牌种类+scope 缓存判定。判定出错 fail-closed（视为不可见）。
+func (h *Hub) broadcastEventCh(uids map[string]bool, channelID, msgType string, data any) {
 	if len(uids) == 0 {
 		return
 	}
@@ -306,9 +330,40 @@ func (h *Hub) broadcastEvent(uids map[string]bool, msgType string, data any) {
 		return
 	}
 	ts := time.Now().UnixMilli()
+
+	// P1-7：写环之前先判定令牌连接，才知道哪些 sid 要跳过。
+	var (
+		visCache map[string]bool
+		hidden   map[string]bool // 不可见令牌连接持有的 sid
+		degraded json.RawMessage // presence.update 对不可见连接的降级载荷
+	)
+	if channelID != "" {
+		visCache = make(map[string]bool)
+		for _, c := range h.tokenConnsOf(uids) {
+			if c.sid != "" && !h.tokenConnVisible(c, channelID, visCache) {
+				if hidden == nil {
+					hidden = make(map[string]bool, 1)
+				}
+				hidden[c.sid] = true
+			}
+		}
+		if len(hidden) > 0 && msgType == TypePresenceUpdate {
+			if d, ok := stripPresencePayload(payload); ok {
+				degraded = d
+			}
+		}
+	}
+
 	seqs := make(map[string]int64, len(uids))
 	for uid := range uids {
 		for _, sid := range h.evlog.SidsOf(uid) {
+			if hidden[sid] {
+				if degraded == nil {
+					continue // 环与投递一起跳过：该 sid 的 seq 不留洞
+				}
+				seqs[sid] = h.evlog.Append(sid, Event{Type: msgType, Payload: degraded, TS: ts})
+				continue
+			}
 			seqs[sid] = h.evlog.Append(sid, Event{Type: msgType, Payload: payload, TS: ts})
 		}
 	}
@@ -321,6 +376,13 @@ func (h *Hub) broadcastEvent(uids map[string]bool, msgType string, data any) {
 	}
 	h.mu.Unlock()
 	for _, c := range targets {
+		if channelID != "" && isTokenConn(c) && !h.tokenConnVisible(c, channelID, visCache) {
+			// 快照之后才注册的令牌连接也在这里补判（命中缓存或锁外查询）。
+			if degraded != nil {
+				h.deliverEvent(c, msgType, degraded, ts, seqs[c.sid])
+			}
+			continue
+		}
 		h.deliverEvent(c, msgType, payload, ts, seqs[c.sid])
 	}
 	// 出站 webhook 事件出口（#52）：hub 的事件流里只看得到五类白名单事件中的
@@ -332,6 +394,42 @@ func (h *Hub) broadcastEvent(uids map[string]bool, msgType string, data any) {
 			h.webhooks.OnWebhookEvent(webhook.EventMessageCreated, cd.ChannelID, payload)
 		}
 	}
+}
+
+// isTokenConn 连接是否由 api_token（pat/bot）建立。JWT 与 dev 连接 principal 为 nil
+// 或 Kind=jwt，走原路径，不做任何额外判定。
+func isTokenConn(c *client) bool {
+	return c.principal != nil && c.principal.Kind != token.KindJWT
+}
+
+// tokenConnsOf 在 h.mu 内取 uids 名下令牌连接的快照（只拿指针，不查库）。
+func (h *Hub) tokenConnsOf(uids map[string]bool) []*client {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []*client
+	for _, c := range h.conns {
+		if uids[c.userID] && isTokenConn(c) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// tokenConnVisible 令牌连接对频道的可见性（P1-7），口径与续传复核一致，直接复用
+// replayChannelVisible。cache 由单次广播持有，键为 uid+令牌种类+scope 集合，同一
+// 广播里同 uid 的多条同 scope 令牌连接只查一次。不得持 h.mu 调用。
+// uid 非数字、频道非数字（dev 内置房间）、查询出错都判不可见（fail-closed）。
+func (h *Hub) tokenConnVisible(c *client, channelID string, cache map[string]bool) bool {
+	key := c.userID + "\x00" + c.principal.Kind + "\x00" + strings.Join(c.principal.Scopes, " ") + "\x00" + channelID
+	if v, ok := cache[key]; ok {
+		return v
+	}
+	vis := false
+	if uid, err := strconv.ParseInt(c.userID, 10, 64); err == nil {
+		vis = h.replayChannelVisible(c.authCtx(), uid, channelID).visible
+	}
+	cache[key] = vis
+	return vis
 }
 
 // speakingRecipientsLocked 悄悄话生效时说话事件的收件 uid 集合（#45）：
@@ -682,17 +780,27 @@ func replayChannelID(ev Event) string {
 // stripPresenceChannel presence.update 去掉频道键（降级为 online-only）。
 // 返回 ok=false 表示载荷解不开或本就没有频道字段。
 func stripPresenceChannel(ev Event) (Event, bool) {
-	var d PresenceUpdateData
-	if err := json.Unmarshal(ev.Payload, &d); err != nil || d.ChannelID == "" {
-		return ev, false
-	}
-	d.ChannelID, d.ServerID = "", ""
-	payload, err := json.Marshal(d)
-	if err != nil {
+	payload, ok := stripPresencePayload(ev.Payload)
+	if !ok {
 		return ev, false
 	}
 	ev.Payload = payload
 	return ev, true
+}
+
+// stripPresencePayload 对已序列化的 presence.update 载荷去掉频道键。续传与实时
+// 广播（P1-7）共用，两条路径的降级结果一致。
+func stripPresencePayload(raw json.RawMessage) (json.RawMessage, bool) {
+	var d PresenceUpdateData
+	if err := json.Unmarshal(raw, &d); err != nil || d.ChannelID == "" {
+		return raw, false
+	}
+	d.ChannelID, d.ServerID = "", ""
+	payload, err := json.Marshal(d)
+	if err != nil {
+		return raw, false
+	}
+	return payload, true
 }
 
 // replayChannelVisible 查看者当前是否仍可见该频道（#102）。

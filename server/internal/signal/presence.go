@@ -274,7 +274,8 @@ func (h *Hub) syncPresenceChannel(uid string) {
 		}
 	}
 	if len(withChan) > 0 {
-		h.broadcastEvent(withChan, TypePresenceUpdate, full)
+		// P1-7：好友的令牌连接若看不到该频道，降级成不带频道键的版本（seq 仍连续）。
+		h.broadcastEventCh(withChan, full.ChannelID, TypePresenceUpdate, full)
 	}
 	if len(only) > 0 {
 		h.broadcastEvent(only, TypePresenceUpdate, onlineOnly)
