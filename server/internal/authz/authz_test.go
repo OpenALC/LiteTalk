@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/internal/token"
 )
 
 var fixtureSeq atomic.Int64
@@ -408,4 +409,35 @@ func (w *wrapperStore) ChannelOverwritesOfServer(ctx context.Context, serverID i
 func (w *wrapperStore) ChannelByID(ctx context.Context, id int64) (*store.Channel, error) {
 	w.bump("ChannelByID", 0)
 	return w.Store.ChannelByID(ctx, id)
+}
+
+// TestRoleCanInServerIgnoresScopeLimit 纯角色判定（P1-2）：与 CanInServer 同一套
+// 快照语义，但 ctx 里带受限令牌主体时**不做** scope 交集——双判定端点（审计读取）
+// 的 scope 腿由端点显式判定，角色腿不能被位级交集重复裁决。
+func TestRoleCanInServerIgnoresScopeLimit(t *testing.T) {
+	f := newFixture(t)
+	a := New(f.st, Options{})
+	ctx := token.WithPrincipal(context.Background(), &token.Principal{
+		Kind: token.KindPAT, TokenID: 7, Scopes: []string{"messages.read"},
+	})
+
+	// 普通成员持只读令牌：服务器级 SendMessages 超出 scope 上限——
+	// CanInServer 拒（交集生效），RoleCanInServer 过（纯角色）。
+	if ok, err := a.CanServer(ctx, f.member.ID, f.srv.ID, store.SendMessages); err != nil || ok {
+		t.Fatalf("CanInServer 应按 scope 交集拒绝：ok=%v err=%v", ok, err)
+	}
+	ok, err := a.RoleCanInServer(ctx, f.member.ID, f.srv.ID, 0, store.SendMessages)
+	if err != nil || !ok {
+		t.Fatalf("RoleCanInServer 应按纯角色放行：ok=%v err=%v", ok, err)
+	}
+	// 角色腿自己会把非成员、无权限成员拒掉。
+	if ok, err := a.RoleCanInServer(ctx, f.stranger.ID, f.srv.ID, 0, store.ManageServer); err != nil || ok {
+		t.Fatalf("局外人应拒绝：ok=%v err=%v", ok, err)
+	}
+	if ok, err := a.RoleCanInServer(ctx, f.member.ID, f.srv.ID, 0, store.ManageServer); err != nil || ok {
+		t.Fatalf("普通成员应拒绝：ok=%v err=%v", ok, err)
+	}
+	if ok, err := a.RoleCanInServer(ctx, f.admin.ID, f.srv.ID, 0, store.ManageServer); err != nil || !ok {
+		t.Fatalf("管理员应放行：ok=%v err=%v", ok, err)
+	}
 }

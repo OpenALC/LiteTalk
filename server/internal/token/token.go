@@ -119,6 +119,23 @@ func (p *Principal) HasScope(name string) bool {
 	return false
 }
 
+// ScopeAllows 从 ctx 取主体做显式 scope 门槛判定（区别于 ScopeLimitFromContext
+// 的位级上限）：
+//   - ctx 无 Principal（WS dev 令牌/测试直调）或 JWT 主体 → true：JWT 的权限
+//     只由角色决定，scope 面不存在，显式 scope 门槛对它恒开放；
+//   - 令牌主体 → 显式持有该 scope 才过（HasScope 精确按名字匹配）。
+//
+// 为什么按名字而不是 ScopeBits 位判定：scope 契约是「名字 → 语义」，位会随
+// 映射演化（admin.read 曾映射 ManageServer、P1-2 后归零），按位推导会随映射
+// 漂移放大或收缩权限；显式门槛的语义必须钉在名字上。
+func ScopeAllows(ctx context.Context, name string) bool {
+	p := PrincipalFromContext(ctx)
+	if p == nil || p.Kind == KindJWT {
+		return true
+	}
+	return p.HasScope(name)
+}
+
 // TokenStore Service 依赖的最小存储面（*store.Mem / *store.MySQL / *store.SQLite 均满足）。
 type TokenStore interface {
 	APITokenByPrefix(ctx context.Context, prefix string) (*store.APIToken, error)

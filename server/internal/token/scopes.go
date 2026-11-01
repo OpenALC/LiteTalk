@@ -24,7 +24,11 @@ var knownScopes = map[string]store.Permission{
 	ScopeAttachmentsWrite: store.AttachFiles,
 	ScopeVoiceConnect:     store.ViewChannel | store.ConnectVoice | store.Speak,
 	ScopeGuildManage:      store.ManageChannels | store.ManageRoles | store.ManageServer,
-	ScopeAdminRead:        store.ManageServer,
+	// admin.read 纯只读（P1-2）：**零权限位**。它曾映射 ManageServer，「只读」
+	// 令牌因此能改服务器名、创建出站 webhook。审计读取不走位级映射，改走端点内
+	// 显式双判定：主体持有 admin.read（token.ScopeAllows）+ 纯角色 ManageServer
+	// （authz.RoleCanInServer，不与 scope 交集）。
+	ScopeAdminRead: 0,
 }
 
 // IsKnownScope 是否在白名单内（创建端拒绝未知值与空列表）。

@@ -328,3 +328,56 @@ func TestTokenManagementJWTOnly(t *testing.T) {
 		t.Fatalf("JWT 列表应 3 条（含已吊销与 bot 行），实际 %d", len(list))
 	}
 }
+
+// TestAdminReadTokenReadOnly admin.read 纯只读（P1-2）：映射归零后改不了服务器、
+// 建不了出站 webhook；审计读取走双判定（持有 admin.read + 纯角色 ManageServer），
+// 无 admin.read 的令牌（messages.read）与角色不够的主体都拿不到审计；成员列表
+// 保持成员可读口径（admin.read 令牌作为成员照常可读）。
+func TestAdminReadTokenReadOnly(t *testing.T) {
+	srv, mem := newTestServer(t)
+	h := srv.Handler()
+	aAccess, _ := registerUser(t, h, mem, "tar@ex.com", "tokAR", "password123")
+	serverID := asID(postJSON(t, h, "/api/v1/servers", aAccess, map[string]string{
+		"name": "审计服", "icon_name": "music", "icon_color": "#4FA4F3",
+	}, http.StatusCreated)["id"])
+
+	mk := func(scopes []string) string {
+		return postJSON(t, h, "/api/v1/tokens", aAccess, map[string]any{
+			"name": "scope 测试", "scopes": scopes,
+		}, http.StatusCreated)["token"].(string)
+	}
+	audit := mk([]string{"admin.read"})
+	readOnly := mk([]string{"messages.read"})
+	guild := mk([]string{"guild.manage"})
+
+	// JWT 改名仍 200（owner），并落一条审计行供查询。
+	patchJSON(t, h, fmt.Sprintf("/api/v1/servers/%d", serverID), aAccess,
+		map[string]any{"name": "审计服二号"}, http.StatusOK)
+
+	// 审计读取双判定：
+	//   - admin.read + 角色够（owner）→ 200；
+	//   - 无 admin.read（messages.read / guild.manage）→ 403（guild.manage 位级映射归零后不再顺带可读）。
+	getJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/audit-log", serverID), audit, http.StatusOK)
+	if resp := getJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/audit-log", serverID), readOnly, http.StatusForbidden).(map[string]any); resp["code"] != "forbidden" {
+		t.Fatalf("messages.read 读审计应 403，实际 %v", resp)
+	}
+	if resp := getJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/audit-log", serverID), guild, http.StatusForbidden).(map[string]any); resp["code"] != "forbidden" {
+		t.Fatalf("guild.manage 读审计应 403（admin.read 归零后位级映射不再放行），实际 %v", resp)
+	}
+
+	// 写面：admin.read 令牌 PATCH 服务器、创建出站 webhook 一律 403（此前改名
+	// 探针实测 200、webhook 可建——外泄私有频道的入口）。
+	if resp := patchJSON(t, h, fmt.Sprintf("/api/v1/servers/%d", serverID), audit,
+		map[string]any{"name": "越权改名"}, http.StatusForbidden); resp["code"] != "forbidden" {
+		t.Fatalf("admin.read 改服务器名应 403，实际 %v", resp)
+	}
+	if resp := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/webhooks", serverID), audit,
+		map[string]any{"url": "https://hooks.example.com/x", "events": []string{"message.created"}}, http.StatusForbidden); resp["code"] != "forbidden" {
+		t.Fatalf("admin.read 建出站 webhook 应 403，实际 %v", resp)
+	}
+
+	// 成员列表保持成员可读：admin.read / messages.read 令牌作为成员都 200。
+	getJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/members", serverID), audit, http.StatusOK)
+	getJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/members", serverID), readOnly, http.StatusOK)
+
+}
