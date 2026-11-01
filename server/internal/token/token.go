@@ -276,6 +276,15 @@ func PrincipalFromContext(ctx context.Context) *Principal {
 	return p
 }
 
+// WithoutPrincipal 返回不带 Principal 的 ctx（其余值、取消与截止时间保留）。
+// 跨主体权限判定专用：CanInServer 会把 ctx 里令牌的 scope 上限与角色权限求交集，
+// 判定收件人/被提及者的可见性时不能带当前请求的主体，否则发送者凭据会裁别人
+// 的权限。实现是写入一个类型化 nil——PrincipalFromContext 断言出 nil 指针，
+// 与「无 Principal」走同一路径；不用 context.Background() 是为了不丢取消信号。
+func WithoutPrincipal(ctx context.Context) context.Context {
+	return context.WithValue(ctx, principalCtxKey{}, (*Principal)(nil))
+}
+
 // ScopeLimitFromContext 供 authz 的集中判定点取 scope 上限：
 //   - ctx 无 Principal（WS 旧路径 / dev 令牌）→ (0, false)：不受限；
 //   - JWT 主体 → (0, false)：不受限（权限只由角色决定）；

@@ -353,6 +353,28 @@ func TestScopeLimitFromContext(t *testing.T) {
 	}
 }
 
+// TestWithoutPrincipal 跨主体判定用的 ctx 剥离：PrincipalFromContext 取不到，
+// ScopeLimitFromContext 回到「不受限」，其余 ctx 值保留。
+func TestWithoutPrincipal(t *testing.T) {
+	type otherKey struct{}
+	ctx := context.WithValue(context.Background(), otherKey{}, "keep")
+	pat := &Principal{Kind: KindPAT, Scopes: []string{ScopeGuildManage}}
+	ctx = WithPrincipal(ctx, pat)
+	if PrincipalFromContext(ctx) == nil {
+		t.Fatal("前置：注入的 Principal 应可读")
+	}
+	bare := WithoutPrincipal(ctx)
+	if p := PrincipalFromContext(bare); p != nil {
+		t.Fatalf("剥离后不应再有 Principal: %+v", p)
+	}
+	if _, limited := ScopeLimitFromContext(bare); limited {
+		t.Fatal("剥离后 scope 不应再产生上限（收件人判定不受发送者凭据约束）")
+	}
+	if v, _ := bare.Value(otherKey{}).(string); v != "keep" {
+		t.Fatal("剥离只去掉 Principal，其余 ctx 值必须保留")
+	}
+}
+
 // TestScopeAllows 显式 scope 门槛（P1-2/P1-3 双判定的 scope 腿）：
 // 无 Principal 与 JWT 主体恒过（权限只由角色决定），令牌主体按名字精确匹配。
 func TestScopeAllows(t *testing.T) {
