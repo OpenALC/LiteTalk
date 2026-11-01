@@ -60,14 +60,23 @@ case "$PKG_TYPE" in
         # RHEL 10 系：WebKitGTK 6.0（webkitgtk6.0）只在 EPEL 10。
         echo "启用 EPEL 10（webkitgtk6.0 的来源，RHEL 10 系用户同样需要）"
         dnf install -y epel-release
-        # 显示栈：RHEL 10 移除了 Xorg 服务器本体，但 Xvfb（含 xvfb-run）仍由
-        # 发行版 devel 仓库提供。优先直装，不在 AppStream 时开 devel——与其他
-        # 三个发行版共用同一 xvfb-run 路径。实测 xwfb-run + Xwayland/cage 栈下
-        # GTK4 应用卡在窗口创建、到不了 ServiceStartup（WebKit 2.48–2.54 在
-        # Xvfb 下均正常，排除版本因素），故不采用 xwayland-run。
-        if ! dnf install -y xorg-x11-server-Xvfb dbus-daemon dejavu-sans-fonts mesa-dri-drivers; then
-          echo "AppStream 无 xorg-x11-server-Xvfb，启用 devel 仓库重试"
-          dnf install -y --enablerepo=devel xorg-x11-server-Xvfb dbus-daemon dejavu-sans-fonts mesa-dri-drivers
+        # 显示栈：RHEL 10 移除了 Xorg 服务器，Xvfb（含 xvfb-run）由 AlmaLinux
+        # 的 devel 仓库提供（仓库 id almalinux-devel，镜像里默认禁用；真不在时
+        # 手动挂 vault 同名源）——与其他三个发行版共用同一 xvfb-run 路径。
+        # 实测 xwfb-run + Xwayland/cage 栈下 GTK4 应用卡在窗口创建、到不了
+        # ServiceStartup（WebKit 2.48–2.54 在 Xvfb 下均正常，排除版本因素）。
+        if ! dnf install -y --enablerepo=almalinux-devel \
+              xorg-x11-server-Xvfb dbus-daemon dejavu-sans-fonts mesa-dri-drivers; then
+          echo "almalinux-devel 仓库不可用，手动添加 vault devel 源"
+          cat > /etc/yum.repos.d/litetalk-alma-devel.repo <<REPO
+[alma-devel]
+name=AlmaLinux ${VERSION_ID} devel
+baseurl=https://vault.almalinux.org/${VERSION_ID}/devel/x86_64/os/
+gpgcheck=1
+gpgkey=https://repo.almalinux.org/almalinux/RPM-GPG-KEY-AlmaLinux-10
+enabled=1
+REPO
+          dnf install -y xorg-x11-server-Xvfb dbus-daemon dejavu-sans-fonts mesa-dri-drivers
         fi
         launch_wrapper=(xvfb-run -a)
         ;;
