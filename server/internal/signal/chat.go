@@ -1,4 +1,5 @@
-// chat 文字聊天：chat.send（C→S）→ 校验/幂等/频控/权限 → 落库 → chat.message 广播（S→C）。
+// chat 文字聊天：chat.send（C→S）→ 校验/幂等/频控/权限 → 落库 → AfterMessagePersisted
+// 创建管线（chat.message 广播 → 未读 → 推送 → 出站 webhook，WS/REST/入站三入口共用）。
 // wire 契约与客户端 client/core/signal/protocol_gen.go 对齐（ChatSendData / ChatMessageData）。
 package signal
 
@@ -53,11 +54,96 @@ const (
 	chatRateWindow     = time.Minute
 )
 
-// handleChatSend 文字消息发送：内容/类型/长度校验 → 权限 → 幂等 → 频控 → 落库 → 广播。
+// AfterMessagePersisted 消息创建后处理单一管线（P1-4/P2-1）：落库成功后的全部
+// 后处理收敛在这一个方法里，WS chat.send、REST CreateMessage、入站 webhook 投递
+// 三条入口共用同一段实现，保证「其他客户端实时可见、未读、推送、出站 webhook」
+// 四个面行为一致：
+//
+//	落库（调用方完成）→ ① 收件人集合 → ② chat.message 事件面广播
+//	→ ③ 各收件人 channel.unread → ④ 推送派发
+//
+// 出站 webhook 的 message.created 由 ② 内既有的 T5 出口挂钩派发（broadcastEvent
+// 对 chat.message 调 OnWebhookEvent，非阻塞入队一次）——这是它唯一的派发路径，
+// REST/入站入口不另直发，避免重复投递。
+//
+// 每一步都尽力而为：消息此刻已落库，任何失败只记日志，绝不把已成功的创建拖成
+// 失败；推送与 webhook 派发均异步入队，不阻塞调用方。
+// senderUID/senderNick 是发送者十进制 uid 与昵称（WS 连接身份、REST 当前用户或
+// webhook 机器人身份），管线不回读发送者资料。
+func (h *Hub) AfterMessagePersisted(ctx context.Context, ch *store.Channel, msg *store.Message, senderUID, senderNick string) {
+	if h == nil || ch == nil || msg == nil {
+		return
+	}
+	uids := h.messageRecipients(ctx, ch, senderUID)
+	// 广播载荷与幂等回显同源（chatMessageFromStore）：回复预览/提及/附件从库
+	// 回填，与 REST 视图同序同值。补全失败只缺增强信息，消息照常广播。
+	out, err := h.chatMessageFromStore(ctx, msg, senderUID, senderNick)
+	if err != nil {
+		h.log.Printf("chat: 消息 %d 广播载荷补全失败: %v", msg.ID, err)
+	}
+	h.broadcastEvent(uids, TypeChatMessage, out)
+	// 未读计数（#40）：广播之后给每个收件人推自己的精确计数，失败只记日志。
+	h.broadcastChatUnread(ctx, ch.ID, uids)
+	// 推送（#53）：@提及/私聊判定在 Broker worker（全设备离线才推），未注入
+	// （推送关闭）时短路。msg.Mentions 已在落库前校验过，直接交给 Broker。
+	if h.push != nil {
+		h.push.NotifyMessage(ctx, ch, msg, senderNick)
+	}
+}
+
+// messageRecipients 创建管线的广播收件人（与 WS 原内联逻辑、REST messageRecipients
+// 同口径）：会话频道 = 全部成员（成员表即权限表）；服务器频道 = 有 ViewChannel
+// 的成员；发送者恒在目标内（前端以广播替换本地回显，不另做回执）。
+// 查询失败只记日志并回落为「仅发送者」——消息已落库，广播是尽力而为。
+func (h *Hub) messageRecipients(ctx context.Context, ch *store.Channel, senderUID string) map[string]bool {
+	uids := map[string]bool{}
+	if senderUID != "" {
+		uids[senderUID] = true
+	}
+	if h.chatStore == nil {
+		return uids
+	}
+	if isConversationChannel(ch) {
+		members, err := h.chatStore.ChannelMembers(ctx, ch.ID)
+		if err != nil {
+			h.log.Printf("chat: 查会话 %d 成员失败（广播回落为仅发送者）: %v", ch.ID, err)
+			return uids
+		}
+		for _, m := range members {
+			uids[formatUID(m.UserID)] = true
+		}
+		return uids
+	}
+	members, err := h.chatStore.MembersOfServer(ctx, ch.ServerID)
+	if err != nil {
+		h.log.Printf("chat: 查服务器 %d 成员失败（广播回落为仅发送者）: %v", ch.ServerID, err)
+		return uids
+	}
+	for _, m := range members {
+		if formatUID(m.UserID) == senderUID {
+			continue // 发送者已恒在目标内
+		}
+		ok, err := h.permCheckQuiet(ctx, m.UserID, ch.ServerID, ch.ID, store.ViewChannel)
+		if err != nil {
+			h.log.Printf("chat: 收件人 %d 权限查询失败，跳过: %v", m.UserID, err)
+			continue
+		}
+		if ok {
+			uids[formatUID(m.UserID)] = true
+		}
+	}
+	return uids
+}
+
+// handleChatSend 文字消息发送：内容/类型/长度校验 → 权限 → 幂等 → 频控 → 落库
+// → AfterMessagePersisted 创建管线（广播 → 未读 → 推送 → 出站 webhook，P1-4/P2-1，
+// 与 REST/入站 webhook 三入口共用）。发送者的「回执」就是这条广播（前端以广播
+// 替换本地回显），因此管线返回即发送完成。
 // 广播范围（#32 事件面 + #35 B3 过滤）：该频道所属服务器**有 ViewChannel 的成员会话**——
-// 在线实时投递，断线续传窗口内的进事件环补发；无权限成员两路都不收。
+// 在线实时投递，断线续传窗口内的会话进事件环补发；无权限成员两路都不收。
 // 私聊/群聊频道（#38）以 channel_members 为唯一权限口径：成员即可见可发，广播目标
-// 即全部成员（含发送者），不查服务器权限。dev 内置房间回退为房内广播。
+// 即全部成员（含发送者），不查服务器权限。dev 内置房间无频道实体，回退为房内
+// 广播（不落库，未读/推送/出站 webhook 不适用）。
 // 文字消息只进文字频道（语音频道 bad_message，#35 B3）。
 //
 // nonce 幂等（#31）：同频道同用户同 nonce 只落一条、只广播一次；重复请求把原消息
@@ -104,12 +190,15 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 		chID, uid int64
 		serverID  int64
 		persist   bool // 有 store 频道实体：落库 + 幂等 + 事件面广播
+		// ch 非 nil = store 频道实体（创建管线的入参之一）。
+		ch *store.Channel
 		// convMembers 非 nil = 私聊/群聊频道：成员表同时是发送资格与广播范围，
 		// 跳过服务器 authz（成员即拥有 View/Send）。
 		convMembers []store.ChannelMember
 	)
 	if id, err := strconv.ParseInt(d.ChannelID, 10, 64); err == nil && h.chatStore != nil {
-		if ch, err := h.chatStore.ChannelByID(ctx, id); err == nil {
+		if fetched, ferr := h.chatStore.ChannelByID(ctx, id); ferr == nil {
+			ch = fetched
 			u, uerr := strconv.ParseInt(c.userID, 10, 64)
 			if isConversationChannel(ch) {
 				// 会话频道（#38）：非成员与非会话一律 not_found，不泄露会话是否存在。
@@ -178,11 +267,11 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 
 	// 回复与提及（#39）：校验先于幂等回读——无效请求不能因 nonce 命中拿到原消息
 	// （与 REST CreateMessage 同口径）。内置房间没有消息实体，两个字段一律拒收，
-	// 避免静默丢弃。
+	// 避免静默丢弃。回复预览不在此拼装：创建管线从库回填（与幂等回显/REST 视图
+	// 同源），这里只用校验结果 replyTo。
 	var (
-		replyTo      *int64
-		replyPreview *ReplyPreview
-		mentionIDs   []int64
+		replyTo    *int64
+		mentionIDs []int64
 	)
 	if !persist {
 		if d.ReplyTo != "" || len(d.Mentions) > 0 {
@@ -195,7 +284,7 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 		}
 	} else {
 		var code, msg string
-		replyTo, replyPreview, code, msg = h.resolveChatReply(ctx, chID, d.ReplyTo)
+		replyTo, _, code, msg = h.resolveChatReply(ctx, chID, d.ReplyTo)
 		if code != "" {
 			h.sendError(c, code, msg)
 			return
@@ -212,7 +301,7 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 		orig, err := h.chatStore.MessageByNonce(ctx, chID, uid, d.Nonce)
 		switch {
 		case err == nil:
-			out, rerr := h.chatMessageFromStore(ctx, orig, c)
+			out, rerr := h.chatMessageFromStore(ctx, orig, c.userID, c.username)
 			if rerr != nil {
 				h.log.Printf("chat: 幂等回显补全失败: %v", rerr)
 				h.sendError(c, ErrCodeInternal, "消息保存失败")
@@ -235,18 +324,6 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 		}
 	}
 
-	out := ChatMessageData{
-		ChannelID: d.ChannelID,
-		Content:   d.Content,
-		TS:        time.Now().UnixMilli(),
-		User:      UserBrief{ID: c.userID, Nickname: c.username},
-		Nonce:     d.Nonce, // 仅发送方带 nonce 时回显（omitempty）
-	}
-	if replyTo != nil {
-		out.ReplyTo = strconv.FormatInt(*replyTo, 10)
-		out.ReplyPreview = replyPreview
-	}
-	out.Mentions = formatMentionIDs(mentionIDs)
 	if persist {
 		msg := &store.Message{
 			ChannelID: chID, UserID: uid, Content: d.Content, Nonce: d.Nonce,
@@ -261,7 +338,7 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 			// 并发同 nonce：前一条已落库，回读原消息定向回显，不再广播。
 			if d.Nonce != "" && errors.Is(err, store.ErrConflict) {
 				if orig, rerr := h.chatStore.MessageByNonce(ctx, chID, uid, d.Nonce); rerr == nil {
-					echo, cerr := h.chatMessageFromStore(ctx, orig, c)
+					echo, cerr := h.chatMessageFromStore(ctx, orig, c.userID, c.username)
 					if cerr != nil {
 						h.log.Printf("chat: 幂等回显补全失败: %v", cerr)
 						h.sendError(c, ErrCodeInternal, "消息保存失败")
@@ -274,59 +351,34 @@ func (h *Hub) handleChatSend(c *client, d ChatSendData) {
 			h.sendError(c, ErrCodeInternal, "消息保存失败")
 			return
 		}
-		out.ID = strconv.FormatInt(msg.ID, 10)
-		out.TS = msg.CreatedAt.UnixMilli()
-		// 附件视图是增强信息：读取失败只记日志，消息照常广播。
-		out.Attachments = h.attachmentInfos(ctx, msg.ID)
-	} else {
-		// dev 房间（无 store 频道）：仅广播，id 用时间戳占位。
-		out.ID = strconv.FormatInt(out.TS, 10)
+		// 创建后处理单一管线（P1-4/P2-1）：广播 → 未读 → 推送 → 出站 webhook，
+		// 与 REST CreateMessage、入站 webhook 投递共用同一段实现。发送者身份取
+		// 连接（幂等回显同口径）；本函数到此结束——发送者的回显就是这条广播。
+		h.AfterMessagePersisted(ctx, ch, msg, c.userID, c.username)
+		return
 	}
 
-	// 广播（#32 事件面）：会话频道 → 全部成员（含发送者，成员表即权限表）；
-	// 服务器频道 → 该服务器有 ViewChannel 的成员会话（逐收件人过滤（#35 B3）：
-	// 无权限者不进事件环、不收实时投递，单个收件人查询失败只记日志跳过——
-	// 不能把整条消息拖成 500）；dev 房间 → 房内成员。
-	// 发送者恒在目标内（前端以广播替换本地回显，不另做回执）。
+	// dev 内置房间（无 store 频道）：仅广播，id 用时间戳占位；无落库实体，
+	// 未读/推送/出站 webhook 不适用，不进管线。
+	out := ChatMessageData{
+		ChannelID: d.ChannelID,
+		Content:   d.Content,
+		TS:        time.Now().UnixMilli(),
+		User:      UserBrief{ID: c.userID, Nickname: c.username},
+		Nonce:     d.Nonce, // 仅发送方带 nonce 时回显（omitempty）
+	}
+	out.ID = strconv.FormatInt(out.TS, 10)
+
+	// dev 房间广播目标 = 房内成员。
 	uids := map[string]bool{c.userID: true}
-	switch {
-	case convMembers != nil:
-		for _, m := range convMembers {
-			uids[formatUID(m.UserID)] = true
+	h.mu.Lock()
+	if room := h.rooms[d.ChannelID]; room != nil {
+		for _, m := range room.members {
+			uids[m.userID] = true
 		}
-	case persist:
-		members, err := h.chatStore.MembersOfServer(ctx, serverID)
-		if err != nil {
-			h.log.Printf("chat: 查服务器 %d 成员失败: %v", serverID, err)
-		}
-		for _, m := range members {
-			if m.UserID == uid {
-				continue // 发送者已恒在目标内
-			}
-			ok, err := h.permCheckQuiet(ctx, m.UserID, serverID, chID, store.ViewChannel)
-			if err != nil {
-				h.log.Printf("chat: 收件人 %d 权限查询失败，跳过: %v", m.UserID, err)
-				continue
-			}
-			if ok {
-				uids[formatUID(m.UserID)] = true
-			}
-		}
-	default:
-		h.mu.Lock()
-		if room := h.rooms[d.ChannelID]; room != nil {
-			for _, m := range room.members {
-				uids[m.userID] = true
-			}
-		}
-		h.mu.Unlock()
 	}
+	h.mu.Unlock()
 	h.broadcastEvent(uids, TypeChatMessage, out)
-	// 未读计数（#40）：消息事件之后给每个收件人推自己的精确计数。失败只记日志，
-	// 不影响已经广播/落库的消息。
-	if persist {
-		h.broadcastChatUnread(ctx, chID, uids)
-	}
 }
 
 // broadcastChatUnread 计算并推送 chat.send 落库后各收件人的未读/提及计数。
@@ -634,16 +686,18 @@ func formatMentionIDs(ids []int64) []string {
 	return out
 }
 
-// chatMessageFromStore 把落库消息还原成 chat.message 载荷（幂等重放定向回显用）。
-// 身份取当前连接：回读按 (channel_id, user_id, nonce) 限定，原消息必属该用户。
-// 回复预览与提及同样从库回填——重放请求体不可信（客户端可能已改过字段）。
-func (h *Hub) chatMessageFromStore(ctx context.Context, m *store.Message, c *client) (ChatMessageData, error) {
+// chatMessageFromStore 把落库消息还原成 chat.message 载荷。身份由调用方给出：
+// WS 幂等重放定向回显用连接身份（回读按 (channel_id, user_id, nonce) 限定，
+// 原消息必属该用户），创建管线用发送者身份（REST 当前用户 / webhook 机器人）。
+// 回复预览与提及同样从库回填——重放请求体不可信（客户端可能已改过字段），
+// 创建路径则保证广播与 REST 视图同序同值。
+func (h *Hub) chatMessageFromStore(ctx context.Context, m *store.Message, userID, nickname string) (ChatMessageData, error) {
 	out := ChatMessageData{
 		ID:        strconv.FormatInt(m.ID, 10),
 		ChannelID: strconv.FormatInt(m.ChannelID, 10),
 		Content:   m.Content,
 		TS:        m.CreatedAt.UnixMilli(),
-		User:      UserBrief{ID: c.userID, Nickname: c.username},
+		User:      UserBrief{ID: userID, Nickname: nickname},
 		Nonce:     m.Nonce,
 	}
 	if m.ReplyTo != nil {

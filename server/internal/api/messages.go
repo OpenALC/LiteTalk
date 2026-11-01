@@ -242,9 +242,11 @@ func (s *Server) CreateMessage(ctx context.Context, request CreateMessageRequest
 		return nil, s.writeStoreErr(ctx, err)
 	}
 	msg.SenderNickname, msg.SenderTag = c.Nickname, c.Tag
-	// 推送触发点（#53）：落库成功后异步派发（@提及/私聊判定在 Broker worker），
-	// 推送关闭时零开销。绝不因推送失败影响消息发送。
-	s.notifyMessageCreate(ctx, ch, msg, c.Nickname)
+	// 创建后处理单一管线（P1-4/P2-1）：广播 → 未读 → 推送 → 出站 webhook，与
+	// WS chat.send、入站 webhook 投递共用同一段实现（此前 REST 不广播、webhook
+	// 不派发，客户端要等拉取才见）。幂等命中（200 回读）不进管线：原消息已在
+	// 创建时刻处理过。管线尽力而为，绝不把已落库的消息拖成发送失败。
+	s.afterMessageCreate(ctx, ch, msg, c.UserID, c.Nickname)
 	return s.createdMessage(ctx, msg, http.StatusCreated)
 }
 

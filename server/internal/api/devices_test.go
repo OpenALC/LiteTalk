@@ -56,6 +56,8 @@ func (r *recordingAPIPusher) last() (push.Notification, []string) {
 }
 
 // newTestServerWithPush 推送开启的测试服务器：全离线（可经 online map 调整）。
+// P1-4/P2-1：推送经消息创建管线（signal.Hub）派发，REST 创建在 hub 缺席时不再
+// 触发推送——装配真实 hub 并注入 Broker（SetPushNotifier），与生产 main.go 同构。
 func newTestServerWithPush(t *testing.T) (*Server, *store.Mem, *recordingAPIPusher, fakeAPIOnline) {
 	t.Helper()
 	mem := store.NewMem()
@@ -67,6 +69,8 @@ func newTestServerWithPush(t *testing.T) (*Server, *store.Mem, *recordingAPIPush
 		Online: online,
 		Limits: auth.NewRateLimit(mem),
 	})
+	hub := newPipeHub(t, mem)
+	hub.SetPushNotifier(b)
 	srv := New(Config{
 		Store:    mem,
 		JWT:      auth.NewJWT("test-secret"),
@@ -75,6 +79,7 @@ func newTestServerWithPush(t *testing.T) (*Server, *store.Mem, *recordingAPIPush
 		Limits:   auth.NewRateLimit(mem),
 		Session:  auth.NewSessionIndex(mem, mem),
 		Presence: mem,
+		Hub:      hub,
 		Push:     b,
 	})
 	t.Cleanup(b.Close)
