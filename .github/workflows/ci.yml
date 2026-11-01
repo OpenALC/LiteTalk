@@ -148,6 +148,11 @@ jobs:
   check-frontend:
     name: 前端检查
     runs-on: ubuntu-24.04
+    # 标签构建注入发布标签作为 Web 客户端版本（#119）：否则浏览器版一直报
+    # package.json 里的旧版本号。分支/PR 为空串，vite 回落 package.json。
+    # 前端仍只在本 job 构建一次。
+    env:
+      LITELTALK_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
     defaults:
       run:
         working-directory: client/frontend

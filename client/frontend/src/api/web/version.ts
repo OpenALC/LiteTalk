@@ -1,5 +1,6 @@
-// Web 客户端版本号：构建期由 vite define 注入（vite.config.ts 读 package.json
-// 的 version 字段），发版时只递增 package.json，不存在第二处要同步的常量。
+// Web 客户端版本号：构建期由 vite define 注入（vite.config.ts 优先读
+// LITELTALK_VERSION，未设置时回落 package.json 的 version），不存在第二处
+// 要同步的常量。
 // 服务端升级门（server/internal/api/mux.go clientVersionAccepted）按主/次版本
 // 解析，值必须以数字开头——"web/1.9.0" 这种形态会被当成非法值整体拒绝，所以
 // 这里不能带 "web/" 前缀。
