@@ -155,11 +155,12 @@ export class SignalSession {
     this.ws.start()
   }
 
-  // stop 断开信令并拆链路（登出/被踢）。连接对象保留，重登即 start。
+  // stop 断开信令并拆链路（登出/被踢）。连接对象保留，重登即 start；
+  // 释放麦克风（会话终结，重入房重新采集）。
   stop(): void {
     this.ws.stop()
     this.stopStats()
-    this.peer.teardown()
+    this.peer.teardown(true)
     this.resetRoomState()
     this.outbox = []
     this.protoVer = 0
@@ -202,7 +203,9 @@ export class SignalSession {
   private handleDisconnect(): void {
     this._connected = false
     this.callbacks.onConnectionStateChange(false)
-    // 拆媒体链路：连接没了，SFU peer 已被服务端清理。
+    // 拆媒体链路：连接没了，SFU peer 已被服务端清理。不释放采集流（teardown
+    // 默认保留）：瞬断属链路状态而非退房，重连后 channel.joined 原样复用，
+    // 与 Go 客户端跨重连保持采集设备打开一致；退房路径在 teardownRoomLocal 释放。
     this.stopStats()
     this.peer.teardown()
   }
@@ -297,10 +300,11 @@ export class SignalSession {
     this.send(Sig.ChannelLeave, { channel_id: room })
   }
 
-  // teardownRoomLocal 拆房间态（媒体链路 + 成员表 + 统计）。不发 channel.leave。
+  // teardownRoomLocal 拆房间态（媒体链路 + 成员表 + 统计）。不发 channel.leave；
+  // 释放麦克风（P2-6）：退房/进房失败回滚/被抢占后浏览器不应再占用采集设备。
   private teardownRoomLocal(): void {
     this.stopStats()
-    this.peer.teardown()
+    this.peer.teardown(true)
     this.members.clear()
     this.whisperWant = []
   }
