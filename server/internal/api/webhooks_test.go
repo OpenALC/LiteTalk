@@ -565,6 +565,83 @@ func TestOutboundWebhookCreateRequiresVisibleChannel(t *testing.T) {
 	}
 }
 
+// TestOutboundWebhookCreateGateBySubscribedEvents #119：可见性门按订阅的事件集合判定。
+// B 持 ManageServer，只看得见语音频道（文字频道被 deny）：
+//   - message.created 需要文字频道 → 拒绝（旧实现只要求「任一频道可见」，会误放行，
+//     而该事件永远不会投递）；
+//   - channel.created 文字/语音频道都会产生 → 允许；
+//   - 混合订阅里 message.created 的腿仍空转 → 拒绝；
+//   - member.joined / member.left 无频道维度 → 即使所有频道都不可见也允许。
+func TestOutboundWebhookCreateGateBySubscribedEvents(t *testing.T) {
+	mem := store.NewMem()
+	az := authz.New(mem, authz.Options{})
+	srv := New(Config{
+		Store:           mem,
+		JWT:             auth.NewJWT("test-secret"),
+		Refresh:         auth.NewRefreshStore(mem),
+		Codes:           auth.NewEmailCodes(mem),
+		Limits:          auth.NewRateLimit(mem),
+		Session:         auth.NewSessionIndex(mem, mem),
+		Presence:        mem,
+		Authz:           az,
+		WebhookURLCheck: func(string) error { return nil },
+	})
+	h := srv.Handler()
+	ctx := context.Background()
+
+	access, serverID, textID := mkServerChannel(t, h, mem, "gate-a@ex.com", "gateA")
+	voiceID := asID(postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/channels", serverID), access,
+		map[string]any{"name": "lobby", "type": "voice"}, http.StatusCreated)["id"])
+	accB, _ := registerUser(t, h, mem, "gate-b@ex.com", "gateB", "password123")
+	inv := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/invites", serverID), access,
+		map[string]any{"max_uses": 5}, http.StatusCreated)
+	postJSON(t, h, "/api/v1/servers/join", accB, map[string]string{"code": inv["code"].(string)}, http.StatusOK)
+	uidB := asID(getJSON(t, h, "/api/v1/users/me", accB, http.StatusOK).(map[string]any)["id"])
+	role := &store.Role{ServerID: serverID, Name: "mgr", Permissions: store.ManageServer}
+	if err := mem.CreateRole(ctx, role); err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.SetMemberRoles(ctx, serverID, uidB, []int64{role.ID}, 0); err != nil {
+		t.Fatal(err)
+	}
+	// 默认成员可见全部频道；deny 掉文字频道后 B 只剩语音频道可见。
+	if err := mem.SetChannelOverwrite(ctx, &store.ChannelOverwrite{
+		ChannelID: textID, TargetType: store.OverwriteTargetMember, TargetID: uidB,
+		Deny: store.ViewChannel,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	az.InvalidateServer(serverID)
+
+	hookPath := fmt.Sprintf("/api/v1/servers/%d/webhooks", serverID)
+	create := func(events []string, want int) map[string]any {
+		t.Helper()
+		return postJSON(t, h, hookPath, accB,
+			map[string]any{"url": "https://hooks.example.com/gate", "events": events}, want)
+	}
+
+	create([]string{"message.created"}, http.StatusForbidden)
+	create([]string{"channel.created"}, http.StatusCreated)
+	create([]string{"channel.deleted"}, http.StatusCreated)
+	create([]string{"message.created", "channel.created"}, http.StatusForbidden)
+
+	// 再 deny 语音频道：B 对服务器内所有频道均不可见。
+	if err := mem.SetChannelOverwrite(ctx, &store.ChannelOverwrite{
+		ChannelID: voiceID, TargetType: store.OverwriteTargetMember, TargetID: uidB,
+		Deny: store.ViewChannel,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	az.InvalidateServer(serverID)
+
+	create([]string{"message.created"}, http.StatusForbidden)
+	create([]string{"channel.created"}, http.StatusForbidden)
+	create([]string{"channel.deleted"}, http.StatusForbidden)
+	// member.* 不经投递侧可见性闸，频道全不可见也能建。
+	create([]string{"member.joined"}, http.StatusCreated)
+	create([]string{"member.left"}, http.StatusCreated)
+}
+
 // ---- P1-8：改址改绑创建者 ----
 // 投递按订阅创建者的频道可见性收窄（P1-5），但 PATCH 改 url 若不改绑创建者，
 // 持 ManageServer 而看不到私有频道的管理者就能把服主的订阅改到自己的地址，
@@ -854,6 +931,41 @@ func TestWebhookPatchURLRequiresChannelView(t *testing.T) {
 	patchJSON(t, f.h, f.hookPath(hookID), f.accM, map[string]any{"url": mSrv.URL}, http.StatusOK)
 	if row := f.row(t, hookID); row.URL != mSrv.URL || row.CreatorID != f.uidM {
 		t.Fatalf("恢复可见后改址应成功并改绑为 M: %+v", row)
+	}
+}
+
+// TestWebhookPatchURLEventsGateUsesNewEvents #119：同一次 PATCH 既改址又改 events 时，
+// 可见性门按**改后**的事件集合判定。M 对所有频道都不可见：把 member.joined 订阅
+// 同时改址并改成 message.created 必须 403（否则改址成功后才改事件即可绕过门）；
+// 改址 + 保留无频道维度的 events 则放行并改绑。
+func TestWebhookPatchURLEventsGateUsesNewEvents(t *testing.T) {
+	f := newRebindFixture(t)
+	oSrv := httptest.NewServer((&hookTarget{}).handler())
+	defer oSrv.Close()
+	mSrv := httptest.NewServer((&hookTarget{}).handler())
+	defer mSrv.Close()
+
+	created := postJSON(t, f.h, fmt.Sprintf("/api/v1/servers/%d/webhooks", f.serverID), f.accO,
+		map[string]any{"url": oSrv.URL, "events": []string{"member.joined"}}, http.StatusCreated)
+	hookID := asID(created["id"])
+
+	f.setViewDeny(t, f.pubID, true) // 加上 fixture 默认对 secret 的 deny：M 对所有文字频道不可见
+
+	// 改址 + 改成 message.created：门按新事件算，M 无文字频道可见 → 拒绝且行不变。
+	patchJSON(t, f.h, f.hookPath(hookID), f.accM,
+		map[string]any{"url": mSrv.URL, "events": []string{"message.created"}}, http.StatusForbidden)
+	if row := f.row(t, hookID); row.URL != oSrv.URL || row.CreatorID != f.uidO {
+		t.Fatalf("被拒的改址不得落库: %+v", row)
+	}
+
+	// 改址 + 保留 member.joined：无频道维度，门跳过，允许改绑。
+	patched := patchJSON(t, f.h, f.hookPath(hookID), f.accM,
+		map[string]any{"url": mSrv.URL, "events": []string{"member.joined"}}, http.StatusOK)
+	if patched["url"] != mSrv.URL {
+		t.Fatalf("PATCH 响应应带新 url，实际 %v", patched["url"])
+	}
+	if row := f.row(t, hookID); row.URL != mSrv.URL || row.CreatorID != f.uidM {
+		t.Fatalf("无频道维度的订阅应允许改址并改绑: %+v", row)
 	}
 }
 
