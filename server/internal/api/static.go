@@ -17,11 +17,13 @@ import (
 // /api/v1/ 与 GET /ws 的模式更具体，ServeMux 按最长匹配优先，永远先于本
 // fallback 命中——不得把 API/WS 吞进 SPA 回退（回归点）。
 
-// webCSP Web 客户端响应的安全头。与前端 vite 构建注入的 <meta> 同值：
+// webCSP Web 客户端响应的安全头。与前端 vite 构建注入的 <meta> 同值，
+// frame-ancestors 除外：meta CSP 不支持该指令，只能由响应头下发。
 // style-src 'unsafe-inline' 是 Vue :style 绑定的硬需求（本批唯一接受的 XSS
 // 风险面）；connect-src 放行 ws/wss/https（信令与远程 TURN）。
 const webCSP = "default-src 'self'; connect-src 'self' ws: wss: https:; " +
-	"img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'"
+	"img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; " +
+	"frame-ancestors 'none'"
 
 // webIndexCacheControl HTML 入口不缓存：每次部署后深链与刷新都要立刻拿到新壳。
 const webIndexCacheControl = "no-cache"
@@ -66,6 +68,8 @@ func RegisterStatic(mux *http.ServeMux, lg *log.Logger) {
 func serveWebUI(w http.ResponseWriter, r *http.Request, sub fs.FS, lg *log.Logger) {
 	h := w.Header()
 	h.Set("Content-Security-Policy", webCSP)
+	// 兼容不支持 frame-ancestors 的旧浏览器；两处都拒绝被嵌入。
+	h.Set("X-Frame-Options", "DENY")
 	h.Set("X-Content-Type-Options", "nosniff")
 	// Referer 不外泄：页面全同源，对第三方跳转（附件新开页）收敛来源信息。
 	h.Set("Referrer-Policy", "no-referrer")
