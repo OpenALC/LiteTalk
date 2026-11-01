@@ -619,6 +619,8 @@ type Store interface {
 	InboundWebhookByID(ctx context.Context, id int64) (*InboundWebhook, error)
 	// InboundWebhooksOfChannel 该频道的全部入站入口，按 id 升序。
 	InboundWebhooksOfChannel(ctx context.Context, channelID int64) ([]InboundWebhook, error)
+	// UpdateInboundWebhook 全行写（轮换 secret 用）；调用方读-改-写，未命中 ErrNotFound。
+	UpdateInboundWebhook(ctx context.Context, w *InboundWebhook) error
 	// DeleteInboundWebhook 删除入站入口；未命中 ErrNotFound。
 	DeleteInboundWebhook(ctx context.Context, id int64) error
 

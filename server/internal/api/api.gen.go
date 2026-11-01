@@ -846,7 +846,7 @@ type InboundDeliveryRequest struct {
 	Content string `json:"content"`
 }
 
-// InboundWebhook 频道级入站投递入口（#52）。url 形如 /api/v1/webhooks/{id}/{secret}， 只在创建响应出现（含一次性 secret）；列表响应不含 secret， 泄露即删除重建。
+// InboundWebhook 频道级入站投递入口（#52）。url 形如 /api/v1/webhooks/{id}/{secret}， 只在创建与 reset_secret（PATCH）响应出现（含一次性 secret）；列表响应 不含 secret，泄露即 PATCH reset_secret 轮换或删除重建。
 type InboundWebhook struct {
 	CreatedAt Time `json:"created_at"`
 
@@ -1031,6 +1031,9 @@ type PatchConversationRequest = PatchConversationBody
 
 // PatchFriendRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null/空串 = 清除备注/ 移出分组，值 = 设置。仅发起方向可写。
 type PatchFriendRequest = PatchFriendBody
+
+// PatchInboundWebhookRequest JSON Merge Patch（RFC 7396）：入站入口只支持 reset_secret 一个可选键， 且必须为 true（空补丁/reset_secret≠true 由实现拒 400 bad_request）。 reset_secret=true 换新 secret 并只在本次响应返回投递路径（含一次性明文）， 旧 URL 立即失效。
+type PatchInboundWebhookRequest = PatchInboundWebhookBody
 
 // PatchMeRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（昵称不可清， 空值被校验拒 400），值 = 设置。部分更新（当前仅 nickname）。
 type PatchMeRequest = PatchMeBody
@@ -1518,6 +1521,12 @@ type PatchChannelApplicationMergePatchPlusJSONRequestBody = PatchChannelRequest
 // CreateInboundWebhookJSONRequestBody defines body for CreateInboundWebhook for application/json ContentType.
 type CreateInboundWebhookJSONRequestBody = CreateInboundWebhookRequest
 
+// PatchInboundWebhookJSONRequestBody defines body for PatchInboundWebhook for application/json ContentType.
+type PatchInboundWebhookJSONRequestBody = PatchInboundWebhookRequest
+
+// PatchInboundWebhookApplicationMergePatchPlusJSONRequestBody defines body for PatchInboundWebhook for application/merge-patch+json ContentType.
+type PatchInboundWebhookApplicationMergePatchPlusJSONRequestBody = PatchInboundWebhookRequest
+
 // SetServerMutedJSONRequestBody defines body for SetServerMuted for application/json ContentType.
 type SetServerMutedJSONRequestBody = ServerMuteRequest
 
@@ -1664,6 +1673,12 @@ type ServerInterface interface {
 	// CreateInboundWebhook 创建频道入站 Webhook（ManageChannels；响应含一次性投递 URL）
 	// (POST /api/v1/channels/{id}/inbound-webhooks)
 	CreateInboundWebhook(w http.ResponseWriter, r *http.Request, id IDPath)
+	// DeleteInboundWebhook 删除入站 Webhook（ManageChannels）
+	// (DELETE /api/v1/channels/{id}/inbound-webhooks/{wid})
+	DeleteInboundWebhook(w http.ResponseWriter, r *http.Request, id IDPath, wid WebhookIDPath)
+	// PatchInboundWebhook 轮换入站 Webhook secret（ManageChannels；Merge Patch）
+	// (PATCH /api/v1/channels/{id}/inbound-webhooks/{wid})
+	PatchInboundWebhook(w http.ResponseWriter, r *http.Request, id IDPath, wid WebhookIDPath)
 	// SetServerMuted 服务端强制闭麦/解禁（需 MuteMembers，#36）
 	// (PUT /api/v1/channels/{id}/members/{user_id}/server-mute)
 	SetServerMuted(w http.ResponseWriter, r *http.Request, id IDPath, userId UserIDPath)
@@ -2239,6 +2254,76 @@ func (siw *ServerInterfaceWrapper) CreateInboundWebhook(w http.ResponseWriter, r
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.CreateInboundWebhook(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// DeleteInboundWebhook operation middleware
+func (siw *ServerInterfaceWrapper) DeleteInboundWebhook(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "wid" -------------
+	var wid WebhookIDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "wid", r.PathValue("wid"), &wid, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "wid", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.DeleteInboundWebhook(w, r, id, wid)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// PatchInboundWebhook operation middleware
+func (siw *ServerInterfaceWrapper) PatchInboundWebhook(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "wid" -------------
+	var wid WebhookIDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "wid", r.PathValue("wid"), &wid, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "wid", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.PatchInboundWebhook(w, r, id, wid)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -4038,6 +4123,8 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodPatch+" "+options.BaseURL+"/api/v1/servers/{id}/webhooks/{wid}", wrapper.PatchServerWebhook)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/channels/{id}/inbound-webhooks", wrapper.ListInboundWebhooks)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/channels/{id}/inbound-webhooks", wrapper.CreateInboundWebhook)
+	m.HandleFunc(http.MethodDelete+" "+options.BaseURL+"/api/v1/channels/{id}/inbound-webhooks/{wid}", wrapper.DeleteInboundWebhook)
+	m.HandleFunc(http.MethodPatch+" "+options.BaseURL+"/api/v1/channels/{id}/inbound-webhooks/{wid}", wrapper.PatchInboundWebhook)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/webhooks/{id}/{secret}", wrapper.DeliverInboundWebhook)
 
 	return m
@@ -5914,6 +6001,248 @@ type CreateInboundWebhookdefaultApplicationProblemPlusJSONResponse struct {
 }
 
 func (response CreateInboundWebhookdefaultApplicationProblemPlusJSONResponse) VisitCreateInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteInboundWebhookRequestObject struct {
+	Id  IDPath        `json:"id"`
+	Wid WebhookIDPath `json:"wid"`
+}
+
+type DeleteInboundWebhookResponseObject interface {
+	VisitDeleteInboundWebhookResponse(w http.ResponseWriter) error
+}
+
+type DeleteInboundWebhook200JSONResponse StatusOk
+
+func (response DeleteInboundWebhook200JSONResponse) VisitDeleteInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteInboundWebhook400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteInboundWebhook400ApplicationProblemPlusJSONResponse) VisitDeleteInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteInboundWebhook401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteInboundWebhook401ApplicationProblemPlusJSONResponse) VisitDeleteInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteInboundWebhook403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteInboundWebhook403ApplicationProblemPlusJSONResponse) VisitDeleteInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteInboundWebhook404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteInboundWebhook404ApplicationProblemPlusJSONResponse) VisitDeleteInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteInboundWebhook429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteInboundWebhook429ApplicationProblemPlusJSONResponse) VisitDeleteInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteInboundWebhookdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response DeleteInboundWebhookdefaultApplicationProblemPlusJSONResponse) VisitDeleteInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchInboundWebhookRequestObject struct {
+	Id                                IDPath        `json:"id"`
+	Wid                               WebhookIDPath `json:"wid"`
+	JSONBody                          *PatchInboundWebhookJSONRequestBody
+	ApplicationMergePatchPlusJSONBody *PatchInboundWebhookApplicationMergePatchPlusJSONRequestBody
+}
+
+type PatchInboundWebhookResponseObject interface {
+	VisitPatchInboundWebhookResponse(w http.ResponseWriter) error
+}
+
+type PatchInboundWebhook200JSONResponse InboundWebhook
+
+func (response PatchInboundWebhook200JSONResponse) VisitPatchInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchInboundWebhook400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response PatchInboundWebhook400ApplicationProblemPlusJSONResponse) VisitPatchInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchInboundWebhook401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response PatchInboundWebhook401ApplicationProblemPlusJSONResponse) VisitPatchInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchInboundWebhook403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response PatchInboundWebhook403ApplicationProblemPlusJSONResponse) VisitPatchInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchInboundWebhook404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response PatchInboundWebhook404ApplicationProblemPlusJSONResponse) VisitPatchInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchInboundWebhook429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response PatchInboundWebhook429ApplicationProblemPlusJSONResponse) VisitPatchInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchInboundWebhookdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response PatchInboundWebhookdefaultApplicationProblemPlusJSONResponse) VisitPatchInboundWebhookResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
@@ -11514,6 +11843,12 @@ type StrictServerInterface interface {
 	// CreateInboundWebhook 创建频道入站 Webhook（ManageChannels；响应含一次性投递 URL）
 	// (POST /api/v1/channels/{id}/inbound-webhooks)
 	CreateInboundWebhook(ctx context.Context, request CreateInboundWebhookRequestObject) (CreateInboundWebhookResponseObject, error)
+	// DeleteInboundWebhook 删除入站 Webhook（ManageChannels）
+	// (DELETE /api/v1/channels/{id}/inbound-webhooks/{wid})
+	DeleteInboundWebhook(ctx context.Context, request DeleteInboundWebhookRequestObject) (DeleteInboundWebhookResponseObject, error)
+	// PatchInboundWebhook 轮换入站 Webhook secret（ManageChannels；Merge Patch）
+	// (PATCH /api/v1/channels/{id}/inbound-webhooks/{wid})
+	PatchInboundWebhook(ctx context.Context, request PatchInboundWebhookRequestObject) (PatchInboundWebhookResponseObject, error)
 	// SetServerMuted 服务端强制闭麦/解禁（需 MuteMembers，#36）
 	// (PUT /api/v1/channels/{id}/members/{user_id}/server-mute)
 	SetServerMuted(ctx context.Context, request SetServerMutedRequestObject) (SetServerMutedResponseObject, error)
@@ -12299,6 +12634,80 @@ func (sh *strictHandler) CreateInboundWebhook(w http.ResponseWriter, r *http.Req
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
 	} else if validResponse, ok := response.(CreateInboundWebhookResponseObject); ok {
 		if err := validResponse.VisitCreateInboundWebhookResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// DeleteInboundWebhook operation middleware
+func (sh *strictHandler) DeleteInboundWebhook(w http.ResponseWriter, r *http.Request, id IDPath, wid WebhookIDPath) {
+	var request DeleteInboundWebhookRequestObject
+
+	request.Id = id
+	request.Wid = wid
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.DeleteInboundWebhook(ctx, request.(DeleteInboundWebhookRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "DeleteInboundWebhook")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(DeleteInboundWebhookResponseObject); ok {
+		if err := validResponse.VisitDeleteInboundWebhookResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// PatchInboundWebhook operation middleware
+func (sh *strictHandler) PatchInboundWebhook(w http.ResponseWriter, r *http.Request, id IDPath, wid WebhookIDPath) {
+	var request PatchInboundWebhookRequestObject
+
+	request.Id = id
+	request.Wid = wid
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+
+		var body PatchInboundWebhookJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.JSONBody = &body
+
+	}
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/merge-patch+json") {
+
+		var body PatchInboundWebhookApplicationMergePatchPlusJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.ApplicationMergePatchPlusJSONBody = &body
+
+	}
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.PatchInboundWebhook(ctx, request.(PatchInboundWebhookRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "PatchInboundWebhook")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(PatchInboundWebhookResponseObject); ok {
+		if err := validResponse.VisitPatchInboundWebhookResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {

@@ -2462,7 +2462,8 @@ paths:
       description: >
         频道级入站投递入口（#52）。要求 Bearer 且调用者对该频道有 ManageChannels。
         只支持服务器文字频道（会话/语音频道 400 bad_channel）。
-        响应不含 secret——泄露即重建；投递路径只在创建响应给一次。
+        响应不含 secret——泄露即 PATCH reset_secret 轮换或删除重建；
+        投递路径只在创建与 reset_secret 响应给一次。
         code：bad_channel、bad_request；401；403；404 not_found；5xx internal。
       tags: [webhooks]
       parameters:
@@ -2523,6 +2524,81 @@ paths:
           $ref: '#/components/responses/RateLimited'
         default:
           $ref: '#/components/responses/Internal'
+  /api/v1/channels/{id}/inbound-webhooks/{wid}:
+    patch:
+      operationId: patchInboundWebhook
+      summary: 轮换入站 Webhook secret（ManageChannels；Merge Patch）
+      description: >
+        JSON Merge Patch（RFC 7396）：入站入口只支持 reset_secret 一个键且必须为
+        true——端点存在的唯一意义就是轮换，空补丁或 reset_secret≠true 一律
+        400 bad_request（静默 200 会让调用方误以为已轮换）。reset_secret=true
+        换新 secret 并只在本次响应返回投递路径（含一次性明文），旧 URL 立即失效
+        （泄露的 URL 可就地作废）。归属不符（wid 不属于该频道）与不存在统一 404。
+        频控键 wh:patch-inb:<uid>。code：bad_request；401；403；404 not_found；
+        429 rate_limited；5xx internal。
+      tags: [webhooks]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+        - $ref: '#/components/parameters/WebhookIDPath'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/PatchInboundWebhookRequest'
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchInboundWebhookRequest'
+      responses:
+        '200':
+          description: 已轮换（url 含一次性新 secret）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InboundWebhook'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Internal'
+    delete:
+      operationId: deleteInboundWebhook
+      summary: 删除入站 Webhook（ManageChannels）
+      description: >
+        删除后旧投递 URL 立即失效（投递侧回读不到该 id，一律 404）。
+        归属不符（wid 不属于该频道）与不存在统一 404。
+        频控键 wh:del-inb:<uid>。code：bad_request；401；403；404 not_found；
+        429 rate_limited；5xx internal。
+      tags: [webhooks]
+      parameters:
+        - $ref: '#/components/parameters/IDPath'
+        - $ref: '#/components/parameters/WebhookIDPath'
+      responses:
+        '200':
+          description: 已删除
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusOk'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Internal'
   /api/v1/webhooks/{id}/{secret}:
     post:
       operationId: deliverInboundWebhook
@@ -2530,7 +2606,7 @@ paths:
       description: >
         外部系统向频道投递消息的唯一入口：凭路径 secret 校验（常数时间比对），
         不区分「id 不存在」与「secret 错」，失败一律 404 not_found（避免枚举；
-        重建/删除入口后旧 URL 即失效）。消息以 webhook 机器人身份落库到频道，
+        轮换/删除/重建入口后旧 URL 即失效）。消息以 webhook 机器人身份落库到频道，
         内容 1–2000 字符，违规 400 bad_content。频控键 inb:<webhook id>。
         本端点不需要也无法使用 Bearer——认证就是 URL 里的 secret。
         code：bad_content；404 not_found；429 rate_limited；5xx internal。
@@ -2974,8 +3050,8 @@ components:
       title: InboundWebhook
       description: >
         频道级入站投递入口（#52）。url 形如 /api/v1/webhooks/{id}/{secret}，
-        只在创建响应出现（含一次性 secret）；列表响应不含 secret，
-        泄露即删除重建。
+        只在创建与 reset_secret（PATCH）响应出现（含一次性 secret）；列表响应
+        不含 secret，泄露即 PATCH reset_secret 轮换或删除重建。
       required: [id, description, created_at]
       properties:
         id:
@@ -3001,6 +3077,15 @@ components:
           type: string
           maxLength: 255
           description: 用途备注（可空）
+    PatchInboundWebhookRequest:
+      type: object
+      title: PatchInboundWebhookRequest
+      description: >
+        JSON Merge Patch（RFC 7396）：入站入口只支持 reset_secret 一个可选键，
+        且必须为 true（空补丁/reset_secret≠true 由实现拒 400 bad_request）。
+        reset_secret=true 换新 secret 并只在本次响应返回投递路径（含一次性明文），
+        旧 URL 立即失效。
+      x-go-type: PatchInboundWebhookBody
     InboundDeliveryRequest:
       type: object
       title: InboundDeliveryRequest

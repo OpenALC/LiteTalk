@@ -2112,6 +2112,10 @@ func (s *SQLite) InboundWebhooksOfChannel(ctx context.Context, channelID int64) 
 	return dbInboundWebhooksOfChannel(ctx, s.db, channelID)
 }
 
+func (s *SQLite) UpdateInboundWebhook(ctx context.Context, w *InboundWebhook) error {
+	return dbUpdateInboundWebhook(ctx, s.db, w)
+}
+
 func (s *SQLite) DeleteInboundWebhook(ctx context.Context, id int64) error {
 	return dbDeleteInboundWebhook(ctx, s.db, id)
 }
