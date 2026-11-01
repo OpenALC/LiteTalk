@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/OpenALC/LiteTalk/server/internal/auth"
+	"github.com/OpenALC/LiteTalk/server/internal/authz"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
 	"github.com/OpenALC/LiteTalk/server/internal/webhook"
 )
@@ -270,7 +271,9 @@ func waitEvent(t *testing.T, target *hookTarget, event string) []byte {
 // 且已启动（REST 挂钩路径不做 EnsureStarted——订阅由测试直插 store）。
 func newTestServerWithDispatch(t *testing.T, mem *store.Mem, target *hookTarget) *Server {
 	t.Helper()
-	disp := webhook.New(webhook.Config{CheckURL: func(string) error { return nil }}, mem)
+	// Visibility 与生产同构注入 authz：直插订阅 CreatorID 为空，按服务器 owner
+	// 代持判定（owner 旁路恒可见），投递链路不受过滤影响。
+	disp := webhook.New(webhook.Config{CheckURL: func(string) error { return nil }, Visibility: authz.New(mem, authz.Options{})}, mem)
 	disp.Start(nil)
 	t.Cleanup(disp.Close)
 	return New(Config{
@@ -418,5 +421,87 @@ func TestMemberJoinedHook(t *testing.T) {
 	target.mu.Unlock()
 	if after != n {
 		t.Fatalf("幂等重放不应再触发事件（%d → %d）", n, after)
+	}
+}
+
+// TestOutboundWebhookCreateRequiresVisibleChannel P1-5 创建门：创建者（非 owner）
+// 持 ManageServer 但对服务器内所有频道都无 ViewChannel 时，订阅永远空转，创建 403；
+// 授予可见频道后可建，且 creator_id 落创建者 uid、对外 wire 不回传 creator。
+func TestOutboundWebhookCreateRequiresVisibleChannel(t *testing.T) {
+	mem := store.NewMem()
+	// 显式持有 authz 实例：权限数据直改 mem 后须手动失效快照再走 REST。
+	az := authz.New(mem, authz.Options{})
+	srv := New(Config{
+		Store:           mem,
+		JWT:             auth.NewJWT("test-secret"),
+		Refresh:         auth.NewRefreshStore(mem),
+		Codes:           auth.NewEmailCodes(mem),
+		Limits:          auth.NewRateLimit(mem),
+		Session:         auth.NewSessionIndex(mem, mem),
+		Presence:        mem,
+		Authz:           az,
+		WebhookURLCheck: func(string) error { return nil },
+	})
+	h := srv.Handler()
+	ctx := context.Background()
+
+	access, serverID, chID := mkServerChannel(t, h, mem, "vis-a@ex.com", "visA")
+	// 成员 B 加入后授予 ManageServer 自定义角色，再对该服唯一频道装成员级 deny
+	// ViewChannel 覆盖（审查场景：ManageServer 但对频道不可见）。
+	accB, _ := registerUser(t, h, mem, "vis-b@ex.com", "visB", "password123")
+	inv := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/invites", serverID), access,
+		map[string]any{"max_uses": 5}, http.StatusCreated)
+	postJSON(t, h, "/api/v1/servers/join", accB, map[string]string{"code": inv["code"].(string)}, http.StatusOK)
+	uidB := asID(getJSON(t, h, "/api/v1/users/me", accB, http.StatusOK).(map[string]any)["id"])
+	role := &store.Role{ServerID: serverID, Name: "mgr", Permissions: store.ManageServer}
+	if err := mem.CreateRole(ctx, role); err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.SetMemberRoles(ctx, serverID, uidB, []int64{role.ID}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.SetChannelOverwrite(ctx, &store.ChannelOverwrite{
+		ChannelID: chID, TargetType: store.OverwriteTargetMember, TargetID: uidB,
+		Deny: store.ViewChannel,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	az.InvalidateServer(serverID)
+
+	// B 有 ManageServer 但看不到任何频道：创建被拒（空转订阅不让建）。
+	postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/webhooks", serverID), accB,
+		map[string]any{"url": "https://hooks.example.com/x", "events": []string{"message.created"}},
+		http.StatusForbidden)
+
+	// 解除 deny（重新授予 ViewChannel）→ 可建。
+	if err := mem.DeleteChannelOverwrite(ctx, chID, store.OverwriteTargetMember, uidB); err != nil {
+		t.Fatal(err)
+	}
+	az.InvalidateServer(serverID)
+	created := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/webhooks", serverID), accB,
+		map[string]any{"url": "https://hooks.example.com/x", "events": []string{"message.created"}},
+		http.StatusCreated)
+	if created["creator_id"] != nil {
+		t.Fatal("对外 wire 不得回传 creator")
+	}
+	row, err := mem.OutboundWebhookByID(ctx, asID(created["id"]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.CreatorID != uidB {
+		t.Fatalf("creator_id 应落创建者 uid %d，实际 %d", uidB, row.CreatorID)
+	}
+
+	// 服主创建：owner 旁路恒可见，创建不受门影响且 creator_id 落服主 uid。
+	createdOwner := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/webhooks", serverID), access,
+		map[string]any{"url": "https://hooks.example.com/owner", "events": []string{"member.joined"}},
+		http.StatusCreated)
+	rowOwner, err := mem.OutboundWebhookByID(ctx, asID(createdOwner["id"]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	uidA := asID(getJSON(t, h, "/api/v1/users/me", access, http.StatusOK).(map[string]any)["id"])
+	if rowOwner.CreatorID != uidA {
+		t.Fatalf("owner 的 creator_id 应为 %d，实际 %d", uidA, rowOwner.CreatorID)
 	}
 }

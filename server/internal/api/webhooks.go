@@ -119,7 +119,9 @@ func (s *Server) ListServerWebhooks(ctx context.Context, request ListServerWebho
 }
 
 // CreateServerWebhook POST /api/v1/servers/{id}/webhooks：URL 过 SSRF 校验、
-// 事件过白名单校验，secret 只在响应出现一次。
+// 事件过白名单校验，secret 只在响应出现一次。创建者（Principal.UserID）落
+// creator_id，投递侧按其当前频道可见性收窄（P1-5）；创建者对服务器内所有频道
+// 都无 ViewChannel 的订阅永远空转，创建即拒绝。
 func (s *Server) CreateServerWebhook(ctx context.Context, request CreateServerWebhookRequestObject) (CreateServerWebhookResponseObject, error) {
 	if e := checkID(request.Id); e != nil {
 		return nil, e
@@ -130,6 +132,9 @@ func (s *Server) CreateServerWebhook(ctx context.Context, request CreateServerWe
 	}
 	if e := s.allowRate(ctx, "wh:create:"+strconv.FormatInt(c.UserID, 10),
 		whCreateLimit, time.Minute, "操作过于频繁，请稍后再试"); e != nil {
+		return nil, e
+	}
+	if e := s.requireAnyChannelView(ctx, request.Id, c.UserID); e != nil {
 		return nil, e
 	}
 	if request.Body == nil {
@@ -148,10 +153,11 @@ func (s *Server) CreateServerWebhook(ctx context.Context, request CreateServerWe
 		return nil, e
 	}
 	w := &store.OutboundWebhook{
-		ServerID: request.Id,
-		URL:      request.Body.Url,
-		Secret:   secret,
-		Events:   joinEvents(events),
+		ServerID:  request.Id,
+		URL:       request.Body.Url,
+		Secret:    secret,
+		Events:    joinEvents(events),
+		CreatorID: c.UserID,
 	}
 	if e := s.checkWebhookURL(ctx, w.URL); e != nil {
 		return nil, e
@@ -397,6 +403,33 @@ func (s *Server) DeliverInboundWebhook(ctx context.Context, request DeliverInbou
 }
 
 // ---- 辅助 ----
+
+// requireAnyChannelView 创建出站订阅的前置门（P1-5）：创建者对服务器内**至少一个**
+// 频道有 ViewChannel，否则订阅对所有频道维度事件（message.created 等）都会被投递侧
+// 的创建者可见性闸拦下、永远空转，创建即 403。
+// 口径与投递过滤一致走纯角色判定（RoleCanInServer，不做 scope 交集）：订阅按创建者
+// **账号**的实时角色可见性收窄，PAT/bot 令牌的 scope 只限制令牌主体自身的 API 能力，
+// 不改变其账号的频道可见性；若这里用 scope 交集，持有 ManageServer scope 而无
+// messages.read 的令牌将被误拒。
+func (s *Server) requireAnyChannelView(ctx context.Context, serverID, userID int64) *apiErr {
+	if s.authz == nil {
+		return errf(http.StatusInternalServerError, "internal", "权限服务未就绪")
+	}
+	chans, err := s.store.ChannelsOfServer(ctx, serverID)
+	if err != nil {
+		return s.writeStoreErr(ctx, err)
+	}
+	for i := range chans {
+		ok, err := s.authz.RoleCanInServer(ctx, userID, serverID, chans[i].ID, store.ViewChannel)
+		if err != nil {
+			return s.writeStoreErr(ctx, err)
+		}
+		if ok {
+			return nil
+		}
+	}
+	return errf(http.StatusForbidden, "forbidden", "创建者对服务器内所有频道均无查看权限，无法创建出站订阅")
+}
 
 // inboundChannel 入站管理的频道门：频道存在（404）、服务器作用域且为文字频道
 // （400 bad_channel）、调用者有 ManageChannels（403）。

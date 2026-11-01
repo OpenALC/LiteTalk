@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/OpenALC/LiteTalk/server/internal/auth"
+	"github.com/OpenALC/LiteTalk/server/internal/authz"
 	"github.com/OpenALC/LiteTalk/server/internal/push"
 	"github.com/OpenALC/LiteTalk/server/internal/sfu"
 	"github.com/OpenALC/LiteTalk/server/internal/signal"
@@ -138,7 +139,9 @@ func newPipeWorld(t *testing.T) *pipeWorld {
 	hub.SetPushNotifier(b)
 	t.Cleanup(b.Close)
 
-	disp := webhook.New(webhook.Config{CheckURL: func(string) error { return nil }}, mem)
+	// Visibility 与生产同构注入 authz：直插订阅 CreatorID 为空，按服务器 owner
+	// 代持判定（owner 旁路恒可见），投递链路不受过滤影响。
+	disp := webhook.New(webhook.Config{CheckURL: func(string) error { return nil }, Visibility: authz.New(mem, authz.Options{})}, mem)
 	disp.Start(nil)
 	t.Cleanup(disp.Close)
 	hub.SetWebhookOutlet(disp) // message.created 出口挂钩（与生产 main.go 同构）

@@ -374,7 +374,7 @@ func main() {
 	// goroutine（§0.8）——启动期库内无订阅则不 Start，首个订阅创建时由 API 层
 	// EnsureStarted 惰性拉起；已有订阅则 Start 在服务端 shutdown ctx 上，
 	// 清理 goroutine 随进程退出干净停止。
-	webhookDisp := webhookFromEnv(st, log.Default())
+	webhookDisp := webhookFromEnv(st, authzInst, log.Default())
 	startWebhookWorkers := false
 	if webhookDisp != nil {
 		hub.SetWebhookOutlet(webhookDisp)
@@ -952,7 +952,9 @@ func splitList(s string) []string {
 // webhookFromEnv 按环境变量构造出站 Webhook 投递器（#52）。
 // 参数全部有安全默认；解析失败拒绝启动（配置错误不能静默吞掉）。
 // worker 数与重试上限夹到区间：误配既不能拖垮投递，也不能把退避拖到天级。
-func webhookFromEnv(st store.Store, lg *log.Logger) *webhook.Dispatcher {
+// az 注入投递前的频道可见性判定（P1-5）：与 REST/WS 共用同一实例，权限变更的
+// 快照失效同源；az 为 nil 时投递器对频道维度事件 fail-closed（生产不应发生）。
+func webhookFromEnv(st store.Store, az *authz.Authorizer, lg *log.Logger) *webhook.Dispatcher {
 	retryMax := envInt("LITETALK_WEBHOOK_RETRY_MAX", webhook.DefaultRetryMax)
 	retryMax = min(max(retryMax, 0), 20)
 	backoffBase, err := parseGCDuration("LITETALK_WEBHOOK_BACKOFF_BASE",
@@ -974,6 +976,7 @@ func webhookFromEnv(st store.Store, lg *log.Logger) *webhook.Dispatcher {
 		BackoffBase: backoffBase,
 		Timeout:     timeout,
 		Workers:     workers,
+		Visibility:  az,
 		Log:         lg,
 	}, st)
 	if d != nil {
