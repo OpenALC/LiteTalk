@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -123,9 +124,16 @@ func (s *Server) ListServerWebhooks(ctx context.Context, request ListServerWebho
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
+	// url 的路径/查询串常内嵌第三方服务凭证，只对创建者与服主回传完整值；
+	// 其余 ManageServer 成员看到 scheme://host/…（见 webhookURLVisibleTo）。
+	var ownerID int64
 	out := make([]OutboundWebhook, 0, len(rows))
 	for i := range rows {
-		out = append(out, outboundWebhookWire(&rows[i], ""))
+		fullURL, err := s.webhookURLVisibleTo(ctx, request.Id, c.UserID, rows[i].CreatorID, &ownerID)
+		if err != nil {
+			return nil, s.writeStoreErr(ctx, err)
+		}
+		out = append(out, outboundWebhookWire(&rows[i], "", fullURL))
 	}
 	return ListServerWebhooks200JSONResponse(out), nil
 }
@@ -189,7 +197,8 @@ func (s *Server) CreateServerWebhook(ctx context.Context, request CreateServerWe
 	})
 	s.log.Printf("[audit] webhook created server=%d id=%d events=%q ip=%s",
 		request.Id, w.ID, w.Events, reqIP(ctx))
-	return CreateServerWebhook201JSONResponse(outboundWebhookWire(w, secret)), nil
+	// 创建者就是调用者：完整 url 是他自己刚提交的，无需掩码。
+	return CreateServerWebhook201JSONResponse(outboundWebhookWire(w, secret, true)), nil
 }
 
 // PatchServerWebhook PATCH /api/v1/servers/{id}/webhooks/{wid}（Merge Patch）：
@@ -296,7 +305,14 @@ func (s *Server) PatchServerWebhook(ctx context.Context, request PatchServerWebh
 			TargetType: "webhook", TargetID: ptrID(w.ID), Detail: "{}",
 		})
 	}
-	return PatchServerWebhook200JSONResponse(outboundWebhookWire(w, secretOut)), nil
+	// 与列表同一口径：非创建者/非 owner 的 PATCH 响应里 url 同样掩码，否则
+	// 「改个 enabled 再看响应」就能绕过列表掩码读到完整地址。
+	var ownerID int64
+	fullURL, err := s.webhookURLVisibleTo(ctx, request.Id, c.UserID, w.CreatorID, &ownerID)
+	if err != nil {
+		return nil, s.writeStoreErr(ctx, err)
+	}
+	return PatchServerWebhook200JSONResponse(outboundWebhookWire(w, secretOut, fullURL)), nil
 }
 
 // DeleteServerWebhook DELETE /api/v1/servers/{id}/webhooks/{wid}：立即不再投递。
@@ -715,11 +731,16 @@ func randTag() (string, error) {
 }
 
 // outboundWebhookWire store 行 → wire。secretOut 非空时（创建 / reset_secret）
-// 才回传一次性明文；其余路径永不回传。
-func outboundWebhookWire(w *store.OutboundWebhook, secretOut string) OutboundWebhook {
+// 才回传一次性明文；其余路径永不回传。fullURL=false 时 url 以掩码形式回传
+// （调用者既不是订阅创建者也不是服主，不应拿到可能内嵌第三方凭证的地址）。
+func outboundWebhookWire(w *store.OutboundWebhook, secretOut string, fullURL bool) OutboundWebhook {
+	rawURL := w.URL
+	if !fullURL {
+		rawURL = maskWebhookURL(rawURL)
+	}
 	out := OutboundWebhook{
 		Id:        idOf(w.ID),
-		Url:       w.URL,
+		Url:       rawURL,
 		Events:    splitEvents(w.Events),
 		Disabled:  w.Disabled,
 		CreatedAt: timeOf(w.CreatedAt),
@@ -765,6 +786,36 @@ func inboundWebhookWire(w *store.InboundWebhook, urlOut string) InboundWebhook {
 // inboundDeliveryPath 入站投递路径（相对路径，含一次性 secret）。
 func inboundDeliveryPath(id int64, secret string) string {
 	return "/api/v1/webhooks/" + strconv.FormatInt(id, 10) + "/" + secret
+}
+
+// webhookURLVisibleTo 完整出站 url 只回传给订阅创建者与服务器 owner。
+// ManageServer 是「管理订阅」的权限，不该附赠他人投递地址里的第三方凭证
+// （Discord/Slack 等 webhook 的 token 就在路径/查询串里）。creator_id 为 0 的
+// 旧行按 owner 代持（与投递侧 creatorVisible 的兜底语义一致）。
+// ownerID 是懒加载缓存（0 = 未查）：列表里多个订阅共享一次查询。
+func (s *Server) webhookURLVisibleTo(ctx context.Context, serverID, userID, creatorID int64, ownerID *int64) (bool, error) {
+	if creatorID == userID {
+		return true, nil
+	}
+	if *ownerID == 0 {
+		srv, err := s.store.ServerByID(ctx, serverID)
+		if err != nil {
+			return false, err
+		}
+		*ownerID = srv.OwnerID
+	}
+	return *ownerID == userID, nil
+}
+
+// maskWebhookURL 保留 scheme 与 host（管理员据此辨认订阅去向），丢弃 userinfo、
+// 路径、查询串与片段——这些位置最常内嵌第三方服务的投递密钥。解析失败时回退到
+// 常数掩码（存库前已过 SSRF/格式校验，正常到不了这里）。
+func maskWebhookURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "…"
+	}
+	return u.Scheme + "://" + u.Host + "/…"
 }
 
 // notifyWebhookEvent REST 层出站事件派发（#52）：hub 事件流只看得到
