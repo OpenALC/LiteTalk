@@ -171,6 +171,35 @@ func assertConcurrentBreaker(t *testing.T, st Store, ctx context.Context) {
 		t.Fatalf("CreateOutboundWebhook: %v", err)
 	}
 
+	// 边界：恰好 breakerAt-1 次失败不得停用。MySQL 的单表 UPDATE 从左到右求值，
+	// fail_count 若写在 disabled 之前，disabled 会看到已自增的新值而提前一次熔断；
+	// SQLite 则永远用旧值。这条断言钉住两方言在同一阈值边界上的一致行为。
+	edge := &OutboundWebhook{ServerID: 1, URL: "https://hooks.example.com/edge",
+		Secret: "s", Events: "message.created", CreatorID: 1}
+	if err := st.CreateOutboundWebhook(ctx, edge); err != nil {
+		t.Fatalf("CreateOutboundWebhook(edge): %v", err)
+	}
+	for i := 0; i < fails-1; i++ {
+		if err := st.RecordWebhookDelivery(ctx, &WebhookDelivery{
+			WebhookID: edge.ID, Event: "message.created", Attempts: 1,
+		}, fails, "consecutive_failures"); err != nil {
+			t.Fatalf("RecordWebhookDelivery(edge 第 %d 次): %v", i+1, err)
+		}
+	}
+	if got, err := st.OutboundWebhookByID(ctx, edge.ID); err != nil ||
+		got.FailCount != fails-1 || got.Disabled {
+		t.Fatalf("阈值前不应停用: %v %+v", err, got)
+	}
+	if err := st.RecordWebhookDelivery(ctx, &WebhookDelivery{
+		WebhookID: edge.ID, Event: "message.created", Attempts: 1,
+	}, fails, "consecutive_failures"); err != nil {
+		t.Fatalf("RecordWebhookDelivery(edge 达阈值): %v", err)
+	}
+	if got, err := st.OutboundWebhookByID(ctx, edge.ID); err != nil ||
+		!got.Disabled || got.DisabledReason != "consecutive_failures" {
+		t.Fatalf("达到阈值应停用: %v %+v", err, got)
+	}
+
 	var wg sync.WaitGroup
 	start := make(chan struct{})
 	errs := make(chan error, fails)
