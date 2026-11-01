@@ -10,7 +10,7 @@
 // 隐私红线（写死在实现里）：Notification 只承载 {title, body, route}，
 // body 用「在 #频道 提到你」这类事实描述，**绝不放消息正文**——锁屏预览会被
 // 旁人看到。所有实现对 push_token 零日志：token 是生产凭据的等价物，
-// 万一要打日志只留前 8 位（MaskToken）。
+// 万一要打日志只留前 4 位，短 token 全遮（MaskToken）。
 package push
 
 import (
@@ -46,13 +46,14 @@ type Noop struct{}
 // Push 空实现。
 func (Noop) Push(context.Context, []Device, Notification) error { return nil }
 
-// MaskToken 日志打码：只留前 8 位，其余以 … 代替。短 token 也照常截断，
-// 避免分支判断反而泄露长度信息。
+// MaskToken 日志打码：不足 12 字符一律只输出 …，更长的最多保留前 4 位。
+// 短 token 的可见前缀占比过高（8 位即近全量）足以被直接冒用；长度分档同时
+// 避免「短 token 打码后仍是原文」这种事实上的泄露。
 func MaskToken(token string) string {
-	if len(token) <= 8 {
-		return token + "…"
+	if len(token) < 12 {
+		return "…"
 	}
-	return token[:8] + "…"
+	return token[:4] + "…"
 }
 
 // safeLog 所有实现共用：注入 nil logger 时不崩。
