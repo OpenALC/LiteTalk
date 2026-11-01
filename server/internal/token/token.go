@@ -200,6 +200,12 @@ func (s *Service) Verify(ctx context.Context, plain string) (*Principal, error) 
 	if subtle.ConstantTimeCompare([]byte(HashSecret(secret)), []byte(row.SecretHash)) != 1 {
 		return nil, ErrInvalidToken
 	}
+	// 明文里的 kind 只是形态标签（检索/展示用），不能当作凭据内容：它必须与
+	// 落库行的 kind 一致。不一致与「令牌不存在」返回同一个错误，避免让持有
+	// 合法 secret 的人借错误差异推断行的种类。
+	if kind != row.Kind {
+		return nil, ErrInvalidToken
+	}
 	now := s.now()
 	if row.RevokedAt != nil && !now.Before(*row.RevokedAt) {
 		return nil, ErrInvalidToken
