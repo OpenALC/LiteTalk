@@ -2,7 +2,8 @@ package api
 
 // webhooks_test.go 入站与出站 Webhook REST（#52）。覆盖：出站 CRUD 与权限门、
 // 事件白名单与 SSRF 校验、reset_secret 一次性明文、入站投递（免鉴权、secret
-// 常数时间口径、占位机器人身份落库）与泄露可重置（旧 URL 一律 404）。
+// 常数时间口径、占位机器人身份落库）与泄露可就地作废（P2-7：入站 reset 后
+// 旧 URL 一律 404、删除后投递 404、跨频道归属 404）。
 
 import (
 	"context"
@@ -212,16 +213,74 @@ func TestInboundWebhookDelivery(t *testing.T) {
 	postJSON(t, h, deliverURL, "", map[string]string{"content": ""}, http.StatusBadRequest)
 	postJSON(t, h, deliverURL, "", map[string]string{"content": strings.Repeat("字", 2001)}, http.StatusBadRequest)
 
-	// 泄露面收口：入站端点契约只有 GET/POST（无 PATCH/DELETE），secret 不可原地
-	// 轮换——重建新入口拿新 URL 是唯一途径（旧入口的废弃由运维删除行或随频道
-	// 删除完成）。这里验证新入口的 URL 与 secret 逐字对应、旧 URL 的错误 secret
-	// 依旧 404（上文已覆盖），并把「入站缺轮换端点」记入交付报告待主会话裁定。
+	// 泄露面收口（P2-7 后）：原地轮换与删除走 PATCH/DELETE（RotateAndDelete 用例），
+	// 这里验证第二个入口的 URL 与 secret 逐字对应、旧 URL 的错误 secret 依旧 404。
 	created2 := postJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/inbound-webhooks", chID), access,
 		map[string]string{"description": "第二个入口"}, http.StatusCreated)
 	if created2["id"] == created["id"] || created2["url"] == deliverURL {
 		t.Fatal("第二个入口应有独立 id 与 secret")
 	}
 	postJSON(t, h, created2["url"].(string), "", map[string]string{"content": "新入口可用"}, http.StatusOK)
+}
+
+// TestInboundWebhookRotateAndDelete P2-7：入站入口的轮换与删除（与出站对齐）。
+// reset 后旧 URL 一律 404、新 URL 200；明文只在 reset 响应出现一次；删除后投递
+// 404、再删再轮换同样 404；跨频道归属与无权限的口径同创建（归属不符 404、
+// 非成员 403）。
+func TestInboundWebhookRotateAndDelete(t *testing.T) {
+	srv, mem := newTestServerWithWebhooks(t)
+	h := srv.Handler()
+	access, _, chID := mkServerChannel(t, h, mem, "inb-r@ex.com", "inbR")
+	other, _, otherCh := mkServerChannel(t, h, mem, "inb-s@ex.com", "inbS")
+
+	created := postJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/inbound-webhooks", chID), access,
+		map[string]string{"description": "CI"}, http.StatusCreated)
+	oldURL := created["url"].(string)
+	hookID := asID(created["id"])
+	postJSON(t, h, oldURL, "", map[string]string{"content": "旧 URL 可用"}, http.StatusOK)
+
+	// 空补丁与 reset_secret≠true 拒 400：端点只为轮换存在，静默 200 会误导调用方。
+	patchJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/inbound-webhooks/%d", chID, hookID), access,
+		map[string]any{}, http.StatusBadRequest)
+	patchJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/inbound-webhooks/%d", chID, hookID), access,
+		map[string]any{"reset_secret": false}, http.StatusBadRequest)
+
+	// 轮换：新 URL（含一次性明文）只在本次响应出现。
+	patched := patchJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/inbound-webhooks/%d", chID, hookID), access,
+		map[string]any{"reset_secret": true}, http.StatusOK)
+	newURL := patched["url"].(string)
+	if newURL == "" || newURL == oldURL {
+		t.Fatalf("reset 应返回新投递路径且不同于旧值: %q", newURL)
+	}
+	if patched["id"] != created["id"] {
+		t.Fatal("轮换不改 id")
+	}
+	// 旧 URL 立即失效，新 URL 可投递。
+	postJSON(t, h, oldURL, "", map[string]string{"content": "x"}, http.StatusNotFound)
+	postJSON(t, h, newURL, "", map[string]string{"content": "新 URL 可用"}, http.StatusOK)
+	// 列表响应永不回传投递路径（明文只在 reset 响应出现一次）。
+	list := getJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/inbound-webhooks", chID), access, http.StatusOK).([]any)
+	if len(list) != 1 || list[0].(map[string]any)["url"] != nil {
+		t.Fatal("列表不得回传投递 URL")
+	}
+
+	// 归属不符（把 A 的入口挂到 B 的频道路径下）与不存在统一 404；非成员 403（同创建口径）。
+	delJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/inbound-webhooks/%d", otherCh, hookID), other, http.StatusNotFound)
+	patchJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/inbound-webhooks/%d", otherCh, hookID), other,
+		map[string]any{"reset_secret": true}, http.StatusNotFound)
+	delJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/inbound-webhooks/%d", chID, hookID), other, http.StatusForbidden)
+	delJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/inbound-webhooks/%d", chID, hookID+999), access, http.StatusNotFound)
+
+	// 删除后旧 URL 一律 404，再删/再轮换同样 404。
+	delJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/inbound-webhooks/%d", chID, hookID), access, http.StatusOK)
+	postJSON(t, h, newURL, "", map[string]string{"content": "x"}, http.StatusNotFound)
+	delJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/inbound-webhooks/%d", chID, hookID), access, http.StatusNotFound)
+	patchJSON(t, h, fmt.Sprintf("/api/v1/channels/%d/inbound-webhooks/%d", chID, hookID), access,
+		map[string]any{"reset_secret": true}, http.StatusNotFound)
+	// 库内行确已删除（不留软删残留）。
+	if _, err := mem.InboundWebhookByID(context.Background(), hookID); err != store.ErrNotFound {
+		t.Fatalf("删除后应 ErrNotFound，实际 %v", err)
+	}
 }
 
 // ---- REST 事件源挂钩测试（#52）：member.joined / channel.created / channel.deleted ----

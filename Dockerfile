@@ -3,6 +3,23 @@
 # 发版镜像请显式传版本号：docker build --build-arg VERSION=vX.Y.Z -t litetalk-server:vX.Y.Z .
 # VERSION 默认 local（非 dev）：生产守卫（JWT/SFU IP/存储降级）全部生效；
 # 只有显式传 VERSION=dev 才回到开发模式，仅限本地自测。
+
+# ---- Web 客户端构建（P2-8）：node + pnpm 产出 dist-web，供 Go 构建阶段 embed，
+# 自托管镜像内置 Web 客户端（/ 不再 404）。pnpm 锁 pnpm@12.10.1——与 CI
+# check-frontend 读 package.json packageManager 的版本一致，禁止 @latest；
+# node 22 与 CI 的 NODE_VERSION 同大版本。vite 构建是纯 JS，产物与目标架构无关，
+# amd64/arm64 共用本阶段输出。
+FROM node:22-bookworm-slim AS webui
+# 非交互环境下关闭 corepack 首次下载的确认提示。
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+WORKDIR /src/client/frontend
+# 先只拷依赖清单：前端源码变更不使依赖安装层失效。
+COPY client/frontend/package.json client/frontend/pnpm-lock.yaml client/frontend/pnpm-workspace.yaml ./
+RUN corepack enable && corepack prepare pnpm@12.10.1 --activate
+RUN pnpm install --frozen-lockfile
+COPY client/frontend/ ./
+RUN pnpm run build:web
+
 FROM golang:1.27 AS build
 WORKDIR /src
 # 先只拷依赖清单：server/ 源码变更不使 go mod download 层失效。
@@ -13,6 +30,10 @@ COPY client/go.mod client/go.sum ./client/
 WORKDIR /src/server
 RUN go mod download
 COPY server/ ./
+# Web 客户端产物进 embed 目录（P2-8）：dist-web → internal/webui/dist，
+# go:embed all:dist 随二进制内置 Web 客户端。放在 COPY server/ 之后：
+# 仓库里的 dist/.gitkeep 占位被真实产物覆盖，embed 目录恒非空。
+COPY --from=webui /src/client/frontend/dist-web/ ./internal/webui/dist/
 ARG VERSION=local
 ARG TARGETARCH=amd64
 # /out/data 供最终镜像创建 /data：命名卷首次创建时继承镜像内目录属主（65532）。

@@ -1753,6 +1753,17 @@ func (m *Mem) InboundWebhooksOfChannel(_ context.Context, channelID int64) ([]In
 	return out, nil
 }
 
+func (m *Mem) UpdateInboundWebhook(_ context.Context, w *InboundWebhook) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.inHooks[w.ID]; !ok {
+		return ErrNotFound
+	}
+	cp := *w
+	m.inHooks[w.ID] = &cp
+	return nil
+}
+
 func (m *Mem) DeleteInboundWebhook(_ context.Context, id int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

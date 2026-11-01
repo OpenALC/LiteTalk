@@ -96,6 +96,18 @@ func (b *PatchWebhookBody) UnmarshalJSON(data []byte) error {
 	})
 }
 
+// PatchInboundWebhookBody PATCH /channels/{id}/inbound-webhooks/{wid} 合并补丁体
+// （P2-7）：入站入口只支持 reset_secret 一键——端点存在的唯一意义是轮换泄露的
+// URL，其余键没有可改的字段。
+type PatchInboundWebhookBody struct {
+	ResetSecret OptBool
+}
+
+// UnmarshalJSON 三态解码。
+func (b *PatchInboundWebhookBody) UnmarshalJSON(data []byte) error {
+	return decodeMergePatch(data, map[string]mergeField{"reset_secret": &b.ResetSecret})
+}
+
 // ---- 出站订阅 ----
 
 // ListServerWebhooks GET /api/v1/servers/{id}/webhooks（ManageServer）。
@@ -349,6 +361,98 @@ func (s *Server) CreateInboundWebhook(ctx context.Context, request CreateInbound
 		TargetType: "webhook", TargetID: ptrID(w.ID), ChannelID: ptrID(ch.ID), Detail: "{}",
 	})
 	return CreateInboundWebhook201JSONResponse(inboundWebhookWire(w, inboundDeliveryPath(w.ID, secret))), nil
+}
+
+// PatchInboundWebhook PATCH /api/v1/channels/{id}/inbound-webhooks/{wid}
+// （Merge Patch，P2-7）：reset_secret=true 换新 secret——旧投递 URL 立即失效，
+// 新明文（url 字段）只在本次响应返回一次。空补丁/reset_secret≠true 一律 400：
+// 静默 200 会让调用方误以为已轮换。归属校验与创建同口径（inboundChannel），
+// wid 不属于该频道与不存在统一 404。
+func (s *Server) PatchInboundWebhook(ctx context.Context, request PatchInboundWebhookRequestObject) (PatchInboundWebhookResponseObject, error) {
+	if e := checkID(request.Id); e != nil {
+		return nil, e
+	}
+	if e := checkID(int64(request.Wid)); e != nil {
+		return nil, e
+	}
+	c := currentUser(ctx)
+	ch, e := s.inboundChannel(ctx, request.Id, c.UserID)
+	if e != nil {
+		return nil, e
+	}
+	if e := s.allowRate(ctx, "wh:patch-inb:"+strconv.FormatInt(c.UserID, 10),
+		whPatchLimit, time.Minute, "操作过于频繁，请稍后再试"); e != nil {
+		return nil, e
+	}
+	body := patchBody(request.JSONBody, request.ApplicationMergePatchPlusJSONBody)
+	if body == nil {
+		return nil, bodyMissing()
+	}
+	if !body.ResetSecret.Set || !body.ResetSecret.Val {
+		return nil, errf(http.StatusBadRequest, "bad_request", "reset_secret 需为 true")
+	}
+	w, err := s.store.InboundWebhookByID(ctx, int64(request.Wid))
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, errf(http.StatusNotFound, "not_found", "资源不存在")
+		}
+		return nil, s.writeStoreErr(ctx, err)
+	}
+	if w.ChannelID != ch.ID {
+		// 归属不符与不存在同响应：不泄露跨频道资源存在性。
+		return nil, errf(http.StatusNotFound, "not_found", "资源不存在")
+	}
+	secret, e := s.newWebhookSecret()
+	if e != nil {
+		return nil, e
+	}
+	w.Secret = secret
+	if err := s.store.UpdateInboundWebhook(ctx, w); err != nil {
+		return nil, s.writeStoreErr(ctx, err)
+	}
+	s.audit(ctx, store.AuditLog{
+		ServerID: ch.ServerID, ActorID: c.UserID, Action: "inbound_webhook.reset_secret",
+		TargetType: "webhook", TargetID: ptrID(w.ID), ChannelID: ptrID(ch.ID), Detail: "{}",
+	})
+	return PatchInboundWebhook200JSONResponse(inboundWebhookWire(w, inboundDeliveryPath(w.ID, secret))), nil
+}
+
+// DeleteInboundWebhook DELETE /api/v1/channels/{id}/inbound-webhooks/{wid}（P2-7）：
+// 入口行删除后旧投递 URL 即失效（投递侧回读不到该 id，一律 404）。
+func (s *Server) DeleteInboundWebhook(ctx context.Context, request DeleteInboundWebhookRequestObject) (DeleteInboundWebhookResponseObject, error) {
+	if e := checkID(request.Id); e != nil {
+		return nil, e
+	}
+	if e := checkID(int64(request.Wid)); e != nil {
+		return nil, e
+	}
+	c := currentUser(ctx)
+	ch, e := s.inboundChannel(ctx, request.Id, c.UserID)
+	if e != nil {
+		return nil, e
+	}
+	if e := s.allowRate(ctx, "wh:del-inb:"+strconv.FormatInt(c.UserID, 10),
+		whDeleteLimit, time.Minute, "操作过于频繁，请稍后再试"); e != nil {
+		return nil, e
+	}
+	w, err := s.store.InboundWebhookByID(ctx, int64(request.Wid))
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, errf(http.StatusNotFound, "not_found", "资源不存在")
+		}
+		return nil, s.writeStoreErr(ctx, err)
+	}
+	if w.ChannelID != ch.ID {
+		return nil, errf(http.StatusNotFound, "not_found", "资源不存在")
+	}
+	if err := s.store.DeleteInboundWebhook(ctx, int64(request.Wid)); err != nil {
+		return nil, s.writeStoreErr(ctx, err)
+	}
+	s.audit(ctx, store.AuditLog{
+		ServerID: ch.ServerID, ActorID: c.UserID, Action: "inbound_webhook.delete",
+		TargetType: "webhook", TargetID: ptrID(w.ID), ChannelID: ptrID(ch.ID), Detail: "{}",
+	})
+	return DeleteInboundWebhook200JSONResponse{Status: StatusOkStatusOk}, nil
 }
 
 // DeliverInboundWebhook POST /api/v1/webhooks/{id}/{secret}（免 Bearer）：

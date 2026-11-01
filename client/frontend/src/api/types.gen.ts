@@ -1175,7 +1175,7 @@ export interface paths {
         };
         /**
          * 频道入站 Webhook 列表（ManageChannels）
-         * @description 频道级入站投递入口（#52）。要求 Bearer 且调用者对该频道有 ManageChannels。 只支持服务器文字频道（会话/语音频道 400 bad_channel）。 响应不含 secret——泄露即重建；投递路径只在创建响应给一次。 code：bad_channel、bad_request；401；403；404 not_found；5xx internal。
+         * @description 频道级入站投递入口（#52）。要求 Bearer 且调用者对该频道有 ManageChannels。 只支持服务器文字频道（会话/语音频道 400 bad_channel）。 响应不含 secret——泄露即 PATCH reset_secret 轮换或删除重建； 投递路径只在创建与 reset_secret 响应给一次。 code：bad_channel、bad_request；401；403；404 not_found；5xx internal。
          */
         get: operations["listInboundWebhooks"];
         put?: never;
@@ -1190,6 +1190,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/channels/{id}/inbound-webhooks/{wid}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * 删除入站 Webhook（ManageChannels）
+         * @description 删除后旧投递 URL 立即失效（投递侧回读不到该 id，一律 404）。 归属不符（wid 不属于该频道）与不存在统一 404。 频控键 wh:del-inb:<uid>。code：bad_request；401；403；404 not_found； 429 rate_limited；5xx internal。
+         */
+        delete: operations["deleteInboundWebhook"];
+        options?: never;
+        head?: never;
+        /**
+         * 轮换入站 Webhook secret（ManageChannels；Merge Patch）
+         * @description JSON Merge Patch（RFC 7396）：入站入口只支持 reset_secret 一个键且必须为 true——端点存在的唯一意义就是轮换，空补丁或 reset_secret≠true 一律 400 bad_request（静默 200 会让调用方误以为已轮换）。reset_secret=true 换新 secret 并只在本次响应返回投递路径（含一次性明文），旧 URL 立即失效 （泄露的 URL 可就地作废）。归属不符（wid 不属于该频道）与不存在统一 404。 频控键 wh:patch-inb:<uid>。code：bad_request；401；403；404 not_found； 429 rate_limited；5xx internal。
+         */
+        patch: operations["patchInboundWebhook"];
+        trace?: never;
+    };
     "/api/v1/webhooks/{id}/{secret}": {
         parameters: {
             query?: never;
@@ -1201,7 +1225,7 @@ export interface paths {
         put?: never;
         /**
          * 入站投递入口（免鉴权；全服务唯一免 Bearer 端点）
-         * @description 外部系统向频道投递消息的唯一入口：凭路径 secret 校验（常数时间比对）， 不区分「id 不存在」与「secret 错」，失败一律 404 not_found（避免枚举； 重建/删除入口后旧 URL 即失效）。消息以 webhook 机器人身份落库到频道， 内容 1–2000 字符，违规 400 bad_content。频控键 inb:<webhook id>。 本端点不需要也无法使用 Bearer——认证就是 URL 里的 secret。 code：bad_content；404 not_found；429 rate_limited；5xx internal。
+         * @description 外部系统向频道投递消息的唯一入口：凭路径 secret 校验（常数时间比对）， 不区分「id 不存在」与「secret 错」，失败一律 404 not_found（避免枚举； 轮换/删除/重建入口后旧 URL 即失效）。消息以 webhook 机器人身份落库到频道， 内容 1–2000 字符，违规 400 bad_content。频控键 inb:<webhook id>。 本端点不需要也无法使用 Bearer——认证就是 URL 里的 secret。 code：bad_content；404 not_found；429 rate_limited；5xx internal。
          */
         post: operations["deliverInboundWebhook"];
         delete?: never;
@@ -1383,7 +1407,7 @@ export interface components {
         PatchWebhookRequest: Record<string, never>;
         /**
          * InboundWebhook
-         * @description 频道级入站投递入口（#52）。url 形如 /api/v1/webhooks/{id}/{secret}， 只在创建响应出现（含一次性 secret）；列表响应不含 secret， 泄露即删除重建。
+         * @description 频道级入站投递入口（#52）。url 形如 /api/v1/webhooks/{id}/{secret}， 只在创建与 reset_secret（PATCH）响应出现（含一次性 secret）；列表响应 不含 secret，泄露即 PATCH reset_secret 轮换或删除重建。
          */
         InboundWebhook: {
             id: string;
@@ -1402,6 +1426,11 @@ export interface components {
             /** @description 用途备注（可空） */
             description?: string;
         };
+        /**
+         * PatchInboundWebhookRequest
+         * @description JSON Merge Patch（RFC 7396）：入站入口只支持 reset_secret 一个可选键， 且必须为 true（空补丁/reset_secret≠true 由实现拒 400 bad_request）。 reset_secret=true 换新 secret 并只在本次响应返回投递路径（含一次性明文）， 旧 URL 立即失效。
+         */
+        PatchInboundWebhookRequest: Record<string, never>;
         /**
          * InboundDeliveryRequest
          * @description 入站投递体（#52）。消息以 webhook 机器人身份落库。
@@ -4496,6 +4525,73 @@ export interface operations {
         responses: {
             /** @description 已创建（url 含一次性 secret） */
             201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InboundWebhook"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    deleteInboundWebhook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+                /** @description 出站订阅 ID 的十进制数字串（#52） */
+                wid: components["parameters"]["WebhookIDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 已删除 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StatusOk"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Internal"];
+        };
+    };
+    patchInboundWebhook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 资源 ID 的十进制数字串（URL 无精度问题；JSON 体里 ID 一律字符串） */
+                id: components["parameters"]["IDPath"];
+                /** @description 出站订阅 ID 的十进制数字串（#52） */
+                wid: components["parameters"]["WebhookIDPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/merge-patch+json": components["schemas"]["PatchInboundWebhookRequest"];
+                "application/json": components["schemas"]["PatchInboundWebhookRequest"];
+            };
+        };
+        responses: {
+            /** @description 已轮换（url 含一次性新 secret） */
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };

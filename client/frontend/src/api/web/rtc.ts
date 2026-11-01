@@ -49,6 +49,9 @@ export class VoicePeer {
   unavailableError = ''
   // capturePromise 单飞采集：权限弹窗可能长时间挂起，必须可等待、可超时。
   private capturePromise: Promise<boolean> | null = null
+  // captureGen 采集代数：退房释放时 +1。权限弹窗期间退房、流迟到才 resolve，
+  // 若不比对代数，迟到的流会被挂回已退房的 peer——麦克风占用指示复燃。
+  private captureGen = 0
 
   constructor(callbacks: RTCCallbacks) {
     this.callbacks = callbacks
@@ -63,8 +66,9 @@ export class VoicePeer {
   }
 
   private async doCapture(): Promise<boolean> {
+    const gen = this.captureGen
     try {
-      this.localStream = await navigator.mediaDevices.getUserMedia({
+      const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
@@ -72,6 +76,12 @@ export class VoicePeer {
         },
         video: false,
       })
+      if (gen !== this.captureGen) {
+        // 采集期间发生退房释放：立即停轨丢弃，不挂回已退房的 peer。
+        for (const t of stream.getTracks()) t.stop()
+        return false
+      }
+      this.localStream = stream
       this.available = true
       return true
     } catch (e) {
@@ -134,6 +144,9 @@ export class VoicePeer {
       for (const track of this.localStream.getAudioTracks()) {
         conn.addTrack(track, this.localStream)
       }
+      // 重入房换了新轨（或复用旧轨）都要回放静音意图：新轨 enabled 恒 true，
+      // 不同步会让「已闭麦」用户实际在推流（服务端按 RFC 6464 电平判定说话）。
+      this.applyMute(this.muted)
     } else {
       // 采集不可用/仍在弹窗：只收不发（recvonly）。Go 侧无此路径——那边
       // JoinChannel 直接失败；浏览器把「能听」与「能说」解耦是净收益，
@@ -230,8 +243,13 @@ export class VoicePeer {
     for (const c of queued) await this.addRemoteICE(c)
   }
 
-  // teardown 拆本地链路（不关采集流——重入房复用同一麦克风轨）。
-  teardown(): void {
+  // teardown 拆本地链路。releaseCapture=false（重建 PC/瞬断重连）：保留采集流，
+  // 重入房复用同一麦克风轨、不重走权限；releaseCapture=true（退房/登出/被抢占）：
+  // 停掉全部本地轨并清空采集态——浏览器麦克风占用指示随之熄灭，下次入房由
+  // startCapture 重新 getUserMedia（失败照旧降级 recvonly，不阻断入房）。
+  // 单飞 promise 必须一并复位并推进代数：复用已结算的旧 promise 会让重入房
+  // 拿不回采集，而复位不推进代数会让迟到的旧流挂回已退房的 peer。
+  teardown(releaseCapture = false): void {
     for (const { el } of this.remoteAudio.values()) el.remove()
     this.remoteAudio.clear()
     if (this.pc) {
@@ -245,6 +263,14 @@ export class VoicePeer {
         // 已关闭
       }
       this.pc = null
+    }
+    if (releaseCapture && this.localStream) {
+      for (const t of this.localStream.getTracks()) t.stop()
+      this.localStream = null
+    }
+    if (releaseCapture) {
+      this.captureGen++
+      this.capturePromise = null
     }
   }
 

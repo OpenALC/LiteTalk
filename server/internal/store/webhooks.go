@@ -291,6 +291,18 @@ func dbInboundWebhooksOfChannel(ctx context.Context, q sqlExecer, channelID int6
 	return out, rows.Err()
 }
 
+// dbUpdateInboundWebhook 全行写（轮换 secret 用，P2-7）；调用方读-改-写，
+// 不动 created_at/channel_id。未命中 ErrNotFound。
+func dbUpdateInboundWebhook(ctx context.Context, q sqlExecer, w *InboundWebhook) error {
+	res, err := q.ExecContext(ctx,
+		`UPDATE inbound_webhooks SET secret = ?, description = ? WHERE id = ?`,
+		w.Secret, w.Description, w.ID)
+	if err != nil {
+		return err
+	}
+	return checkAffected(res)
+}
+
 // dbDeleteInboundWebhook 删除入站入口；未命中 ErrNotFound。
 func dbDeleteInboundWebhook(ctx context.Context, q sqlExecer, id int64) error {
 	res, err := q.ExecContext(ctx, `DELETE FROM inbound_webhooks WHERE id = ?`, id)

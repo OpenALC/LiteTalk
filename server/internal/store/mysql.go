@@ -2159,6 +2159,10 @@ func (m *MySQL) InboundWebhooksOfChannel(ctx context.Context, channelID int64) (
 	return dbInboundWebhooksOfChannel(ctx, m.db, channelID)
 }
 
+func (m *MySQL) UpdateInboundWebhook(ctx context.Context, w *InboundWebhook) error {
+	return dbUpdateInboundWebhook(ctx, m.db, w)
+}
+
 func (m *MySQL) DeleteInboundWebhook(ctx context.Context, id int64) error {
 	return dbDeleteInboundWebhook(ctx, m.db, id)
 }
