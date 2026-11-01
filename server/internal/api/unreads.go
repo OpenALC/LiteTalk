@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/internal/token"
 )
 
 // #40 B2：未读与提及计数的 REST 面。
@@ -109,6 +110,11 @@ func (s *Server) visibleChannelSet(ctx context.Context, uid int64) ([]int64, map
 		}
 	}
 
+	// 会话读 scope（P1-6）：不满足读口径的令牌整体跳过会话，未读汇总与 /search
+	// 都不含其内容。ctx 即请求 ctx（router 中间件已注入 Principal）。
+	if !token.CanReadConversation(ctx) {
+		return channelIDs, channelServer, serverIDs, nil
+	}
 	conversations, err := s.store.ListConversations(ctx, uid)
 	if err != nil {
 		return nil, nil, nil, err

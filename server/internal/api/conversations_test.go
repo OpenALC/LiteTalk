@@ -580,3 +580,66 @@ func TestConversationMessagesRequireWriteScope(t *testing.T) {
 	// JWT 不受影响。
 	sendMsg(t, h, w.alice, convID, "JWT 照常")
 }
+
+// TestConversationReadRequiresViewScope 会话频道读路径的 scope 门（P1-6）：
+// P1-3 只给写路径加了门，读路径只查成员——guild.manage / admin.read /
+// attachments.write 令牌曾能读私聊全文。口径与服务器频道读一致（scope 映射位含
+// ViewChannel）：messages.read / messages.write / voice.connect 放行，其余 403；
+// 非成员仍 404（先于 scope 判定）；JWT 不变；未读汇总与搜索不含被拒令牌的会话。
+func TestConversationReadRequiresViewScope(t *testing.T) {
+	w := newConvWorld(t)
+	h := w.h
+
+	created := postJSON(t, h, "/api/v1/conversations", w.alice,
+		map[string]any{"kind": "direct", "user_ids": uidList(w.bobID)}, http.StatusCreated)
+	convID := asID(created["id"])
+	msgPath := fmt.Sprintf("/api/v1/channels/%d/messages", convID)
+	// bob 发一条，对 alice 既是未读也是搜索命中。
+	msgID := sendMsg(t, h, w.bob, convID, "p16密文")
+	oneMsgPath := fmt.Sprintf("%s/%d", msgPath, msgID)
+	readPath := fmt.Sprintf("/api/v1/channels/%d/read", convID)
+	readBody := map[string]string{"last_message_id": strconv.FormatInt(msgID, 10)}
+
+	denied := map[string]string{
+		"guild.manage":      patFor(t, w.mem, w.aliceID, "guild.manage"),
+		"admin.read":        patFor(t, w.mem, w.aliceID, "admin.read"),
+		"attachments.write": patFor(t, w.mem, w.aliceID, "attachments.write"),
+	}
+	allowed := map[string]string{
+		"messages.read":  patFor(t, w.mem, w.aliceID, "messages.read"),
+		"messages.write": patFor(t, w.mem, w.aliceID, "messages.write"),
+		"voice.connect":  patFor(t, w.mem, w.aliceID, "voice.connect"),
+		"JWT":            w.alice,
+	}
+
+	for name, tok := range denied {
+		if resp, ok := getJSON(t, h, msgPath, tok, http.StatusForbidden).(map[string]any); !ok || resp["code"] != "forbidden" {
+			t.Fatalf("%s 读会话消息列表应 403 forbidden，实际 %v", name, resp)
+		}
+		getJSON(t, h, oneMsgPath, tok, http.StatusForbidden)
+		if resp := doJSON(t, h, http.MethodPut, readPath, tok, readBody, http.StatusForbidden); resp["code"] != "forbidden" {
+			t.Fatalf("%s 标记会话已读应 403 forbidden，实际 %v", name, resp)
+		}
+		// 未读汇总与搜索都不含被拒令牌的会话内容。
+		if _, in := fetchUnreads(t, h, tok).channels[convID]; in {
+			t.Fatalf("%s 的未读汇总不应包含会话 %d", name, convID)
+		}
+		if got := fetchSearch(t, h, tok, "p16密文"); len(got) != 0 {
+			t.Fatalf("%s 搜索不应命中会话消息: %v", name, got)
+		}
+	}
+	for name, tok := range allowed {
+		getJSON(t, h, msgPath, tok, http.StatusOK)
+		getJSON(t, h, oneMsgPath, tok, http.StatusOK)
+		if _, in := fetchUnreads(t, h, tok).channels[convID]; !in {
+			t.Fatalf("%s 的未读汇总应包含会话 %d", name, convID)
+		}
+		assertSearchSet(t, fetchSearch(t, h, tok, "p16密文"), msgID)
+		// 水位只前进，重复标记幂等。
+		doJSON(t, h, http.MethodPut, readPath, tok, readBody, http.StatusOK)
+	}
+
+	// 非成员（erin）：成员判定先于 scope 判定，放行与被拒 scope 都是 404。
+	getJSON(t, h, msgPath, patFor(t, w.mem, w.erinID, "messages.read"), http.StatusNotFound)
+	getJSON(t, h, msgPath, patFor(t, w.mem, w.erinID, "guild.manage"), http.StatusNotFound)
+}
