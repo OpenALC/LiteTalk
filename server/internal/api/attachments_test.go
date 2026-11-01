@@ -513,3 +513,29 @@ func TestAttachmentDownloadBlobMissing(t *testing.T) {
 		t.Fatalf("对象丢失期望 404 实际 %d", dl.Code)
 	}
 }
+
+// TestUploadRequiresAttachmentsWriteScope 上传的 scope 门（P1-3 顺带）：上传此前
+// 只查登录，attachments.write 形同虚设——无该 scope 的令牌（messages.read）403，
+// 持有该 scope 的令牌与 JWT 主体照常上传。
+func TestUploadRequiresAttachmentsWriteScope(t *testing.T) {
+	srv, mem, _ := newAttachmentTestServer(t, 1<<20)
+	h := srv.Handler()
+	access, _ := registerUser(t, h, mem, "up-scope@ex.com", "upScope", "password123")
+	ro := postJSON(t, h, "/api/v1/tokens", access, map[string]any{
+		"name": "只读", "scopes": []string{"messages.read"},
+	}, http.StatusCreated)["token"].(string)
+	aw := postJSON(t, h, "/api/v1/tokens", access, map[string]any{
+		"name": "附件", "scopes": []string{"attachments.write"},
+	}, http.StatusCreated)["token"].(string)
+
+	part := uploadPart{field: "file", filename: "a.png", data: testPNG(t, 4, 4)}
+	if rec := uploadAttachment(t, h, ro, part); rec.Code != http.StatusForbidden {
+		t.Fatalf("messages.read 上传应 403，实际 %d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := uploadAttachment(t, h, aw, part); rec.Code != http.StatusCreated {
+		t.Fatalf("attachments.write 上传应 201，实际 %d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := uploadAttachment(t, h, access, part); rec.Code != http.StatusCreated {
+		t.Fatalf("JWT 上传应 201，实际 %d body=%s", rec.Code, rec.Body.String())
+	}
+}
