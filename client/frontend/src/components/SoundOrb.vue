@@ -64,14 +64,15 @@ const active = computed(() => props.speaking && !props.muted && !props.deafen)
 }
 .orb-bars { display: flex; align-items: center; gap: 3.5px; height: 26px; }
 .orb-bars i {
-  width: 4px; height: 24px; border-radius: 2px;
+  width: 4px; height: 8px; border-radius: 2px;
   background: var(--idc);
-  transform: scaleY(0.333333);
 }
 .orb.speaking {
   box-shadow: 0 0 0 2px var(--idc), 0 0 26px color-mix(in srgb, var(--idc) 25%, transparent);
 }
 .orb.speaking .orb-bars i {
+  height: 24px;
+  transform: scaleY(0.333333);
   animation: wave 1.05s ease-in-out infinite;
   animation-delay: calc(var(--i) * 0.13s);
 }
