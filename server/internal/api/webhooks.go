@@ -250,21 +250,32 @@ func (s *Server) PatchServerWebhook(ctx context.Context, request PatchServerWebh
 		}
 		w.URL = body.Url.Val
 	}
-	// events 先落到内存行，可见性门才能按**改后**的订阅集合判定（同一次 PATCH
-	// 既改地址又改事件时，要按新集合算会不会空转）。
+	// events 先落到内存行，可见性门才能按**改后**的订阅集合判定。
+	// 只改事件也要过门，否则能先建 member.* 再改成永远空转的频道订阅。
+	eventsChanged := false
 	if body.Events.Set {
 		if body.Events.Null || !webhook.ValidEvents(body.Events.Val) {
 			return nil, errf(http.StatusBadRequest, "bad_events",
 				"events 必须非空、不重复且全部在白名单内")
 		}
-		w.Events = joinEvents(body.Events.Val)
+		events := joinEvents(body.Events.Val)
+		eventsChanged = events != w.Events
+		w.Events = events
 	}
 	oldCreatorID := w.CreatorID
-	if urlChanged {
-		if e := s.requireSubscribedChannelView(ctx, request.Id, c.UserID,
+	if urlChanged || eventsChanged {
+		// 改址者成为最终创建者；只改事件仍按原创建者判定。不能拿操作者的
+		// principal/scope 约束他人订阅，旧行 creator_id=0 在门内按 owner 代持。
+		gateUserID := w.CreatorID
+		if urlChanged {
+			gateUserID = c.UserID
+		}
+		if e := s.requireSubscribedChannelView(ctx, request.Id, gateUserID,
 			strings.Fields(w.Events)); e != nil {
 			return nil, e
 		}
+	}
+	if urlChanged {
 		w.CreatorID = c.UserID
 	}
 	if body.ResetSecret.Set && body.ResetSecret.Val {
@@ -586,6 +597,14 @@ func (s *Server) requireSubscribedChannelView(ctx context.Context, serverID, use
 	}
 	if !needText && !needAny {
 		return nil // 仅 member.*：无频道维度，投递不经过可见性闸
+	}
+	if userID == 0 {
+		// 0022 前的旧行 creator_id=0 由服务器 owner 代持，与投递侧一致。
+		srv, err := s.store.ServerByID(ctx, serverID)
+		if err != nil {
+			return s.writeStoreErr(ctx, err)
+		}
+		userID = srv.OwnerID
 	}
 	if s.authz == nil {
 		return errf(http.StatusInternalServerError, "internal", "权限服务未就绪")
