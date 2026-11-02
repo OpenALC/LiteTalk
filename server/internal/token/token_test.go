@@ -140,6 +140,52 @@ func TestVerifyFailures(t *testing.T) {
 	}
 }
 
+// TestVerifyKindMismatch 明文 kind 与库行 kind 不一致必须拒绝，且错误与
+// 「令牌不存在」完全相同：两者都只回 ErrInvalidToken，调用方无从区分是
+// 行不存在还是种类对不上。两个方向各测一遍，secret/前缀全部合法，只有
+// kind 一边不同——排除其它失败原因。
+func TestVerifyKindMismatch(t *testing.T) {
+	svc, mem, _ := newTestService(t)
+	ctx := context.Background()
+	u := mustUser(t, mem, "kind@ex.com", "kind", 0)
+
+	cases := []struct {
+		name    string
+		plain   string
+		rowKind string
+	}{
+		{"明文 pat / 行 bot", KindPAT, KindBot},
+		{"明文 bot / 行 pat", KindBot, KindPAT},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := NewPlain(tc.plain)
+			if err != nil {
+				t.Fatalf("NewPlain: %v", err)
+			}
+			row := &store.APIToken{
+				UserID:     u.ID,
+				Name:       "kind",
+				Prefix:     p.Prefix,
+				SecretHash: p.Hash,
+				Kind:       tc.rowKind,
+				Scopes:     "messages.read",
+			}
+			if err := mem.CreateAPIToken(ctx, row); err != nil {
+				t.Fatalf("CreateAPIToken: %v", err)
+			}
+			got, err := svc.Verify(ctx, p.Token)
+			if err != ErrInvalidToken {
+				t.Fatalf("kind 不一致应返回 ErrInvalidToken（与令牌不存在相同），实际 %v（principal=%+v）", err, got)
+			}
+			// 对照：同一个服务对真正不存在的令牌也返回这一个哨兵。
+			if _, err := svc.Verify(ctx, "ltk_pat_00000000_"+p.Token[len(p.Token)-43:]); err != ErrInvalidToken {
+				t.Fatalf("不存在的令牌应返回同一个 ErrInvalidToken: %v", err)
+			}
+		})
+	}
+}
+
 // TestVerifyRevokedImmediate 吊销立即生效：无缓存，下一次校验即拒绝。
 func TestVerifyRevokedImmediate(t *testing.T) {
 	svc, mem, now := newTestService(t)
@@ -304,6 +350,28 @@ func TestScopeLimitFromContext(t *testing.T) {
 	limit, ok = ScopeLimitFromContext(WithPrincipal(ctx, empty))
 	if !ok || limit != 0 {
 		t.Fatalf("空 scope 令牌 = 无任何权限：limit=%v ok=%v", limit, ok)
+	}
+}
+
+// TestWithoutPrincipal 跨主体判定用的 ctx 剥离：PrincipalFromContext 取不到，
+// ScopeLimitFromContext 回到「不受限」，其余 ctx 值保留。
+func TestWithoutPrincipal(t *testing.T) {
+	type otherKey struct{}
+	ctx := context.WithValue(context.Background(), otherKey{}, "keep")
+	pat := &Principal{Kind: KindPAT, Scopes: []string{ScopeGuildManage}}
+	ctx = WithPrincipal(ctx, pat)
+	if PrincipalFromContext(ctx) == nil {
+		t.Fatal("前置：注入的 Principal 应可读")
+	}
+	bare := WithoutPrincipal(ctx)
+	if p := PrincipalFromContext(bare); p != nil {
+		t.Fatalf("剥离后不应再有 Principal: %+v", p)
+	}
+	if _, limited := ScopeLimitFromContext(bare); limited {
+		t.Fatal("剥离后 scope 不应再产生上限（收件人判定不受发送者凭据约束）")
+	}
+	if v, _ := bare.Value(otherKey{}).(string); v != "keep" {
+		t.Fatal("剥离只去掉 Principal，其余 ctx 值必须保留")
 	}
 }
 

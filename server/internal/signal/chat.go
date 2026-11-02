@@ -119,11 +119,17 @@ func (h *Hub) messageRecipients(ctx context.Context, ch *store.Channel, senderUI
 		h.log.Printf("chat: 查服务器 %d 成员失败（广播回落为仅发送者）: %v", ch.ServerID, err)
 		return uids
 	}
+	// 收件人可见性是跨主体判定：只由收件人自己的角色决定。必须剥掉发送者的
+	// Principal——CanInServer 会把 ctx 里令牌的 scope 上限与角色权限求交集，
+	// 带发送者 ctx 等于让发送者的凭据去裁别人的可见性。WS 入口碰巧传的是
+	// background ctx（无 Principal），但 REST / 入站 webhook 入口传的是携带
+	// 主体的请求 ctx；不能依赖「发消息的令牌必带 messages.write」这个隐含前提。
+	recipientCtx := token.WithoutPrincipal(ctx)
 	for _, m := range members {
 		if formatUID(m.UserID) == senderUID {
 			continue // 发送者已恒在目标内
 		}
-		ok, err := h.permCheckQuiet(ctx, m.UserID, ch.ServerID, ch.ID, store.ViewChannel)
+		ok, err := h.permCheckQuiet(recipientCtx, m.UserID, ch.ServerID, ch.ID, store.ViewChannel)
 		if err != nil {
 			h.log.Printf("chat: 收件人 %d 权限查询失败，跳过: %v", m.UserID, err)
 			continue

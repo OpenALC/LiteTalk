@@ -5,7 +5,10 @@ import (
 	"io/fs"
 	"math"
 	"os"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/OpenALC/LiteTalk/server/migrations"
 )
@@ -176,6 +179,39 @@ func TestMySQLMigrateAndCRUD(t *testing.T) {
 
 	// 频道分类归属（#72）：与 Mem 共用同一套断言，两边语义漂移会直接测挂。
 	assertChannelCategoryPersist(t, m)
+}
+
+// TestMySQLUserByEmailCaseInsensitive 真库：utf8mb4_unicode_ci 让存量混合
+// 大小写邮箱也能被规范化邮箱命中，且大小写变体重复建号冲突（SQLite 靠
+// lower() 兜底，两边语义对齐）。
+func TestMySQLUserByEmailCaseInsensitive(t *testing.T) {
+	m := openTestMySQL(t)
+	defer m.Close()
+	ctx := context.Background()
+	if _, err := m.DB().ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS litetalk_test"); err != nil {
+		t.Fatalf("建测试库失败: %v", err)
+	}
+	if _, err := m.DB().ExecContext(ctx, "USE litetalk_test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Migrate(ctx, findMigrations(t)); err != nil {
+		t.Fatalf("迁移失败: %v", err)
+	}
+	suffix := strconv.FormatInt(time.Now().UnixNano()%1e9, 10)
+	email := "Legacy.Mixed." + suffix + "@Example.COM"
+	mixed := &User{Email: email, Nickname: "ci" + suffix, Tag: "0001", PasswordHash: "h"}
+	if err := m.CreateUser(ctx, mixed); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	got, err := m.UserByEmail(ctx, strings.ToLower(email))
+	if err != nil || got.ID != mixed.ID {
+		t.Fatalf("规范化邮箱应命中存量混合大小写行: %+v %v", got, err)
+	}
+	if err := m.CreateUser(ctx, &User{
+		Email: strings.ToLower(email), Nickname: "dup" + suffix, Tag: "0002",
+	}); err != ErrConflict {
+		t.Fatalf("ci 排序下大小写变体的同一邮箱应 ErrConflict，实际 %v", err)
+	}
 }
 
 // findMigrations 定位迁移文件：优先 embed（migrations.FS），回退磁盘目录。

@@ -28,6 +28,13 @@ const (
 	offlineEdgeTTL = 90 * time.Second
 )
 
+// offlineSweepInterval 离线边沿清理节拍。offlineAt 只服务 offlineEdgeTTL 内的
+// 兜底判定，过期条目不删会随历史上线过的用户数无界增长（OnUserOffline 每来
+// 一次离线就写一条）。放在 worker 节拍里跑，不进 OnUserOffline 调用路径——
+// 后者的契约是快速返回、只写一次时间戳。30s 使删除延迟最多一个 TTL，稳态条目
+// 数有界在「两个 TTL 内离线过的用户」。测试可缩短。
+var offlineSweepInterval = 30 * time.Second
+
 // DeviceStore Broker 依赖的存储窄接口（*store.Store 满足）。
 type DeviceStore interface {
 	PushDevicesOfUser(ctx context.Context, userID int64) ([]store.PushDevice, error)
@@ -115,8 +122,10 @@ func NewBroker(cfg BrokerConfig) *Broker {
 		cancel:    cancel,
 		offlineAt: make(map[string]time.Time, 16),
 	}
+	// 启动前快照清理节拍：避免 worker 与测试对包级变量的并发读写。
+	sweep := offlineSweepInterval
 	b.wg.Add(1)
-	go b.worker(ctx)
+	go b.worker(ctx, sweep)
 	return b
 }
 
@@ -136,7 +145,8 @@ func (b *Broker) NotifyMessage(ctx context.Context, ch *store.Channel, msg *stor
 	if ch.Scope == store.ChannelScopeDirect {
 		// 私聊：接收者是对端成员，worker 里反查（发送路径零额外查询）。
 		b.enqueue(task{kind: "direct", actor: strconv.FormatInt(msg.UserID, 10),
-			route: "conversation:" + strconv.FormatInt(ch.ID, 10), channelID: ch.ID})
+			actorNick: senderNick,
+			route:     "conversation:" + strconv.FormatInt(ch.ID, 10), channelID: ch.ID})
 		return
 	}
 	if len(msg.Mentions) == 0 {
@@ -198,17 +208,35 @@ func (b *Broker) enqueue(t task) {
 	}
 }
 
-// worker 单工作协程：逐任务做离线判定、双频控与投递。
-func (b *Broker) worker(ctx context.Context) {
+// worker 单工作协程：逐任务做离线判定、双频控与投递；空闲节拍顺带清理过期
+// 离线边沿（cleanup 的唯一入口——OnUserOffline 只负责写）。
+func (b *Broker) worker(ctx context.Context, sweep time.Duration) {
 	defer b.wg.Done()
+	ticker := time.NewTicker(sweep)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-ticker.C:
+			b.sweepOfflineEdges()
 		case t := <-b.ch:
 			b.process(ctx, t)
 		}
 	}
+}
+
+// sweepOfflineEdges 删除超过 offlineEdgeTTL 的离线边沿：它们已不参与
+// userOffline 判定，留着只会让 map 无界增长。
+func (b *Broker) sweepOfflineEdges() {
+	cutoff := time.Now().Add(-offlineEdgeTTL)
+	b.mu.Lock()
+	for uid, at := range b.offlineAt {
+		if at.Before(cutoff) {
+			delete(b.offlineAt, uid)
+		}
+	}
+	b.mu.Unlock()
 }
 
 // process 单个任务的完整判定链：发起者频控 → 接收者解析 → 离线判定 →

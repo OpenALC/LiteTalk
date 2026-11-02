@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -96,7 +97,9 @@ func (m *Mem) CreateUser(_ context.Context, u *User) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, x := range m.users {
-		if x.Email == u.Email {
+		// 与 MySQL 的 ci 排序、SQLite 的 lower() 兜底同语义：邮箱唯一性与
+		// 查询都大小写不敏感。
+		if strings.EqualFold(x.Email, u.Email) {
 			return ErrConflict
 		}
 		if x.Nickname == u.Nickname && x.Tag == u.Tag {
@@ -126,7 +129,7 @@ func (m *Mem) UserByEmail(_ context.Context, email string) (*User, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, u := range m.users {
-		if u.Email == email {
+		if strings.EqualFold(u.Email, email) {
 			cp := *u
 			return &cp, nil
 		}

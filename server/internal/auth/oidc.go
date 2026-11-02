@@ -21,6 +21,7 @@ import (
 	"log"
 	"math/big"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -69,9 +70,20 @@ var (
 const (
 	oidcHTTPTimeout   = 10 * time.Second
 	oidcCacheTTL      = 15 * time.Minute // discovery 与 JWKS 共用同一缓存窗口
-	oidcClockSkew     = time.Minute      // exp 判定的时钟偏差容忍
+	oidcClockSkew     = time.Minute      // exp/iat 判定的时钟偏差容忍
 	oidcRespLimit     = 1 << 20          // IdP 响应体上限（discovery/JWKS 都远小于此）
 	oidcVerifierBytes = 32               // PKCE verifier 熵（RFC 7636 要求 ≥256bit）
+	// oidcIATMaxAge 签发时间的陈旧上限：OIDC 不规定 iat 与 exp 的间隔，正常 IdP
+	// 签发的 ID Token 生命周期是分钟到小时级。上限只用于拒绝「exp 仍有效但签发
+	// 已远超合理时长」的令牌（被盗令牌长期重放/IdP 时钟异常），不参与常规过期判定。
+	oidcIATMaxAge = 24 * time.Hour
+	// oidcKidMissTTL 未知 kid 的负缓存窗口：同一 kid 在窗口内最多触发一次 JWKS
+	// 重拉。登录面免鉴权，kid 来自攻击者可控的 JOSE 头——没有负缓存时，每个
+	// 伪造 kid 的请求都会放大成一次上游请求。
+	oidcKidMissTTL = 60 * time.Second
+	// oidcKidMissLimit 负缓存表上限：同一原因（kid 攻击者可控），map 不能无限增长。
+	// 超限整表清空——负缓存只承担放大防护，丢弃历史不影响验签正确性。
+	oidcKidMissLimit = 1024
 )
 
 // NewOIDCPKCE 生成 code_verifier（43 字符 base64url = 256bit 熵）与 S256 摘要。
@@ -107,6 +119,10 @@ type OIDCProvider struct {
 	discoveryAt time.Time
 	jwks        map[string]*rsa.PublicKey // kid → key
 	jwksAt      time.Time
+	kidMiss     map[string]time.Time // 未知 kid → 最近一次确认不存在的时刻
+	// fetchMu 串行化 JWKS 重拉：并发未知 kid 只允许一个请求真正打上游，其余
+	// 在锁后复查负缓存直接失败；也避免并发首拉互相覆盖。
+	fetchMu sync.Mutex
 }
 
 // NewOIDCProvider 构造依赖方。scopes 为空补默认集。
@@ -249,6 +265,8 @@ type oidcIDToken struct {
 	Issuer            string   `json:"iss"`
 	Subject           string   `json:"sub"`
 	Audience          any      `json:"aud"` // 单串或数组
+	AuthorizedParty   string   `json:"azp"`
+	IssuedAt          int64    `json:"iat"`
 	Expires           int64    `json:"exp"`
 	Nonce             string   `json:"nonce"`
 	Email             string   `json:"email"`
@@ -257,19 +275,33 @@ type oidcIDToken struct {
 	PreferredUsername string   `json:"preferred_username"`
 }
 
-// audience aud 声明归一：单值或数组任一包含 clientID 即命中。
-func (t *oidcIDToken) audience(clientID string) bool {
+// audiences aud 声明归一：单值或数组，剔除空串与非字符串项。
+func (t *oidcIDToken) audiences() []string {
 	switch a := t.Audience.(type) {
 	case string:
-		return a == clientID
+		if a != "" {
+			return []string{a}
+		}
 	case []any:
+		out := make([]string, 0, len(a))
 		for _, v := range a {
-			if s, ok := v.(string); ok && s == clientID {
-				return true
+			if s, ok := v.(string); ok && s != "" {
+				out = append(out, s)
 			}
 		}
+		return out
 	}
-	return false
+	return nil
+}
+
+// authorizedPartyOK azp 校验（OIDC Core §3.1.3.7）：azp 出现时必须等于本
+// client_id；多个 aud 时 azp 必须出现（区分「发给谁」与「为谁签发」）。
+// 单 aud 且无 azp 是合规形态，不额外要求——这条取舍避免误伤只回单串 aud 的 IdP。
+func (t *oidcIDToken) authorizedPartyOK(clientID string, audCount int) bool {
+	if t.AuthorizedParty == "" {
+		return audCount <= 1
+	}
+	return t.AuthorizedParty == clientID
 }
 
 // verifyIDToken 拆头 → JWKS 取钥 → RS256 验签 → iss/aud/exp/sub/nonce 校验。
@@ -311,13 +343,24 @@ func (p *OIDCProvider) verifyIDToken(ctx context.Context, raw, nonce string) (*O
 		return nil, fmt.Errorf("%w: 载荷解析失败", ErrOIDCToken)
 	}
 	now := p.now()
+	auds := t.audiences()
 	switch {
 	case t.Issuer != p.cfg.Issuer:
 		return nil, fmt.Errorf("%w: iss 不符", ErrOIDCToken)
-	case !t.audience(p.cfg.ClientID):
+	case !slices.Contains(auds, p.cfg.ClientID):
 		return nil, fmt.Errorf("%w: aud 不符", ErrOIDCToken)
+	case !t.authorizedPartyOK(p.cfg.ClientID, len(auds)):
+		return nil, fmt.Errorf("%w: azp 不符", ErrOIDCToken)
 	case t.Expires == 0 || now.After(time.Unix(t.Expires, 0).Add(oidcClockSkew)):
 		return nil, fmt.Errorf("%w: 已过期", ErrOIDCToken)
+	// iat 缺失即不合规（OIDC Core 要求必填）；未来时间只容忍时钟偏差，
+	// 过旧上限见 oidcIATMaxAge 的注释。
+	case t.IssuedAt == 0:
+		return nil, fmt.Errorf("%w: 缺少 iat", ErrOIDCToken)
+	case time.Unix(t.IssuedAt, 0).After(now.Add(oidcClockSkew)):
+		return nil, fmt.Errorf("%w: iat 在未来", ErrOIDCToken)
+	case now.Sub(time.Unix(t.IssuedAt, 0)) > oidcIATMaxAge:
+		return nil, fmt.Errorf("%w: iat 过旧", ErrOIDCToken)
 	case t.Subject == "":
 		return nil, fmt.Errorf("%w: 缺少 sub", ErrOIDCToken)
 	case nonce != "" && t.Nonce != nonce:
@@ -343,15 +386,35 @@ type oidcJWKS struct {
 }
 
 // publicKey 按 kid 取验签公钥：缓存命中且未过期直接返回；未知 kid 或缓存过期
-// 时重拉 JWKS（支持 IdP 换钥）。重拉失败但缓存里仍有该 kid 时退回旧钥
-// （可用性优先——IdP 抖动不应放大成全部用户登录失败）。
+// 时重拉 JWKS（支持 IdP 换钥），未知 kid 带 oidcKidMissTTL 负缓存。重拉失败但
+// 缓存里仍有该 kid 时退回旧钥（可用性优先——IdP 抖动不应放大成全部用户登录失败）。
 func (p *OIDCProvider) publicKey(ctx context.Context, kid string) (*rsa.PublicKey, error) {
 	p.mu.Lock()
 	key, haveKey := p.jwks[kid]
 	fresh := p.now().Sub(p.jwksAt) < oidcCacheTTL
+	missAt, missed := p.kidMiss[kid]
 	p.mu.Unlock()
 	if haveKey && fresh {
 		return key, nil
+	}
+	if missed && p.now().Sub(missAt) < oidcKidMissTTL {
+		return nil, fmt.Errorf("%w: JWKS 中不存在 kid %q", ErrOIDCUpstream, kid)
+	}
+
+	// 拿到 fetchMu 后必须复查：等待期间别的请求可能已完成刷新（缓存里出现
+	// 该 kid）或已写入负缓存，两种情况都不该再打一次上游。
+	p.fetchMu.Lock()
+	defer p.fetchMu.Unlock()
+	p.mu.Lock()
+	key, haveKey = p.jwks[kid]
+	fresh = p.now().Sub(p.jwksAt) < oidcCacheTTL
+	missAt, missed = p.kidMiss[kid]
+	p.mu.Unlock()
+	if haveKey && fresh {
+		return key, nil
+	}
+	if missed && p.now().Sub(missAt) < oidcKidMissTTL {
+		return nil, fmt.Errorf("%w: JWKS 中不存在 kid %q", ErrOIDCUpstream, kid)
 	}
 
 	keys, err := p.fetchJWKS(ctx)
@@ -362,13 +425,35 @@ func (p *OIDCProvider) publicKey(ctx context.Context, kid string) (*rsa.PublicKe
 		}
 		return nil, err
 	}
+	now := p.now()
 	p.mu.Lock()
-	p.jwks, p.jwksAt = keys, p.now()
+	p.jwks, p.jwksAt = keys, now
+	if _, ok := keys[kid]; ok {
+		delete(p.kidMiss, kid)
+	} else {
+		p.recordKidMissLocked(kid, now)
+	}
 	p.mu.Unlock()
 	if k, ok := keys[kid]; ok {
 		return k, nil
 	}
 	return nil, fmt.Errorf("%w: JWKS 中不存在 kid %q", ErrOIDCUpstream, kid)
+}
+
+// recordKidMissLocked 记录未知 kid 并清理过期项；调用方持有 p.mu。
+func (p *OIDCProvider) recordKidMissLocked(kid string, now time.Time) {
+	if p.kidMiss == nil {
+		p.kidMiss = make(map[string]time.Time)
+	}
+	for k, at := range p.kidMiss {
+		if now.Sub(at) >= oidcKidMissTTL {
+			delete(p.kidMiss, k)
+		}
+	}
+	if len(p.kidMiss) >= oidcKidMissLimit {
+		clear(p.kidMiss)
+	}
+	p.kidMiss[kid] = now
 }
 
 // fetchJWKS 拉取并解析 JWKS（HTTP 在锁外；jwks_uri 来自 discovery 缓存）。

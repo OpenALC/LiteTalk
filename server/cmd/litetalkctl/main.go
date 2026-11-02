@@ -3,7 +3,7 @@
 // bot create（#51）：创建 bot 账号（users.is_bot=1）并签发一次性 bot 令牌
 // （ltk_bot_*）。创建入口只有 CLI 不开 REST——能连上数据库本身就是要管理员，
 // 这比再加一个 REST 权限面诚实。明文令牌只打印到 stdout 一次，不落盘；
-// 丢了只能吊销重建。
+// 丢了按 prefix 吊销重建（bot revoke，#119）。
 //
 // 连库方式与服务端同一套环境变量：
 //
@@ -52,6 +52,8 @@ func usage() {
   bot create --name <名字> [--scopes <列表>] [--data <目录>]
       创建 bot 账号并签发一次性 bot 令牌（ltk_bot_* 明文，仅此一次输出）。
       --scopes 空格或逗号分隔，缺省 "messages.read messages.write"。
+  bot revoke --prefix <prefix> [--data <目录>]
+      按 8 位小写 hex prefix 吊销 bot 令牌，立即生效；重复执行幂等。
 
 环境变量（与服务端同口径）: LITETALK_STORE / LITETALK_MYSQL_DSN /
 LITETALK_SQLITE_PATH / LITETALK_DATA_DIR / LITETALK_MIGRATIONS_DIR

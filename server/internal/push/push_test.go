@@ -48,14 +48,19 @@ func TestNewUnconfiguredReturnsNoop(t *testing.T) {
 	}
 }
 
-// TestMaskToken push_token 日志打码：只留前 8 位。
+// TestMaskToken push_token 日志打码：不足 12 字符全遮，更长的只留前 4 位。
 func TestMaskToken(t *testing.T) {
-	if got := MaskToken("abcdef0123456789"); got != "abcdef01…" {
-		t.Fatalf("长 token 打码不符: %q", got)
+	cases := map[int]string{
+		0:  "…",
+		8:  "…",
+		12: "aaaa…",
+		40: "aaaa…",
 	}
-	// 短 token 固定追加 …，保持统一截断语义。
-	if got := MaskToken("abc"); got != "abc…" {
-		t.Fatalf("短 token 打码不符: %q", got)
+	for n, want := range cases {
+		token := strings.Repeat("a", n)
+		if got := MaskToken(token); got != want {
+			t.Fatalf("长度 %d 打码不符: got %q want %q", n, got, want)
+		}
 	}
 }
 

@@ -218,8 +218,17 @@ func (s *SQLite) UserByID(ctx context.Context, id int64) (*User, error) {
 	return s.scanUser(s.db.QueryRowContext(ctx, `SELECT `+sqUserCols+` FROM users WHERE id = ?`, id))
 }
 
+// UserByEmail 先走等值查询（命中唯一索引 uk_users_email，新账号邮箱全部小写
+// 写入，常规路径不回退索引）；未命中再用 lower() 兼容存量大小写混合行。
+// lower(email) 无法走索引，只会在旧数据/未注册邮箱上发生一次扫描——不加
+// 表达式索引是因为存量数据变更需要迁移，不在本改动的授权范围内。
 func (s *SQLite) UserByEmail(ctx context.Context, email string) (*User, error) {
-	return s.scanUser(s.db.QueryRowContext(ctx, `SELECT `+sqUserCols+` FROM users WHERE email = ?`, email))
+	u, err := s.scanUser(s.db.QueryRowContext(ctx, `SELECT `+sqUserCols+` FROM users WHERE email = ?`, email))
+	if err == nil || !errors.Is(err, ErrNotFound) {
+		return u, err
+	}
+	return s.scanUser(s.db.QueryRowContext(ctx,
+		`SELECT `+sqUserCols+` FROM users WHERE lower(email) = lower(?) ORDER BY id LIMIT 1`, email))
 }
 
 func (s *SQLite) UserByNicknameTag(ctx context.Context, nickname, tag string) (*User, error) {
