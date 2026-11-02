@@ -198,7 +198,8 @@ jobs:
           path: client/frontend/dist-web
           retention-days: 3
 
-  # Linux：gtk3 标签（v3 内部 cgo 包不受 server 标签豁免，勿用 server 标签做检查）
+  # Linux：默认 GTK4 + WebKitGTK 6.0 路径（不加标签；production 产物用 -tags production）。
+  # v3 内部 cgo 包不受 server 标签豁免，勿用 server 标签做检查
   check-client-linux:
     name: 客户端检查（Linux）
     needs: check-frontend
@@ -210,7 +211,7 @@ jobs:
       - uses: actions/checkout@v4
       # libx11-dev / libxi-dev 供 client/core/hotkey/hotkey_linux.go 的 cgo 用
       # （X11 + XInput2 raw 事件）。只是构建期开发库：libX11.so.6 / libXi.so.6 运行
-      # 时已由 libgtk-3-0 传递依赖，nfpm 的 depends 不用动。
+      # 时已由 libgtk-4-1 传递依赖，nfpm 的 depends 不用动。
       # desktop-file-utils 供 .desktop 静态校验（issue #6），前移到检查
       # job：不依赖构建产物，dev 期间每次 push 都能发现打包期才暴露的问题。
       # xvfb / xauth / dbus-daemon 供同 job 的安装后启动冒烟（issue #6）：
@@ -223,7 +224,7 @@ jobs:
       - name: 安装 GTK/WebKitGTK/X11/desktop-file/冒烟依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev libx11-dev libxi-dev desktop-file-utils \
+          sudo apt-get install -y pkg-config libgtk-4-dev libwebkitgtk-6.0-dev libx11-dev libxi-dev desktop-file-utils \
             xvfb xauth dbus-daemon libasound2t64 libpulse0
       - name: desktop-file-validate（.desktop 静态校验）
         run: desktop-file-validate build/linux/io.github.openalc.LiteTalk.desktop
@@ -247,16 +248,22 @@ jobs:
       - name: 第三方库产物校验（SHA256SUMS）
         run: cd third_party && sha256sum -c SHA256SUMS
       - name: go vet
-        run: go vet -tags gtk3 ./...
-      - name: go test（-race）
-        run: go test -tags gtk3 -race -count=1 ./...
+        run: go vet ./...
+      - name: go test（默认 GTK4，-race）
+        run: go test -race -count=1 ./...
+      # GTK3 回退路径只覆盖不依赖图形开发库的配置边界；完整旧版构建仍属
+      # 可选 legacy 产物决策，不在本 job 安装两套 WebKitGTK 开发库。
+      - name: go test（legacy GTK3 配置边界，-race）
+        run: go test -race -count=1 -tags gtk3 ./core/config
       - name: go build
-        run: go build -tags gtk3 ./...
-      # ---- issue #6：安装后启动冒烟（非 tag 也跑） ----
+        run: go build ./...
+      # ---- issue #6/#5：安装后启动冒烟（非 tag 也跑） ----
       # nfpm 打包此前只在 tag 时执行，PR 上从未验证过「装得上、起得来」。
       # 前端产物复用 check-frontend 的 artifact，这里不再构建前端。
+      # 跨发行版（Debian 13 / Fedora 40 / AlmaLinux 10）的依赖闭包实测在下面的
+      # smoke-client-linux-install 矩阵，产物经 artifact 传下去。
       - name: 构建 production 二进制（供 nfpm 安装包）
-        run: go build -tags gtk3,production -trimpath -ldflags "-s -w -X main.version=smoke" -o build/bin/LiteTalk .
+        run: go build -tags production -trimpath -ldflags "-s -w -X main.version=smoke" -o build/bin/LiteTalk .
       # glibc 符号版本检查（issue #9）：构建基线 ubuntu-24.04 = glibc 2.39。
       # 产物引用的最高符号版本不得更高，否则静默抬高最低发行版要求。
       # 复用上面的 production 产物，不额外构建；检查前移到检查组后每次 push/PR 都跑
@@ -280,12 +287,18 @@ jobs:
       # 本 job 也跑 nfpm（安装冒烟），所以同样需要许可证目录（#117）。
       - name: 生成第三方许可证目录
         run: bash build/third-party-licenses.sh build
-      - name: 打 deb 并安装
+      - name: 打 deb/rpm 并安装 deb（runner 侧闭包检查）
         run: |
           export VERSION=0.0.0
           export ARCH=amd64
           mkdir -p dist
           nfpm package --config build/nfpm.yaml --packager deb --target dist/
+          # rpm 一并产出（nfpm 原生写 rpm，无需 rpmbuild）：供下面的
+          # smoke-client-linux-install 矩阵在 Debian 13 / Fedora 40 /
+          # AlmaLinux 10 容器里实测依赖闭包。与发版打包 job 同一份 nfpm 配置，
+          # 仅内嵌版本号不同（这里固定 0.0.0），安装与启动行为一致。
+          nfpm package --config build/nfpm.yaml --packager rpm --target dist/
+          mv dist/*.rpm "dist/litetalk_${VERSION}_${ARCH}.rpm"
           deb="$(ls dist/litetalk_${VERSION}_${ARCH}.deb)"
           sudo dpkg -i "$deb"
           # 安装物一致性：.desktop 文件名 = ApplicationID（Wayland 按文件名
@@ -306,12 +319,31 @@ jobs:
                    webrtc-apm/COPYING webrtc-apm/LICENSE.abseil; do
             test -f "$doc/$f" || { echo "::error::安装包缺少许可证 $f"; exit 1; }
           done
+      - name: 启动冒烟断言负例（仅启动日志不得通过）
+        run: |
+          log="$(mktemp)"
+          trap 'rm -f "$log"' EXIT
+          printf '=== LiteTalk smoke 启动 (pid=1) ===\n' > "$log"
+          if bash build/linux/assert-smoke-ready.sh 124 "$log"; then
+            echo '::error::缺少前端就绪标记却通过了启动冒烟'
+            exit 1
+          fi
+          printf 'litetalk-smoke:frontend-ready\n' >> "$log"
+          bash build/linux/assert-smoke-ready.sh 124 "$log"
       - name: 启动冒烟（Xvfb，10 秒）
         env:
           # 无 GPU 的 Xvfb 下关闭 WebKit 合成/DMABUF，避免软件渲染初始化失败
           WEBKIT_DISABLE_COMPOSITING_MODE: '1'
           WEBKIT_DISABLE_DMABUF_RENDERER: '1'
           LIBGL_ALWAYS_SOFTWARE: '1'
+          # WebKitGTK 6.0 的 bwrap 沙箱在无头 CI 上无法建立（无特权 user
+          # namespace，bwrap 报 setting up uid map: Permission denied，xdg-dbus-proxy
+          # 随之启动失败并 g_error 崩掉进程，退出码 2）。冒烟只验证安装闭包与
+          # 启动存活，沙箱由用户真实桌面环境提供；GTK3 时代的 webkit2gtk-4.1
+          # 无此问题（对比 dev 分支绿色冒烟日志）。
+          WEBKIT_FORCE_SANDBOX: '0'
+          WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS: '1'
+          LITETALK_CI_SMOKE: '1'
         run: |
           set +e
           # dbus-run-session 必需：v3 单实例锁走会话总线，无总线时
@@ -320,20 +352,60 @@ jobs:
           code=$?
           set -e
           cat smoke.log
-          # exit 124 = timeout 到点杀进程，说明这 10 秒内 litetalk 一直存活：
-          # 启动成功且没有自行退出。0（提前退出）、1（启动失败）、139（崩溃）
-          # 等一律失败。依据是本应用启动后进入事件循环并驻留，不会自行结束。
-          if [ "$code" -ne 124 ]; then
-            echo "::error::启动冒烟失败：litetalk 退出码 $code（期望 124：限时内持续运行）"
-            exit 1
-          fi
-          # 124 只证明进程没退出，再确认进入了 ServiceStartup 的启动日志，
-          # 排除卡在 GTK/WebKit 初始化之前的假阳性。
-          if ! grep -q "启动 (pid=" smoke.log; then
-            echo "::error::启动冒烟日志缺少启动标记，进程未进入服务启动"
-            exit 1
-          fi
-          echo "启动冒烟通过：litetalk 在 10 秒时限内持续运行且输出了启动日志"
+          bash build/linux/assert-smoke-ready.sh "$code" smoke.log
+      # deb/rpm 产物交给 smoke-client-linux-install 矩阵做四发行版闭包实测
+      # （if: always()：启动冒烟失败时产物照样可取，容器矩阵可单独定位）。
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: client-linux-packages
+          path: client/dist/*
+          if-no-files-found: ignore
+          retention-days: 3
+
+  # ---- #5 W3：四发行版容器安装冒烟（deb/rpm 依赖闭包实测，G2 数据来源） ----
+  # 安装包复用 check-client-linux 的 artifact，这里不重复构建前端与 Go 侧。
+  # 闭包结论以本矩阵为准：nfpm 声明的 Depends 必须能被各发行版自己的仓库解析；
+  # RHEL 10 系需要 EPEL 10（WebKitGTK 6.0 只在 EPEL），由冒烟脚本显式启用并记录。
+  # 容器失败时步骤日志含 dnf/apt 输出与启动日志，可读定位。
+  smoke-client-linux-install:
+    name: 安装冒烟（${{ matrix.distro }}）
+    needs: check-client-linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: ubuntu-24.04
+            image: ubuntu:24.04
+            pkg-type: deb
+          - distro: debian-13
+            image: debian:13
+            pkg-type: deb
+          - distro: fedora-40
+            image: fedora:40
+            pkg-type: rpm
+          # RHEL 10 系代理选 almalinux:10：rockylinux 的 Docker Hub 官方镜像
+          # 没有 10 这个 tag（manifest unknown，实测），almalinux 有 10/10.x。
+          - distro: almalinux-10
+            image: almalinux:10
+            pkg-type: rpm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: client-linux-packages
+          path: smoke-pkgs
+      - name: 容器内安装并启动（${{ matrix.image }}）
+        run: |
+          docker run --rm \
+            -v "$PWD/smoke-pkgs:/smoke/pkgs:ro" \
+            -v "$PWD/client/build/linux/install-smoke.sh:/smoke/install-smoke.sh:ro" \
+            -v "$PWD/client/build/linux/assert-smoke-ready.sh:/smoke/assert-smoke-ready.sh:ro" \
+            -e PKG_TYPE=${{ matrix.pkg-type }} \
+            "${{ matrix.image }}" \
+            bash /smoke/install-smoke.sh
 
   # Windows：主力平台。真实 cgo Opus / DPAPI / WASAPI 路径只在这里被编译与测试
   check-client-windows:
@@ -524,7 +596,7 @@ jobs:
       - name: 安装 GTK/WebKitGTK/X11 开发库
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev libx11-dev libxi-dev
+          sudo apt-get install -y pkg-config libgtk-4-dev libwebkitgtk-6.0-dev libx11-dev libxi-dev
       - uses: actions/download-artifact@v4
         with:
           name: frontend-dist
@@ -538,7 +610,7 @@ jobs:
       - name: 构建客户端（注入版本号）
         working-directory: client
         run: |
-          go build -tags gtk3,production -trimpath \
+          go build -tags production -trimpath \
             -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
             -o build/bin/LiteTalk .
       # 第三方许可证随附目录（#117）：绿色版 tar 与 deb/rpm 共用这一份，
@@ -618,14 +690,16 @@ jobs:
     name: 发布 GitHub Release
     needs:
       - check-contract
+      - smoke-client-linux-install
       - package-server
       - package-client-windows
       - package-client-linux
       - package-client-macos
-    # always() 让 macOS 失败不阻断；显式要求所有阻塞 job（含 check-contract）为 success
+    # always() 让 macOS 失败不阻断；显式要求所有阻塞 job（含安装冒烟）为 success
     if: >-
       always() && startsWith(github.ref, 'refs/tags/v') &&
       needs.check-contract.result == 'success' &&
+      needs.smoke-client-linux-install.result == 'success' &&
       needs.package-server.result == 'success' &&
       needs.package-client-windows.result == 'success' &&
       needs.package-client-linux.result == 'success'

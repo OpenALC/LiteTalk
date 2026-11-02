@@ -731,7 +731,14 @@ func (a *App) ShowMainWindow() {
 
 // GetHibernateMode 休眠模式：off（不休眠）/ hibernate（卸载业务组件）/ destroy（整页重载）。
 // 前端监听 sys:hibernate / sys:wake 事件切换休眠态（见 stores/hibernate.ts）。
-func (a *App) GetHibernateMode() string { return a.cfg.HibernateMode() }
+func (a *App) GetHibernateMode() string {
+	// App.vue 在原生桥就绪并完成 mount 后调用此绑定。CI 冒烟用它确认
+	// GTK/WebKit 页面确实执行了前端 JS；ServiceStartup 日志早于窗口创建。
+	if os.Getenv("LITETALK_CI_SMOKE") == "1" {
+		log.Print("litetalk-smoke:frontend-ready")
+	}
+	return a.cfg.HibernateMode()
+}
 
 // SetHibernateMode 持久化休眠模式（校验 off/hibernate/destroy）。
 func (a *App) SetHibernateMode(mode string) error { return a.cfg.SetHibernateMode(mode) }
