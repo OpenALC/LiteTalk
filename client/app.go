@@ -50,6 +50,9 @@ type App struct {
 	// winMu 保护 window 引用（托盘回调/服务绑定/窗口事件监听分属不同 goroutine）。
 	winMu  sync.Mutex
 	window *application.WebviewWindow
+	// destroyingWindow 标识已认领销毁的窗口；Close 异步，旧窗口摘除前
+	// 第二次销毁不得在等待后误作用于随后重建的新窗口。
+	destroyingWindow *application.WebviewWindow
 
 	// recreating 程序化销毁渲染进程（里程碑② destroy 模式）的标志：
 	// WindowClosing Hook 见它放行关闭。重建窗口后复位（见 showFromTray）——
@@ -99,13 +102,13 @@ type App struct {
 
 	audioCtx *audio.Context // 设备枚举用，惰性创建
 
-	// 设置页监视独立于通话管线；生命周期锁覆盖设备启动与停止，旧页面的
-	// Stop token 不能关闭新页面接管的监视。回调只读 epoch，不取此锁。
+	// 设置页监视独立于通话管线；生命周期锁覆盖设备启动与停止。每次调用
+	// 持独立 lease，迟到的旧页面 Stop 不会关闭新页面的监视。
 	levelMu          sync.Mutex
 	levelMon         levelMonitor
 	levelStart       func(string, audio.InputMode, func(audio.LevelSample)) (levelMonitor, error)
 	levelSeq         uint64
-	levelToken       string
+	levelLeases      map[string]*application.WebviewWindow
 	levelEpoch       uint64
 	levelActiveEpoch atomic.Uint64
 	levelSuspended   bool
@@ -480,10 +483,8 @@ func (a *App) buildWindow(opts application.WebviewWindowOptions) *application.We
 // 旧窗口收尾与新窗口可短暂并存，v3 WindowManager 负责移除旧实例。
 // 重复触发安全（window 已 nil 直接返回）。
 func (a *App) destroyRenderProcess() {
-	// 销毁前端后，页面卸载时发出的异步 Stop 可能无法送达。
-	a.suspendLevelMonitor()
 	win := a.getWindow()
-	if win == nil {
+	if !a.claimWindowForDestroy(win) {
 		return
 	}
 	if b := win.Bounds(); b.Width > 0 {
@@ -493,7 +494,7 @@ func (a *App) destroyRenderProcess() {
 	}
 	a.recreating.Store(true)
 	win.Close()
-	a.setWindow(nil)
+	a.completeWindowDestroy(win)
 }
 
 // showFromTray 托盘「显示主界面」：窗口被销毁（destroy 休眠模式）则按记忆的
@@ -504,8 +505,6 @@ func (a *App) showFromTray() {
 		if a.wails == nil {
 			return // 测试环境
 		}
-		// 新 WebView 创建时前端可能立即发起绑定调用，先恢复接收新监视。
-		a.resumeLevelMonitor()
 		opts := application.WebviewWindowOptions{
 			Title:            "轻音 LiteTalk",
 			Width:            1080,
@@ -526,6 +525,7 @@ func (a *App) showFromTray() {
 		}
 		win = a.buildWindow(opts)
 		a.setWindow(win)
+		a.resumeLevelMonitor(win)
 		if a.savedMaximised {
 			win.Maximise()
 		}
@@ -546,7 +546,6 @@ func (a *App) showFromTray() {
 	if desktop.IsWaylandSession() {
 		win.Focus()
 	}
-	a.resumeLevelMonitor()
 	a.emit("sys:wake", nil)
 }
 
@@ -1217,12 +1216,16 @@ func (a *App) TestSpeaker() error {
 	return audio.TestPlayback(a.cfg.Get().AudioPlayback, 880, 1500*time.Millisecond)
 }
 
-// StartLevelMonitor 启动设置页实时电平推送；每次调用返回独立 token。
-// 同一进程只开一路采集，新页面接管时换 token，旧页面的迟到 Stop 便不会误停。
-func (a *App) StartLevelMonitor() (string, error) {
+// StartLevelMonitor 启动设置页实时电平推送；每次调用返回独立 lease token。
+// Wails 把来源窗口放进 ctx。销毁重建后的旧窗口调用不得重新打开采集流。
+func (a *App) StartLevelMonitor(ctx context.Context) (string, error) {
 	a.levelMu.Lock()
 	defer a.levelMu.Unlock()
-	if a.levelShutdown || a.levelSuspended {
+	if ctx == nil {
+		return "", errors.New("电平监视缺少窗口来源")
+	}
+	source, ok := ctx.Value(application.WindowKey).(*application.WebviewWindow)
+	if !ok || source == nil || source != a.getWindow() || a.levelShutdown || a.levelSuspended {
 		return "", errors.New("电平监视窗口已关闭")
 	}
 	if a.levelMon == nil {
@@ -1254,23 +1257,34 @@ func (a *App) StartLevelMonitor() (string, error) {
 		a.levelMon = mon
 	}
 	a.levelSeq++
-	a.levelToken = strconv.FormatUint(a.levelSeq, 10)
-	return a.levelToken, nil
+	token := strconv.FormatUint(a.levelSeq, 10)
+	if a.levelLeases == nil {
+		a.levelLeases = make(map[string]*application.WebviewWindow)
+	}
+	a.levelLeases[token] = source
+	return token, nil
 }
 
-// StopLevelMonitor 只接受本次页面持有的 token；重复或迟到调用是无害 no-op。
-func (a *App) StopLevelMonitor(token string) {
+// StopLevelMonitor 只释放本次调用所属窗口持有的 lease；重复或迟到调用无副作用。
+func (a *App) StopLevelMonitor(ctx context.Context, token string) {
 	a.levelMu.Lock()
 	defer a.levelMu.Unlock()
-	if token == "" || token != a.levelToken {
+	if ctx == nil || token == "" {
 		return
 	}
-	a.stopLevelMonitorLocked()
+	source, ok := ctx.Value(application.WindowKey).(*application.WebviewWindow)
+	if !ok || source == nil || a.levelLeases[token] != source {
+		return
+	}
+	delete(a.levelLeases, token)
+	if len(a.levelLeases) == 0 {
+		a.stopLevelMonitorLocked()
+	}
 }
 
 // stopLevelMonitorLocked 先撤销回调代际，再等待采集流结束。调用方持 levelMu。
 func (a *App) stopLevelMonitorLocked() {
-	a.levelToken = ""
+	a.levelLeases = nil
 	a.levelActiveEpoch.Store(0)
 	if a.levelMon != nil {
 		a.levelMon.Stop()
@@ -1278,17 +1292,43 @@ func (a *App) stopLevelMonitorLocked() {
 	}
 }
 
-func (a *App) suspendLevelMonitor() {
+// claimWindowForDestroy 把本次目标身份与监视停流一起认领。锁顺序与
+// StartLevelMonitor 相同（levelMu → winMu）；Close 必须在锁外执行。
+func (a *App) claimWindowForDestroy(target *application.WebviewWindow) bool {
 	a.levelMu.Lock()
 	defer a.levelMu.Unlock()
+	a.winMu.Lock()
+	if target == nil || a.window != target || a.destroyingWindow != nil {
+		a.winMu.Unlock()
+		return false
+	}
+	a.destroyingWindow = target
 	a.levelSuspended = true
+	a.winMu.Unlock()
 	a.stopLevelMonitorLocked()
+	return true
 }
 
-func (a *App) resumeLevelMonitor() {
+// completeWindowDestroy 只摘除本次认领的旧窗口；若已有新窗口，绝不清掉它。
+func (a *App) completeWindowDestroy(target *application.WebviewWindow) {
+	a.winMu.Lock()
+	defer a.winMu.Unlock()
+	if a.window == target {
+		a.window = nil
+	}
+	if a.destroyingWindow == target {
+		a.destroyingWindow = nil
+	}
+}
+
+func (a *App) resumeLevelMonitor(target *application.WebviewWindow) {
 	a.levelMu.Lock()
 	defer a.levelMu.Unlock()
-	if !a.levelShutdown {
+	// 旧窗口的 Show 可与销毁交错，只有新窗口完成登记后能恢复。
+	a.winMu.Lock()
+	fresh := target != nil && a.window == target && a.destroyingWindow != target
+	a.winMu.Unlock()
+	if !a.levelShutdown && fresh {
 		a.levelSuspended = false
 	}
 }
