@@ -19,6 +19,7 @@ import { cleanErrorText } from '../utils/errorText'
 import { withAudioDefaults } from '../utils/audioSettings'
 import { useWindowOverlay, type OverlayState } from '../utils/windowOverlay'
 import { useHibernateDestroyAvailability } from '../utils/hibernateAvailability'
+import { LevelMonitorScope } from '../utils/levelMonitorScope'
 import ServerConnPanel from '../components/ServerConnPanel.vue'
 import NetworkDiagPanel from '../components/NetworkDiagPanel.vue'
 import Toast from '../components/Toast.vue'
@@ -85,10 +86,14 @@ let cancelOverlay: (() => void) | null = null
 
 // LevelBridge Go 侧 Start/StopLevelMonitor（bridge.ts 类型未含，本地扩展；
 // 浏览器 mock 桩无此方法 → 可选调用静默跳过）。
-type LevelBridge = { StartLevelMonitor?(): Promise<void>; StopLevelMonitor?(): Promise<void> }
+type LevelBridge = { StartLevelMonitor?(): Promise<string>; StopLevelMonitor?(token: string): Promise<void> }
 function levelBridge() {
   return goApp() as ReturnType<typeof goApp> & LevelBridge
 }
+const levelScope = new LevelMonitorScope(
+  () => levelBridge().StartLevelMonitor?.(),
+  (token) => levelBridge().StopLevelMonitor?.(token),
+)
 
 // 语音设置：Go 侧返回已回落默认的完整值（码率/VBR/DTX/FEC/丢包/降噪强度/AGC/
 // 麦克风/扬声器音量/VAD 五档/Opus 复杂度/输入声道/前置增益）。
@@ -245,11 +250,12 @@ async function testMic() {
     lvl.value = data as AudioLevel
   })
   try {
-    await levelBridge().StartLevelMonitor?.()
-  } catch {
-    // 监视启动失败（如设备忙）不阻断 2 秒自检本身
-  }
-  try {
+    try {
+      await levelScope.start()
+    } catch {
+      // 监视启动失败（如设备忙）不阻断 2 秒自检本身
+    }
+    if (levelScope.closed) return // 卸载期间尚未开始自检，不再占用设备两秒
     const r = await goApp().TestMicrophone()
     console.log('[device-test] mic rms=%d peak=%d', r.rms, r.peak)
     if (r.rms >= 150) {
@@ -262,7 +268,7 @@ async function testMic() {
     toast.value?.show(`麦克风测试失败：${cleanErrorText(e, '未知错误')}`, true)
   } finally {
     try {
-      await levelBridge().StopLevelMonitor?.()
+      await levelScope.stop()
     } catch {
       // 幂等停止，失败无须提示
     }
@@ -283,7 +289,7 @@ onUnmounted(() => {
   cancelHkAvail = null
   cancelSecret?.()
   cancelSecret = null
-  void levelBridge().StopLevelMonitor?.().catch(() => {})
+  void levelScope.dispose().catch(() => {})
 })
 
 // testSpeaker 扬声器自检：播放 880Hz 测试音 1.5 秒（Go 阻塞至播完）。
