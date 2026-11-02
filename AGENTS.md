@@ -5,11 +5,12 @@ LiteTalk 是 OpenALC 组织的开源桌面语音开黑软件，SFU 架构，服�
 
 - 客户端：Go 1.27 + Wails **v3.0.0-beta.30**（版本锁死，`go.mod` 与 `@wailsio/runtime` 必须同版本）+ Vue 3 / Vite / TS / Pinia
 - 音频链路：malgo 采集 → rnnoise-go 降噪与 VAD → 自研 libopus cgo 封装 → pion/webrtc
-- 服务端：Go 单体（REST `/api/v1` + WS 信令 + 自研 Pion SFU，ICE-Lite UDP mux :7845）+ MySQL + Redis + coturn
+- 服务端：Go 单体（REST `/api/v1` + WS 信令 + 自研 Pion SFU，ICE-Lite UDP mux :7845），默认 SQLite（含持久化 KV）+ 内置 TURN/TLS；可选 MySQL、Redis、coturn 或前置反代。
 
 本地规划文档在 `docs/`（**不进仓库**），动手前先读：
 - `docs/优化完善方案.md`：已知缺陷清单与修复批次。修 bug 前先查这里有没有登记，按里面的定位和方案做。
 - `docs/演进建议.md`：架构方向与路线图。新功能先对照这份文档，不要与之冲突。
+- 当前执行范围以用户最近确认的任务书为准：批次 7 看 `docs/批次7-任务流程单.md`，GTK4 看 `docs/v1.10.0-GTK4迁移计划书.md` 与 `docs/gtk4-基线数据.md`；旧路线图的版本表、历史待办不覆盖后续决策。
 
 ### 长期记忆（与 Claude Code 共用）
 
@@ -17,6 +18,7 @@ LiteTalk 是 OpenALC 组织的开源桌面语音开黑软件，SFU 架构，服�
 
 - `MEMORY.md` 是索引，一条事实一个 `.md` 文件，frontmatter 带 `name` / `description` / `metadata.type`。
 - **开工前先读 `MEMORY.md`**，按索引只读相关文件；不要把记忆内容抄进本文件。
+- 索引中的当前进度入口优先于历史档案；执行前用对应分支、CI 和任务书核对状态，历史部署记录只代表记录日期的观测。
 - 写入口径：仓库、git 历史或本文件已能得知的不记；相对日期写成绝对日期。
 - 该目录在仓库之外，含生产凭据等敏感信息，**禁止复制进仓库或提交**。
 - Claude Code 的记忆目录已联接到同一目录，两边读写的是同一份文件。
@@ -26,7 +28,7 @@ LiteTalk 是 OpenALC 组织的开源桌面语音开黑软件，SFU 架构，服�
 ## 1. 硬性约束（违反即返工）
 
 ### 仓库与工具链
-- 远程仓库根目录**当前实际内容**：`client/`、`server/`、`api/`、`.github/` 四个目录，加 `.gitignore`、`.gitattributes`、`.dockerignore`、`Dockerfile`、`docker-compose.yml`、`README.md`、`LICENSE`、`AGENTS.md` 八个文件。
+- 仓库主体为 `client/`、`server/`、`api/`、`.github/`；项目规范只维护根 `AGENTS.md`，`CLAUDE.md` 通过 `@AGENTS.md` 导入，禁止维护两份规范正文。
   - `api/`（#28/#29）：REST 与信令契约的单一事实源——`openapi.yaml` + `signal/*.schema.json`，由 `server/api/tools/` 下的生成器消费。
   - `Dockerfile`/`docker-compose.yml`/`.dockerignore`（#27）：一键自托管。
   - `.gitattributes`：统一行尾为 LF。
@@ -73,7 +75,7 @@ GH="/c/Users/Yang/AppData/Local/Microsoft/WinGet/Packages/GitHub.cli_Microsoft.W
 - Windows 上手动 `go build` 必须加 `-ldflags "-H=windowsgui"`，否则启动时会附带一个控制台窗口。
 - 构建标签：
   - Windows / macOS：`production`（选正式版 runtime.js）；
-  - **Linux 一律用 `gtk3`**（对应 WebKitGTK 4.1），打包用 `gtk3,production`。不要用 `server` 标签做 Linux 检查。
+  - **正式 Linux 链路仍用 `gtk3`**（对应 WebKitGTK 4.1），打包用 `gtk3,production`。GTK4 迁移实验分支按任务书使用默认 GTK4 路径（检查不加 `gtk3`，打包用 `production`）；门禁与用户审查通过前不切正式默认。不要用 `server` 标签做 Linux 检查。
 - 热重载开发：在 `client/` 下执行 `wails3 dev`（**不是** `wails dev`，那是 v2 CLI，会报找不到 `wails.json`）。Windows 的 Taskfile 通过 `CC` 指定 mingw gcc，默认路径是 `C:/tools/mingw64/bin`，可用 `LITETALK_MINGW` 覆盖。go-task 在 Windows 上设置 `env.PATH` 不会影响命令查找，所以不要改成通过 PATH 注入。
 - 改动 `client/Taskfile.yml`、`client/build/**/Taskfile.yml` 或 `build/config.yml` 后，必须在**没有手动设置 PATH 和 CGO_ENABLED 的干净 shell** 里实际跑一次 `wails3 dev`，并跑一次 `wails3 task --dry package VERSION=v0.0.0`，确认版本号确实注入了。CI 不覆盖这部分。
 - mingw ld 的 `claims to have 0xffff relocs` 警告无害。
@@ -132,7 +134,7 @@ git checkout -- .
 规则：
 - **macOS 永远不阻塞发版**：`release` 的 `if` 条件里**不准**加入 macOS job 的结果，macOS job 必须保留 `continue-on-error: true`。
 - 前端只在 `check-frontend` 构建一次，其他 job 通过 `download-artifact` 获取 `frontend-dist`。**不要在其他 job 里重复构建前端**；新增需要 embed 的 job 时，同样通过 `needs: check-frontend` 下载产物。
-- 只改 `*.md` 或 `LICENSE` 的提交不会触发 CI（paths-ignore）。标签推送不受这个过滤影响。
+- 只改 `*.md` 或 `LICENSE` 的 **push** 不触发 CI（paths-ignore）；PR 仍触发检查，标签推送不受这个过滤影响。文档 push 被过滤时记录“未触发”，不能把旧 run 当成本次全绿。
 - 同一 ref 的新提交会取消旧的检查运行；标签运行不会被取消。
 - 第三方工具要锁版本（例如 `NFPM_VERSION`），禁止使用 `@latest`。runner 也要锁版本（`ubuntu-24.04`），不用 `ubuntu-latest`：它即将迁移到 Ubuntu 26，会改变 glibc 和 WebKitGTK 版本。
 - 待办：各个 actions 仍是 v4/v5，运行在 Node 20 上，有弃用警告。升级到当前大版本（checkout/setup-go/setup-node/upload-artifact v7、download-artifact v8、pnpm/action-setup v6、action-gh-release v3）属于单独任务。打包 job 只在标签时运行，升级后要先用 `workflow_dispatch` 跑一次检查组，再借下一次发版验证打包组。
@@ -158,32 +160,29 @@ git checkout -- .
 - 一次提交只做一件事。格式化、重命名这类机械改动单独提交，不和逻辑改动混在一起。
 
 ### 分支
-- 默认在 `main` 上小步提交、直接推送（个人项目现状）。
-- 以下改动走 `feat/*` 或 `fix/*` 分支并提 PR（CI 在 PR 上同样运行）：协议或信令变更、数据库迁移、跨多个批次的大改动，以及用户要求评审的改动。合并方式用 squash。
+- 当前开发以 `dev` 为集成分支；实现从任务指定基点切独立 `feat/*` 或 `fix/*` 分支，不默认直推 `main`。
+- 协议或信令变更、数据库迁移、跨批次大改动，以及用户要求评审的改动，按任务书提 PR；用户审查通过后再合入 `main`，合并方式用 squash。
 
-### dev 分支工作流（2026-10-18 起，覆盖 v1.3.0 → v1.5.0）
-- 这一轮所有改动都在 `dev` 上做。**不合入 main、不打标签、不发版**，直到 v1.5.0 审查通过。
-- 三个版本**连续推进，中途不开审查 PR**。用户只在 v1.5.0 全部完成后审一次代码。
-- 每完成一个版本：该版本最后一次 push 的 CI 必须全绿，才能进入下一个版本。
-- v1.5.0 完工后开一个 `dev` → `main` 的 PR，描述里按版本分三段列出提交范围（`git log <版本起点>..dev --oneline`）并链接对应 issue。
-- 审查意见在 PR 上回复；对应的修正照常提交到 `dev`，提交信息引用单号。
-- v1.5.0 审查通过后才把 `dev` 一次性合入 `main`，之后才谈发版。
+### dev 集成与审查工作流
+- v1.3.0 → v1.5.0 的连续开发、暂不发版约定已结束，不再作为后续版本的永久禁令。当前批次的范围、审查时点与发版授权以用户确认的任务书为准。
 - 实施由 SubAgent 在各自 worktree 完成；**实现代理负责提交、推送与 CI 监控**，主会话只负责派活、验收、合并与发版，**不亲自写实现代码**（节省主上下文）。代理推送独立 `feat/#N-*` / `fix/#N-*` 分支并跑该分支 CI，报告 run id 与结果；主会话验收后再合入 `dev`，合入后的 `dev` CI 仍由同一代理监控。代理不直接改 `main`/`dev`。
+- 主会话逐项验收后按任务书顺序合入 `dev`（批次 7 用 `--no-ff`）；这次集成 CI 全绿后再合下一项。纯文档 push 按 CI 过滤规则单独记录。
+- 版本或批次审查 PR 按交付范围列提交段并链接 issue；审查修正继续在独立分支交付后合入 `dev`。不因旧版本曾要求“中途不开 PR”而跳过当前审查。
+- GTK4 迁移与批次 7 加固分开交付。GTK4 计划采用 fork 工作流；开工先核对实际 remote 与基点，不能把本机 `gtk` 分支当成已配置好的 fork。迁移期不推标签。
 
 ### Issue 跟踪（路线图功能已全部建单）
 - 路线图（`docs/演进建议.md`）与批三范围的每个功能都对应一个 issue，标签分三轴：目标版本（`v1.2.0`…`v2.0.0`/`backlog`）、优先级（`P0`/`P1`/`P2`）、领域（`area/client`、`area/server` 等）。
 - **动手前先认领**：从 issue 的"要点/验收"出发实现，不要在没单的情况下自行扩大范围。
 - **提交信息引用单号**：在摘要后加 `(#N)`，例：`feat(client): 全局热键与按键说话——三平台钩子与 PTT 门控 (#4)`。一次提交只关一个单；跨多个单的改动拆开提交。
-- **关闭时机（dev 工作流期间）**：该 issue 所属版本**已被用户审查通过且合并到 main** 后才 `gh issue close N --repo OpenALC/LiteTalk`。CI 全绿只说明可以进审查，不是关单条件。
-- dev 工作流之外仍按旧规则：改动已推送且这次 CI 全绿即可关。
+- **关闭时机**：该 issue 所属交付**已被用户审查通过且合并到 main** 后才 `gh issue close N --repo OpenALC/LiteTalk`。CI 全绿只说明可以进审查，不是关单条件；集中跟进单还要逐项对账，不能随其中一项完成就关整单。
 - 复现不出来或决定不做的单，在 issue 里写结论再关，**不留说不清的 open 单**。
-- 版本号以用户批准的执行计划为准，不要按 `docs/演进建议.md` §10 的旧表推断（该表已作废，只作推导留存）。已确认的顺延与修正：PTT 独立成批 = v1.2.0、批三 = v1.3.0、一键自托管 = v1.4.0，其后各版本顺延；**GTK4 迁移改到 v2.0.0**（issue #5，v1.3.0 起的 Linux 工作仍以 `-tags gtk3` 为前提）；**移动端延期不排期**（issue #55 移入 backlog）。
+- 版本号以用户批准的执行计划为准，不要按 `docs/演进建议.md` §10 的旧表推断。**2026-11-02 决策：v1.10.0 只做 GTK4 迁移（#5）**，旧 v2.0.0 排期失效；屏幕共享/摄像头（#48）与 HTTP/3 顺延到 v1.11.0 起，具体范围另定。**移动端延期不排期**（#55，backlog）。
 
 ### 节奏（强制，不再逐次请示用户）
-1. 每完成一个功能：提交，`git push` 到 `dev`，**等这次 push 的 CI 全绿**。CI 红了先修，不能带着红灯继续。
+1. 每完成一个功能：实现代理提交并推送独立分支，**等这次 push 的 CI 全绿**，主会话验收后合入 `dev`，再等集成 CI 全绿。CI 红了先修，不能带着红灯继续；纯文档 push 按过滤规则记录。
 2. 每完成一个版本：该版本最后一次 push 的 CI 必须全绿，才能进入下一个版本。
 3. 所有版本完成后：本地做一次全量验证（第 3 节全部命令），并确认 `dev` 上最新的 CI 是绿的。
-4. **打标签发版暂停**：dev 工作流期间（v1.3.0 → v1.5.0）禁止 `git tag` 和推送标签。用户审查通过并把 `dev` 合入 `main` 后，再按下面的清单发版：
+4. 发版须同时满足本次任务书的验收、审查与用户授权；历史发版不构成新标签的授权。**批次 7 的 v1.9.8-alpha 仍待用户批准发布**；本次规范与记忆同步不打标签、不部署。获准发版后核对下列资产，并等标签 CI 成功：
    - Windows：setup.exe、portable.zip
    - Linux amd64/arm64：portable.tar.gz、deb、rpm
    - 服务端：amd64/arm64 tar.gz
@@ -191,7 +190,7 @@ git checkout -- .
    - macOS：有就有，没有不影响发版
 
 ### 服务端发版后的部署提醒
-- Release 包里已经附带 `migrations/`，**升级时必须一起解压覆盖**。漏掉的话服务能正常启动，但相关查询会报 500（unknown column）。
+- SQL 迁移已 embed 进服务端二进制，Release 包不再分发 `migrations/`，正常升级无需另传 SQL。`LITETALK_MIGRATIONS_DIR` 会覆盖内嵌来源；旧目录可能让新迁移缺失，部署前检查并移除无意遗留的覆盖配置。
 - 新增迁移要成对提供 `NNNN_xxx.up.sql` 和 `NNNN_xxx.down.sql`，只追加，不修改已发布的迁移文件。文件里只能写 SQL，**禁止**出现 markdown 片段。
 - 部署验证顺序：先 `healthz` 看版本号，再测改动涉及的端点，最后跑 `server/cmd/e2eprobe` 走一遍全链路。
 - 部署机数据库的直连凭据见长期记忆 `litetalk-deploy-db-access`，**不要写进仓库**。临时探针脚本用完即删。
@@ -210,7 +209,7 @@ git checkout -- .
 - **音频回调和处理 goroutine 中禁止阻塞**：不能做网络 I/O、不能持有长锁、不能调 `ws.Send`。需要往外发东西时，投递到带缓冲的 channel，由专门的 goroutine 发送。
 - 对 libopus 编码器的调用（`encode`、`ctl`、`destroy`）必须持有 `encMu`，否则会出现 C 堆上的 use-after-free。
 - 平台差异用文件后缀和 build tag 隔离（`_windows.go`、`_linux.go`、`_other.go`）。stub 只能用于确实不支持的平台，**不能拿 stub 冒充已经实现**。
-- Wails 层（`app.go`）只做适配，业务逻辑放进 `internal/`，为后续抽出与 UI 无关的 core 做准备。
+- Wails 层（`app.go`）只做适配，业务逻辑已在 `core/`；`internal/` 只保留平台壳件，遵守下文分层边界。
 - 并发：Wails 的绑定方法会被并发调用，共享字段必须加锁或用 atomic。CI 开启了 `-race`。
 
 ### Go 服务端
@@ -228,7 +227,7 @@ git checkout -- .
 ### 客户端分层（#34）
 - `client/core/` 是与 UI 无关的业务层：`{api,audio,codec,config,gateway,hotkey,rtc,signal,voice}`。**`core/` 禁止 import `desktop/`、`wails`、`application`、`@wailsio`**——由 `client/core_boundary_test.go` 用 `go/ast` 机制性强制，改 `core/` 后必须 `go test -count=1 -run TestCoreForbidsDesktopImports .`（该测试运行时扫目录，**不加 `-count=1` 会命中测试缓存拿到旧结果**）。
 - `client/internal/` 现在只剩平台壳件；桌面适配层在 `app.go`（Wails 绑定、窗口、托盘、事件转发），只做适配，业务逻辑在 `core/`。
-- 音频热路径文件（`core/audio/{dsp,pipeline,mixer,ringbuffer,remote}.go`）**只做机械搬迁，不改逻辑**；搬迁前后基准必须一致（参考值：`BenchmarkSendOpus` 0 allocs、`SendOpusWrite/noext` 0、`SendOpusWrite/ext` 1——那 1 个是 pion stats 拦截器的 `header.Clone()`，非本项目代码）。
+- 音频热路径文件（`core/audio/{dsp,pipeline,mixer,ringbuffer,remote}.go`）的 #34 机械搬迁已完成；后续逻辑改动按对应 issue 实施并复跑基准（参考值：`BenchmarkSendOpus` 0 allocs、`SendOpusWrite/noext` 0、`SendOpusWrite/ext` 1——那 1 个是 pion stats 拦截器的 `header.Clone()`，非本项目代码）。
 - 报音频基准一律 `-benchtime=200x -count=3` 或默认 benchtime，**禁用 `-benchtime=1x`**（单次迭代会把懒初始化算进 alloc 计数，数字不可信）。
 
 ### 前端
@@ -241,7 +240,7 @@ git checkout -- .
 
 ## 7. Wails v3 已知陷阱（都踩过）
 
-- v3 默认在最后一个窗口关闭时退出进程。各平台都要设置 `DisableQuitOnLastWindowClosed: true`；目前只配了 Windows，Linux 和 macOS 还没配。
+- destroy 休眠依赖最后一窗关闭后进程仍存活。Windows、Linux 已设置 `DisableQuitOnLastWindowClosed: true`；macOS 使用相反语义的 `ApplicationShouldTerminateAfterLastWindowClosed: false`。维护窗口生命周期时保留这些设置，不要跨平台照抄字段。
 - 关窗拦截用 `window.RegisterHook(events.Common.WindowClosing, ...)` 加 `e.Cancel()`。所有放行路径都要显式调用 quit。
 - 销毁窗口或重建渲染进程时，`recreating` 标志必须在重建完成后复位。
 - 前端 `Events.On` 的回调参数是 WailsEvent，载荷在 `.data` 里。
