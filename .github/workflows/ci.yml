@@ -244,8 +244,12 @@ jobs:
         run: cd third_party && sha256sum -c SHA256SUMS
       - name: go vet
         run: go vet ./...
-      - name: go test（-race）
+      - name: go test（默认 GTK4，-race）
         run: go test -race -count=1 ./...
+      # GTK3 回退路径只覆盖不依赖图形开发库的配置边界；完整旧版构建仍属
+      # 可选 legacy 产物决策，不在本 job 安装两套 WebKitGTK 开发库。
+      - name: go test（legacy GTK3 配置边界，-race）
+        run: go test -race -count=1 -tags gtk3 ./core/config
       - name: go build
         run: go build ./...
       # ---- issue #6/#5：安装后启动冒烟（非 tag 也跑） ----
