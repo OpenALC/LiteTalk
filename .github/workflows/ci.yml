@@ -364,6 +364,7 @@ jobs:
     name: 安装冒烟（${{ matrix.distro }}）
     needs: check-client-linux
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:

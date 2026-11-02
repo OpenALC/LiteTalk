@@ -57,13 +57,14 @@ case "$PKG_TYPE" in
         launch_wrapper=(xvfb-run -a)
         ;;
       rocky|almalinux|rhel|ol)
-        # RHEL 10 系：WebKitGTK 6.0（webkitgtk6.0）与 cage 都只在 EPEL 10；
-        # RHEL 10 已移除 Xorg/Xvfb，无头显示走 xwayland-run（AppStream）+ cage。
-        echo "启用 EPEL 10（webkitgtk6.0 / cage 的来源，RHEL 10 系用户同样需要）"
+        # RHEL 10 系：WebKitGTK 6.0 与 Weston 均由 EPEL 10 提供。
+        # Xvfb 不在该发行版的正式仓库；Weston headless 可直接提供 Wayland
+        # 会话，避免依赖开发仓库或 xwayland-run 的嵌套显示栈。
+        echo "启用 EPEL 10（webkitgtk6.0 / weston 的来源）"
         dnf install -y epel-release
-        # 冒烟环境补齐：同 Fedora，显示栈换成 xwayland-run + cage。
-        dnf install -y xwayland-run cage dbus-daemon dejavu-sans-fonts mesa-dri-drivers
-        launch_wrapper=(xwfb-run -c cage)
+        dnf install -y weston dbus-daemon dejavu-sans-fonts mesa-dri-drivers
+        launch_wrapper=()
+        launch_backend=wayland
         ;;
       *)
         echo "ERROR: 未覆盖的 rpm 发行版 $ID，请在脚本 case 中补充"
@@ -91,11 +92,34 @@ export WEBKIT_DISABLE_DMABUF_RENDERER=1
 export LIBGL_ALWAYS_SOFTWARE=1
 export WEBKIT_FORCE_SANDBOX=0
 export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
-# 统一固定 X11 后端：xvfb-run 只有 X11，而 xwfb-run 会同时导出 WAYLAND_DISPLAY，
-# GTK4 会优先选 Wayland——Wails beta.30 的 GTK4 Wayland 路径在 cage 无头栈里
-# 卡在窗口创建、到不了 ServiceStartup（AlmaLinux 10 实测）。固定后四个发行版
-# 走同一 X11 路径，判定口径一致。
-export GDK_BACKEND=x11
+if [ "${launch_backend:-x11}" = wayland ]; then
+  export XDG_RUNTIME_DIR=$(mktemp -d)
+  chmod 700 "$XDG_RUNTIME_DIR"
+  export WAYLAND_DISPLAY=wayland-litetalk-smoke
+  export GDK_BACKEND=wayland
+  weston --backend=headless --renderer=pixman --no-config \
+    --socket="$WAYLAND_DISPLAY" --width=1280 --height=720 \
+    --log=/tmp/litetalk-weston.log &
+  weston_pid=$!
+  trap 'kill "$weston_pid" 2>/dev/null || true; rm -rf "$XDG_RUNTIME_DIR"' EXIT
+  for _ in $(seq 1 50); do
+    [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ] && break
+    if ! kill -0 "$weston_pid" 2>/dev/null; then
+      cat /tmp/litetalk-weston.log
+      echo "ERROR: Weston headless 启动失败"
+      exit 1
+    fi
+    sleep 0.1
+  done
+  [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ] || {
+    cat /tmp/litetalk-weston.log
+    echo "ERROR: Weston headless 未创建 Wayland socket"
+    exit 1
+  }
+else
+  # xvfb-run 仅提供 X11；显式指定避免宿主的 WAYLAND_DISPLAY 干扰选择。
+  export GDK_BACKEND=x11
+fi
 
 set +e
 "${launch_wrapper[@]}" dbus-run-session -- timeout 10 litetalk > "$LOG" 2>&1
