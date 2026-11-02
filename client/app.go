@@ -38,6 +38,8 @@ import (
 // version 客户端版本号，可用 -ldflags "-X main.version=" 注入，默认 dev
 var version = "dev"
 
+type levelMonitor interface{ Stop() }
+
 // App 应用结构体：Wails v3 应用/窗口引用、设置项、业务会话与 API 客户端。
 // 导出方法经 Service 绑定暴露给前端调用（Call.ByName("main.App.<方法>")）。
 type App struct {
@@ -97,9 +99,17 @@ type App struct {
 
 	audioCtx *audio.Context // 设备枚举用，惰性创建
 
-	// levelMon 设置页实时电平推送（audio:level，100ms 节流）；仅麦克风测试
-	// 期间活跃。a.mu 保护指针本身，Stop 在锁外等待监视 goroutine 退出。
-	levelMon *audio.LevelMonitor
+	// 设置页监视独立于通话管线；生命周期锁覆盖设备启动与停止，旧页面的
+	// Stop token 不能关闭新页面接管的监视。回调只读 epoch，不取此锁。
+	levelMu          sync.Mutex
+	levelMon         levelMonitor
+	levelStart       func(string, audio.InputMode, func(audio.LevelSample)) (levelMonitor, error)
+	levelSeq         uint64
+	levelToken       string
+	levelEpoch       uint64
+	levelActiveEpoch atomic.Uint64
+	levelSuspended   bool
+	levelShutdown    bool
 
 	// 全局热键（v1.2.0）：hkMgr 持系统钩子，hkGate 是长期存活的值对象——
 	// 都不随会话重建，重连时经 Session.SetSendGate 把同一个 Gate 挂到新管线上，
@@ -470,6 +480,8 @@ func (a *App) buildWindow(opts application.WebviewWindowOptions) *application.We
 // 旧窗口收尾与新窗口可短暂并存，v3 WindowManager 负责移除旧实例。
 // 重复触发安全（window 已 nil 直接返回）。
 func (a *App) destroyRenderProcess() {
+	// 销毁前端后，页面卸载时发出的异步 Stop 可能无法送达。
+	a.suspendLevelMonitor()
 	win := a.getWindow()
 	if win == nil {
 		return
@@ -492,6 +504,8 @@ func (a *App) showFromTray() {
 		if a.wails == nil {
 			return // 测试环境
 		}
+		// 新 WebView 创建时前端可能立即发起绑定调用，先恢复接收新监视。
+		a.resumeLevelMonitor()
 		opts := application.WebviewWindowOptions{
 			Title:            "轻音 LiteTalk",
 			Width:            1080,
@@ -532,6 +546,7 @@ func (a *App) showFromTray() {
 	if desktop.IsWaylandSession() {
 		win.Focus()
 	}
+	a.resumeLevelMonitor()
 	a.emit("sys:wake", nil)
 }
 
@@ -1216,39 +1231,88 @@ func (a *App) TestSpeaker() error {
 	return audio.TestPlayback(a.cfg.Get().AudioPlayback, 880, 1500*time.Millisecond)
 }
 
-// StartLevelMonitor 启动设置页实时电平推送（audio:level 事件，100ms 节流）。
-// 仅麦克风测试期间调用（TestMicrophone 启动、结束时 StopLevelMonitor）；
-// 重复调用为无害 no-op。设备/下混模式取持久化配置，与通话链路一致。
-func (a *App) StartLevelMonitor() error {
-	as := a.cfg.GetAudioSettings()
-	selector := a.cfg.Get().AudioCapture
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.levelMon != nil {
-		return nil
+// StartLevelMonitor 启动设置页实时电平推送；每次调用返回独立 token。
+// 同一进程只开一路采集，新页面接管时换 token，旧页面的迟到 Stop 便不会误停。
+func (a *App) StartLevelMonitor() (string, error) {
+	a.levelMu.Lock()
+	defer a.levelMu.Unlock()
+	if a.levelShutdown || a.levelSuspended {
+		return "", errors.New("电平监视窗口已关闭")
 	}
-	mon, err := audio.StartLevelMonitor(selector, audio.ParseInputMode(as.InputMode), func(s audio.LevelSample) {
-		// 监视 goroutine 上回调：只投递事件，不做任何阻塞操作。
-		a.emit("audio:level", map[string]any{
-			"peak": s.PeakDB, "rms": s.RmsDB, "threshold": s.ThresholdDB,
-		})
-	})
-	if err != nil {
-		return err
+	if a.levelMon == nil {
+		as := a.cfg.GetAudioSettings()
+		selector := a.cfg.Get().AudioCapture
+		a.levelEpoch++
+		epoch := a.levelEpoch
+		a.levelActiveEpoch.Store(epoch)
+		emit := func(s audio.LevelSample) {
+			if a.levelActiveEpoch.Load() != epoch {
+				return
+			}
+			// 监视 goroutine 上只投递事件，不做阻塞操作。
+			a.emit("audio:level", map[string]any{
+				"peak": s.PeakDB, "rms": s.RmsDB, "threshold": s.ThresholdDB,
+			})
+		}
+		var mon levelMonitor
+		var err error
+		if a.levelStart != nil { // 测试注入，不启动真实采集设备
+			mon, err = a.levelStart(selector, audio.ParseInputMode(as.InputMode), emit)
+		} else {
+			mon, err = audio.StartLevelMonitor(selector, audio.ParseInputMode(as.InputMode), emit)
+		}
+		if err != nil {
+			a.levelActiveEpoch.Store(0)
+			return "", err
+		}
+		a.levelMon = mon
 	}
-	a.levelMon = mon
-	return nil
+	a.levelSeq++
+	a.levelToken = strconv.FormatUint(a.levelSeq, 10)
+	return a.levelToken, nil
 }
 
-// StopLevelMonitor 停止电平推送并释放设备（幂等；锁外等待监视退出，避免死锁）。
-func (a *App) StopLevelMonitor() {
-	a.mu.Lock()
-	mon := a.levelMon
-	a.levelMon = nil
-	a.mu.Unlock()
-	if mon != nil {
-		mon.Stop()
+// StopLevelMonitor 只接受本次页面持有的 token；重复或迟到调用是无害 no-op。
+func (a *App) StopLevelMonitor(token string) {
+	a.levelMu.Lock()
+	defer a.levelMu.Unlock()
+	if token == "" || token != a.levelToken {
+		return
 	}
+	a.stopLevelMonitorLocked()
+}
+
+// stopLevelMonitorLocked 先撤销回调代际，再等待采集流结束。调用方持 levelMu。
+func (a *App) stopLevelMonitorLocked() {
+	a.levelToken = ""
+	a.levelActiveEpoch.Store(0)
+	if a.levelMon != nil {
+		a.levelMon.Stop()
+		a.levelMon = nil
+	}
+}
+
+func (a *App) suspendLevelMonitor() {
+	a.levelMu.Lock()
+	defer a.levelMu.Unlock()
+	a.levelSuspended = true
+	a.stopLevelMonitorLocked()
+}
+
+func (a *App) resumeLevelMonitor() {
+	a.levelMu.Lock()
+	defer a.levelMu.Unlock()
+	if !a.levelShutdown {
+		a.levelSuspended = false
+	}
+}
+
+func (a *App) shutdownLevelMonitor() {
+	a.levelMu.Lock()
+	defer a.levelMu.Unlock()
+	a.levelShutdown = true
+	a.levelSuspended = true
+	a.stopLevelMonitorLocked()
 }
 
 // ---------- 语音会话 ----------
@@ -3066,7 +3130,9 @@ func (a *App) GetVoiceMembers() []voice.PeerView {
 
 // ServiceShutdown v3 服务关闭回调：退出清理。
 func (a *App) ServiceShutdown() error {
-	// 先停悬浮层：Stop 会等待窗口线程退出，保证后续拆会话时没有快照回调
+	// 设置页监视持独立声卡设备；不能依赖正在退出的 WebView 异步停流。
+	a.shutdownLevelMonitor()
+	// 再停悬浮层：Stop 会等待窗口线程退出，保证后续拆会话时没有快照回调
 	// 还在访问 Session。
 	a.stopWindowOverlay()
 	a.disconnectSession()
