@@ -27,6 +27,10 @@
 #   leak       旧 destroy 请求 20 轮 RSS 与 WebKit 进程趋势；GTK4 验证降级
 #   all        以上全部
 #
+# 目标二进制须包含 #5 的 LITETALK_CI_SMOKE=1 前端就绪日志
+# `litetalk-smoke:frontend-ready`（GetHibernateMode 在前端 mount 后输出）。
+# 每次主实例启动使用独立日志，只认本次日志里的标记；缺标记视为失败。
+#
 # --trigger 触发按钮（前端自定义标题栏，见 client/frontend/src/components/TitleBar.vue）：
 #   close  关闭按钮（生产路径 WindowClose → interceptClose → Hide/destroy）
 #   min    最小化按钮（直接 win.Minimise；destroy 模式经 WindowMinimise 事件销毁）
@@ -239,6 +243,17 @@ emit() { # $1=suite $2=iter $3=metric $4=value $5=unit
 emit_meta() {
   echo "# $*"
   [ "$OUT_FD" = 1 ] || echo "# $*" >&$OUT_FD
+}
+emit_live_rss() { # $1=suite $2=iter $3=metric $4=主进程pid
+  local rss
+  if ! process_running "$4"; then
+    emit "$1" "$2" "$3" FAIL KiB; return 1
+  fi
+  rss=$(tree_rss_kib "$4")
+  if [ "$rss" -le 0 ]; then
+    emit "$1" "$2" "$3" FAIL KiB; return 1
+  fi
+  emit "$1" "$2" "$3" "$rss" KiB
 }
 
 emit_meta "binary=$BIN_ABS gtk=$GTK_VER webkit=${WEBKIT_VER:-unknown} mode=$MODE suite=$SUITE runs=$RUNS trigger=$TRIGGER"
@@ -491,6 +506,9 @@ suite_cold() {
       fail=$((fail + 1))
       emit "cold-$tag" "$i" "window_mapped" "FAIL" "ms"
     fi
+    if ! process_running "$SCRIPT_MAIN"; then
+      emit "cold-$tag" "$i" main_process_alive FAIL bool
+    fi
     stop_app
   done
   emit "cold-$tag" 0 "failures" "$fail" "count"
@@ -514,11 +532,11 @@ cycle_hide_show() {
   fi
   emit "$suite" "$it" "$act" "$LAST_TRIGGER_MS" ms
   emit "$suite" "$it" "${act}_tries" "$LAST_TRIGGER_TRIES" count
-  if ! kill -0 "$SCRIPT_MAIN" 2>/dev/null; then
+  if ! process_running "$SCRIPT_MAIN"; then
     emit "$suite" "$it" main_process_alive FAIL bool; return 1
   fi
   if [ "$detailed" = 1 ]; then
-    emit "$suite" "$it" rss_after_hide "$(tree_rss_kib "$SCRIPT_MAIN")" KiB
+    emit_live_rss "$suite" "$it" rss_after_hide "$SCRIPT_MAIN" || return 1
     emit "$suite" "$it" counts_after_hide "$(webkit_counts)" kv
   fi
   sleep 1 # 状态稳定，不计入测量
@@ -535,6 +553,9 @@ cycle_hide_show() {
   else
     emit "$suite" "$it" "$wake" FAIL ms; ok=0
   fi
+  if ! process_running "$SCRIPT_MAIN"; then
+    emit "$suite" "$it" main_process_alive_after_wake FAIL bool; ok=0
+  fi
   if [ "$suite" = destroy-downgrade ]; then
     if [ "$(disk_config_mode)" = destroy ]; then
       emit "$suite" "$it" config_destroy_retained yes bool
@@ -548,7 +569,7 @@ cycle_hide_show() {
     fi
   fi
   if [ "$detailed" = 1 ]; then
-    emit "$suite" "$it" rss_after_wake "$(tree_rss_kib "$SCRIPT_MAIN")" KiB
+    emit_live_rss "$suite" "$it" rss_after_wake "$SCRIPT_MAIN" || return 1
     emit "$suite" "$it" counts_after_wake "$(webkit_counts)" kv
   fi
   if ! wait_proc_exit "$sec" 5000; then
@@ -576,6 +597,9 @@ cycle_destroy_rebuild() {
   fi
   emit "destroy-rebuild" "$it" "destroy" "$LAST_TRIGGER_MS" "ms"
   emit "destroy-rebuild" "$it" "destroy_tries" "$LAST_TRIGGER_TRIES" "count"
+  if ! process_running "$SCRIPT_MAIN"; then
+    emit destroy-rebuild "$it" main_process_alive_after_destroy FAIL bool; return 1
+  fi
   # destroy 完成信号：WebKitWebProcess 回落到基线（win.Close 后渲染进程退出）
   if wait_webproc_gone 8000; then
     emit "destroy-rebuild" "$it" "webprocess_exit" "$(el_ms "$LAST_TRIGGER_T0" "$(now_ns)")" "ms"
@@ -583,7 +607,7 @@ cycle_destroy_rebuild() {
     emit "destroy-rebuild" "$it" "webprocess_exit" "FAIL" "ms"
   fi
   if [ "$detailed" = 1 ]; then
-    emit "destroy-rebuild" "$it" "rss_after_destroy" "$(tree_rss_kib "$SCRIPT_MAIN")" "KiB"
+    emit_live_rss destroy-rebuild "$it" rss_after_destroy "$SCRIPT_MAIN" || return 1
     emit "destroy-rebuild" "$it" "counts_after_destroy" "$(webkit_counts)" "kv"
   fi
   sleep 1
@@ -597,9 +621,12 @@ cycle_destroy_rebuild() {
   else
     emit "destroy-rebuild" "$it" "rebuild" "FAIL" "ms"
   fi
+  if ! process_running "$SCRIPT_MAIN"; then
+    emit destroy-rebuild "$it" main_process_alive_after_rebuild FAIL bool
+  fi
   if [ "$detailed" = 1 ]; then
     sleep 1.5
-    emit "destroy-rebuild" "$it" "rss_after_rebuild" "$(tree_rss_kib "$SCRIPT_MAIN")" "KiB"
+    emit_live_rss destroy-rebuild "$it" rss_after_rebuild "$SCRIPT_MAIN" || return 1
     emit "destroy-rebuild" "$it" "counts_after_rebuild" "$(webkit_counts)" "kv"
   fi
   wait_proc_exit "$sec" 5000 || emit "destroy-rebuild" "$it" "second_instance_lingering" FAIL bool
@@ -675,21 +702,41 @@ suite_lifecycle() {
 # 套件：cpu 空闲 CPU（$1=标签 $2=附加env）
 # ============================================================
 suite_cpu() {
-  local tag=$1 envkv=$2 t0 t1 ticks0 ticks1 wall pct
+  local tag=$1 envkv=$2 t0 t1 ticks0 ticks1 wall pct i
   launch_app "$envkv"
   if ! wait_main_window 30000 >/dev/null 2>&1 || ! wait_frontend_ready 30000; then
     emit "cpu-idle-$tag" 1 startup FAIL bool
     stop_app; return 1
   fi
   sleep 5 # 就绪稳定
+  if ! process_running "$SCRIPT_MAIN"; then
+    emit "cpu-idle-$tag" 1 process_alive_before_sample FAIL bool
+    stop_app; return 1
+  fi
   t0=$(now_ns); ticks0=$(tree_cpu_ticks "$SCRIPT_MAIN")
-  sleep "$CPU_SECONDS"
+  for i in $(seq 1 "$CPU_SECONDS"); do
+    sleep 1
+    if ! process_running "$SCRIPT_MAIN"; then
+      emit "cpu-idle-$tag" "$i" process_alive_during_sample FAIL bool
+      stop_app; return 1
+    fi
+  done
   t1=$(now_ns); ticks1=$(tree_cpu_ticks "$SCRIPT_MAIN")
+  if ! process_running "$SCRIPT_MAIN" || [ "$ticks1" -lt "$ticks0" ]; then
+    emit "cpu-idle-$tag" 1 process_or_ticks FAIL bool
+    stop_app; return 1
+  fi
+  local rss
+  rss=$(tree_rss_kib "$SCRIPT_MAIN")
+  if [ "$rss" -le 0 ]; then
+    emit "cpu-idle-$tag" 1 tree_rss FAIL KiB
+    stop_app; return 1
+  fi
   wall=$(( (t1 - t0) / 1000000000 )); [ "$wall" -lt 1 ] && wall=1
   # 核占比 = Δtick/CLK_TCK(=CPU秒) / wall × 100
   pct=$(( (ticks1 - ticks0) * 100 / CLK_TCK / wall ))
   emit "cpu-idle-$tag" 1 "tree_cpu_percent" "$pct" "percent_of_one_core"
-  emit "cpu-idle-$tag" 1 "tree_rss" "$(tree_rss_kib "$SCRIPT_MAIN")" "KiB"
+  emit "cpu-idle-$tag" 1 tree_rss "$rss" KiB
   emit "cpu-idle-$tag" 1 "process_count" "$(tree_pids "$SCRIPT_MAIN" | wc -l)" "count"
   stop_app
 }
@@ -698,7 +745,7 @@ suite_cpu() {
 # 套件：rss 三档休眠模式
 # ============================================================
 suite_rss() {
-  local m s suite after_metric web_before
+  local m s suite after_metric web_before rss valid
   for m in off hibernate destroy; do
     suite="rss-$m"
     [ "$m" != destroy ] || { [ "$GTK_VER" = 4 ] && suite=rss-destroy-downgrade || suite=rss-destroy; }
@@ -710,10 +757,23 @@ suite_rss() {
     fi
     sleep 5
     # 窗口可见态连采 3 次（间隔 2s），文档取中位数
+    valid=1
     for s in 1 2 3; do
-      emit "$suite" "$s" rss_window_visible "$(tree_rss_kib "$SCRIPT_MAIN")" KiB
+      if ! process_running "$SCRIPT_MAIN"; then
+        emit "$suite" "$s" rss_window_visible FAIL KiB; valid=0; break
+      fi
+      rss=$(tree_rss_kib "$SCRIPT_MAIN")
+      if [ "$rss" -le 0 ]; then
+        emit "$suite" "$s" rss_window_visible FAIL KiB; valid=0; break
+      fi
+      emit "$suite" "$s" rss_window_visible "$rss" KiB
       sleep 2
     done
+    if [ "$valid" = 0 ]; then stop_app; continue; fi
+    if ! process_running "$SCRIPT_MAIN"; then
+      emit "$suite" 1 process_alive_after_visible FAIL bool
+      stop_app; continue
+    fi
     emit "$suite" 1 process_count_visible "$(tree_pids "$SCRIPT_MAIN" | wc -l)" count
     web_before=$(count_comm WebKitWebProcess)
     if [ "$m" = destroy ] && [ "$web_before" -lt 1 ]; then
@@ -725,6 +785,10 @@ suite_rss() {
         emit "$suite" 1 hide FAIL bool
         stop_app; continue
       fi
+      if ! process_running "$SCRIPT_MAIN"; then
+        emit "$suite" 1 process_alive_after_hide FAIL bool
+        stop_app; continue
+      fi
       if [ "$GTK_VER" = 3 ] && [ "$m" = destroy ]; then
         if ! wait_webproc_gone 8000; then emit "$suite" 1 webprocess_exit FAIL bool; fi
         after_metric=rss_after_destroy
@@ -732,10 +796,19 @@ suite_rss() {
         after_metric=rss_after_hibernate
       fi
       sleep 3
+      valid=1
       for s in 1 2 3; do
-        emit "$suite" "$s" "$after_metric" "$(tree_rss_kib "$SCRIPT_MAIN")" KiB
+        if ! process_running "$SCRIPT_MAIN"; then
+          emit "$suite" "$s" "$after_metric" FAIL KiB; valid=0; break
+        fi
+        rss=$(tree_rss_kib "$SCRIPT_MAIN")
+        if [ "$rss" -le 0 ]; then
+          emit "$suite" "$s" "$after_metric" FAIL KiB; valid=0; break
+        fi
+        emit "$suite" "$s" "$after_metric" "$rss" KiB
         sleep 2
       done
+      if [ "$valid" = 0 ]; then stop_app; continue; fi
       emit "$suite" 1 counts_after_hide "$(webkit_counts)" kv
       if [ "$suite" = rss-destroy-downgrade ]; then
         [ "$(disk_config_mode)" = destroy ] && emit "$suite" 1 config_destroy_retained yes bool ||
@@ -766,7 +839,9 @@ suite_leak() {
     stop_app; return 1
   fi
   sleep 2
-  emit "$suite" 0 rss_baseline "$(tree_rss_kib "$SCRIPT_MAIN")" KiB
+  if ! emit_live_rss "$suite" 0 rss_baseline "$SCRIPT_MAIN"; then
+    stop_app; return 1
+  fi
   emit "$suite" 0 counts_baseline "$(webkit_counts)" kv
   local i fail=0
   for i in $(seq 1 "$LEAK_CYCLES"); do
@@ -796,6 +871,10 @@ if [ "$MODE" = "wayland" ]; then
   if wait_frontend_ready 30000 && process_running "$SCRIPT_MAIN"; then
     emit wayland-smoke 1 frontend_ready "$(el_ms "$t0" "$(now_ns)")" ms
     sleep 5
+    if ! process_running "$SCRIPT_MAIN"; then
+      emit wayland-smoke 1 process_alive_before_sample FAIL bool
+      stop_app; exit 1
+    fi
     ticks0=$(tree_cpu_ticks "$SCRIPT_MAIN"); t0=$(now_ns)
     alive=1
     for i in $(seq 1 "$CPU_SECONDS"); do
@@ -807,9 +886,18 @@ if [ "$MODE" = "wayland" ]; then
     done
     if [ "$alive" = 1 ]; then
       ticks1=$(tree_cpu_ticks "$SCRIPT_MAIN"); t1=$(now_ns)
+      if ! process_running "$SCRIPT_MAIN" || [ "$ticks1" -lt "$ticks0" ]; then
+        emit wayland-smoke 1 process_or_ticks FAIL bool
+        stop_app; exit 1
+      fi
+      rss=$(tree_rss_kib "$SCRIPT_MAIN")
+      if [ "$rss" -le 0 ]; then
+        emit wayland-smoke 1 tree_rss FAIL KiB
+        stop_app; exit 1
+      fi
       wall=$(( (t1 - t0) / 1000000000 )); [ "$wall" -lt 1 ] && wall=1
       emit "wayland-smoke" 1 "tree_cpu_percent" "$(( (ticks1 - ticks0) * 100 / CLK_TCK / wall ))" "percent_of_one_core"
-      emit "wayland-smoke" 1 "tree_rss" "$(tree_rss_kib "$SCRIPT_MAIN")" "KiB"
+      emit wayland-smoke 1 tree_rss "$rss" KiB
     fi
   else
     emit wayland-smoke 1 frontend_ready FAIL bool
