@@ -120,6 +120,7 @@ APP_TAG="LITETALK_MEASURE_APP=$RUN_ID"
 INFRA_TAG="LITETALK_MEASURE_INFRA=$RUN_ID"
 SCRIPT_MAIN=""
 SECOND_PID=""
+SCRIPT_LOG=""
 WATCHER_PID=""
 DBUS_PID=""
 BASELINE_WEBPROC=0
@@ -362,19 +363,36 @@ disk_config_mode() {
     "$WORKDIR/config/LiteTalk/config.json"
 }
 
-launch_app() { # $1=附加环境变量(k=v 或 -) → 设置 SCRIPT_MAIN
+launch_app() { # $1=附加环境变量(k=v 或 -) → 设置 SCRIPT_MAIN 和本次启动专属日志
   local envkv=$1
+  SCRIPT_LOG="$WORKDIR/app-main-$(date +%s%N).log"
   if [ "$envkv" != "-" ]; then
-    env "$APP_TAG" "$envkv" "$BIN_ABS" >>"$WORKDIR/app.log" 2>&1 &
+    env "$APP_TAG" LITETALK_CI_SMOKE=1 "$envkv" "$BIN_ABS" >"$SCRIPT_LOG" 2>&1 &
   else
-    env "$APP_TAG" "$BIN_ABS" >>"$WORKDIR/app.log" 2>&1 &
+    env "$APP_TAG" LITETALK_CI_SMOKE=1 "$BIN_ABS" >"$SCRIPT_LOG" 2>&1 &
   fi
   SCRIPT_MAIN=$!
 }
 
 launch_secondary() {
-  env "$APP_TAG" "$BIN_ABS" >>"$WORKDIR/app.log" 2>&1 &
+  env "$APP_TAG" LITETALK_CI_SMOKE=1 "$BIN_ABS" >>"$WORKDIR/app-secondary.log" 2>&1 &
   SECOND_PID=$!
+}
+
+process_running() { # $1=pid；zombie 也视为退出
+  local state
+  state=$(ps -o stat= -p "$1" 2>/dev/null) || return 1
+  [ -n "$state" ] && [ "${state#Z}" = "$state" ]
+}
+
+wait_frontend_ready() { # $1=超时ms；只查本次主实例日志，不能命中前一轮
+  local deadline=$(( $(now_ms) + $1 ))
+  while [ "$(now_ms)" -lt "$deadline" ]; do
+    grep -Fq 'litetalk-smoke:frontend-ready' "$SCRIPT_LOG" 2>/dev/null && return 0
+    process_running "$SCRIPT_MAIN" || return 1
+    sleep 0.05
+  done
+  return 1
 }
 
 wait_main_window() { # $1=超时ms → 成功时输出 wid
@@ -438,7 +456,7 @@ suite_cold() {
   local tag=$1 envkv=$2 n=$3 i wid t0 t1 ms webok fail=0
   for i in 1 2; do # 预热（WebKit 字体/网络进程缓存），不计入
     launch_app "$envkv"
-    if ! wait_main_window 30000 >/dev/null 2>&1; then
+    if ! wait_main_window 30000 >/dev/null 2>&1 || ! wait_frontend_ready 30000; then
       emit "cold-$tag" 0 warmup FAIL bool
       stop_app; return 1
     fi
@@ -452,6 +470,11 @@ suite_cold() {
       ms=$(el_ms "$t0" "$t1")
       webok=$(wait_webproc 15000 && echo yes || echo no)
       emit "cold-$tag" "$i" "window_mapped" "$ms" "ms"
+      if wait_frontend_ready 30000; then
+        emit "cold-$tag" "$i" frontend_ready "$(el_ms "$t0" "$(now_ns)")" ms
+      else
+        emit "cold-$tag" "$i" frontend_ready FAIL ms
+      fi
       if [ "$webok" = yes ]; then
         emit "cold-$tag" "$i" webprocess_present yes bool
       else
@@ -534,6 +557,9 @@ cycle_hide_show() {
 cycle_destroy_rebuild() {
   local it=$1 detailed=${2:-0} wid0 wid2 t0 t1 ms sec
   [ "$GTK_VER" = 3 ] || { echo "GTK4 禁止运行真实 destroy 套件" >&2; return 1; }
+  if [ "$(count_comm WebKitWebProcess)" -lt 1 ]; then
+    emit destroy-rebuild "$it" webprocess_before FAIL count; return 1
+  fi
   wid0=$(main_window "$SCRIPT_MAIN")
   if [ -z "$wid0" ]; then
     emit "destroy-rebuild" "$it" "destroy" "FAIL" "ms"; return 1
@@ -583,7 +609,7 @@ suite_lifecycle() {
   # show_wake 与托盘点击真实路径的差距上限即此值
   set_config_mode off
   launch_app "-"
-  if ! wait_main_window 30000 >/dev/null 2>&1; then
+  if ! wait_main_window 30000 >/dev/null 2>&1 || ! wait_frontend_ready 30000; then
     emit wake-calibration 0 startup FAIL bool
     stop_app; return 1
   fi
@@ -604,7 +630,7 @@ suite_lifecycle() {
     [ "$m" != destroy ] || { [ "$GTK_VER" = 4 ] && suite=destroy-downgrade || suite=destroy-rebuild; }
     set_config_mode "$m"
     launch_app "-"
-    if ! wait_main_window 30000 >/dev/null 2>&1; then
+    if ! wait_main_window 30000 >/dev/null 2>&1 || ! wait_frontend_ready 30000; then
       emit "$suite" 0 startup FAIL bool
       stop_app; continue
     fi
@@ -644,7 +670,7 @@ suite_lifecycle() {
 suite_cpu() {
   local tag=$1 envkv=$2 t0 t1 ticks0 ticks1 wall pct
   launch_app "$envkv"
-  if ! wait_main_window 30000 >/dev/null 2>&1; then
+  if ! wait_main_window 30000 >/dev/null 2>&1 || ! wait_frontend_ready 30000; then
     emit "cpu-idle-$tag" 1 startup FAIL bool
     stop_app; return 1
   fi
@@ -671,7 +697,7 @@ suite_rss() {
     [ "$m" != destroy ] || { [ "$GTK_VER" = 4 ] && suite=rss-destroy-downgrade || suite=rss-destroy; }
     set_config_mode "$m"
     launch_app "-"
-    if ! wait_main_window 30000 >/dev/null 2>&1; then
+    if ! wait_main_window 30000 >/dev/null 2>&1 || ! wait_frontend_ready 30000; then
       emit "$suite" 0 startup FAIL bool
       stop_app; continue
     fi
@@ -683,6 +709,10 @@ suite_rss() {
     done
     emit "$suite" 1 process_count_visible "$(tree_pids "$SCRIPT_MAIN" | wc -l)" count
     web_before=$(count_comm WebKitWebProcess)
+    if [ "$m" = destroy ] && [ "$web_before" -lt 1 ]; then
+      emit "$suite" 1 webprocess_before FAIL count
+      stop_app; continue
+    fi
     if [ "$m" != off ]; then
       if ! trigger_and_wait_gone; then
         emit "$suite" 1 hide FAIL bool
@@ -720,8 +750,12 @@ suite_leak() {
   [ "$GTK_VER" = 4 ] && suite=destroy-downgrade
   set_config_mode destroy
   launch_app "-"
-  if ! wait_main_window 30000 >/dev/null 2>&1; then
+  if ! wait_main_window 30000 >/dev/null 2>&1 || ! wait_frontend_ready 30000; then
     emit "$suite" 0 startup FAIL bool
+    stop_app; return 1
+  fi
+  if [ "$(count_comm WebKitWebProcess)" -lt 1 ]; then
+    emit "$suite" 0 webprocess_before FAIL count
     stop_app; return 1
   fi
   sleep 2
@@ -744,20 +778,34 @@ suite_leak() {
 # ============================================================
 if [ "$MODE" = "wayland" ]; then
   export GDK_BACKEND=wayland
-  emit_meta "wayland 模式: X11 工具无法观测窗口映射，仅进程级存活与资源粗测（窗口指标 NA）"
+  emit_meta "wayland 模式: GDK_BACKEND=wayland WAYLAND_DISPLAY=$WAYLAND_DISPLAY；窗口映射时间仍为 NA"
+  if [ ! -S "$WAYLAND_DISPLAY" ]; then
+    emit wayland-smoke 0 display_socket FAIL bool
+    exit 1
+  fi
+  set_config_mode off
+  t0=$(now_ns)
   launch_app "-"
-  sleep 10
-  if kill -0 "$SCRIPT_MAIN" 2>/dev/null; then
-    emit "wayland-smoke" 1 "process_alive_10s" "yes" "bool"
-    emit "wayland-smoke" 1 "wayland_fd_count" "$(ls -l /proc/$SCRIPT_MAIN/fd 2>/dev/null | grep -c wayland)" "count"
+  if wait_frontend_ready 30000 && process_running "$SCRIPT_MAIN"; then
+    emit wayland-smoke 1 frontend_ready "$(el_ms "$t0" "$(now_ns)")" ms
+    sleep 5
     ticks0=$(tree_cpu_ticks "$SCRIPT_MAIN"); t0=$(now_ns)
-    sleep "$CPU_SECONDS"
-    ticks1=$(tree_cpu_ticks "$SCRIPT_MAIN"); t1=$(now_ns)
-    wall=$(( (t1 - t0) / 1000000000 )); [ "$wall" -lt 1 ] && wall=1
-    emit "wayland-smoke" 1 "tree_cpu_percent" "$(( (ticks1 - ticks0) * 100 / CLK_TCK / wall ))" "percent_of_one_core"
-    emit "wayland-smoke" 1 "tree_rss" "$(tree_rss_kib "$SCRIPT_MAIN")" "KiB"
+    alive=1
+    for i in $(seq 1 "$CPU_SECONDS"); do
+      sleep 1
+      if ! process_running "$SCRIPT_MAIN"; then
+        emit wayland-smoke "$i" process_alive_during_sample FAIL bool
+        alive=0; break
+      fi
+    done
+    if [ "$alive" = 1 ]; then
+      ticks1=$(tree_cpu_ticks "$SCRIPT_MAIN"); t1=$(now_ns)
+      wall=$(( (t1 - t0) / 1000000000 )); [ "$wall" -lt 1 ] && wall=1
+      emit "wayland-smoke" 1 "tree_cpu_percent" "$(( (ticks1 - ticks0) * 100 / CLK_TCK / wall ))" "percent_of_one_core"
+      emit "wayland-smoke" 1 "tree_rss" "$(tree_rss_kib "$SCRIPT_MAIN")" "KiB"
+    fi
   else
-    emit wayland-smoke 1 process_alive_10s FAIL bool
+    emit wayland-smoke 1 frontend_ready FAIL bool
   fi
   stop_app
   [ "$FAIL_COUNT" = 0 ]
