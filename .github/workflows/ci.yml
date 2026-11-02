@@ -314,6 +314,17 @@ jobs:
                    webrtc-apm/COPYING webrtc-apm/LICENSE.abseil; do
             test -f "$doc/$f" || { echo "::error::安装包缺少许可证 $f"; exit 1; }
           done
+      - name: 启动冒烟断言负例（仅启动日志不得通过）
+        run: |
+          log="$(mktemp)"
+          trap 'rm -f "$log"' EXIT
+          printf '=== LiteTalk smoke 启动 (pid=1) ===\n' > "$log"
+          if bash build/linux/assert-smoke-ready.sh 124 "$log"; then
+            echo '::error::缺少前端就绪标记却通过了启动冒烟'
+            exit 1
+          fi
+          printf 'litetalk-smoke:frontend-ready\n' >> "$log"
+          bash build/linux/assert-smoke-ready.sh 124 "$log"
       - name: 启动冒烟（Xvfb，10 秒）
         env:
           # 无 GPU 的 Xvfb 下关闭 WebKit 合成/DMABUF，避免软件渲染初始化失败
@@ -327,6 +338,7 @@ jobs:
           # 无此问题（对比 dev 分支绿色冒烟日志）。
           WEBKIT_FORCE_SANDBOX: '0'
           WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS: '1'
+          LITETALK_CI_SMOKE: '1'
         run: |
           set +e
           # dbus-run-session 必需：v3 单实例锁走会话总线，无总线时
@@ -335,20 +347,7 @@ jobs:
           code=$?
           set -e
           cat smoke.log
-          # exit 124 = timeout 到点杀进程，说明这 10 秒内 litetalk 一直存活：
-          # 启动成功且没有自行退出。0（提前退出）、1（启动失败）、139（崩溃）
-          # 等一律失败。依据是本应用启动后进入事件循环并驻留，不会自行结束。
-          if [ "$code" -ne 124 ]; then
-            echo "::error::启动冒烟失败：litetalk 退出码 $code（期望 124：限时内持续运行）"
-            exit 1
-          fi
-          # 124 只证明进程没退出，再确认进入了 ServiceStartup 的启动日志，
-          # 排除卡在 GTK/WebKit 初始化之前的假阳性。
-          if ! grep -q "启动 (pid=" smoke.log; then
-            echo "::error::启动冒烟日志缺少启动标记，进程未进入服务启动"
-            exit 1
-          fi
-          echo "启动冒烟通过：litetalk 在 10 秒时限内持续运行且输出了启动日志"
+          bash build/linux/assert-smoke-ready.sh "$code" smoke.log
       # deb/rpm 产物交给 smoke-client-linux-install 矩阵做四发行版闭包实测
       # （if: always()：启动冒烟失败时产物照样可取，容器矩阵可单独定位）。
       - uses: actions/upload-artifact@v4
@@ -398,6 +397,7 @@ jobs:
           docker run --rm \
             -v "$PWD/smoke-pkgs:/smoke/pkgs:ro" \
             -v "$PWD/client/build/linux/install-smoke.sh:/smoke/install-smoke.sh:ro" \
+            -v "$PWD/client/build/linux/assert-smoke-ready.sh:/smoke/assert-smoke-ready.sh:ro" \
             -e PKG_TYPE=${{ matrix.pkg-type }} \
             "${{ matrix.image }}" \
             bash /smoke/install-smoke.sh

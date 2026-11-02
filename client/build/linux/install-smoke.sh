@@ -92,6 +92,7 @@ export WEBKIT_DISABLE_DMABUF_RENDERER=1
 export LIBGL_ALWAYS_SOFTWARE=1
 export WEBKIT_FORCE_SANDBOX=0
 export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
+export LITETALK_CI_SMOKE=1
 if [ "${launch_backend:-x11}" = wayland ]; then
   export XDG_RUNTIME_DIR=$(mktemp -d)
   chmod 700 "$XDG_RUNTIME_DIR"
@@ -128,16 +129,5 @@ set -e
 
 echo "== 启动日志（退出码 $code，期望 124 = 限时存活）=="
 cat "$LOG"
-# exit 124 = timeout 到点杀进程，说明这 10 秒内 litetalk 一直存活；0 / 1 / 139
-# 等一律失败。依据与宿主冒烟相同：应用启动后进入事件循环并驻留，不会自行结束。
-if [ "$code" -ne 124 ]; then
-  echo "ERROR: 启动冒烟失败：litetalk 退出码 $code（期望 124：限时内持续运行）"
-  exit 1
-fi
-# 124 只证明进程没退出，再确认进入了 ServiceStartup 的启动日志，排除卡在
-# GTK/WebKit 初始化之前的假阳性。
-if ! grep -q "启动 (pid=" "$LOG"; then
-  echo "ERROR: 启动冒烟日志缺少启动标记，进程未进入服务启动"
-  exit 1
-fi
+bash /smoke/assert-smoke-ready.sh "$code" "$LOG"
 echo "安装冒烟通过：${PRETTY_NAME:-$ID} 上安装包依赖解析成功且 litetalk 限时启动存活"
