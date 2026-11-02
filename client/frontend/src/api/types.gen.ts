@@ -1127,7 +1127,7 @@ export interface paths {
         };
         /**
          * 出站 Webhook 订阅列表（ManageServer）
-         * @description 服务器级出站事件订阅（#52）。要求 Bearer 且调用者在该服务器有 ManageServer。 响应永不回传 secret（HMAC 签名密钥）；被熔断自动停用的订阅带 disabled_reason=consecutive_failures。 code：bad_request（路径 ID 非法）；401；403 forbidden；404 not_found；5xx internal。
+         * @description 服务器级出站事件订阅（#52）。要求 Bearer 且调用者在该服务器有 ManageServer。 响应永不回传 secret（HMAC 签名密钥）；被熔断自动停用的订阅带 disabled_reason=consecutive_failures。url 仅对订阅创建者与服务器 owner 回传完整值，其余调用者得到 scheme://host/… 掩码。 code：bad_request（路径 ID 非法）；401；403 forbidden；404 not_found；5xx internal。
          */
         get: operations["listServerWebhooks"];
         put?: never;
@@ -1161,7 +1161,7 @@ export interface paths {
         head?: never;
         /**
          * 改出站订阅（ManageServer；Merge Patch）
-         * @description JSON Merge Patch（RFC 7396）：url / events / enabled / reset_secret 四个可选键， 缺省不改。reset_secret=true 换新 secret 并只在本次响应返回明文， 旧 secret 立即失效（URL 泄露的可重置途径）；enabled=true 手动重新启用并 清零连续失败计数（熔断停用后的唯一恢复途径），enabled=false 手动停用。 url / events 更新与创建同规则校验（bad_url / bad_events）。 归属不符（wid 不属于该服务器）与不存在统一 404。 频控键 wh:patch:<uid>。code：bad_url、bad_events；401；403；404 not_found； 429 rate_limited；5xx internal。
+         * @description JSON Merge Patch（RFC 7396）：url / events / enabled / reset_secret 四个可选键， 缺省不改。reset_secret=true 换新 secret 并只在本次响应返回明文， 旧 secret 立即失效（URL 泄露的可重置途径）；enabled=true 手动重新启用并 清零连续失败计数（熔断停用后的唯一恢复途径），enabled=false 手动停用。 url / events 更新与创建同规则校验（bad_url / bad_events）。 响应里的 url 与列表同口径：仅订阅创建者与服务器 owner 得到完整值， 其余调用者得到 scheme://host/… 掩码（改址后调用方成为创建者，返回其 刚提交的完整地址）。归属不符（wid 不属于该服务器）与不存在统一 404。 频控键 wh:patch:<uid>。code：bad_url、bad_events；401；403；404 not_found； 429 rate_limited；5xx internal。
          */
         patch: operations["patchServerWebhook"];
         trace?: never;
@@ -1181,7 +1181,7 @@ export interface paths {
         put?: never;
         /**
          * 创建频道入站 Webhook（ManageChannels；响应含一次性投递 URL）
-         * @description 创建后响应带 url=/api/v1/webhooks/{id}/{secret}（含一次性 secret 明文， 只在本次出现），外部系统直接 POST 该 URL 即可向频道投递消息。 频控键 wh:create-inb:<uid>。 code：bad_channel、bad_request；401；403；404 not_found；429 rate_limited； 5xx internal。
+         * @description 创建后响应带 url=/api/v1/webhooks/{id}/{secret}（含一次性 secret 明文， 只在本次出现）。**url 是相对路径**，调用方自行拼服务器地址 （scheme + host + port）后再 POST，即可向频道投递消息。 频控键 wh:create-inb:<uid>。 code：bad_channel、bad_request；401；403；404 not_found；429 rate_limited； 5xx internal。
          */
         post: operations["createInboundWebhook"];
         delete?: never;
@@ -1377,7 +1377,7 @@ export interface components {
          */
         OutboundWebhook: {
             id: string;
-            /** @description 投递目标（POST，application/json） */
+            /** @description 投递目标（POST，application/json）。完整值只回传给订阅创建者与服务器 owner； 其余 ManageServer 成员看到掩码 scheme://host/…（路径/查询串常内嵌第三方 服务的投递凭证）。创建与改址响应总是调用方自己提交的完整地址。 */
             url: string;
             /** @description 订阅的事件白名单子集 */
             events: ("message.created" | "member.joined" | "member.left" | "channel.created" | "channel.deleted")[];
@@ -1407,13 +1407,13 @@ export interface components {
         PatchWebhookRequest: Record<string, never>;
         /**
          * InboundWebhook
-         * @description 频道级入站投递入口（#52）。url 形如 /api/v1/webhooks/{id}/{secret}， 只在创建与 reset_secret（PATCH）响应出现（含一次性 secret）；列表响应 不含 secret，泄露即 PATCH reset_secret 轮换或删除重建。
+         * @description 频道级入站投递入口（#52）。url 形如 /api/v1/webhooks/{id}/{secret}， 只在创建与 reset_secret（PATCH）响应出现（含一次性 secret）；列表响应 不含 secret，泄露即 PATCH reset_secret 轮换或删除重建。 **url 是相对路径**，不含服务器地址，调用方自行拼上 scheme + host + port 后使用。
          */
         InboundWebhook: {
             id: string;
             /** @description 用途备注（如「CI 告警」） */
             description: string;
-            /** @description 投递路径（含一次性 secret，仅创建响应） */
+            /** @description 投递路径（相对路径，含一次性 secret，仅创建 / reset_secret 响应）。 调用方自行拼服务器地址后使用。 */
             url?: string;
             /** Format: date-time */
             created_at: string;

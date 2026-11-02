@@ -565,6 +565,83 @@ func TestOutboundWebhookCreateRequiresVisibleChannel(t *testing.T) {
 	}
 }
 
+// TestOutboundWebhookCreateGateBySubscribedEvents #119：可见性门按订阅的事件集合判定。
+// B 持 ManageServer，只看得见语音频道（文字频道被 deny）：
+//   - message.created 需要文字频道 → 拒绝（旧实现只要求「任一频道可见」，会误放行，
+//     而该事件永远不会投递）；
+//   - channel.created 文字/语音频道都会产生 → 允许；
+//   - 混合订阅里 message.created 的腿仍空转 → 拒绝；
+//   - member.joined / member.left 无频道维度 → 即使所有频道都不可见也允许。
+func TestOutboundWebhookCreateGateBySubscribedEvents(t *testing.T) {
+	mem := store.NewMem()
+	az := authz.New(mem, authz.Options{})
+	srv := New(Config{
+		Store:           mem,
+		JWT:             auth.NewJWT("test-secret"),
+		Refresh:         auth.NewRefreshStore(mem),
+		Codes:           auth.NewEmailCodes(mem),
+		Limits:          auth.NewRateLimit(mem),
+		Session:         auth.NewSessionIndex(mem, mem),
+		Presence:        mem,
+		Authz:           az,
+		WebhookURLCheck: func(string) error { return nil },
+	})
+	h := srv.Handler()
+	ctx := context.Background()
+
+	access, serverID, textID := mkServerChannel(t, h, mem, "gate-a@ex.com", "gateA")
+	voiceID := asID(postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/channels", serverID), access,
+		map[string]any{"name": "lobby", "type": "voice"}, http.StatusCreated)["id"])
+	accB, _ := registerUser(t, h, mem, "gate-b@ex.com", "gateB", "password123")
+	inv := postJSON(t, h, fmt.Sprintf("/api/v1/servers/%d/invites", serverID), access,
+		map[string]any{"max_uses": 5}, http.StatusCreated)
+	postJSON(t, h, "/api/v1/servers/join", accB, map[string]string{"code": inv["code"].(string)}, http.StatusOK)
+	uidB := asID(getJSON(t, h, "/api/v1/users/me", accB, http.StatusOK).(map[string]any)["id"])
+	role := &store.Role{ServerID: serverID, Name: "mgr", Permissions: store.ManageServer}
+	if err := mem.CreateRole(ctx, role); err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.SetMemberRoles(ctx, serverID, uidB, []int64{role.ID}, 0); err != nil {
+		t.Fatal(err)
+	}
+	// 默认成员可见全部频道；deny 掉文字频道后 B 只剩语音频道可见。
+	if err := mem.SetChannelOverwrite(ctx, &store.ChannelOverwrite{
+		ChannelID: textID, TargetType: store.OverwriteTargetMember, TargetID: uidB,
+		Deny: store.ViewChannel,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	az.InvalidateServer(serverID)
+
+	hookPath := fmt.Sprintf("/api/v1/servers/%d/webhooks", serverID)
+	create := func(events []string, want int) map[string]any {
+		t.Helper()
+		return postJSON(t, h, hookPath, accB,
+			map[string]any{"url": "https://hooks.example.com/gate", "events": events}, want)
+	}
+
+	create([]string{"message.created"}, http.StatusForbidden)
+	create([]string{"channel.created"}, http.StatusCreated)
+	create([]string{"channel.deleted"}, http.StatusCreated)
+	create([]string{"message.created", "channel.created"}, http.StatusForbidden)
+
+	// 再 deny 语音频道：B 对服务器内所有频道均不可见。
+	if err := mem.SetChannelOverwrite(ctx, &store.ChannelOverwrite{
+		ChannelID: voiceID, TargetType: store.OverwriteTargetMember, TargetID: uidB,
+		Deny: store.ViewChannel,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	az.InvalidateServer(serverID)
+
+	create([]string{"message.created"}, http.StatusForbidden)
+	create([]string{"channel.created"}, http.StatusForbidden)
+	create([]string{"channel.deleted"}, http.StatusForbidden)
+	// member.* 不经投递侧可见性闸，频道全不可见也能建。
+	create([]string{"member.joined"}, http.StatusCreated)
+	create([]string{"member.left"}, http.StatusCreated)
+}
+
 // ---- P1-8：改址改绑创建者 ----
 // 投递按订阅创建者的频道可见性收窄（P1-5），但 PATCH 改 url 若不改绑创建者，
 // 持 ManageServer 而看不到私有频道的管理者就能把服主的订阅改到自己的地址，
@@ -854,6 +931,120 @@ func TestWebhookPatchURLRequiresChannelView(t *testing.T) {
 	patchJSON(t, f.h, f.hookPath(hookID), f.accM, map[string]any{"url": mSrv.URL}, http.StatusOK)
 	if row := f.row(t, hookID); row.URL != mSrv.URL || row.CreatorID != f.uidM {
 		t.Fatalf("恢复可见后改址应成功并改绑为 M: %+v", row)
+	}
+}
+
+// TestOutboundWebhookURLMaskedForNonCreator #119：出站 url 的路径/查询串常内嵌
+// 第三方投递凭证（Discord/Slack 的 token 就在路径里），完整值只回传给订阅创建者
+// 与服务器 owner；其余 ManageServer 成员在列表与 PATCH 响应里只看到 scheme://host/…。
+// creator_id=0 的旧行按 owner 代持；改址者获得完整响应（他刚提交该地址并成为创建者）。
+func TestOutboundWebhookURLMaskedForNonCreator(t *testing.T) {
+	f := newRebindFixture(t)
+	const fullURL = "https://hooks.example.com/services/T000/B000/secret-token?key=abc"
+	const masked = "https://hooks.example.com/…"
+	listPath := fmt.Sprintf("/api/v1/servers/%d/webhooks", f.serverID)
+
+	created := postJSON(t, f.h, listPath, f.accO,
+		map[string]any{"url": fullURL, "events": []string{"message.created"}}, http.StatusCreated)
+	hookID := asID(created["id"])
+	if created["url"] != fullURL {
+		t.Fatalf("创建者应看到自己提交的完整 url，实际 %v", created["url"])
+	}
+
+	// 非创建者的 ManageServer 成员：列表与 PATCH 响应都只给掩码。
+	list := getJSON(t, f.h, listPath, f.accM, http.StatusOK).([]any)
+	if len(list) != 1 {
+		t.Fatalf("列表应有 1 条，实际 %d", len(list))
+	}
+	if got := list[0].(map[string]any)["url"]; got != masked {
+		t.Fatalf("非创建者列表应得掩码 url %q，实际 %v", masked, got)
+	}
+	patched := patchJSON(t, f.h, f.hookPath(hookID), f.accM,
+		map[string]any{"enabled": false}, http.StatusOK)
+	if got := patched["url"]; got != masked {
+		t.Fatalf("非创建者 PATCH 响应应得掩码 url %q，实际 %v", masked, got)
+	}
+
+	// 服主列表是完整地址（owner 是服务器的信任根）。
+	ownerList := getJSON(t, f.h, listPath, f.accO, http.StatusOK).([]any)
+	if got := ownerList[0].(map[string]any)["url"]; got != fullURL {
+		t.Fatalf("服主应读到完整 url，实际 %v", got)
+	}
+
+	// 0022 前的旧行（creator_id=0，owner 代持）：owner 完整，其他管理者掩码。
+	legacyURL := "https://legacy.example.com/hook/legacy-secret"
+	legacy := &store.OutboundWebhook{ServerID: f.serverID, URL: legacyURL,
+		Secret: "s", Events: "member.joined"}
+	if err := f.mem.CreateOutboundWebhook(context.Background(), legacy); err != nil {
+		t.Fatal(err)
+	}
+	legacyID := strconv.FormatInt(legacy.ID, 10)
+	for _, tc := range []struct {
+		acc, want string
+	}{
+		{f.accO, legacyURL},
+		{f.accM, "https://legacy.example.com/…"},
+	} {
+		rows := getJSON(t, f.h, listPath, tc.acc, http.StatusOK).([]any)
+		var got any
+		for _, r := range rows {
+			m := r.(map[string]any)
+			if m["id"] == legacyID {
+				got = m["url"]
+			}
+		}
+		if got != tc.want {
+			t.Fatalf("%s 对旧行的 url 应为 %q，实际 %v", tc.acc, tc.want, got)
+		}
+	}
+
+	// 非创建者改址：响应带完整新地址（他刚提交），改绑后他就是创建者。
+	newURL := "https://other.example.com/new/hook?token=new"
+	rebound := patchJSON(t, f.h, f.hookPath(hookID), f.accM,
+		map[string]any{"url": newURL}, http.StatusOK)
+	if got := rebound["url"]; got != newURL {
+		t.Fatalf("改址者应看到完整新 url，实际 %v", got)
+	}
+	for _, r := range getJSON(t, f.h, listPath, f.accM, http.StatusOK).([]any) {
+		m := r.(map[string]any)
+		if m["id"] == strconv.FormatInt(hookID, 10) && m["url"] != newURL {
+			t.Fatalf("改绑后创建者列表应给完整新 url，实际 %v", m["url"])
+		}
+	}
+}
+
+// TestWebhookPatchURLEventsGateUsesNewEvents #119：同一次 PATCH 既改址又改 events 时，
+// 可见性门按**改后**的事件集合判定。M 对所有频道都不可见：把 member.joined 订阅
+// 同时改址并改成 message.created 必须 403（否则改址成功后才改事件即可绕过门）；
+// 改址 + 保留无频道维度的 events 则放行并改绑。
+func TestWebhookPatchURLEventsGateUsesNewEvents(t *testing.T) {
+	f := newRebindFixture(t)
+	oSrv := httptest.NewServer((&hookTarget{}).handler())
+	defer oSrv.Close()
+	mSrv := httptest.NewServer((&hookTarget{}).handler())
+	defer mSrv.Close()
+
+	created := postJSON(t, f.h, fmt.Sprintf("/api/v1/servers/%d/webhooks", f.serverID), f.accO,
+		map[string]any{"url": oSrv.URL, "events": []string{"member.joined"}}, http.StatusCreated)
+	hookID := asID(created["id"])
+
+	f.setViewDeny(t, f.pubID, true) // 加上 fixture 默认对 secret 的 deny：M 对所有文字频道不可见
+
+	// 改址 + 改成 message.created：门按新事件算，M 无文字频道可见 → 拒绝且行不变。
+	patchJSON(t, f.h, f.hookPath(hookID), f.accM,
+		map[string]any{"url": mSrv.URL, "events": []string{"message.created"}}, http.StatusForbidden)
+	if row := f.row(t, hookID); row.URL != oSrv.URL || row.CreatorID != f.uidO {
+		t.Fatalf("被拒的改址不得落库: %+v", row)
+	}
+
+	// 改址 + 保留 member.joined：无频道维度，门跳过，允许改绑。
+	patched := patchJSON(t, f.h, f.hookPath(hookID), f.accM,
+		map[string]any{"url": mSrv.URL, "events": []string{"member.joined"}}, http.StatusOK)
+	if patched["url"] != mSrv.URL {
+		t.Fatalf("PATCH 响应应带新 url，实际 %v", patched["url"])
+	}
+	if row := f.row(t, hookID); row.URL != mSrv.URL || row.CreatorID != f.uidM {
+		t.Fatalf("无频道维度的订阅应允许改址并改绑: %+v", row)
 	}
 }
 
