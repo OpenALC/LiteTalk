@@ -122,7 +122,8 @@ git checkout -- .
 | 检查 | `check-tag` | 只在标签推送时 | 是 | 校验标签符合版本规范 |
 | 检查 | `check-server` | 每次 push 和 PR | 是 | gofmt、`go mod tidy -diff`、vet、`test -race`、build |
 | 检查 | `check-frontend` | 每次 push 和 PR | 是 | `pnpm install --frozen-lockfile`、type-check、vitest、build，产出 `frontend-dist` artifact |
-| 检查 | `check-client-linux` | 每次 push 和 PR | 是 | gofmt、tidy、vet、`test -race`、build（`-tags gtk3`） |
+| 检查 | `check-client-linux` | 每次 push 和 PR | 是 | gofmt、tidy、vet、`test -race`、build；正式链路用 `-tags gtk3`，`gtk` 迁移分支用默认 GTK4，并额外以 `-tags gtk3` 测 `core/config` |
+| 检查 | `smoke-client-linux-install` | `gtk` 迁移分支的 push、PR 与标签 | 是 | Ubuntu 24.04、Debian 13、Fedora 40、AlmaLinux 10 安装及启动检查；必须有前端挂载后的原生绑定就绪信号，只有进程存活或早期启动日志不算通过；该分支的 release 依赖此门禁 |
 | 检查 | `check-client-windows` | 每次 push 和 PR | 是 | vet、`test -race`、production GUI build。**这是真实 cgo Opus、DPAPI、WASAPI 唯一被测试的地方** |
 | 检查 | `check-contract` | 每次 push 和 PR | 是 | 契约 ↔ 实现双向比对（`server/api/tests`，AST + 运行时注册表 + kin-openapi）、Go 生成物新鲜度、schemathesis 模糊测试（锁版本，固定 seed，断言无 5xx 与形状违约）。**阻塞发版** |
 | 打包 | `package-server` | 标签 | 是 | linux amd64/arm64，tar.gz 内含二进制；`migrations/` 已 embed 进二进制（#18），不再随包分发 |
