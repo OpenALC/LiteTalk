@@ -685,14 +685,16 @@ jobs:
     name: 发布 GitHub Release
     needs:
       - check-contract
+      - smoke-client-linux-install
       - package-server
       - package-client-windows
       - package-client-linux
       - package-client-macos
-    # always() 让 macOS 失败不阻断；显式要求所有阻塞 job（含 check-contract）为 success
+    # always() 让 macOS 失败不阻断；显式要求所有阻塞 job（含安装冒烟）为 success
     if: >-
       always() && startsWith(github.ref, 'refs/tags/v') &&
       needs.check-contract.result == 'success' &&
+      needs.smoke-client-linux-install.result == 'success' &&
       needs.package-server.result == 'success' &&
       needs.package-client-windows.result == 'success' &&
       needs.package-client-linux.result == 'success'
