@@ -809,6 +809,10 @@ suite_rss() {
         sleep 2
       done
       if [ "$valid" = 0 ]; then stop_app; continue; fi
+      if ! process_running "$SCRIPT_MAIN"; then
+        emit "$suite" 1 process_alive_after_rss FAIL bool
+        stop_app; continue
+      fi
       emit "$suite" 1 counts_after_hide "$(webkit_counts)" kv
       if [ "$suite" = rss-destroy-downgrade ]; then
         [ "$(disk_config_mode)" = destroy ] && emit "$suite" 1 config_destroy_retained yes bool ||
