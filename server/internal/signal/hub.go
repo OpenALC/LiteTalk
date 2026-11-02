@@ -16,6 +16,7 @@ import (
 	"github.com/OpenALC/LiteTalk/server/internal/authz"
 	"github.com/OpenALC/LiteTalk/server/internal/sfu"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/internal/token"
 	"github.com/coder/websocket"
 	"github.com/pion/webrtc/v4"
 )
@@ -28,6 +29,12 @@ const (
 	kickSendWindow        = 400 * time.Millisecond
 	// session.kicked 发送窗口（§0.6：300~500ms）
 	writeTimeout = 10 * time.Second // 单条下行写超时
+
+	// 令牌会话复查（PR118 P2-2）：PAT/bot 连接在心跳时按 tokenID 复查吊销/过期。
+	// 复查间隔与 last_used_at 落库节流同量级（60s）——25s 一拍的心跳不该每次都打库；
+	// 单次复查查询的时限独立于心跳超时，卡住的 store 查询不能拖死心跳节拍。
+	defaultTokenRecheckEvery = 60 * time.Second
+	tokenRecheckTimeout      = 5 * time.Second
 
 	// 优雅关闭（#21）：server.shutdown 的发送窗口、等待 cleanup 的上限与轮询间隔。
 	// 超时后打日志继续关闭——不能因为个别连接卡住就拖住进程退出。
@@ -52,12 +59,34 @@ type Hub struct {
 	// authz 权限判定（#35 B3）：与 api.Server 共享实例；nil 时权限门 fail-closed。
 	authz Authz
 
+	// tokens ltk_ 令牌校验（#51）：ChatDeps.Tokens 启动期注入，运行期只读。
+	// nil = 不做 WS 侧 scope 收窄。
+	tokens TokenVerifier
+
+	// sessionChecks 令牌主体会话存续复查（PR118 P2-2）：ChatDeps.SessionChecks
+	// 启动期注入，运行期只读。PAT/bot 连接在心跳时按 tokenID 复查吊销/过期，
+	// 失效即断连。nil = 不复查（测试/过渡，旧行为）。
+	sessionChecks TokenSessionChecker
+
+	// offline 离线边沿接收方（#53）：SetOfflineNotifier 启动阶段注入一次，
+	// 运行期只读。
+	offline OfflineNotifier
+
+	// webhooks 出站 webhook 事件出口（#52）：SetWebhookOutlet 启动阶段注入一次，
+	// 运行期只读。与 offline 同口径；实现只做非阻塞入队。
+	webhooks WebhookOutlet
+
+	// push 消息推送派发器（P1-4，#53）：SetPushNotifier 启动阶段注入一次，
+	// 运行期只读。与 offline/webhooks 同口径；实现只做非阻塞入队。
+	push PushNotifier
+
 	// 心跳参数（默认值见包常量；测试可缩短）
-	heartbeatEvery time.Duration
-	pongWait       time.Duration
-	readIdle       time.Duration
-	presenceTTL    time.Duration // 在线态 TTL（默认 defaultPresenceTTL，测试可缩短）
-	shutdownWait   time.Duration // Shutdown 等待 cleanup 的上限（默认 defaultShutdownWait，测试可缩短）
+	heartbeatEvery    time.Duration
+	pongWait          time.Duration
+	readIdle          time.Duration
+	tokenRecheckEvery time.Duration // 令牌会话复查最小间隔（P2-2，测试可缩短）
+	presenceTTL       time.Duration // 在线态 TTL（默认 defaultPresenceTTL，测试可缩短）
+	shutdownWait      time.Duration // Shutdown 等待 cleanup 的上限（默认 defaultShutdownWait，测试可缩短）
 
 	// shuttingDown 关闭标记（#21）：在 Shutdown 广播/断连之前置位，ServeWS 据此
 	// 拒绝新连接，杜绝「广播之后仍有新 WS 接入」的窗口。
@@ -66,6 +95,12 @@ type Hub struct {
 	mu    sync.Mutex
 	rooms map[string]*roomState
 	conns map[connKey]*client // uid+"\x00"+dev → 当前连接（§0.8）
+	// tokenConns conns 中令牌（pat/bot）连接的条数（P1-7 P3）。**只是广播路径的性能
+	// 短路**：为 0 时 broadcastEventCh 不必扫描 conns 找令牌连接。它不决定正确性——
+	// 广播目标循环对每条连接仍逐个判 isTokenConn，快照之后才注册的令牌连接靠那里兜底。
+	// 增减只发生在 register/unregister，与 conns 的改动处于同一把 h.mu 的同一临界区，
+	// 读侧无锁 Load。principal 构造后不变，所以 isTokenConn 对同一连接前后一致。
+	tokenConns atomic.Int64
 	// userRooms uid → 当前语音房 ID（#92 好友频道 presence 反查）。
 	// 只在成员真正写入 room.members[uid] 的同一临界区设置；leaveWorkLocked
 	// 核对 members[uid]==c 且映射值等于本次 roomID 才删除，旧连接迟到的
@@ -81,6 +116,21 @@ type Hub struct {
 	// presenceChanPublished 好友频道 presence 的去抖缓存（#92）：uid → 上次推送的
 	// 语音房状态。无键 = 尚未推过（离线边沿清空，重进同一频道必须重推）。
 	presenceChanPublished map[string]presenceChanState
+	// presenceChanRetry 好友频道 presence 待重试集合（#102）：权限查询故障导致
+	// 部分接收者被跳过时记录他们，下一次心跳/状态变化只补发这部分人，
+	// 不把「部分失败」当成「已发送」。与 presenceChanPublished 同受 presenceMu 保护。
+	presenceChanRetry map[string]presenceChanPending
+
+	// 频道密码限流（#102）：pwFails 为 uid+频道 → 最近失败时间戳（滑动窗），
+	// pwSem 限制同时进行的 bcrypt 校验数。见 channelpw.go。
+	pwMu    sync.Mutex
+	pwFails map[pwFailKey][]time.Time
+	pwSem   chan struct{}
+	// pwCheck 密码校验函数（默认 auth.CheckPassword；测试可替换以断言
+	// 限流期间确实没有调用 bcrypt）。
+	pwCheck func(hash, plain string) bool
+	// pwWait 拿不到校验信号量时的最长等待（默认 channelPwWait，测试可缩短）。
+	pwWait time.Duration
 
 	// evlog 事件面每会话事件环（#32）：seq 分配与断线续传补发。
 	// 实现为进程内环形队列（单实例假设，见 gateway.go 头注释）。
@@ -139,11 +189,17 @@ type client struct {
 	sid      string // 会话 ID（握手比对后的声明值；dev 令牌为空）
 	dev      string // 设备类型（desktop/…）
 	connID   uint64 // Hub 自增连接标识；SFU peer 挂此值做归属核对（§0.9）
+	// principal 连接的令牌主体（#51）：握手以 ltk_ 令牌建立时由 TokenVerifier
+	// 产出，含 Scopes。JWT/dev 连接为 nil。只读字段——建连时写入，之后无并发写。
+	principal *token.Principal
 
 	send       chan []byte // 下行队列（单写者 goroutine 消费）
 	readCancel context.CancelFunc
 	lastAct    atomic.Int64 // 最近活动（UnixNano）：数据读或心跳 pong
 	closing    atomic.Bool  // CloseNow 幂等
+	// lastSessionCheck 上次令牌会话复查时刻（UnixNano，P2-2）：握手 Verify 记为
+	// 首次复查点，之后与 tokenRecheckEvery 比较节流。只有心跳 goroutine 读写。
+	lastSessionCheck atomic.Int64
 
 	mu     sync.Mutex
 	roomID string // 当前所在频道（空 = 未加入）
@@ -174,6 +230,17 @@ func (c *client) closeNow() {
 	_ = c.conn.CloseNow()
 }
 
+// authCtx 本连接的权限检查上下文（#51）：api_token 连接把 Principal 注入 ctx，
+// WS 侧与 REST 侧汇聚到 authz.CanInServer 的同一个 scope 交集点
+// （token.ScopeLimitFromContext）——不是给 bot 单开一条分支。JWT/dev 连接
+// principal 为 nil，注入后行为不变。
+//
+// 只用于「连接本人」的权限判定。跨主体检查（提及目标可见性、广播收件人过滤、
+// 成员快照）必须用 background ctx：发送者的 scope 不得收窄别人的权限。
+func (c *client) authCtx() context.Context {
+	return token.WithPrincipal(context.Background(), c.principal)
+}
+
 // Authz 频道权限判定（#35 B3，*authz.Authorizer 满足；测试可注入故障假实现）。
 // CanInServer 语义与 authz 包一致：非成员/无权限 (false, nil)，故障 (false, err)。
 type Authz interface {
@@ -181,6 +248,31 @@ type Authz interface {
 	// CanServer 服务器级判定（#37 密码旁路：Administrator/owner）。
 	CanServer(ctx context.Context, uid, serverID int64, perm store.Permission) (bool, error)
 	InvalidateServer(serverID int64)
+}
+
+// OfflineNotifier 离线边沿接收方（#53 移动推送）：该用户最后一个连接实例关闭后
+// 回调。实现必须快速返回（仅内存操作），不得阻塞 cleanup 路径。
+type OfflineNotifier interface {
+	OnUserOffline(uid string)
+}
+
+// WebhookOutlet 出站 webhook 事件出口（#52，internal/webhook.Dispatcher 满足）：
+// 在 broadcastEvent 读快照、放锁之后调用，实现只做一次非阻塞入队——
+// 绝不能持 h.mu 调用（那是在 WS 写路径上），也不做任何网络 I/O。
+type WebhookOutlet interface {
+	// OnWebhookEvent eventType 是白名单事件名（webhook.EventMessageCreated 等），
+	// channelID 为十进制频道 ID（dev 内置房间无 store 实体，由实现方丢弃），
+	// payload 是已序列化的原网关事件载荷。
+	OnWebhookEvent(eventType, channelID string, payload json.RawMessage)
+}
+
+// PushNotifier 消息推送派发器（P1-4，#53，internal/push.Broker 满足）：
+// 创建管线的推送步经它派发。实现只做一次非阻塞入队（带缓冲 channel + worker），
+// 离线判定、节流与设备查询全在 worker——广播路径绝不阻塞。
+type PushNotifier interface {
+	// NotifyMessage 频道消息触发（@提及/私聊判定在实现内部）。ch 与 msg 由
+	// 调用方保证此后不再修改。
+	NotifyMessage(ctx context.Context, ch *store.Channel, msg *store.Message, senderNick string)
 }
 
 // ChatDeps 聊天持久化与频控依赖（可零值：仅广播不落库、不限流）。
@@ -202,6 +294,31 @@ type ChatDeps struct {
 	// Authz 权限判定（#35 B3）。nil 且 Store 是 store.Store 时自建默认实例（测试兼容）；
 	// 生产必须注入与 api 共享的同一实例，否则写后失效不同步。
 	Authz Authz
+	// Tokens ltk_ 明文令牌校验（#51）：与 REST 中间件、WS 握手 authenticator 共用
+	// 同一 *token.Service 实例（一条实现，不另建）。nil 时不做 WS 侧 scope 收窄
+	// （JWT/dev 连接本就不受限，旧行为不变）。
+	Tokens TokenVerifier
+	// SessionChecks 令牌主体会话存续复查（P2-2）：PAT/bot 连接在心跳时按 tokenID
+	// 复查吊销/过期，失效即断连（泄漏凭据不再长期持有连接）。nil 不复查。
+	// 生产注入 main 侧基于 store.APITokenByID 的适配实现。
+	SessionChecks TokenSessionChecker
+}
+
+// TokenVerifier 校验 ltk_ 明文令牌并返回主体（#51）。*token.Service 满足。
+// 握手 authenticator 只回 Identity（不含 scope），hub 拿到同一明文再 Verify 一次
+// 取 Principal 挂会话——握手是低频路径，多一次按前缀的索引点查可忽略；换来的是
+// 无共享可变登记表（不同令牌不同连接不会串）+ 吊销在握手时刻再核一遍。
+type TokenVerifier interface {
+	Verify(ctx context.Context, plain string) (*token.Principal, error)
+}
+
+// TokenSessionChecker 令牌会话存续复查（PR118 P2-2）：按 tokenID 查询令牌是否
+// 仍然有效（未吊销、未过期）。与 TokenVerifier 互补——连接建立后 hub 手里只剩
+// Principal.TokenID，没有明文可重放；JWT/dev 主体无 TokenID 不复查（exp 由握手
+// 与旧令牌过渡期兜底）。生产由 main 用 store 的令牌行只读查询适配注入；
+// nil = 不复查（测试/过渡，旧行为：吊销只对新连接与 REST 生效）。
+type TokenSessionChecker interface {
+	SessionValid(ctx context.Context, tokenID int64) (bool, error)
 }
 
 // NewHub 构造信令 hub。maxMembers <= 0 时取 SFU 的上限。
@@ -235,14 +352,20 @@ func NewHub(s *sfu.SFU, authn Authenticator, sess *auth.SessionIndex, logger *lo
 		joinRate:          chat.JoinRate,
 		offerRate:         chat.OfferRate,
 		authz:             az,
+		tokens:            chat.Tokens,
+		sessionChecks:     chat.SessionChecks,
 		heartbeatEvery:    defaultHeartbeatEvery,
 		pongWait:          defaultPongWait,
 		readIdle:          defaultReadIdle,
+		tokenRecheckEvery: defaultTokenRecheckEvery,
 		rooms:             make(map[string]*roomState),
 		conns:             make(map[connKey]*client),
 		userRooms:         make(map[string]string),
 		evlog:             newMemEventLog(chat.Backlog),
 		presencePublished: make(map[string]bool),
+		// #102 频道密码限流：失败窗口按需建，信号量容量固定。
+		pwFails: make(map[pwFailKey][]time.Time, 8),
+		pwSem:   make(chan struct{}, channelPwConcurrency),
 	}
 	// SFU 说话翻转 → 网关事件面（#33）：判定在 SFU ticker，下发在 WS 层。
 	s.SetOnSpeaking(h.broadcastVoiceSpeaking)
@@ -252,6 +375,18 @@ func NewHub(s *sfu.SFU, authn Authenticator, sess *auth.SessionIndex, logger *lo
 // SetProtoMax 设置服务端宣布的协议版本上限（LITETALK_PROTOCOL_MAX 逃生阀）。
 // n <= 0 恢复默认（构建期 ProtocolVersionMax）。仅限启动阶段调用。
 func (h *Hub) SetProtoMax(n int) { h.protoMax = n }
+
+// SetOfflineNotifier 注册离线边沿接收方（#53 移动推送）。仅限启动阶段调用
+// （ServeWS 开始后并发写有数据竞争），与 SetProtoMax 同口径。
+func (h *Hub) SetOfflineNotifier(n OfflineNotifier) { h.offline = n }
+
+// SetWebhookOutlet 注册出站 webhook 事件出口（#52）。仅限启动阶段调用，
+// 与 SetOfflineNotifier 同口径。
+func (h *Hub) SetWebhookOutlet(n WebhookOutlet) { h.webhooks = n }
+
+// SetPushNotifier 注册消息推送派发器（P1-4，#53）。仅限启动阶段调用，
+// 与 SetOfflineNotifier 同口径。
+func (h *Hub) SetPushNotifier(n PushNotifier) { h.push = n }
 
 // ServeWS 处理 GET /ws?token=<jwt|dev-xxx>。
 func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
@@ -270,6 +405,17 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
+	}
+	// ltk_ 令牌连接（#51）：再取一次 Principal 挂会话，发送类权限检查据此做
+	// scope 收窄。同一条 TokenVerifier（与握手 authenticator 共用 token.Service），
+	// 校验失败同样 401——不区分「哪一步失败」，不给探测信息。
+	var principal *token.Principal
+	if raw := r.URL.Query().Get("token"); h.tokens != nil && strings.HasPrefix(raw, token.PlainPrefix) {
+		principal, err = h.tokens.Verify(r.Context(), raw)
+		if err != nil {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 	}
 	// 握手比对会话 sid（§0.4）：不符 → 401 + X-LiteTalk-Auth: session_replaced（body code 同值）。
 	if !h.sessionOK(r.Context(), id) {
@@ -310,10 +456,14 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 		username:   id.Username,
 		sid:        id.Sid,
 		dev:        id.Dev,
+		principal:  principal,
 		send:       make(chan []byte, 256),
 		readCancel: cancel,
 	}
 	c.lastAct.Store(time.Now().UnixNano())
+	// 握手 Verify 即首次会话复查点（P2-2）：从此刻起算 tokenRecheckEvery 的节流窗，
+	// 首次心跳复查落在建连 ≥60s 之后，不给热路径加压。
+	c.lastSessionCheck.Store(time.Now().UnixNano())
 
 	// 注册（§0.6 踢人序）：先登记新连接，再处理被顶替的旧连接。
 	// becameOnline 是 register 在 h.mu 内判定的 0→1 边沿（#11）：只有真正
@@ -391,13 +541,28 @@ func (h *Hub) register(c *client) (old *client, becameOnline bool) {
 	// 插入后数连接数会得到 1，误判成 0→1（P2 重复推送 online）。
 	hadAny := h.connCountLocked(c.userID) > 0
 	h.conns[key] = c
+	// P1-7 P3：计数与 conns 同临界区同步。被顶替的旧连接离开 conns，是令牌连接就要减。
+	if old != nil && isTokenConn(old) {
+		h.tokenConns.Add(-1)
+	}
+	if isTokenConn(c) {
+		h.tokenConns.Add(1)
+	}
 	return old, !hadAny
 }
 
 // unregister 仅当 conns[key] 仍是本连接时摘除（被顶替的旧连接不得误删新连接，§0.8）。
 // 返回该 uid 是否由 1 条连接变为 0 条（becameOffline，#11 的下线边沿）；
 // 与删除在同一临界区判定，避免「先查后删」race。
+//
+// #117：离线边沿同时清掉好友频道去抖/待重试缓存，且与 conns 摘除同处一个
+// h.mu 临界区。connCount 是「是否离线」的对外事实——任何在 h.mu 内看到 0 条
+// 连接的观测者（waitOffline、心跳）都不能再看到残留的待重试标记；把清理留在
+// 更晚的 syncPresence 会让观测者读到「已离线但标记仍在」的中间态。缓存受
+// presenceMu 保护，故先取 presenceMu（锁序 presenceMu → h.mu）。
 func (h *Hub) unregister(c *client) (becameOffline bool) {
+	h.presenceMu.Lock()
+	defer h.presenceMu.Unlock()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	key := makeConnKey(c.userID, c.dev)
@@ -405,7 +570,16 @@ func (h *Hub) unregister(c *client) (becameOffline bool) {
 		return false // 已被顶替：新连接仍在同一 uid 下，状态未变
 	}
 	delete(h.conns, key)
-	return h.connCountLocked(c.userID) == 0
+	// P1-7 P3：已核对 conns[key]==c 才会走到这里，被顶替的旧连接不会重复减。
+	if isTokenConn(c) {
+		h.tokenConns.Add(-1)
+	}
+	if h.connCountLocked(c.userID) != 0 {
+		return false
+	}
+	delete(h.presenceChanPublished, c.userID)
+	delete(h.presenceChanRetry, c.userID)
+	return true
 }
 
 // connCountLocked 调用方须持 h.mu。
@@ -637,7 +811,54 @@ func (h *Hub) heartbeatLoop(ctx context.Context, c *client) {
 			// 会永久保住断线旧 sid 的环），没有这一拍，30 分钟没消息的在线会话
 			// 会被 sweep 误淘汰、之后 resume 得到 unknown_session。
 			h.evlog.Touch(c.sid)
+			h.recheckTokenSession(ctx, c) // 令牌主体会话复查（P2-2），节流见函数注释
 		}
+	}
+}
+
+// recheckTokenSession 令牌主体会话存续复查（PR118 P2-2）：PAT/bot 令牌在连接建立
+// 后被吊销/过期时，最迟在复查点之后的下一次心跳断开——「吊销立即生效」此前只对
+// REST 与新连接成立，泄漏的凭据可长期持有 WS 连接。
+//
+// 节流：每个连接记上次复查时刻（握手 Verify 记为首个复查点），距它不足
+// tokenRecheckEvery（默认 60s，与 last_used_at 落库节流同量级）不查库——25s 一拍
+// 的心跳不该每拍都打库。节流判定用 CAS 抢占：同一连接只有心跳一个 goroutine
+// 进来，CAS 只是防御性的。
+// 实例纪律：复查跑在本连接自己的心跳 goroutine 上，closeNow 关的就是这条连接，
+// 不做按 uid/tokenID 的盲扫，无跨实例误伤面。
+// fail-open（查询故障不断连）：store 抖动不应误杀在线会话——JWT 主体被吊销不了，
+// 令牌误断同样代价高；下一个复查点会再查，吊销最多多存活一个复查周期。仅
+// 「确认失效」才关连接。
+func (h *Hub) recheckTokenSession(ctx context.Context, c *client) {
+	if h.sessionChecks == nil || c.principal == nil || c.principal.Kind == token.KindJWT {
+		return // JWT/dev 连接无 TokenID，不复查
+	}
+	tokenID := c.principal.TokenID
+	if tokenID <= 0 {
+		return
+	}
+	every := h.tokenRecheckEvery
+	if every <= 0 {
+		every = defaultTokenRecheckEvery
+	}
+	now := time.Now()
+	last := c.lastSessionCheck.Load()
+	if now.Sub(time.Unix(0, last)) < every {
+		return
+	}
+	if !c.lastSessionCheck.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+	cctx, ccancel := context.WithTimeout(ctx, tokenRecheckTimeout)
+	valid, err := h.sessionChecks.SessionValid(cctx, tokenID)
+	ccancel()
+	if err != nil {
+		h.log.Printf("ws: %s 令牌 %d 会话复查失败（fail-open 保留连接，下个复查点再查）: %v", c.userID, tokenID, err)
+		return
+	}
+	if !valid {
+		h.log.Printf("ws: %s 令牌 %d 已吊销/过期，关闭连接", c.userID, tokenID)
+		c.closeNow()
 	}
 }
 
@@ -650,6 +871,12 @@ func (h *Hub) cleanup(c *client) {
 	h.leaveRoom(c)
 	if becameOffline {
 		h.syncPresence(c.userID)
+		// 离线检测挂钩（#53）：unregister 已核对同一连接实例（conns[key]==c），
+		// becameOffline 即「该用户最后一个连接实例已关闭」的权威边沿；
+		// 按 uid 盲判的旧连接 cleanup 在 unregister 里已被挡下，到不了这里。
+		if h.offline != nil {
+			h.offline.OnUserOffline(c.userID)
+		}
 	}
 	h.log.Printf("ws: %s 已断开", c.userID)
 }
@@ -857,7 +1084,9 @@ func (h *Hub) serverMax() int64 {
 // 非成员→forbidden，然后才是权限不足。
 // 校验含 store 查询，调用方不得持有 hub.mu。
 func (h *Hub) authorizeChannelJoin(c *client, channelID string) (code, msg string) {
-	ctx := context.Background()
+	// 进房是连接本人的权限判定：api_token 连接经 authCtx 携带 Principal，
+	// scope 缺 voice.connect 对应位（ViewChannel/ConnectVoice）时在此拒绝（#51）。
+	ctx := c.authCtx()
 	chID, err := strconv.ParseInt(channelID, 10, 64)
 	if err != nil {
 		if h.dev {
@@ -975,7 +1204,9 @@ func (h *Hub) joinRoom(c *client, channelID, password string) {
 		bypass := false
 		if h.authz != nil {
 			var aerr error
-			bypass, aerr = h.authz.CanServer(context.Background(), uid, ch.ServerID, store.Administrator)
+			// 密码旁路同属连接本人的权限：api_token 连接受 scope 收窄约束
+			// （guild.manage 之外的令牌不得旁路频道密码，#51）。
+			bypass, aerr = h.authz.CanServer(c.authCtx(), uid, ch.ServerID, store.Administrator)
 			if aerr != nil {
 				h.log.Printf("ws: 密码旁路查询失败（用户 %d 频道 %d）: %v", uid, ch.ID, aerr)
 				h.sendError(c, ErrCodeInternal, "权限查询失败")
@@ -987,10 +1218,25 @@ func (h *Hub) joinRoom(c *client, channelID, password string) {
 				h.sendError(c, ErrCodeForbidden, "该频道需要密码")
 				return
 			}
-			if !auth.CheckPassword(ch.PasswordHash, password) {
+			// #102：失败限流先于 bcrypt——超限的尝试一次哈希都不跑。
+			failKey := makePwFailKey(c.userID, channelID)
+			now := time.Now()
+			if !h.pwAttemptAllowed(failKey, now) {
+				h.sendError(c, ErrCodeRateLimited, "密码尝试过于频繁")
+				return
+			}
+			ok, admitted := h.pwVerify(ch.PasswordHash, password)
+			if !admitted {
+				// 全局并发闸已满：同样不跑 bcrypt，等价于限流。
+				h.sendError(c, ErrCodeRateLimited, "密码尝试过于频繁")
+				return
+			}
+			if !ok {
+				h.pwRecordFailure(failKey, now)
 				h.sendError(c, ErrCodeBadPassword, "频道密码错误")
 				return
 			}
+			h.pwClearFailures(failKey)
 		}
 	}
 
@@ -1324,6 +1570,13 @@ func (h *Hub) handleVoiceRequestState(c *client, d VoiceRequestStateData) {
 // 截断后的悄悄话会让用户以为对方听得到，实际没发出去。
 const maxWhisperTargets = 100
 
+// voiceWhisperRateLimit 悄悄话目标下发频控（#117）：每次改目标都要分配 map、
+// 算改动前后收件人快照、写日志并替换 SFU 上的原子快照，客户端可以在一个连接上
+// 高频刷。与 voice.request_state 同套路按 uid 计数（跨连接累计），复用现有
+// rate_limited 错误码，不新增契约。上限比目标选择宽松：按住悄悄话时逐个增减
+// 目标是正常操作。
+const voiceWhisperRateLimit, voiceWhisperRateWindow = 30, time.Minute
+
 // handleVoiceWhisper 同频道悄悄话（#45）：发送者必须当前在语音房间；目标去重、
 // 排除自己，只保留当前同房成员（成员可能刚离开，静默过滤）。空数组 = 取消。
 // 目标集合存到 SFU Peer 的不可变快照上，转发路径只做原子读 + 查表。
@@ -1336,6 +1589,15 @@ func (h *Hub) handleVoiceWhisper(c *client, d VoiceWhisperData) {
 	if len(d.Targets) > maxWhisperTargets {
 		h.sendError(c, ErrCodeBadMessage, "悄悄话目标最多 100 个")
 		return
+	}
+	// 频控放在廉价校验之后、任何分配之前：被限流的请求不再分配 map/切片，
+	// 也不写日志。h.limits 为 nil 时按连接计数（测试/过渡路径）。
+	if h.limits != nil {
+		ok, err := h.limits.Allow(context.Background(), "whisper:"+c.userID, voiceWhisperRateLimit, voiceWhisperRateWindow)
+		if err != nil || !ok {
+			h.sendError(c, ErrCodeRateLimited, "悄悄话切换过于频繁")
+			return
+		}
 	}
 	roomID := c.roomIDLocked()
 	if roomID == "" {
@@ -1640,6 +1902,15 @@ func (h *Hub) connCount(uid string) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.connCountLocked(uid)
+}
+
+// UserOnline 该 uid 当前是否在本进程持有至少一条 WS 连接（#53 移动推送的
+// 全设备离线判定用，与 connCount 同源实时查询；presence KV 有 90s 级过期延迟，
+// 不能做离线判定）。持 h.mu。
+func (h *Hub) UserOnline(uid string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.connCountLocked(uid) > 0
 }
 
 // connQuotaOK 单 uid 连接数配额（#20）：同 uid+dev 的重连是顶替（净增 0），

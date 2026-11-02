@@ -65,9 +65,8 @@ func (h *Hub) syncPresence(uid string) {
 		h.pushPresence(uid, true)
 		return
 	}
-	// 离线边沿（#92）：先无条件清频道去抖缓存——不能依赖 KV DEL 成功，
-	// 否则重连再进同一频道会被当成「状态未变」而不重推。
-	delete(h.presenceChanPublished, uid)
+	// 频道去抖/待重试缓存不在这里清：离线边沿已在 unregister 摘除最后一条连接
+	// 的同一临界区无条件清掉（#117），与 connCount==0 对外可见保持原子。
 	if err := h.presence.Del(ctx, presenceKey(uid)); err != nil {
 		h.log.Printf("presence: DEL %s 失败: %v", uid, err)
 		return
@@ -89,12 +88,20 @@ func (h *Hub) renewPresence(c *client) {
 		return
 	}
 	h.presenceMu.Lock()
-	defer h.presenceMu.Unlock()
 	if h.connByDevice(c.userID, c.dev) != c {
+		h.presenceMu.Unlock()
 		return
 	}
 	if err := h.presence.Set(context.Background(), presenceKey(c.userID), "1", h.ttl()); err != nil {
 		h.log.Printf("presence: 续期 %s 失败: %v", c.userID, err)
+	}
+	// #102：上一次频道推送有接收者因权限查询故障被跳过时，借这次心跳重算。
+	// 不能在这里直接调 syncPresenceChannel——它要拿同一把 presenceMu（不可重入），
+	// 先放锁再调；锁内只取标记。
+	_, retry := h.presenceChanRetry[c.userID]
+	h.presenceMu.Unlock()
+	if retry {
+		h.syncPresenceChannel(c.userID)
 	}
 }
 
@@ -112,6 +119,9 @@ func (h *Hub) presenceOnline(uid string) bool {
 // 单向好友（pending/blocked）不推；好友数量小，逐个查关系即可。
 // 目标是好友的**全部会话**（在线实时投递 + 断线续传窗口内进环），不只在线连接。
 func (h *Hub) pushPresence(uid string, online bool) {
+	if h.uidIsBot(uid) {
+		return // bot 不进 presence 广播（#51）：不作为事件主体出现
+	}
 	ctx := context.Background()
 	id, err := parseUID(uid)
 	if err != nil {
@@ -163,19 +173,31 @@ const (
 	viewNo
 )
 
+// presenceChanPending 好友频道推送的待重试集合（#102）。
+// viewers 为 nil 表示接收者集合未知（好友查询本身失败），下一次整体重算；
+// 非 nil 时只补发其中仍待处理的查看者——已经收到过的好友不重复打扰。
+type presenceChanPending struct {
+	viewers map[string]bool
+}
+
 // syncPresenceChannel 把 uid 的语音房变化推给其互为已接受好友的会话（#92）。
 // 与 syncPresence 共用 presenceMu（锁序 presenceMu → h.mu）。触发点：join 登记
 // 成功、leaveRoom、KickChannel 摘除、断线 cleanup 的离房；失败路径不推。
 //
 //   - 最后一条连接断开时跳过：离线由 syncPresence 的 offline 载荷表达，
-//     频道去抖缓存也在那个边沿被无条件清空。
+//     频道去抖/待重试缓存已在 unregister 的离线边沿无条件清空（#117），
+//     迟到的同步在这里按 connCount==0 直接返回，不会把标记写回。
 //   - 与去抖缓存比较，状态未变不推；无频道只推 online=true（不带频道键）。
 //   - 有频道时逐个接收者按其 ViewChannel 过滤：通过推带 channel_id/server_id
 //     的载荷，不通过推 online-only，查询故障跳过该接收者并记日志。
 //   - dev 非数字房间（serverID==0）一律不带频道字段；载荷永不包含频道名。
+//   - #102：被跳过的接收者记进待重试集合，下一次心跳/状态变化只补发他们。
 func (h *Hub) syncPresenceChannel(uid string) {
 	if h.presence == nil {
 		return
+	}
+	if h.uidIsBot(uid) {
+		return // bot 不进 presence 广播（#51）：语音房变化不作为事件主体推送
 	}
 	h.presenceMu.Lock()
 	defer h.presenceMu.Unlock()
@@ -190,9 +212,17 @@ func (h *Hub) syncPresenceChannel(uid string) {
 	if h.presenceChanPublished == nil {
 		h.presenceChanPublished = make(map[string]presenceChanState)
 	}
-	if prev, seen := h.presenceChanPublished[uid]; seen && prev == cur {
+	if h.presenceChanRetry == nil {
+		h.presenceChanRetry = make(map[string]presenceChanPending)
+	}
+	prev, seen := h.presenceChanPublished[uid]
+	pending, hasPending := h.presenceChanRetry[uid]
+	if seen && prev == cur && !hasPending {
 		return // 状态未变（同房重复 join、同房换设备等）：去抖
 	}
+	// 状态没变、只是补发上次被跳过的接收者：收件人候选收窄到待重试集合，
+	// 已经收到过的好友不再重复推。
+	partialOnly := seen && prev == cur && hasPending && pending.viewers != nil
 	ctx := context.Background()
 	id, err := parseUID(uid)
 	if err != nil {
@@ -201,7 +231,10 @@ func (h *Hub) syncPresenceChannel(uid string) {
 	fs, err := h.presence.FriendshipsOfUser(ctx, id)
 	if err != nil {
 		h.log.Printf("presence: 查 %s 好友失败: %v", uid, err)
-		return // 不更新缓存：下一次状态变化重试
+		// #102：接收者未知 → 整体待重试。不推进已发送状态之外的东西，
+		// 下一次心跳重算。
+		h.presenceChanRetry[uid] = presenceChanPending{}
+		return
 	}
 	ts := time.Now().UnixMilli()
 	onlineOnly := PresenceUpdateData{UserID: uid, Online: true, TS: ts}
@@ -212,6 +245,7 @@ func (h *Hub) syncPresenceChannel(uid string) {
 	}
 	withChan := make(map[string]bool, len(fs))
 	only := make(map[string]bool, len(fs))
+	nextPending := make(map[string]bool)
 	for _, f := range fs {
 		if f.Status != store.FriendAccepted {
 			continue
@@ -220,23 +254,36 @@ func (h *Hub) syncPresenceChannel(uid string) {
 		if f.FriendID == id {
 			other = f.UserID
 		}
+		otherUID := formatUID(other)
+		if partialOnly && !pending.viewers[otherUID] {
+			continue // 上一轮已送达：补发不重复打扰
+		}
 		if full.ChannelID == "" {
-			only[formatUID(other)] = true
+			only[otherUID] = true
 			continue
 		}
 		switch h.friendViewChannel(ctx, other, cur) {
 		case viewYes:
-			withChan[formatUID(other)] = true
+			withChan[otherUID] = true
 		case viewNo:
-			only[formatUID(other)] = true
-		default: // viewUnknown：跳过，不推
+			only[otherUID] = true
+		default: // viewUnknown：跳过，不推，但要留待重试标记
+			nextPending[otherUID] = true
 		}
 	}
 	if len(withChan) > 0 {
-		h.broadcastEvent(withChan, TypePresenceUpdate, full)
+		// P1-7：好友的令牌连接若看不到该频道，降级成不带频道键的版本（seq 仍连续）。
+		h.broadcastEventCh(withChan, full.ChannelID, TypePresenceUpdate, full)
 	}
 	if len(only) > 0 {
 		h.broadcastEvent(only, TypePresenceUpdate, onlineOnly)
+	}
+	// #102：仍有被跳过的查看者时保留待重试标记（只记他们），否则清掉。
+	// 已发送状态照常推进——这批接收者确实收到了，只是有一部分没收到。
+	if len(nextPending) > 0 {
+		h.presenceChanRetry[uid] = presenceChanPending{viewers: nextPending}
+	} else {
+		delete(h.presenceChanRetry, uid)
 	}
 	h.presenceChanPublished[uid] = cur
 }

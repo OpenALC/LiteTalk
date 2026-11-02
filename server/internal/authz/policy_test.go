@@ -127,6 +127,47 @@ func TestMergeChannelUnheldRoleIgnored(t *testing.T) {
 	}
 }
 
+// TestMergeChannelPriorityDenyVsGrant 优先发言授予/撤销的位组合语义（#117）：
+// 个人 deny 会让「授予」失效（同层 deny 胜），所以授予必须同时清 deny；
+// 撤销只清个人 allow 位时，角色层的授予仍然生效（个人层无位可删）。
+func TestMergeChannelPriorityDenyVsGrant(t *testing.T) {
+	base := store.DefaultMemberPerms // 不含 PrioritySpeaker
+	const uid, everyoneID, roleID = int64(7), int64(1), int64(2)
+	roleGrant := store.ChannelOverwrite{
+		TargetType: store.OverwriteTargetRole, TargetID: roleID, Allow: store.PrioritySpeaker,
+	}
+	held := []int64{everyoneID, roleID}
+
+	// 个人 deny + 授权 allow（客户端只补 allow 的旧行为）→ deny 胜，授予无效。
+	ows := []store.ChannelOverwrite{
+		roleGrant,
+		{TargetType: store.OverwriteTargetMember, TargetID: uid, Allow: store.PrioritySpeaker, Deny: store.PrioritySpeaker},
+	}
+	if p := mergeChannel(base, uid, everyoneID, held, ows); p.Has(store.PrioritySpeaker) {
+		t.Fatal("个人 deny 与 allow 并存时 deny 胜，授予不应生效")
+	}
+	// 授予清掉 personal deny（#117 修复后的位组合）→ 动作重放：角色 allow 生效。
+	ows = []store.ChannelOverwrite{
+		roleGrant,
+		{TargetType: store.OverwriteTargetMember, TargetID: uid, Allow: store.PrioritySpeaker},
+	}
+	if p := mergeChannel(base, uid, everyoneID, held, ows); !p.Has(store.PrioritySpeaker) {
+		t.Fatal("清掉个人 deny 后角色授予应生效")
+	}
+	// 撤销：只删个人 allow 位，角色 allow 仍在 → 仍然生效（客户端据此提示无法撤销）。
+	ows = []store.ChannelOverwrite{roleGrant}
+	if p := mergeChannel(base, uid, everyoneID, held, ows); !p.Has(store.PrioritySpeaker) {
+		t.Fatal("角色授予在个人位撤销后应保持生效")
+	}
+	// 没有角色授予时，撤销即失效。
+	ows = []store.ChannelOverwrite{
+		{TargetType: store.OverwriteTargetRole, TargetID: roleID},
+	}
+	if p := mergeChannel(base, uid, everyoneID, held, ows); p.Has(store.PrioritySpeaker) {
+		t.Fatal("无角色授予时个人位撤销应使权限失效")
+	}
+}
+
 // TestBasePermissionsFallback 角色数据缺失时回退静态模板，任何路径不许 panic。
 func TestBasePermissionsFallback(t *testing.T) {
 	const uid = int64(7)

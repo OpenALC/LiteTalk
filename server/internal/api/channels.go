@@ -7,6 +7,7 @@ import (
 
 	"github.com/OpenALC/LiteTalk/server/internal/signal"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/internal/webhook"
 )
 
 func validChannelName(s string) bool {
@@ -118,6 +119,8 @@ func (s *Server) CreateChannel(ctx context.Context, request CreateChannelRequest
 			"audio_bitrate_kbps": ch.AudioBitrateKbps, "audio_frame_ms": ch.AudioFrameMS,
 		}),
 	})
+	// 出站 webhook 事件出口（#52）：channel.created，落库后入队（非阻塞，不影响请求）。
+	s.notifyWebhookEvent(webhook.EventChannelCreated, ch.ServerID, ch.ID, channelView(ch))
 	return CreateChannel201JSONResponse(channelView(ch)), nil
 }
 
@@ -145,7 +148,10 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 	}
 	// #116 10ms 帧长能力闸的「修改前」值：必须在应用 body 之前取，用于判断
 	// 本次是否真的把帧长启用为 10ms（值不变或 10→20 不触发）。
+	// #117：码率同理留一份「修改前」值，作为 channel.audio 广播的兜底判定——客户
+	// 端已经按快照差下发，这里再挡一层「Set 了但最终值没变」的请求。
 	prevFrameMS := ch.AudioFrameMS
+	prevBitrate := ch.AudioBitrateKbps
 	// 有子频道时禁改 category/type/挂父（#37）：子树的分类/类型/层级跟着父走，
 	// 半改会造成树形漂移；先于任何字段应用判，避免半写。
 	if req.CategoryID.Set || req.Type.Set || req.ParentID.Set {
@@ -226,7 +232,9 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 	}
 	// #46 音质三态：缺省不改、0 = 清零（跟随设置/默认帧长）、null 拒 400。
 	// 校验用上方定稿的频道类型：同一次 PATCH 改成 text 时非零音质会被拒。
-	audioChanged := req.AudioBitrateKbps.Set || req.AudioFrameMs.Set
+	// #117：Set 只说明「客户端发了」，还不足以广播——最终值没变（重复提交同一
+	// 份配置）也要跳过，否则全房间会白重跑一次音质应用。判定放在 normalizeChannelAudio
+	// 之后，拿归一后的最终值和修改前的值比。
 	if req.AudioBitrateKbps.Set {
 		if req.AudioBitrateKbps.Clearing() {
 			return nil, errf(http.StatusBadRequest, "bad_channel_option", "audio_bitrate_kbps 不可清除，0 表示不限制")
@@ -264,6 +272,20 @@ func (s *Server) PatchChannel(ctx context.Context, request PatchChannelRequestOb
 	}
 	// 类型改成 text 时清掉旧音质（text 恒 0/0）；校验已在各字段应用时按最终类型完成。
 	normalizeChannelAudio(ch)
+	// #117 音质广播的兜底判定：请求里 Set 了且最终值（归一后）确实与修改前不同。
+	// 逐字段判——只改码率的请求不应因帧长字段被带上而算作帧长变更。
+	audioChanged := (req.AudioBitrateKbps.Set && ch.AudioBitrateKbps != prevBitrate) ||
+		(req.AudioFrameMs.Set && ch.AudioFrameMS != prevFrameMS)
+	// #102：类型改成 text 时一并清掉密码与人数上限——否则切回 voice 会复活旧密码。
+	// 放在全部字段应用之后按最终类型判定：同一次 PATCH 里显式改密码 + 改成 text
+	// 会在上方的 checkChannelPassword 先被拒，走到这里的一定是「切类型」本身。
+	if normalizeChannelOptions(ch) {
+		// 审计仍只记「密码变了」，不落哈希本身。
+		detail["password_changed"] = true
+		if _, ok := detail["user_limit"]; !ok {
+			detail["user_limit"] = 0
+		}
+	}
 	// 子频道自身改 type/category 也必须与父一致（#101 P2）：上方 409 只拦
 	// 「有子频道的父频道」，子频道此前可以单方面漂移出父的类型/分类，破坏
 	// 两级树的不变量。字段应用完成后统一核对最终值，避免半写。
@@ -373,12 +395,16 @@ func (s *Server) DeleteChannel(ctx context.Context, request DeleteChannelRequest
 			}
 		}
 	}
+	// 出站 webhook 事件出口（#52）：channel.deleted，删除事务提交后入队；
+	// ch 是删除前快照（行已不在库，worker 不能经频道反查，serverID 直接给出）。
+	s.notifyWebhookEvent(webhook.EventChannelDeleted, ch.ServerID, ch.ID, channelView(ch))
 	return DeleteChannel200JSONResponse{Status: "ok"}, nil
 }
 
 // ListChannels GET /api/v1/servers/{id}/channels（v0.1.2 补缺口）。
 // 返回分类与频道两个数组，频道带 category_id；前端按分类归组渲染。
-// 成员可读，但只返回其有 ViewChannel 的频道（#35 B3）；categories 不因空分类过滤。
+// 成员可读，但只返回其有 ViewChannel 的频道（#35 B3）；分类按「至少有一个可见
+// 频道」过滤（#102），持 ManageChannels 时保留空分类以便管理。
 func (s *Server) ListChannels(ctx context.Context, request ListChannelsRequestObject) (ListChannelsResponseObject, error) {
 	if e := checkID(request.Id); e != nil {
 		return nil, e
@@ -405,6 +431,12 @@ func (s *Server) ListChannels(ctx context.Context, request ListChannelsRequestOb
 	}
 	if categories == nil {
 		categories = []store.Category{}
+	}
+	// 分类名按频道可见性过滤（#102）：无可见频道的分类不返回，
+	// 否则无权限成员仍能看到分类名。与频道同一口径。
+	categories, err = s.visibleCategories(ctx, c.UserID, request.Id, categories, channels)
+	if err != nil {
+		return nil, s.writeStoreErr(ctx, err)
 	}
 	// ETag 协商（#31）：内容哈希弱标签，命中 If-None-Match 回 304。
 	out := ServerChannels{Categories: categoryViews(categories), Channels: channelViews(channels)}

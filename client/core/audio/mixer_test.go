@@ -320,6 +320,43 @@ func TestMixerDuckZeroAlloc(t *testing.T) {
 	}
 }
 
+// TestMixerFlushPeer 帧长热切换冲刷（#117）：RequestFlush 后下一拍丢弃该路已排队
+// 的旧采样，未请求冲刷的 peer 不受影响。冲刷掉的这一路本拍确实没有采样可播，
+// 欠载计数如实 +1（重新预填期间的静默）——刻意不把它伪装成正常帧。
+func TestMixerFlushPeer(t *testing.T) {
+	m, out := newTestMixer()
+	stale := m.AddPeer("stale")
+	fresh := m.AddPeer("fresh")
+	fillPeer(stale, 1000, 4)
+	fillPeer(fresh, 1000, 2)
+
+	stale.RequestFlush()
+	m.Tick()
+
+	frame := readFrame(t, out)
+	for i, v := range frame {
+		if v != 1000 {
+			t.Fatalf("sample %d = %d, want 1000（只应有 fresh 一路）", i, v)
+		}
+	}
+	if got := stale.UnderrunFrames.Load(); got != 1 {
+		t.Fatalf("冲刷后 stale 欠载计数 = %d, want 1（本拍无采样）", got)
+	}
+	if got := stale.BufferedSamples(); got != 0 {
+		t.Fatalf("冲刷后 stale 残留 %d 采样，want 0", got)
+	}
+	// 冲刷只生效一次：后续写入正常参与混音。
+	if got := fresh.BufferedSamples(); got != FrameSize {
+		t.Fatalf("fresh 残留 %d 采样，want %d", got, FrameSize)
+	}
+	fillPeer(stale, 500, 1)
+	m.Tick()
+	frame = readFrame(t, out)
+	if frame[0] != 1500 {
+		t.Fatalf("冲刷后再写入的采样未参与混音（%d, want 1500）", frame[0])
+	}
+}
+
 // BenchmarkMixerTick 4 路 peer 混音热点：必须 0 allocs/op。
 func BenchmarkMixerTick(b *testing.B) {
 	out := NewRingBuffer(1 << 20)

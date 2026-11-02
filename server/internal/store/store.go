@@ -5,6 +5,8 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"time"
 
@@ -33,18 +35,33 @@ func newID(id int64) int64 {
 	return snowflake.Next()
 }
 
+// pushTokenHash push_token 的幂等派生键：SHA-256 十六进制（64 定长）。
+// token 明文可达 4KB 放不进唯一索引，且哈希派生收在 Store 内部，
+// 调用方无法落一行哈希与明文不一致的脏数据。
+func pushTokenHash(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+// pushDeviceCols push_devices 行的查询列集（MySQL 与 SQLite 实现共用）。
+const pushDeviceCols = `id, user_id, platform, push_token, last_seen_at, created_at`
+
 // User 用户（§6.1 users 表）。无头像字段。
 type User struct {
-	ID            int64     `json:"id" db:"id"`
-	Email         string    `json:"email" db:"email"`
-	Nickname      string    `json:"nickname" db:"nickname"`
-	Tag           string    `json:"tag" db:"tag"`
-	PasswordHash  string    `json:"-" db:"password_hash"`
-	EmailVerified bool      `json:"email_verified" db:"email_verified"`
-	IsGuest       bool      `json:"is_guest" db:"is_guest"`
-	Status        int8      `json:"status" db:"status"`
-	CreatedAt     time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at" db:"updated_at"`
+	ID            int64  `json:"id" db:"id"`
+	Email         string `json:"email" db:"email"`
+	Nickname      string `json:"nickname" db:"nickname"`
+	Tag           string `json:"tag" db:"tag"`
+	PasswordHash  string `json:"-" db:"password_hash"`
+	EmailVerified bool   `json:"email_verified" db:"email_verified"`
+	IsGuest       bool   `json:"is_guest" db:"is_guest"`
+	// IsBot 机器人账号（迁移 0018，#51）：password_hash 落空串（无法密码登录）、
+	// email 用 <prefix>@bots.invalid；对用户不可见（好友候选/@提及候选/成员管理
+	// 列表过滤），仅经 api_token 连 WS/REST。
+	IsBot     bool      `json:"is_bot" db:"is_bot"`
+	Status    int8      `json:"status" db:"status"`
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt time.Time `json:"updated_at" db:"updated_at"`
 }
 
 // FriendshipStatus 好友关系状态。
@@ -242,6 +259,51 @@ type UserSession struct {
 	UpdatedAt  time.Time `json:"updated_at" db:"updated_at"`
 }
 
+// APIToken 个人访问令牌/机器人令牌（迁移 0018，#51 #54）。一张表两种 kind：
+// pat 挂普通用户，bot 挂 is_bot 用户（创建入口属 #51）。
+// SecretHash 是 SHA-256(secret) 的十六进制（为什么不用 bcrypt 见 internal/token 注释）；
+// Prefix 有意公开（UI 展示与日志关联），不是秘密也不做鉴权要素。
+// 明文只在创建响应里出现一次，任何读路径都不回传。
+type APIToken struct {
+	ID         int64
+	UserID     int64
+	Name       string // 用户可见备注（"CI 机器人"）
+	Prefix     string // 明文前缀 8 位小写 hex，检索与展示用
+	SecretHash string // SHA-256(secret) 十六进制（64 字符）
+	Kind       string // "pat" | "bot"
+	Scopes     string // 空格分隔的 scope 白名单子集；空 = 无任何权限
+	ExpiresAt  *time.Time
+	LastUsedAt *time.Time
+	RevokedAt  *time.Time
+	CreatedAt  time.Time
+}
+
+// PushDevice 移动推送设备（迁移 0020，#53）。push_token 是生产凭据的等价物：
+// 明文仅供推送通道投递使用——不进任何 API 响应，日志一律打码（只留前 8 位）。
+// TokenHash 由 Store 在 Upsert 时按 SHA-256(push_token) 派生，调用方不得自行赋值；
+// 幂等键 (user_id, token_hash) 见迁移 0020（token 可达 4KB，超出索引长度上限）。
+type PushDevice struct {
+	ID        int64     `json:"id" db:"id"`
+	UserID    int64     `json:"user_id" db:"user_id"`
+	Platform  string    `json:"platform" db:"platform"` // ios / android（CHECK 约束同口径）
+	Token     string    `json:"-" db:"push_token"`
+	LastSeen  time.Time `json:"last_seen_at" db:"last_seen_at"`
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
+}
+
+// OIDCIdentity OIDC 外部身份绑定（迁移 0021，#54）。(Issuer, Sub) 唯一：
+// 同一 IdP 身份只允许绑定一个本地账号。自动绑定只发生在首次登录且 IdP 声明
+// email_verified 的场合（防账号劫持，绝不自动合并账号）。Email 记录绑定/建号
+// 时刻 IdP 声明的邮箱，仅审计用途，任何 API 不回显。
+type OIDCIdentity struct {
+	ID        int64
+	Issuer    string
+	Sub       string
+	UserID    int64
+	Email     string
+	CreatedAt time.Time
+}
+
 // Role 角色（迁移 0010）。BuiltinKey 三值 member/admin/owner 为内置（不可改删、
 // 每服各一条），空串 = 自定义角色（DB 存 NULL）。Permissions 只用低 15 位。
 type Role struct {
@@ -309,6 +371,10 @@ type Store interface {
 	UserByEmail(ctx context.Context, email string) (*User, error)
 	UserByNicknameTag(ctx context.Context, nickname, tag string) (*User, error)
 	UpdateUser(ctx context.Context, u *User) error
+	// BotsAmong uids 中是 bot 账号的子集合（#51）：好友候选/@提及候选/成员管理
+	// 列表的统一 bot 过滤辅助——调用方一次集合查询做差，不各自拼 WHERE is_bot=0。
+	// 空入参返回空 map 不查库；查询故障上抛，调用方决定放行或拒绝。
+	BotsAmong(ctx context.Context, uids []int64) (map[int64]bool, error)
 	// HasUsers 库内是否已有用户（首启探测用；UserByID(1) 随 Snowflake 失效）。
 	HasUsers(ctx context.Context) (bool, error)
 	// HasServers 库内是否已有服务器（#27：实例是否已被认领的持久判据，
@@ -483,6 +549,80 @@ type Store interface {
 	DeleteUserSession(ctx context.Context, userID int64, deviceType string) error
 	// DeleteAllUserSessions 删除该用户全部设备会话（重置密码用）。
 	DeleteAllUserSessions(ctx context.Context, userID int64) error
+
+	// api_tokens（迁移 0018，#51 #54）。prefix 唯一（uk_api_tokens_prefix）。
+
+	// CreateAPIToken 写入一行；ID 未预置时取 Snowflake，回填 CreatedAt；
+	// prefix 重复返回 ErrConflict。
+	CreateAPIToken(ctx context.Context, t *APIToken) error
+	// APITokenByPrefix 按 8 位明文前缀检索（校验热路径，走唯一索引）；无命中 ErrNotFound。
+	APITokenByPrefix(ctx context.Context, prefix string) (*APIToken, error)
+	// APITokenByID 单条回读（吊销前的归属校验用）；无命中 ErrNotFound。
+	APITokenByID(ctx context.Context, id int64) (*APIToken, error)
+	// APITokensOfUser 该用户全部令牌，按 created_at、id 升序（列表端点，只回元数据）。
+	APITokensOfUser(ctx context.Context, userID int64) ([]APIToken, error)
+	// RevokeAPIToken 置 revoked_at（读路径每次实时查库，吊销立即生效）；未命中 ErrNotFound。
+	RevokeAPIToken(ctx context.Context, id int64, at time.Time) error
+	// TouchAPITokenLastUsed 更新 last_used_at（60s 节流后的异步落库，尽力而为：
+	// 行已不存在时静默忽略，不参与错误路径）。
+	TouchAPITokenLastUsed(ctx context.Context, id int64, at time.Time) error
+
+	// push_devices（迁移 0020，#53）：移动推送设备注册表。
+	// UpsertPushDevice 按 (user_id, SHA-256(push_token)) 幂等：命中更新
+	// platform/last_seen 并回填 d.ID 返回 false；未命中插入返回 true。
+	// TokenHash 由实现派生（见 PushDevice 注释），d.ID 未预置时取 Snowflake。
+	UpsertPushDevice(ctx context.Context, d *PushDevice) (bool, error)
+	// PushDevicesOfUser 该用户全部设备，按 id 升序。
+	PushDevicesOfUser(ctx context.Context, userID int64) ([]PushDevice, error)
+	// PushDeviceByID 单台设备；无命中 ErrNotFound。归属校验（user_id 比对）由调用方负责。
+	PushDeviceByID(ctx context.Context, id int64) (*PushDevice, error)
+	// DeletePushDevice 删除设备行；未命中 ErrNotFound。
+	DeletePushDevice(ctx context.Context, id int64) error
+
+	// oidc_identities（迁移 0021，#54）：OIDC 外部身份绑定。(issuer, sub) 唯一。
+
+	// OIDCIdentityByIssuerSub 按 (issuer, sub) 查绑定；无命中 ErrNotFound。
+	OIDCIdentityByIssuerSub(ctx context.Context, issuer, sub string) (*OIDCIdentity, error)
+	// CreateOIDCIdentity 写入绑定；ID 未预置时取 Snowflake，回填 CreatedAt；
+	// (issuer, sub) 重复返回 ErrConflict（同一外部身份已绑定其他账号时由调用方
+	// 决定语义——handler 层把它折叠为既有绑定直接登录）。
+	CreateOIDCIdentity(ctx context.Context, i *OIDCIdentity) error
+
+	// webhooks（迁移 0019，#52）：出站订阅 / 入站投递入口 / 投递记录。
+	// Secret 的读写口径见 OutboundWebhook / InboundWebhook 注释：明文只在创建与
+	// reset_secret 的响应里出现一次，任何查询路径不回传。
+
+	// CreateOutboundWebhook 写入一行；ID 未预置时取 Snowflake，回填 CreatedAt/UpdatedAt。
+	CreateOutboundWebhook(ctx context.Context, w *OutboundWebhook) error
+	// OutboundWebhookByID 单条回读；无命中 ErrNotFound。
+	OutboundWebhookByID(ctx context.Context, id int64) (*OutboundWebhook, error)
+	// OutboundWebhooksOfServer 该服全部出站订阅，按 id 升序（含停用的，列表要标原因）。
+	OutboundWebhooksOfServer(ctx context.Context, serverID int64) ([]OutboundWebhook, error)
+	// HasOutboundWebhooks 库内是否存在任一出站订阅（启动期判定是否需要投递 worker）。
+	HasOutboundWebhooks(ctx context.Context) (bool, error)
+	// UpdateOutboundWebhook 全行写（url/secret/events/熔断状态/creator_id）；调用方
+	// 读-改-写，不动 created_at/server_id。未命中 ErrNotFound。
+	UpdateOutboundWebhook(ctx context.Context, w *OutboundWebhook) error
+	// DeleteOutboundWebhook 删除订阅行；未命中 ErrNotFound。
+	DeleteOutboundWebhook(ctx context.Context, id int64) error
+	// RecordWebhookDelivery 落一条投递记录并在同一事务推进熔断计数：成功清零
+	// fail_count；失败自增，达到 breakerAt 时置 disabled=1 与 disabled_reason
+	// （已停用的保持停用）。回填 d.ID/CreatedAt。
+	RecordWebhookDelivery(ctx context.Context, d *WebhookDelivery, breakerAt int, reason string) error
+	// WebhookDeliveriesBefore 早于 before 的投递记录（清理扫描），按 id 升序；limit 夹到 [1,500]。
+	WebhookDeliveriesBefore(ctx context.Context, before time.Time, limit int) ([]WebhookDelivery, error)
+	// DeleteWebhookDeliveries 批量删除投递记录；空入参 no-op，不存在的 id 忽略。
+	DeleteWebhookDeliveries(ctx context.Context, ids []int64) error
+	// CreateInboundWebhook 写入频道级投递入口；ID 未预置时取 Snowflake，回填 CreatedAt。
+	CreateInboundWebhook(ctx context.Context, w *InboundWebhook) error
+	// InboundWebhookByID 单条回读；无命中 ErrNotFound。
+	InboundWebhookByID(ctx context.Context, id int64) (*InboundWebhook, error)
+	// InboundWebhooksOfChannel 该频道的全部入站入口，按 id 升序。
+	InboundWebhooksOfChannel(ctx context.Context, channelID int64) ([]InboundWebhook, error)
+	// UpdateInboundWebhook 全行写（轮换 secret 用）；调用方读-改-写，未命中 ErrNotFound。
+	UpdateInboundWebhook(ctx context.Context, w *InboundWebhook) error
+	// DeleteInboundWebhook 删除入站入口；未命中 ErrNotFound。
+	DeleteInboundWebhook(ctx context.Context, id int64) error
 
 	// roles / member_roles / channel_overwrites / audit_log（迁移 0010，#35 B1）。
 	// 「不属于该服务器」与「不存在」统一返回 ErrNotFound，不泄露跨服资源是否存在。

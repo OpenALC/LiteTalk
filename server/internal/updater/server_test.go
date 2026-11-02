@@ -2,6 +2,7 @@ package updater
 
 import (
 	"bytes"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -433,6 +434,81 @@ func writeSecretFile(t *testing.T, path, content string, mode os.FileMode) {
 	}
 }
 
+// readSpy 记录 body 是否被读过：限流前置的关键断言（#102）。
+type readSpy struct {
+	r     io.Reader
+	reads int
+}
+
+func (s *readSpy) Read(p []byte) (int, error) {
+	s.reads++
+	return s.r.Read(p)
+}
+
+// TestWebhookRateLimitBeforeBodyRead 已超限的 IP 在读 body 与算 HMAC 之前就被 429 拒掉，
+// 且正常请求（未超限 IP / 正确签名）完全不受影响。
+func TestWebhookRateLimitBeforeBodyRead(t *testing.T) {
+	env := newWebhookEnv(t, nil)
+	clk := newFakeClock()
+	env.server.now = clk.Now
+	body := releaseBody("v1.1.0-alpha", true)
+
+	post := func(ip string, spy *readSpy, sign bool) int {
+		req := httptest.NewRequest(http.MethodPost, "/hooks/github-release", nil)
+		req.Body = io.NopCloser(spy)
+		req.RemoteAddr = ip + ":4444"
+		req.Header.Set("X-GitHub-Event", "release")
+		req.Header.Set("X-GitHub-Delivery", "d-"+ip)
+		if sign {
+			req.Header.Set("X-Hub-Signature-256", "sha256="+hmacHex([]byte(testSecret), body))
+		} else {
+			req.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("00", 32))
+		}
+		rec := httptest.NewRecorder()
+		env.server.Handler().ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	const victim = "203.0.113.50"
+	// 打满配额（前 invalidMaxPerIP 次 401，第 invalidMaxPerIP+1 次起 429）
+	for i := 0; i <= invalidMaxPerIP; i++ {
+		if code := post(victim, &readSpy{r: bytes.NewReader(body)}, false); code != http.StatusUnauthorized && code != http.StatusTooManyRequests {
+			t.Fatalf("第 %d 次签名失败 = %d", i+1, code)
+		}
+	}
+
+	// 超限后：body 不得被读取
+	spy := &readSpy{r: bytes.NewReader(body)}
+	if code := post(victim, spy, false); code != http.StatusTooManyRequests {
+		t.Fatalf("超限 IP = %d，want 429", code)
+	}
+	if spy.reads != 0 {
+		t.Fatalf("超限后仍读了 body %d 次（限流必须前置到读 body 之前）", spy.reads)
+	}
+
+	// 正确签名也照样被限流挡在前面（限流按 IP，不看签名对错）
+	spyOK := &readSpy{r: bytes.NewReader(body)}
+	if code := post(victim, spyOK, true); code != http.StatusTooManyRequests {
+		t.Fatalf("超限 IP 的正确签名 = %d，want 429", code)
+	}
+
+	// 其他 IP 完全不受影响：正常读 body 并走到签名校验
+	spyOther := &readSpy{r: bytes.NewReader(body)}
+	if code := post("203.0.113.51", spyOther, true); code == http.StatusTooManyRequests {
+		t.Fatal("其他 IP 不应被限流")
+	}
+	if spyOther.reads == 0 {
+		t.Fatal("未超限 IP 应正常读取 body")
+	}
+
+	// 窗口过期后恢复
+	clk.advance(invalidWindowSize)
+	spyAfter := &readSpy{r: bytes.NewReader(body)}
+	if code := post(victim, spyAfter, true); code == http.StatusTooManyRequests {
+		t.Fatal("窗口过期后不应再限流")
+	}
+}
+
 // TestWebhookInvalidSignatureRateLimit：同一 IP 1 分钟窗口内前 20 次 401、第 21 次 429；
 // 其他 IP 不受影响，正确签名不受影响，窗口过期后恢复。
 func TestWebhookInvalidSignatureRateLimit(t *testing.T) {
@@ -464,7 +540,9 @@ func TestWebhookInvalidSignatureRateLimit(t *testing.T) {
 		t.Fatalf("其他 IP 签名失败 = %d, want 401", code)
 	}
 
-	// 成功签名不受限流影响（ping 不触发更新）
+	// #102：限流已前置到读 body 之前，所以超出配额的 IP 在该窗口内连正确签名也拿 429。
+	// 这是有意的取舍：正常投递远达不到阈值，而放行正确签名会让攻击者用伪造的
+	// 合法请求把预检变成可绕过的空转（body 与 HMAC 的计算开销照样付）。
 	req := httptest.NewRequest(http.MethodPost, "/hooks/github-release", bytes.NewReader([]byte(`{}`)))
 	req.RemoteAddr = "203.0.113.7:4444"
 	req.Header.Set("X-GitHub-Event", "ping")
@@ -472,12 +550,22 @@ func TestWebhookInvalidSignatureRateLimit(t *testing.T) {
 	req.Header.Set("X-Hub-Signature-256", "sha256="+hmacHex([]byte(testSecret), []byte(`{}`)))
 	rec := httptest.NewRecorder()
 	env.server.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("限流 IP 上的正确签名 = %d, want 202", rec.Code)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("超限 IP 上的正确签名 = %d, want 429", rec.Code)
 	}
 
-	// 窗口过后重新计数
+	// 窗口过后重新计数：正确签名恢复正常受理，同一 IP 的失败计数也重置
 	clk.advance(invalidWindowSize)
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodPost, "/hooks/github-release", bytes.NewReader([]byte(`{}`)))
+	req2.RemoteAddr = "203.0.113.7:4444"
+	req2.Header.Set("X-GitHub-Event", "ping")
+	req2.Header.Set("X-GitHub-Delivery", "d-rl-ping-2")
+	req2.Header.Set("X-Hub-Signature-256", "sha256="+hmacHex([]byte(testSecret), []byte(`{}`)))
+	env.server.Handler().ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusAccepted {
+		t.Fatalf("窗口过期后的正确签名 = %d, want 202", rec2.Code)
+	}
 	if code := bad("203.0.113.7"); code != http.StatusUnauthorized {
 		t.Fatalf("窗口过期后 = %d, want 401", code)
 	}

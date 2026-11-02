@@ -8,6 +8,8 @@ import { createPinia, setActivePinia } from 'pinia'
 const mockGoApp = vi.hoisted(() => ({
   Logout: vi.fn(async () => {}),
   Login: vi.fn(),
+  GetAuthConfig: vi.fn(),
+  OidcExchange: vi.fn(),
 }))
 const mockEventsOn = vi.hoisted(() => {
   const handlers = new Map<string, Array<(...args: unknown[]) => void>>()
@@ -183,6 +185,91 @@ describe('auth store 服务端关闭', () => {
 // 业务 store 跨账号/跨服务器残留（#85，覆盖 #14 的登出复位与 #17 的换服复位）：
 // 主动登出、被踢、换服（auth:kicked server_changed）与登录新账号前，servers/
 // friends/voice/chat 必须回到登录前状态。
+// （seed/expectCleared 模块级：OIDC 回调交换（#118 P2-5）的用例复用同口径。）
+function seed() {
+  const servers = useServersStore()
+  servers.servers.push({
+    id: '100', name: 'A 的服务器', icon: 'Music',
+    channels: [{ id: '1001', name: '开黑房', type: 'voice', group: '语音频道' }],
+  })
+  servers.selectServer('100')
+  servers.extraGroups = { '100': [{ id: '101', name: '甲组', position: 0 }] }
+
+  const friends = useFriendsStore()
+  friends.online = [{
+    id: 'f1', userId: '10', name: '好友甲', nickname: '好友甲', remark: '',
+    status: 'online', sub: '在线', group: '好友', incoming: false,
+  }]
+  friends.offline = [{
+    id: 'f2', userId: '20', name: '好友乙', nickname: '好友乙', remark: '',
+    status: 'offline', sub: '离线', group: '好友', incoming: false,
+  }]
+  friends.pending = [{ id: 'p1', name: '待处理', outgoing: true }]
+
+  const voice = useVoiceStore()
+  voice.channelId = '1001'
+  voice.members = [{
+    user_id: '10', nickname: '好友甲', tag: '0001', speaking: false, mute: false, deafen: false,
+    priority: false,
+  }]
+  voice.connected = true
+  voice.muted = true
+  voice.deafened = true
+  voice.latencyMs = 30
+  voice.peerVolumes = { '10': 1.5 }
+  voice.setSelf('10')
+
+  useChatStore().messagesByChannel = {
+    '1001': [{
+      id: 'm1', channel_id: '1001', user_id: '10', nickname: '好友甲',
+      content: 'hi', ts: '2026-01-01T00:00:00Z',
+    }],
+  }
+
+  const conversations = useConversationsStore()
+  conversations.list = [{
+    id: '500', kind: 'direct', name: '', created_at: '2026-01-01T00:00:00Z',
+    members: [{
+      user_id: '10', nickname: '好友甲', tag: '0001',
+      role: 'member', joined_at: '2026-01-01T00:00:00Z',
+    }],
+  }]
+  conversations.currentId = '500'
+  conversations.dmMode = true
+}
+
+function expectCleared() {
+  const servers = useServersStore()
+  // 示例服务器已移除：登出后列表为空，登录后由 loadRemoteServers 重新填充。
+  expect(servers.servers).toEqual([])
+  expect(servers.findServer('100')).toBeUndefined()
+  expect(servers.currentServerId).toBe('')
+  expect(servers.currentChannelId).toBe('')
+  expect(servers.extraGroups).toEqual({})
+
+  const friends = useFriendsStore()
+  expect(friends.online).toEqual([])
+  expect(friends.offline).toEqual([])
+  expect(friends.pending).toEqual([])
+
+  const voice = useVoiceStore()
+  expect(voice.channelId).toBe('')
+  expect(voice.members).toEqual([])
+  expect(voice.connected).toBe(false)
+  expect(voice.muted).toBe(false)
+  expect(voice.deafened).toBe(false)
+  expect(voice.latencyMs).toBe(0)
+  expect(voice.peerVolumes).toEqual({})
+  expect(voice.selfId()).toBe('')
+
+  expect(useChatStore().messagesByChannel).toEqual({})
+
+  const conversations = useConversationsStore()
+  expect(conversations.list).toEqual([])
+  expect(conversations.currentId).toBe('')
+  expect(conversations.dmMode).toBe(false)
+}
+
 describe('auth store 业务 store 复位（#85）', () => {
   beforeEach(() => {
     mockEventsOn.reset()
@@ -201,91 +288,6 @@ describe('auth store 业务 store 复位（#85）', () => {
   }
   const loginB: AuthResult = {
     access_token: 'tok-b', refresh_token: 'ref-b', user: userB, session_ok: true,
-  }
-
-  // seed 填满 A 账号残留：真实服务器、分类缓存、好友、语音房间、聊天记录。
-  function seed() {
-    const servers = useServersStore()
-    servers.servers.push({
-      id: '100', name: 'A 的服务器', icon: 'Music',
-      channels: [{ id: '1001', name: '开黑房', type: 'voice', group: '语音频道' }],
-    })
-    servers.selectServer('100')
-    servers.extraGroups = { '100': [{ id: '101', name: '甲组', position: 0 }] }
-
-    const friends = useFriendsStore()
-    friends.online = [{
-      id: 'f1', userId: '10', name: '好友甲', nickname: '好友甲', remark: '',
-      status: 'online', sub: '在线', group: '好友', incoming: false,
-    }]
-    friends.offline = [{
-      id: 'f2', userId: '20', name: '好友乙', nickname: '好友乙', remark: '',
-      status: 'offline', sub: '离线', group: '好友', incoming: false,
-    }]
-    friends.pending = [{ id: 'p1', name: '待处理', outgoing: true }]
-
-    const voice = useVoiceStore()
-    voice.channelId = '1001'
-    voice.members = [{
-      user_id: '10', nickname: '好友甲', tag: '0001', speaking: false, mute: false, deafen: false,
-      priority: false,
-    }]
-    voice.connected = true
-    voice.muted = true
-    voice.deafened = true
-    voice.latencyMs = 30
-    voice.peerVolumes = { '10': 1.5 }
-    voice.setSelf('10')
-
-    useChatStore().messagesByChannel = {
-      '1001': [{
-        id: 'm1', channel_id: '1001', user_id: '10', nickname: '好友甲',
-        content: 'hi', ts: '2026-01-01T00:00:00Z',
-      }],
-    }
-
-    const conversations = useConversationsStore()
-    conversations.list = [{
-      id: '500', kind: 'direct', name: '', created_at: '2026-01-01T00:00:00Z',
-      members: [{
-        user_id: '10', nickname: '好友甲', tag: '0001',
-        role: 'member', joined_at: '2026-01-01T00:00:00Z',
-      }],
-    }]
-    conversations.currentId = '500'
-    conversations.dmMode = true
-  }
-
-  function expectCleared() {
-    const servers = useServersStore()
-    // 示例服务器已移除：登出后列表为空，登录后由 loadRemoteServers 重新填充。
-    expect(servers.servers).toEqual([])
-    expect(servers.findServer('100')).toBeUndefined()
-    expect(servers.currentServerId).toBe('')
-    expect(servers.currentChannelId).toBe('')
-    expect(servers.extraGroups).toEqual({})
-
-    const friends = useFriendsStore()
-    expect(friends.online).toEqual([])
-    expect(friends.offline).toEqual([])
-    expect(friends.pending).toEqual([])
-
-    const voice = useVoiceStore()
-    expect(voice.channelId).toBe('')
-    expect(voice.members).toEqual([])
-    expect(voice.connected).toBe(false)
-    expect(voice.muted).toBe(false)
-    expect(voice.deafened).toBe(false)
-    expect(voice.latencyMs).toBe(0)
-    expect(voice.peerVolumes).toEqual({})
-    expect(voice.selfId()).toBe('')
-
-    expect(useChatStore().messagesByChannel).toEqual({})
-
-    const conversations = useConversationsStore()
-    expect(conversations.list).toEqual([])
-    expect(conversations.currentId).toBe('')
-    expect(conversations.dmMode).toBe(false)
   }
 
   it('主动登出清空 servers/friends/voice/chat', async () => {
@@ -370,5 +372,108 @@ describe('auth store 业务 store 复位（#85）', () => {
     await auth.logout()
 
     expectCleared()
+  })
+})
+
+// OIDC 模式判断（#118 P2-5）：auth_mode × oidc_enabled 决定登录页入口组合。
+// oidc_enabled 缺省（旧服务器不下发）必须按 false 处理，不能显示一个必然 404
+// 的按钮；auth_mode=oidc 时密码入口整体关闭（服务端对密码登录直接 403）。
+describe('auth store OIDC 模式判断', () => {
+  beforeEach(() => {
+    mockEventsOn.reset()
+    mockGoApp.GetAuthConfig.mockReset()
+    mockGoApp.OidcExchange.mockReset()
+    ;(globalThis as { window?: unknown }).window = globalThis
+    setActivePinia(createPinia())
+  })
+
+  function cfg(mode: 'full' | 'simple' | 'oidc', oidcEnabled?: boolean) {
+    return {
+      auth_mode: mode,
+      mail_configured: false,
+      self_host: false,
+      bootstrap_required: false,
+      ...(oidcEnabled === undefined ? {} : { oidc_enabled: oidcEnabled }),
+    }
+  }
+
+  it.each([
+    { mode: 'full' as const, enabled: undefined, simple: false, oidc: false },
+    { mode: 'full' as const, enabled: true, simple: false, oidc: true },
+    { mode: 'simple' as const, enabled: undefined, simple: true, oidc: false },
+    { mode: 'simple' as const, enabled: true, simple: true, oidc: true },
+    // auth_mode=oidc 但开关缺省属部署错配：oidcEnabled 仍按 false（按钮显隐的
+    // 统一口径），仅 OIDC 页面的主按钮不受它门控（那是唯一登录路径，错误在点击时浮出）。
+    { mode: 'oidc' as const, enabled: undefined, simple: false, oidc: false },
+    { mode: 'oidc' as const, enabled: true, simple: false, oidc: true },
+  ])('auth_mode=$mode oidc_enabled=$enabled → simpleMode=$simple oidcEnabled=$oidc', async ({ mode, enabled, simple, oidc }) => {
+    mockGoApp.GetAuthConfig.mockResolvedValue(cfg(mode, enabled))
+    const auth = useAuthStore()
+    await auth.loadConfig()
+    expect(auth.simpleMode).toBe(simple)
+    expect(auth.oidcEnabled).toBe(oidc)
+    expect(auth.oidcOnly).toBe(mode === 'oidc')
+  })
+
+  it('oidc_enabled 缺省按 false（不显示必然 404 的按钮）', async () => {
+    mockGoApp.GetAuthConfig.mockResolvedValue(cfg('full'))
+    const auth = useAuthStore()
+    await auth.loadConfig()
+    expect(auth.oidcEnabled).toBe(false)
+  })
+
+  it('loadConfig 失败保持默认 full：无 OIDC 入口、密码表单照常', async () => {
+    mockGoApp.GetAuthConfig.mockRejectedValue(new Error('net down'))
+    const auth = useAuthStore()
+    await auth.loadConfig()
+    expect(auth.oidcEnabled).toBe(false)
+    expect(auth.oidcOnly).toBe(false)
+  })
+})
+
+// OIDC 回调交换（#118 P2-5）：loginWithOidcCode 与 login 同一成功口径
+// （复位业务 store、写用户、清被踢/关闭终态），失败原样上抛给回调页区分文案。
+describe('auth store OIDC 回调交换', () => {
+  beforeEach(() => {
+    mockEventsOn.reset()
+    mockGoApp.Logout.mockReset().mockResolvedValue(undefined)
+    mockGoApp.OidcExchange.mockReset()
+    mockRouter.push.mockReset().mockResolvedValue(undefined)
+    mockRouter.currentRoute.value.name = 'main'
+    ;(globalThis as { window?: unknown }).window = globalThis
+    setActivePinia(createPinia())
+  })
+
+  const oidcUser: UserProfile = {
+    id: '3', nickname: 'oidc用户', tag: '0003', email: 'o@example.com',
+    email_verified: true, is_guest: false, status: 0, online: true,
+    created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z',
+  }
+  const oidcResult: AuthResult = {
+    access_token: 'tok-o', refresh_token: 'ref-o', user: oidcUser, session_ok: true,
+  }
+
+  it('交换成功：写用户进应用、清被踢原因', async () => {
+    seed()
+    mockGoApp.OidcExchange.mockResolvedValue(oidcResult)
+    const auth = useAuthStore()
+    auth.setKickedReason('login_expired')
+
+    await auth.loginWithOidcCode('cd-1', 'st-1')
+
+    expect(mockGoApp.OidcExchange).toHaveBeenCalledWith('cd-1', 'st-1')
+    expect(auth.loggedIn).toBe(true)
+    expect(auth.user?.id).toBe('3')
+    expect(auth.kickedReason).toBe('')
+    expectCleared()
+  })
+
+  it('交换失败原样上抛且不进应用（文案区分在回调页）', async () => {
+    mockGoApp.OidcExchange.mockRejectedValue({ code: 'bad_state', message: '登录状态无效或已过期' })
+    const auth = useAuthStore()
+
+    await expect(auth.loginWithOidcCode('cd', 'st')).rejects.toMatchObject({ code: 'bad_state' })
+    expect(auth.loggedIn).toBe(false)
+    expect(auth.user).toBeNull()
   })
 })

@@ -35,6 +35,18 @@ type fakeHub struct {
 	roomLegacy     map[string]bool
 	legacyCalls    int
 	legacyPassCall int
+
+	// creates 创建后管线（P1-4/P2-1）的调用快照：REST/入站接线只断言「进了
+	// 管线一次、参数正确」，管线步骤行为由真实 hub 在 msgpipe_test.go 端到端验证。
+	creates []createEvent
+}
+
+// createEvent 一次 AfterMessagePersisted 的断言快照。
+type createEvent struct {
+	senderUID  string
+	channelID  int64
+	messageID  int64
+	senderNick string
 }
 
 // priorityEvent 一次 voice.priority 广播的断言快照（#45）。
@@ -183,6 +195,23 @@ func (f *fakeHub) BroadcastVoicePriority(channelID, userID string, priority bool
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.priorities = append(f.priorities, priorityEvent{channelID: channelID, userID: userID, priority: priority})
+}
+
+// AfterMessagePersisted 记录创建后管线调用（P1-4/P2-1）。行为零实现——
+// 编辑/删除广播的既有断言不受 REST create 接线影响；管线步骤由真实 hub 测。
+func (f *fakeHub) AfterMessagePersisted(_ context.Context, ch *store.Channel, msg *store.Message, senderUID, senderNick string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.creates = append(f.creates, createEvent{
+		senderUID: senderUID, channelID: ch.ID, messageID: msg.ID, senderNick: senderNick,
+	})
+}
+
+// createLog 全部创建后管线调用的快照。
+func (f *fakeHub) createLog() []createEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]createEvent(nil), f.creates...)
 }
 
 // priorityLog 全部 voice.priority 广播的快照。

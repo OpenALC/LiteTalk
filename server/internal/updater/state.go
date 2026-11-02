@@ -3,6 +3,7 @@ package updater
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -53,10 +54,24 @@ type StateStore struct {
 }
 
 // OpenState 打开（或初始化）状态目录。目录 0700 创建：状态含部署元数据，不给他人读。
+// 已存在但权限宽松的目录会在启动时收紧（见 hardenStateDir）；日志走默认输出。
 func OpenState(dir string) (*StateStore, error) {
+	return OpenStateWithLogger(dir, nil)
+}
+
+// OpenStateWithLogger 同 OpenState，告警写到给定 logger（为 nil 时用 log.Printf）。
+func OpenStateWithLogger(dir string, logger *log.Logger) (*StateStore, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("建状态目录: %w", err)
 	}
+	warnf := func(format string, args ...any) {
+		if logger != nil {
+			logger.Printf(format, args...)
+			return
+		}
+		log.Printf(format, args...)
+	}
+	hardenStateDir(dir, warnf)
 	s := &StateStore{dir: dir, path: filepath.Join(dir, "state.json"), now: time.Now}
 	b, err := os.ReadFile(s.path)
 	if err == nil {

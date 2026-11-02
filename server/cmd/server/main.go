@@ -31,11 +31,14 @@ import (
 	"github.com/OpenALC/LiteTalk/server/internal/bootstrap"
 	"github.com/OpenALC/LiteTalk/server/internal/linkpreview"
 	"github.com/OpenALC/LiteTalk/server/internal/mailer"
+	"github.com/OpenALC/LiteTalk/server/internal/push"
 	"github.com/OpenALC/LiteTalk/server/internal/rtcapi"
 	"github.com/OpenALC/LiteTalk/server/internal/sfu"
 	"github.com/OpenALC/LiteTalk/server/internal/signal"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/internal/token"
 	"github.com/OpenALC/LiteTalk/server/internal/turn"
+	"github.com/OpenALC/LiteTalk/server/internal/webhook"
 	"github.com/OpenALC/LiteTalk/server/migrations"
 )
 
@@ -177,6 +180,9 @@ func main() {
 	codes := auth.NewEmailCodes(kv)
 	limits := auth.NewRateLimit(kv)
 	sessIndex := auth.NewSessionIndex(st, kv)
+	// api_token（#54）校验服务：REST 中间件与 WS 握手共用同一实例——
+	// 一条实现（token.Service.Verify），last_used 节流表也只在这一份。
+	apiTokenSvc := token.NewService(st, log.Default())
 
 	// SFU：ICE-Lite + 单 UDP mux（§5.2）+ 可选 ICE-TCP mux（#25）
 	sfuUDPPort := envInt("LITETALK_SFU_UDP", 7845)
@@ -239,25 +245,39 @@ func main() {
 	}
 	var authenticator signal.Authenticator
 	if devAuth {
-		authenticator = func(token string) (signal.Identity, error) {
-			if !strings.HasPrefix(token, "dev-") {
-				if claims, err := jwtSigner.ParseAccess(token); err == nil {
+		authenticator = func(t string) (signal.Identity, error) {
+			// api_token（#54）：与 REST 同一条校验实现，先于 JWT 解析判定。
+			if id, handled, err := apiTokenIdentity(apiTokenSvc, t); handled {
+				if err != nil {
+					return signal.Identity{}, signal.ErrUnauthorized
+				}
+				return id, nil
+			}
+			if !strings.HasPrefix(t, "dev-") {
+				if claims, err := jwtSigner.ParseAccess(t); err == nil {
 					return identityFromClaims(claims), nil
 				}
 			}
 			// dev- 令牌无会话概念：SkipSessionCheck 跳过握手 sid 比对（仅 dev 构建可达）。
-			return signal.DevAuthenticator(token)
+			return signal.DevAuthenticator(t)
 		}
-		log.Println("WS 鉴权: JWT + dev-token 兜底（开发模式）")
+		log.Println("WS 鉴权: JWT + api_token + dev-token 兜底（开发模式）")
 	} else {
-		authenticator = func(token string) (signal.Identity, error) {
-			claims, err := jwtSigner.ParseAccess(token)
+		authenticator = func(t string) (signal.Identity, error) {
+			// api_token（#54）：与 REST 同一条校验实现，先于 JWT 解析判定。
+			if id, handled, err := apiTokenIdentity(apiTokenSvc, t); handled {
+				if err != nil {
+					return signal.Identity{}, signal.ErrUnauthorized
+				}
+				return id, nil
+			}
+			claims, err := jwtSigner.ParseAccess(t)
 			if err != nil {
 				return signal.Identity{}, signal.ErrUnauthorized
 			}
 			return identityFromClaims(claims), nil
 		}
-		log.Println("WS 鉴权: JWT")
+		log.Println("WS 鉴权: JWT + api_token")
 	}
 	// 权限判定唯一实例（#35 B3）：REST 与 WS 共用，写后失效（InvalidateServer）
 	// 才能同时作用于两侧的缓存——两个实例会各自缓存、互相看不到失效。
@@ -273,31 +293,22 @@ func main() {
 		// 每会话事件环条数（#32）：断线续传窗口 = min(环容量, 30min 空闲 TTL)。
 		Backlog: cfg.gatewayBacklog,
 		Authz:   authzInst,
+		// api_token 主体（#51）：hub 握手据此把 Principal 挂到连接会话，发送类
+		// 权限检查经 authCtx 汇聚到 authz.CanInServer 的 scope 交集点。与 REST
+		// 中间件、握手 authenticator 是同一个 token.Service 实例。
+		Tokens: apiTokenSvc,
+		// 令牌会话复查（PR118 P2-2）：PAT/bot 连接心跳时按 tokenID 复查吊销/过期，
+		// 失效即断连（60s 节流，见 signal.hub）。复用同一 store 的只读点查。
+		SessionChecks: apitokenSessionChecker{st: st},
 	})
 	// LITETALK_PROTOCOL_MAX：服务端宣布的协议版本上限（#29 逃生阀）。
 	// 0/缺省 = 构建期 ProtocolVersionMax；调小可临时挡住过新的客户端区间。
 	hub.SetProtoMax(envInt("LITETALK_PROTOCOL_MAX", 0))
 
-	// TURN 短期凭证签发（coturn use-auth-secret，§5.4）
-	var rtcAuth rtcapi.UserFromToken
-	if devAuth {
-		rtcAuth = func(token string) (string, error) {
-			if !strings.HasPrefix(token, "dev-") {
-				if claims, err := jwtSigner.ParseAccess(token); err == nil {
-					return strconv.FormatInt(claims.UserID, 10), nil
-				}
-			}
-			return devUserID(token)
-		}
-	} else {
-		rtcAuth = func(token string) (string, error) {
-			claims, err := jwtSigner.ParseAccess(token)
-			if err != nil {
-				return "", err
-			}
-			return strconv.FormatInt(claims.UserID, 10), nil
-		}
-	}
+	// TURN 短期凭证签发（coturn use-auth-secret，§5.4）。api_token（#54）同样受理，
+	// 但令牌主体必须显式携带 voice.connect scope（PR118 P2-3）；JWT 主体不变
+	// （角色权限由 channel.join 的 authz 判定把关）。
+	rtcAuth := newRTCAuth(jwtSigner, apiTokenSvc, devAuth)
 	// TURN 短期凭证签发 URLs（§0.4）：显式 env 优先；未设且内置 TURN 启用则按
 	// host（LITETALK_DOMAIN，否则 LITETALK_SFU_IP）回填。生产模式在内置 TURN
 	// 关闭且未配置外部 TURN 时不再回落 loopback（#13 P2），见 resolveCredentialURLs。
@@ -330,6 +341,26 @@ func main() {
 	}, log.Default())
 	log.Printf("发信通道: %s", mailName)
 
+	// 移动推送（#53）：LITETALK_PUSH_PROVIDER 未配置 = 功能关闭——Noop、不启
+	// worker、零外部副作用，/config 报 push_enabled=false，触发点全部短路。
+	pusher, pushName := push.New(push.FromEnv())
+	log.Printf("推送通道: %s", pushName)
+	pushBroker := push.NewBroker(push.BrokerConfig{
+		Pusher: pusher,
+		Store:  st,
+		Online: hub, // 连接表实时在线判定 + 离线边沿（cleanup 挂钩）
+		Limits: limits,
+		Log:    log.Default(),
+	})
+	if pushBroker != nil {
+		hub.SetOfflineNotifier(pushBroker)
+		// 消息创建管线（P1-4/P2-1）：推送派发器注入 hub——WS/REST/入站三条入口
+		// 的消息后处理都经 hub 的单一管线，推送在管线的最后一步异步派发。
+		// 启动阶段注入一次，运行期只读（与 SetOfflineNotifier 同口径）。
+		hub.SetPushNotifier(pushBroker)
+		defer pushBroker.Close()
+	}
+
 	// 附件二进制存储（#41 B2）：local（默认，$DATA_DIR/uploads）或 S3 兼容对象存储。
 	// 只校验配置不探测连通性：S3 暂时不可达不应挡住整个服务启动。
 	blobStore, blobDriver, err := blob.New(cfg.upload, log.Default())
@@ -339,11 +370,38 @@ func main() {
 	log.Printf("附件存储: %s（单文件上限 %d MiB，图片单边上限 %d 像素）",
 		blobDriver, cfg.uploadMax>>20, serverUploadMaxDimension)
 
-	// Auth 模式：full（默认，验证码流程）/ simple（免验证码，私域部署从简）。
-	// 合法性已在 cfg.validate（步骤 2）把关。
+	// 出站 Webhook 投递器（#52）：参数全部有默认值。零订阅部署不启动任何后台
+	// goroutine（§0.8）——启动期库内无订阅则不 Start，首个订阅创建时由 API 层
+	// EnsureStarted 惰性拉起；已有订阅则 Start 在服务端 shutdown ctx 上，
+	// 清理 goroutine 随进程退出干净停止。
+	webhookDisp := webhookFromEnv(st, authzInst, log.Default())
+	startWebhookWorkers := false
+	if webhookDisp != nil {
+		hub.SetWebhookOutlet(webhookDisp)
+		defer webhookDisp.Close()
+		if has, herr := st.HasOutboundWebhooks(context.Background()); herr != nil {
+			log.Printf("出站 Webhook: 读取订阅存在性失败（%v），按无订阅处理", herr)
+		} else if has {
+			startWebhookWorkers = true
+		}
+	}
+
+	// Auth 模式：full（默认，验证码流程）/ simple（免验证码，私域部署从简）/
+	// oidc（仅 OIDC 登录，企业部署）。合法性已在 cfg.validate（步骤 2）把关。
 	authMode := cfg.authMode
 	if authMode == "simple" {
 		log.Println("Auth 模式: simple（注册/找回免验证码，仅建议私域部署）")
+	}
+	if authMode == "oidc" {
+		log.Println("Auth 模式: oidc（仅 OIDC 登录，密码登录/注册/找回已禁用）")
+	}
+
+	// OIDC 登录（#54）：LITETALK_OIDC_* 全空 = 功能关闭（/config 报
+	// oidc_enabled=false，端点 404，零后台资源）；配置完整才注入 API 层。
+	var oidcCfg *auth.OIDCConfig
+	if cfg.oidc.Complete() {
+		oidcCfg = &cfg.oidc
+		log.Printf("OIDC 登录: 已启用（issuer=%s）", cfg.oidc.Issuer)
 	}
 
 	// 链接预览（#42 B4）：关闭时为 nil，端点统一 404 no_preview；缓存复用现有 KV。
@@ -382,6 +440,8 @@ func main() {
 		RTCAuth: rtcAuth,
 		// 权限判定与信令 hub 共用同一实例（#35 B3）。
 		Authz: authzInst,
+		// api_token 校验与 WS 握手共用同一实例（#54，一条实现）。
+		Tokens: apiTokenSvc,
 		// 附件存储与校验（#41 B2）：上传/下载端点；MaxDimension 显式收紧到 4096。
 		Blob: blobStore,
 		Upload: attachment.Config{
@@ -392,11 +452,20 @@ func main() {
 		// 链接预览（#42 B4）：KV 缓存 + 抓取器；关闭时 LinkPreview=nil。
 		KV:          kv,
 		LinkPreview: linkPreview,
+		// 移动推送派发器（#53）：nil = 关闭（见上方推送通道构造）。
+		Push: pushBroker,
+		// 出站 Webhook 投递器（#52）：API 层只负责建首个订阅时的惰性启动。
+		Webhooks: webhookDisp,
+		// OIDC 登录（#54）：nil = 未配置（端点 404，零副作用）。
+		OIDC: oidcCfg,
 	})
 
 	mux := http.NewServeMux()
 	mux.Handle("/api/v1/", apiSrv.Handler())
 	mux.HandleFunc("GET /ws", hub.ServeWS)
+	// Web 客户端静态托管（#50）：dist 无产物时全部 404（纯 API 形态）；
+	// /api/v1/ 与 /ws 模式更具体，ServeMux 最长匹配优先，不会被 fallback 吞掉。
+	api.RegisterStatic(mux, log.Default())
 
 	// ---- bootstrap（§0.6 步骤 8）：首启生成管理员邀请码并打印（幂等）；#27 T4 填实现 ----
 	bootstrap.Ensure(context.Background(), kv, st, cfg.jwtSecret, log.Default())
@@ -421,6 +490,12 @@ func main() {
 		go attGC.Run(ctx)
 	} else {
 		log.Println("附件回收: 关闭（LITETALK_ATTACHMENT_GC）")
+	}
+
+	// 出站 Webhook worker 与投递记录清理（#52）：ctx 接服务端 shutdown，
+	// 优雅关闭时干净停止。库内无订阅则整段跳过（零后台 goroutine）。
+	if startWebhookWorkers {
+		webhookDisp.Start(ctx)
 	}
 
 	// ---- 起 HTTP（§0.6 步骤 9）：ACME TLS + :80 挑战，或纯 HTTP ----
@@ -487,16 +562,30 @@ func startHTTP(cfg *config, mux http.Handler, stop context.CancelFunc) []*http.S
 		httpsSrv := newServer(cfg.addr, mux)
 		httpsSrv.TLSConfig = mgr.TLSConfig()
 		httpSrv := newServer(":80", mgr.HTTPHandler())
-		// ACME 部署不占 8077，但 updater 默认按 loopback 8077 断言版本（#101）：
-		// 单独起一个只暴露 healthz 的监听，不把完整管理 API 带到回环面。
-		healthSrv := newServer(acmeHealthAddr, healthOnlyHandler(version))
 		log.Printf("ACME: 单域 %s 自动签发（TLS-ALPN-01 + HTTP-01），证书缓存 %s", cfg.domain, cfg.acmeCache)
-		log.Printf("ACME: loopback health http://%s/api/v1/healthz", acmeHealthAddr)
 		listen("HTTPS "+cfg.addr, httpsSrv, func() error { return httpsSrv.ListenAndServeTLS("", "") }, true)
 		listen("HTTP :80", httpSrv, httpSrv.ListenAndServe, true)
-		// 端口冲突/无权限走上面统一的失败路径：打日志并 stop()，不静默吞掉。
-		listen("health "+acmeHealthAddr, healthSrv, healthSrv.ListenAndServe, false)
-		return []*http.Server{httpsSrv, httpSrv, healthSrv}
+		servers := []*http.Server{httpsSrv, httpSrv}
+
+		// ACME 部署默认不占 8077，但 updater 默认按 loopback 8077 断言版本（#101）：
+		// 单独起一个只暴露 healthz 的监听，不把完整管理 API 带到回环面。
+		// 两种情况不启这一路（#102）：
+		//   1. LITETALK_ADDR 显式配成了 8077——主 mux 已在该端口提供 /api/v1/healthz；
+		//   2. 端口已被别的进程占用——更新器的 healthz 断言会失败回滚，但这不该让
+		//      整个服务退出（443/80 与 SFU 都还正常工作）。降级为告警，healthz 走配置地址。
+		if acmeHealthCovered(cfg.addr) {
+			log.Printf("ACME: %s 已覆盖 loopback healthz 端口，跳过额外监听", cfg.addr)
+		} else {
+			healthSrv := newServer(acmeHealthAddr, healthOnlyHandler(version))
+			if err := listenOptional("health "+acmeHealthAddr, healthSrv); err != nil {
+				log.Printf("ACME: loopback health %s 未启动: %v；healthz 请改用 %s（更新器需相应设置 LITETALK_UPDATER_HEALTH_URL）",
+					acmeHealthAddr, err, cfg.addr)
+			} else {
+				log.Printf("ACME: loopback health http://%s/api/v1/healthz", acmeHealthAddr)
+				servers = append(servers, healthSrv)
+			}
+		}
+		return servers
 	}
 
 	srv := newServer(cfg.addr, mux)
@@ -512,6 +601,37 @@ func startHTTP(cfg *config, mux http.Handler, stop context.CancelFunc) []*http.S
 	}
 	listen("HTTP "+cfg.addr, srv, srv.ListenAndServe, false)
 	return []*http.Server{srv}
+}
+
+// acmeHealthCovered 主监听地址是否已覆盖 acmeHealthAddr 的端口。
+// 成立时主 mux 本身就在该端口上提供 /api/v1/healthz，再起回环监听必然绑定冲突。
+// 地址形态无法解析时返回 false（照常尝试起回环面，起不来也只是告警）。
+func acmeHealthCovered(mainAddr string) bool {
+	_, port, err := net.SplitHostPort(mainAddr)
+	if err != nil {
+		return false
+	}
+	_, healthPort, err := net.SplitHostPort(acmeHealthAddr)
+	if err != nil {
+		return false
+	}
+	return port == healthPort
+}
+
+// listenOptional 启动一个"失败不影响主服务"的监听：**先绑定**再 serve，
+// 绑定失败立即可见并作为返回值交给调用方记录，而不是丢进 goroutine 里悄悄退出。
+func listenOptional(name string, srv *http.Server) error {
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		return err
+	}
+	go func() {
+		// 绑定成功后 serve 只会因关闭或运行期错误返回；两种情况都不该终止主服务。
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("%s 服务异常退出: %v", name, err)
+		}
+	}()
+	return nil
 }
 
 // healthOnlyHandler ACME 模式的回环探活面：只提供 GET /api/v1/healthz。
@@ -561,6 +681,93 @@ func identityFromClaims(claims *auth.Claims) signal.Identity {
 func devUserID(token string) (string, error) {
 	id, err := signal.DevAuthenticator(token)
 	return id.UserID, err
+}
+
+// apiTokenIdentity ltk_ 前缀令牌 → 信令身份（#54）：与 REST 中间件共用同一条
+// token.Service.Verify（一条实现，不两套）。SkipSessionCheck——api_token 没有
+// 会话概念，吊销/过期即失效，无 sid 可比对。handled=false 表示不是 ltk_ 令牌
+// （交给调用方走 JWT/dev 路径）；handled=true 且 err 非空即校验失败（401 口径）。
+func apiTokenIdentity(svc *token.Service, plain string) (id signal.Identity, handled bool, err error) {
+	if !strings.HasPrefix(plain, token.PlainPrefix) {
+		return signal.Identity{}, false, nil
+	}
+	p, verr := svc.Verify(context.Background(), plain)
+	if verr != nil {
+		return signal.Identity{}, true, verr
+	}
+	return signal.Identity{
+		UserID:           strconv.FormatInt(p.UserID, 10),
+		Username:         p.Nickname,
+		SkipSessionCheck: true,
+	}, true, nil
+}
+
+// newRTCAuth TURN 凭证签发的鉴权闭包（§5.4；PR118 P2-3）：JWT 主体原样放行
+// （入房权限由 authz 判定）；令牌主体（Kind != jwt）必须 HasScope("voice.connect")
+// 才签发 12h 中继凭证，否则返回 rtcapi.ErrScopeForbidden——api/rtc.go 据此回 403
+// scope_forbidden，与「凭据无效」的 401 分开。dev 兜底（dev- 令牌映射 uid）保持
+// 原口径：非 ltk_ 令牌两类解析都失败时走 devUserID。
+func newRTCAuth(jwtSigner *auth.JWT, apiTokenSvc *token.Service, dev bool) rtcapi.UserFromToken {
+	if dev {
+		return func(t string) (string, error) {
+			if !strings.HasPrefix(t, token.PlainPrefix) {
+				if claims, err := jwtSigner.ParseAccess(t); err == nil {
+					return strconv.FormatInt(claims.UserID, 10), nil
+				}
+			} else if p, err := apiTokenSvc.Verify(context.Background(), t); err == nil {
+				if !p.HasScope(token.ScopeVoiceConnect) {
+					return "", rtcapi.ErrScopeForbidden
+				}
+				return strconv.FormatInt(p.UserID, 10), nil
+			}
+			return devUserID(t)
+		}
+	}
+	return func(t string) (string, error) {
+		if strings.HasPrefix(t, token.PlainPrefix) {
+			p, err := apiTokenSvc.Verify(context.Background(), t)
+			if err != nil {
+				return "", err
+			}
+			if !p.HasScope(token.ScopeVoiceConnect) {
+				return "", rtcapi.ErrScopeForbidden
+			}
+			return strconv.FormatInt(p.UserID, 10), nil
+		}
+		claims, err := jwtSigner.ParseAccess(t)
+		if err != nil {
+			return "", err
+		}
+		return strconv.FormatInt(claims.UserID, 10), nil
+	}
+}
+
+// apitokenSessionChecker 把 store 的令牌行只读查询适配成 hub 的
+// signal.TokenSessionChecker（PR118 P2-2）：WS 心跳按 tokenID 复查令牌吊销/过期，
+// 泄漏的 PAT/bot 凭据吊销后不再长期持有连接。只判 revoked_at/expires_at——属主
+// 停用等其余失效路径仍由握手 Verify 与 REST 实时校验兜底，复查不做重复判定。
+type apitokenSessionChecker struct {
+	st store.Store
+}
+
+// SessionValid 满足 signal.TokenSessionChecker。行已删（并发删除窗口）按失效处理；
+// 查询故障原样上抛，由 hub 侧 fail-open（心跳复查不断在线会话）。
+func (c apitokenSessionChecker) SessionValid(ctx context.Context, tokenID int64) (bool, error) {
+	row, err := c.st.APITokenByID(ctx, tokenID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	now := time.Now()
+	if row.RevokedAt != nil && !now.Before(*row.RevokedAt) {
+		return false, nil
+	}
+	if row.ExpiresAt != nil && !now.Before(*row.ExpiresAt) {
+		return false, nil
+	}
+	return true, nil
 }
 
 // ---- 环境变量小工具 ----
@@ -740,6 +947,43 @@ func splitList(s string) []string {
 		}
 	}
 	return out
+}
+
+// webhookFromEnv 按环境变量构造出站 Webhook 投递器（#52）。
+// 参数全部有安全默认；解析失败拒绝启动（配置错误不能静默吞掉）。
+// worker 数与重试上限夹到区间：误配既不能拖垮投递，也不能把退避拖到天级。
+// az 注入投递前的频道可见性判定（P1-5）：与 REST/WS 共用同一实例，权限变更的
+// 快照失效同源；az 为 nil 时投递器对频道维度事件 fail-closed（生产不应发生）。
+func webhookFromEnv(st store.Store, az *authz.Authorizer, lg *log.Logger) *webhook.Dispatcher {
+	retryMax := envInt("LITETALK_WEBHOOK_RETRY_MAX", webhook.DefaultRetryMax)
+	retryMax = min(max(retryMax, 0), 20)
+	backoffBase, err := parseGCDuration("LITETALK_WEBHOOK_BACKOFF_BASE",
+		os.Getenv("LITETALK_WEBHOOK_BACKOFF_BASE"), webhook.DefaultBackoffBase,
+		100*time.Millisecond, time.Minute)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	timeout, err := parseGCDuration("LITETALK_WEBHOOK_TIMEOUT",
+		os.Getenv("LITETALK_WEBHOOK_TIMEOUT"), webhook.DefaultTimeout,
+		time.Second, time.Minute)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	workers := envInt("LITETALK_WEBHOOK_WORKERS", webhook.DefaultWorkers)
+	workers = min(max(workers, 1), 32)
+	d := webhook.New(webhook.Config{
+		RetryMax:    retryMax,
+		BackoffBase: backoffBase,
+		Timeout:     timeout,
+		Workers:     workers,
+		Visibility:  az,
+		Log:         lg,
+	}, st)
+	if d != nil {
+		lg.Printf("出站 Webhook: 就绪（workers=%d，retry_max=%d，backoff_base=%s，timeout=%s；零订阅时不启动后台协程）",
+			workers, retryMax, backoffBase, timeout)
+	}
+	return d
 }
 
 // pickStoreKind 决定存储后端（§0.3）：LITETALK_STORE 显式指定 > LITETALK_MYSQL_DSN

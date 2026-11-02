@@ -4,6 +4,7 @@ import SettingsView from '../views/SettingsView.vue'
 import LoginView from '../views/auth/LoginView.vue'
 import RegisterView from '../views/auth/RegisterView.vue'
 import ForgotView from '../views/auth/ForgotView.vue'
+import OidcCallbackView from '../views/auth/OidcCallbackView.vue'
 import { useAuthStore } from '../stores/auth'
 import { goApp } from '../api/bridge'
 
@@ -16,6 +17,9 @@ const router = createRouter({
     { path: '/login', name: 'login', component: LoginView },
     { path: '/register', name: 'register', component: RegisterView },
     { path: '/forgot', name: 'forgot', component: ForgotView },
+    // OIDC 回调页（#118 P2-5）：IdP 重定向回部署配置的 redirect_url 即本页，
+    // 用户必然未登录，必须在 authPages 白名单里，否则守卫会把它顶回登录页。
+    { path: '/oidc/callback', name: 'oidc-callback', component: OidcCallbackView },
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
 })
@@ -25,7 +29,7 @@ const router = createRouter({
 // 恢复失败才落登录页；已登录访问鉴权页时回主界面。
 router.beforeEach(async (to) => {
   const auth = useAuthStore()
-  const authPages = ['login', 'register', 'forgot']
+  const authPages = ['login', 'register', 'forgot', 'oidc-callback']
   if (!auth.loggedIn && !authPages.includes(to.name as string)) {
     try {
       auth.user = await goApp().GetMe()

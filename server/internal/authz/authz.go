@@ -7,6 +7,7 @@ import (
 	"context"
 
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/internal/token"
 )
 
 // Can 判断 uid 对频道的权限。channelID 必须是真实频道（不存在返回 store.ErrNotFound）；
@@ -23,9 +24,17 @@ func (a *Authorizer) Can(ctx context.Context, uid, channelID int64, perm store.P
 // channelID == 0 视为服务器级（不看频道覆盖）；perm 含频道位时同样按服务器级
 // 处理，不报错。channelID 属于 serverID 由调用方保证，这里不回查（错配时该频道
 // 在本服快照里没有覆盖，退化为服务器级结果）。
+//
+// #54 scope 上限的唯一交集点：ctx 里带 api_token 的 Principal（pat/bot）时，
+// 最终权限 = 角色权限 ∩ scope 映射位。检查的权限位超出 scope 上限直接拒绝、
+// 不查角色——scope 绝不授予只收紧，角色降级后令牌自动失去对应权限。
+// ctx 无 Principal（WS 旧路径）或 JWT 主体时不受限，行为与之前完全一致。
 func (a *Authorizer) CanInServer(ctx context.Context, uid, serverID, channelID int64, perm store.Permission) (bool, error) {
 	if ok, err := precheck(perm); err != nil || ok {
 		return ok, err
+	}
+	if limit, ok := token.ScopeLimitFromContext(ctx); ok && perm&^limit != 0 {
+		return false, nil
 	}
 	snap, err := a.policyFor(ctx, serverID)
 	if err != nil {
@@ -37,6 +46,22 @@ func (a *Authorizer) CanInServer(ctx context.Context, uid, serverID, channelID i
 // CanServer 只做服务器级判断，不看频道覆盖。
 func (a *Authorizer) CanServer(ctx context.Context, uid, serverID int64, perm store.Permission) (bool, error) {
 	return a.CanInServer(ctx, uid, serverID, 0, perm)
+}
+
+// RoleCanInServer 纯角色判定：与 CanInServer 同一套策略快照与合并语义，但**不做**
+// scope 上限交集。给「scope 腿由端点显式判定」的双判定场合用（P1-2：审计读取 =
+// 主体持有 admin.read + 纯角色 ManageServer）——若走 CanInServer，scope 交集会与
+// 显式 scope 腿重复裁决，且 admin.read 归零后映射位凑不齐，角色腿永远过不去。
+// channelID == 0 视为服务器级，与 CanInServer 相同；(false, nil) 统一 403。
+func (a *Authorizer) RoleCanInServer(ctx context.Context, uid, serverID, channelID int64, perm store.Permission) (bool, error) {
+	if ok, err := precheck(perm); err != nil || ok {
+		return ok, err
+	}
+	snap, err := a.policyFor(ctx, serverID)
+	if err != nil {
+		return false, err
+	}
+	return snap.effective(uid, channelID, perm), nil
 }
 
 // IsMember 成员判断（纯成员表；owner 不旁路——归属判断用 Can*）。

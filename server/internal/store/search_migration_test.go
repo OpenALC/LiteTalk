@@ -41,12 +41,16 @@ func TestSearchMigrationSQLite(t *testing.T) {
 	if ftsTableExists(t, m) {
 		t.Fatal("0016 之前不应存在 messages_fts")
 	}
-	u := &User{Email: "mig-search@ex.com", Nickname: "迁移搜索", Tag: "0001"}
-	if err := m.CreateUser(ctx, u); err != nil {
-		t.Fatalf("CreateUser: %v", err)
+	// 旧 schema（无 is_bot 列）上直写用户行：本用例固定停在 0015/0016，
+	// 不能调带全列的 store 写入器（同 nickname 迁移用例的口径）。
+	const uID = int64(7101)
+	if _, err := m.DB().ExecContext(ctx,
+		`INSERT INTO users (id, email, nickname, tag, password_hash) VALUES (?, 'mig-search@ex.com', '迁移搜索', '0001', '')`,
+		uID); err != nil {
+		t.Fatalf("预置用户失败: %v", err)
 	}
 	const chID = int64(7001)
-	insertLegacyMessage(t, m, 6001, chID, u.ID, "升级前关键词")
+	insertLegacyMessage(t, m, 6001, chID, uID, "升级前关键词")
 
 	if err := m.Migrate(ctx, through); err != nil {
 		t.Fatalf("应用 0016 失败: %v", err)
@@ -58,7 +62,7 @@ func TestSearchMigrationSQLite(t *testing.T) {
 	assertSearchIDs(t, searchIDs(t, m, []int64{chID}, "升级前关键词", 20), 6001)
 
 	// 新插入 → 索引同步。
-	created := &Message{ChannelID: chID, UserID: u.ID, Content: "升级后新增词"}
+	created := &Message{ChannelID: chID, UserID: uID, Content: "升级后新增词"}
 	if err := m.CreateMessage(ctx, created); err != nil {
 		t.Fatalf("CreateMessage: %v", err)
 	}
@@ -78,7 +82,7 @@ func TestSearchMigrationSQLite(t *testing.T) {
 
 	// 索引缺项（例如绕过 store 直写 messages）不应让后续编辑失败：
 	// 直接 DELETE 索引项对不存在的 rowid 是 no-op，编辑后重新写入正确词项。
-	insertLegacyMessage(t, m, 6002, chID, u.ID, "绕过索引的正文")
+	insertLegacyMessage(t, m, 6002, chID, uID, "绕过索引的正文")
 	if err := m.UpdateMessageContent(ctx, 6002, "补回索引的正文", nil, time.Now()); err != nil {
 		t.Fatalf("索引缺项时编辑不应失败: %v", err)
 	}
@@ -129,14 +133,17 @@ func TestSearchMigrationMySQL(t *testing.T) {
 		t.Fatal("0016 之前 MATCH 应失败（无 FULLTEXT 索引）")
 	}
 	// 用户必须先真实存在：SearchMessages 按 users 表内联发送者昵称/tag。
-	u := &User{Email: "mig-search@ex.com", Nickname: "迁移搜索", Tag: "0001"}
-	if err := m.CreateUser(ctx, u); err != nil {
-		t.Fatalf("CreateUser: %v", err)
+	// 旧 schema（无 is_bot 列）直写，理由同 SQLite 变体。
+	const uID = int64(7102)
+	if _, err := m.DB().ExecContext(ctx,
+		`INSERT INTO users (id, email, nickname, tag, password_hash) VALUES (?, 'mig-search@ex.com', '迁移搜索', '0001', '')`,
+		uID); err != nil {
+		t.Fatalf("预置用户失败: %v", err)
 	}
 	const chID = int64(7001)
 	if _, err := m.DB().ExecContext(ctx,
 		`INSERT INTO messages (id, channel_id, user_id, content) VALUES (6001, ?, ?, '升级前关键词')`,
-		chID, u.ID); err != nil {
+		chID, uID); err != nil {
 		t.Fatalf("预置消息失败: %v", err)
 	}
 
@@ -157,7 +164,7 @@ func TestSearchMigrationMySQL(t *testing.T) {
 	}
 
 	// store 层：新插入/编辑/软删由 InnoDB 自动维护全文索引。
-	created := &Message{ChannelID: chID, UserID: u.ID, Content: "升级后新增词"}
+	created := &Message{ChannelID: chID, UserID: uID, Content: "升级后新增词"}
 	if err := m.CreateMessage(ctx, created); err != nil {
 		t.Fatalf("CreateMessage: %v", err)
 	}

@@ -93,6 +93,13 @@ describe('Beta APM mock 默认值', () => {
     env.DEV = true
     await expect(goApp().APMSupported()).resolves.toBe(true)
   })
+
+  // #117：DRED 开关与 APM 同口径，设置页据此禁用开关并提示不支持。
+  it('mock 平台报告支持 DRED', async () => {
+    installWindow()
+    env.DEV = true
+    await expect(goApp().DREDSupported()).resolves.toBe(true)
+  })
 })
 
 // 游戏内悬浮层（#47，Beta，仅 Windows）：浏览器 mock 默认关闭、报告支持，

@@ -7,6 +7,7 @@ import { X } from 'lucide-vue-next'
 import {
   AUDIO_BITRATE_CHOICES,
   AUDIO_FRAME_CHOICES,
+  diffChannelAudioOptions,
   normalizeChannelAudioOptions,
   useServersStore,
 } from '../stores/data'
@@ -38,6 +39,13 @@ const parent = ref(ch.value?.parentId ?? '0')
 const bitrate = ref(ch.value?.audioBitrateKbps ?? 0)
 const frameMS = ref(ch.value?.audioFrameMs ?? 0)
 
+// audioBaseline 打开弹层时的音质快照（#117）：保存时只下发与它不同的字段。
+// 用快照而不是实时 store 值——弹层开着时别的管理员改了音质，广播会更新 store，
+// 拿实时值比会把没动过的字段判成「变了」。快照本身也要过一遍归一：服务端可能
+// 存着下拉框外的旧值（如帧长 20 归 0），原样保留即可，不必触发一次写入。
+const audioBaseline = normalizeChannelAudioOptions(
+  ch.value?.audioBitrateKbps ?? 0, ch.value?.audioFrameMs ?? 0)
+
 // bitrateLabel 码率选项文案（0 = 跟随用户设置）。
 function bitrateLabel(v: number) {
   return v === 0 ? '跟随用户设置' : `${v} kbps`
@@ -61,8 +69,10 @@ async function submit() {
   }
   try {
     // parent：'0' = 提升顶层；其余 = 设置父（空串在 store 侧=不改，这里总是有值）。
-    // 音质只对语音频道生效；text 频道服务端会把两字段归一为 0。
-    const audio = normalizeChannelAudioOptions(bitrate.value, frameMS.value)
+    // 音质只对语音频道生效；text 频道服务端会把两字段归一为 0。未变的字段发 -1
+    // （= 不改），避免只改名字也触发 channel.audio 广播。
+    const audio = diffChannelAudioOptions(
+      audioBaseline, normalizeChannelAudioOptions(bitrate.value, frameMS.value))
     await servers.updateChannelOptions(
       servers.currentServerId, cur.id, parent.value, limit.value,
       audio.bitrateKbps, audio.frameMS, password.value, clearPassword.value,

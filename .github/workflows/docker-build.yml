@@ -1,0 +1,55 @@
+# 轻音 LiteTalk 镜像构建检查（#50 / P2-8 内置 Web 客户端）
+#
+# 只构建，不登录 registry、不推送：验证根目录 Dockerfile 仍能构建出可用镜像。
+# 推送镜像属于发版流程，不在这里做。
+#
+# 触发只跟镜像相关文件：Dockerfile / .dockerignore / docker-compose.yml / 前端依赖清单，
+# 外加本 workflow 自身——否则首次加入本文件的这次推送不会触发任何构建，无从自证可用。
+# workflow_dispatch 只有在默认分支已有本文件时才可用，日常靠 push 的 paths 触发。
+#
+# 注：镜像的 webui 阶段会重新构建前端，这是 CLAUDE.md §4「前端只在 check-frontend 构建一次」
+# 的显式例外——镜像必须自带 Web 客户端产物（dist-web，base=/），与桌面产物 frontend-dist
+# （base=./，给 Wails 用）不能混用；且镜像要在没有 CI artifact 的环境里独立构建。
+name: Docker 镜像构建
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'docker-compose.yml'
+      - 'client/frontend/package.json'
+      - 'client/frontend/pnpm-lock.yaml'
+      - '.github/workflows/docker-build.yml'
+  pull_request:
+    paths:
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'docker-compose.yml'
+      - 'client/frontend/package.json'
+      - 'client/frontend/pnpm-lock.yaml'
+      - '.github/workflows/docker-build.yml'
+  workflow_dispatch:
+
+# 与 ci.yml 同风格：同一 ref 的新提交取消旧运行；镜像构建慢，取消能省 runner 时间
+concurrency:
+  group: docker-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  docker-build:
+    name: 镜像构建（不推送）
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # 构建失败即 job 失败。不引入 buildx/push action：runner 自带 docker，
+      # 本地与 CI 用同一条命令最容易复现。
+      - name: docker build
+        run: docker build -t litetalk-server:ci .
+      # 记录体积，便于发现镜像异常膨胀（例如前端产物没进 embed、依赖层失效）
+      - name: 记录镜像体积
+        run: docker image inspect litetalk-server:ci --format '镜像体积：{{.Size}} 字节'

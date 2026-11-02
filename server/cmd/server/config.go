@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/OpenALC/LiteTalk/server/internal/attachment"
+	"github.com/OpenALC/LiteTalk/server/internal/auth"
 	"github.com/OpenALC/LiteTalk/server/internal/blob"
 )
 
@@ -48,6 +49,9 @@ type config struct {
 	sfuIP         string
 	sfuIPExplicit bool // LITETALK_SFU_IP 显式设置过（显式 > --domain 推导）
 	authMode      string
+	// oidc OIDC 登录配置（#54）。全空 = 功能关闭（零副作用）；
+	// 部分设置但缺必填项在 loadConfig 即报错（fail-fast，不带病运行）。
+	oidc auth.OIDCConfig
 }
 
 // loadConfig 解析 flag 与 env。output 为 flag 用法/错误输出（main 传 os.Stderr，测试传 io.Discard）。
@@ -136,6 +140,12 @@ func loadConfig(args []string, output io.Writer) (*config, error) {
 		return nil, err
 	}
 	cfg.attachmentGC = gcCfg
+	// OIDC 登录（#54）：全空 = 功能关闭；写一半的配置直接拒绝启动。
+	oidcCfg, err := parseOIDCConfig()
+	if err != nil {
+		return nil, err
+	}
+	cfg.oidc = oidcCfg
 	cfg.addr = envOr("LITETALK_ADDR", defaultAddr)
 	cfg.addrExplicit = os.Getenv("LITETALK_ADDR") != ""
 	// 触发条件（§0.5）：--domain 非空 且 未设 --behind-proxy。
@@ -307,6 +317,47 @@ func parseGCBatch(raw string) (int, error) {
 	return n, nil
 }
 
+// parseOIDCConfig 解析 LITETALK_OIDC_*（#54）。任何一项都没设置 = 功能关闭
+// （零副作用，返回零值）；设置了部分项则要求 issuer/client_id/client_secret/
+// redirect_url 全部齐备——写一半的配置按启动失败处理，避免「看起来开了、
+// 实际静默关闭」的部署事故。scopes 逗号或空白分隔，空回落 openid profile email。
+func parseOIDCConfig() (auth.OIDCConfig, error) {
+	cfg := auth.OIDCConfig{
+		Issuer:       strings.TrimSpace(os.Getenv("LITETALK_OIDC_ISSUER")),
+		ClientID:     strings.TrimSpace(os.Getenv("LITETALK_OIDC_CLIENT_ID")),
+		ClientSecret: strings.TrimSpace(os.Getenv("LITETALK_OIDC_CLIENT_SECRET")),
+		RedirectURL:  strings.TrimSpace(os.Getenv("LITETALK_OIDC_REDIRECT_URL")),
+	}
+	if cfg.Scopes = splitList(os.Getenv("LITETALK_OIDC_SCOPES")); len(cfg.Scopes) == 0 {
+		cfg.Scopes = auth.DefaultOIDCScopes()
+	}
+	set := 0
+	for _, v := range []string{cfg.Issuer, cfg.ClientID, cfg.ClientSecret, cfg.RedirectURL} {
+		if v != "" {
+			set++
+		}
+	}
+	if set == 0 {
+		return auth.OIDCConfig{}, nil
+	}
+	var missing []string
+	for k, v := range map[string]string{
+		"LITETALK_OIDC_ISSUER":        cfg.Issuer,
+		"LITETALK_OIDC_CLIENT_ID":     cfg.ClientID,
+		"LITETALK_OIDC_CLIENT_SECRET": cfg.ClientSecret,
+		"LITETALK_OIDC_REDIRECT_URL":  cfg.RedirectURL,
+	} {
+		if v == "" {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) > 0 {
+		return auth.OIDCConfig{}, fmt.Errorf("OIDC 登录配置不完整，缺少 %s（不启用请把 LITETALK_OIDC_* 全部留空）",
+			strings.Join(missing, "、"))
+	}
+	return cfg, nil
+}
+
 // lookupIP 域名解析（测试可替换；生产 = net.LookupIP）。
 var lookupIP = net.LookupIP
 
@@ -360,8 +411,12 @@ func (c *config) validate(dev bool) error {
 		// JWT 密钥仍必须校验——码由它派生，密钥不对打出来的是废码。
 		return nil
 	}
-	if c.authMode != "full" && c.authMode != "simple" {
-		return fmt.Errorf("LITETALK_AUTH_MODE 只支持 full / simple，实际为 %q", c.authMode)
+	if c.authMode != "full" && c.authMode != "simple" && c.authMode != "oidc" {
+		return fmt.Errorf("LITETALK_AUTH_MODE 只支持 full / simple / oidc，实际为 %q", c.authMode)
+	}
+	// 仅 OIDC 模式（#54）必须配齐 IdP：否则服务起得来却没有任何登录途径。
+	if c.authMode == "oidc" && !c.oidc.Complete() {
+		return errors.New("LITETALK_AUTH_MODE=oidc 需要完整配置 LITETALK_OIDC_ISSUER / CLIENT_ID / CLIENT_SECRET / REDIRECT_URL")
 	}
 	// 附件存储（#41 B2）：driver 必须是 local/s3；s3 驱动缺必填项时不静默降级。
 	switch c.upload.Driver {

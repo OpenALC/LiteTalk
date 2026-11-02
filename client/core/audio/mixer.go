@@ -34,6 +34,11 @@ type PeerInput struct {
 	// duckCur 平滑中的当前乘数。仅 Tick goroutine 读写（单写者，免锁）。
 	duckCur float64
 
+	// flushReq 帧长热切换（#117）请求丢弃已排队的旧帧。环是 SPSC，只能由消费者
+	// （Tick）执行丢弃，写侧（解码 goroutine）只能置标志；下一拍生效，最多残留
+	// 一拍（10ms）的旧帧长采样。
+	flushReq atomic.Bool
+
 	// 统计（原子计数）
 	UnderrunFrames atomic.Uint64 // tick 读到不足 480 采样的帧数（对端静默/断流）
 	WrittenSamples atomic.Uint64 // 解码侧写入的采样数
@@ -107,6 +112,10 @@ func (p *PeerInput) nextDuck() float64 {
 
 // BufferedSamples 输入环当前可读采样数（诊断用；只读原子，不干扰混音）。
 func (p *PeerInput) BufferedSamples() int { return p.ring.Available() }
+
+// RequestFlush 丢弃该路已排队的陈旧采样（帧长热切换用，#117）。任意 goroutine
+// 可调；实际丢弃在下一拍 Tick 上由消费者完成（环是 SPSC，写侧不能动 tail）。
+func (p *PeerInput) RequestFlush() { p.flushReq.Store(true) }
 
 // Mixer 多路混音器：N 路 peer 输入环（480 采样/10ms）→ per-peer 增益 →
 // int32 求和截断 → 单一输出（管线播放环）。
@@ -231,6 +240,7 @@ func (m *Mixer) Tick() {
 
 	if m.deafen.Load() {
 		for _, p := range peers {
+			p.flushReq.Store(false)
 			p.ring.Read(m.frame[:]) // 排空丢弃
 		}
 		for i := range m.out {
@@ -242,6 +252,9 @@ func (m *Mixer) Tick() {
 	}
 
 	for _, p := range peers {
+		if p.flushReq.Swap(false) {
+			p.ring.Discard() // 帧长切换：丢旧帧长的排队采样，不把它当作本拍欠载
+		}
 		n := p.ring.Read(m.frame[:])
 		if n < FrameSize {
 			for i := n; i < FrameSize; i++ {

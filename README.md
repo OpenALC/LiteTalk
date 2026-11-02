@@ -85,6 +85,17 @@ TLS 三种模式（详见部署手册）：
 | 验证码邮件 | 三选一：**Webhook**（`LITETALK_MAILER_WEBHOOK`，对接自有发码平台，契约见 [server/README.md](server/README.md)）/ **SMTP**（`LITETALK_SMTP_*`）/ **Console**（默认，打印到日志） |
 | 全部环境变量 | [server/deploy/env/litetalk.env.example](server/deploy/env/litetalk.env.example) |
 
+## 安全说明
+
+- **Web 客户端令牌存 localStorage**：服务端托管的浏览器版把 access/refresh token 存在 `localStorage`
+  （键前缀 `litetalk.web.`），刷新页面不用重登。代价是该存储对同源脚本可读——一旦发生 XSS，
+  令牌会被直接读走；也无法像 httpOnly cookie 那样把凭据隔离在 JS 之外。当前的缓解是 Web 入口
+  由响应头下发 CSP（`default-src 'self'`，脚本只允许同源；`frame-ancestors 'none'`）并附
+  `X-Frame-Options: DENY`，前端不加载任何第三方脚本，XSS 面收敛到自身代码与构建依赖。这是有意的
+  取舍，不是遗漏。如需进一步隔离，方向是 httpOnly cookie + CSRF 防护。
+- **桌面客户端**凭据走操作系统安全存储（Windows DPAPI；Linux 优先 Secret Service 密钥环，
+  不可用时回落为 0600 配置文件），不使用 localStorage。
+
 ## 开发
 
 前置：Go 1.27+、Node 22+、pnpm。仓库结构：

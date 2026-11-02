@@ -53,6 +53,12 @@ RequestExecutionLevel admin
   !define ARG_WAILS_AMD64_BINARY "..\..\bin\LiteTalk.exe"
 !endif
 
+; 第三方许可证目录（#117）：由 client/build/third-party-licenses.sh 生成。
+; 静态链接的 opus / opusfile / ogg / WebRTC APM（含 abseil）要求二进制分发
+; 随附许可证全文。路径相对于本脚本（client/build/windows/installer）。
+!define THIRD_PARTY_DIR      "..\..\third-party"
+!define THIRD_PARTY_SUBDIR   "third-party"
+
 Function .onInit
   ${IfNot} ${RunningX64}
     MessageBox MB_ICONSTOP "轻音 LiteTalk 仅支持 64 位 Windows。"
@@ -67,6 +73,12 @@ Section
 
     File /oname=${PRODUCT_EXECUTABLE} "${ARG_WAILS_AMD64_BINARY}"
     File /oname=icon.ico "..\icon.ico"
+
+    ; 第三方许可证：装到 $INSTDIR\third-party\，与绿色版 zip 内布局一致
+    ; （#117）。/r 递归，目录缺失时 makensis 在编译期就报错，不会静默漏发。
+    SetOutPath "$INSTDIR\${THIRD_PARTY_SUBDIR}"
+    File /r "${THIRD_PARTY_DIR}\*.*"
+    SetOutPath $INSTDIR
 
     CreateShortcut "$SMPROGRAMS\${INFO_PRODUCTNAME}.lnk" "$INSTDIR\${PRODUCT_EXECUTABLE}"
     CreateShortCut "$DESKTOP\${INFO_PRODUCTNAME}.lnk" "$INSTDIR\${PRODUCT_EXECUTABLE}"

@@ -24,6 +24,7 @@ import (
 	"github.com/OpenALC/LiteTalk/server/internal/blob"
 	"github.com/OpenALC/LiteTalk/server/internal/snowflake"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/internal/token"
 )
 
 const (
@@ -41,10 +42,15 @@ const (
 )
 
 // UploadAttachment POST /api/v1/attachments（multipart，登录可传）。
+// scope 门（P1-3 顺带）：上传此前只查登录，attachments.write 形同虚设——
+// JWT 主体恒过，令牌主体须显式持有该 scope。
 func (s *Server) UploadAttachment(ctx context.Context, request UploadAttachmentRequestObject) (UploadAttachmentResponseObject, error) {
 	u := currentUser(ctx)
 	if u == nil {
 		return nil, errf(http.StatusUnauthorized, "unauthorized", "缺少访问令牌")
+	}
+	if !token.ScopeAllows(ctx, token.ScopeAttachmentsWrite) {
+		return nil, errf(http.StatusForbidden, "forbidden", "缺少 attachments.write 权限")
 	}
 	if request.Body == nil {
 		return nil, errf(http.StatusBadRequest, "bad_request", "请求体不是合法的 multipart 表单")

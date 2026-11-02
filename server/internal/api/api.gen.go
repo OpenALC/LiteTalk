@@ -20,6 +20,24 @@ import (
 	openapi_types "github.com/oapi-codegen/runtime/types"
 )
 
+// Defines values for ApiTokenKind.
+const (
+	ApiTokenKindBot ApiTokenKind = "bot"
+	ApiTokenKindPat ApiTokenKind = "pat"
+)
+
+// Valid indicates whether the value is a known member of the ApiTokenKind enum.
+func (e ApiTokenKind) Valid() bool {
+	switch e {
+	case ApiTokenKindBot:
+		return true
+	case ApiTokenKindPat:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for ChannelInfoType.
 const (
 	ChannelInfoTypeText  ChannelInfoType = "text"
@@ -128,6 +146,81 @@ func (e CreateConversationRequestKind) Valid() bool {
 	}
 }
 
+// Defines values for CreateTokenRequestScopes.
+const (
+	AdminRead        CreateTokenRequestScopes = "admin.read"
+	AttachmentsWrite CreateTokenRequestScopes = "attachments.write"
+	GuildManage      CreateTokenRequestScopes = "guild.manage"
+	MessagesRead     CreateTokenRequestScopes = "messages.read"
+	MessagesWrite    CreateTokenRequestScopes = "messages.write"
+	VoiceConnect     CreateTokenRequestScopes = "voice.connect"
+)
+
+// Valid indicates whether the value is a known member of the CreateTokenRequestScopes enum.
+func (e CreateTokenRequestScopes) Valid() bool {
+	switch e {
+	case AdminRead:
+		return true
+	case AttachmentsWrite:
+		return true
+	case GuildManage:
+		return true
+	case MessagesRead:
+		return true
+	case MessagesWrite:
+		return true
+	case VoiceConnect:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for CreateWebhookRequestEvents.
+const (
+	CreateWebhookRequestEventsChannelCreated CreateWebhookRequestEvents = "channel.created"
+	CreateWebhookRequestEventsChannelDeleted CreateWebhookRequestEvents = "channel.deleted"
+	CreateWebhookRequestEventsMemberJoined   CreateWebhookRequestEvents = "member.joined"
+	CreateWebhookRequestEventsMemberLeft     CreateWebhookRequestEvents = "member.left"
+	CreateWebhookRequestEventsMessageCreated CreateWebhookRequestEvents = "message.created"
+)
+
+// Valid indicates whether the value is a known member of the CreateWebhookRequestEvents enum.
+func (e CreateWebhookRequestEvents) Valid() bool {
+	switch e {
+	case CreateWebhookRequestEventsChannelCreated:
+		return true
+	case CreateWebhookRequestEventsChannelDeleted:
+		return true
+	case CreateWebhookRequestEventsMemberJoined:
+		return true
+	case CreateWebhookRequestEventsMemberLeft:
+		return true
+	case CreateWebhookRequestEventsMessageCreated:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for CreatedTokenKind.
+const (
+	CreatedTokenKindBot CreatedTokenKind = "bot"
+	CreatedTokenKindPat CreatedTokenKind = "pat"
+)
+
+// Valid indicates whether the value is a known member of the CreatedTokenKind enum.
+func (e CreatedTokenKind) Valid() bool {
+	switch e {
+	case CreatedTokenKindBot:
+		return true
+	case CreatedTokenKindPat:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for EmailCodeRequestPurpose.
 const (
 	Register EmailCodeRequestPurpose = "register"
@@ -203,9 +296,73 @@ func (e MemberInfoRole) Valid() bool {
 	}
 }
 
+// Defines values for OutboundWebhookEvents.
+const (
+	OutboundWebhookEventsChannelCreated OutboundWebhookEvents = "channel.created"
+	OutboundWebhookEventsChannelDeleted OutboundWebhookEvents = "channel.deleted"
+	OutboundWebhookEventsMemberJoined   OutboundWebhookEvents = "member.joined"
+	OutboundWebhookEventsMemberLeft     OutboundWebhookEvents = "member.left"
+	OutboundWebhookEventsMessageCreated OutboundWebhookEvents = "message.created"
+)
+
+// Valid indicates whether the value is a known member of the OutboundWebhookEvents enum.
+func (e OutboundWebhookEvents) Valid() bool {
+	switch e {
+	case OutboundWebhookEventsChannelCreated:
+		return true
+	case OutboundWebhookEventsChannelDeleted:
+		return true
+	case OutboundWebhookEventsMemberJoined:
+		return true
+	case OutboundWebhookEventsMemberLeft:
+		return true
+	case OutboundWebhookEventsMessageCreated:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for PushDevicePlatform.
+const (
+	PushDevicePlatformAndroid PushDevicePlatform = "android"
+	PushDevicePlatformIos     PushDevicePlatform = "ios"
+)
+
+// Valid indicates whether the value is a known member of the PushDevicePlatform enum.
+func (e PushDevicePlatform) Valid() bool {
+	switch e {
+	case PushDevicePlatformAndroid:
+		return true
+	case PushDevicePlatformIos:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for RegisterDeviceRequestPlatform.
+const (
+	RegisterDeviceRequestPlatformAndroid RegisterDeviceRequestPlatform = "android"
+	RegisterDeviceRequestPlatformIos     RegisterDeviceRequestPlatform = "ios"
+)
+
+// Valid indicates whether the value is a known member of the RegisterDeviceRequestPlatform enum.
+func (e RegisterDeviceRequestPlatform) Valid() bool {
+	switch e {
+	case RegisterDeviceRequestPlatformAndroid:
+		return true
+	case RegisterDeviceRequestPlatformIos:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for ServerConfigAuthMode.
 const (
 	Full   ServerConfigAuthMode = "full"
+	Oidc   ServerConfigAuthMode = "oidc"
 	Simple ServerConfigAuthMode = "simple"
 )
 
@@ -213,6 +370,8 @@ const (
 func (e ServerConfigAuthMode) Valid() bool {
 	switch e {
 	case Full:
+		return true
+	case Oidc:
 		return true
 	case Simple:
 		return true
@@ -301,6 +460,36 @@ type AddFriendRequest struct {
 	Nickname string  `json:"nickname"`
 	Tag      *string `json:"tag,omitempty"`
 }
+
+// ApiToken 个人访问令牌元数据（#54）。**永不包含明文与 secret_hash**——明文只在创建 响应出现一次。ID 为十进制字符串；prefix 为明文前缀 8 位小写 hex （有意公开，用于 UI 展示与日志关联，不是鉴权要素）。
+type ApiToken struct {
+	CreatedAt Time `json:"created_at"`
+
+	// ExpiresAt 过期时刻；null = 长期有效
+	ExpiresAt *Time `json:"expires_at,omitempty"`
+	Id        ID    `json:"id"`
+
+	// Kind pat=个人访问令牌；bot=机器人令牌（创建入口属
+	Kind ApiTokenKind `json:"kind"`
+
+	// LastUsedAt 最近使用时刻（60s 节流异步落库）
+	LastUsedAt *Time `json:"last_used_at,omitempty"`
+
+	// Name 用户可见备注（"CI 机器人"）
+	Name string `json:"name"`
+
+	// Prefix 明文前缀 8 位小写 hex（ltk_pat_<prefix>…****）
+	Prefix string `json:"prefix"`
+
+	// RevokedAt 吊销时刻；null = 未吊销
+	RevokedAt *Time `json:"revoked_at,omitempty"`
+
+	// Scopes 授权 scope 白名单子集；权限 = 角色权限 ∩ scope 映射位
+	Scopes []string `json:"scopes"`
+}
+
+// ApiTokenKind pat=个人访问令牌；bot=机器人令牌（创建入口属
+type ApiTokenKind string
 
 // Attachment 附件元数据（#41）。二进制内容不在 JSON 中；url 与 thumbnail_url 是带下载 能力凭证（key）的相对路径（/api/v1/attachments/{id}?key=...），可直接放进 img 标签，不需要 Authorization。宽高仅图片非零；thumbnail_url 仅图片给出。
 type Attachment struct {
@@ -477,6 +666,12 @@ type CreateConversationRequest struct {
 // CreateConversationRequestKind defines model for CreateConversationRequest.Kind.
 type CreateConversationRequestKind string
 
+// CreateInboundWebhookRequest 创建频道入站投递入口（#52）。
+type CreateInboundWebhookRequest struct {
+	// Description 用途备注（可空）
+	Description *string `json:"description,omitempty"`
+}
+
 // CreateInviteRequest 请求体仍需为 JSON 对象；两字段缺省按 0 处理。
 type CreateInviteRequest struct {
 	// ExpiresIn 秒；0 = 不过期
@@ -530,6 +725,50 @@ type CreateServerRequest struct {
 	// Name 2–32 字符
 	Name string `json:"name"`
 }
+
+// CreateTokenRequest defines model for CreateTokenRequest.
+type CreateTokenRequest struct {
+	// ExpiresAt 过期时刻；缺省/ null = 长期有效；须晚于当前时刻
+	ExpiresAt *Time `json:"expires_at,omitempty"`
+
+	// Name 用户可见备注
+	Name string `json:"name"`
+
+	// Scopes 授权 scope 列表；非空且不重复（空 = 无权限，明确拒绝）
+	Scopes []CreateTokenRequestScopes `json:"scopes"`
+}
+
+// CreateTokenRequestScopes defines model for CreateTokenRequest.Scopes.
+type CreateTokenRequestScopes string
+
+// CreateWebhookRequest 创建出站订阅（#52）。
+type CreateWebhookRequest struct {
+	// Events 订阅事件（白名单子集，不重复）
+	Events []CreateWebhookRequestEvents `json:"events"`
+
+	// Url 投递目标；服务端做 SSRF 校验（拒绝内网/回环/link-local/云元数据）
+	Url string `json:"url"`
+}
+
+// CreateWebhookRequestEvents defines model for CreateWebhookRequest.Events.
+type CreateWebhookRequestEvents string
+
+// CreatedToken 创建响应：元数据 + 一次性明文 token。**明文此后任何接口都不再返回**。
+type CreatedToken struct {
+	CreatedAt Time             `json:"created_at"`
+	ExpiresAt *Time            `json:"expires_at,omitempty"`
+	Id        ID               `json:"id"`
+	Kind      CreatedTokenKind `json:"kind"`
+	Name      string           `json:"name"`
+	Prefix    string           `json:"prefix"`
+	Scopes    []string         `json:"scopes"`
+
+	// Token 一次性明文 ltk_pat_<prefix8hex>_<secret>；仅此一次
+	Token string `json:"token"`
+}
+
+// CreatedTokenKind defines model for CreatedToken.Kind.
+type CreatedTokenKind string
 
 // EditMessageRequest defines model for EditMessageRequest.
 type EditMessageRequest struct {
@@ -599,6 +838,24 @@ type ICEServer struct {
 
 	// Username TURN 短期用户名（<expiry_unix>:<uid>）；STUN 条目无此字段
 	Username *string `json:"username,omitempty"`
+}
+
+// InboundDeliveryRequest 入站投递体（#52）。消息以 webhook 机器人身份落库。
+type InboundDeliveryRequest struct {
+	// Content 消息正文（与频道消息同限）
+	Content string `json:"content"`
+}
+
+// InboundWebhook 频道级入站投递入口（#52）。url 形如 /api/v1/webhooks/{id}/{secret}， 只在创建与 reset_secret（PATCH）响应出现（含一次性 secret）；列表响应 不含 secret，泄露即 PATCH reset_secret 轮换或删除重建。
+type InboundWebhook struct {
+	CreatedAt Time `json:"created_at"`
+
+	// Description 用途备注（如「CI 告警」）
+	Description string `json:"description"`
+	Id          ID     `json:"id"`
+
+	// Url 投递路径（含一次性 secret，仅创建响应）
+	Url *string `json:"url,omitempty"`
 }
 
 // Invite 邀请码。ID 为十进制字符串（#31）。
@@ -711,6 +968,51 @@ type Message struct {
 	UserId         ID      `json:"user_id"`
 }
 
+// OidcAuthorizeRequest 请求体可为空（设备类型回落 desktop）。
+type OidcAuthorizeRequest struct {
+	// Device 设备类型 desktop/mobile；空 = desktop
+	Device *string `json:"device,omitempty"`
+}
+
+// OidcAuthorizeResponse defines model for OidcAuthorizeResponse.
+type OidcAuthorizeResponse struct {
+	// Url IdP 授权页 URL（含 state 与 PKCE code_challenge）；直接重定向浏览器
+	Url string `json:"url"`
+}
+
+// OidcCallbackRequest defines model for OidcCallbackRequest.
+type OidcCallbackRequest struct {
+	// Code IdP 重定向回 redirect_url 时携带的授权码
+	Code string `json:"code"`
+
+	// State IdP 原样带回的 state（服务端一次性消费）
+	State string `json:"state"`
+}
+
+// OutboundWebhook 出站事件订阅（#52）。secret 是出站投递的 HMAC-SHA256 签名密钥（64 位 hex）， 只在创建响应或 reset_secret 的 PATCH 响应里出现一次，任何其他响应永不回传。 接收方校验签名：取 X-LiteTalk-Timestamp（unix 秒），与本地时刻相差超过 ±5 分钟即拒绝（防重放）；以共享 secret 为密钥对 "<timestamp>.<原始请求体>" 计算 HMAC-SHA256，与 X-LiteTalk-Signature 头的 sha256=<hex> 部分做常数时间比对。
+type OutboundWebhook struct {
+	CreatedAt Time `json:"created_at"`
+
+	// Disabled 是否已停用（熔断自动停用或手动停用）
+	Disabled bool `json:"disabled"`
+
+	// DisabledReason 停用原因（熔断为 consecutive_failures）；正常运行不带
+	DisabledReason *string `json:"disabled_reason,omitempty"`
+
+	// Events 订阅的事件白名单子集
+	Events []OutboundWebhookEvents `json:"events"`
+	Id     ID                      `json:"id"`
+
+	// Secret 一次性明文（仅创建 / reset_secret 的 PATCH 响应）
+	Secret *string `json:"secret,omitempty"`
+
+	// Url 投递目标（POST，application/json）
+	Url string `json:"url"`
+}
+
+// OutboundWebhookEvents defines model for OutboundWebhook.Events.
+type OutboundWebhookEvents string
+
 // PasswordResetRequest defines model for PasswordResetRequest.
 type PasswordResetRequest struct {
 	Code     string `json:"code"`
@@ -730,11 +1032,17 @@ type PatchConversationRequest = PatchConversationBody
 // PatchFriendRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null/空串 = 清除备注/ 移出分组，值 = 设置。仅发起方向可写。
 type PatchFriendRequest = PatchFriendBody
 
+// PatchInboundWebhookRequest JSON Merge Patch（RFC 7396）：入站入口只支持 reset_secret 一个可选键， 且必须为 true（空补丁/reset_secret≠true 由实现拒 400 bad_request）。 reset_secret=true 换新 secret 并只在本次响应返回投递路径（含一次性明文）， 旧 URL 立即失效。
+type PatchInboundWebhookRequest = PatchInboundWebhookBody
+
 // PatchMeRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（昵称不可清， 空值被校验拒 400），值 = 设置。部分更新（当前仅 nickname）。
 type PatchMeRequest = PatchMeBody
 
 // PatchServerRequest JSON Merge Patch（RFC 7396，#31）：缺省 = 不改，null = 清空（名称/图标 不可清，空值被校验拒 400），值 = 设置。
 type PatchServerRequest = PatchServerBody
+
+// PatchWebhookRequest JSON Merge Patch（RFC 7396，#52）：url / events / enabled / reset_secret 四个 可选键，缺省不改。reset_secret=true 换新 secret 并只在本次响应返回明文， 旧 secret 立即失效；enabled=true 手动重新启用并清零连续失败计数。
+type PatchWebhookRequest = PatchWebhookBody
 
 // Problem RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段 （RFC 9457 允许的扩展字段，至少保留一个版本）。
 type Problem struct {
@@ -772,10 +1080,37 @@ type PublicUser struct {
 	UpdatedAt Time   `json:"updated_at"`
 }
 
+// PushDevice 已注册的移动推送设备（#53）。不含 push_token——生产凭据等价物一律不回显。
+type PushDevice struct {
+	CreatedAt  Time               `json:"created_at"`
+	Id         ID                 `json:"id"`
+	LastSeenAt Time               `json:"last_seen_at"`
+	Platform   PushDevicePlatform `json:"platform"`
+}
+
+// PushDevicePlatform defines model for PushDevice.Platform.
+type PushDevicePlatform string
+
+// PushDeviceList defines model for PushDeviceList.
+type PushDeviceList struct {
+	Devices []PushDevice `json:"devices"`
+}
+
 // RefreshRequest defines model for RefreshRequest.
 type RefreshRequest struct {
 	RefreshToken string `json:"refresh_token"`
 }
+
+// RegisterDeviceRequest 设备注册（#53）。push_token 是推送通道设备凭据（FCM token / APNs token / ntfy topic）。
+type RegisterDeviceRequest struct {
+	Platform RegisterDeviceRequestPlatform `json:"platform"`
+
+	// PushToken 推送通道设备凭据；服务端只存不回显，日志一律打码。
+	PushToken string `json:"push_token"`
+}
+
+// RegisterDeviceRequestPlatform defines model for RegisterDeviceRequest.Platform.
+type RegisterDeviceRequestPlatform string
 
 // RegisterRequest defines model for RegisterRequest.
 type RegisterRequest struct {
@@ -845,6 +1180,7 @@ type ServerChannels struct {
 
 // ServerConfig defines model for ServerConfig.
 type ServerConfig struct {
+	// AuthMode full=验证码流程；simple=免验证码（私域）；oidc=仅 OIDC 登录（密码/注册入口全部关闭）
 	AuthMode ServerConfigAuthMode `json:"auth_mode"`
 
 	// BootstrapRequired 管理员邀请码未消费（注册页提示等待管理员邀请）
@@ -853,11 +1189,17 @@ type ServerConfig struct {
 	// MailConfigured 发信通道为真实投递（非 Console 打印）
 	MailConfigured bool `json:"mail_configured"`
 
+	// OidcEnabled OIDC 登录已启用（LITETALK_OIDC_* 配置完整；false 时 /auth/oidc/* 返回 404，前端不显示 OIDC 按钮）
+	OidcEnabled *bool `json:"oidc_enabled,omitempty"`
+
+	// PushEnabled 移动推送已启用（LITETALK_PUSH_PROVIDER 配置了可用通道；false 时 /devices 仍可注册，仅不派发）
+	PushEnabled *bool `json:"push_enabled,omitempty"`
+
 	// SelfHost 一键自托管形态（SQLite/进程内单机部署）
 	SelfHost bool `json:"self_host"`
 }
 
-// ServerConfigAuthMode defines model for ServerConfig.AuthMode.
+// ServerConfigAuthMode full=验证码流程；simple=免验证码（私域）；oidc=仅 OIDC 登录（密码/注册入口全部关闭）
 type ServerConfigAuthMode string
 
 // ServerInfo 服务器（群组）。图标为预设 Lucide 图标名 + 颜色，无图片。ID 为十进制字符串（#31）。
@@ -1001,6 +1343,9 @@ type IDPath = int64
 // MessageIDPath defines model for MessageIDPath.
 type MessageIDPath = int64
 
+// SecretPath defines model for SecretPath.
+type SecretPath = string
+
 // TargetIDPath defines model for TargetIDPath.
 type TargetIDPath = int64
 
@@ -1009,6 +1354,9 @@ type TargetTypePath string
 
 // UserIDPath defines model for UserIDPath.
 type UserIDPath = int64
+
+// WebhookIDPath defines model for WebhookIDPath.
+type WebhookIDPath = int64
 
 // BadRequest RFC 9457 问题详情（application/problem+json，#31）。code 为扩展字段 （机器可读错误码，客户端依赖，字符串码与旧版一致）；detail 为本次出错 的中文提示。message 与 detail 同值，是兼容旧客户端的提示字段 （RFC 9457 允许的扩展字段，至少保留一个版本）。
 type BadRequest = Problem
@@ -1143,6 +1491,12 @@ type LoginJSONRequestBody = LoginRequest
 // LogoutJSONRequestBody defines body for Logout for application/json ContentType.
 type LogoutJSONRequestBody = LogoutRequest
 
+// OidcAuthorizeJSONRequestBody defines body for OidcAuthorize for application/json ContentType.
+type OidcAuthorizeJSONRequestBody = OidcAuthorizeRequest
+
+// OidcCallbackJSONRequestBody defines body for OidcCallback for application/json ContentType.
+type OidcCallbackJSONRequestBody = OidcCallbackRequest
+
 // ResetPasswordJSONRequestBody defines body for ResetPassword for application/json ContentType.
 type ResetPasswordJSONRequestBody = PasswordResetRequest
 
@@ -1163,6 +1517,15 @@ type PatchChannelJSONRequestBody = PatchChannelRequest
 
 // PatchChannelApplicationMergePatchPlusJSONRequestBody defines body for PatchChannel for application/merge-patch+json ContentType.
 type PatchChannelApplicationMergePatchPlusJSONRequestBody = PatchChannelRequest
+
+// CreateInboundWebhookJSONRequestBody defines body for CreateInboundWebhook for application/json ContentType.
+type CreateInboundWebhookJSONRequestBody = CreateInboundWebhookRequest
+
+// PatchInboundWebhookJSONRequestBody defines body for PatchInboundWebhook for application/json ContentType.
+type PatchInboundWebhookJSONRequestBody = PatchInboundWebhookRequest
+
+// PatchInboundWebhookApplicationMergePatchPlusJSONRequestBody defines body for PatchInboundWebhook for application/merge-patch+json ContentType.
+type PatchInboundWebhookApplicationMergePatchPlusJSONRequestBody = PatchInboundWebhookRequest
 
 // SetServerMutedJSONRequestBody defines body for SetServerMuted for application/json ContentType.
 type SetServerMutedJSONRequestBody = ServerMuteRequest
@@ -1190,6 +1553,9 @@ type PatchConversationApplicationMergePatchPlusJSONRequestBody = PatchConversati
 
 // AddConversationMembersJSONRequestBody defines body for AddConversationMembers for application/json ContentType.
 type AddConversationMembersJSONRequestBody = AddConversationMembersRequest
+
+// RegisterDeviceJSONRequestBody defines body for RegisterDevice for application/json ContentType.
+type RegisterDeviceJSONRequestBody = RegisterDeviceRequest
 
 // CreateFriendRequestJSONRequestBody defines body for CreateFriendRequest for application/json ContentType.
 type CreateFriendRequestJSONRequestBody = AddFriendRequest
@@ -1230,11 +1596,26 @@ type SetMemberRolesJSONRequestBody = SetMemberRolesRequest
 // CreateRoleJSONRequestBody defines body for CreateRole for application/json ContentType.
 type CreateRoleJSONRequestBody = CreateRoleRequest
 
+// CreateServerWebhookJSONRequestBody defines body for CreateServerWebhook for application/json ContentType.
+type CreateServerWebhookJSONRequestBody = CreateWebhookRequest
+
+// PatchServerWebhookJSONRequestBody defines body for PatchServerWebhook for application/json ContentType.
+type PatchServerWebhookJSONRequestBody = PatchWebhookRequest
+
+// PatchServerWebhookApplicationMergePatchPlusJSONRequestBody defines body for PatchServerWebhook for application/merge-patch+json ContentType.
+type PatchServerWebhookApplicationMergePatchPlusJSONRequestBody = PatchWebhookRequest
+
+// CreateTokenJSONRequestBody defines body for CreateToken for application/json ContentType.
+type CreateTokenJSONRequestBody = CreateTokenRequest
+
 // PatchMeJSONRequestBody defines body for PatchMe for application/json ContentType.
 type PatchMeJSONRequestBody = PatchMeRequest
 
 // PatchMeApplicationMergePatchPlusJSONRequestBody defines body for PatchMe for application/merge-patch+json ContentType.
 type PatchMeApplicationMergePatchPlusJSONRequestBody = PatchMeRequest
+
+// DeliverInboundWebhookJSONRequestBody defines body for DeliverInboundWebhook for application/json ContentType.
+type DeliverInboundWebhookJSONRequestBody = InboundDeliveryRequest
 
 // ServerInterface represents all server handlers.
 type ServerInterface interface {
@@ -1259,6 +1640,12 @@ type ServerInterface interface {
 	// Logout 登出并吊销 refresh_token
 	// (POST /api/v1/auth/logout)
 	Logout(w http.ResponseWriter, r *http.Request)
+	// OidcAuthorize 发起 OIDC 登录（返回 IdP 授权页 URL）
+	// (POST /api/v1/auth/oidc/authorize)
+	OidcAuthorize(w http.ResponseWriter, r *http.Request)
+	// OidcCallback OIDC 回调（code+state 换本地令牌对）
+	// (POST /api/v1/auth/oidc/callback)
+	OidcCallback(w http.ResponseWriter, r *http.Request)
 	// ResetPassword 邮箱验证码重置密码
 	// (POST /api/v1/auth/password/reset)
 	ResetPassword(w http.ResponseWriter, r *http.Request)
@@ -1280,6 +1667,18 @@ type ServerInterface interface {
 	// PatchChannel 改频道（owner/admin）
 	// (PATCH /api/v1/channels/{id})
 	PatchChannel(w http.ResponseWriter, r *http.Request, id IDPath)
+	// ListInboundWebhooks 频道入站 Webhook 列表（ManageChannels）
+	// (GET /api/v1/channels/{id}/inbound-webhooks)
+	ListInboundWebhooks(w http.ResponseWriter, r *http.Request, id IDPath)
+	// CreateInboundWebhook 创建频道入站 Webhook（ManageChannels；响应含一次性投递 URL）
+	// (POST /api/v1/channels/{id}/inbound-webhooks)
+	CreateInboundWebhook(w http.ResponseWriter, r *http.Request, id IDPath)
+	// DeleteInboundWebhook 删除入站 Webhook（ManageChannels）
+	// (DELETE /api/v1/channels/{id}/inbound-webhooks/{wid})
+	DeleteInboundWebhook(w http.ResponseWriter, r *http.Request, id IDPath, wid WebhookIDPath)
+	// PatchInboundWebhook 轮换入站 Webhook secret（ManageChannels；Merge Patch）
+	// (PATCH /api/v1/channels/{id}/inbound-webhooks/{wid})
+	PatchInboundWebhook(w http.ResponseWriter, r *http.Request, id IDPath, wid WebhookIDPath)
 	// SetServerMuted 服务端强制闭麦/解禁（需 MuteMembers，#36）
 	// (PUT /api/v1/channels/{id}/members/{user_id}/server-mute)
 	SetServerMuted(w http.ResponseWriter, r *http.Request, id IDPath, userId UserIDPath)
@@ -1337,6 +1736,15 @@ type ServerInterface interface {
 	// RemoveConversationMember 移除/退出群聊成员
 	// (DELETE /api/v1/conversations/{id}/members/{user_id})
 	RemoveConversationMember(w http.ResponseWriter, r *http.Request, id IDPath, userId UserIDPath)
+	// ListDevices 列出自己的推送设备
+	// (GET /api/v1/devices)
+	ListDevices(w http.ResponseWriter, r *http.Request)
+	// RegisterDevice 注册推送设备（同 push_token 幂等更新）
+	// (POST /api/v1/devices)
+	RegisterDevice(w http.ResponseWriter, r *http.Request)
+	// DeleteDevice 注销推送设备
+	// (DELETE /api/v1/devices/{id})
+	DeleteDevice(w http.ResponseWriter, r *http.Request, id IDPath)
 	// ListFriends 好友与好友请求列表
 	// (GET /api/v1/friends)
 	ListFriends(w http.ResponseWriter, r *http.Request)
@@ -1412,9 +1820,30 @@ type ServerInterface interface {
 	// CreateRole 创建自定义角色（需 ManageRoles，#35 B4）
 	// (POST /api/v1/servers/{id}/roles)
 	CreateRole(w http.ResponseWriter, r *http.Request, id IDPath)
+	// ListServerWebhooks 出站 Webhook 订阅列表（ManageServer）
+	// (GET /api/v1/servers/{id}/webhooks)
+	ListServerWebhooks(w http.ResponseWriter, r *http.Request, id IDPath)
+	// CreateServerWebhook 创建出站订阅（ManageServer；响应含一次性 secret）
+	// (POST /api/v1/servers/{id}/webhooks)
+	CreateServerWebhook(w http.ResponseWriter, r *http.Request, id IDPath)
+	// DeleteServerWebhook 删除出站订阅（ManageServer）
+	// (DELETE /api/v1/servers/{id}/webhooks/{wid})
+	DeleteServerWebhook(w http.ResponseWriter, r *http.Request, id IDPath, wid WebhookIDPath)
+	// PatchServerWebhook 改出站订阅（ManageServer；Merge Patch）
+	// (PATCH /api/v1/servers/{id}/webhooks/{wid})
+	PatchServerWebhook(w http.ResponseWriter, r *http.Request, id IDPath, wid WebhookIDPath)
 	// GetSync 事件续传失败后的聚合快照
 	// (GET /api/v1/sync)
 	GetSync(w http.ResponseWriter, r *http.Request)
+	// ListTokens 当前用户的令牌列表（只含元数据）
+	// (GET /api/v1/tokens)
+	ListTokens(w http.ResponseWriter, r *http.Request)
+	// CreateToken 创建个人访问令牌（响应含一次性明文）
+	// (POST /api/v1/tokens)
+	CreateToken(w http.ResponseWriter, r *http.Request)
+	// RevokeToken 吊销令牌（立即生效）
+	// (DELETE /api/v1/tokens/{id})
+	RevokeToken(w http.ResponseWriter, r *http.Request, id IDPath)
 	// ListUnreads 全部可见频道与服务器的未读/提及计数
 	// (GET /api/v1/unreads)
 	ListUnreads(w http.ResponseWriter, r *http.Request)
@@ -1424,6 +1853,9 @@ type ServerInterface interface {
 	// PatchMe 改昵称（无头像字段）
 	// (PATCH /api/v1/users/me)
 	PatchMe(w http.ResponseWriter, r *http.Request)
+	// DeliverInboundWebhook 入站投递入口（免鉴权；全服务唯一免 Bearer 端点）
+	// (POST /api/v1/webhooks/{id}/{secret})
+	DeliverInboundWebhook(w http.ResponseWriter, r *http.Request, id IDPath, secret SecretPath)
 }
 
 // ServerInterfaceWrapper converts contexts to parameters.
@@ -1589,6 +2021,34 @@ func (siw *ServerInterfaceWrapper) Logout(w http.ResponseWriter, r *http.Request
 	handler.ServeHTTP(w, r)
 }
 
+// OidcAuthorize operation middleware
+func (siw *ServerInterfaceWrapper) OidcAuthorize(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.OidcAuthorize(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// OidcCallback operation middleware
+func (siw *ServerInterfaceWrapper) OidcCallback(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.OidcCallback(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 // ResetPassword operation middleware
 func (siw *ServerInterfaceWrapper) ResetPassword(w http.ResponseWriter, r *http.Request) {
 
@@ -1742,6 +2202,128 @@ func (siw *ServerInterfaceWrapper) PatchChannel(w http.ResponseWriter, r *http.R
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.PatchChannel(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListInboundWebhooks operation middleware
+func (siw *ServerInterfaceWrapper) ListInboundWebhooks(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListInboundWebhooks(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// CreateInboundWebhook operation middleware
+func (siw *ServerInterfaceWrapper) CreateInboundWebhook(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.CreateInboundWebhook(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// DeleteInboundWebhook operation middleware
+func (siw *ServerInterfaceWrapper) DeleteInboundWebhook(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "wid" -------------
+	var wid WebhookIDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "wid", r.PathValue("wid"), &wid, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "wid", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.DeleteInboundWebhook(w, r, id, wid)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// PatchInboundWebhook operation middleware
+func (siw *ServerInterfaceWrapper) PatchInboundWebhook(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "wid" -------------
+	var wid WebhookIDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "wid", r.PathValue("wid"), &wid, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "wid", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.PatchInboundWebhook(w, r, id, wid)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -2336,6 +2918,60 @@ func (siw *ServerInterfaceWrapper) RemoveConversationMember(w http.ResponseWrite
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.RemoveConversationMember(w, r, id, userId)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListDevices operation middleware
+func (siw *ServerInterfaceWrapper) ListDevices(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListDevices(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// RegisterDevice operation middleware
+func (siw *ServerInterfaceWrapper) RegisterDevice(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.RegisterDevice(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// DeleteDevice operation middleware
+func (siw *ServerInterfaceWrapper) DeleteDevice(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.DeleteDevice(w, r, id)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -3024,11 +3660,187 @@ func (siw *ServerInterfaceWrapper) CreateRole(w http.ResponseWriter, r *http.Req
 	handler.ServeHTTP(w, r)
 }
 
+// ListServerWebhooks operation middleware
+func (siw *ServerInterfaceWrapper) ListServerWebhooks(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListServerWebhooks(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// CreateServerWebhook operation middleware
+func (siw *ServerInterfaceWrapper) CreateServerWebhook(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.CreateServerWebhook(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// DeleteServerWebhook operation middleware
+func (siw *ServerInterfaceWrapper) DeleteServerWebhook(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "wid" -------------
+	var wid WebhookIDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "wid", r.PathValue("wid"), &wid, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "wid", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.DeleteServerWebhook(w, r, id, wid)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// PatchServerWebhook operation middleware
+func (siw *ServerInterfaceWrapper) PatchServerWebhook(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "wid" -------------
+	var wid WebhookIDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "wid", r.PathValue("wid"), &wid, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "wid", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.PatchServerWebhook(w, r, id, wid)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 // GetSync operation middleware
 func (siw *ServerInterfaceWrapper) GetSync(w http.ResponseWriter, r *http.Request) {
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.GetSync(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListTokens operation middleware
+func (siw *ServerInterfaceWrapper) ListTokens(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListTokens(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// CreateToken operation middleware
+func (siw *ServerInterfaceWrapper) CreateToken(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.CreateToken(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// RevokeToken operation middleware
+func (siw *ServerInterfaceWrapper) RevokeToken(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.RevokeToken(w, r, id)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -3071,6 +3883,41 @@ func (siw *ServerInterfaceWrapper) PatchMe(w http.ResponseWriter, r *http.Reques
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.PatchMe(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// DeliverInboundWebhook operation middleware
+func (siw *ServerInterfaceWrapper) DeliverInboundWebhook(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id IDPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "integer", Format: "int64", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "secret" -------------
+	var secret SecretPath
+
+	err = runtime.BindStyledParameterWithOptions("simple", "secret", r.PathValue("secret"), &secret, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "secret", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.DeliverInboundWebhook(w, r, id, secret)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -3209,6 +4056,8 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/auth/logout", wrapper.Logout)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/auth/email-code", wrapper.SendEmailCode)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/auth/guest", wrapper.GuestLogin)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/auth/oidc/authorize", wrapper.OidcAuthorize)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/auth/oidc/callback", wrapper.OidcCallback)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/auth/password/reset", wrapper.ResetPassword)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/users/me", wrapper.GetMe)
 	m.HandleFunc(http.MethodPatch+" "+options.BaseURL+"/api/v1/users/me", wrapper.PatchMe)
@@ -3262,6 +4111,21 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/attachments", wrapper.UploadAttachment)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/attachments/{id}", wrapper.DownloadAttachment)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/attachments/{id}/thumbnail", wrapper.DownloadAttachmentThumbnail)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/tokens", wrapper.ListTokens)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/tokens", wrapper.CreateToken)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/devices", wrapper.ListDevices)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/devices", wrapper.RegisterDevice)
+	m.HandleFunc(http.MethodDelete+" "+options.BaseURL+"/api/v1/tokens/{id}", wrapper.RevokeToken)
+	m.HandleFunc(http.MethodDelete+" "+options.BaseURL+"/api/v1/devices/{id}", wrapper.DeleteDevice)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/servers/{id}/webhooks", wrapper.ListServerWebhooks)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/servers/{id}/webhooks", wrapper.CreateServerWebhook)
+	m.HandleFunc(http.MethodDelete+" "+options.BaseURL+"/api/v1/servers/{id}/webhooks/{wid}", wrapper.DeleteServerWebhook)
+	m.HandleFunc(http.MethodPatch+" "+options.BaseURL+"/api/v1/servers/{id}/webhooks/{wid}", wrapper.PatchServerWebhook)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/api/v1/channels/{id}/inbound-webhooks", wrapper.ListInboundWebhooks)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/channels/{id}/inbound-webhooks", wrapper.CreateInboundWebhook)
+	m.HandleFunc(http.MethodDelete+" "+options.BaseURL+"/api/v1/channels/{id}/inbound-webhooks/{wid}", wrapper.DeleteInboundWebhook)
+	m.HandleFunc(http.MethodPatch+" "+options.BaseURL+"/api/v1/channels/{id}/inbound-webhooks/{wid}", wrapper.PatchInboundWebhook)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/api/v1/webhooks/{id}/{secret}", wrapper.DeliverInboundWebhook)
 
 	return m
 }
@@ -3966,6 +4830,212 @@ type LogoutdefaultApplicationProblemPlusJSONResponse struct {
 }
 
 func (response LogoutdefaultApplicationProblemPlusJSONResponse) VisitLogoutResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OidcAuthorizeRequestObject struct {
+	Body *OidcAuthorizeJSONRequestBody
+}
+
+type OidcAuthorizeResponseObject interface {
+	VisitOidcAuthorizeResponse(w http.ResponseWriter) error
+}
+
+type OidcAuthorize200JSONResponse OidcAuthorizeResponse
+
+func (response OidcAuthorize200JSONResponse) VisitOidcAuthorizeResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OidcAuthorize400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response OidcAuthorize400ApplicationProblemPlusJSONResponse) VisitOidcAuthorizeResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OidcAuthorize404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response OidcAuthorize404ApplicationProblemPlusJSONResponse) VisitOidcAuthorizeResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OidcAuthorize426ApplicationProblemPlusJSONResponse struct {
+	ClientUpgradeRequiredApplicationProblemPlusJSONResponse
+}
+
+func (response OidcAuthorize426ApplicationProblemPlusJSONResponse) VisitOidcAuthorizeResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(426)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OidcAuthorize429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response OidcAuthorize429ApplicationProblemPlusJSONResponse) VisitOidcAuthorizeResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OidcAuthorizedefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response OidcAuthorizedefaultApplicationProblemPlusJSONResponse) VisitOidcAuthorizeResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OidcCallbackRequestObject struct {
+	Body *OidcCallbackJSONRequestBody
+}
+
+type OidcCallbackResponseObject interface {
+	VisitOidcCallbackResponse(w http.ResponseWriter) error
+}
+
+type OidcCallback200JSONResponse TokenPair
+
+func (response OidcCallback200JSONResponse) VisitOidcCallbackResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OidcCallback400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response OidcCallback400ApplicationProblemPlusJSONResponse) VisitOidcCallbackResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OidcCallback404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response OidcCallback404ApplicationProblemPlusJSONResponse) VisitOidcCallbackResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OidcCallback426ApplicationProblemPlusJSONResponse struct {
+	ClientUpgradeRequiredApplicationProblemPlusJSONResponse
+}
+
+func (response OidcCallback426ApplicationProblemPlusJSONResponse) VisitOidcCallbackResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(426)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OidcCallback429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response OidcCallback429ApplicationProblemPlusJSONResponse) VisitOidcCallbackResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OidcCallbackdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response OidcCallbackdefaultApplicationProblemPlusJSONResponse) VisitOidcCallbackResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
@@ -4708,6 +5778,471 @@ type PatchChanneldefaultApplicationProblemPlusJSONResponse struct {
 }
 
 func (response PatchChanneldefaultApplicationProblemPlusJSONResponse) VisitPatchChannelResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInboundWebhooksRequestObject struct {
+	Id IDPath `json:"id"`
+}
+
+type ListInboundWebhooksResponseObject interface {
+	VisitListInboundWebhooksResponse(w http.ResponseWriter) error
+}
+
+type ListInboundWebhooks200JSONResponse []InboundWebhook
+
+func (response ListInboundWebhooks200JSONResponse) VisitListInboundWebhooksResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInboundWebhooks400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response ListInboundWebhooks400ApplicationProblemPlusJSONResponse) VisitListInboundWebhooksResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInboundWebhooks401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response ListInboundWebhooks401ApplicationProblemPlusJSONResponse) VisitListInboundWebhooksResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInboundWebhooks403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response ListInboundWebhooks403ApplicationProblemPlusJSONResponse) VisitListInboundWebhooksResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInboundWebhooks404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response ListInboundWebhooks404ApplicationProblemPlusJSONResponse) VisitListInboundWebhooksResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInboundWebhooksdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response ListInboundWebhooksdefaultApplicationProblemPlusJSONResponse) VisitListInboundWebhooksResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInboundWebhookRequestObject struct {
+	Id   IDPath `json:"id"`
+	Body *CreateInboundWebhookJSONRequestBody
+}
+
+type CreateInboundWebhookResponseObject interface {
+	VisitCreateInboundWebhookResponse(w http.ResponseWriter) error
+}
+
+type CreateInboundWebhook201JSONResponse InboundWebhook
+
+func (response CreateInboundWebhook201JSONResponse) VisitCreateInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(201)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInboundWebhook400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response CreateInboundWebhook400ApplicationProblemPlusJSONResponse) VisitCreateInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInboundWebhook401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response CreateInboundWebhook401ApplicationProblemPlusJSONResponse) VisitCreateInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInboundWebhook403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response CreateInboundWebhook403ApplicationProblemPlusJSONResponse) VisitCreateInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInboundWebhook404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response CreateInboundWebhook404ApplicationProblemPlusJSONResponse) VisitCreateInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInboundWebhook429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response CreateInboundWebhook429ApplicationProblemPlusJSONResponse) VisitCreateInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInboundWebhookdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response CreateInboundWebhookdefaultApplicationProblemPlusJSONResponse) VisitCreateInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteInboundWebhookRequestObject struct {
+	Id  IDPath        `json:"id"`
+	Wid WebhookIDPath `json:"wid"`
+}
+
+type DeleteInboundWebhookResponseObject interface {
+	VisitDeleteInboundWebhookResponse(w http.ResponseWriter) error
+}
+
+type DeleteInboundWebhook200JSONResponse StatusOk
+
+func (response DeleteInboundWebhook200JSONResponse) VisitDeleteInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteInboundWebhook400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteInboundWebhook400ApplicationProblemPlusJSONResponse) VisitDeleteInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteInboundWebhook401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteInboundWebhook401ApplicationProblemPlusJSONResponse) VisitDeleteInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteInboundWebhook403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteInboundWebhook403ApplicationProblemPlusJSONResponse) VisitDeleteInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteInboundWebhook404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteInboundWebhook404ApplicationProblemPlusJSONResponse) VisitDeleteInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteInboundWebhook429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteInboundWebhook429ApplicationProblemPlusJSONResponse) VisitDeleteInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteInboundWebhookdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response DeleteInboundWebhookdefaultApplicationProblemPlusJSONResponse) VisitDeleteInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchInboundWebhookRequestObject struct {
+	Id                                IDPath        `json:"id"`
+	Wid                               WebhookIDPath `json:"wid"`
+	JSONBody                          *PatchInboundWebhookJSONRequestBody
+	ApplicationMergePatchPlusJSONBody *PatchInboundWebhookApplicationMergePatchPlusJSONRequestBody
+}
+
+type PatchInboundWebhookResponseObject interface {
+	VisitPatchInboundWebhookResponse(w http.ResponseWriter) error
+}
+
+type PatchInboundWebhook200JSONResponse InboundWebhook
+
+func (response PatchInboundWebhook200JSONResponse) VisitPatchInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchInboundWebhook400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response PatchInboundWebhook400ApplicationProblemPlusJSONResponse) VisitPatchInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchInboundWebhook401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response PatchInboundWebhook401ApplicationProblemPlusJSONResponse) VisitPatchInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchInboundWebhook403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response PatchInboundWebhook403ApplicationProblemPlusJSONResponse) VisitPatchInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchInboundWebhook404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response PatchInboundWebhook404ApplicationProblemPlusJSONResponse) VisitPatchInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchInboundWebhook429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response PatchInboundWebhook429ApplicationProblemPlusJSONResponse) VisitPatchInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchInboundWebhookdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response PatchInboundWebhookdefaultApplicationProblemPlusJSONResponse) VisitPatchInboundWebhookResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
@@ -6656,6 +8191,216 @@ type RemoveConversationMemberdefaultApplicationProblemPlusJSONResponse struct {
 }
 
 func (response RemoveConversationMemberdefaultApplicationProblemPlusJSONResponse) VisitRemoveConversationMemberResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListDevicesRequestObject struct {
+}
+
+type ListDevicesResponseObject interface {
+	VisitListDevicesResponse(w http.ResponseWriter) error
+}
+
+type ListDevices200JSONResponse PushDeviceList
+
+func (response ListDevices200JSONResponse) VisitListDevicesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListDevicesdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response ListDevicesdefaultApplicationProblemPlusJSONResponse) VisitListDevicesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RegisterDeviceRequestObject struct {
+	Body *RegisterDeviceJSONRequestBody
+}
+
+type RegisterDeviceResponseObject interface {
+	VisitRegisterDeviceResponse(w http.ResponseWriter) error
+}
+
+type RegisterDevice200JSONResponse PushDevice
+
+func (response RegisterDevice200JSONResponse) VisitRegisterDeviceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RegisterDevice201JSONResponse PushDevice
+
+func (response RegisterDevice201JSONResponse) VisitRegisterDeviceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(201)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RegisterDevice400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response RegisterDevice400ApplicationProblemPlusJSONResponse) VisitRegisterDeviceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RegisterDevice429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response RegisterDevice429ApplicationProblemPlusJSONResponse) VisitRegisterDeviceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RegisterDevicedefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response RegisterDevicedefaultApplicationProblemPlusJSONResponse) VisitRegisterDeviceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteDeviceRequestObject struct {
+	Id IDPath `json:"id"`
+}
+
+type DeleteDeviceResponseObject interface {
+	VisitDeleteDeviceResponse(w http.ResponseWriter) error
+}
+
+type DeleteDevice200JSONResponse StatusOk
+
+func (response DeleteDevice200JSONResponse) VisitDeleteDeviceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteDevice400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteDevice400ApplicationProblemPlusJSONResponse) VisitDeleteDeviceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteDevice404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteDevice404ApplicationProblemPlusJSONResponse) VisitDeleteDeviceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteDevice429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteDevice429ApplicationProblemPlusJSONResponse) VisitDeleteDeviceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteDevicedefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response DeleteDevicedefaultApplicationProblemPlusJSONResponse) VisitDeleteDeviceResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
@@ -8978,6 +10723,471 @@ func (response CreateRoledefaultApplicationProblemPlusJSONResponse) VisitCreateR
 	return err
 }
 
+type ListServerWebhooksRequestObject struct {
+	Id IDPath `json:"id"`
+}
+
+type ListServerWebhooksResponseObject interface {
+	VisitListServerWebhooksResponse(w http.ResponseWriter) error
+}
+
+type ListServerWebhooks200JSONResponse []OutboundWebhook
+
+func (response ListServerWebhooks200JSONResponse) VisitListServerWebhooksResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListServerWebhooks400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response ListServerWebhooks400ApplicationProblemPlusJSONResponse) VisitListServerWebhooksResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListServerWebhooks401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response ListServerWebhooks401ApplicationProblemPlusJSONResponse) VisitListServerWebhooksResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListServerWebhooks403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response ListServerWebhooks403ApplicationProblemPlusJSONResponse) VisitListServerWebhooksResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListServerWebhooks404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response ListServerWebhooks404ApplicationProblemPlusJSONResponse) VisitListServerWebhooksResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListServerWebhooksdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response ListServerWebhooksdefaultApplicationProblemPlusJSONResponse) VisitListServerWebhooksResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateServerWebhookRequestObject struct {
+	Id   IDPath `json:"id"`
+	Body *CreateServerWebhookJSONRequestBody
+}
+
+type CreateServerWebhookResponseObject interface {
+	VisitCreateServerWebhookResponse(w http.ResponseWriter) error
+}
+
+type CreateServerWebhook201JSONResponse OutboundWebhook
+
+func (response CreateServerWebhook201JSONResponse) VisitCreateServerWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(201)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateServerWebhook400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response CreateServerWebhook400ApplicationProblemPlusJSONResponse) VisitCreateServerWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateServerWebhook401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response CreateServerWebhook401ApplicationProblemPlusJSONResponse) VisitCreateServerWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateServerWebhook403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response CreateServerWebhook403ApplicationProblemPlusJSONResponse) VisitCreateServerWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateServerWebhook404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response CreateServerWebhook404ApplicationProblemPlusJSONResponse) VisitCreateServerWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateServerWebhook429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response CreateServerWebhook429ApplicationProblemPlusJSONResponse) VisitCreateServerWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateServerWebhookdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response CreateServerWebhookdefaultApplicationProblemPlusJSONResponse) VisitCreateServerWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteServerWebhookRequestObject struct {
+	Id  IDPath        `json:"id"`
+	Wid WebhookIDPath `json:"wid"`
+}
+
+type DeleteServerWebhookResponseObject interface {
+	VisitDeleteServerWebhookResponse(w http.ResponseWriter) error
+}
+
+type DeleteServerWebhook200JSONResponse StatusOk
+
+func (response DeleteServerWebhook200JSONResponse) VisitDeleteServerWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteServerWebhook400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteServerWebhook400ApplicationProblemPlusJSONResponse) VisitDeleteServerWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteServerWebhook401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteServerWebhook401ApplicationProblemPlusJSONResponse) VisitDeleteServerWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteServerWebhook403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteServerWebhook403ApplicationProblemPlusJSONResponse) VisitDeleteServerWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteServerWebhook404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteServerWebhook404ApplicationProblemPlusJSONResponse) VisitDeleteServerWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteServerWebhook429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response DeleteServerWebhook429ApplicationProblemPlusJSONResponse) VisitDeleteServerWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteServerWebhookdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response DeleteServerWebhookdefaultApplicationProblemPlusJSONResponse) VisitDeleteServerWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchServerWebhookRequestObject struct {
+	Id                                IDPath        `json:"id"`
+	Wid                               WebhookIDPath `json:"wid"`
+	JSONBody                          *PatchServerWebhookJSONRequestBody
+	ApplicationMergePatchPlusJSONBody *PatchServerWebhookApplicationMergePatchPlusJSONRequestBody
+}
+
+type PatchServerWebhookResponseObject interface {
+	VisitPatchServerWebhookResponse(w http.ResponseWriter) error
+}
+
+type PatchServerWebhook200JSONResponse OutboundWebhook
+
+func (response PatchServerWebhook200JSONResponse) VisitPatchServerWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchServerWebhook400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response PatchServerWebhook400ApplicationProblemPlusJSONResponse) VisitPatchServerWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchServerWebhook401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response PatchServerWebhook401ApplicationProblemPlusJSONResponse) VisitPatchServerWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchServerWebhook403ApplicationProblemPlusJSONResponse struct {
+	ForbiddenApplicationProblemPlusJSONResponse
+}
+
+func (response PatchServerWebhook403ApplicationProblemPlusJSONResponse) VisitPatchServerWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchServerWebhook404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response PatchServerWebhook404ApplicationProblemPlusJSONResponse) VisitPatchServerWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchServerWebhook429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response PatchServerWebhook429ApplicationProblemPlusJSONResponse) VisitPatchServerWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PatchServerWebhookdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response PatchServerWebhookdefaultApplicationProblemPlusJSONResponse) VisitPatchServerWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
 type GetSyncRequestObject struct {
 }
 
@@ -9021,6 +11231,250 @@ type GetSyncdefaultApplicationProblemPlusJSONResponse struct {
 }
 
 func (response GetSyncdefaultApplicationProblemPlusJSONResponse) VisitGetSyncResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListTokensRequestObject struct {
+}
+
+type ListTokensResponseObject interface {
+	VisitListTokensResponse(w http.ResponseWriter) error
+}
+
+type ListTokens200JSONResponse []ApiToken
+
+func (response ListTokens200JSONResponse) VisitListTokensResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListTokens401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response ListTokens401ApplicationProblemPlusJSONResponse) VisitListTokensResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListTokensdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response ListTokensdefaultApplicationProblemPlusJSONResponse) VisitListTokensResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateTokenRequestObject struct {
+	Body *CreateTokenJSONRequestBody
+}
+
+type CreateTokenResponseObject interface {
+	VisitCreateTokenResponse(w http.ResponseWriter) error
+}
+
+type CreateToken201JSONResponse CreatedToken
+
+func (response CreateToken201JSONResponse) VisitCreateTokenResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(201)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateToken400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response CreateToken400ApplicationProblemPlusJSONResponse) VisitCreateTokenResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateToken401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response CreateToken401ApplicationProblemPlusJSONResponse) VisitCreateTokenResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateToken429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response CreateToken429ApplicationProblemPlusJSONResponse) VisitCreateTokenResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateTokendefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response CreateTokendefaultApplicationProblemPlusJSONResponse) VisitCreateTokenResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RevokeTokenRequestObject struct {
+	Id IDPath `json:"id"`
+}
+
+type RevokeTokenResponseObject interface {
+	VisitRevokeTokenResponse(w http.ResponseWriter) error
+}
+
+type RevokeToken200JSONResponse StatusOk
+
+func (response RevokeToken200JSONResponse) VisitRevokeTokenResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RevokeToken400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response RevokeToken400ApplicationProblemPlusJSONResponse) VisitRevokeTokenResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RevokeToken401ApplicationProblemPlusJSONResponse struct {
+	UnauthorizedApplicationProblemPlusJSONResponse
+}
+
+func (response RevokeToken401ApplicationProblemPlusJSONResponse) VisitRevokeTokenResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RevokeToken404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response RevokeToken404ApplicationProblemPlusJSONResponse) VisitRevokeTokenResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RevokeToken429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response RevokeToken429ApplicationProblemPlusJSONResponse) VisitRevokeTokenResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RevokeTokendefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response RevokeTokendefaultApplicationProblemPlusJSONResponse) VisitRevokeTokenResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
@@ -9244,6 +11698,95 @@ func (response PatchMedefaultApplicationProblemPlusJSONResponse) VisitPatchMeRes
 	return err
 }
 
+type DeliverInboundWebhookRequestObject struct {
+	Id     IDPath     `json:"id"`
+	Secret SecretPath `json:"secret"`
+	Body   *DeliverInboundWebhookJSONRequestBody
+}
+
+type DeliverInboundWebhookResponseObject interface {
+	VisitDeliverInboundWebhookResponse(w http.ResponseWriter) error
+}
+
+type DeliverInboundWebhook200JSONResponse StatusOk
+
+func (response DeliverInboundWebhook200JSONResponse) VisitDeliverInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeliverInboundWebhook400ApplicationProblemPlusJSONResponse struct {
+	BadRequestApplicationProblemPlusJSONResponse
+}
+
+func (response DeliverInboundWebhook400ApplicationProblemPlusJSONResponse) VisitDeliverInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeliverInboundWebhook404ApplicationProblemPlusJSONResponse struct {
+	NotFoundApplicationProblemPlusJSONResponse
+}
+
+func (response DeliverInboundWebhook404ApplicationProblemPlusJSONResponse) VisitDeliverInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeliverInboundWebhook429ApplicationProblemPlusJSONResponse struct {
+	RateLimitedApplicationProblemPlusJSONResponse
+}
+
+func (response DeliverInboundWebhook429ApplicationProblemPlusJSONResponse) VisitDeliverInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(429)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeliverInboundWebhookdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response DeliverInboundWebhookdefaultApplicationProblemPlusJSONResponse) VisitDeliverInboundWebhookResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
 // StrictServerInterface represents all server handlers.
 type StrictServerInterface interface {
 	// UploadAttachment 上传附件（multipart，登录可传）
@@ -9267,6 +11810,12 @@ type StrictServerInterface interface {
 	// Logout 登出并吊销 refresh_token
 	// (POST /api/v1/auth/logout)
 	Logout(ctx context.Context, request LogoutRequestObject) (LogoutResponseObject, error)
+	// OidcAuthorize 发起 OIDC 登录（返回 IdP 授权页 URL）
+	// (POST /api/v1/auth/oidc/authorize)
+	OidcAuthorize(ctx context.Context, request OidcAuthorizeRequestObject) (OidcAuthorizeResponseObject, error)
+	// OidcCallback OIDC 回调（code+state 换本地令牌对）
+	// (POST /api/v1/auth/oidc/callback)
+	OidcCallback(ctx context.Context, request OidcCallbackRequestObject) (OidcCallbackResponseObject, error)
 	// ResetPassword 邮箱验证码重置密码
 	// (POST /api/v1/auth/password/reset)
 	ResetPassword(ctx context.Context, request ResetPasswordRequestObject) (ResetPasswordResponseObject, error)
@@ -9288,6 +11837,18 @@ type StrictServerInterface interface {
 	// PatchChannel 改频道（owner/admin）
 	// (PATCH /api/v1/channels/{id})
 	PatchChannel(ctx context.Context, request PatchChannelRequestObject) (PatchChannelResponseObject, error)
+	// ListInboundWebhooks 频道入站 Webhook 列表（ManageChannels）
+	// (GET /api/v1/channels/{id}/inbound-webhooks)
+	ListInboundWebhooks(ctx context.Context, request ListInboundWebhooksRequestObject) (ListInboundWebhooksResponseObject, error)
+	// CreateInboundWebhook 创建频道入站 Webhook（ManageChannels；响应含一次性投递 URL）
+	// (POST /api/v1/channels/{id}/inbound-webhooks)
+	CreateInboundWebhook(ctx context.Context, request CreateInboundWebhookRequestObject) (CreateInboundWebhookResponseObject, error)
+	// DeleteInboundWebhook 删除入站 Webhook（ManageChannels）
+	// (DELETE /api/v1/channels/{id}/inbound-webhooks/{wid})
+	DeleteInboundWebhook(ctx context.Context, request DeleteInboundWebhookRequestObject) (DeleteInboundWebhookResponseObject, error)
+	// PatchInboundWebhook 轮换入站 Webhook secret（ManageChannels；Merge Patch）
+	// (PATCH /api/v1/channels/{id}/inbound-webhooks/{wid})
+	PatchInboundWebhook(ctx context.Context, request PatchInboundWebhookRequestObject) (PatchInboundWebhookResponseObject, error)
 	// SetServerMuted 服务端强制闭麦/解禁（需 MuteMembers，#36）
 	// (PUT /api/v1/channels/{id}/members/{user_id}/server-mute)
 	SetServerMuted(ctx context.Context, request SetServerMutedRequestObject) (SetServerMutedResponseObject, error)
@@ -9345,6 +11906,15 @@ type StrictServerInterface interface {
 	// RemoveConversationMember 移除/退出群聊成员
 	// (DELETE /api/v1/conversations/{id}/members/{user_id})
 	RemoveConversationMember(ctx context.Context, request RemoveConversationMemberRequestObject) (RemoveConversationMemberResponseObject, error)
+	// ListDevices 列出自己的推送设备
+	// (GET /api/v1/devices)
+	ListDevices(ctx context.Context, request ListDevicesRequestObject) (ListDevicesResponseObject, error)
+	// RegisterDevice 注册推送设备（同 push_token 幂等更新）
+	// (POST /api/v1/devices)
+	RegisterDevice(ctx context.Context, request RegisterDeviceRequestObject) (RegisterDeviceResponseObject, error)
+	// DeleteDevice 注销推送设备
+	// (DELETE /api/v1/devices/{id})
+	DeleteDevice(ctx context.Context, request DeleteDeviceRequestObject) (DeleteDeviceResponseObject, error)
 	// ListFriends 好友与好友请求列表
 	// (GET /api/v1/friends)
 	ListFriends(ctx context.Context, request ListFriendsRequestObject) (ListFriendsResponseObject, error)
@@ -9420,9 +11990,30 @@ type StrictServerInterface interface {
 	// CreateRole 创建自定义角色（需 ManageRoles，#35 B4）
 	// (POST /api/v1/servers/{id}/roles)
 	CreateRole(ctx context.Context, request CreateRoleRequestObject) (CreateRoleResponseObject, error)
+	// ListServerWebhooks 出站 Webhook 订阅列表（ManageServer）
+	// (GET /api/v1/servers/{id}/webhooks)
+	ListServerWebhooks(ctx context.Context, request ListServerWebhooksRequestObject) (ListServerWebhooksResponseObject, error)
+	// CreateServerWebhook 创建出站订阅（ManageServer；响应含一次性 secret）
+	// (POST /api/v1/servers/{id}/webhooks)
+	CreateServerWebhook(ctx context.Context, request CreateServerWebhookRequestObject) (CreateServerWebhookResponseObject, error)
+	// DeleteServerWebhook 删除出站订阅（ManageServer）
+	// (DELETE /api/v1/servers/{id}/webhooks/{wid})
+	DeleteServerWebhook(ctx context.Context, request DeleteServerWebhookRequestObject) (DeleteServerWebhookResponseObject, error)
+	// PatchServerWebhook 改出站订阅（ManageServer；Merge Patch）
+	// (PATCH /api/v1/servers/{id}/webhooks/{wid})
+	PatchServerWebhook(ctx context.Context, request PatchServerWebhookRequestObject) (PatchServerWebhookResponseObject, error)
 	// GetSync 事件续传失败后的聚合快照
 	// (GET /api/v1/sync)
 	GetSync(ctx context.Context, request GetSyncRequestObject) (GetSyncResponseObject, error)
+	// ListTokens 当前用户的令牌列表（只含元数据）
+	// (GET /api/v1/tokens)
+	ListTokens(ctx context.Context, request ListTokensRequestObject) (ListTokensResponseObject, error)
+	// CreateToken 创建个人访问令牌（响应含一次性明文）
+	// (POST /api/v1/tokens)
+	CreateToken(ctx context.Context, request CreateTokenRequestObject) (CreateTokenResponseObject, error)
+	// RevokeToken 吊销令牌（立即生效）
+	// (DELETE /api/v1/tokens/{id})
+	RevokeToken(ctx context.Context, request RevokeTokenRequestObject) (RevokeTokenResponseObject, error)
 	// ListUnreads 全部可见频道与服务器的未读/提及计数
 	// (GET /api/v1/unreads)
 	ListUnreads(ctx context.Context, request ListUnreadsRequestObject) (ListUnreadsResponseObject, error)
@@ -9432,6 +12023,9 @@ type StrictServerInterface interface {
 	// PatchMe 改昵称（无头像字段）
 	// (PATCH /api/v1/users/me)
 	PatchMe(ctx context.Context, request PatchMeRequestObject) (PatchMeResponseObject, error)
+	// DeliverInboundWebhook 入站投递入口（免鉴权；全服务唯一免 Bearer 端点）
+	// (POST /api/v1/webhooks/{id}/{secret})
+	DeliverInboundWebhook(ctx context.Context, request DeliverInboundWebhookRequestObject) (DeliverInboundWebhookResponseObject, error)
 }
 
 type StrictHandlerFunc func(ctx context.Context, w http.ResponseWriter, r *http.Request, request any) (any, error)
@@ -9685,6 +12279,71 @@ func (sh *strictHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// OidcAuthorize operation middleware
+func (sh *strictHandler) OidcAuthorize(w http.ResponseWriter, r *http.Request) {
+	var request OidcAuthorizeRequestObject
+
+	var body OidcAuthorizeJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if !errors.Is(err, io.EOF) {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+	} else {
+		request.Body = &body
+	}
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.OidcAuthorize(ctx, request.(OidcAuthorizeRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "OidcAuthorize")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(OidcAuthorizeResponseObject); ok {
+		if err := validResponse.VisitOidcAuthorizeResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// OidcCallback operation middleware
+func (sh *strictHandler) OidcCallback(w http.ResponseWriter, r *http.Request) {
+	var request OidcCallbackRequestObject
+
+	var body OidcCallbackJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.OidcCallback(ctx, request.(OidcCallbackRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "OidcCallback")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(OidcCallbackResponseObject); ok {
+		if err := validResponse.VisitOidcCallbackResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
 // ResetPassword operation middleware
 func (sh *strictHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 	var request ResetPasswordRequestObject
@@ -9916,6 +12575,139 @@ func (sh *strictHandler) PatchChannel(w http.ResponseWriter, r *http.Request, id
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
 	} else if validResponse, ok := response.(PatchChannelResponseObject); ok {
 		if err := validResponse.VisitPatchChannelResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// ListInboundWebhooks operation middleware
+func (sh *strictHandler) ListInboundWebhooks(w http.ResponseWriter, r *http.Request, id IDPath) {
+	var request ListInboundWebhooksRequestObject
+
+	request.Id = id
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ListInboundWebhooks(ctx, request.(ListInboundWebhooksRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ListInboundWebhooks")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ListInboundWebhooksResponseObject); ok {
+		if err := validResponse.VisitListInboundWebhooksResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// CreateInboundWebhook operation middleware
+func (sh *strictHandler) CreateInboundWebhook(w http.ResponseWriter, r *http.Request, id IDPath) {
+	var request CreateInboundWebhookRequestObject
+
+	request.Id = id
+
+	var body CreateInboundWebhookJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.CreateInboundWebhook(ctx, request.(CreateInboundWebhookRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "CreateInboundWebhook")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(CreateInboundWebhookResponseObject); ok {
+		if err := validResponse.VisitCreateInboundWebhookResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// DeleteInboundWebhook operation middleware
+func (sh *strictHandler) DeleteInboundWebhook(w http.ResponseWriter, r *http.Request, id IDPath, wid WebhookIDPath) {
+	var request DeleteInboundWebhookRequestObject
+
+	request.Id = id
+	request.Wid = wid
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.DeleteInboundWebhook(ctx, request.(DeleteInboundWebhookRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "DeleteInboundWebhook")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(DeleteInboundWebhookResponseObject); ok {
+		if err := validResponse.VisitDeleteInboundWebhookResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// PatchInboundWebhook operation middleware
+func (sh *strictHandler) PatchInboundWebhook(w http.ResponseWriter, r *http.Request, id IDPath, wid WebhookIDPath) {
+	var request PatchInboundWebhookRequestObject
+
+	request.Id = id
+	request.Wid = wid
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+
+		var body PatchInboundWebhookJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.JSONBody = &body
+
+	}
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/merge-patch+json") {
+
+		var body PatchInboundWebhookApplicationMergePatchPlusJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.ApplicationMergePatchPlusJSONBody = &body
+
+	}
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.PatchInboundWebhook(ctx, request.(PatchInboundWebhookRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "PatchInboundWebhook")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(PatchInboundWebhookResponseObject); ok {
+		if err := validResponse.VisitPatchInboundWebhookResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {
@@ -10483,6 +13275,87 @@ func (sh *strictHandler) RemoveConversationMember(w http.ResponseWriter, r *http
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
 	} else if validResponse, ok := response.(RemoveConversationMemberResponseObject); ok {
 		if err := validResponse.VisitRemoveConversationMemberResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// ListDevices operation middleware
+func (sh *strictHandler) ListDevices(w http.ResponseWriter, r *http.Request) {
+	var request ListDevicesRequestObject
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ListDevices(ctx, request.(ListDevicesRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ListDevices")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ListDevicesResponseObject); ok {
+		if err := validResponse.VisitListDevicesResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// RegisterDevice operation middleware
+func (sh *strictHandler) RegisterDevice(w http.ResponseWriter, r *http.Request) {
+	var request RegisterDeviceRequestObject
+
+	var body RegisterDeviceJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.RegisterDevice(ctx, request.(RegisterDeviceRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "RegisterDevice")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(RegisterDeviceResponseObject); ok {
+		if err := validResponse.VisitRegisterDeviceResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// DeleteDevice operation middleware
+func (sh *strictHandler) DeleteDevice(w http.ResponseWriter, r *http.Request, id IDPath) {
+	var request DeleteDeviceRequestObject
+
+	request.Id = id
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.DeleteDevice(ctx, request.(DeleteDeviceRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "DeleteDevice")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(DeleteDeviceResponseObject); ok {
+		if err := validResponse.VisitDeleteDeviceResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {
@@ -11233,6 +14106,139 @@ func (sh *strictHandler) CreateRole(w http.ResponseWriter, r *http.Request, id I
 	}
 }
 
+// ListServerWebhooks operation middleware
+func (sh *strictHandler) ListServerWebhooks(w http.ResponseWriter, r *http.Request, id IDPath) {
+	var request ListServerWebhooksRequestObject
+
+	request.Id = id
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ListServerWebhooks(ctx, request.(ListServerWebhooksRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ListServerWebhooks")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ListServerWebhooksResponseObject); ok {
+		if err := validResponse.VisitListServerWebhooksResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// CreateServerWebhook operation middleware
+func (sh *strictHandler) CreateServerWebhook(w http.ResponseWriter, r *http.Request, id IDPath) {
+	var request CreateServerWebhookRequestObject
+
+	request.Id = id
+
+	var body CreateServerWebhookJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.CreateServerWebhook(ctx, request.(CreateServerWebhookRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "CreateServerWebhook")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(CreateServerWebhookResponseObject); ok {
+		if err := validResponse.VisitCreateServerWebhookResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// DeleteServerWebhook operation middleware
+func (sh *strictHandler) DeleteServerWebhook(w http.ResponseWriter, r *http.Request, id IDPath, wid WebhookIDPath) {
+	var request DeleteServerWebhookRequestObject
+
+	request.Id = id
+	request.Wid = wid
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.DeleteServerWebhook(ctx, request.(DeleteServerWebhookRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "DeleteServerWebhook")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(DeleteServerWebhookResponseObject); ok {
+		if err := validResponse.VisitDeleteServerWebhookResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// PatchServerWebhook operation middleware
+func (sh *strictHandler) PatchServerWebhook(w http.ResponseWriter, r *http.Request, id IDPath, wid WebhookIDPath) {
+	var request PatchServerWebhookRequestObject
+
+	request.Id = id
+	request.Wid = wid
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+
+		var body PatchServerWebhookJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.JSONBody = &body
+
+	}
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/merge-patch+json") {
+
+		var body PatchServerWebhookApplicationMergePatchPlusJSONRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+			return
+		}
+		request.ApplicationMergePatchPlusJSONBody = &body
+
+	}
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.PatchServerWebhook(ctx, request.(PatchServerWebhookRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "PatchServerWebhook")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(PatchServerWebhookResponseObject); ok {
+		if err := validResponse.VisitPatchServerWebhookResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
 // GetSync operation middleware
 func (sh *strictHandler) GetSync(w http.ResponseWriter, r *http.Request) {
 	var request GetSyncRequestObject
@@ -11250,6 +14256,87 @@ func (sh *strictHandler) GetSync(w http.ResponseWriter, r *http.Request) {
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
 	} else if validResponse, ok := response.(GetSyncResponseObject); ok {
 		if err := validResponse.VisitGetSyncResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// ListTokens operation middleware
+func (sh *strictHandler) ListTokens(w http.ResponseWriter, r *http.Request) {
+	var request ListTokensRequestObject
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ListTokens(ctx, request.(ListTokensRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ListTokens")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ListTokensResponseObject); ok {
+		if err := validResponse.VisitListTokensResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// CreateToken operation middleware
+func (sh *strictHandler) CreateToken(w http.ResponseWriter, r *http.Request) {
+	var request CreateTokenRequestObject
+
+	var body CreateTokenJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.CreateToken(ctx, request.(CreateTokenRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "CreateToken")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(CreateTokenResponseObject); ok {
+		if err := validResponse.VisitCreateTokenResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// RevokeToken operation middleware
+func (sh *strictHandler) RevokeToken(w http.ResponseWriter, r *http.Request, id IDPath) {
+	var request RevokeTokenRequestObject
+
+	request.Id = id
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.RevokeToken(ctx, request.(RevokeTokenRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "RevokeToken")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(RevokeTokenResponseObject); ok {
+		if err := validResponse.VisitRevokeTokenResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {
@@ -11350,6 +14437,40 @@ func (sh *strictHandler) PatchMe(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// DeliverInboundWebhook operation middleware
+func (sh *strictHandler) DeliverInboundWebhook(w http.ResponseWriter, r *http.Request, id IDPath, secret SecretPath) {
+	var request DeliverInboundWebhookRequestObject
+
+	request.Id = id
+	request.Secret = secret
+
+	var body DeliverInboundWebhookJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.DeliverInboundWebhook(ctx, request.(DeliverInboundWebhookRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "DeliverInboundWebhook")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(DeliverInboundWebhookResponseObject); ok {
+		if err := validResponse.VisitDeliverInboundWebhookResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
 // PublicRoutePatterns 免鉴权路由（openapi.yaml 中 security: [] 的操作）。
 // 由 openapigen 生成；未列出的路由一律要求 Bearer 鉴权。
 var PublicRoutePatterns = map[string]bool{
@@ -11361,8 +14482,11 @@ var PublicRoutePatterns = map[string]bool{
 	"POST /api/v1/auth/guest":                true,
 	"POST /api/v1/auth/login":                true,
 	"POST /api/v1/auth/logout":               true,
+	"POST /api/v1/auth/oidc/authorize":       true,
+	"POST /api/v1/auth/oidc/callback":        true,
 	"POST /api/v1/auth/password/reset":       true,
 	"POST /api/v1/auth/refresh":              true,
 	"POST /api/v1/auth/register":             true,
 	"POST /api/v1/rtc/credentials":           true,
+	"POST /api/v1/webhooks/{id}/{secret}":    true,
 }

@@ -350,6 +350,102 @@ func TestJitterFrameMS10(t *testing.T) {
 	}
 }
 
+// TestJitterFrameSwitchFlush 帧长热切换冲刷旧帧（#117）：切换后槽内不得残留旧帧，
+// 切换前已在途的旧包（含乱序晚到）一律丢弃，首帧延迟等于新帧长的预填深度。
+func TestJitterFrameSwitchFlush(t *testing.T) {
+	jb := NewJitterBuffer()
+	out := make([]byte, JitterMaxPayload)
+
+	// 20ms 稳态：预填 3 包 → 弹 3 包，槽内清空。
+	pushInOrder(jb, 100, 3)
+	for i := 0; i < 3; i++ {
+		if _, lost, ok := jb.Pop(out); !ok || lost {
+			t.Fatalf("20ms pop %d: lost=%v ok=%v", i, lost, ok)
+		}
+	}
+	if st := jb.Stats(); st.Buffered != 0 || !st.Started {
+		t.Fatalf("切换前状态 = %+v, want started 且槽空", st)
+	}
+
+	// 切 10ms：槽内已无帧，但要回到预填态（目标 6 包 = 60ms）。
+	if err := jb.SetFrameMS(10); err != nil {
+		t.Fatalf("SetFrameMS(10): %v", err)
+	}
+	if st := jb.Stats(); st.Buffered != 0 || st.Started {
+		t.Fatalf("切换后状态 = %+v, want Buffered=0 且未开始", st)
+	}
+	if _, _, ok := jb.Pop(out); ok {
+		t.Fatal("切换后未重新预填就出帧了")
+	}
+
+	// 切换前已到达过、但乱序晚到的旧 20ms 包（seq 101 ≤ 切换时刻最大序号 102）：
+	// 若被收进槽会以旧帧长参与预填，必须丢弃。
+	jb.Push(101, []byte{101, 0, 0xAB}, jitterBase.Add(101*time.Millisecond))
+	if st := jb.Stats(); st.Buffered != 0 {
+		t.Fatalf("旧帧长包被收进槽（Buffered=%d）", st.Buffered)
+	}
+
+	// 新帧长 10ms、100ms 间隔的 6 包填满预填目标；首帧延迟 = 6×10ms。
+	for i := 0; i < 6; i++ {
+		seq := uint16(104 + i)
+		jb.Push(seq, []byte{byte(seq), byte(seq >> 8), 0xAB}, jitterBase.Add(time.Duration(i)*10*time.Millisecond))
+	}
+	if st := jb.Stats(); st.TargetPackets != 6 || st.Buffered != 6 {
+		t.Fatalf("10ms 预填状态 = %+v, want target=6 buffered=6", st)
+	}
+	n, lost, ok := jb.Pop(out)
+	if !ok || lost || n != 3 || out[0] != 104 {
+		t.Fatalf("切换后首帧 = n%d lost=%v ok=%v payload=%v, want seq 104", n, lost, ok, out[:n])
+	}
+	for i := 1; i < 6; i++ {
+		if _, lost, ok := jb.Pop(out); !ok || lost || out[0] != byte(104+i) {
+			t.Fatalf("切换后第 %d 帧 = seq %d lost=%v ok=%v, want %d", i, out[0], lost, ok, 104+i)
+		}
+	}
+
+	// 切回 20ms：同样冲刷并回到 3 包预填，旧 10ms 帧不再参与。
+	if err := jb.SetFrameMS(20); err != nil {
+		t.Fatalf("SetFrameMS(20): %v", err)
+	}
+	if _, _, ok := jb.Pop(out); ok {
+		t.Fatal("切回 20ms 后未重新预填就出帧了")
+	}
+	for i := 0; i < 3; i++ {
+		seq := uint16(200 + i)
+		jb.Push(seq, []byte{byte(seq), byte(seq >> 8), 0xAB}, jitterBase.Add(time.Duration(i)*20*time.Millisecond))
+	}
+	n, lost, ok = jb.Pop(out)
+	if !ok || lost || out[0] != 200 {
+		t.Fatalf("切回 20ms 首帧 = n%d lost=%v ok=%v payload=%v, want seq 200", n, lost, ok, out[:n])
+	}
+}
+
+// TestJitterFrameSwitchDropsBuffered 切换时槽内有未消费的旧帧（#117）：必须被
+// 清掉，否则旧帧长采样会持续垫高播放延迟。
+func TestJitterFrameSwitchDropsBuffered(t *testing.T) {
+	jb := NewJitterBuffer()
+	out := make([]byte, JitterMaxPayload)
+	pushInOrder(jb, 300, 8) // 8 包 → 预填 3 包后开始，余 5 包留在槽里
+	if _, _, ok := jb.Pop(out); !ok {
+		t.Fatal("预填应已完成")
+	}
+	if st := jb.Stats(); st.Buffered == 0 {
+		t.Fatal("测试前置：槽内应还有未消费的旧帧")
+	}
+	if err := jb.SetFrameMS(10); err != nil {
+		t.Fatal(err)
+	}
+	if st := jb.Stats(); st.Buffered != 0 || st.Started {
+		t.Fatalf("切换后残留 = %+v, want Buffered=0 未开始", st)
+	}
+	// 槽位被清空后，旧 seq 若在槽内会随即被弹出；确认 5 拍内没有再吐出旧帧。
+	for i := 0; i < 5; i++ {
+		if _, _, ok := jb.Pop(out); ok {
+			t.Fatalf("第 %d 拍仍在弹旧帧（payload=%v）", i, out[:3])
+		}
+	}
+}
+
 // BenchmarkJitterPushPop 稳态推拉热点：必须 0 allocs/op。
 func BenchmarkJitterPushPop(b *testing.B) {
 	jb := NewJitterBuffer()

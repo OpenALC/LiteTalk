@@ -505,6 +505,19 @@ describe('voice store 悄悄话与优先发言', () => {
     expect(mockGoApp.SetPrioritySpeaker).toHaveBeenCalledWith('room1', 'u1', true)
   })
 
+  it('撤销无效时按说明提示，不当作错误样式', async () => {
+    const voice = useVoiceStore()
+    const notify = useNotifyStore()
+    voice.channelId = 'room1'
+    mockGoApp.SetPrioritySpeaker.mockRejectedValueOnce(
+      new Error('RuntimeError: 该权限由角色授予，无法在此撤销'),
+    )
+    await voice.setPrioritySpeaker('u1', false)
+    expect(notify.visible).toBe(true)
+    expect(notify.text).toBe('该权限由角色授予，无法在此撤销')
+    expect(notify.isError).toBe(false)
+  })
+
   it('加入频道清空旧的悄悄话选择', async () => {
     const voice = useVoiceStore()
     voice.channelId = 'room1'

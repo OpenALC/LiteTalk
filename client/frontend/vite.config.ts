@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
@@ -5,10 +6,60 @@ import vue from '@vitejs/plugin-vue'
 // strictPort 防止端口被占用时 vite 静默换端口、导致 Go 侧连不上 dev server。
 const port = process.env.WAILS_VITE_PORT ? Number(process.env.WAILS_VITE_PORT) : 9245
 
-// Wails 嵌入产物需使用相对路径引用资源
-export default defineConfig({
-  plugins: [vue()],
-  base: './',
+// Web 客户端版本（#50）：默认源是本 package.json 的 version 字段，经 define
+// 注入 src/api/web/version.ts。CI 标签构建（#119）用 LITELTALK_VERSION 覆盖，
+// 让浏览器版版本号与发布标签一致；缺失/空值回落 package.json。导出供单测覆盖。
+// 注入值剥掉前导 v/V：服务端版本门按主/次版本解析且要求数字开头，不能依赖
+// 下游的 TrimPrefix 兜底（version.ts 的约束注释同此）。
+export function resolveWebVersion(
+  pkgVersion: string,
+  env: { LITELTALK_VERSION?: string } = process.env,
+): string {
+  return env.LITELTALK_VERSION?.trim().replace(/^[vV]/, '') || pkgVersion
+}
+
+const pkgVersion = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version as string
+const webClientVersion = resolveWebVersion(pkgVersion)
+
+// CSP 头（#50）：只注入 web 构建（--mode web）。桌面构建由 Wails 资产通道
+// 加载，注入 meta CSP 反而可能拦掉 webview 内部资源，所以桌面路径原样返回。
+// style-src 'unsafe-inline' 是 Vue :style 绑定的硬需求——这是本批唯一接受的
+// XSS 风险面（CSP 其余方向仍锁 'self'）。
+const WEB_CSP = [
+  "default-src 'self'",
+  "connect-src 'self' ws: wss: https:",
+  "img-src 'self' data: blob:",
+  "media-src 'self' blob:",
+  "style-src 'self' 'unsafe-inline'",
+].join('; ')
+
+function webOnlyCSP(): import('vite').Plugin {
+  // transformIndexHtml 的 ctx 不带 mode：从 configResolved 捕获后再判别。
+  let isWeb = false
+  return {
+    name: 'web-only-csp',
+    apply: 'build',
+    configResolved(cfg) {
+      isWeb = cfg.mode === 'web'
+    },
+    transformIndexHtml(html) {
+      if (!isWeb) return html
+      return html.replace(
+        '<head>',
+        `<head>\n    <meta http-equiv="Content-Security-Policy" content="${WEB_CSP}">`,
+      )
+    },
+  }
+}
+
+// Wails 嵌入产物需使用相对路径引用资源；web 构建（#50）由服务端托管，
+// 必须绝对根路径 base（SPA 深链 /join/<code> 才能解析到 /assets/*）。
+export default defineConfig(({ mode }) => ({
+  plugins: [vue(), webOnlyCSP()],
+  define: {
+    __LITETALK_WEB_VERSION__: JSON.stringify(webClientVersion),
+  },
+  base: mode === 'web' ? '/' : './',
   server: {
     port,
     strictPort: true,
@@ -18,4 +69,4 @@ export default defineConfig({
     // 表现为"应用启动了但页面永远加载不出"。
     host: '127.0.0.1',
   },
-})
+}))

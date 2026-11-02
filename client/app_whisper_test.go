@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -463,7 +464,8 @@ func (p *priorityServer) handler() http.Handler {
 	})
 }
 
-// TestSetPrioritySpeaker 保留其他权限位、撤销不写 deny、空覆盖删除、无覆盖撤销为空操作。
+// TestSetPrioritySpeaker 保留其他权限位、授予清个人 deny、撤销不写 deny、
+// 空覆盖删除、无覆盖撤销为空操作。
 func TestSetPrioritySpeaker(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -475,6 +477,13 @@ func TestSetPrioritySpeaker(t *testing.T) {
 		{
 			name:    "授予保留其他位",
 			current: `[{"channel_id":"7","target_type":"member","target_id":"3","allow":"8","deny":"2","updated_at":"2026-01-01T00:00:00Z"}]`,
+			enabled: true, wantPut: "24|2",
+		},
+		{
+			// #117：残留的个人 deny 会让授予在 mergeChannel 里被 deny 盖掉
+			// （member 层 (p|allow)&^deny），授予必须同时清这一位。
+			name:    "授予清掉个人 deny 位",
+			current: `[{"channel_id":"7","target_type":"member","target_id":"3","allow":"8","deny":"18","updated_at":"2026-01-01T00:00:00Z"}]`,
 			enabled: true, wantPut: "24|2",
 		},
 		{
@@ -496,6 +505,11 @@ func TestSetPrioritySpeaker(t *testing.T) {
 			name:    "无个人覆盖撤销是空操作",
 			current: `[{"channel_id":"7","target_type":"role","target_id":"9","allow":"16","deny":"0","updated_at":"2026-01-01T00:00:00Z"}]`,
 			enabled: false,
+		},
+		{
+			name:    "授予后撤销的往返回到原状态",
+			current: `[{"channel_id":"7","target_type":"member","target_id":"3","allow":"8","deny":"0","updated_at":"2026-01-01T00:00:00Z"}]`,
+			enabled: false, wantPut: "8|0",
 		},
 	}
 	for _, tc := range cases {
@@ -522,6 +536,84 @@ func TestSetPrioritySpeaker(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSetPrioritySpeakerDenyRoundTrip 授予 → 撤销往返：授予写 allow+清 deny，
+// 撤销重新读回库里的覆盖只清 allow，最终回到授予前的位组合（不残留 deny）。
+func TestSetPrioritySpeakerDenyRoundTrip(t *testing.T) {
+	// deny 里带 PrioritySpeaker（16）与 ViewChannel（1）：授予后只剩 1。
+	stub := &priorityServer{current: `[{"channel_id":"7","target_type":"member","target_id":"3","allow":"8","deny":"17","updated_at":"2026-01-01T00:00:00Z"}]`}
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+	app := &App{api: newAppAPI(srv.URL)}
+
+	if err := app.SetPrioritySpeaker("7", "3", true); err != nil {
+		t.Fatalf("授予: %v", err)
+	}
+	if err := app.SetPrioritySpeaker("7", "3", false); err != nil {
+		t.Fatalf("撤销: %v", err)
+	}
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	if len(stub.puts) != 2 || stub.puts[0] != "24|1" || stub.puts[1] != "8|1" {
+		t.Fatalf("往返 PUT = %v，期望 [24|1 8|1]", stub.puts)
+	}
+}
+
+// TestSetPrioritySpeakerRevokeFromRole 撤销个人位改不了 effective 结果时明确
+// 报错（#117）：成员仍是优先发言、个人覆盖里却没有该位 → ErrPriorityFromRole，
+// 且不写一条注定无效的覆盖。成员标记来自会话成员表。
+func TestSetPrioritySpeakerRevokeFromRole(t *testing.T) {
+	stub := &priorityServer{current: `[{"channel_id":"7","target_type":"role","target_id":"9","allow":"16","deny":"0","updated_at":"2026-01-01T00:00:00Z"}]`}
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	app, sess, ws := newWhisperApp(t, 4)
+	app.api = newAppAPI(srv.URL)
+	ws.push(t, signal.Envelope{
+		Type: signal.TypeChannelJoined, TS: 3,
+		Data: json.RawMessage(`{"channel_id":"room1","members":[
+			{"user_id":"3","nickname":"丙","mute":false,"deafen":false,"speaking":false,"online":true,"priority":true}
+		],"self":{"user_id":"1","nickname":"甲","mute":false,"deafen":false,"speaking":false,"online":true}}`),
+	})
+	waitPeerPriority(t, sess, "3", true)
+
+	err := app.SetPrioritySpeaker("7", "3", false)
+	if !errors.Is(err, ErrPriorityFromRole) {
+		t.Fatalf("角色授予下撤销应返回 ErrPriorityFromRole，得到 %v", err)
+	}
+	stub.mu.Lock()
+	puts, deletes := append([]string(nil), stub.puts...), stub.deletes
+	stub.mu.Unlock()
+	if len(puts) != 0 || deletes != 0 {
+		t.Fatalf("不应写库，实际 PUT=%v DELETE=%d", puts, deletes)
+	}
+
+	// 成员已不是优先发言（例如角色刚被收回）：撤销仍是空操作，不报错。
+	ws.push(t, signal.Envelope{
+		Type: signal.TypeVoicePriority, TS: 4,
+		Data: json.RawMessage(`{"channel_id":"room1","user_id":"3","priority":false}`),
+	})
+	waitPeerPriority(t, sess, "3", false)
+	if err := app.SetPrioritySpeaker("7", "3", false); err != nil {
+		t.Fatalf("无个人覆盖且未生效时撤销应为空操作: %v", err)
+	}
+}
+
+// waitPeerPriority 等会话成员表的 priority 标记落到期望值（事件经 ws 读循环
+// 异步写入），避免与 push 竞态。
+func waitPeerPriority(t *testing.T, s *voice.Session, userID string, want bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, m := range s.Members() {
+			if m.UserID == userID && m.Priority == want {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("成员 %s 的 priority 未在 5s 内变为 %v", userID, want)
 }
 
 // TestSetPrioritySpeakerForbidden 403 原样返回，前端提示权限不足。

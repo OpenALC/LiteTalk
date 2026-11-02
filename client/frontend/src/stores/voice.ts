@@ -2,7 +2,12 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { eventsOn, goApp } from '../api/bridge'
 import type { PeerView, VoicePeerDiag, VoiceStats, WhisperEvent } from '../api/types'
+import { cleanErrorText } from '../utils/errorText'
 import { useNotifyStore } from './notify'
+
+// PRIORITY_FROM_ROLE 与 Go 侧 ErrPriorityFromRole 的文案逐字一致（#117）：
+// 撤销个人覆盖改不了角色授予的权限，Go 把这个原因当错误返回，UI 按说明展示。
+const PRIORITY_FROM_ROLE = '该权限由角色授予，无法在此撤销'
 
 // emptyVoiceStats 空统计快照（未入房/事件未到）。字段与 Go VoiceStats 对齐，
 // 可选字段保持缺省，UI 统一按 0/-- 渲染。
@@ -239,12 +244,16 @@ export const useVoiceStore = defineStore('voice', () => {
 
   // setPrioritySpeaker 授予/撤销优先发言（#45）。结果由服务端 voice.priority
   // 广播回填；无 ManageChannels 权限时 Go 侧返回 403，这里只提示。
+  // 撤销无效（权限由角色授予，Go 侧回「该权限由角色授予，无法在此撤销」，#117）
+  // 是说明而非故障，用普通提示而不是错误样式，其余错误照旧走 fromErr。
   async function setPrioritySpeaker(userId: string, enabled: boolean) {
     if (!channelId.value) return
     try {
       await goApp().SetPrioritySpeaker(channelId.value, userId, enabled)
     } catch (e) {
-      useNotifyStore().fromErr(e, '优先发言设置失败')
+      const text = cleanErrorText(e, '优先发言设置失败')
+      if (!enabled && text === PRIORITY_FROM_ROLE) useNotifyStore().show(text)
+      else useNotifyStore().show(text, true)
     }
   }
 

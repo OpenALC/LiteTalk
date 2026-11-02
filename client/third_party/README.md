@@ -41,6 +41,37 @@ Linux arm64 host 为 `aarch64-linux-gnu`；产物 `strip --strip-debug`。
 `windows-amd64/`、`linux-amd64/`、`linux-arm64/` 分平台存放同名
 `libwebrtc-apm.a`，由 `core/audio/apm_cgo.go` 的 `#cgo` 指令按目标平台选路径。
 
+## 产物校验（#117）
+
+`SHA256SUMS` 记录本目录每个 `.a` 的 SHA256，并在注释里写明上游版本与构建
+参数。校验：
+
+```bash
+cd client/third_party && sha256sum -c SHA256SUMS
+```
+
+CI 的 `check-client-linux` 与 `check-client-windows` 各跑一次，库被替换或重建
+却没同步清单就红。重建任何静态库后必须：
+
+1. 更新 `SHA256SUMS` 对应的行（并同步注释里的版本/构建参数）；
+2. 在提交信息里写明变更原因（上游升级 / 构建参数变化）。
+
+## 分发合规（#117）
+
+发布包静态链接上述库，二进制分发必须随附许可证全文。随附内容由
+`client/build/third-party-licenses.sh` 生成并打进各产物：
+
+| 产物 | 许可证位置 |
+|---|---|
+| deb / rpm | `/usr/share/doc/litetalk/third-party/` |
+| Linux 绿色版 tar.gz | `share/doc/litetalk/third-party/` |
+| Windows 安装器 | 安装目录下 `third-party\` |
+| Windows 绿色版 zip | zip 内 `third-party\` |
+
+各组件许可证来源：`opus/COPYING`、`opusfile/COPYING`、`ogg/COPYING`、
+`webrtc-apm/COPYING`（BSD-3-Clause）与 `webrtc-apm/LICENSE.abseil`
+（abseil 的 Apache-2.0 全文，静态合并进 libwebrtc-apm.a）。
+
 ## 链接方式
 
 - **发布版（静态）**：`-Wl,-Bstatic -Wl,--start-group -lopusfile -lopus -logg -lm -Wl,--end-group -Wl,-Bdynamic -static-libgcc`，产物仅依赖 KERNEL32 + UCRT 系统 DLL

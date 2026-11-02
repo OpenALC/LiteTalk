@@ -16,14 +16,19 @@ import (
 	"github.com/OpenALC/LiteTalk/server/internal/blob"
 	"github.com/OpenALC/LiteTalk/server/internal/linkpreview"
 	"github.com/OpenALC/LiteTalk/server/internal/mailer"
+	"github.com/OpenALC/LiteTalk/server/internal/push"
 	"github.com/OpenALC/LiteTalk/server/internal/rtcapi"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/internal/token"
+	"github.com/OpenALC/LiteTalk/server/internal/webhook"
 )
 
-// AuthMode 鉴权模式：full（默认，验证码流程）/ simple（免验证码，适合私域部署）。
+// AuthMode 鉴权模式：full（默认，验证码流程）/ simple（免验证码，适合私域部署）/
+// oidc（外部身份，仅 OIDC 登录——本地密码入口全部关闭，见各入口的门控）。
 const (
 	AuthModeFull   = "full"
 	AuthModeSimple = "simple"
+	AuthModeOIDC   = "oidc"
 )
 
 // Hub abstracts signal.Hub for logout/reset-password session kicking.
@@ -55,6 +60,12 @@ type Hub interface {
 	// RoomHasLegacyClients 该房间当前是否有协议 <3 的连接（#116）：PATCH 启用
 	// 10ms 帧长前检查，避免与不认识 10ms 的旧客户端混用；房间不存在返回 false。
 	RoomHasLegacyClients(channelID string) bool
+	// AfterMessagePersisted 消息创建后处理单一管线（P1-4/P2-1）：落库成功后的
+	// 广播 → 未读 → 推送 → 出站 webhook（webhook 由广播内的 T5 出口挂钩派发，
+	// REST/入站不另直发）。WS chat.send / REST CreateMessage / 入站 webhook 投递
+	// 三条入口共用同一实现。尽力而为：失败只记日志，不返回错误，绝不把已落库
+	// 的消息拖成发送失败。senderUID 为十进制 uid，senderNick 为发送者昵称。
+	AfterMessagePersisted(ctx context.Context, ch *store.Channel, msg *store.Message, senderUID, senderNick string)
 }
 
 // PresenceReader 在线状态读取（#11）：presence:{uid} 存在 = 在线。
@@ -96,6 +107,9 @@ type Server struct {
 	selfHost bool               // 一键自托管形态（GET /api/v1/config 自描述，#26）
 	// authz 权限判定（#35 B3）：与 signal.Hub 共享同一实例，缓存失效才同步。
 	authz *authz.Authorizer
+	// apiTokens api_token（pat/bot）校验服务（#54）：REST 中间件与 WS 握手共用
+	// 同一条实现。nil 时按 Store 自建（测试兼容）；生产传与 WS 同一实例。
+	apiTokens *token.Service
 	// bootstrapRequired 管理员邀请码是否未消费（#27 T4 接线；nil=恒 false）。
 	bootstrapRequired func() bool
 	// version 服务端构建版本（GET /api/v1/healthz 回显，#77）。
@@ -112,6 +126,20 @@ type Server struct {
 	kv store.KV
 	// linkPreview 链接预览抓取器（nil=功能关闭，端点统一 404 no_preview）。
 	linkPreview LinkPreviewFetcher
+	// push 移动推送派发器（#53）。nil = 推送关闭：/config 报 push_enabled=false，
+	// 触发点全部短路（设备注册端点仍可用，注册数据等开启后即生效）。
+	push *push.Broker
+	// webhooks 出站投递器（#52）。nil = 只影响惰性启动（EnsureStarted 变 no-op），
+	// webhook 的 CRUD 与入站投递仍可用。
+	webhooks *webhook.Dispatcher
+	// webhookURLCheck 出站 URL 的 SSRF 校验（New 补默认 linkpreview.CheckDialable；
+	// 测试注入放行桩以对 httptest 目标建订阅）。
+	webhookURLCheck func(string) error
+	// oidc OIDC 依赖方（#54）。nil = 未配置，功能关闭：/auth/oidc/* 一律 404，
+	// 不做 discovery、不建状态表（零副作用）。
+	oidc *auth.OIDCProvider
+	// oidcStates 授权流程 state 的一次性存储（5 分钟 TTL）。oidc 为 nil 时不构造。
+	oidcStates *auth.OIDCStates
 }
 
 // Config 构造配置。
@@ -150,6 +178,9 @@ type Config struct {
 	// Authz 权限判定（#35 B3）。nil 时用 Store 自建默认实例（测试兼容）；
 	// 生产必须传入与 signal.Hub 共享的同一实例，否则写后失效不同步。
 	Authz *authz.Authorizer
+	// Tokens api_token 校验服务（#54）。nil 时用 Store 自建（测试兼容）；
+	// 生产建议显式传入与 WS 鉴权共用的同一实例（last_used 节流表按实例记）。
+	Tokens *token.Service
 	// Blob 附件二进制存储（#41 B2）。生产由 cmd/server 按 LITETALK_UPLOAD_* 构造；
 	// nil 时上传/下载端点返回 500（测试未注入 blob 的旧用例不受影响）。
 	Blob blob.Store
@@ -162,6 +193,18 @@ type Config struct {
 	// LinkPreview 链接预览抓取器（#42 B4）。生产由 cmd/server 按
 	// LITETALK_LINK_PREVIEW* 构造；nil = 功能关闭，端点一律 404 no_preview。
 	LinkPreview LinkPreviewFetcher
+	// Push 移动推送派发器（#53）。生产由 cmd/server 按 LITETALK_PUSH_* 构造；
+	// nil = 推送关闭（/config push_enabled=false，触发点短路，零后台 goroutine）。
+	Push *push.Broker
+	// Webhooks 出站投递器（#52）。生产由 cmd/server 构造并与 hub 的事件出口共享
+	// 同一实例；nil = 投递器不启动（已建订阅在重启后也不投递），CRUD 与入站不受影响。
+	Webhooks *webhook.Dispatcher
+	// WebhookURLCheck 出站 URL 的 SSRF 校验；nil 用 linkpreview.CheckDialable
+	//（测试注入放行桩，httptest 目标是 127.0.0.1，默认校验会拒绝）。
+	WebhookURLCheck func(string) error
+	// OIDC 登录配置（#54）。nil 或不完整 = 功能关闭（端点 404，零副作用）；
+	// 完整性由 cmd/server 启动校验把关，这里对不完整配置只记日志并关闭。
+	OIDC *auth.OIDCConfig
 }
 
 // New 构造 API Server。
@@ -175,8 +218,19 @@ func New(cfg Config) *Server {
 		m = &mailer.Console{Log: lg}
 	}
 	mode := cfg.AuthMode
-	if mode != AuthModeSimple {
+	if mode != AuthModeSimple && mode != AuthModeOIDC {
 		mode = AuthModeFull
+	}
+	// OIDC 登录（#54）：配置完整才构造依赖方与状态表；不完整按关闭处理并明示。
+	var oidcProv *auth.OIDCProvider
+	var oidcSt *auth.OIDCStates
+	if cfg.OIDC != nil {
+		if cfg.OIDC.Complete() {
+			oidcProv = auth.NewOIDCProvider(*cfg.OIDC, lg)
+			oidcSt = auth.NewOIDCStates(cfg.KV)
+		} else {
+			lg.Printf("[config] LITETALK_OIDC_* 配置不完整，OIDC 登录关闭")
+		}
 	}
 	ver := cfg.Version
 	if ver == "" {
@@ -186,6 +240,16 @@ func New(cfg Config) *Server {
 	if az == nil && cfg.Store != nil {
 		// 测试/单用方场景自建；生产（main.go）注入与 Hub 共享的实例。
 		az = authz.New(cfg.Store, authz.Options{})
+	}
+	toks := cfg.Tokens
+	if toks == nil && cfg.Store != nil {
+		// 同上：测试/单用方场景自建；生产传入与 WS 鉴权共用的同一实例。
+		toks = token.NewService(cfg.Store, lg)
+	}
+	urlCheck := cfg.WebhookURLCheck
+	if urlCheck == nil {
+		// 出站 URL 的 SSRF 校验默认复用链接预览的黑名单（#52）。
+		urlCheck = linkpreview.CheckDialable
 	}
 	return &Server{
 		store:             cfg.Store,
@@ -203,6 +267,7 @@ func New(cfg Config) *Server {
 		voice:             cfg.VoicePresence,
 		selfHost:          cfg.SelfHost,
 		authz:             az,
+		apiTokens:         toks,
 		bootstrapRequired: cfg.BootstrapRequired,
 		version:           ver,
 		rtcCfg:            cfg.RTC,
@@ -211,6 +276,11 @@ func New(cfg Config) *Server {
 		upload:            normalizeUploadConfig(cfg.Upload),
 		kv:                cfg.KV,
 		linkPreview:       cfg.LinkPreview,
+		push:              cfg.Push,
+		webhooks:          cfg.Webhooks,
+		webhookURLCheck:   urlCheck,
+		oidc:              oidcProv,
+		oidcStates:        oidcSt,
 	}
 }
 
@@ -265,6 +335,11 @@ func parseTrustedProxies(lg *log.Logger, entries []string) []*net.IPNet {
 // simpleMode 当前是否为简捷模式（免验证码）。
 func (s *Server) simpleMode() bool { return s.authMode == AuthModeSimple }
 
+// oidcOnly 当前是否为仅 OIDC 模式：外部身份是唯一登录途径，本地密码入口
+// （登录/注册/找回）整体关闭。与 simpleMode 语义不同——simple 是「免验证码」，
+// oidc 是「外部身份」，两者不可混为一谈（批次 6 §7 逐点复查）。
+func (s *Server) oidcOnly() bool { return s.authMode == AuthModeOIDC }
+
 // mailConfigured 发信通道是否为真实投递（Console 打印不算）。
 func (s *Server) mailConfigured() bool {
 	_, isConsole := s.mailer.(*mailer.Console)
@@ -295,49 +370,66 @@ func (s *Server) Handler() http.Handler {
 
 // ---- 上下文 ----
 
-type ctxKey int
-
-const userKey ctxKey = 1
-
 // legacyTokenGrace 旧版本令牌（无 sid）过渡期：与 signal 侧同值同时长，
 // 服务端升级后已签发令牌在有效期内仍可用，给用户留重新登录窗口（P1-3）。
 const legacyTokenGrace = 2*time.Hour + 5*time.Minute
 
-// auth 鉴权中间件：Authorization: Bearer <access_jwt>。
+// auth 鉴权中间件：Authorization: Bearer <access_jwt | ltk_pat_...|ltk_bot_...>。
+// api_token（#54）按明文前缀分流：ltk_ 开头走 token.Service 校验，**先于** JWT
+// 解析判定——别让 JWT 解析器对非法串抛错刷日志。两条路径产出同一个
+// token.Principal（内嵌 auth.Claims），handler 与 authz 的口径不变。
 // 多设备会话（v1.1.0）：比对 claims.Sid 与当前会话 sid；不符 → 401 session_replaced。
 // 旧版本令牌（sid 空）在 legacyTokenGrace 过渡期内放行（兼容 v1.0.x 客户端）；
 // sess 为 nil 时整段跳过（测试/降级路径，生产不可达）。
+// 令牌路径不做会话比对：api_token 没有会话概念，吊销/过期即失效
+// （每次实时查库，绝不缓存 Principal），属主被删/停用同样失效。
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		h := r.Header.Get("Authorization")
-		token := strings.TrimPrefix(h, "Bearer ")
-		if token == "" || token == h {
+		bearer := strings.TrimPrefix(h, "Bearer ")
+		if bearer == "" || bearer == h {
 			writeErr(w, http.StatusUnauthorized, "unauthorized", "缺少访问令牌")
 			return
 		}
-		claims, err := s.jwt.ParseAccess(token)
-		if err != nil {
-			writeErr(w, http.StatusUnauthorized, "unauthorized", "访问令牌无效或已过期")
-			return
-		}
-		if s.sess != nil {
-			if claims.Sid == "" {
-				// 旧版本令牌：过渡期内放行，超期拒绝。
-				if claims.IssuedAt == nil || time.Since(claims.IssuedAt.Time) >= legacyTokenGrace {
-					w.Header().Set("X-LiteTalk-Auth", "session_replaced")
-					writeErr(w, http.StatusUnauthorized, "session_replaced", "登录状态已过期，请重新登录")
-					return
-				}
-			} else {
-				curSid, err := s.sess.Get(r.Context(), claims.UserID, claims.Dev)
-				if err != nil || curSid == "" || claims.Sid != curSid {
-					w.Header().Set("X-LiteTalk-Auth", "session_replaced")
-					writeErr(w, http.StatusUnauthorized, "session_replaced", "账号已在其他设备登录")
-					return
+		var principal *token.Principal
+		if strings.HasPrefix(bearer, token.PlainPrefix) {
+			// api_token（pat/bot）：独立于密码登录的凭据路径，不进 JWT 解析。
+			if s.apiTokens == nil { // 无 Store 的极端构造（fail-closed）
+				writeErr(w, http.StatusUnauthorized, "unauthorized", "访问令牌无效或已过期")
+				return
+			}
+			p, err := s.apiTokens.Verify(r.Context(), bearer)
+			if err != nil {
+				writeErr(w, http.StatusUnauthorized, "unauthorized", "访问令牌无效或已过期")
+				return
+			}
+			principal = p
+		} else {
+			claims, err := s.jwt.ParseAccess(bearer)
+			if err != nil {
+				writeErr(w, http.StatusUnauthorized, "unauthorized", "访问令牌无效或已过期")
+				return
+			}
+			if s.sess != nil {
+				if claims.Sid == "" {
+					// 旧版本令牌：过渡期内放行，超期拒绝。
+					if claims.IssuedAt == nil || time.Since(claims.IssuedAt.Time) >= legacyTokenGrace {
+						w.Header().Set("X-LiteTalk-Auth", "session_replaced")
+						writeErr(w, http.StatusUnauthorized, "session_replaced", "登录状态已过期，请重新登录")
+						return
+					}
+				} else {
+					curSid, err := s.sess.Get(r.Context(), claims.UserID, claims.Dev)
+					if err != nil || curSid == "" || claims.Sid != curSid {
+						w.Header().Set("X-LiteTalk-Auth", "session_replaced")
+						writeErr(w, http.StatusUnauthorized, "session_replaced", "账号已在其他设备登录")
+						return
+					}
 				}
 			}
+			principal = &token.Principal{Claims: claims, Kind: token.KindJWT}
 		}
-		next(w, r.WithContext(context.WithValue(r.Context(), userKey, claims)))
+		next(w, r.WithContext(token.WithPrincipal(r.Context(), principal)))
 	}
 }
 

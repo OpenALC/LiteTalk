@@ -148,6 +148,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 // 这是「收到了、选择不动作」，不该在 GitHub 留失败投递。
 func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	delivery := r.Header.Get("X-GitHub-Delivery")
+	// 限流前置（#102）：已超限的 IP 在读 body 与算 HMAC 之前就拒掉。
+	// 8088 直接对公网监听，读 1MiB body + SHA256/HMAC 是真实开销；
+	// 只读预检不消耗配额，真正的计数仍由签名失败路径的 noteInvalid 累加。
+	if s.invalidBlocked(clientIP(r.RemoteAddr)) {
+		s.logf("webhook 拒绝：签名失败次数已达上限（读 body 前拦截）delivery=%s ip=%s", delivery, clientIP(r.RemoteAddr))
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, MaxBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -297,6 +305,22 @@ func validSignature(secret []byte, header string, body []byte) bool {
 	mac := hmac.New(sha256.New, secret)
 	mac.Write(body)
 	return hmac.Equal(mac.Sum(nil), want)
+}
+
+// invalidBlocked 只读预检：该 IP 在当前窗口内是否已超限（不计数、不写入）。
+// 供 handleWebhook 在读 body 之前短路；窗口过期的条目视为未超限（清理留给 noteInvalid）。
+func (s *Server) invalidBlocked(ip string) bool {
+	now := s.now()
+	s.invalidMu.Lock()
+	defer s.invalidMu.Unlock()
+	w, ok := s.invalid[ip]
+	if !ok {
+		return false
+	}
+	if now.Sub(w.start) >= invalidWindowSize {
+		return false
+	}
+	return w.count > invalidMaxPerIP
 }
 
 // noteInvalid 记录一次签名失败，返回该 IP 是否仍在窗口配额内（false → 429）。

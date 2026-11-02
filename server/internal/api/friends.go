@@ -76,6 +76,10 @@ func (s *Server) CreateFriendRequest(ctx context.Context, request CreateFriendRe
 	if err != nil {
 		return nil, errf(http.StatusNotFound, "not_found", "用户不存在")
 	}
+	// bot 不进好友候选（#51）：与「用户不存在」同形，不泄露名字是否被 bot 占用。
+	if e := rejectBotTarget(target); e != nil {
+		return nil, e
+	}
 	if target.ID == c.UserID {
 		return nil, errf(http.StatusBadRequest, "bad_target", "不能添加自己为好友")
 	}
@@ -94,6 +98,8 @@ func (s *Server) CreateFriendRequest(ctx context.Context, request CreateFriendRe
 	if err := s.store.CreateFriendship(ctx, f); err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
+	// 推送触发点（#53）：通知被请求方（离线判定/节流在 Broker worker，异步）。
+	s.notifyFriendRequest(ctx, target.ID, c.UserID, c.Nickname)
 	return CreateFriendRequest201JSONResponse{
 		Id: idOf(f.ID), Status: FriendEntryStatus(f.Status), Incoming: false,
 		// 新建的是 pending 关系：不回在线态（#11 P2）。

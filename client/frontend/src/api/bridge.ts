@@ -1,10 +1,19 @@
 // bridge 封装 Wails v3 Go 绑定（@wailsio/runtime 的 Call.ByName("main.App.*")）。
 // 浏览器独立开发（vite dev 无 Go 后端）时走 mock 桩，行为可联调 UI。
+// Web 构建（vite build --mode web，服务端托管）：走 src/api/web 的浏览器实现层，
+// REST + WS + WebRTC 全在 TS 侧（#50）。
 // 原生环境判定：Go 在 webview 启动时注入 window._wails.flags（浏览器环境恒无）。
 import { Call, Events } from '@wailsio/runtime'
 import type { AttachmentView, AudioSettings, AuthResult, CategoryDTO, ChannelDTO, ChatMessage, ConnConfigView, ConnTestResult, Conversation, FriendDTO, HotkeySettings, LinkPreview, MentionCandidate, NetworkDiagResult, PeerView, ServerChannels, ServerConfig, ServerDTO, UnreadChannel, Unreads, UserProfile, VoiceStateView, WindowOverlaySettings } from './types'
+import { webApp } from './web/app'
+import { webEventsOff, webEventsOn } from './web/events'
 
-type GoApp = {
+// IS_WEB_BUILD web 构建判别（构建期常量，桌面构建被 tree-shake 成 false）。
+// web 构建只由服务端托管给浏览器，永不进 webview——isNative 恒 false，
+// 依赖 window._wails 注入时序的一切等待/降级逻辑都必须在此短路。
+const IS_WEB_BUILD = import.meta.env.MODE === 'web'
+
+export type GoApp = {
   GetVersion(): Promise<string>
   GetAuthConfig(): Promise<ServerConfig>
   GetHibernateMode(): Promise<string> // off / hibernate / destroy
@@ -31,6 +40,12 @@ type GoApp = {
   LoginAsGuest(): Promise<AuthResult>
   Register(nickname: string, email: string, password: string, code: string, bootstrap: string): Promise<AuthResult>
   ResetPassword(email: string, code: string, newPassword: string): Promise<void>
+  // OidcAuthorize 发起 OIDC 登录（#118 P2-5）：返回 IdP 授权页 URL。web 端由
+  // 调用方当前窗口跳转；桌面端 Go 侧已用系统浏览器打开，返回值仅作展示兜底。
+  OidcAuthorize(): Promise<string>
+  // OidcExchange 回调页专用：code+state 换令牌对并建立会话。仅 web 回调链路
+  // 调用——桌面会话落在系统浏览器里的服务端托管 Web 客户端，不经过本方法。
+  OidcExchange(code: string, state: string): Promise<AuthResult>
   Logout(): Promise<void>
   GetMe(): Promise<UserProfile>
   ListAudioDevices(): Promise<{ capture: AudioDeviceDTO[]; playback: AudioDeviceDTO[] }>
@@ -42,6 +57,9 @@ type GoApp = {
   SetAudioSettings(s: AudioSettings): Promise<void>
   // WebRTC APM（Beta）可用性：false 的平台（如 macOS stub）设置页禁用开关。
   APMSupported(): Promise<boolean>
+  // DRED（深度冗余）可用性（#117）：false 的平台/构建设置页把开关置为关闭并
+  // 提示，避免配置显示「已开启」而实际走普通模式。
+  DREDSupported(): Promise<boolean>
   // 游戏内悬浮层（#47，Beta，仅 Windows）：Supported 为 false 时设置页禁用开关。
   WindowOverlaySupported(): Promise<boolean>
   GetWindowOverlaySettings(): Promise<WindowOverlaySettings>
@@ -229,6 +247,10 @@ const mockApp: GoApp = {
     return mockApp.Login(email, "mock")
   },
   async ResetPassword() {},
+  // OIDC 桩（#118 P2-5）：浏览器开发返回假授权 URL（不导航，联调 UI），
+  // 交换复用登录桩（dev 可手工进 #/oidc/callback?code=x&state=y 看回调页）。
+  async OidcAuthorize() { return 'https://idp.example/authorize?state=mock' },
+  async OidcExchange() { return mockApp.Login('dev@example.com', 'mock') },
   async Logout() {},
   async LoginAsGuest() {
     return {
@@ -263,8 +285,10 @@ const mockApp: GoApp = {
   async SetAudioSettings() {},
   // 浏览器预览没有 C++ APM，但保持 Beta 区可见可操作（落盘为 no-op）。
   async APMSupported() { return true },
-  // 悬浮层 mock：默认关闭；浏览器预览没有原生窗口，仍报告支持以便联调 UI，
-  // 保存为 no-op（真实平台能力由 Go 侧 Supported 报告）。
+  // 浏览器预览没有真实编码器：报告支持，让 DRED 开关保持可操作（落盘为 no-op）。
+  async DREDSupported() { return true },
+  // 浏览器预览没有原生窗口：仍报告支持以便联调 UI，保存为 no-op，
+  // 也不会有 sys:overlay 回滚事件（真实能力由 Go 侧 Supported 报告）。
   async WindowOverlaySupported() { return true },
   async GetWindowOverlaySettings() { return { enabled: false } },
   async SetWindowOverlaySettings() {},
@@ -406,6 +430,9 @@ const nativeApp = new Proxy({} as GoApp, {
 
 export function goApp(): GoApp {
   if (isNative()) return nativeApp
+  // Web 构建（服务端托管的浏览器端）：直接走浏览器实现层。必须在 mock 分支
+  // 之前——web 生产构建 DEV=false，落到底部 nativeApp 只会响亮失败。
+  if (IS_WEB_BUILD) return webApp
   if (import.meta.env.DEV) return mockApp
   // 生产环境原生初始化失败：mock 会让「登录一律成功」，是安全事故——
   // 宁可调用原生绑定报错（响亮失败），也不静默走桩。
@@ -414,6 +441,12 @@ export function goApp(): GoApp {
 
 export function isNative(): boolean {
   return !!window._wails?.flags
+}
+
+// isWebBuild 当前是否为服务端托管的 web 构建（构建期常量）。OIDC 登录据此
+// 分流：web 用当前窗口跳 IdP，桌面由 Go 侧开系统浏览器。
+export function isWebBuild(): boolean {
+  return IS_WEB_BUILD
 }
 
 // nativeInitFailed 生产环境等待原生标志超时仍未就绪时置位（模块级单例）。
@@ -438,6 +471,8 @@ export function __resetBridgeForTest(): void {
 // 生产环境 WebView2 冷启动可能数秒，等待延长到 10s，超时判为原生初始化失败并
 // 置 nativeInitFailed——生产静默落 mock 是安全事故，绝不发生。
 export function whenNativeReady(timeoutMs?: number): Promise<void> {
+  // Web 构建永不注入 window._wails：必须短路，否则首屏白等满超时才挂载。
+  if (IS_WEB_BUILD) return Promise.resolve()
   if (isNative() || typeof window === 'undefined') return Promise.resolve()
   const timeout = timeoutMs ?? (import.meta.env.DEV ? 800 : 10_000)
   return new Promise((resolve) => {
@@ -460,9 +495,11 @@ export function whenNativeReady(timeoutMs?: number): Promise<void> {
   })
 }
 
-// eventsOn Wails 事件订阅。v3 回调收 WailsEvent 对象，取 .data 对齐 v2 的直载荷语义。
-// 浏览器环境静默（mock 不产事件）。
+// eventsOn 事件订阅。Web 构建路由到 web 事件总线（signal 层以同名同形事件
+// 驱动 stores）；v3 回调收 WailsEvent 对象，取 .data 对齐 v2 的直载荷语义。
+// 浏览器预览环境静默（mock 不产事件）。
 export function eventsOn(name: string, cb: (...args: unknown[]) => void): () => void {
+  if (IS_WEB_BUILD) return webEventsOn(name, cb)
   if (!isNative()) return () => {}
   // v3 的 Events.On 返回按监听器的取消函数：卸载时逐个注销，
   // 不许用 eventsOff 按事件名清（会把别人注册的同名监听一并清掉）。
@@ -471,6 +508,10 @@ export function eventsOn(name: string, cb: (...args: unknown[]) => void): () => 
 
 // eventsOff 取消事件订阅（休眠态清理用；v3 按事件名清掉全部监听）。
 export function eventsOff(name: string) {
+  if (IS_WEB_BUILD) {
+    webEventsOff(name)
+    return
+  }
   if (!isNative()) return
   Events.Off(name)
 }

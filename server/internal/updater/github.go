@@ -141,8 +141,9 @@ func (g *GitHubClient) fetchOnce(ctx context.Context, u string) (*ghRelease, err
 	return &rel, nil
 }
 
-// ResolveLatest 取最新发布 tag（含预发布；releases/latest 接口不返回预发布，改用列表）。
-// 按通道策略过滤：未开预发布时跳过带后缀的 tag。
+// ResolveLatest 取最新的发布 tag（含预发布；releases/latest 接口不返回预发布，改用列表）。
+// 按通道策略过滤后**取 semver 最高者**，不依赖列表顺序：列表按发布时间排序，
+// 补发旧版本（如为修打包失败而发的 v1.0.1-alpha）会排在真正最新版之前。
 func (g *GitHubClient) ResolveLatest(ctx context.Context, allowPrerelease bool) (string, error) {
 	u := fmt.Sprintf("%s/repos/%s/releases?per_page=20", g.APIBase, g.Repo)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -162,16 +163,26 @@ func (g *GitHubClient) ResolveLatest(ctx context.Context, allowPrerelease bool) 
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&rels); err != nil {
 		return "", fmt.Errorf("解析 releases JSON: %w", err)
 	}
+	best := ""
+	var bestVer tagVer
 	for _, r := range rels {
-		if _, ok := parseTag(r.TagName); !ok {
+		v, ok := parseTag(r.TagName)
+		if !ok {
 			continue
 		}
 		if (r.Prerelease || isPrereleaseTag(r.TagName)) && !allowPrerelease {
 			continue
 		}
-		return r.TagName, nil
+		// 同版本号取先出现的（列表顺序=发布时间倒序，先出现的更新）
+		if best == "" || v.newerThan(bestVer) {
+			best = r.TagName
+			bestVer = v
+		}
 	}
-	return "", fmt.Errorf("没有符合通道策略的 release")
+	if best == "" {
+		return "", fmt.Errorf("没有符合通道策略的 release")
+	}
+	return best, nil
 }
 
 // Download 下载资产到 destPath，边下边算 SHA256。要求 HTTP 200 + 响应体不超限。

@@ -134,6 +134,9 @@ type App struct {
 	// emitHook 测试专用的事件观察口（emit 广播前同步回调，生产恒为 nil）。
 	// 事件是跨层唯一可观测输出；没有它，测试只能断言状态副作用、断不到 reason。
 	emitHook func(name string, data any)
+
+	// dredSupportFn 测试专用的 DRED 能力覆盖（见 dredSupport；生产恒为 nil）。
+	dredSupportFn func() bool
 }
 
 // NewApp 创建应用实例
@@ -1048,6 +1051,31 @@ func (a *App) LoginAsGuest() (*api.AuthResult, error) {
 // ResetPassword 邮箱验证码重置密码。
 func (a *App) ResetPassword(email, code, newPassword string) error {
 	return a.api.ResetPassword(email, code, newPassword)
+}
+
+// OidcAuthorize 发起 OIDC 登录（#118 P2-5）：REST 换授权 URL 后用系统浏览器
+// 打开（同 OpenAttachment 的 OpenURL 口径，仅放行 http/https）。返回 URL 供
+// 前端展示兜底。code/state 的令牌交换不经桌面端：IdP 重定向到部署配置的
+// redirect_url，会话落在服务端托管的 Web 客户端里——桌面深度链接回跳留后续任务。
+func (a *App) OidcAuthorize() (string, error) {
+	u, err := a.api.OidcAuthorize(context.Background())
+	if err != nil {
+		return "", err
+	}
+	parsed, perr := url.Parse(strings.TrimSpace(u))
+	if perr != nil || parsed.Host == "" {
+		return "", fmt.Errorf("授权地址无效")
+	}
+	if !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
+		return "", fmt.Errorf("仅支持打开 http/https 授权地址")
+	}
+	if a.wails == nil {
+		return "", fmt.Errorf("浏览器不可用：桌面环境未就绪")
+	}
+	if err := a.wails.Browser.OpenURL(parsed.String()); err != nil {
+		return "", err
+	}
+	return parsed.String(), nil
 }
 
 // Logout 注销：断信令、吊销 refresh，清空本地用户档案。
@@ -2049,7 +2077,9 @@ const priorityPermBit uint64 = 1 << 4
 
 // SetPrioritySpeaker 授予/撤销某成员的优先发言（#45，需 ManageChannels）。
 // 读当前 member 覆盖 → 保留其他权限位、只增删 PrioritySpeaker → 空覆盖删除。
-// 撤销只清 allow 位、不写 deny，角色可能已授予该权限，不能反向压制。
+// 授予同时清掉个人 deny 位（同层 deny 胜于 allow，残留 deny 会让授予静默失效）。
+// 撤销只清 allow 位、不写 deny；若成员的有效权限仍来自角色/@everyone，撤销
+// 不可能生效，返回 ErrPriorityFromRole 让 UI 明示，而不是静默成功（#117）。
 // 服务端权限不足时返回 API 错误（前端提示 403）。
 func (a *App) SetPrioritySpeaker(channelID, userID string, enabled bool) error {
 	if a.api == nil {
@@ -2077,7 +2107,17 @@ func (a *App) SetPrioritySpeaker(channelID, userID string, enabled bool) error {
 	}
 	if enabled {
 		allow |= priorityPermBit
+		// 同层 deny 胜于 allow（authz.mergeChannel：member 层 (p|allow)&^deny）：
+		// 残留的个人 deny 会让「授予」变成静默空操作，必须一并清掉。
+		deny &^= priorityPermBit
 	} else {
+		hadPersonal := cur != nil && allow&priorityPermBit != 0
+		// 个人覆盖里没有该位、成员却仍是优先发言：授予只可能来自角色/@everyone
+		// 或 owner/Administrator 旁路，此处撤销改不了 effective 结果——不写库里
+		// 注定无效的覆盖，直接明确报错让 UI 说明原因（#117）。
+		if !hadPersonal && a.memberPriority(userID) {
+			return ErrPriorityFromRole
+		}
 		// 撤销且无个人覆盖：角色授予保持原样，不必写一条 deny。
 		if cur == nil {
 			return nil
@@ -2090,6 +2130,27 @@ func (a *App) SetPrioritySpeaker(channelID, userID string, enabled bool) error {
 	_, err = a.api.SetChannelOverwrite(channelID, "member", userID,
 		strconv.FormatUint(allow, 10), strconv.FormatUint(deny, 10))
 	return err
+}
+
+// ErrPriorityFromRole 撤销优先发言无效：该权限由角色或更高层授予（#117）。
+// 前端把它当提示文案展示，不与网络/权限错误混为一谈。
+var ErrPriorityFromRole = errors.New("该权限由角色授予，无法在此撤销")
+
+// memberPriority 成员当前生效的优先发言标记（不在房/无会话时为 false）。
+// 取值来自会话侧成员表，已由 channel.joined 快照与 voice.priority 广播维持。
+func (a *App) memberPriority(userID string) bool {
+	a.mu.Lock()
+	s := a.sess
+	a.mu.Unlock()
+	if s == nil {
+		return false
+	}
+	for _, m := range s.Members() {
+		if m.UserID == userID {
+			return m.Priority
+		}
+	}
+	return false
 }
 
 // parsePermBits 十进制权限位串 → uint64；空串按 0（服务端输出可能省略 0）。
@@ -2196,6 +2257,21 @@ func (a *App) runtimeAudio() audio.RuntimeSettings {
 // false 的平台（如 macOS stub）设置页应禁用开关并提示不支持。
 func (a *App) APMSupported() bool { return audio.APMSupported() }
 
+// DREDSupported 报告当前平台与 libopus 是否支持深度冗余（#117）。false 的
+// 平台/构建设置页应把开关置为关闭并提示，避免配置显示「已开启」而实际走
+// 普通模式。与 APMSupported 同一口径。
+func (a *App) DREDSupported() bool { return a.dredSupport() }
+
+// dredSupport DRED 能力探测入口。生产实现是 audio.DREDSupported、结果由其后
+// 缓存；测试整体替换它来驱动「不支持」分支，使该分支在 Windows/Linux 的 CI
+// 上也被真实执行（不能用 t.Skip 把平台分支藏起来）。
+func (a *App) dredSupport() bool {
+	if a.dredSupportFn != nil {
+		return a.dredSupportFn()
+	}
+	return audio.DREDSupported()
+}
+
 // GetAudioSettings 读取持久化语音设置（设置页初始化用；未设置字段回落默认值）。
 func (a *App) GetAudioSettings() config.AudioSettings { return a.cfg.GetAudioSettings() }
 
@@ -2232,6 +2308,12 @@ func (a *App) SetAudioSettings(s config.AudioSettings) error {
 	if s.EnableAPM && !audio.APMSupported() {
 		return fmt.Errorf("当前平台不支持 WebRTC APM")
 	}
+	// DRED 默认开启：不支持 DRED 的平台/构建上，保存设置本身不算错，但配置里
+	// 不能再留着「已开启」。这里明确拒绝把 DRED 打开，前端据此回滚开关并提示
+	// （#117）。关闭方向永远放行。
+	if s.DRED != nil && *s.DRED && !a.dredSupport() {
+		return fmt.Errorf("当前平台不支持深度冗余（DRED）")
+	}
 	if err := a.cfg.SetAudioSettings(s); err != nil {
 		return err
 	}
@@ -2242,6 +2324,9 @@ func (a *App) SetAudioSettings(s config.AudioSettings) error {
 		err := sess.ApplyAudio(a.runtimeAudio())
 		if s.EnableAPM && a.rollbackAPMIfInactive(sess) && err == nil {
 			err = fmt.Errorf("启用 WebRTC APM 失败")
+		}
+		if a.rollbackDREDIfInactive(sess) && err == nil {
+			err = fmt.Errorf("启用深度冗余（DRED）失败")
 		}
 		return err
 	}
@@ -2263,6 +2348,42 @@ func (a *App) rollbackAPMIfInactive(sess *voice.Session) bool {
 		log.Printf("rollback enable_apm: %v", err)
 	}
 	return true
+}
+
+// rollbackDREDIfInactive 未能启用 DRED 时回滚持久化的 dred（#117），口径与
+// rollbackAPMIfInactive 一致：macOS/stub 平台与不支持 DRED 的旧 libopus 上，
+// 配置不能一直显示「已开启」而实际走普通模式。
+//
+// 无会话（未连接/音频降级）时只按平台能力判断：平台本身支持就先不动，等
+// 连接后真正应用失败再回滚——否则「断网时点一下保存」会把支持平台的 DRED 清掉。
+func (a *App) rollbackDREDIfInactive(sess *voice.Session) bool {
+	as := a.cfg.GetAudioSettings()
+	requested := as.DRED != nil && *as.DRED
+	haveSession := sess != nil
+	active := haveSession && sess.DREDActive()
+	if !dredRollbackNeeded(requested, haveSession, active, a.dredSupport()) {
+		return false
+	}
+	off := false
+	as.DRED = &off
+	if err := a.cfg.SetAudioSettings(as); err != nil {
+		log.Printf("rollback dred: %v", err)
+	}
+	return true
+}
+
+// dredRollbackNeeded 判断是否需要把持久化的 dred 回滚为关闭（#117），纯函数
+// 便于穷举组合测试。有会话时以「编码器是否真的启用」为准；无会话（未连接/
+// 音频降级）时只看平台能力——支持 DRED 的平台要等连接后应用失败再回滚，
+// 否则「断网时点一下保存」会把支持的平台白白关掉。
+func dredRollbackNeeded(requested, haveSession, active, supported bool) bool {
+	if !requested {
+		return false
+	}
+	if haveSession {
+		return !active
+	}
+	return !supported
 }
 
 // ---------- 全局热键（v1.2.0：PTT / 闭麦 / 静音 / 全关全开） ----------
@@ -2421,16 +2542,36 @@ func (a *App) SetWindowOverlaySettings(s config.OverlaySettings) error {
 }
 
 // startWindowOverlay ServiceStartup 调用：按持久化配置启动（Beta 默认关闭）。
-// 平台不支持或窗口创建失败只记日志，不影响主窗口可用性。
+//
+// 启动失败与 APM / DRED 同口径回滚：把 window_overlay.enabled 落盘改回 false，
+// 再把错误经 sys:overlay 事件推给前端——否则用户下次启动仍会失败却没有任何
+// 提示，设置页还显示「已开启」（#117）。启动阶段前端可能尚未订阅，事件可能
+// 丢失，因此 GetWindowOverlaySettings 读到的已是回滚后的 false，UI 首屏即一致。
 func (a *App) startWindowOverlay() {
 	a.overlayMu.Lock()
 	defer a.overlayMu.Unlock()
-	if !overlay.Supported() || !a.cfg.GetWindowOverlaySettings().Enabled {
+	if !a.cfg.GetWindowOverlaySettings().Enabled {
+		return
+	}
+	if !overlay.Supported() {
+		// 持久化值来自别的平台（配置随账号/机器同步）：本平台无能为力，
+		// 保留原值不当作失败，只记日志。
 		return
 	}
 	if err := overlay.Start(a.overlaySnapshot); err != nil {
-		log.Printf("overlay start: %v", err)
+		log.Printf("overlay start: %v（已回滚 window_overlay.enabled）", err)
+		rb := config.OverlaySettings{Enabled: false}
+		if rbErr := a.cfg.SetWindowOverlaySettings(rb); rbErr != nil {
+			log.Printf("rollback window_overlay: %v", rbErr)
+		}
+		a.emit("sys:overlay", OverlayStateEvent{Enabled: false, Error: err.Error()})
 	}
+}
+
+// OverlayStateEvent sys:overlay 事件载荷：启动失败时前端据此提示并关掉开关。
+type OverlayStateEvent struct {
+	Enabled bool   `json:"enabled"`
+	Error   string `json:"error,omitempty"`
 }
 
 // stopWindowOverlay 关闭悬浮层（ServiceShutdown 调用，幂等）。

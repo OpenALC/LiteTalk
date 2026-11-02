@@ -256,9 +256,9 @@ var createTriggerRe = regexp.MustCompile(`(?is)^create\s+(?:or\s+replace\s+)?(?:
 func (m *MySQL) CreateUser(ctx context.Context, u *User) error {
 	u.ID = newID(u.ID)
 	_, err := m.db.ExecContext(ctx,
-		`INSERT INTO users (id, email, nickname, tag, password_hash, email_verified, is_guest, status)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		u.ID, u.Email, u.Nickname, u.Tag, u.PasswordHash, u.EmailVerified, u.IsGuest, u.Status)
+		`INSERT INTO users (id, email, nickname, tag, password_hash, email_verified, is_guest, is_bot, status)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		u.ID, u.Email, u.Nickname, u.Tag, u.PasswordHash, u.EmailVerified, u.IsGuest, u.IsBot, u.Status)
 	if err != nil {
 		if isDup(err) {
 			return ErrConflict
@@ -272,7 +272,7 @@ func (m *MySQL) CreateUser(ctx context.Context, u *User) error {
 func (m *MySQL) scanUser(row interface{ Scan(...any) error }) (*User, error) {
 	var u User
 	err := row.Scan(&u.ID, &u.Email, &u.Nickname, &u.Tag, &u.PasswordHash,
-		&u.EmailVerified, &u.IsGuest, &u.Status, &u.CreatedAt, &u.UpdatedAt)
+		&u.EmailVerified, &u.IsGuest, &u.IsBot, &u.Status, &u.CreatedAt, &u.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -282,12 +282,14 @@ func (m *MySQL) scanUser(row interface{ Scan(...any) error }) (*User, error) {
 	return &u, nil
 }
 
-const userCols = `id, email, nickname, tag, password_hash, email_verified, is_guest, status, created_at, updated_at`
+const userCols = `id, email, nickname, tag, password_hash, email_verified, is_guest, is_bot, status, created_at, updated_at`
 
 func (m *MySQL) UserByID(ctx context.Context, id int64) (*User, error) {
 	return m.scanUser(m.db.QueryRowContext(ctx, `SELECT `+userCols+` FROM users WHERE id = ?`, id))
 }
 
+// UserByEmail 依赖 utf8mb4_unicode_ci（0001 迁移）：等值比较本身大小写不敏感，
+// 存量大小写混合账号无需 lower() 也能命中，且走唯一索引 uk_users_email。
 func (m *MySQL) UserByEmail(ctx context.Context, email string) (*User, error) {
 	return m.scanUser(m.db.QueryRowContext(ctx, `SELECT `+userCols+` FROM users WHERE email = ?`, email))
 }
@@ -299,8 +301,8 @@ func (m *MySQL) UserByNicknameTag(ctx context.Context, nickname, tag string) (*U
 
 func (m *MySQL) UpdateUser(ctx context.Context, u *User) error {
 	res, err := m.db.ExecContext(ctx,
-		`UPDATE users SET nickname = ?, tag = ?, password_hash = ?, email_verified = ?, status = ?
-		 WHERE id = ?`, u.Nickname, u.Tag, u.PasswordHash, u.EmailVerified, u.Status, u.ID)
+		`UPDATE users SET nickname = ?, tag = ?, password_hash = ?, email_verified = ?, is_bot = ?, status = ?
+		 WHERE id = ?`, u.Nickname, u.Tag, u.PasswordHash, u.EmailVerified, u.IsBot, u.Status, u.ID)
 	if err != nil {
 		if isDup(err) {
 			return ErrConflict
@@ -1773,6 +1775,95 @@ func (m *MySQL) DeleteAllUserSessions(ctx context.Context, userID int64) error {
 	return err
 }
 
+// ---- api_tokens（迁移 0018，#51 #54）----
+
+const apiTokenCols = `id, user_id, name, prefix, secret_hash, kind, scopes, expires_at, last_used_at, revoked_at, created_at`
+
+func (m *MySQL) CreateAPIToken(ctx context.Context, t *APIToken) error {
+	t.ID = newID(t.ID)
+	_, err := m.db.ExecContext(ctx,
+		`INSERT INTO api_tokens (id, user_id, name, prefix, secret_hash, kind, scopes, expires_at, last_used_at, revoked_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.UserID, t.Name, t.Prefix, t.SecretHash, t.Kind, t.Scopes,
+		t.ExpiresAt, t.LastUsedAt, t.RevokedAt)
+	if err != nil {
+		if isDup(err) {
+			return ErrConflict
+		}
+		return err
+	}
+	return m.db.QueryRowContext(ctx, `SELECT created_at FROM api_tokens WHERE id = ?`, t.ID).
+		Scan(&t.CreatedAt)
+}
+
+func (m *MySQL) scanAPIToken(row interface{ Scan(...any) error }) (*APIToken, error) {
+	var t APIToken
+	var exp, lastUsed, revoked sql.NullTime
+	err := row.Scan(&t.ID, &t.UserID, &t.Name, &t.Prefix, &t.SecretHash, &t.Kind,
+		&t.Scopes, &exp, &lastUsed, &revoked, &t.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if exp.Valid {
+		v := exp.Time
+		t.ExpiresAt = &v
+	}
+	if lastUsed.Valid {
+		v := lastUsed.Time
+		t.LastUsedAt = &v
+	}
+	if revoked.Valid {
+		v := revoked.Time
+		t.RevokedAt = &v
+	}
+	return &t, nil
+}
+
+func (m *MySQL) APITokenByPrefix(ctx context.Context, prefix string) (*APIToken, error) {
+	return m.scanAPIToken(m.db.QueryRowContext(ctx,
+		`SELECT `+apiTokenCols+` FROM api_tokens WHERE prefix = ?`, prefix))
+}
+
+func (m *MySQL) APITokenByID(ctx context.Context, id int64) (*APIToken, error) {
+	return m.scanAPIToken(m.db.QueryRowContext(ctx,
+		`SELECT `+apiTokenCols+` FROM api_tokens WHERE id = ?`, id))
+}
+
+func (m *MySQL) APITokensOfUser(ctx context.Context, userID int64) ([]APIToken, error) {
+	rows, err := m.db.QueryContext(ctx,
+		`SELECT `+apiTokenCols+` FROM api_tokens WHERE user_id = ? ORDER BY created_at, id`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []APIToken{}
+	for rows.Next() {
+		t, err := m.scanAPIToken(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *t)
+	}
+	return out, rows.Err()
+}
+
+func (m *MySQL) RevokeAPIToken(ctx context.Context, id int64, at time.Time) error {
+	res, err := m.db.ExecContext(ctx, `UPDATE api_tokens SET revoked_at = ? WHERE id = ?`, at, id)
+	if err != nil {
+		return err
+	}
+	return checkAffected(res)
+}
+
+// TouchAPITokenLastUsed 尽力而为：行已不存在（并发删除）不报错，异步路径不该失败。
+func (m *MySQL) TouchAPITokenLastUsed(ctx context.Context, id int64, at time.Time) error {
+	_, err := m.db.ExecContext(ctx, `UPDATE api_tokens SET last_used_at = ? WHERE id = ?`, at, id)
+	return err
+}
+
 // ---- roles / member_roles / channel_overwrites / audit_log（迁移 0010，#35 B1） ----
 // 语义实现与 SQLite 共用 roles.go 的 db* 函数，这里只做方言接线。
 
@@ -1877,3 +1968,203 @@ func checkAffected(res sql.Result) error {
 
 // 编译期断言：MySQL 是 Store 的完整实现。
 var _ Store = (*MySQL)(nil)
+
+// ---- push_devices（迁移 0020，#53） ----
+
+func scanPushDevice(row *sql.Row) (*PushDevice, error) {
+	d := &PushDevice{}
+	err := row.Scan(&d.ID, &d.UserID, &d.Platform, &d.Token, &d.LastSeen, &d.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return d, nil
+}
+
+// UpsertPushDevice 按 (user_id, token_hash) 幂等：命中更新 platform/last_seen 并
+// 回填既有 ID 返回 false；未命中插入返回 true。并发首插撞唯一键时退回更新，
+// 不把竞态暴露成 ErrConflict——重复注册语义上就是更新。
+func (m *MySQL) UpsertPushDevice(ctx context.Context, d *PushDevice) (bool, error) {
+	hash := pushTokenHash(d.Token)
+	now := time.Now()
+	var id int64
+	err := m.db.QueryRowContext(ctx,
+		`SELECT id FROM push_devices WHERE user_id = ? AND token_hash = ?`, d.UserID, hash).Scan(&id)
+	if err == nil {
+		if _, err = m.db.ExecContext(ctx,
+			`UPDATE push_devices SET platform = ?, push_token = ?, last_seen_at = ? WHERE id = ?`,
+			d.Platform, d.Token, now, id); err != nil {
+			return false, err
+		}
+		d.ID, d.LastSeen = id, now
+		return false, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	d.ID = newID(d.ID)
+	if _, err = m.db.ExecContext(ctx,
+		`INSERT INTO push_devices (id, user_id, platform, push_token, token_hash, last_seen_at, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		d.ID, d.UserID, d.Platform, d.Token, hash, now, now); err != nil {
+		if !isDup(err) {
+			return false, err
+		}
+		// 并发首插：另一连接已写入同一 (user_id, token_hash)，退回更新既有行。
+		if e := m.db.QueryRowContext(ctx,
+			`SELECT id FROM push_devices WHERE user_id = ? AND token_hash = ?`, d.UserID, hash).Scan(&id); e != nil {
+			return false, e
+		}
+		if _, e := m.db.ExecContext(ctx,
+			`UPDATE push_devices SET platform = ?, push_token = ?, last_seen_at = ? WHERE id = ?`,
+			d.Platform, d.Token, now, id); e != nil {
+			return false, e
+		}
+		d.ID, d.LastSeen = id, now
+		return false, nil
+	}
+	d.CreatedAt = now
+	return true, nil
+}
+
+// PushDevicesOfUser 该用户全部设备，按 id 升序。
+func (m *MySQL) PushDevicesOfUser(ctx context.Context, userID int64) ([]PushDevice, error) {
+	rows, err := m.db.QueryContext(ctx,
+		`SELECT `+pushDeviceCols+` FROM push_devices WHERE user_id = ? ORDER BY id`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []PushDevice{}
+	for rows.Next() {
+		var d PushDevice
+		if err := rows.Scan(&d.ID, &d.UserID, &d.Platform, &d.Token, &d.LastSeen, &d.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// PushDeviceByID 单台设备；无命中 ErrNotFound。
+func (m *MySQL) PushDeviceByID(ctx context.Context, id int64) (*PushDevice, error) {
+	return scanPushDevice(m.db.QueryRowContext(ctx,
+		`SELECT `+pushDeviceCols+` FROM push_devices WHERE id = ?`, id))
+}
+
+// DeletePushDevice 删除设备行；未命中 ErrNotFound。
+func (m *MySQL) DeletePushDevice(ctx context.Context, id int64) error {
+	res, err := m.db.ExecContext(ctx, `DELETE FROM push_devices WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	return checkAffected(res)
+}
+
+// ---- oidc_identities（迁移 0021，#54） ----
+
+// oidcIdentityCols 查询列集（SQLite 实现共用同形 SQL）。
+const oidcIdentityCols = `id, issuer, sub, user_id, email, created_at`
+
+func scanOIDCIdentity(row interface{ Scan(...any) error }) (*OIDCIdentity, error) {
+	var i OIDCIdentity
+	err := row.Scan(&i.ID, &i.Issuer, &i.Sub, &i.UserID, &i.Email, &i.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &i, nil
+}
+
+func (m *MySQL) CreateOIDCIdentity(ctx context.Context, i *OIDCIdentity) error {
+	i.ID = newID(i.ID)
+	_, err := m.db.ExecContext(ctx,
+		`INSERT INTO oidc_identities (id, issuer, sub, user_id, email)
+		 VALUES (?, ?, ?, ?, ?)`,
+		i.ID, i.Issuer, i.Sub, i.UserID, i.Email)
+	if err != nil {
+		if isDup(err) {
+			return ErrConflict
+		}
+		return err
+	}
+	return m.db.QueryRowContext(ctx, `SELECT created_at FROM oidc_identities WHERE id = ?`, i.ID).
+		Scan(&i.CreatedAt)
+}
+
+func (m *MySQL) OIDCIdentityByIssuerSub(ctx context.Context, issuer, sub string) (*OIDCIdentity, error) {
+	return scanOIDCIdentity(m.db.QueryRowContext(ctx,
+		`SELECT `+oidcIdentityCols+` FROM oidc_identities WHERE issuer = ? AND sub = ?`, issuer, sub))
+}
+
+// ---- webhooks（迁移 0019，#52）----
+// CRUD 与投递记录共用 webhooks.go 的 db* 实现；RecordWebhookDelivery 的
+// 读-改-写在事务内完成，并发投递同一订阅不会越过熔断阈值。
+
+func (m *MySQL) CreateOutboundWebhook(ctx context.Context, w *OutboundWebhook) error {
+	return dbCreateOutboundWebhook(ctx, m.db, w)
+}
+
+func (m *MySQL) OutboundWebhookByID(ctx context.Context, id int64) (*OutboundWebhook, error) {
+	return dbOutboundWebhookByID(ctx, m.db, id)
+}
+
+func (m *MySQL) OutboundWebhooksOfServer(ctx context.Context, serverID int64) ([]OutboundWebhook, error) {
+	return dbOutboundWebhooksOfServer(ctx, m.db, serverID)
+}
+
+func (m *MySQL) HasOutboundWebhooks(ctx context.Context) (bool, error) {
+	return dbHasOutboundWebhooks(ctx, m.db)
+}
+
+func (m *MySQL) UpdateOutboundWebhook(ctx context.Context, w *OutboundWebhook) error {
+	return dbUpdateOutboundWebhook(ctx, m.db, w)
+}
+
+func (m *MySQL) DeleteOutboundWebhook(ctx context.Context, id int64) error {
+	return dbDeleteOutboundWebhook(ctx, m.db, id)
+}
+
+func (m *MySQL) RecordWebhookDelivery(ctx context.Context, d *WebhookDelivery, breakerAt int, reason string) error {
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := dbRecordWebhookDelivery(ctx, tx, d, breakerAt, reason); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (m *MySQL) WebhookDeliveriesBefore(ctx context.Context, before time.Time, limit int) ([]WebhookDelivery, error) {
+	return dbWebhookDeliveriesBefore(ctx, m.db, before, limit)
+}
+
+func (m *MySQL) DeleteWebhookDeliveries(ctx context.Context, ids []int64) error {
+	return dbDeleteWebhookDeliveries(ctx, m.db, ids)
+}
+
+func (m *MySQL) CreateInboundWebhook(ctx context.Context, w *InboundWebhook) error {
+	return dbCreateInboundWebhook(ctx, m.db, w)
+}
+
+func (m *MySQL) InboundWebhookByID(ctx context.Context, id int64) (*InboundWebhook, error) {
+	return dbInboundWebhookByID(ctx, m.db, id)
+}
+
+func (m *MySQL) InboundWebhooksOfChannel(ctx context.Context, channelID int64) ([]InboundWebhook, error) {
+	return dbInboundWebhooksOfChannel(ctx, m.db, channelID)
+}
+
+func (m *MySQL) UpdateInboundWebhook(ctx context.Context, w *InboundWebhook) error {
+	return dbUpdateInboundWebhook(ctx, m.db, w)
+}
+
+func (m *MySQL) DeleteInboundWebhook(ctx context.Context, id int64) error {
+	return dbDeleteInboundWebhook(ctx, m.db, id)
+}

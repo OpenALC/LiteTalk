@@ -12,6 +12,7 @@ usage() {
   cat <<'EOF'
 用法: update.sh --tag vX.Y.Z [选项]
   --tag               目标版本（vX.Y.Z[-alpha|-beta|-rc] 或 latest）；必填
+                      latest = 通道内 semver 最高的 release；不新于已装版本时只报"已是最新"
   --dry-run           只下载校验解包，不替换二进制、不重启、不写状态
   --no-restart        替换二进制但不重启服务（不推进已发布版本）
   --allow-prerelease  放行 -alpha/-beta/-rc（默认通道只收正式版）
@@ -19,7 +20,7 @@ usage() {
   -h, --help          显示帮助
 
 推荐: sudo -u www /www/wwwroot/LiteTalk/update.sh --tag vX.Y.Z
-退出码: 0 成功 / 1 更新失败（已回滚）/ 2 参数错误 / 75 已有更新在运行
+退出码: 0 成功（含 latest 已是最新）/ 1 更新失败（已回滚）/ 2 参数错误 / 75 已有更新在运行
 EOF
 }
 

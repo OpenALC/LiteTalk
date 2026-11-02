@@ -186,9 +186,9 @@ func (s *SQLite) RollbackLast(ctx context.Context, fsys fs.FS) error {
 func (s *SQLite) CreateUser(ctx context.Context, u *User) error {
 	u.ID = newID(u.ID)
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO users (id, email, nickname, tag, password_hash, email_verified, is_guest, status)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		u.ID, u.Email, u.Nickname, u.Tag, u.PasswordHash, u.EmailVerified, u.IsGuest, u.Status)
+		`INSERT INTO users (id, email, nickname, tag, password_hash, email_verified, is_guest, is_bot, status)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		u.ID, u.Email, u.Nickname, u.Tag, u.PasswordHash, u.EmailVerified, u.IsGuest, u.IsBot, u.Status)
 	if err != nil {
 		if isDupSQLite(err) {
 			return ErrConflict
@@ -202,7 +202,7 @@ func (s *SQLite) CreateUser(ctx context.Context, u *User) error {
 func (s *SQLite) scanUser(row interface{ Scan(...any) error }) (*User, error) {
 	var u User
 	err := row.Scan(&u.ID, &u.Email, &u.Nickname, &u.Tag, &u.PasswordHash,
-		&u.EmailVerified, &u.IsGuest, &u.Status, &u.CreatedAt, &u.UpdatedAt)
+		&u.EmailVerified, &u.IsGuest, &u.IsBot, &u.Status, &u.CreatedAt, &u.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -212,14 +212,23 @@ func (s *SQLite) scanUser(row interface{ Scan(...any) error }) (*User, error) {
 	return &u, nil
 }
 
-const sqUserCols = `id, email, nickname, tag, password_hash, email_verified, is_guest, status, created_at, updated_at`
+const sqUserCols = `id, email, nickname, tag, password_hash, email_verified, is_guest, is_bot, status, created_at, updated_at`
 
 func (s *SQLite) UserByID(ctx context.Context, id int64) (*User, error) {
 	return s.scanUser(s.db.QueryRowContext(ctx, `SELECT `+sqUserCols+` FROM users WHERE id = ?`, id))
 }
 
+// UserByEmail 先走等值查询（命中唯一索引 uk_users_email，新账号邮箱全部小写
+// 写入，常规路径不回退索引）；未命中再用 lower() 兼容存量大小写混合行。
+// lower(email) 无法走索引，只会在旧数据/未注册邮箱上发生一次扫描——不加
+// 表达式索引是因为存量数据变更需要迁移，不在本改动的授权范围内。
 func (s *SQLite) UserByEmail(ctx context.Context, email string) (*User, error) {
-	return s.scanUser(s.db.QueryRowContext(ctx, `SELECT `+sqUserCols+` FROM users WHERE email = ?`, email))
+	u, err := s.scanUser(s.db.QueryRowContext(ctx, `SELECT `+sqUserCols+` FROM users WHERE email = ?`, email))
+	if err == nil || !errors.Is(err, ErrNotFound) {
+		return u, err
+	}
+	return s.scanUser(s.db.QueryRowContext(ctx,
+		`SELECT `+sqUserCols+` FROM users WHERE lower(email) = lower(?) ORDER BY id LIMIT 1`, email))
 }
 
 func (s *SQLite) UserByNicknameTag(ctx context.Context, nickname, tag string) (*User, error) {
@@ -232,9 +241,9 @@ func (s *SQLite) UserByNicknameTag(ctx context.Context, nickname, tag string) (*
 // checkAffected 不会把「原样保存」误报成 ErrNotFound。
 func (s *SQLite) UpdateUser(ctx context.Context, u *User) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE users SET nickname = ?, tag = ?, password_hash = ?, email_verified = ?, status = ?,
+		`UPDATE users SET nickname = ?, tag = ?, password_hash = ?, email_verified = ?, is_bot = ?, status = ?,
 		 updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-		u.Nickname, u.Tag, u.PasswordHash, u.EmailVerified, u.Status, u.ID)
+		u.Nickname, u.Tag, u.PasswordHash, u.EmailVerified, u.IsBot, u.Status, u.ID)
 	if err != nil {
 		if isDupSQLite(err) {
 			return ErrConflict
@@ -1751,6 +1760,95 @@ func (s *SQLite) DeleteAllUserSessions(ctx context.Context, userID int64) error 
 	return err
 }
 
+// ---- api_tokens（迁移 0018，#51 #54）----
+
+const sqAPITokenCols = `id, user_id, name, prefix, secret_hash, kind, scopes, expires_at, last_used_at, revoked_at, created_at`
+
+func (s *SQLite) CreateAPIToken(ctx context.Context, t *APIToken) error {
+	t.ID = newID(t.ID)
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO api_tokens (id, user_id, name, prefix, secret_hash, kind, scopes, expires_at, last_used_at, revoked_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.UserID, t.Name, t.Prefix, t.SecretHash, t.Kind, t.Scopes,
+		t.ExpiresAt, t.LastUsedAt, t.RevokedAt)
+	if err != nil {
+		if isDupSQLite(err) {
+			return ErrConflict
+		}
+		return err
+	}
+	return s.db.QueryRowContext(ctx, `SELECT created_at FROM api_tokens WHERE id = ?`, t.ID).
+		Scan(&t.CreatedAt)
+}
+
+func (s *SQLite) scanAPIToken(row interface{ Scan(...any) error }) (*APIToken, error) {
+	var t APIToken
+	var exp, lastUsed, revoked sql.NullTime
+	err := row.Scan(&t.ID, &t.UserID, &t.Name, &t.Prefix, &t.SecretHash, &t.Kind,
+		&t.Scopes, &exp, &lastUsed, &revoked, &t.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if exp.Valid {
+		v := exp.Time
+		t.ExpiresAt = &v
+	}
+	if lastUsed.Valid {
+		v := lastUsed.Time
+		t.LastUsedAt = &v
+	}
+	if revoked.Valid {
+		v := revoked.Time
+		t.RevokedAt = &v
+	}
+	return &t, nil
+}
+
+func (s *SQLite) APITokenByPrefix(ctx context.Context, prefix string) (*APIToken, error) {
+	return s.scanAPIToken(s.db.QueryRowContext(ctx,
+		`SELECT `+sqAPITokenCols+` FROM api_tokens WHERE prefix = ?`, prefix))
+}
+
+func (s *SQLite) APITokenByID(ctx context.Context, id int64) (*APIToken, error) {
+	return s.scanAPIToken(s.db.QueryRowContext(ctx,
+		`SELECT `+sqAPITokenCols+` FROM api_tokens WHERE id = ?`, id))
+}
+
+func (s *SQLite) APITokensOfUser(ctx context.Context, userID int64) ([]APIToken, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+sqAPITokenCols+` FROM api_tokens WHERE user_id = ? ORDER BY created_at, id`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []APIToken{}
+	for rows.Next() {
+		t, err := s.scanAPIToken(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *t)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLite) RevokeAPIToken(ctx context.Context, id int64, at time.Time) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE api_tokens SET revoked_at = ? WHERE id = ?`, at, id)
+	if err != nil {
+		return err
+	}
+	return checkAffected(res)
+}
+
+// TouchAPITokenLastUsed 尽力而为：行已不存在（并发删除）不报错，异步路径不该失败。
+func (s *SQLite) TouchAPITokenLastUsed(ctx context.Context, id int64, at time.Time) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE api_tokens SET last_used_at = ? WHERE id = ?`, at, id)
+	return err
+}
+
 // ---- roles / member_roles / channel_overwrites / audit_log（迁移 0010，#35 B1） ----
 // 语义实现与 MySQL 共用 roles.go 的 db* 函数，这里只做方言接线。
 
@@ -1848,3 +1946,185 @@ func isDupSQLite(err error) bool {
 
 // 编译期断言：SQLite 是 Store 的完整实现，无降级方法。
 var _ Store = (*SQLite)(nil)
+
+// ---- push_devices（迁移 0020，#53） ----
+
+// UpsertPushDevice 按 (user_id, token_hash) 幂等：命中更新 platform/last_seen 并
+// 回填既有 ID 返回 false；未命中插入返回 true。并发首插撞唯一键时退回更新，
+// 不把竞态暴露成 ErrConflict——重复注册语义上就是更新。
+func (s *SQLite) UpsertPushDevice(ctx context.Context, d *PushDevice) (bool, error) {
+	hash := pushTokenHash(d.Token)
+	now := time.Now()
+	var id int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id FROM push_devices WHERE user_id = ? AND token_hash = ?`, d.UserID, hash).Scan(&id)
+	if err == nil {
+		if _, err = s.db.ExecContext(ctx,
+			`UPDATE push_devices SET platform = ?, push_token = ?, last_seen_at = ? WHERE id = ?`,
+			d.Platform, d.Token, now, id); err != nil {
+			return false, err
+		}
+		d.ID, d.LastSeen = id, now
+		return false, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	d.ID = newID(d.ID)
+	if _, err = s.db.ExecContext(ctx,
+		`INSERT INTO push_devices (id, user_id, platform, push_token, token_hash, last_seen_at, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		d.ID, d.UserID, d.Platform, d.Token, hash, now, now); err != nil {
+		if !isDupSQLite(err) {
+			return false, err
+		}
+		// 并发首插：另一连接已写入同一 (user_id, token_hash)，退回更新既有行。
+		if e := s.db.QueryRowContext(ctx,
+			`SELECT id FROM push_devices WHERE user_id = ? AND token_hash = ?`, d.UserID, hash).Scan(&id); e != nil {
+			return false, e
+		}
+		if _, e := s.db.ExecContext(ctx,
+			`UPDATE push_devices SET platform = ?, push_token = ?, last_seen_at = ? WHERE id = ?`,
+			d.Platform, d.Token, now, id); e != nil {
+			return false, e
+		}
+		d.ID, d.LastSeen = id, now
+		return false, nil
+	}
+	d.CreatedAt = now
+	return true, nil
+}
+
+// PushDevicesOfUser 该用户全部设备，按 id 升序。
+func (s *SQLite) PushDevicesOfUser(ctx context.Context, userID int64) ([]PushDevice, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+pushDeviceCols+` FROM push_devices WHERE user_id = ? ORDER BY id`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []PushDevice{}
+	for rows.Next() {
+		var d PushDevice
+		if err := rows.Scan(&d.ID, &d.UserID, &d.Platform, &d.Token, &d.LastSeen, &d.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// PushDeviceByID 单台设备；无命中 ErrNotFound。
+func (s *SQLite) PushDeviceByID(ctx context.Context, id int64) (*PushDevice, error) {
+	return scanPushDevice(s.db.QueryRowContext(ctx,
+		`SELECT `+pushDeviceCols+` FROM push_devices WHERE id = ?`, id))
+}
+
+// DeletePushDevice 删除设备行；未命中 ErrNotFound。
+func (s *SQLite) DeletePushDevice(ctx context.Context, id int64) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM push_devices WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ---- oidc_identities（迁移 0021，#54）----
+// SQL 与 MySQL 同形（无 ENUM、无方言 upsert），scanOIDCIdentity 共用 mysql.go 的实现。
+
+func (s *SQLite) CreateOIDCIdentity(ctx context.Context, i *OIDCIdentity) error {
+	i.ID = newID(i.ID)
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO oidc_identities (id, issuer, sub, user_id, email)
+		 VALUES (?, ?, ?, ?, ?)`,
+		i.ID, i.Issuer, i.Sub, i.UserID, i.Email)
+	if err != nil {
+		if isDupSQLite(err) {
+			return ErrConflict
+		}
+		return err
+	}
+	return s.db.QueryRowContext(ctx, `SELECT created_at FROM oidc_identities WHERE id = ?`, i.ID).
+		Scan(&i.CreatedAt)
+}
+
+func (s *SQLite) OIDCIdentityByIssuerSub(ctx context.Context, issuer, sub string) (*OIDCIdentity, error) {
+	return scanOIDCIdentity(s.db.QueryRowContext(ctx,
+		`SELECT `+oidcIdentityCols+` FROM oidc_identities WHERE issuer = ? AND sub = ?`, issuer, sub))
+}
+
+// ---- webhooks（迁移 0019，#52）----
+// CRUD 与投递记录共用 webhooks.go 的 db* 实现；SQL 与 MySQL 同形（无 ENUM、
+// 无方言 upsert），这里只做事务接线。RecordWebhookDelivery 的读-改-写在事务内
+// 完成，并发投递同一订阅不会越过熔断阈值。
+
+func (s *SQLite) CreateOutboundWebhook(ctx context.Context, w *OutboundWebhook) error {
+	return dbCreateOutboundWebhook(ctx, s.db, w)
+}
+
+func (s *SQLite) OutboundWebhookByID(ctx context.Context, id int64) (*OutboundWebhook, error) {
+	return dbOutboundWebhookByID(ctx, s.db, id)
+}
+
+func (s *SQLite) OutboundWebhooksOfServer(ctx context.Context, serverID int64) ([]OutboundWebhook, error) {
+	return dbOutboundWebhooksOfServer(ctx, s.db, serverID)
+}
+
+func (s *SQLite) HasOutboundWebhooks(ctx context.Context) (bool, error) {
+	return dbHasOutboundWebhooks(ctx, s.db)
+}
+
+func (s *SQLite) UpdateOutboundWebhook(ctx context.Context, w *OutboundWebhook) error {
+	return dbUpdateOutboundWebhook(ctx, s.db, w)
+}
+
+func (s *SQLite) DeleteOutboundWebhook(ctx context.Context, id int64) error {
+	return dbDeleteOutboundWebhook(ctx, s.db, id)
+}
+
+func (s *SQLite) RecordWebhookDelivery(ctx context.Context, d *WebhookDelivery, breakerAt int, reason string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := dbRecordWebhookDelivery(ctx, tx, d, breakerAt, reason); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *SQLite) WebhookDeliveriesBefore(ctx context.Context, before time.Time, limit int) ([]WebhookDelivery, error) {
+	return dbWebhookDeliveriesBefore(ctx, s.db, before, limit)
+}
+
+func (s *SQLite) DeleteWebhookDeliveries(ctx context.Context, ids []int64) error {
+	return dbDeleteWebhookDeliveries(ctx, s.db, ids)
+}
+
+func (s *SQLite) CreateInboundWebhook(ctx context.Context, w *InboundWebhook) error {
+	return dbCreateInboundWebhook(ctx, s.db, w)
+}
+
+func (s *SQLite) InboundWebhookByID(ctx context.Context, id int64) (*InboundWebhook, error) {
+	return dbInboundWebhookByID(ctx, s.db, id)
+}
+
+func (s *SQLite) InboundWebhooksOfChannel(ctx context.Context, channelID int64) ([]InboundWebhook, error) {
+	return dbInboundWebhooksOfChannel(ctx, s.db, channelID)
+}
+
+func (s *SQLite) UpdateInboundWebhook(ctx context.Context, w *InboundWebhook) error {
+	return dbUpdateInboundWebhook(ctx, s.db, w)
+}
+
+func (s *SQLite) DeleteInboundWebhook(ctx context.Context, id int64) error {
+	return dbDeleteInboundWebhook(ctx, s.db, id)
+}

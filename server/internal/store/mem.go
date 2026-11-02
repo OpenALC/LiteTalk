@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -32,11 +33,23 @@ type Mem struct {
 	readStates map[int64]map[int64]int64
 	// attachments 附件元数据（迁移 0015，#41）：attachmentID → 行。
 	attachments map[int64]*Attachment
+	// pushDevices 推送设备（迁移 0020，#53）：deviceID → 行。幂等键
+	// (user_id, pushTokenHash) 线性扫——内存实现只服务测试，量小。
+	pushDevices map[int64]*PushDevice
 
 	roles       map[int64]*Role                                     // roleID → role（迁移 0010）
 	memberRoles map[int64]map[int64]map[int64]*MemberRoleAssignment // serverID → userID → roleID → 分配
 	overwrites  map[overwriteKey]*ChannelOverwrite                  // (channel,targetType,targetID) → 覆盖
 	auditLogs   map[int64]*AuditLog                                 // id → 审计行
+	apiTokens   map[int64]*APIToken                                 // tokenID → 行（迁移 0018，#51 #54）
+
+	// oidcIdentities OIDC 外部身份绑定（迁移 0021，#54）：(issuer, sub) → 行。
+	oidcIdentities map[oidcIdentityKey]*OIDCIdentity
+
+	// webhooks 三表（迁移 0019，#52）：出站订阅、入站入口、投递记录。
+	outHooks    map[int64]*OutboundWebhook
+	inHooks     map[int64]*InboundWebhook
+	webhookDels map[int64]*WebhookDelivery
 
 	*MemKV // KV 部分（Get/Set/Del/Incr/IncrCap/Eval 由 MemKV 提供）
 }
@@ -64,10 +77,16 @@ func NewMem() *Mem {
 		channelMembers: map[int64]map[int64]*ChannelMember{},
 		readStates:     map[int64]map[int64]int64{},
 		attachments:    map[int64]*Attachment{},
+		pushDevices:    map[int64]*PushDevice{},
 		roles:          map[int64]*Role{},
 		memberRoles:    map[int64]map[int64]map[int64]*MemberRoleAssignment{},
 		overwrites:     map[overwriteKey]*ChannelOverwrite{},
 		auditLogs:      map[int64]*AuditLog{},
+		apiTokens:      map[int64]*APIToken{},
+		oidcIdentities: map[oidcIdentityKey]*OIDCIdentity{},
+		outHooks:       map[int64]*OutboundWebhook{},
+		inHooks:        map[int64]*InboundWebhook{},
+		webhookDels:    map[int64]*WebhookDelivery{},
 		MemKV:          NewMemKV(),
 	}
 }
@@ -78,7 +97,9 @@ func (m *Mem) CreateUser(_ context.Context, u *User) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, x := range m.users {
-		if x.Email == u.Email {
+		// 与 MySQL 的 ci 排序、SQLite 的 lower() 兜底同语义：邮箱唯一性与
+		// 查询都大小写不敏感。
+		if strings.EqualFold(x.Email, u.Email) {
 			return ErrConflict
 		}
 		if x.Nickname == u.Nickname && x.Tag == u.Tag {
@@ -108,7 +129,7 @@ func (m *Mem) UserByEmail(_ context.Context, email string) (*User, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, u := range m.users {
-		if u.Email == email {
+		if strings.EqualFold(u.Email, email) {
 			cp := *u
 			return &cp, nil
 		}
@@ -1459,6 +1480,304 @@ func (m *Mem) DeleteAllUserSessions(_ context.Context, userID int64) error {
 	return nil
 }
 
+// ---- api_tokens（迁移 0018，#51 #54）----
+
+func (m *Mem) CreateAPIToken(_ context.Context, t *APIToken) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t.ID = newID(t.ID)
+	for _, x := range m.apiTokens {
+		if x.Prefix == t.Prefix {
+			return ErrConflict
+		}
+	}
+	if t.CreatedAt.IsZero() {
+		t.CreatedAt = time.Now()
+	}
+	cp := *t
+	m.apiTokens[t.ID] = &cp
+	return nil
+}
+
+func (m *Mem) APITokenByPrefix(_ context.Context, prefix string) (*APIToken, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, x := range m.apiTokens {
+		if x.Prefix == prefix {
+			cp := *x
+			return &cp, nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
+func (m *Mem) APITokenByID(_ context.Context, id int64) (*APIToken, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, ok := m.apiTokens[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	cp := *t
+	return &cp, nil
+}
+
+func (m *Mem) APITokensOfUser(_ context.Context, userID int64) ([]APIToken, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []APIToken{}
+	for _, x := range m.apiTokens {
+		if x.UserID == userID {
+			out = append(out, *x)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out, nil
+}
+
+func (m *Mem) RevokeAPIToken(_ context.Context, id int64, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, ok := m.apiTokens[id]
+	if !ok {
+		return ErrNotFound
+	}
+	t.RevokedAt = &at
+	return nil
+}
+
+func (m *Mem) TouchAPITokenLastUsed(_ context.Context, id int64, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if t, ok := m.apiTokens[id]; ok {
+		t.LastUsedAt = &at
+	}
+	return nil
+}
+
+// ---- oidc_identities（迁移 0021，#54）----
+
+// oidcIdentityKey 绑定行主键 (issuer, sub)。与迁移 0021 的唯一索引同口径。
+type oidcIdentityKey struct {
+	issuer string
+	sub    string
+}
+
+func (m *Mem) CreateOIDCIdentity(_ context.Context, i *OIDCIdentity) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := oidcIdentityKey{issuer: i.Issuer, sub: i.Sub}
+	if _, ok := m.oidcIdentities[k]; ok {
+		return ErrConflict
+	}
+	i.ID = newID(i.ID)
+	if i.CreatedAt.IsZero() {
+		i.CreatedAt = time.Now()
+	}
+	cp := *i
+	m.oidcIdentities[k] = &cp
+	return nil
+}
+
+func (m *Mem) OIDCIdentityByIssuerSub(_ context.Context, issuer, sub string) (*OIDCIdentity, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	i, ok := m.oidcIdentities[oidcIdentityKey{issuer: issuer, sub: sub}]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	cp := *i
+	return &cp, nil
+}
+
+// ---- webhooks（迁移 0019，#52）----
+
+func (m *Mem) CreateOutboundWebhook(_ context.Context, w *OutboundWebhook) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	w.ID = newID(w.ID)
+	now := time.Now()
+	w.CreatedAt, w.UpdatedAt = now, now
+	cp := *w
+	m.outHooks[w.ID] = &cp
+	return nil
+}
+
+func (m *Mem) OutboundWebhookByID(_ context.Context, id int64) (*OutboundWebhook, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	w, ok := m.outHooks[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	cp := *w
+	return &cp, nil
+}
+
+func (m *Mem) OutboundWebhooksOfServer(_ context.Context, serverID int64) ([]OutboundWebhook, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []OutboundWebhook{}
+	for _, x := range m.outHooks {
+		if x.ServerID == serverID {
+			out = append(out, *x)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+func (m *Mem) HasOutboundWebhooks(_ context.Context) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.outHooks) > 0, nil
+}
+
+func (m *Mem) UpdateOutboundWebhook(_ context.Context, w *OutboundWebhook) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.outHooks[w.ID]
+	if !ok {
+		return ErrNotFound
+	}
+	cur.URL, cur.Secret, cur.Events = w.URL, w.Secret, w.Events
+	cur.Disabled, cur.DisabledReason, cur.FailCount = w.Disabled, w.DisabledReason, w.FailCount
+	cur.CreatorID = w.CreatorID // P1-8：与 SQL 方言同口径，改址改绑随全行写落库
+	cur.UpdatedAt = time.Now()
+	w.UpdatedAt = cur.UpdatedAt
+	return nil
+}
+
+func (m *Mem) DeleteOutboundWebhook(_ context.Context, id int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.outHooks[id]; !ok {
+		return ErrNotFound
+	}
+	delete(m.outHooks, id)
+	return nil
+}
+
+// RecordWebhookDelivery 单锁内完成「落记录 + 推进熔断计数」，语义与 SQL 方言的事务版一致。
+func (m *Mem) RecordWebhookDelivery(_ context.Context, d *WebhookDelivery, breakerAt int, reason string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d.ID = newID(d.ID)
+	d.CreatedAt = time.Now()
+	cp := *d
+	m.webhookDels[d.ID] = &cp
+	if d.WebhookID == 0 {
+		return nil
+	}
+	w, ok := m.outHooks[d.WebhookID]
+	if !ok {
+		return nil // 订阅已删除：投递记录保留，熔断计数无行可推进
+	}
+	if d.OK {
+		w.FailCount = 0
+	} else {
+		w.FailCount++
+		if !w.Disabled && w.FailCount >= breakerAt {
+			w.Disabled = true
+			w.DisabledReason = reason
+		}
+	}
+	return nil
+}
+
+func (m *Mem) WebhookDeliveriesBefore(_ context.Context, before time.Time, limit int) ([]WebhookDelivery, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	out := []WebhookDelivery{}
+	for _, x := range m.webhookDels {
+		if x.CreatedAt.Before(before) {
+			out = append(out, *x)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (m *Mem) DeleteWebhookDeliveries(_ context.Context, ids []int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, id := range ids {
+		delete(m.webhookDels, id)
+	}
+	return nil
+}
+
+func (m *Mem) CreateInboundWebhook(_ context.Context, w *InboundWebhook) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	w.ID = newID(w.ID)
+	if w.CreatedAt.IsZero() {
+		w.CreatedAt = time.Now()
+	}
+	cp := *w
+	m.inHooks[w.ID] = &cp
+	return nil
+}
+
+func (m *Mem) InboundWebhookByID(_ context.Context, id int64) (*InboundWebhook, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	w, ok := m.inHooks[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	cp := *w
+	return &cp, nil
+}
+
+func (m *Mem) InboundWebhooksOfChannel(_ context.Context, channelID int64) ([]InboundWebhook, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []InboundWebhook{}
+	for _, x := range m.inHooks {
+		if x.ChannelID == channelID {
+			out = append(out, *x)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+func (m *Mem) UpdateInboundWebhook(_ context.Context, w *InboundWebhook) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.inHooks[w.ID]; !ok {
+		return ErrNotFound
+	}
+	cp := *w
+	m.inHooks[w.ID] = &cp
+	return nil
+}
+
+func (m *Mem) DeleteInboundWebhook(_ context.Context, id int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.inHooks[id]; !ok {
+		return ErrNotFound
+	}
+	delete(m.inHooks, id)
+	return nil
+}
+
 // ---- roles / member_roles / channel_overwrites / audit_log（迁移 0010，#35 B1） ----
 
 func (m *Mem) ListRoles(_ context.Context, serverID int64) ([]Role, error) {
@@ -1797,4 +2116,67 @@ func (m *Mem) AuditLogBefore(_ context.Context, serverID, beforeID int64, limit 
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+// ---- push_devices（迁移 0020，#53） ----
+
+// UpsertPushDevice 按 (user_id, pushTokenHash) 幂等：命中更新 platform/last_seen
+// 并回填 d.ID 返回 false；未命中插入返回 true。
+func (m *Mem) UpsertPushDevice(_ context.Context, d *PushDevice) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	hash := pushTokenHash(d.Token)
+	now := time.Now()
+	for _, x := range m.pushDevices {
+		if x.UserID == d.UserID && pushTokenHash(x.Token) == hash {
+			x.Platform = d.Platform
+			x.Token = d.Token
+			x.LastSeen = now
+			d.ID = x.ID
+			d.LastSeen = now
+			return false, nil
+		}
+	}
+	d.ID = newID(d.ID)
+	d.LastSeen = now
+	d.CreatedAt = now
+	cp := *d
+	m.pushDevices[d.ID] = &cp
+	return true, nil
+}
+
+// PushDevicesOfUser 该用户全部设备，按 id 升序。
+func (m *Mem) PushDevicesOfUser(_ context.Context, userID int64) ([]PushDevice, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []PushDevice{}
+	for _, d := range m.pushDevices {
+		if d.UserID == userID {
+			out = append(out, *d)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+// PushDeviceByID 单台设备；无命中 ErrNotFound。
+func (m *Mem) PushDeviceByID(_ context.Context, id int64) (*PushDevice, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if d := m.pushDevices[id]; d != nil {
+		cp := *d
+		return &cp, nil
+	}
+	return nil, ErrNotFound
+}
+
+// DeletePushDevice 删除设备行；未命中 ErrNotFound。
+func (m *Mem) DeletePushDevice(_ context.Context, id int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.pushDevices[id]; !ok {
+		return ErrNotFound
+	}
+	delete(m.pushDevices, id)
+	return nil
 }

@@ -2,8 +2,11 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
+
+	"github.com/OpenALC/LiteTalk/server/internal/rtcapi"
 )
 
 // GetHealthz GET /api/v1/healthz（免鉴权，#77 收编）。
@@ -30,6 +33,11 @@ func (s *Server) PostRtcCredentials(ctx context.Context, request PostRtcCredenti
 	}
 	uid, err := s.rtcAuth(token)
 	if err != nil || uid == "" {
+		// PR118 P2-3：令牌主体缺 voice.connect 是授权不足而非凭据无效——
+		// 403 与 401 分开，凭据语义不变。
+		if errors.Is(err, rtcapi.ErrScopeForbidden) {
+			return nil, errf(http.StatusForbidden, "scope_forbidden", "令牌缺少 voice.connect 权限")
+		}
 		// 不把底层解析错误（过期/签名/会话细节）写进响应。
 		return nil, errf(http.StatusUnauthorized, "unauthorized", "访问令牌无效或已过期")
 	}

@@ -2,6 +2,7 @@ package voice
 
 import (
 	"context"
+	"net"
 	"testing"
 	"time"
 
@@ -11,6 +12,111 @@ import (
 	"github.com/OpenALC/LiteTalk/client/core/signal"
 	"github.com/pion/webrtc/v4"
 )
+
+// TestSignatureAddr 地址判定表：只有真正参与出网的地址进入签名（#117）。
+func TestSignatureAddr(t *testing.T) {
+	cases := []struct {
+		ip   string
+		want string // 空串 = 丢弃
+	}{
+		{"127.0.0.1", ""},                    // 回环
+		{"::1", ""},                          // 回环 v6
+		{"169.254.13.7", ""},                 // link-local v4（APIPA）
+		{"fe80::1c2b:3d4e:5f60:7081%12", ""}, // link-local v6
+		{"ff02::1", ""},                      // link-local multicast
+		{"224.0.0.251", ""},                  // multicast
+		{"0.0.0.0", ""},                      // unspecified
+		{"::", ""},                           // unspecified v6
+		{"10.0.0.5", "10.0.0.5"},             // 普通 v4
+		{"192.168.1.20", "192.168.1.20"},
+		// v4-mapped v6 归一成 v4，不另生成一条 v6 分量。
+		{"::ffff:10.0.0.5", "10.0.0.5"},
+		// v6 只留 /64 前缀：同一前缀下换接口标识符不会改变签名。
+		{"2001:db8:1:2:aaaa:bbbb:cccc:dddd", "2001:db8:1:2::/64"},
+		{"2001:db8:1:2:1111:2222:3333:4444", "2001:db8:1:2::/64"},
+		{"2001:db8:9:9::1", "2001:db8:9:9::/64"},
+		{"2606:4700::1111", "2606:4700::/64"},
+	}
+	for _, c := range cases {
+		ip := net.ParseIP(c.ip)
+		got, ok := signatureAddr(ip)
+		if c.want == "" {
+			if ok {
+				t.Errorf("signatureAddr(%q) = %q，应丢弃", c.ip, got)
+			}
+			continue
+		}
+		if !ok || got != c.want {
+			t.Errorf("signatureAddr(%q) = %q,%v，want %q", c.ip, got, ok, c.want)
+		}
+	}
+}
+
+// TestSignatureFrom 接口级判定：down / 回环 / 虚拟接口不参与签名；隐私地址
+// 轮换不改变签名，真实前缀与 v4 变化会让签名变。
+func TestSignatureFrom(t *testing.T) {
+	base := func() []ifaceAddrs {
+		return []ifaceAddrs{
+			{name: "Ethernet", up: true, addrs: []net.IP{
+				net.ParseIP("10.0.0.5"), net.ParseIP("169.254.3.4"),
+				net.ParseIP("fe80::1"),
+			}},
+			// Hyper-V 虚拟交换机：地址随宿主网络反复变化，不得入签。
+			{name: "vEthernet (Default Switch)", up: true, addrs: []net.IP{net.ParseIP("192.168.56.1")}},
+			{name: "vEthernet (WSL)", up: true, addrs: []net.IP{net.ParseIP("172.24.144.1")}},
+			{name: "docker0", up: true, addrs: []net.IP{net.ParseIP("172.17.0.1")}},
+			{name: "virbr0", up: true, addrs: []net.IP{net.ParseIP("192.168.122.1")}},
+			{name: "Tunnel tap-windows", up: true, addrs: []net.IP{net.ParseIP("10.8.0.6")}},
+			// 隧道型 VPN：连上/断开都只是隧道自己的地址在变。
+			{name: "wg0", up: true, addrs: []net.IP{net.ParseIP("10.66.0.2")}},
+			// down 的接口不参与。
+			{name: "Wi-Fi", up: false, addrs: []net.IP{net.ParseIP("192.168.1.7")}},
+			// 回环接口即使带非回环地址也不参与。
+			{name: "Loopback", up: true, loop: true, addrs: []net.IP{net.ParseIP("10.9.9.9")}},
+		}
+	}
+
+	got := signatureFrom(base())
+	if got != "Ethernet=10.0.0.5" {
+		t.Fatalf("签名 = %q，只应包含物理接口的全局 v4", got)
+	}
+
+	// 隐私 IPv6 在同一 /64 下轮换接口标识符：签名必须不变。
+	rotated := base()
+	rotated[0].addrs = append(rotated[0].addrs,
+		net.ParseIP("2001:db8:1:2:aaaa:bbbb:cccc:dddd"))
+	withV6 := signatureFrom(rotated)
+	if withV6 != "Ethernet=10.0.0.5,2001:db8:1:2::/64" {
+		t.Fatalf("IPv6 应折叠成 /64 前缀，实际 %q", withV6)
+	}
+	rotated[0].addrs[len(rotated[0].addrs)-1] = net.ParseIP("2001:db8:1:2:1111:2222:3333:4444")
+	if again := signatureFrom(rotated); again != withV6 {
+		t.Fatalf("隐私地址轮换改变了签名：%q → %q", withV6, again)
+	}
+
+	// 真换网（前缀与 v4 都变）必须让签名变。
+	rotated[0].addrs = []net.IP{net.ParseIP("10.1.0.5"), net.ParseIP("2001:db8:5:6::1")}
+	if moved := signatureFrom(rotated); moved == withV6 {
+		t.Fatal("换到新网络后签名应变化")
+	}
+
+	// 全部接口被过滤（只剩虚拟网卡）：合法空签名，不是枚举失败。
+	onlyVirtual := []ifaceAddrs{{name: "vEthernet (WSL)", up: true, addrs: []net.IP{net.ParseIP("172.24.144.1")}}}
+	if s := signatureFrom(onlyVirtual); s != "" {
+		t.Fatalf("虚拟接口不应入签，实际 %q", s)
+	}
+}
+
+// TestLANNotReservedBug 旧实现把非回环一律入签，这里反向确认物理接口上的
+// 公共地址仍被保留（过滤不能把真实通路一起砍掉）。
+func TestSignatureKeepsPhysicalGlobalAddrs(t *testing.T) {
+	got := signatureFrom([]ifaceAddrs{
+		{name: "Wi-Fi", up: true, addrs: []net.IP{net.ParseIP("203.0.113.9"), net.ParseIP("2001:db8:aa:bb::7")}},
+	})
+	if got != "Wi-Fi=2001:db8:aa:bb::/64,203.0.113.9" {
+		t.Fatalf("物理接口全局地址应保留并排序，实际 %q", got)
+	}
+}
 
 // TestNetworkWatcherTriggersOnce 签名稳定变化后才触发一次；持续同签名不重复，
 // 抖动回到原签名则取消（#49 A）。

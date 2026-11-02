@@ -1213,3 +1213,100 @@ func TestNetworkDiagNoAPIDoesNotPanic(t *testing.T) {
 		t.Fatalf("无凭证时 STUN/TURN 应 skipped: %+v", res)
 	}
 }
+
+// TestDREDRollbackDecision 无会话/有会话两条路径的 DRED 回滚判定（#117）：
+// 有会话以编码器实际状态为准；无会话只看平台能力，避免在支持的平台上
+// 因为「还没连接」就白白关掉 DRED。
+func TestDREDRollbackDecision(t *testing.T) {
+	cases := []struct {
+		name                                            string
+		requested, haveSession, active, supported, want bool
+	}{
+		{"未请求开启", false, true, false, true, false},
+		{"有会话且已启用", true, true, true, true, false},
+		{"有会话但未启用", true, true, false, false, true},
+		{"无会话且不支持平台", true, false, false, false, true},
+		{"无会话但平台支持", true, false, false, true, false},
+	}
+	for _, c := range cases {
+		if got := dredRollbackNeeded(c.requested, c.haveSession, c.active, c.supported); got != c.want {
+			t.Errorf("%s: dredRollbackNeeded = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestDREDRollbackPersists 回滚必须真的落盘：持久化的 dred 改回 false，下次
+// 启动设置页才不会又显示「已开启」。用注入的能力覆盖驱动「不支持」分支，
+// 在 Windows/Linux 上也真实执行（不靠 t.Skip 掩盖）。
+func TestDREDRollbackPersists(t *testing.T) {
+	m := config.NewWithPath(filepath.Join(t.TempDir(), "config.json"))
+	app := newAppWithConfig(m)
+	app.dredSupportFn = func() bool { return false }
+
+	on := true
+	as := m.GetAudioSettings()
+	as.DRED = &on
+	if err := m.SetAudioSettings(as); err != nil {
+		t.Fatal(err)
+	}
+
+	if !app.rollbackDREDIfInactive(nil) {
+		t.Fatal("不支持 DRED 的平台应发生回滚")
+	}
+	if got := m.GetAudioSettings(); got.DRED == nil || *got.DRED {
+		t.Fatalf("回滚后持久化 dred = %+v, want false", got.DRED)
+	}
+	if app.rollbackDREDIfInactive(nil) {
+		t.Fatal("已是关闭态时不应再回滚")
+	}
+	// 平台支持时不回滚：DRED 只是「还没连接」，不是不支持。
+	app.dredSupportFn = func() bool { return true }
+	if err := m.SetAudioSettings(as); err != nil {
+		t.Fatal(err)
+	}
+	if app.rollbackDREDIfInactive(nil) {
+		t.Fatal("支持 DRED 的平台在未连接时不应回滚")
+	}
+}
+
+// TestSetAudioSettingsDREDUnsupported 不支持 DRED 时拒绝把开关打开（#117），
+// 且不写入配置；关闭方向放行。用注入的能力覆盖驱动该分支。
+func TestSetAudioSettingsDREDUnsupported(t *testing.T) {
+	m := config.NewWithPath(filepath.Join(t.TempDir(), "config.json"))
+	app := newAppWithConfig(m)
+	app.dredSupportFn = func() bool { return false }
+
+	// 先把持久化值落到明确的关闭态（默认是开，见 config 层缺省 true）。
+	off := false
+	base := m.GetAudioSettings()
+	base.DRED = &off
+	if err := m.SetAudioSettings(base); err != nil {
+		t.Fatal(err)
+	}
+
+	on := true
+	as := m.GetAudioSettings()
+	as.DRED = &on
+	if err := app.SetAudioSettings(as); err == nil {
+		t.Fatal("不支持 DRED 时开启应报错")
+	}
+	if got := app.GetAudioSettings(); got.DRED == nil || *got.DRED {
+		t.Fatalf("被拒绝的设置不应写入配置: %+v", got.DRED)
+	}
+
+	// 关闭方向放行（即便平台不支持，关闭本来就是合法目标）。
+	as.DRED = &off
+	if err := app.SetAudioSettings(as); err != nil {
+		t.Fatalf("关闭 DRED 应放行: %v", err)
+	}
+
+	// 支持的平台正常开启，且不需要回滚。
+	app.dredSupportFn = func() bool { return true }
+	as.DRED = &on
+	if err := app.SetAudioSettings(as); err != nil {
+		t.Fatalf("支持的平台开启 DRED 不应报错: %v", err)
+	}
+	if got := app.GetAudioSettings(); got.DRED == nil || !*got.DRED {
+		t.Fatalf("支持的平台开启后应持久化为 true: %+v", got.DRED)
+	}
+}

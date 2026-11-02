@@ -26,6 +26,11 @@ MySQL、Redis、外部 coturn、前置反代都是可选扩展，见本文末尾
   （模板里这一行是注释掉的，不要随手打开）。
 - 签发域名必须是 `--domain` 单域名（HostPolicy 白名单）；其他 SNI 一律拒绝，防止被 CA 限流。
 - 需要公网 80/443 可达（Let's Encrypt 验证）；安全组/防火墙放行这两个端口。
+- **另占 `127.0.0.1:8077`（仅环回）**：更新器默认按该地址做 healthz 版本断言，所以 ACME 模式
+  会在回环上单独起一个只提供 `GET /api/v1/healthz` 的监听，不把管理 API 带到回环面。
+  该端口不对公网开放，无需放行。`LITETALK_ADDR` 显式配成 8077 时跳过这一路（主监听已覆盖）；
+  8077 被别的进程占用时只记告警，服务照常启动，此时请把 `LITETALK_UPDATER_HEALTH_URL`
+  改到实际可达的 healthz 地址（如 `https://域名/api/v1/healthz`），否则更新后的版本断言会超时回滚。
 - 设了域名后，SFU 宣告地址默认由 DNS 解析推导；解析不出或结果不对时再显式配 `LITETALK_SFU_IP`。
 
 **模式 2 要点**：
@@ -41,7 +46,7 @@ MySQL、Redis、外部 coturn、前置反代都是可选扩展，见本文末尾
 |---|---|---|
 | 443 | TCP | 内置 ACME HTTPS（REST + WSS）；模式 2 下归反代 |
 | 80 | TCP | ACME HTTP-01 与 301 跳转；模式 2 下归反代 |
-| 8077 | TCP | 纯 HTTP API（无 TLS / 前置反代模式；默认只监听本机即可） |
+| 8077 | TCP | 纯 HTTP API（无 TLS / 前置反代模式；默认只监听本机即可）。**ACME 模式下仍会在 `127.0.0.1:8077` 起一个只提供 healthz 的环回监听**（供更新器断言版本），仅本机可达、不需要放行 |
 | 8088 | TCP | 自动更新器 webhook（可选安装；`/status` 仍仅环回，公网只需放行本端口） |
 | 7845 | UDP | SFU 媒体（ICE-Lite UDP mux） |
 | 7845 | TCP | ICE-TCP（UDP 被封网络直连；`LITETALK_SFU_TCP=0` 可关闭） |
@@ -60,7 +65,8 @@ firewall-cmd --reload
 ```
 
 更新器（§9）只监听 8088 明文 HTTP，不需要 DNS、证书或 443，也不经过 nginx；
-主服务内置 ACME 仍独占 443/80，两者互不影响。不装更新器就不必放行 8088。
+主服务内置 ACME 独占**公网** 443/80，并在环回另起一个 `127.0.0.1:8077` 的 healthz 面供更新器断言，
+两者互不影响。不装更新器就不必放行 8088；环回 8077 任何模式都不需要放行。
 
 ## 2. 服务端二进制
 
@@ -214,12 +220,16 @@ sudo systemctl start litetalk
   ```bash
   sudo -u www /www/wwwroot/LiteTalk/update.sh --tag v1.6.2-alpha --allow-prerelease   # 手工升级
   sudo -u www /www/wwwroot/LiteTalk/update.sh --tag v1.6.2-alpha --dry-run --allow-prerelease  # 只校验不落地
+  sudo -u www /www/wwwroot/LiteTalk/update.sh --tag latest --allow-prerelease         # 跟到通道内最新
   ```
 
   用 `sudo -u www`（服务用户）执行：root 落下的 `state.json`/锁文件属主会让以 www 运行的
   更新器读不到状态、拿不到锁（EACCES）。退出码：0 成功、1 更新失败（已回滚）、2 参数错误、
   **75 已有更新在运行**（webhook 或另一个 `--once` 持锁，等它结束再重试）。
 
+  `latest` 按 **semver 取通道内最高**（不是 release 列表第一条：补发的旧版本 tag 会排在最前），
+  并且与 webhook 同一条防降级闸——解析结果不新于已装版本时只打印"已是最新"并 **退出 0**，
+  不下载、不替换、不写状态。显式指定 `--tag vX.Y.Z` 不受此闸限制，可用来手工回退。
 ## 8. 一键安装（#97）
 
 `install.sh` 把上面 2-5 步压成一条命令（幂等，重复执行只补齐缺失项，不覆盖已有配置）：
@@ -234,7 +244,8 @@ sudo bash install.sh --dir /opt/litetalk --user litetalk --no-updater
 
 - 检测 root/OS/arch，从 GitHub Release 下载 `litetalk-server-linux-<arch>.tar.gz`
   （内含 `litetalk-server` + `litetalk-updater` + `update.sh`）并校验 `SHA256SUMS.txt`；
-- 安全解包（成员白名单、拒绝路径穿越/符号链接），二进制 root 所有 0755，安装目录属主是服务用户；
+- 安全解包（成员白名单；拒绝路径穿越与符号链接/硬链接/设备/FIFO 等非普通条目，
+  与更新器 `safeExtract` 同口径），二进制 root 所有 0755，安装目录属主是服务用户；
 - 生成 `/etc/litetalk.env` 与更新器 env/secret 模板（**不覆盖已有文件**；secret 生成后不回显，
   权限 `0640 root:<服务用户>`——更新器以服务用户运行要自己读它，other 位为 0）；
 - 安装 systemd 单元与 sudoers 并 `enable --now`。**已存在的 unit/sudoers 不会被覆盖**，
@@ -242,6 +253,9 @@ sudo bash install.sh --dir /opt/litetalk --user litetalk --no-updater
 - 生成的 `litetalk.service` 已带 `AmbientCapabilities/CapabilityBoundingSet=CAP_NET_BIND_SERVICE`：
   非 root 服务用户也能用 `LITETALK_DOMAIN` 起内置 ACME 监听 443，不必事后手改 unit；
 - **通道策略**：默认只装正式版 tag；预发布（`-alpha/-beta/-rc`）需显式 `--prerelease`。
+  `--version latest` 按 **semver 取通道内最高**（不是 release 列表第一条）。
+- `--dir` 必须是绝对路径、不含 `..`、不含空白字符（路径会原样写进 systemd 单元，
+  空白会把 `ExecStart` 拆段），违规直接以退出码 2 拒绝。
 
 ## 9. 自动更新（#97）
 
@@ -257,6 +271,10 @@ HTTP，HMAC 校验）→ 下载 + SHA256 → 原子替换 → `systemctl restart
 2. 网络：安全组/防火墙放行 **TCP 8088**。不涉及 DNS 与证书，也不占用 80/443——
    443 归主服务内置 ACME，两者互不影响；8088 必须空闲（被占用时更新器启动即退出，
    unit 的启动限流会阻止重启风暴）。`/status` 仅接受环回来源。
+   更新器默认走 `http://127.0.0.1:8077/api/v1/healthz` 做版本断言：模式 2/3 下就是主服务
+   自己的监听；模式 1（ACME）下主服务会在环回补起一个只有 healthz 的 8077 监听（见「TLS 三种模式」模式 1）。
+   那个端口被占用时主服务只告警不退出，此时把 `LITETALK_UPDATER_HEALTH_URL` 指向实际可达的
+   healthz（如 `https://域名/api/v1/healthz`），否则每次更新都会因断言超时而回滚。
 3. 更新器单元与 sudoers 见 `systemd/litetalk-updater.service` 与 `sudoers/litetalk-updater`
    （`install.sh` 已装则跳过）。**注意**：更新器单元不能开 `NoNewPrivileges=true`——
    它会禁掉 sudo 的 setuid 提权，`sudo -n systemctl restart` 全部失败；最小权限由
@@ -344,6 +362,7 @@ curl -fsS http://127.0.0.1:8077/api/v1/healthz             # 主服务版本应�
 | 症状 | 原因与处置 |
 |---|---|
 | webhook 401 | secret 不一致；重新同步 GitHub webhook 的 secret 与 `/etc/litetalk-updater.webhook.secret` |
+| webhook 429 | 同一来源 IP 一分钟内签名失败超过 20 次：超限后**在读 body 之前**直接 429（含正确签名）。等窗口过期（≤1 分钟）自动恢复；正常投递达不到阈值，反复 429 说明有来源在猜 secret |
 | ping/发布后无动作、日志 `忽略：预发布` | 当前 tag 带 `-alpha` 等后缀，`LITETALK_UPDATER_ALLOW_PRERELEASE=0`（默认）；接受预发布就显式设 `1` |
 | 日志 `忽略：更新器已关闭` | `LITETALK_UPDATER_ENABLED=0`；排障完成改回 `1` |
 | 更新失败 `sudo ... : exit status 1` | sudoers 缺失/未 `chmod 440`，或单元开了 `NoNewPrivileges`（见 §9.1 注） |
@@ -363,9 +382,11 @@ webhook 不可达时，GitHub Actions 在 release 发布后可经 SSH 调服务�
 远端退出码 **75**（已有更新在运行）视为已被覆盖，只记 notice、不算失败。
 与 webhook 走同一条流水线（跨进程锁互斥），重复触发不会二次替换。
 
-**端口拓扑**：更新器监听 8088 明文 HTTP，主服务内置 ACME 独占 443/80，两者互不影响；
-8088 必须空闲，不需要 DNS/证书。不要在同机加反向代理指向 8088——反代会让来源恒为环回，
-`/status` 被误判为本地访问而公开。将来若需要 TLS，应另行设计。
+**端口拓扑**：更新器监听 8088 明文 HTTP；主服务内置 ACME 独占公网 443/80，并在
+`127.0.0.1:8077` 补一个只提供 healthz 的环回监听（更新器的版本断言入口，见「TLS 三种模式」模式 1），
+三者互不冲突；8088 必须空闲，不需要 DNS/证书，8077 只在环回内占用、不需要放行。
+不要在同机加反向代理指向 8088——反代会让来源恒为环回，`/status` 被误判为本地访问而公开。
+将来若需要 TLS，应另行设计。
 
 ### 9.6 回滚
 

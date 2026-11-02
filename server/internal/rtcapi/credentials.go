@@ -12,9 +12,17 @@ import (
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"time"
 )
+
+// ErrScopeForbidden 令牌主体缺 voice.connect scope（PR118 P2-3）：TURN 中继是
+// 有限资源，12h 短期凭证只发给明确授权语音的令牌，messages.read 等窄 scope 凭据
+// 不得把服务器当公网中继。由 main 注入的鉴权闭包在令牌主体缺 scope 时返回；
+// api 层据此回 403（其余错误一律 401，不泄露失败细节）。JWT 主体不适用——
+// 其权限由角色决定，走进房 authz 判定。
+var ErrScopeForbidden = errors.New("rtc: token missing voice.connect scope")
 
 // DefaultTTL 凭证默认有效期（§5.4：12h）。
 const DefaultTTL = 12 * time.Hour

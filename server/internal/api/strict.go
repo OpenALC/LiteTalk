@@ -10,6 +10,7 @@ import (
 
 	"github.com/OpenALC/LiteTalk/server/internal/auth"
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/internal/token"
 )
 
 // apiErr 业务错误载体：strict 方法返回它，由 ResponseErrorHandlerFunc 统一经
@@ -138,10 +139,14 @@ func reqIP(ctx context.Context) string {
 	return p
 }
 
-// currentUser 从上下文取当前用户（auth 中间件注入）。
+// currentUser 从上下文取当前用户：auth 中间件注入的 Principal 内嵌的身份声明。
+// JWT 与 api_token（#54）两条路径产出同一个 token.Principal，调用点口径不变
+// （令牌路径的 Claims 是属主用户，Sid/Dev 恒空——令牌没有会话概念）。
 func currentUser(ctx context.Context) *auth.Claims {
-	c, _ := ctx.Value(userKey).(*auth.Claims)
-	return c
+	if p := token.PrincipalFromContext(ctx); p != nil {
+		return p.Claims
+	}
+	return nil
 }
 
 // checkID 路径 ID 须为正整数（沿用旧 pathID 口径；非数字由 adapter 层先拒）。

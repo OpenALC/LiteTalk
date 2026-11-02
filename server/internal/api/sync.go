@@ -46,8 +46,12 @@ func (s *Server) GetSync(ctx context.Context, request GetSyncRequestObject) (Get
 		if categories == nil {
 			categories = []store.Category{}
 		}
-		// 频道按 ViewChannel 过滤（#35 B3），categories 原样。
+		// 频道按 ViewChannel 过滤（#35 B3）；分类按「至少有一个可见频道」过滤（#102）。
 		channels, err = s.visibleChannels(ctx, c.UserID, srv.ID, channels)
+		if err != nil {
+			return nil, s.writeStoreErr(ctx, err)
+		}
+		categories, err = s.visibleCategories(ctx, c.UserID, srv.ID, categories, channels)
 		if err != nil {
 			return nil, s.writeStoreErr(ctx, err)
 		}

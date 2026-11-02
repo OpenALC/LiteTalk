@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/OpenALC/LiteTalk/server/internal/store"
+	"github.com/OpenALC/LiteTalk/server/internal/webhook"
 )
 
 // 服务器名称与图标校验（§5.4：图标为预设 Lucide 图标+颜色）。
@@ -224,6 +225,11 @@ func (s *Server) JoinServer(ctx context.Context, request JoinServerRequestObject
 	s.authz.InvalidateServer(inv.ServerID)
 	// 新成员以当前最新消息为已读水位，避免把全部历史看成未读（#40）。
 	s.initServerReadStates(ctx, c.UserID, inv.ServerID)
+	// 出站 webhook 事件出口（#52）：member.joined，仅在真实插入路径派发——
+	// 上面 ErrConflict 的并发幂等重放不重复发事件。
+	s.notifyWebhookEvent(webhook.EventMemberJoined, inv.ServerID, 0, map[string]any{
+		"user_id": idOf(c.UserID), "role": string(store.RoleMember),
+	})
 	return JoinServer200JSONResponse(serverView(srv)), nil
 }
 
@@ -238,6 +244,11 @@ func (s *Server) ListServerMembers(ctx context.Context, request ListServerMember
 		return nil, e
 	}
 	members, err := s.store.MembersOfServer(ctx, request.Id)
+	if err != nil {
+		return nil, s.writeStoreErr(ctx, err)
+	}
+	// bot 不进成员管理列表（#51）：bot 是合法成员可收发消息，但列表只面向人对人。
+	members, err = filterBots(ctx, s.store, members, func(m store.ServerMember) int64 { return m.UserID })
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
@@ -309,6 +320,23 @@ func (s *Server) requirePerm(ctx context.Context, serverID, userID int64, perm s
 	return nil
 }
 
+// requireRolePerm 纯角色权限门（P1-2）：与 requirePerm 同一套快照语义，但**不做**
+// scope 上限交集——给「scope 腿已由端点显式判定」的双判定端点用（审计读取）。
+// 404/403/500 口径与 requirePerm 一致。
+func (s *Server) requireRolePerm(ctx context.Context, serverID, userID int64, perm store.Permission) *apiErr {
+	if s.authz == nil {
+		return errf(http.StatusInternalServerError, "internal", "权限服务未就绪")
+	}
+	ok, err := s.authz.RoleCanInServer(ctx, userID, serverID, 0, perm)
+	if err != nil {
+		return s.writeStoreErr(ctx, err)
+	}
+	if !ok {
+		return errf(http.StatusForbidden, "forbidden", "权限不足")
+	}
+	return nil
+}
+
 // requireMember 成员门（#35 B3）：服务器不存在 404，非成员 403，故障 500。
 func (s *Server) requireMember(ctx context.Context, serverID, userID int64) *apiErr {
 	if s.authz == nil {
@@ -339,8 +367,9 @@ func (s *Server) requireChannelPerm(ctx context.Context, ch *store.Channel, user
 	return nil
 }
 
-// visibleChannels 过滤出 uid 有 ViewChannel 的频道（#35 B3；categories 不过滤）。
+// visibleChannels 过滤出 uid 有 ViewChannel 的频道（#35 B3）。
 // 单频道判定故障直接上抛 500——静默丢频道会把可用性问题伪装成权限问题。
+// 分类不再「原样返回」：由 visibleCategories 按同一口径过滤（#102）。
 func (s *Server) visibleChannels(ctx context.Context, uid, serverID int64, chans []store.Channel) ([]store.Channel, error) {
 	if s.authz == nil {
 		return nil, errf(http.StatusInternalServerError, "internal", "权限服务未就绪")
@@ -353,6 +382,48 @@ func (s *Server) visibleChannels(ctx context.Context, uid, serverID int64, chans
 		}
 		if ok {
 			out = append(out, ch)
+		}
+	}
+	return out, nil
+}
+
+// visibleCategories 分类名过滤（#102）：只返回「至少有一个可见频道」的分类。
+//
+// 分类本身没有独立的查看权限，它的可见性完全由归属频道决定——只过滤频道、
+// 分类原样返回时，一个没有任何可见频道的服务器也会把分类名（往往写着「指挥部」
+// 「内鬼专用」这类信息）暴露给无权限成员。
+//
+// visible 是调用方已按 ViewChannel 过滤后的频道列表，这里只做归并，不重复查权限：
+// 与频道过滤同一口径，两处结果不可能互相矛盾。
+//
+// ManageChannels 持有人在响应里保留空分类（否则管理端点创建的新分类在列表里
+// 看不见，无法往里面挂频道）；该判定按服务器级做一次，不随分类数线性放大。
+func (s *Server) visibleCategories(ctx context.Context, uid, serverID int64, cats []store.Category, visible []store.Channel) ([]store.Category, error) {
+	if len(cats) == 0 {
+		return cats, nil
+	}
+	keep := make(map[int64]bool, len(visible))
+	for _, ch := range visible {
+		if ch.CategoryID != nil {
+			keep[*ch.CategoryID] = true
+		}
+	}
+	out := make([]store.Category, 0, len(cats))
+	// 只有存在空分类时才需要问 ManageChannels：一次额外权限查询。
+	emptyAllowed := false
+	if len(keep) < len(cats) {
+		if s.authz == nil {
+			return nil, errf(http.StatusInternalServerError, "internal", "权限服务未就绪")
+		}
+		ok, err := s.authz.CanServer(ctx, uid, serverID, store.ManageChannels)
+		if err != nil {
+			return nil, err
+		}
+		emptyAllowed = ok
+	}
+	for _, cat := range cats {
+		if keep[cat.ID] || emptyAllowed {
+			out = append(out, cat)
 		}
 	}
 	return out, nil

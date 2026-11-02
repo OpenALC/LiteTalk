@@ -23,6 +23,21 @@ export function normalizeChannelAudioOptions(bitrateKbps: number, frameMS: numbe
   return { bitrateKbps: bitrate, frameMS: frame }
 }
 
+// #117 音质字段按快照差下发：与打开弹层时的值逐字段比较，未变的以 -1 表示
+// 「不改」（bridge/Go 侧同约定），变了就发最终值。0 是有效值（跟随用户设置 /
+// 默认帧长），必须能下发——所以只能和快照比，不能用真假值判断。两个字段一起
+// 无脑下发会被服务端当成音质变更，纯改名也会广播 channel.audio 让全房间重跑
+// 一次音质应用。
+export function diffChannelAudioOptions(
+  before: { bitrateKbps: number; frameMS: number },
+  after: { bitrateKbps: number; frameMS: number },
+): { bitrateKbps: number; frameMS: number } {
+  return {
+    bitrateKbps: after.bitrateKbps === before.bitrateKbps ? -1 : after.bitrateKbps,
+    frameMS: after.frameMS === before.frameMS ? -1 : after.frameMS,
+  }
+}
+
 export interface Channel {
   id: string
   name: string

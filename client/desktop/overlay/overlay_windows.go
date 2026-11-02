@@ -54,6 +54,9 @@ var (
 	procMonitorFromWindow          = user32.NewProc("MonitorFromWindow")
 	procGetMonitorInfoW            = user32.NewProc("GetMonitorInfoW")
 	procGetDpiForSystem            = user32.NewProc("GetDpiForSystem")
+	procGetCursorPos               = user32.NewProc("GetCursorPos")
+	// #117 多显示器：悬浮层贴光标所在显示器的左上角，而不是永远主屏。
+	procMonitorFromPoint = user32.NewProc("MonitorFromPoint")
 
 	procCreateSolidBrush      = gdi32.NewProc("CreateSolidBrush")
 	procCreateFontW           = gdi32.NewProc("CreateFontW")
@@ -89,6 +92,9 @@ const (
 	wmMouseActivate = 0x0021
 	wmNCHitTest     = 0x0084
 	wmTimer         = 0x0113
+	// wmDPICHanged 0x02E0：窗口所在显示器 DPI 变化（缩放设置变更/窗口换屏）。
+	// 老 SDK 头文件里可能没有，直接写字面量。
+	wmDPICHanged = 0x02E0
 
 	maNoActivate = 3
 
@@ -97,6 +103,9 @@ const (
 
 	logPixelsX              = 88
 	monitorDefaultToPrimary = 1
+	// monitorDefaultToNearest 光标不在任何显示器内（远程桌面断开等）时取最近的
+	// 那块，不给 0 句柄。
+	monitorDefaultToNearest = 2
 	nullPen                 = 8
 	defaultCharset          = 1
 	cleartypeQuality        = 5
@@ -120,14 +129,8 @@ const (
 	classAlreadyExists = 1410 // ERROR_CLASS_ALREADY_EXISTS
 )
 
-// 布局尺寸以 96 DPI 为基准，运行时按系统 DPI 缩放。
+// 布局尺寸与缩放计算在 layout.go（平台无关，Linux 检查 job 也跑得到）。
 const (
-	panelWidthDip = 232
-	rowHeightDip  = 30
-	paddingDip    = 10
-	marginDip     = 16
-	dotRadiusDip  = 4
-	gapDip        = 8
 	fontPointSize = 12
 )
 
@@ -210,6 +213,9 @@ func supportedPlatform() bool {
 		procEndPaint, procFillRect, procDrawTextW, procCreateFontW,
 		procSelectObject, procCreateSolidBrush, procMonitorFromWindow,
 		procGetMonitorInfoW, procShowWindow, procSetWindowPos,
+		// 多显示器定位与 DPI 重缩放（#117）：缺任一函数就按不支持处理，
+		// 不能让 Call 在窗口线程上 panic。
+		procGetCursorPos, procMonitorFromPoint,
 	} {
 		if p.Find() != nil {
 			return false
@@ -369,7 +375,7 @@ func createWindow(snapshot Snapshot) (*windowState, uintptr, error) {
 		return nil, 0, fmt.Errorf("overlay: SetLayeredWindowAttributes: %v", callErr)
 	}
 
-	st := newWindowState(snapshot, hwnd)
+	st := newWindowState(snapshot, hwnd, systemDPI())
 	if st.font == 0 || st.panelBrush == 0 || st.nullPen == 0 ||
 		st.dotBrushes[0] == 0 || st.dotBrushes[1] == 0 ||
 		st.dotBrushes[2] == 0 || st.dotBrushes[3] == 0 {
@@ -378,15 +384,8 @@ func createWindow(snapshot Snapshot) (*windowState, uintptr, error) {
 		return nil, 0, errors.New("overlay: 创建 GDI 资源失败")
 	}
 
-	// 主显示器工作区左上角（MVP 不做多显示器/拖拽配置）。
-	mon, _, _ := procMonitorFromWindow.Call(0, monitorDefaultToPrimary)
-	mi := monitorInfo{cbSize: uint32(unsafe.Sizeof(monitorInfo{}))}
-	if r, _, _ := procGetMonitorInfoW.Call(mon, uintptr(unsafe.Pointer(&mi))); r != 0 {
-		st.x = mi.rcWork.left + st.dp(marginDip)
-		st.y = mi.rcWork.top + st.dp(marginDip)
-	} else {
-		st.x, st.y = st.dp(marginDip), st.dp(marginDip)
-	}
+	// 初始位置：光标所在显示器（没有光标时取主显示器）的工作区左上角。
+	st.x, st.y = st.cursorAnchor()
 
 	if r, _, callErr := procSetTimer.Call(hwnd, timerID, timerInterval, 0); r == 0 {
 		st.destroyGDI()
@@ -396,8 +395,27 @@ func createWindow(snapshot Snapshot) (*windowState, uintptr, error) {
 	return st, hwnd, nil
 }
 
-func newWindowState(snapshot Snapshot, hwnd uintptr) *windowState {
-	st := &windowState{snapshot: snapshot, hwnd: hwnd, dpi: systemDPI()}
+// cursorAnchor 光标所在显示器的工作区左上角（#117：不再固定主显示器）。
+// 取不到光标（远程桌面断开、无输入会话）时退回主显示器。工作区已扣除
+// 任务栏；副屏的 left/top 可能为负，按原值定位。
+func (st *windowState) cursorAnchor() (int32, int32) {
+	var mon uintptr
+	var pt point
+	if r, _, _ := procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt))); r != 0 {
+		mon, _, _ = procMonitorFromPoint.Call(uintptr(unsafe.Pointer(&pt)), monitorDefaultToNearest)
+	}
+	if mon == 0 {
+		mon, _, _ = procMonitorFromWindow.Call(0, monitorDefaultToPrimary)
+	}
+	mi := monitorInfo{cbSize: uint32(unsafe.Sizeof(monitorInfo{}))}
+	if r, _, _ := procGetMonitorInfoW.Call(mon, uintptr(unsafe.Pointer(&mi))); r != 0 {
+		return anchorInWorkArea(mi.rcWork.left, mi.rcWork.top, st.dpi)
+	}
+	return st.dp(marginDip), st.dp(marginDip)
+}
+
+func newWindowState(snapshot Snapshot, hwnd uintptr, dpi uint32) *windowState {
+	st := &windowState{snapshot: snapshot, hwnd: hwnd, dpi: validDPI(dpi)}
 	if b, _, _ := procCreateSolidBrush.Call(uintptr(panelColor)); b != 0 {
 		st.panelBrush = b
 	}
@@ -419,7 +437,7 @@ func (st *windowState) createFont() uintptr {
 		return 0
 	}
 	// 负高度 = 字符高度；缺字体时 GDI 字体映射器自动回落到 Segoe UI。
-	h := int32(-st.pt(fontPointSize))
+	h := -fontHeight(fontPointSize, st.dpi)
 	f, _, _ := procCreateFontW.Call(
 		uintptr(h), 0, 0, 0, fwNormal, 0, 0, 0,
 		defaultCharset, 0, 0, cleartypeQuality, 0,
@@ -430,13 +448,12 @@ func (st *windowState) createFont() uintptr {
 }
 
 // dp 把 96 DPI 基准尺寸缩放成物理像素。
-func (st *windowState) dp(v int32) int32 {
-	return int32(int64(v) * int64(st.dpi) / 96)
+func (st *windowState) dp(v uint32) int32 {
+	return scaleDPI(v, st.dpi)
 }
 
-// pt 把磅值换算成物理像素（CreateFontW 的字符高度）。
-func (st *windowState) pt(v int32) int32 {
-	return int32(int64(v) * int64(st.dpi) / 72)
+func (st *windowState) pt(v uint32) int32 {
+	return fontHeight(v, st.dpi)
 }
 
 func systemDPI() uint32 {
@@ -472,6 +489,11 @@ func (st *windowState) poll(hwnd uintptr) {
 		}
 		return
 	}
+	if !st.visible {
+		// 从隐藏转显示时重挂到光标所在显示器（#117）：用户换屏后下一批
+		// 发言直接出现在眼前那块的左上角，而不是留在上一块屏上。
+		st.x, st.y = st.cursorAnchor()
+	}
 	st.resize(hwnd)
 	st.redraw(hwnd)
 	if !st.visible {
@@ -483,11 +505,29 @@ func (st *windowState) poll(hwnd uintptr) {
 }
 
 func (st *windowState) resize(hwnd uintptr) {
-	st.width = st.dp(panelWidthDip)
-	st.height = st.dp(paddingDip)*2 + int32(len(st.last))*st.dp(rowHeightDip)
+	st.width, st.height = panelSize(st.dpi, len(st.last))
 	procSetWindowPos.Call(hwnd, 0,
 		uintptr(st.x), uintptr(st.y), uintptr(st.width), uintptr(st.height),
 		swpNoZOrder|swpNoActivate)
+}
+
+// applyDPI 处理 WM_DPICHANGED：按新 DPI 重建字体（字号随缩放变），重新定位
+// 到光标所在显示器的工作区，再按新尺寸重绘。
+//
+// 不采用 lParam 里的系统建议矩形：悬浮层的位置策略固定是「工作区左上角 +
+// 边距」，跟着建议矩形走反而会偏离我们自己的布局；同时这也避开了
+// uintptr → *RECT 的转换（go vet 的 unsafeptr 检查拒绝该写法）。
+//
+// 只重建字体；画刷与画笔与 DPI 无关，不重建。
+func (st *windowState) applyDPI(hwnd uintptr, dpi uint32) {
+	st.dpi = validDPI(dpi)
+	if st.font != 0 {
+		procDeleteObject.Call(st.font)
+	}
+	st.font = st.createFont()
+	st.x, st.y = st.cursorAnchor()
+	st.resize(hwnd)
+	st.redraw(hwnd)
 }
 
 // redraw 直接画到窗口 DC 并清掉更新区：隐藏窗口也能先画好再显示，
@@ -635,6 +675,12 @@ func overlayWndProc(hwnd, message, wParam, lParam uintptr) uintptr {
 	case wmTimer:
 		if st != nil && wParam == timerID {
 			st.poll(hwnd)
+		}
+		return 0
+	case wmDPICHanged:
+		if st != nil {
+			// wParam 低字 = 新 DPI（高字是 Y 轴，Win10 起与低字恒等）。
+			st.applyDPI(hwnd, uint32(wParam&0xFFFF))
 		}
 		return 0
 	case wmClose:

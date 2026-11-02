@@ -4,7 +4,7 @@
 // 右键菜单：复制邀请码/新建频道/重命名/删除服务器/设为首页；
 // 介绍页右键：删除介绍页（仅当首页不是介绍页，可恢复）。
 // 角标死数据已移除（走查 13：无真实未读数据源）。
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   Plus, Home, MessageCircle, MessagesSquare, Gamepad2, Music, Palette, BookOpen, Coffee, Mic,
@@ -16,6 +16,7 @@ import { useConversationsStore } from '../stores/conversations'
 import { useNotifyStore } from '../stores/notify'
 import { badgeText, unreadLabel, useUnreadsStore } from '../stores/unreads'
 import { goApp } from '../api/bridge'
+import { consumePendingInviteCode } from '../api/web/deeplink'
 import ServerDialog from './ServerDialog.vue'
 import ContextMenu, { type CtxItem } from './ContextMenu.vue'
 import PromptDialog from './PromptDialog.vue'
@@ -43,6 +44,22 @@ const currentIcons = computed(() =>
 
 // ---- 创建/加入弹层 ----
 const showServerDialog = ref(false)
+// 邀请深链预填（#50）：/join/<code> 启动时 web/deeplink.ts 已把码暂存，
+// 挂载时取码打开加入页签——登录前打开的链接在登录完成后同样走到这里。
+const invitePrefill = ref<{ code: string } | null>(null)
+onMounted(() => {
+  const code = consumePendingInviteCode()
+  if (code) {
+    invitePrefill.value = { code }
+    showServerDialog.value = true
+  }
+})
+
+// closeServerDialog 关弹层并清预填：残留的码会让下次手动打开的弹层错误预填。
+function closeServerDialog() {
+  showServerDialog.value = false
+  invitePrefill.value = null
+}
 
 // ---- 服务器右键菜单（设为首 introduction 页为首页时普通服务器均可设首页） ----
 const ctx = ref<{ x: number; y: number; id: string; name: string } | null>(null)
@@ -225,7 +242,12 @@ async function removeServer(id: string) {
       <Settings :size="20" />
     </button>
 
-    <ServerDialog v-if="showServerDialog" @close="showServerDialog = false" />
+    <ServerDialog
+      v-if="showServerDialog"
+      :initial-tab="invitePrefill ? 'join' : undefined"
+      :initial-code="invitePrefill?.code"
+      @close="closeServerDialog"
+    />
 
     <ContextMenu v-if="ctx" :x="ctx.x" :y="ctx.y" :items="ctxItems"
                  @select="onCtxSelect" @close="ctx = null" />
