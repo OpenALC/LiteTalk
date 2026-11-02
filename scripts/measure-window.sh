@@ -320,43 +320,86 @@ main_window() { # $1=pid → 主窗口 id（可见且面积≥200x200 中最大�
   return 0
 }
 
-click_titlebar_button() { # $1=wid $2=从右数第几个按钮(1=关闭 3=最小化)
-  local wid=$1 n=$2 geo ax ay w
+prepare_titlebar_button() { # $1=wid $2=从右数第几个按钮；焦点和指针准备均在计时之前
+  local wid=$1 n=$2 geo ax ay w tx ty focused loc px py t0 activate_x activate_y
+  t0=$(now_ns)
+  if ! timeout 2s xdotool windowfocus "$wid" 2>/dev/null; then
+    emit input-diagnostic "$INPUT_ATTEMPT" windowfocus FAIL ms; return 1
+  fi
+  focused=$(xdotool getwindowfocus 2>/dev/null) || return 1
+  emit input-diagnostic "$INPUT_ATTEMPT" windowfocus "$(el_ms "$t0" "$(now_ns)")" ms
+  if [ "$focused" != "$wid" ]; then
+    emit input-diagnostic "$INPUT_ATTEMPT" focus_match FAIL bool
+    emit_meta "input: expected_window=$wid focused_window=$focused"
+    return 1
+  fi
+  sleep 0.15
   geo=$(xwininfo -id "$wid" 2>/dev/null)
   ax=$(echo "$geo" | awk '/Absolute upper-left X/{print $4}')
   ay=$(echo "$geo" | awk '/Absolute upper-left Y/{print $4}')
   w=$(echo "$geo" | awk '/^  Width:/{print $2}')
-  [ -n "$ax" ] && [ -n "$w" ] || return 1
-  # 布局：右内边距 6px + 按钮 42px（TitleBar.vue）：第 n 个按钮中心 = W - 27 - 42*(n-1)
-  xdotool mousemove --sync $((ax + w - 27 - 42 * (n - 1))) $((ay + 19)) click 1
-}
-
-trigger_action() { # 触发一次窗口收起（close 或 min），返回点击是否成功
-  local wid=$1
-  # 先聚焦窗口：WSLg 首击仅用于聚焦（click-to-focus），不落控件
-  xdotool windowfocus "$wid" 2>/dev/null
-  sleep 0.15
-  if [ "$TRIGGER" = "close" ]; then
-    click_titlebar_button "$wid" 1
-  else
-    click_titlebar_button "$wid" 3
+  [ -n "$ax" ] && [ -n "$ay" ] && [ -n "$w" ] || return 1
+  # WSLg 的合成器可能在 X11 focus 已匹配后仍吞掉首个鼠标点击。
+  # 在标题栏无控件的中点做激活点击，随后重新读窗口几何；该准备步骤不计入关闭耗时。
+  activate_x=$((ax + w / 2))
+  activate_y=$((ay + 19))
+  timeout 2s xdotool mousemove "$activate_x" "$activate_y" || return 1
+  t0=$(now_ns)
+  if ! timeout 2s xdotool click 1; then
+    emit input-diagnostic "$INPUT_ATTEMPT" activation_click FAIL ms; return 1
   fi
+  emit input-diagnostic "$INPUT_ATTEMPT" activation_click "$(el_ms "$t0" "$(now_ns)")" ms
+  sleep 0.1
+  focused=$(xdotool getwindowfocus 2>/dev/null) || return 1
+  if [ "$focused" != "$wid" ] || [ "$(main_window "$SCRIPT_MAIN")" != "$wid" ]; then
+    emit input-diagnostic "$INPUT_ATTEMPT" activation_focus FAIL bool; return 1
+  fi
+  emit input-diagnostic "$INPUT_ATTEMPT" activation_focus yes bool
+  geo=$(xwininfo -id "$wid" 2>/dev/null)
+  ax=$(echo "$geo" | awk '/Absolute upper-left X/{print $4}')
+  ay=$(echo "$geo" | awk '/Absolute upper-left Y/{print $4}')
+  w=$(echo "$geo" | awk '/^  Width:/{print $2}')
+  # 布局：右内边距 6px + 按钮 42px（TitleBar.vue）：第 n 个按钮中心 = W - 27 - 42*(n-1)
+  tx=$((ax + w - 27 - 42 * (n - 1)))
+  ty=$((ay + 19))
+  t0=$(now_ns)
+  if ! timeout 2s xdotool mousemove "$tx" "$ty"; then
+    emit input-diagnostic "$INPUT_ATTEMPT" mousemove FAIL ms; return 1
+  fi
+  loc=$(xdotool getmouselocation --shell)
+  px=$(printf '%s\n' "$loc" | sed -n 's/^X=//p')
+  py=$(printf '%s\n' "$loc" | sed -n 's/^Y=//p')
+  emit input-diagnostic "$INPUT_ATTEMPT" mousemove "$(el_ms "$t0" "$(now_ns)")" ms
+  if [ "$px" != "$tx" ] || [ "$py" != "$ty" ]; then
+    emit input-diagnostic "$INPUT_ATTEMPT" pointer_match FAIL bool
+    emit_meta "input: expected_pointer=$tx,$ty observed_pointer=$px,$py"
+    return 1
+  fi
+  emit input-diagnostic "$INPUT_ATTEMPT" pointer_match yes bool
 }
 
 trigger_and_wait_gone() { # 点击 + 重试（WSLg 窗口自动排布可能导致点击瞬间窗口位移）。成功 0
-  # 计时只计成功那一次点击（重试不计入，重试次数单独记录）
-  local wid t0 attempt
+  # 焦点与指针先准备并确认；计时从实际 click 命令发出开始。
+  local wid t0 attempt n click0
   for attempt in 1 2 3; do
     wid=$(main_window "$SCRIPT_MAIN")
     [ -z "$wid" ] && return 1 # 窗口已消失，无从触发
+    INPUT_ATTEMPT=$attempt
+    n=1; [ "$TRIGGER" = min ] && n=3
+    prepare_titlebar_button "$wid" "$n" || continue
     t0=$(now_ns)
-    trigger_action "$wid" || continue
+    click0=$t0
+    if ! timeout 2s xdotool click 1; then
+      emit input-diagnostic "$attempt" click_command FAIL ms; continue
+    fi
+    emit input-diagnostic "$attempt" click_command "$(el_ms "$click0" "$(now_ns)")" ms
     if wait_main_gone 4000; then
       LAST_TRIGGER_MS=$(el_ms "$t0" "$(now_ns)")
       LAST_TRIGGER_T0=$t0
       LAST_TRIGGER_TRIES=$attempt
       return 0
     fi
+    emit input-diagnostic "$attempt" click_window_still_visible yes bool
   done
   return 1
 }
@@ -575,7 +618,7 @@ cycle_hide_show() {
   if ! wait_proc_exit "$sec" 5000; then
     emit "$suite" "$it" second_instance_lingering FAIL bool; ok=0
   fi
-  sleep 1
+  sleep 2 # 唤醒后让前端 hibernate 组件恢复完成，不计入下一轮点击时间
   [ "$ok" = 1 ]
 }
 
@@ -684,6 +727,7 @@ suite_lifecycle() {
       if [ "$suite" = destroy-downgrade ] && [ "$(disk_config_mode)" != destroy ]; then
         emit "$suite" 0 config_destroy_retained FAIL bool
       fi
+      sleep 2 # 预探测唤醒后的组件恢复，不计入正式轮次
     fi
     fail=0
     for i in $(seq 1 "$RUNS"); do
