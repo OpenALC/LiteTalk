@@ -429,3 +429,32 @@ func TestRateLimit(t *testing.T) {
 		t.Fatal("第 6 次应拒绝")
 	}
 }
+
+// TestNormalizeEmail 邮箱口径：去空格/制表符并转小写（注册、登录、验证码、
+// OIDC 绑定共用这一个实现）。
+func TestNormalizeEmail(t *testing.T) {
+	for in, want := range map[string]string{
+		" User@Example.COM ": "user@example.com",
+		"a\tb@x.y":           "ab@x.y",
+		"AbC@X.Y":            "abc@x.y",
+	} {
+		if got := NormalizeEmail(in); got != want {
+			t.Fatalf("NormalizeEmail(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestEmailCodeNormalizesEmail 发码与验码用同一规范化口径：调用方传入不同
+// 大小写/空白形态的同一地址时验证码仍应通过（否则表现为「码总是错」）。
+func TestEmailCodeNormalizesEmail(t *testing.T) {
+	ctx := context.Background()
+	mem := store.NewMem()
+	ec := NewEmailCodes(mem)
+	code, err := ec.Send(ctx, PurposeRegister, "  User@Example.COM ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ec.Verify(ctx, PurposeRegister, "user@example.com", code); err != nil {
+		t.Fatalf("规范化后的同一地址应验码通过: %v", err)
+	}
+}

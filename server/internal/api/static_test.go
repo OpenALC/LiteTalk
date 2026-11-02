@@ -61,8 +61,12 @@ func TestStaticServeWebUI(t *testing.T) {
 		if cc := rec.Header().Get("Cache-Control"); cc != webIndexCacheControl {
 			t.Fatalf("%s: Cache-Control = %q，期望 %q", p, cc, webIndexCacheControl)
 		}
-		if rec.Header().Get("Content-Security-Policy") == "" {
-			t.Fatalf("%s: 缺少 CSP 头", p)
+		if csp := rec.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "frame-ancestors 'none'") {
+			t.Fatalf("%s: CSP 缺少 frame-ancestors 'none'，实际 %q", p, csp)
+		}
+		// 旧浏览器兼容头：与 CSP frame-ancestors 双保险，拒绝被 iframe 嵌入。
+		if xfo := rec.Header().Get("X-Frame-Options"); xfo != "DENY" {
+			t.Fatalf("%s: X-Frame-Options = %q，期望 DENY", p, xfo)
 		}
 	}
 
@@ -74,6 +78,12 @@ func TestStaticServeWebUI(t *testing.T) {
 	if cc := rec.Header().Get("Cache-Control"); cc != webAssetCacheControl {
 		t.Fatalf("资产 Cache-Control = %q", cc)
 	}
+	if csp := rec.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "frame-ancestors 'none'") {
+		t.Fatalf("资产响应 CSP 缺少 frame-ancestors 'none'，实际 %q", csp)
+	}
+	if xfo := rec.Header().Get("X-Frame-Options"); xfo != "DENY" {
+		t.Fatalf("资产响应 X-Frame-Options = %q，期望 DENY", xfo)
+	}
 
 	// 不存在的资产 404，绝不回 HTML 壳（否则坏资源以 200+text/html 静默失败）
 	rec = get(t, mux, "/assets/nope-999.js")
@@ -81,7 +91,14 @@ func TestStaticServeWebUI(t *testing.T) {
 		t.Fatalf("缺失资产应 404 不带壳: %d %q", rec.Code, rec.Body.String())
 	}
 
-	// /api 与 /ws 不被 fallback 吞掉（回归点）
+	// /api 与 /ws 不被 fallback 吞掉（回归点），且静态托管的安全头不外溢到 API：
+	// 这些头只属于 Web 入口，API 响应由各自 handler 决定。
+	for _, p := range []string{"/api/v1/healthz", "/ws"} {
+		r := get(t, mux, p)
+		if r.Header().Get("X-Frame-Options") != "" || r.Header().Get("Content-Security-Policy") != "" {
+			t.Fatalf("%s: API/WS 响应不应带静态托管的 CSP/X-Frame-Options", p)
+		}
+	}
 	if r := get(t, mux, "/api/v1/healthz"); r.Body.String() != "api" {
 		t.Fatalf("/api/v1/ 被 SPA fallback 吞掉: %q", r.Body.String())
 	}

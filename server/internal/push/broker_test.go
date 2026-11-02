@@ -93,6 +93,10 @@ func TestBrokerDirectAndFriendRequest(t *testing.T) {
 	if rec.Notif.Route != "conversation:55" {
 		t.Fatalf("私聊 route 不符: %q", rec.Notif.Route)
 	}
+	// 标题口径与群/频道推送一致：发送者昵称（空标题在锁屏上无法区分来源）。
+	if rec.Notif.Title != "私聊发送者" {
+		t.Fatalf("私聊推送标题应为发送者昵称，实际 %q", rec.Notif.Title)
+	}
 	// 好友请求：100 → 300。
 	b.NotifyFriendRequest(ctx, 300, 100, "请求者")
 	waitForPush(t, pusher, 2)
@@ -180,6 +184,38 @@ func TestBrokerOfflineEdgeFallback(t *testing.T) {
 	time.Sleep(80 * time.Millisecond)
 	if pusher.count() != 1 {
 		t.Fatalf("边沿消费后不应再兜底，实际 %d 次", pusher.count())
+	}
+}
+
+// TestBrokerOfflineEdgeTTLCleanup offlineAt 由 worker 节拍按 offlineEdgeTTL 清理：
+// 过期条目消失，TTL 内的条目保留。清理只能来自 worker（OnUserOffline 只写）。
+func TestBrokerOfflineEdgeTTLCleanup(t *testing.T) {
+	old := offlineSweepInterval
+	offlineSweepInterval = 5 * time.Millisecond
+	defer func() { offlineSweepInterval = old }()
+
+	b, _, _ := newBroker(t, map[string]bool{})
+	b.OnUserOffline("fresh")
+	b.mu.Lock()
+	b.offlineAt["stale"] = time.Now().Add(-offlineEdgeTTL - time.Second)
+	b.mu.Unlock()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		b.mu.Lock()
+		_, stale := b.offlineAt["stale"]
+		_, fresh := b.offlineAt["fresh"]
+		b.mu.Unlock()
+		if !stale {
+			if !fresh {
+				t.Fatal("TTL 内的离线边沿不应被清理")
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("过期离线边沿未被 worker 节拍清理")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
