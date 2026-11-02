@@ -64,9 +64,9 @@ const active = computed(() => props.speaking && !props.muted && !props.deafen)
 }
 .orb-bars { display: flex; align-items: center; gap: 3.5px; height: 26px; }
 .orb-bars i {
-  width: 4px; height: 8px; border-radius: 2px;
+  width: 4px; height: 24px; border-radius: 2px;
   background: var(--idc);
-  transition: height 0.15s var(--ease);
+  transform: scaleY(0.333333);
 }
 .orb.speaking {
   box-shadow: 0 0 0 2px var(--idc), 0 0 26px color-mix(in srgb, var(--idc) 25%, transparent);
@@ -76,8 +76,8 @@ const active = computed(() => props.speaking && !props.muted && !props.deafen)
   animation-delay: calc(var(--i) * 0.13s);
 }
 @keyframes wave {
-  0%, 100% { height: 8px; }
-  50% { height: 24px; }
+  0%, 100% { transform: scaleY(0.333333); }
+  50% { transform: scaleY(1); }
 }
 .orb.state-icon :deep(svg), .orb.dual-off :deep(svg) { color: var(--ink-400); }
 /* 双关态：灰球 + 双图标 + 红色双环（区别于单关） */
