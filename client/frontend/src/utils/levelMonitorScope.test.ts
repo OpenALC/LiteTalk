@@ -28,6 +28,24 @@ describe('LevelMonitorScope', () => {
     expect(stopNative).toHaveBeenCalledExactlyOnceWith('current')
   })
 
+  it('B 先启动后，A 的迟到启动只归还 A 的 token', async () => {
+    let resolveOld!: (token: string) => void
+    const stopNative = vi.fn(async (_token: string) => {})
+    const oldScope = new LevelMonitorScope(
+      () => new Promise<string>((resolve) => { resolveOld = resolve }), stopNative,
+    )
+    const newScope = new LevelMonitorScope(async () => 'B', stopNative)
+    const pendingOld = oldScope.start()
+    await oldScope.dispose()
+    expect(await newScope.start()).toBe(true)
+
+    resolveOld('A')
+    expect(await pendingOld).toBe(false)
+    expect(stopNative).toHaveBeenCalledExactlyOnceWith('A')
+    await newScope.stop()
+    expect(stopNative).toHaveBeenNthCalledWith(2, 'B')
+  })
+
   it('无原生监视的浏览器桩仍允许原有麦克风自检', async () => {
     const stopNative = vi.fn(async (_token: string) => {})
     const scope = new LevelMonitorScope(() => undefined, stopNative)
