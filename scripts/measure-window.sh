@@ -115,6 +115,9 @@ if [ "$MODE" = wayland ]; then
 fi
 DBUS_ADDR="unix:path=$WORKDIR/dbus/session-bus"
 export DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDR"
+LOCAL_API="http://127.0.0.1:1"
+LOCAL_WS="ws://127.0.0.1:1/ws"
+printf '{"server_base":"%s","hibernate_mode":"off"}\n' "$LOCAL_API" > "$WORKDIR/config/LiteTalk/config.json"
 RUN_ID=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
 APP_TAG="LITETALK_MEASURE_APP=$RUN_ID"
 INFRA_TAG="LITETALK_MEASURE_INFRA=$RUN_ID"
@@ -241,6 +244,7 @@ emit_meta() {
 emit_meta "binary=$BIN_ABS gtk=$GTK_VER webkit=${WEBKIT_VER:-unknown} mode=$MODE suite=$SUITE runs=$RUNS trigger=$TRIGGER"
 emit_meta "host=$(uname -sr) cpus=$(nproc) date=$(date -Iseconds)"
 emit_meta "workdir=$WORKDIR run_id=$RUN_ID dmabuf_disabled=${WEBKIT_DISABLE_DMABUF_RENDERER:-0}"
+emit_meta "server_base=$LOCAL_API ws_base=$LOCAL_WS (仅 loopback，无保存凭据)"
 emit_meta "note=窗口时间用 10ms 轮询探测；cpu=单核占用百分比；rss=KiB"
 
 # ---------- D-Bus 会话总线与占位托盘宿主 ----------
@@ -355,7 +359,7 @@ effective_mode() {
   if [ "$GTK_VER" = 4 ] && [ "$1" = destroy ]; then echo hibernate; else echo "$1"; fi
 }
 set_config_mode() {
-  printf '{"hibernate_mode":"%s"}\n' "$1" > "$WORKDIR/config/LiteTalk/config.json"
+  printf '{"server_base":"%s","hibernate_mode":"%s"}\n' "$LOCAL_API" "$1" > "$WORKDIR/config/LiteTalk/config.json"
   emit_meta "requested_mode=$1 expected_effective_mode=$(effective_mode "$1")"
 }
 disk_config_mode() {
@@ -367,15 +371,18 @@ launch_app() { # $1=附加环境变量(k=v 或 -) → 设置 SCRIPT_MAIN 和本�
   local envkv=$1
   SCRIPT_LOG="$WORKDIR/app-main-$(date +%s%N).log"
   if [ "$envkv" != "-" ]; then
-    env "$APP_TAG" LITETALK_CI_SMOKE=1 "$envkv" "$BIN_ABS" >"$SCRIPT_LOG" 2>&1 &
+    env "$APP_TAG" LITETALK_CI_SMOKE=1 "LITETALK_API=$LOCAL_API" "LITETALK_WS=$LOCAL_WS" \
+      "$envkv" "$BIN_ABS" >"$SCRIPT_LOG" 2>&1 &
   else
-    env "$APP_TAG" LITETALK_CI_SMOKE=1 "$BIN_ABS" >"$SCRIPT_LOG" 2>&1 &
+    env "$APP_TAG" LITETALK_CI_SMOKE=1 "LITETALK_API=$LOCAL_API" "LITETALK_WS=$LOCAL_WS" \
+      "$BIN_ABS" >"$SCRIPT_LOG" 2>&1 &
   fi
   SCRIPT_MAIN=$!
 }
 
 launch_secondary() {
-  env "$APP_TAG" LITETALK_CI_SMOKE=1 "$BIN_ABS" >>"$WORKDIR/app-secondary.log" 2>&1 &
+  env "$APP_TAG" LITETALK_CI_SMOKE=1 "LITETALK_API=$LOCAL_API" "LITETALK_WS=$LOCAL_WS" \
+    "$BIN_ABS" >>"$WORKDIR/app-secondary.log" 2>&1 &
   SECOND_PID=$!
 }
 
