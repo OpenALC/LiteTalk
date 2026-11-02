@@ -1046,6 +1046,67 @@ func TestWebhookPatchURLEventsGateUsesNewEvents(t *testing.T) {
 	if row := f.row(t, hookID); row.URL != mSrv.URL || row.CreatorID != f.uidM {
 		t.Fatalf("无频道维度的订阅应允许改址并改绑: %+v", row)
 	}
+
+	// 恢复 M 的文字频道可见性后，同次改址和事件应按 M 的角色放行；
+	// guild.manage PAT 没有 messages.read，不能让操作凭据的 scope 干扰判定。
+	f.setViewDeny(t, f.pubID, false)
+	thirdURL := "https://third.example.com/new"
+	pat := patFor(t, f.mem, f.uidM, "guild.manage")
+	patchJSON(t, f.h, f.hookPath(hookID), pat,
+		map[string]any{"url": thirdURL, "events": []string{"message.created"}}, http.StatusOK)
+	if row := f.row(t, hookID); row.URL != thirdURL || row.Events != "message.created" || row.CreatorID != f.uidM {
+		t.Fatalf("同次改址/事件应按最终创建者角色放行: %+v", row)
+	}
+}
+
+// TestWebhookPatchEventsUsesEffectiveCreator 仅改事件不改地址时，判定主体仍是
+// 原订阅创建者，不能拿执行 PATCH 的管理员角色或令牌 scope 代替；旧行 creator_id=0
+// 由服主代持。403 不应改动库行，允许修改也不应改绑创建者。
+func TestWebhookPatchEventsUsesEffectiveCreator(t *testing.T) {
+	t.Run("创建者不可见但操作者可见时拒绝且不落库", func(t *testing.T) {
+		f := newRebindFixture(t)
+		created := postJSON(t, f.h, fmt.Sprintf("/api/v1/servers/%d/webhooks", f.serverID), f.accM,
+			map[string]any{"url": "https://hooks.example.com/m", "events": []string{"member.joined"}}, http.StatusCreated)
+		hookID := asID(created["id"])
+		before := *f.row(t, hookID)
+		f.setViewDeny(t, f.pubID, true) // M 已看不到任何文字频道；服主 O 仍可见
+		patchJSON(t, f.h, f.hookPath(hookID), f.accO,
+			map[string]any{"events": []string{"message.created"}}, http.StatusForbidden)
+		if row := f.row(t, hookID); row.URL != before.URL || row.Events != before.Events ||
+			row.CreatorID != before.CreatorID || row.UpdatedAt != before.UpdatedAt {
+			t.Fatalf("403 后订阅行不得变化: before=%+v after=%+v", before, row)
+		}
+	})
+
+	t.Run("创建者可见但操作者不可见时允许且不改绑", func(t *testing.T) {
+		f := newRebindFixture(t)
+		created := postJSON(t, f.h, fmt.Sprintf("/api/v1/servers/%d/webhooks", f.serverID), f.accO,
+			map[string]any{"url": "https://hooks.example.com/o", "events": []string{"member.joined"}}, http.StatusCreated)
+		hookID := asID(created["id"])
+		f.setViewDeny(t, f.pubID, true)                 // M 无可见文字频道
+		pat := patFor(t, f.mem, f.uidM, "guild.manage") // 也不带 messages.read
+		patchJSON(t, f.h, f.hookPath(hookID), pat,
+			map[string]any{"events": []string{"message.created"}}, http.StatusOK)
+		if row := f.row(t, hookID); row.URL != "https://hooks.example.com/o" ||
+			row.Events != "message.created" || row.CreatorID != f.uidO {
+			t.Fatalf("事件更新应按原创建者放行，且不改绑: %+v", row)
+		}
+	})
+
+	t.Run("旧行按服主代持且不补写创建者", func(t *testing.T) {
+		f := newRebindFixture(t)
+		legacy := &store.OutboundWebhook{ServerID: f.serverID, URL: "https://hooks.example.com/legacy",
+			Secret: "s", Events: "member.joined"}
+		if err := f.mem.CreateOutboundWebhook(context.Background(), legacy); err != nil {
+			t.Fatal(err)
+		}
+		f.setViewDeny(t, f.pubID, true)
+		patchJSON(t, f.h, f.hookPath(legacy.ID), f.accM,
+			map[string]any{"events": []string{"message.created"}}, http.StatusOK)
+		if row := f.row(t, legacy.ID); row.Events != "message.created" || row.CreatorID != 0 {
+			t.Fatalf("旧行应按服主权限更新事件且保持旧创建者字段: %+v", row)
+		}
+	})
 }
 
 // TestWebhookPatchURLWritesAudit 改址写审计 webhook.update_url：记旧/新创建者，
