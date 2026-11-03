@@ -447,7 +447,7 @@ func (a *App) setupTray() {
 		a.SetMute(!s.Muted())
 	})
 	quitItem.OnClick(func(*application.Context) {
-		a.forceQuit.Store(true)
+		a.markForceQuit()
 		a.wails.Quit()
 	})
 
@@ -729,10 +729,18 @@ func (a *App) quitAfterClose() {
 
 // QuitApp 显式退出程序（设置页「退出程序」按钮，不依赖托盘）。
 func (a *App) QuitApp() {
-	a.forceQuit.Store(true)
+	a.markForceQuit()
 	if a.wails != nil {
 		a.wails.Quit()
 	}
+}
+
+func (a *App) markForceQuit() {
+	a.winMu.Lock()
+	a.forceQuit.Store(true)
+	a.wakePending = false
+	a.wakePendingFocus = false
+	a.winMu.Unlock()
 }
 
 // TrayReady 返回托盘是否就绪（前端可在关闭前预判行为）。
@@ -1393,9 +1401,9 @@ func (a *App) claimWindowForDestroy(target *application.WebviewWindow) bool {
 		if flag := a.windowCloseFlags[target]; flag != nil {
 			flag.Store(true)
 		}
-		if a.wakeInProgress {
-			a.wakePending = true
-		}
+		// 本次关闭取代先前尚未完成的唤醒；只有关闭认领后新到的请求才可重开。
+		a.wakePending = false
+		a.wakePendingFocus = false
 	}
 	a.levelSuspended = true
 	a.winMu.Unlock()
