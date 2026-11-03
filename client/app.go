@@ -53,10 +53,19 @@ type App struct {
 	// destroyingWindow 标识已认领销毁的窗口；Close 异步，旧窗口摘除前
 	// 第二次销毁不得在等待后误作用于随后重建的新窗口。
 	destroyingWindow *application.WebviewWindow
+	// Windows 托盘/单实例唤醒共享一次重建认领；所有 Wails 调用都在 winMu 外。
+	wakeInProgress   bool
+	wakeDone         chan struct{}
+	wakePending      bool
+	wakePendingFocus bool
+	windowCloseFlags map[*application.WebviewWindow]*atomic.Bool
+	wakeBuild        func(application.WebviewWindowOptions) *application.WebviewWindow
+	wakeActivate     func(*application.WebviewWindow, bool, bool, bool)
+	destroySnapshot  func(*application.WebviewWindow) (application.Rect, bool)
+	destroyClose     func(*application.WebviewWindow)
 
-	// recreating 程序化销毁渲染进程（里程碑② destroy 模式）的标志：
-	// WindowClosing Hook 见它放行关闭。重建窗口后复位（见 showFromTray）——
-	// 新窗口的 Hook 同样检查此标志，不复位会把用户正常关窗误判为销毁。
+	// recreating 标记程序化销毁；Windows 关闭钩子改用窗口实例标志，
+	// 旧窗完成关闭请求后即可复位。其它平台维持重建后复位的原行为。
 	recreating atomic.Bool
 
 	// 销毁前保存的窗口位置/大小/最大化态，托盘唤醒重建时恢复。
@@ -438,7 +447,7 @@ func (a *App) setupTray() {
 		a.SetMute(!s.Muted())
 	})
 	quitItem.OnClick(func(*application.Context) {
-		a.forceQuit.Store(true)
+		a.markForceQuit()
 		a.wails.Quit()
 	})
 
@@ -458,10 +467,28 @@ func (a *App) setupTray() {
 // 窗口实例级的，重建必须重新注册。
 func (a *App) buildWindow(opts application.WebviewWindowOptions) *application.WebviewWindow {
 	win := a.wails.Window.NewWithOptions(opts)
+	var programmaticClose atomic.Bool
+	if runtime.GOOS == "windows" {
+		a.winMu.Lock()
+		if a.windowCloseFlags == nil {
+			a.windowCloseFlags = make(map[*application.WebviewWindow]*atomic.Bool)
+		}
+		a.windowCloseFlags[win] = &programmaticClose
+		a.winMu.Unlock()
+	}
 
 	// 关窗拦截：默认隐藏到托盘而非退出（见 interceptClose）。
 	// Hook 先于 v3 内建关闭处理器执行，Cancel 即中止关闭。
 	win.RegisterHook(events.Common.WindowClosing, func(e *application.WindowEvent) {
+		if runtime.GOOS == "windows" {
+			if programmaticClose.Load() || !a.isCurrentWindow(win) {
+				return
+			}
+			if a.interceptCloseForWindow(win) {
+				e.Cancel()
+			}
+			return
+		}
 		if a.interceptClose() {
 			e.Cancel()
 		}
@@ -470,7 +497,11 @@ func (a *App) buildWindow(opts application.WebviewWindowOptions) *application.We
 	// 最小化监听：destroy 模式最小化即销毁渲染进程（监听器在独立 goroutine 执行）。
 	win.OnWindowEvent(events.Common.WindowMinimise, func(*application.WindowEvent) {
 		if a.cfg.HibernateMode() == "destroy" {
-			a.destroyRenderProcess()
+			if runtime.GOOS == "windows" {
+				a.destroyRenderProcessFor(win)
+			} else {
+				a.destroyRenderProcess()
+			}
 		}
 	})
 
@@ -484,22 +515,73 @@ func (a *App) buildWindow(opts application.WebviewWindowOptions) *application.We
 // 重复触发安全（window 已 nil 直接返回）。
 func (a *App) destroyRenderProcess() {
 	win := a.getWindow()
+	a.destroyRenderProcessFor(win)
+}
+
+func (a *App) destroyRenderProcessFor(win *application.WebviewWindow) {
 	if !a.claimWindowForDestroy(win) {
 		return
 	}
-	if b := win.Bounds(); b.Width > 0 {
-		bb := b
-		a.savedBounds = &bb
-		a.savedMaximised = win.IsMaximised()
+	if runtime.GOOS == "windows" {
+		a.recreating.Store(true)
+		a.winMu.Lock()
+		wakeDone := a.wakeDone
+		a.winMu.Unlock()
+		if wakeDone != nil {
+			select {
+			case <-wakeDone:
+			default:
+				// Show 可能等待 UI 线程；让旧窗的显示先结束，再在独立 goroutine 关闭。
+				go func() {
+					<-wakeDone
+					a.finishDestroyRenderProcess(win)
+				}()
+				return
+			}
+		}
 	}
-	a.recreating.Store(true)
-	win.Close()
+	a.finishDestroyRenderProcess(win)
+}
+
+func (a *App) finishDestroyRenderProcess(win *application.WebviewWindow) {
+	b, maximised := application.Rect{}, false
+	if a.destroySnapshot != nil {
+		b, maximised = a.destroySnapshot(win)
+	} else {
+		b = win.Bounds()
+		if b.Width > 0 {
+			maximised = win.IsMaximised()
+		}
+	}
+	if b.Width > 0 {
+		bb := b
+		a.winMu.Lock()
+		a.savedBounds = &bb
+		a.savedMaximised = maximised
+		a.winMu.Unlock()
+	}
+	if runtime.GOOS != "windows" {
+		a.recreating.Store(true)
+	}
+	if a.destroyClose != nil {
+		a.destroyClose(win)
+	} else {
+		win.Close()
+	}
 	a.completeWindowDestroy(win)
+	if runtime.GOOS == "windows" {
+		a.recreating.Store(false)
+		a.resumePendingWakeWindows()
+	}
 }
 
 // showFromTray 托盘「显示主界面」：窗口被销毁（destroy 休眠模式）则按记忆的
 // 位置/大小/最大化态重建；否则解除最小化并前置。发 sys:wake 让前端清休眠态。
 func (a *App) showFromTray() {
+	if runtime.GOOS == "windows" {
+		a.showFromTrayWindows(false)
+		return
+	}
 	win := a.getWindow()
 	if win == nil {
 		if a.wails == nil {
@@ -647,10 +729,18 @@ func (a *App) quitAfterClose() {
 
 // QuitApp 显式退出程序（设置页「退出程序」按钮，不依赖托盘）。
 func (a *App) QuitApp() {
-	a.forceQuit.Store(true)
+	a.markForceQuit()
 	if a.wails != nil {
 		a.wails.Quit()
 	}
+}
+
+func (a *App) markForceQuit() {
+	a.winMu.Lock()
+	a.forceQuit.Store(true)
+	a.wakePending = false
+	a.wakePendingFocus = false
+	a.winMu.Unlock()
 }
 
 // TrayReady 返回托盘是否就绪（前端可在关闭前预判行为）。
@@ -735,6 +825,10 @@ func (a *App) WindowClose() {
 // 复用托盘唤醒逻辑（destroy 模式按记忆位置重建 / Show / 已最小化则 Restore），
 // 再前置聚焦。回调来自 wails 单实例监听 goroutine，与托盘回调同级，无新约束。
 func (a *App) ShowMainWindow() {
+	if runtime.GOOS == "windows" {
+		a.showFromTrayWindows(true)
+		return
+	}
 	a.showFromTray()
 	if win := a.getWindow(); win != nil {
 		win.Focus()
@@ -1303,6 +1397,14 @@ func (a *App) claimWindowForDestroy(target *application.WebviewWindow) bool {
 		return false
 	}
 	a.destroyingWindow = target
+	if runtime.GOOS == "windows" {
+		if flag := a.windowCloseFlags[target]; flag != nil {
+			flag.Store(true)
+		}
+		// 本次关闭取代先前尚未完成的唤醒；只有关闭认领后新到的请求才可重开。
+		a.wakePending = false
+		a.wakePendingFocus = false
+	}
 	a.levelSuspended = true
 	a.winMu.Unlock()
 	a.stopLevelMonitorLocked()
@@ -1319,6 +1421,7 @@ func (a *App) completeWindowDestroy(target *application.WebviewWindow) {
 	if a.destroyingWindow == target {
 		a.destroyingWindow = nil
 	}
+	delete(a.windowCloseFlags, target)
 }
 
 func (a *App) resumeLevelMonitor(target *application.WebviewWindow) {
