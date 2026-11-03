@@ -1639,13 +1639,23 @@ func (a *App) connectSessionLocked(token, nickname string) error {
 			if s == nil {
 				return
 			}
-			if !s.InRoom() {
-				continue
-			}
-			a.emit("voice:stats", s.Stats())
+			a.emitVoiceStats(s)
 		}
 	}()
 	return nil
+}
+
+// voiceStatsSource 只读 UI 诊断源；测试用它确认跳过时没有调用昂贵的 Stats。
+type voiceStatsSource interface {
+	InRoom() bool
+	Stats() string
+}
+
+func (a *App) emitVoiceStats(s voiceStatsSource) {
+	if !s.InRoom() || !a.shouldCollectVoiceStats() {
+		return
+	}
+	a.emit("voice:stats", s.Stats())
 }
 
 // disconnectSession 关闭会话。
