@@ -42,7 +42,8 @@ type config struct {
 	uploadTypes []string // LITETALK_UPLOAD_ALLOWED_TYPES，空 = attachment 包默认白名单
 
 	// 附件生命周期回收（#41 P2）。默认开启；值在 loadConfig 里夹到安全区间。
-	attachmentGC attachmentGCConfig
+	attachmentGC     attachmentGCConfig
+	webhookRedactURL bool // LITETALK_WEBHOOK_REDACT_URL：默认关闭，保留已发布 url 响应语义
 
 	// 校验输入（启动序步骤 2 集中把关；本批无对应 flag，仅 env）
 	jwtSecret     string
@@ -92,6 +93,7 @@ func loadConfig(args []string, output io.Writer) (*config, error) {
 		behindProxy:      *behindProxy,
 		dataDir:          *dataDir,
 		printAdminInvite: *printAdminInvite,
+		webhookRedactURL: envBool("LITETALK_WEBHOOK_REDACT_URL"),
 		gatewayBacklog:   *gatewayBacklog,
 		sfuActiveN:       *sfuActiveN,
 		sfuActiveHoldMS:  *sfuActiveHold,

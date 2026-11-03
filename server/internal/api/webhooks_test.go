@@ -667,7 +667,7 @@ type rebindFixture struct {
 	uidM     int64
 }
 
-func newRebindFixture(t *testing.T) *rebindFixture {
+func newRebindFixture(t *testing.T, redactURL ...bool) *rebindFixture {
 	t.Helper()
 	mem := store.NewMem()
 	az := authz.New(mem, authz.Options{})
@@ -675,16 +675,17 @@ func newRebindFixture(t *testing.T) *rebindFixture {
 	disp.Start(nil)
 	t.Cleanup(disp.Close)
 	srv := New(Config{
-		Store:           mem,
-		JWT:             auth.NewJWT("test-secret"),
-		Refresh:         auth.NewRefreshStore(mem),
-		Codes:           auth.NewEmailCodes(mem),
-		Limits:          auth.NewRateLimit(mem),
-		Session:         auth.NewSessionIndex(mem, mem),
-		Presence:        mem,
-		Authz:           az,
-		Webhooks:        disp,
-		WebhookURLCheck: func(string) error { return nil },
+		Store:            mem,
+		JWT:              auth.NewJWT("test-secret"),
+		Refresh:          auth.NewRefreshStore(mem),
+		Codes:            auth.NewEmailCodes(mem),
+		Limits:           auth.NewRateLimit(mem),
+		Session:          auth.NewSessionIndex(mem, mem),
+		Presence:         mem,
+		Authz:            az,
+		Webhooks:         disp,
+		WebhookURLCheck:  func(string) error { return nil },
+		WebhookRedactURL: len(redactURL) > 0 && redactURL[0],
 	})
 	h := srv.Handler()
 	ctx := context.Background()
@@ -939,7 +940,7 @@ func TestWebhookPatchURLRequiresChannelView(t *testing.T) {
 // 与服务器 owner；其余 ManageServer 成员在列表与 PATCH 响应里只看到 scheme://host/…。
 // creator_id=0 的旧行按 owner 代持；改址者获得完整响应（他刚提交该地址并成为创建者）。
 func TestOutboundWebhookURLMaskedForNonCreator(t *testing.T) {
-	f := newRebindFixture(t)
+	f := newRebindFixture(t, true)
 	const fullURL = "https://hooks.example.com/services/T000/B000/secret-token?key=abc"
 	const masked = "https://hooks.example.com/…"
 	listPath := fmt.Sprintf("/api/v1/servers/%d/webhooks", f.serverID)
@@ -1010,6 +1011,83 @@ func TestOutboundWebhookURLMaskedForNonCreator(t *testing.T) {
 		if m["id"] == strconv.FormatInt(hookID, 10) && m["url"] != newURL {
 			t.Fatalf("改绑后创建者列表应给完整新 url，实际 %v", m["url"])
 		}
+	}
+}
+
+func TestOutboundWebhookURLRedactionDefaultOff(t *testing.T) {
+	f := newRebindFixture(t)
+	const fullURL = "https://hooks.example.com/services/T/B/secret?key=abc"
+	hookID, _ := f.createHook(t, f.accO, fullURL)
+	listPath := fmt.Sprintf("/api/v1/servers/%d/webhooks", f.serverID)
+	rows := getJSON(t, f.h, listPath, f.accM, http.StatusOK).([]any)
+	if len(rows) != 1 || rows[0].(map[string]any)["url"] != fullURL {
+		t.Fatalf("默认关闭脱敏时 ManageServer 列表应保持已发布完整 url: %v", rows)
+	}
+	patched := patchJSON(t, f.h, f.hookPath(hookID), f.accM,
+		map[string]any{"enabled": false}, http.StatusOK)
+	if patched["url"] != fullURL {
+		t.Fatalf("默认关闭脱敏时 PATCH 响应仍应是完整 url: %v", patched["url"])
+	}
+}
+
+func TestOutboundWebhookRejectsRedactedURLWrites(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("redaction=%t", enabled), func(t *testing.T) {
+			testOutboundWebhookRejectsRedactedURLWrites(t, enabled)
+		})
+	}
+}
+
+func testOutboundWebhookRejectsRedactedURLWrites(t *testing.T, enabled bool) {
+	f := newRebindFixture(t, enabled)
+	const fullURL = "https://hooks.example.com/services/T/B/secret?key=abc"
+	hookID, _ := f.createHook(t, f.accO, fullURL)
+	listPath := fmt.Sprintf("/api/v1/servers/%d/webhooks", f.serverID)
+	masked := maskWebhookURL(fullURL)
+	if enabled {
+		rows := getJSON(t, f.h, listPath, f.accM, http.StatusOK).([]any)
+		if rows[0].(map[string]any)["url"] != masked {
+			t.Fatalf("开启脱敏后列表必须返回本次回写测试所用的掩码: %v", rows)
+		}
+	}
+	before := *f.row(t, hookID)
+	for _, candidate := range []string{masked, "https://hooks.example.com/%E2%80%A6"} {
+		got := patchJSON(t, f.h, f.hookPath(hookID), f.accM,
+			map[string]any{"url": candidate, "enabled": false, "reset_secret": true}, http.StatusBadRequest)
+		if got["code"] != "bad_url" {
+			t.Fatalf("脱敏 URL 回写应报 bad_url: %v", got)
+		}
+		after := f.row(t, hookID)
+		if after.URL != before.URL || after.CreatorID != before.CreatorID ||
+			after.Secret != before.Secret || after.Disabled != before.Disabled ||
+			after.Events != before.Events || after.FailCount != before.FailCount {
+			t.Fatalf("拒绝掩码回写后订阅被修改: before=%+v after=%+v", before, after)
+		}
+		got = postJSON(t, f.h, listPath, f.accM,
+			map[string]any{"url": candidate, "events": []string{"member.joined"}}, http.StatusBadRequest)
+		if got["code"] != "bad_url" {
+			t.Fatalf("创建订阅不得接受脱敏 URL: %v", got)
+		}
+	}
+	if got := len(getJSON(t, f.h, listPath, f.accO, http.StatusOK).([]any)); got != 1 {
+		t.Fatalf("拒绝掩码创建后订阅数应仍为 1，实际 %d", got)
+	}
+	// 只拒绝完整展示占位符；真实地址的其它 Unicode 路径仍可保存。
+	for _, candidate := range []string{
+		"https://hooks.example.com/…/valid",
+		"https://hooks.example.com/真实…路径?key=ok",
+	} {
+		created := postJSON(t, f.h, listPath, f.accM,
+			map[string]any{"url": candidate, "events": []string{"member.joined"}}, http.StatusCreated)
+		if created["url"] != candidate {
+			t.Fatalf("合法 Unicode 地址不应被改写: %v", created["url"])
+		}
+	}
+	const changed = "https://hooks.example.com/更新…路径"
+	patched := patchJSON(t, f.h, f.hookPath(hookID), f.accM,
+		map[string]any{"url": changed}, http.StatusOK)
+	if patched["url"] != changed || f.row(t, hookID).URL != changed {
+		t.Fatalf("合法 Unicode PATCH 未保存完整地址: %v", patched)
 	}
 }
 

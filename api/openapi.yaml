@@ -2317,8 +2317,9 @@ paths:
       description: >
         服务器级出站事件订阅（#52）。要求 Bearer 且调用者在该服务器有 ManageServer。
         响应永不回传 secret（HMAC 签名密钥）；被熔断自动停用的订阅带
-        disabled_reason=consecutive_failures。url 仅对订阅创建者与服务器 owner
-        回传完整值，其余调用者得到 scheme://host/… 掩码。
+        disabled_reason=consecutive_failures。默认保持已发布语义，ManageServer 调用者
+        得到完整 url；部署者设 LITETALK_WEBHOOK_REDACT_URL=1 后，仅订阅创建者与
+        服务器 owner 得到完整值，其余调用者得到 scheme://host/… 展示掩码。
         code：bad_request（路径 ID 非法）；401；403 forbidden；404 not_found；5xx internal。
       tags: [webhooks]
       parameters:
@@ -2391,9 +2392,11 @@ paths:
         旧 secret 立即失效（URL 泄露的可重置途径）；enabled=true 手动重新启用并
         清零连续失败计数（熔断停用后的唯一恢复途径），enabled=false 手动停用。
         url / events 更新与创建同规则校验（bad_url / bad_events）。
-        响应里的 url 与列表同口径：仅订阅创建者与服务器 owner 得到完整值，
-        其余调用者得到 scheme://host/… 掩码（改址后调用方成为创建者，返回其
-        刚提交的完整地址）。归属不符（wid 不属于该服务器）与不存在统一 404。
+        响应里的 url 与列表同口径：默认完整；设置 LITETALK_WEBHOOK_REDACT_URL=1
+        后仅订阅创建者与服务器 owner 得到完整值，其余调用者得到
+        scheme://host/… 展示掩码（改址后调用方成为创建者，返回其刚提交的完整地址）。
+        展示掩码不能回写为创建或修改目标，提交时返回 400 bad_url。
+        归属不符（wid 不属于该服务器）与不存在统一 404。
         频控键 wh:patch:<uid>。code：bad_url、bad_events；401；403；404 not_found；
         429 rate_limited；5xx internal。
       tags: [webhooks]
@@ -3003,9 +3006,11 @@ components:
           type: string
           maxLength: 2048
           description: >
-            投递目标（POST，application/json）。完整值只回传给订阅创建者与服务器 owner；
-            其余 ManageServer 成员看到掩码 scheme://host/…（路径/查询串常内嵌第三方
-            服务的投递凭证）。创建与改址响应总是调用方自己提交的完整地址。
+            投递目标（POST，application/json）。默认保持已发布的完整 url 响应；
+            部署者启用 LITETALK_WEBHOOK_REDACT_URL 后，仅订阅创建者与服务器 owner
+            看到完整值，其余 ManageServer 成员看到 scheme://host/… 展示掩码
+            （路径/查询串常内嵌第三方凭证）。展示掩码不能回写为投递目标，创建与
+            改址响应总是调用方自己提交的完整地址。
         events:
           type: array
           items:

@@ -1006,7 +1006,7 @@ type OutboundWebhook struct {
 	// Secret 一次性明文（仅创建 / reset_secret 的 PATCH 响应）
 	Secret *string `json:"secret,omitempty"`
 
-	// Url 投递目标（POST，application/json）。完整值只回传给订阅创建者与服务器 owner； 其余 ManageServer 成员看到掩码 scheme://host/…（路径/查询串常内嵌第三方 服务的投递凭证）。创建与改址响应总是调用方自己提交的完整地址。
+	// Url 投递目标（POST，application/json）。默认保持已发布的完整 url 响应； 部署者启用 LITETALK_WEBHOOK_REDACT_URL 后，仅订阅创建者与服务器 owner 看到完整值，其余 ManageServer 成员看到 scheme://host/… 展示掩码 （路径/查询串常内嵌第三方凭证）。展示掩码不能回写为投递目标，创建与 改址响应总是调用方自己提交的完整地址。
 	Url string `json:"url"`
 }
 
