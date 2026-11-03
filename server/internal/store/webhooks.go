@@ -163,9 +163,19 @@ func dbDeleteOutboundWebhook(ctx context.Context, q sqlExecer, id int64) error {
 }
 
 // dbRecordWebhookDelivery 落一条投递记录并在同一事务里推进熔断计数：成功清零
-// fail_count；失败自增，达到 breakerAt 时置 disabled=1 与 disabled_reason（已停用的
-// 保持停用，计数继续累计无副作用）。订阅已被并发删除时记录照落、计数跳过。
-// 调用方（SQLite/MySQL 接线）必须以事务传入 q，读-改-写才不会被并发投递撕开。
+// fail_count；失败原子自增，达到 breakerAt 时置 disabled=1 与 disabled_reason
+// （已停用的保持停用与原因，计数继续累计无副作用）。订阅已被并发删除时记录照落、
+// UPDATE 命中 0 行不报错。
+//
+// 计数推进是单条 UPDATE，不做「先 SELECT 再写回绝对值」：多连接并发投递同一订阅
+// 时，两个事务会读到同一个旧值，后提交者把先提交者的自增覆盖掉（丢更新），熔断
+// 阈值被无限推后。事务现在只保证「投递记录 + 计数」同进同退。
+//
+// 方言陷阱：MySQL 单表 UPDATE 的 SET 从左到右求值，后面的表达式看到的是前面列
+// **刚赋的新值**；SQLite 的所有表达式一律用旧值。disabled_reason 与 disabled 的
+// 判定都依赖旧的 fail_count/disabled，所以必须排在 fail_count 自增之前——顺序
+// 反过来时 MySQL 里 disabled_reason 会看到已自增的 fail_count，与 SQLite 分叉。
+// 不用 SELECT ... FOR UPDATE：SQLite 不支持。
 func dbRecordWebhookDelivery(ctx context.Context, q sqlExecer, d *WebhookDelivery, breakerAt int, reason string) error {
 	d.ID = newID(d.ID)
 	now := time.Now()
@@ -179,30 +189,18 @@ func dbRecordWebhookDelivery(ctx context.Context, q sqlExecer, d *WebhookDeliver
 	if d.WebhookID == 0 {
 		return nil
 	}
-	var failCount int
-	var disabled bool
-	var disabledReason string
-	err := q.QueryRowContext(ctx,
-		`SELECT fail_count, disabled, disabled_reason FROM webhooks WHERE id = ?`, d.WebhookID).
-		Scan(&failCount, &disabled, &disabledReason)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil // 订阅已删除：投递记录保留，熔断计数无行可推进
-	}
-	if err != nil {
+	if d.OK {
+		_, err := q.ExecContext(ctx,
+			`UPDATE webhooks SET fail_count = 0 WHERE id = ?`, d.WebhookID)
 		return err
 	}
-	if d.OK {
-		failCount = 0
-	} else {
-		failCount++
-		if !disabled && failCount >= breakerAt {
-			disabled = true
-			disabledReason = reason
-		}
-	}
-	_, err = q.ExecContext(ctx,
-		`UPDATE webhooks SET fail_count = ?, disabled = ?, disabled_reason = ? WHERE id = ?`,
-		failCount, disabled, disabledReason, d.WebhookID)
+	_, err := q.ExecContext(ctx,
+		`UPDATE webhooks SET
+			disabled_reason = CASE WHEN disabled = 0 AND fail_count + 1 >= ? THEN ? ELSE disabled_reason END,
+			disabled        = CASE WHEN disabled = 0 AND fail_count + 1 >= ? THEN 1 ELSE disabled END,
+			fail_count      = fail_count + 1
+		 WHERE id = ?`,
+		breakerAt, reason, breakerAt, d.WebhookID)
 	return err
 }
 

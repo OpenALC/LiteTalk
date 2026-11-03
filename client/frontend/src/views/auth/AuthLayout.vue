@@ -3,17 +3,30 @@
 // v0.1.2：窗口控制已统一上收 App.vue 全局 TitleBar（原悬浮窗控移除，见模板注释）；
 // 品牌区/表单空白仍可拖拽窗口。
 // 首装引导：自动探活默认地址，连不上时展开「连接服务器」弹层（全 auth 页面共享一次探测）。
-import { onMounted, ref } from 'vue'
+import { onMounted, onUnmounted, ref } from 'vue'
 import { AudioWaveform, Server, X } from 'lucide-vue-next'
 import { goApp } from '../../api/bridge'
 import ServerConnPanel from '../../components/ServerConnPanel.vue'
 import Toast from '../../components/Toast.vue'
+import { bindAuthWaveMotion } from './authWaveMotion'
 
 // 模块级标志：login/register/forgot 间切换 AuthLayout 会重挂载，探测只做一次。
 let autoProbed = false
 
 const showConn = ref(false)
 const toast = ref<InstanceType<typeof Toast>>()
+const wavePaused = ref(false)
+let stopWaveMotion: (() => void) | null = null
+
+onMounted(() => {
+  stopWaveMotion = bindAuthWaveMotion(window, document, (paused) => {
+    wavePaused.value = paused
+  })
+})
+onUnmounted(() => {
+  stopWaveMotion?.()
+  stopWaveMotion = null
+})
 
 onMounted(async () => {
   if (autoProbed) return
@@ -42,7 +55,7 @@ onMounted(async () => {
       </div>
       <div class="brand-mid">
         <p class="brand-tag">轻量、清晰的桌面语音。<br>打开频道，即刻开聊。</p>
-        <div class="waves" aria-hidden="true">
+        <div class="waves" :class="{ paused: wavePaused }" aria-hidden="true">
           <span v-for="i in 8" :key="i" :style="{ '--i': i - 1 }" />
         </div>
       </div>
@@ -118,6 +131,7 @@ onMounted(async () => {
   animation: wave 2.4s var(--ease) infinite;
   animation-delay: calc(var(--i) * 0.14s);
 }
+.waves.paused span { animation-play-state: paused; }
 .waves span:nth-child(3n) { background: var(--brand-500); }
 .waves span:nth-child(1) { height: 22px; }
 .waves span:nth-child(2) { height: 38px; }

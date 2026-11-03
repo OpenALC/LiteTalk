@@ -457,3 +457,34 @@ sudo cp -a /www/wwwroot/LiteTalk.bak-<时间戳>/. /www/wwwroot/LiteTalk/
 
 切换完成后再按 §9 装更新器、放行 TCP 8088 并配 webhook，用 ping + Redeliver 做演练；
 `/status` 用 SSH 端口转发查看。
+
+## 11. 应用内 Webhook
+
+出站订阅的目标 `url` 可能在路径或查询串携带第三方投递凭证。默认保持已发布
+API 行为：持 `ManageServer` 的成员从列表和 PATCH 响应取得完整地址。
+部署者可在 `/etc/litetalk.env` 设置 `LITETALK_WEBHOOK_REDACT_URL=1`（或 `true`）
+并重启服务：订阅创建者和服务器 owner 仍取得完整地址，其他管理者只见
+`scheme://host/…`。这个值仅供展示；用它创建或修改订阅会返回 `400 bad_url`，
+且不会修改原订阅。启用前请检查依赖列表完整 URL 的管理脚本。关闭开关后
+仍拒绝回写这种展示占位符，避免跨配置复制损坏投递目标。
+
+### 入站投递
+
+除 §9 的 GitHub 自动更新 webhook 外，服务端还有面向外部系统的频道入站入口：
+经客户端或 API 创建（`POST /api/v1/channels/{id}/inbound-webhooks`，需 ManageChannels），
+响应里的 `url` 形如 `/api/v1/webhooks/{id}/{secret}`。外部系统向该地址 POST
+`{"content": "..."}`（1–2000 字符），消息即以 webhook 机器人身份落库到该文字频道。
+该端点不需要 Bearer——凭证就是 URL 路径里的 secret。
+
+**`url` 是相对路径**，不含服务器地址；调用方自行拼上 scheme + host + port
+（例如 `https://voice.example.com` + 路径）后使用。
+
+secret 在 URL 路径里，任何记录完整请求路径的组件都等于记录了这个凭证：
+
+- 前置反代（§6.1）的访问日志默认记录请求 URI：对 `/api/v1/webhooks/` 前缀脱敏，
+  或对该路径关闭访问日志。nginx 可以用 `map $uri` 把该前缀改写成常数，再放进
+  `log_format` 代替 `$request`。
+- 应用侧审计只记 webhook id 与频道 id，不记 secret；也不要把该 URL 写进工单、
+  聊天记录或 CI 日志。
+- 泄露后立即轮换：`PATCH /api/v1/channels/{id}/inbound-webhooks/{wid}` 带
+  `{"reset_secret": true}`，旧 URL 立即失效；删除入口同样使其失效。

@@ -41,9 +41,30 @@
 
 ### 最低支持发行版
 
-Linux 产物以 **Ubuntu 24.04**（glibc 2.39）为构建基线，CI 校验产物不引用更高版本的 glibc 符号；
-运行环境需提供 WebKitGTK 4.1（libopus 已静态链接进二进制，无系统依赖）。中文界面依赖系统 CJK 字体，
-最小化安装建议补装 `fonts-noto-cjk`，否则界面文字可能显示为方框。
+Linux 产物以 **Ubuntu 24.04**（glibc 2.39）为构建基线，CI 校验产物不引用更高版本的 glibc 符号。
+客户端基于 **GTK4 + WebKitGTK 6.0**（libopus 已静态链接进二进制），最低发行版矩阵如下
+（包名与仓库来源经 CI 四发行版容器实测，见 `.github/workflows/ci.yml` 的安装冒烟矩阵）：
+
+| 发行版 | WebKitGTK 6.0 运行库包名 | 额外仓库 | GTK4 |
+|---|---|---|---|
+| Ubuntu 24.04+ | `libwebkitgtk-6.0-4` | 无 | 4.14+ |
+| Debian 13+ | `libwebkitgtk-6.0-4` | 无 | 4.18+ |
+| Fedora 40+ | `webkitgtk6.0` | 无 | 4.14+ |
+| RHEL 10+（Rocky / Alma 等兼容克隆） | `webkitgtk6.0` | **需启用 EPEL 10** | 4.16+ |
+
+安装时用包管理器解析依赖闭包：`apt install ./litetalk_*.deb` 或 `dnf install ./litetalk_*.rpm`；
+RHEL 10 系先 `dnf install epel-release`。
+
+**不再支持 Ubuntu 22.04 / Debian 12 / RHEL 9**：这些发行版不提供 WebKitGTK 6.0
+（Ubuntu 22.04 的 GTK4 还停留在 4.6），无法运行 v1.10.0 及以后的 Linux 客户端；
+需要继续使用请停留在 v1.9.x 及更早版本。
+
+v1.10.0-alpha 的 Linux GTK4 客户端暂不提供 `destroy` 休眠选项。已有配置若选择了
+`destroy`，运行时按 `hibernate` 处理，配置文件中的原值不会被覆盖；Windows 不受这一降级影响。
+
+中文界面依赖系统 CJK 字体，最小化安装建议补装 `fonts-noto-cjk`（Ubuntu/Debian）、
+`google-noto-sans-cjk-fonts`（Fedora）或 `google-noto-sans-cjk-ttc-fonts`（RHEL 系），
+否则界面文字可能显示为方框。
 
 ### 服务端
 

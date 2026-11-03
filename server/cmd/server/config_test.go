@@ -31,8 +31,31 @@ func clearConfigEnv(t *testing.T) {
 		"LITETALK_OIDC_ISSUER", "LITETALK_OIDC_CLIENT_ID",
 		"LITETALK_OIDC_CLIENT_SECRET", "LITETALK_OIDC_REDIRECT_URL",
 		"LITETALK_OIDC_SCOPES",
+		"LITETALK_WEBHOOK_REDACT_URL",
 	} {
 		t.Setenv(k, "")
+	}
+}
+
+func TestLoadConfigWebhookRedactURL(t *testing.T) {
+	clearConfigEnv(t)
+	cfg, err := loadConfig(nil, io.Discard)
+	if err != nil || cfg.webhookRedactURL {
+		t.Fatalf("默认应保留完整 url: enabled=%v err=%v", cfg.webhookRedactURL, err)
+	}
+	for _, value := range []string{"1", "true", "TRUE"} {
+		t.Setenv("LITETALK_WEBHOOK_REDACT_URL", value)
+		cfg, err = loadConfig(nil, io.Discard)
+		if err != nil || !cfg.webhookRedactURL {
+			t.Fatalf("环境变量 %q 应开启脱敏: enabled=%v err=%v", value, cfg.webhookRedactURL, err)
+		}
+	}
+	for _, value := range []string{"0", "false", "off"} {
+		t.Setenv("LITETALK_WEBHOOK_REDACT_URL", value)
+		cfg, err = loadConfig(nil, io.Discard)
+		if err != nil || cfg.webhookRedactURL {
+			t.Fatalf("环境变量 %q 应关闭脱敏: enabled=%v err=%v", value, cfg.webhookRedactURL, err)
+		}
 	}
 }
 

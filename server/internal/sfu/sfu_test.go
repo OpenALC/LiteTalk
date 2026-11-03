@@ -23,6 +23,9 @@ type testClient struct {
 
 	pc    *webrtc.PeerConnection
 	track *webrtc.TrackLocalStaticRTP
+	// SFU 的防抖 offer 可能与 t.Cleanup 并行；关闭须等待当前 answer 完成。
+	offerMu sync.Mutex
+	closing bool
 
 	mu           sync.Mutex
 	received     []*rtp.Packet
@@ -114,9 +117,8 @@ func newTestClientConfig(t *testing.T, s *SFU, roomID, userID string, networks [
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = pc.Close() })
-
 	c := &testClient{t: t, sfu: s, roomID: roomID, userID: userID, pc: pc}
+	t.Cleanup(func() { _ = c.close() })
 	c.seq.Store(100)
 
 	track, err := webrtc.NewTrackLocalStaticRTP(
@@ -195,25 +197,43 @@ func newTestClientConfig(t *testing.T, s *SFU, roomID, userID string, networks [
 	return c
 }
 
+func (c *testClient) close() error {
+	c.offerMu.Lock()
+	defer c.offerMu.Unlock()
+	c.closing = true
+	return c.pc.Close()
+}
+
 // SendOffer 实现 SignalSender：SFU 重协商 offer → 应用到桩并回 answer。
 func (c *testClient) SendOffer(sdp string) {
-	if err := c.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: sdp}); err != nil {
-		c.t.Errorf("[%s] 应用重协商 offer: %v", c.userID, err)
+	c.offerMu.Lock()
+	defer c.offerMu.Unlock()
+	if c.closing {
+		return
+	}
+	if err := c.answerOffer(sdp); err != nil {
+		c.t.Errorf("[%s] %v", c.userID, err)
 		return
 	}
 	c.t.Logf("[%s] 收到 SFU 重协商 offer，已应答", c.userID)
+}
+
+// answerOffer 仅由持有 offerMu 的调用方使用；运行中的协商错误必须上报。
+func (c *testClient) answerOffer(sdp string) error {
+	if err := c.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: sdp}); err != nil {
+		return fmt.Errorf("应用重协商 offer: %w", err)
+	}
 	answer, err := c.pc.CreateAnswer(nil)
 	if err != nil {
-		c.t.Errorf("[%s] 创建重协商 answer: %v", c.userID, err)
-		return
+		return fmt.Errorf("创建重协商 answer: %w", err)
 	}
 	if err := c.pc.SetLocalDescription(answer); err != nil {
-		c.t.Errorf("[%s] 设置本地 answer: %v", c.userID, err)
-		return
+		return fmt.Errorf("设置本地 answer: %w", err)
 	}
 	if err := c.sfu.HandleAnswer(c.roomID, c.userID, answer.SDP); err != nil {
-		c.t.Errorf("[%s] 回送 answer: %v", c.userID, err)
+		return fmt.Errorf("回送 answer: %w", err)
 	}
+	return nil
 }
 
 // SendCandidate 实现 SignalSender：SFU trickle → 应用到桩（answer 前到达的先缓存）。

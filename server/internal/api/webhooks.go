@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -123,17 +124,25 @@ func (s *Server) ListServerWebhooks(ctx context.Context, request ListServerWebho
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
+	// url 的路径/查询串常内嵌第三方服务凭证；部署者开启脱敏时，仅创建者与服主
+	// 回传完整值，其余 ManageServer 成员看到 scheme://host/…（见 webhookURLVisibleTo）。
+	var ownerID int64
 	out := make([]OutboundWebhook, 0, len(rows))
 	for i := range rows {
-		out = append(out, outboundWebhookWire(&rows[i], ""))
+		fullURL, err := s.webhookURLVisibleTo(ctx, request.Id, c.UserID, rows[i].CreatorID, &ownerID)
+		if err != nil {
+			return nil, s.writeStoreErr(ctx, err)
+		}
+		out = append(out, outboundWebhookWire(&rows[i], "", fullURL))
 	}
 	return ListServerWebhooks200JSONResponse(out), nil
 }
 
 // CreateServerWebhook POST /api/v1/servers/{id}/webhooks：URL 过 SSRF 校验、
 // 事件过白名单校验，secret 只在响应出现一次。创建者（Principal.UserID）落
-// creator_id，投递侧按其当前频道可见性收窄（P1-5）；创建者对服务器内所有频道
-// 都无 ViewChannel 的订阅永远空转，创建即拒绝。
+// creator_id，投递侧按其当前频道可见性收窄（P1-5）；订阅了频道维度事件却对
+// 能产生该事件的频道全无 ViewChannel（message.created 看文字频道，channel.*
+// 看任意频道）的订阅永远空转，创建即拒绝（见 requireSubscribedChannelView）。
 func (s *Server) CreateServerWebhook(ctx context.Context, request CreateServerWebhookRequestObject) (CreateServerWebhookResponseObject, error) {
 	if e := checkID(request.Id); e != nil {
 		return nil, e
@@ -146,9 +155,6 @@ func (s *Server) CreateServerWebhook(ctx context.Context, request CreateServerWe
 		whCreateLimit, time.Minute, "操作过于频繁，请稍后再试"); e != nil {
 		return nil, e
 	}
-	if e := s.requireAnyChannelView(ctx, request.Id, c.UserID); e != nil {
-		return nil, e
-	}
 	if request.Body == nil {
 		return nil, bodyMissing()
 	}
@@ -159,6 +165,11 @@ func (s *Server) CreateServerWebhook(ctx context.Context, request CreateServerWe
 	if !webhook.ValidEvents(events) {
 		return nil, errf(http.StatusBadRequest, "bad_events",
 			"events 必须非空、不重复且全部在白名单内")
+	}
+	// 可见性门按订阅的事件判定（见 requireSubscribedChannelView）：只有频道维度
+	// 事件才要求调用者能看见至少一个能产生该事件的频道。
+	if e := s.requireSubscribedChannelView(ctx, request.Id, c.UserID, events); e != nil {
+		return nil, e
 	}
 	secret, e := s.newWebhookSecret()
 	if e != nil {
@@ -186,7 +197,8 @@ func (s *Server) CreateServerWebhook(ctx context.Context, request CreateServerWe
 	})
 	s.log.Printf("[audit] webhook created server=%d id=%d events=%q ip=%s",
 		request.Id, w.ID, w.Events, reqIP(ctx))
-	return CreateServerWebhook201JSONResponse(outboundWebhookWire(w, secret)), nil
+	// 创建者就是调用者：完整 url 是他自己刚提交的，无需掩码。
+	return CreateServerWebhook201JSONResponse(outboundWebhookWire(w, secret, true)), nil
 }
 
 // PatchServerWebhook PATCH /api/v1/servers/{id}/webhooks/{wid}（Merge Patch）：
@@ -238,19 +250,33 @@ func (s *Server) PatchServerWebhook(ctx context.Context, request PatchServerWebh
 		}
 		w.URL = body.Url.Val
 	}
-	oldCreatorID := w.CreatorID
-	if urlChanged {
-		if e := s.requireAnyChannelView(ctx, request.Id, c.UserID); e != nil {
-			return nil, e
-		}
-		w.CreatorID = c.UserID
-	}
+	// events 先落到内存行，可见性门才能按**改后**的订阅集合判定。
+	// 只改事件也要过门，否则能先建 member.* 再改成永远空转的频道订阅。
+	eventsChanged := false
 	if body.Events.Set {
 		if body.Events.Null || !webhook.ValidEvents(body.Events.Val) {
 			return nil, errf(http.StatusBadRequest, "bad_events",
 				"events 必须非空、不重复且全部在白名单内")
 		}
-		w.Events = joinEvents(body.Events.Val)
+		events := joinEvents(body.Events.Val)
+		eventsChanged = events != w.Events
+		w.Events = events
+	}
+	oldCreatorID := w.CreatorID
+	if urlChanged || eventsChanged {
+		// 改址者成为最终创建者；只改事件仍按原创建者判定。不能拿操作者的
+		// principal/scope 约束他人订阅，旧行 creator_id=0 在门内按 owner 代持。
+		gateUserID := w.CreatorID
+		if urlChanged {
+			gateUserID = c.UserID
+		}
+		if e := s.requireSubscribedChannelView(ctx, request.Id, gateUserID,
+			strings.Fields(w.Events)); e != nil {
+			return nil, e
+		}
+	}
+	if urlChanged {
+		w.CreatorID = c.UserID
 	}
 	if body.ResetSecret.Set && body.ResetSecret.Val {
 		// 旧 secret 立即失效：新 secret 原子落库；明文只在本次响应出现一次。
@@ -290,7 +316,14 @@ func (s *Server) PatchServerWebhook(ctx context.Context, request PatchServerWebh
 			TargetType: "webhook", TargetID: ptrID(w.ID), Detail: "{}",
 		})
 	}
-	return PatchServerWebhook200JSONResponse(outboundWebhookWire(w, secretOut)), nil
+	// 与列表同一口径：开启脱敏时，非创建者/非 owner 的 PATCH 响应也要掩码，
+	// 否则「改个 enabled 再看响应」就能绕过列表掩码读到完整地址。
+	var ownerID int64
+	fullURL, err := s.webhookURLVisibleTo(ctx, request.Id, c.UserID, w.CreatorID, &ownerID)
+	if err != nil {
+		return nil, s.writeStoreErr(ctx, err)
+	}
+	return PatchServerWebhook200JSONResponse(outboundWebhookWire(w, secretOut, fullURL)), nil
 }
 
 // DeleteServerWebhook DELETE /api/v1/servers/{id}/webhooks/{wid}：立即不再投递。
@@ -534,14 +567,45 @@ func (s *Server) DeliverInboundWebhook(ctx context.Context, request DeliverInbou
 
 // ---- 辅助 ----
 
-// requireAnyChannelView 出站订阅的可见性门：创建（P1-5）与改址改绑（P1-8）共用。
-// 调用者对服务器内**至少一个**频道有 ViewChannel，否则订阅对所有频道维度事件
-// （message.created 等）都会被投递侧的创建者可见性闸拦下、永远空转，创建/改址即 403。
+// requireSubscribedChannelView 出站订阅的可见性门：创建（P1-5）与改址改绑（P1-8）共用，
+// 按本次订阅的事件集合判定，而不是笼统地要求「任一频道可见」。
+//
+// 投递侧对频道维度事件按创建者当前 ViewChannel 实时过滤（internal/webhook.creatorVisible），
+// 所以这里只拦「订阅了却永远不可能投递」的组合。白名单事件的频道依赖不同：
+//   - message.created：只由文字频道的消息产生 → 必须可见至少一个文字频道；
+//   - channel.created / channel.deleted：文字与语音频道都会产生 → 任一类型即可；
+//   - member.joined / member.left：无频道维度（投递体不带 channel_id，投递侧也不做
+//     可见性过滤）→ 不存在空转，不要求任何频道可见。
+//
+// 旧实现按「任一频道可见」放行：创建者只看得见语音频道时也能建 message.created
+// 订阅，而该事件永远不会投递；反过来 member.* 订阅却被无关的频道可见性卡住。
+// events 必须是已通过 webhook.ValidEvents 的集合。
+//
 // 口径与投递过滤一致走纯角色判定（RoleCanInServer，不做 scope 交集）：订阅按创建者
 // **账号**的实时角色可见性收窄，PAT/bot 令牌的 scope 只限制令牌主体自身的 API 能力，
 // 不改变其账号的频道可见性；若这里用 scope 交集，持有 ManageServer scope 而无
 // messages.read 的令牌将被误拒。
-func (s *Server) requireAnyChannelView(ctx context.Context, serverID, userID int64) *apiErr {
+func (s *Server) requireSubscribedChannelView(ctx context.Context, serverID, userID int64, events []string) *apiErr {
+	needText, needAny := false, false
+	for _, ev := range events {
+		switch ev {
+		case webhook.EventMessageCreated:
+			needText = true
+		case webhook.EventChannelCreated, webhook.EventChannelDeleted:
+			needAny = true
+		}
+	}
+	if !needText && !needAny {
+		return nil // 仅 member.*：无频道维度，投递不经过可见性闸
+	}
+	if userID == 0 {
+		// 0022 前的旧行 creator_id=0 由服务器 owner 代持，与投递侧一致。
+		srv, err := s.store.ServerByID(ctx, serverID)
+		if err != nil {
+			return s.writeStoreErr(ctx, err)
+		}
+		userID = srv.OwnerID
+	}
 	if s.authz == nil {
 		return errf(http.StatusInternalServerError, "internal", "权限服务未就绪")
 	}
@@ -549,16 +613,29 @@ func (s *Server) requireAnyChannelView(ctx context.Context, serverID, userID int
 	if err != nil {
 		return s.writeStoreErr(ctx, err)
 	}
+	textOK, anyOK := false, false
 	for i := range chans {
 		ok, err := s.authz.RoleCanInServer(ctx, userID, serverID, chans[i].ID, store.ViewChannel)
 		if err != nil {
 			return s.writeStoreErr(ctx, err)
 		}
-		if ok {
-			return nil
+		if !ok {
+			continue
+		}
+		anyOK = true // 文字频道同时也是「任一频道」
+		if chans[i].Type == store.ChannelText {
+			textOK = true
 		}
 	}
-	return errf(http.StatusForbidden, "forbidden", "调用者对服务器内所有频道均无查看权限，无法创建或改址出站订阅")
+	if needText && !textOK {
+		return errf(http.StatusForbidden, "forbidden",
+			"调用者对服务器内所有文字频道均无查看权限，message.created 订阅不会投递")
+	}
+	if needAny && !anyOK {
+		return errf(http.StatusForbidden, "forbidden",
+			"调用者对服务器内所有频道均无查看权限，频道事件订阅不会投递")
+	}
+	return nil
 }
 
 // inboundChannel 入站管理的频道门：频道存在（404）、服务器作用域且为文字频道
@@ -590,6 +667,11 @@ func (s *Server) inboundChannel(ctx context.Context, channelID, userID int64) (*
 func (s *Server) checkWebhookURL(_ context.Context, rawURL string) *apiErr {
 	if rawURL == "" || len(rawURL) > 2048 {
 		return errf(http.StatusBadRequest, "bad_url", "url 不合法")
+	}
+	// 列表中的脱敏展示值不是投递目标。无论当前开关状态如何都拒绝回写，
+	// 避免切换配置后旧客户端把占位符落库；只拦截完整的 /… 形态。
+	if isMaskedWebhookURL(rawURL) {
+		return errf(http.StatusBadRequest, "bad_url", "脱敏展示地址不能作为投递目标，请填写完整 url")
 	}
 	if err := s.webhookURLCheck(rawURL); err != nil {
 		return errf(http.StatusBadRequest, "bad_url", "url 不被允许（内网/保留地址或格式非法）")
@@ -673,11 +755,16 @@ func randTag() (string, error) {
 }
 
 // outboundWebhookWire store 行 → wire。secretOut 非空时（创建 / reset_secret）
-// 才回传一次性明文；其余路径永不回传。
-func outboundWebhookWire(w *store.OutboundWebhook, secretOut string) OutboundWebhook {
+// 才回传一次性明文；其余路径永不回传。fullURL=false 时 url 以掩码形式回传
+// （调用者既不是订阅创建者也不是服主，不应拿到可能内嵌第三方凭证的地址）。
+func outboundWebhookWire(w *store.OutboundWebhook, secretOut string, fullURL bool) OutboundWebhook {
+	rawURL := w.URL
+	if !fullURL {
+		rawURL = maskWebhookURL(rawURL)
+	}
 	out := OutboundWebhook{
 		Id:        idOf(w.ID),
-		Url:       w.URL,
+		Url:       rawURL,
 		Events:    splitEvents(w.Events),
 		Disabled:  w.Disabled,
 		CreatedAt: timeOf(w.CreatedAt),
@@ -723,6 +810,49 @@ func inboundWebhookWire(w *store.InboundWebhook, urlOut string) InboundWebhook {
 // inboundDeliveryPath 入站投递路径（相对路径，含一次性 secret）。
 func inboundDeliveryPath(id int64, secret string) string {
 	return "/api/v1/webhooks/" + strconv.FormatInt(id, 10) + "/" + secret
+}
+
+// webhookURLVisibleTo 开关关闭时保持已发布的完整 url 响应；开启时只回传给
+// 订阅创建者与服务器 owner。ManageServer 是「管理订阅」的权限，不该附赠第三方凭证
+// （Discord/Slack 等 webhook 的 token 就在路径/查询串里）。creator_id 为 0 的
+// 旧行按 owner 代持（与投递侧 creatorVisible 的兜底语义一致）。
+// ownerID 是懒加载缓存（0 = 未查）：列表里多个订阅共享一次查询。
+func (s *Server) webhookURLVisibleTo(ctx context.Context, serverID, userID, creatorID int64, ownerID *int64) (bool, error) {
+	if !s.webhookRedactURL {
+		return true, nil
+	}
+	if creatorID == userID {
+		return true, nil
+	}
+	if *ownerID == 0 {
+		srv, err := s.store.ServerByID(ctx, serverID)
+		if err != nil {
+			return false, err
+		}
+		*ownerID = srv.OwnerID
+	}
+	return *ownerID == userID, nil
+}
+
+// maskWebhookURL 保留 scheme 与 host（管理员据此辨认订阅去向），丢弃 userinfo、
+// 路径、查询串与片段——这些位置最常内嵌第三方服务的投递密钥。解析失败时回退到
+// 常数掩码（存库前已过 SSRF/格式校验，正常到不了这里）。
+func maskWebhookURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "…"
+	}
+	return u.Scheme + "://" + u.Host + "/…"
+}
+
+// isMaskedWebhookURL 只认本服务端可能返回的整段占位路径；百分号编码的同一
+// Unicode 字符也视为占位符，不扩大到包含省略号的其它真实路径。
+func isMaskedWebhookURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.Opaque != "" {
+		return false
+	}
+	return u.Path == "/…" && u.RawQuery == "" && !u.ForceQuery && u.Fragment == "" && !strings.Contains(raw, "#")
 }
 
 // notifyWebhookEvent REST 层出站事件派发（#52）：hub 事件流只看得到

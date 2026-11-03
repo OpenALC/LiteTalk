@@ -456,6 +456,8 @@ func main() {
 		Push: pushBroker,
 		// 出站 Webhook 投递器（#52）：API 层只负责建首个订阅时的惰性启动。
 		Webhooks: webhookDisp,
+		// 默认完整 url 与已发布 API 一致；部署者可启用非创建者脱敏。
+		WebhookRedactURL: cfg.webhookRedactURL,
 		// OIDC 登录（#54）：nil = 未配置（端点 404，零副作用）。
 		OIDC: oidcCfg,
 	})
