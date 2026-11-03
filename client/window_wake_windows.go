@@ -37,7 +37,14 @@ func (a *App) interceptCloseForWindow(target *application.WebviewWindow) bool {
 // showFromTrayWindows 在锁内认领一次唤醒，建窗、显示、聚焦均在锁外。
 // 并发普通唤醒由首个调用完成；单实例聚焦请求或销毁中请求延后重放。
 func (a *App) showFromTrayWindows(focus bool) {
+	if a.forceQuit.Load() {
+		return
+	}
 	a.winMu.Lock()
+	if a.forceQuit.Load() {
+		a.winMu.Unlock()
+		return
+	}
 	if a.destroyingWindow != nil {
 		a.wakePending = true
 		a.wakePendingFocus = a.wakePendingFocus || focus
@@ -60,6 +67,9 @@ func (a *App) showFromTrayWindows(focus bool) {
 
 func (a *App) runWakeWindows(focus bool) {
 	defer a.finishWakeWindows()
+	if a.forceQuit.Load() {
+		return
+	}
 	a.winMu.Lock()
 	win := a.window
 	var bounds application.Rect
@@ -97,11 +107,19 @@ func (a *App) runWakeWindows(focus bool) {
 			return
 		}
 		a.winMu.Lock()
+		if a.forceQuit.Load() {
+			if flag := a.windowCloseFlags[win]; flag != nil {
+				flag.Store(true)
+			}
+			a.winMu.Unlock()
+			a.closeUnpublishedWindow(win)
+			return
+		}
 		a.window = win
 		a.winMu.Unlock()
 		a.resumeLevelMonitor(win)
 	}
-	if !a.isCurrentWindow(win) {
+	if a.forceQuit.Load() || !a.isCurrentWindow(win) {
 		return
 	}
 	if a.wakeActivate != nil {
@@ -118,9 +136,21 @@ func (a *App) runWakeWindows(focus bool) {
 			win.Focus()
 		}
 	}
-	if a.isCurrentWindow(win) {
+	if !a.forceQuit.Load() && a.isCurrentWindow(win) {
 		a.emit("sys:wake", nil)
 	}
+}
+
+// closeUnpublishedWindow 清理建窗途中收到退出请求的隐藏窗口，不能让它进入主窗引用。
+func (a *App) closeUnpublishedWindow(win *application.WebviewWindow) {
+	if a.destroyClose != nil {
+		a.destroyClose(win)
+	} else {
+		win.Close()
+	}
+	a.winMu.Lock()
+	delete(a.windowCloseFlags, win)
+	a.winMu.Unlock()
 }
 
 func (a *App) finishWakeWindows() {
@@ -134,6 +164,12 @@ func (a *App) finishWakeWindows() {
 
 func (a *App) resumePendingWakeWindows() {
 	a.winMu.Lock()
+	if a.forceQuit.Load() {
+		a.wakePending = false
+		a.wakePendingFocus = false
+		a.winMu.Unlock()
+		return
+	}
 	if !a.wakePending || a.wakeInProgress || a.destroyingWindow != nil {
 		a.winMu.Unlock()
 		return

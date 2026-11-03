@@ -37,6 +37,26 @@ func waitWakeDone(t *testing.T, done <-chan struct{}) {
 	}
 }
 
+func waitWakeIdle(t *testing.T, a *App) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		a.winMu.Lock()
+		idle := a.destroyingWindow == nil && !a.wakeInProgress && !a.wakePending
+		a.winMu.Unlock()
+		if idle {
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline:
+			t.Fatal("窗口生命周期未归于空闲")
+		}
+	}
+}
+
 func TestWindowsWakeConcurrentBuildReentryAndFocus(t *testing.T) {
 	a := newAppWithConfig(config.NewWithPath(filepath.Join(t.TempDir(), "config.json")))
 	newWindow := &application.WebviewWindow{}
@@ -150,31 +170,32 @@ func TestWindowsWakeDuringDestroyRestoresSavedGeometry(t *testing.T) {
 	}
 }
 
-func TestWindowsWakeOverlapsInFlightShowAndDestroy(t *testing.T) {
+func TestWindowsExplicitDestroyDuringShowStaysHidden(t *testing.T) {
 	a := newAppWithConfig(config.NewWithPath(filepath.Join(t.TempDir(), "config.json")))
 	oldWindow := &application.WebviewWindow{}
-	newWindow := &application.WebviewWindow{}
 	a.setWindow(oldWindow)
 	showEntered := make(chan struct{})
 	releaseShow := make(chan struct{})
 	showDone := make(chan struct{})
-	newShown := make(chan wakeCall, 1)
 	closed := make(chan struct{})
+	var builds atomic.Int32
 	a.wakeActivate = func(win *application.WebviewWindow, built, maximised, focus bool) {
 		if win == oldWindow {
 			close(showEntered)
 			<-releaseShow
-			return
 		}
-		newShown <- wakeCall{win, built, maximised, focus}
 	}
-	a.wakeBuild = func(application.WebviewWindowOptions) *application.WebviewWindow { return newWindow }
+	a.wakeBuild = func(application.WebviewWindowOptions) *application.WebviewWindow {
+		builds.Add(1)
+		return &application.WebviewWindow{}
+	}
 	a.destroySnapshot = func(*application.WebviewWindow) (application.Rect, bool) {
 		return application.Rect{Width: 1080, Height: 680}, false
 	}
 	a.destroyClose = func(*application.WebviewWindow) { close(closed) }
 	go func() { a.showFromTrayWindows(false); close(showDone) }()
 	waitWakeDone(t, showEntered)
+	a.ShowMainWindow() // 此聚焦请求早于用户明确销毁，必须一并取消。
 	a.destroyRenderProcessFor(oldWindow)
 	select {
 	case <-closed:
@@ -184,8 +205,85 @@ func TestWindowsWakeOverlapsInFlightShowAndDestroy(t *testing.T) {
 	close(releaseShow)
 	waitWakeDone(t, showDone)
 	waitWakeDone(t, closed)
-	call := waitWakeCall(t, newShown)
-	if call.window != newWindow || !call.built || a.getWindow() != newWindow {
-		t.Fatalf("显示旧窗与销毁交叉后丢失了恢复: %+v", call)
+	waitWakeIdle(t, a)
+	if a.getWindow() != nil || builds.Load() != 0 || a.recreating.Load() {
+		t.Fatal("显示旧窗后用户明确销毁，最终应保持无窗口")
+	}
+}
+
+func TestWindowsQuitWhileBuildInFlightClosesUnpublishedWindow(t *testing.T) {
+	a := newAppWithConfig(config.NewWithPath(filepath.Join(t.TempDir(), "config.json")))
+	newWindow := &application.WebviewWindow{}
+	enteredBuild := make(chan struct{})
+	releaseBuild := make(chan struct{})
+	done := make(chan struct{})
+	var closeFlag atomic.Bool
+	var closes, activations, wakes atomic.Int32
+	a.wakeBuild = func(application.WebviewWindowOptions) *application.WebviewWindow {
+		a.winMu.Lock()
+		a.windowCloseFlags = map[*application.WebviewWindow]*atomic.Bool{newWindow: &closeFlag}
+		a.winMu.Unlock()
+		close(enteredBuild)
+		<-releaseBuild
+		return newWindow
+	}
+	a.destroyClose = func(win *application.WebviewWindow) {
+		if win != newWindow || !closeFlag.Load() {
+			t.Errorf("未以程序化关闭标志清理新建的隐藏窗口")
+		}
+		closes.Add(1)
+	}
+	a.wakeActivate = func(*application.WebviewWindow, bool, bool, bool) { activations.Add(1) }
+	a.emitHook = func(name string, _ any) {
+		if name == "sys:wake" {
+			wakes.Add(1)
+		}
+	}
+	go func() { a.showFromTrayWindows(false); close(done) }()
+	waitWakeDone(t, enteredBuild)
+	a.QuitApp()
+	close(releaseBuild)
+	waitWakeDone(t, done)
+	if a.getWindow() != nil || closes.Load() != 1 || activations.Load() != 0 || wakes.Load() != 0 {
+		t.Fatalf("退出中建窗须关闭且不得发布/显示/发唤醒事件: closes=%d activations=%d wakes=%d", closes.Load(), activations.Load(), wakes.Load())
+	}
+	a.winMu.Lock()
+	_, retained := a.windowCloseFlags[newWindow]
+	a.winMu.Unlock()
+	if retained {
+		t.Fatal("已清理窗口的关闭标志仍留在表中")
+	}
+}
+
+func TestWindowsQuitCancelsPendingWake(t *testing.T) {
+	a := newAppWithConfig(config.NewWithPath(filepath.Join(t.TempDir(), "config.json")))
+	oldWindow := &application.WebviewWindow{}
+	a.setWindow(oldWindow)
+	enteredClose := make(chan struct{})
+	releaseClose := make(chan struct{})
+	destroyed := make(chan struct{})
+	var builds atomic.Int32
+	a.destroySnapshot = func(*application.WebviewWindow) (application.Rect, bool) {
+		return application.Rect{Width: 1080, Height: 680}, false
+	}
+	a.destroyClose = func(*application.WebviewWindow) {
+		close(enteredClose)
+		<-releaseClose
+	}
+	a.wakeBuild = func(application.WebviewWindowOptions) *application.WebviewWindow {
+		builds.Add(1)
+		return &application.WebviewWindow{}
+	}
+	a.wakeActivate = func(*application.WebviewWindow, bool, bool, bool) {}
+	go func() { a.destroyRenderProcessFor(oldWindow); close(destroyed) }()
+	waitWakeDone(t, enteredClose)
+	a.showFromTrayWindows(false)
+	a.QuitApp()
+	close(releaseClose)
+	waitWakeDone(t, destroyed)
+	waitWakeIdle(t, a)
+	a.showFromTrayWindows(true)
+	if builds.Load() != 0 || a.getWindow() != nil || a.recreating.Load() {
+		t.Fatal("退出期间排队或后到的唤醒不得重建窗口")
 	}
 }
