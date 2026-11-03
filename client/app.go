@@ -839,7 +839,21 @@ func (a *App) ShowMainWindow() {
 
 // GetHibernateMode 休眠模式：off（不休眠）/ hibernate（卸载业务组件）/ destroy（整页重载）。
 // 前端监听 sys:hibernate / sys:wake 事件切换休眠态（见 stores/hibernate.ts）。
-func (a *App) GetHibernateMode() string { return a.cfg.HibernateMode() }
+func (a *App) GetHibernateMode() string {
+	// App.vue 在原生桥就绪并完成 mount 后调用此绑定。CI 冒烟用它确认
+	// GTK/WebKit 页面确实执行了前端 JS；ServiceStartup 日志早于窗口创建。
+	if os.Getenv("LITETALK_CI_SMOKE") == "1" {
+		log.Print("litetalk-smoke:frontend-ready")
+	}
+	return a.cfg.HibernateMode()
+}
+
+// HibernateDestroyAvailable 当前构建是否允许 destroy 休眠模式：设置页据此
+// 裁剪「彻底卸载」选项。GTK4 构建（Linux 默认路径）在 Wails v3.0.0-beta.30
+// 上销毁/重建窗口会滞留 WebKitWebProcess（实测 20 轮 +348MiB/轮、7.4GiB，
+// 见 core/config 的 downgradeDestroyForGTK4），destroy 读路径已被强降为
+// hibernate，选项必须一并隐藏；gtk3 legacy 与 Windows/macOS 不变。
+func (a *App) HibernateDestroyAvailable() bool { return config.HibernateDestroyAvailable() }
 
 // SetHibernateMode 持久化休眠模式（校验 off/hibernate/destroy）。
 func (a *App) SetHibernateMode(mode string) error { return a.cfg.SetHibernateMode(mode) }

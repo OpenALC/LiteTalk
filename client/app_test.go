@@ -25,33 +25,41 @@ import (
 )
 
 // 验证休眠模式三态（off/hibernate/destroy）的读写、持久化与非法值校验。
+// 期望值按构建取（#5）：缺省回落 config.HibernateModeDefault（Linux 自
+// v1.10.0 起 hibernate，其余 off）；GTK4 构建读路径把 destroy 强降为
+// hibernate（上游窗口销毁泄漏），其余构建 destroy 原样。
 func TestHibernateMode(t *testing.T) {
 	m := config.NewWithPath(filepath.Join(t.TempDir(), "config.json"))
 	app := newAppWithConfig(m)
 
-	if app.GetHibernateMode() != "off" {
-		t.Fatal("默认值应为 off")
+	if app.GetHibernateMode() != config.HibernateModeDefault() {
+		t.Fatalf("默认值应为 %s", config.HibernateModeDefault())
 	}
 	if err := app.SetHibernateMode("destroy"); err != nil {
 		t.Fatalf("SetHibernateMode: %v", err)
 	}
-	if app.GetHibernateMode() != "destroy" {
-		t.Fatal("设置 destroy 后读取应为 destroy")
+	want := "destroy"
+	if !config.HibernateDestroyAvailable() {
+		want = "hibernate"
 	}
-	// 持久化：新实例读盘恢复。
+	if app.GetHibernateMode() != want {
+		t.Fatalf("设置 destroy 后读取应为 %s", want)
+	}
+	// 持久化：新实例读盘恢复（GTK4 构建同样读出强降值）。
 	app2 := newAppWithConfig(config.NewWithPath(m.Path()))
-	if app2.GetHibernateMode() != "destroy" {
+	if app2.GetHibernateMode() != want {
 		t.Fatal("休眠模式应已持久化到 config.json")
 	}
 	if err := app.SetHibernateMode("nope"); err == nil {
 		t.Fatal("非法模式应报错")
 	}
-	if app.GetHibernateMode() != "destroy" {
+	if app.GetHibernateMode() != want {
 		t.Fatal("非法值不得改动已存模式")
 	}
 }
 
-// 验证旧版双布尔开关 → 三态休眠模式的一次性迁移。
+// 验证旧版双布尔开关 → 三态休眠模式的一次性迁移。GTK4 构建上迁移产出的
+// destroy 读路径强降为 hibernate（#5），期望值按构建取。
 func TestHibernateModeMigration(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
@@ -59,13 +67,17 @@ func TestHibernateModeMigration(t *testing.T) {
 	if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	want := "destroy"
+	if !config.HibernateDestroyAvailable() {
+		want = "hibernate"
+	}
 	m := config.NewWithPath(path)
-	if got := m.HibernateMode(); got != "destroy" {
-		t.Fatalf("旧版双开应迁移为 destroy，得到 %s", got)
+	if got := m.HibernateMode(); got != want {
+		t.Fatalf("旧版双开应迁移为 %s，得到 %s", want, got)
 	}
 	// 幂等：再次加载不变。
 	m2 := config.NewWithPath(path)
-	if got := m2.HibernateMode(); got != "destroy" {
+	if got := m2.HibernateMode(); got != want {
 		t.Fatalf("迁移应幂等，得到 %s", got)
 	}
 }

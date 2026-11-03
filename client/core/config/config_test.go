@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -42,6 +43,88 @@ func TestCloseToTray(t *testing.T) {
 	m2 := NewWithPath(m.Path())
 	if m2.CloseToTray() {
 		t.Fatal("关闭行为未持久化为退出程序")
+	}
+}
+
+// TestHibernateModeDefaultCoherence 缺省值相干性：新配置回落 HibernateModeDefault
+// 且值合法；非法存量值同样回落缺省。各平台的具体取值由带 build tag 的用例
+// 断言（hibernate_mode_linux_test.go / hibernate_mode_other_test.go），不用
+// t.Skip 掩盖。
+func TestHibernateModeDefaultCoherence(t *testing.T) {
+	if !HibernateModeValid[HibernateModeDefault()] {
+		t.Fatalf("平台缺省值非法: %q", HibernateModeDefault())
+	}
+	m := tmpManager(t)
+	if got := m.HibernateMode(); got != HibernateModeDefault() {
+		t.Fatalf("新配置应回落平台缺省 %s，得到 %s", HibernateModeDefault(), got)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"hibernate_mode":"nonsense"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := NewWithPath(path).HibernateMode(); got != HibernateModeDefault() {
+		t.Fatalf("非法存量值应回落平台缺省 %s，得到 %s", HibernateModeDefault(), got)
+	}
+}
+
+// TestHibernateDestroyDowngradeGTK4 存量 destroy 的读路径强降（#5）：
+// GTK4 构建读出 hibernate、文件不被回写、重载幂等；gtk3 legacy 与非 Linux
+// 构建读出 destroy 原样（destroy 在那些构建里仍正常，回写会永久破坏用户
+// 回滚后的选择——强降只发生在 GTK4 进程内）。
+func TestHibernateDestroyDowngradeGTK4(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	raw := `{"hibernate_mode":"destroy"}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	want := "destroy"
+	if !HibernateDestroyAvailable() {
+		want = "hibernate" // GTK4 构建：读路径强降
+	}
+	m := NewWithPath(path)
+	if got := m.HibernateMode(); got != want {
+		t.Fatalf("存量 destroy 应读为 %s，得到 %s", want, got)
+	}
+	// 文件不被回写：加载后 hibernate_mode 仍为 destroy（加载本身可能因
+	// vad 等一次性迁移重排文件，这里只断言休眠模式字段不被强降覆盖）。
+	assertFileKeepsDestroy(t, path)
+	// 再走一次写路径（Update 的落盘底稿来自 m.cfg），存量 destroy 仍不得被覆盖。
+	if err := m.Update(func(c *Config) error { c.HomeServerID = "srv-1"; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	assertFileKeepsDestroy(t, path)
+	// 幂等：重新加载读值一致。
+	if got := NewWithPath(path).HibernateMode(); got != want {
+		t.Fatalf("重载后应仍读出 %s，得到 %s", want, got)
+	}
+}
+
+// assertFileKeepsDestroy 断言 path 的配置文件里 hibernate_mode 仍是 destroy。
+func assertFileKeepsDestroy(t *testing.T, path string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var c Config
+	if err := json.Unmarshal(data, &c); err != nil {
+		t.Fatalf("配置文件损坏: %v", err)
+	}
+	if c.HibernateMode != "destroy" {
+		t.Fatalf("强降不得回写文件，hibernate_mode 被改为: %s", data)
+	}
+}
+
+// TestHibernateLegacyToggleOffPreserved 旧开关显式关闭（hibernate_on_minimize:
+// false）表示用户已选择「不休眠」：Linux 缺省值改 hibernate（#5）只作用于
+// 无任何偏好的新配置，迁移不得覆盖已表达的偏好。
+func TestHibernateLegacyToggleOffPreserved(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"hibernate_on_minimize":false}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := NewWithPath(path).HibernateMode(); got != "off" {
+		t.Fatalf("旧开关显式关闭应保留 off，得到 %s", got)
 	}
 }
 

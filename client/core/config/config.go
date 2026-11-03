@@ -42,7 +42,7 @@ const (
 type Config struct {
 	ServerBase          string           `json:"server_base,omitempty"`           // 服务端基址，如 https://example.com
 	HibernateOnMinimize *bool            `json:"hibernate_on_minimize,omitempty"` // 最小化时休眠界面（旧版布尔，已由 HibernateMode 取代，保留读取做迁移）
-	HibernateMode       string           `json:"hibernate_mode,omitempty"`        // 休眠模式：off 不休眠 / hibernate 卸载业务组件 / destroy 整页重载（默认 off）
+	HibernateMode       string           `json:"hibernate_mode,omitempty"`        // 休眠模式：off 不休眠 / hibernate 卸载业务组件 / destroy 整页重载（缺省见 HibernateModeDefault：Linux v1.10.0 起 hibernate，其余 off；GTK4 构建 destroy 读路径强降 hibernate）
 	CloseToTray         *bool            `json:"close_to_tray,omitempty"`         // 关闭窗口时最小化到托盘（默认 true；false=退出程序）
 	SavedEmail          string           `json:"saved_email,omitempty"`           // 记住的登录邮箱
 	EncPassword         string           `json:"enc_password,omitempty"`          // 记住的密码密文（Windows DPAPI base64；Linux keyring 命中时恒空，旧版 base64 仅保留读取迁移；其余平台恒空）
@@ -292,6 +292,8 @@ func (m *Manager) migrateOnce() {
 	// 休眠模式迁移：旧版两个布尔开关（最小化休眠 / 卸载界面）语义重叠、
 	// 且卸载开关依赖休眠开关才生效（用户反馈「重复且不生效」）——合并为三态。
 	// 空值 = 未迁移，非空即终态（无需标记位）。与 vad 迁移独立判断、各自幂等。
+	// 落入平台缺省（hibernate_mode_*.go）的只有「无任何旧开关」的新配置：
+	// 旧开关显式为 false 的用户已表达过「不休眠」的偏好，缺省值调整不覆盖它。
 	dirty := false
 	if m.cfg.HibernateMode == "" {
 		switch {
@@ -299,8 +301,10 @@ func (m *Manager) migrateOnce() {
 			m.cfg.HibernateMode = "destroy"
 		case m.cfg.HibernateOnMinimize != nil && *m.cfg.HibernateOnMinimize:
 			m.cfg.HibernateMode = "hibernate"
-		default:
+		case m.cfg.HibernateOnMinimize != nil:
 			m.cfg.HibernateMode = "off"
+		default:
+			m.cfg.HibernateMode = defaultHibernateMode
 		}
 		dirty = true
 	}
@@ -478,13 +482,17 @@ func (m *Manager) SetCloseToTray(v bool) error {
 // HibernateModeValid 合法休眠模式。
 var HibernateModeValid = map[string]bool{"off": true, "hibernate": true, "destroy": true}
 
-// HibernateMode 休眠模式（off/hibernate/destroy；非法或空值回落 off）。
+// HibernateMode 休眠模式（off/hibernate/destroy；非法或空值回落平台缺省，
+// 见 HibernateModeDefault）。GTK4 构建上 destroy 一律按 hibernate 返回
+// （强降原因与恢复方式见 downgradeDestroyForGTK4）——强降放在读路径而非
+// 加载时改写 m.cfg：Update/Save 以 m.cfg 为底稿，改写会借后续无关保存
+// 把强降值带回磁盘，破坏用户回滚 gtk3 后的原选择。
 func (m *Manager) HibernateMode() string {
 	v := m.Get().HibernateMode
 	if !HibernateModeValid[v] {
-		return "off"
+		v = defaultHibernateMode
 	}
-	return v
+	return downgradeDestroyForGTK4(v)
 }
 
 // SetHibernateMode 持久化休眠模式（校验 off/hibernate/destroy）。

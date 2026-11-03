@@ -66,18 +66,19 @@ const active = computed(() => props.speaking && !props.muted && !props.deafen)
 .orb-bars i {
   width: 4px; height: 8px; border-radius: 2px;
   background: var(--idc);
-  transition: height 0.15s var(--ease);
 }
 .orb.speaking {
   box-shadow: 0 0 0 2px var(--idc), 0 0 26px color-mix(in srgb, var(--idc) 25%, transparent);
 }
 .orb.speaking .orb-bars i {
+  height: 24px;
+  transform: scaleY(0.333333);
   animation: wave 1.05s ease-in-out infinite;
   animation-delay: calc(var(--i) * 0.13s);
 }
 @keyframes wave {
-  0%, 100% { height: 8px; }
-  50% { height: 24px; }
+  0%, 100% { transform: scaleY(0.333333); }
+  50% { transform: scaleY(1); }
 }
 .orb.state-icon :deep(svg), .orb.dual-off :deep(svg) { color: var(--ink-400); }
 /* 双关态：灰球 + 双图标 + 红色双环（区别于单关） */

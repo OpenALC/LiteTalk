@@ -76,6 +76,7 @@ wails3 dev               # 需 wails v3 CLI：go install github.com/wailsapp/wai
 注意：
 - 系统里的 `wails`（v2 CLI）不兼容 v3 项目（报 `wails.json` 找不到即为此），必须用 `wails3`；
 - vite 显式绑 `127.0.0.1`：wails v3 Windows 的 asset 代理地址是 `wails.localhost`（解析 IPv4），vite 默认只绑 IPv6 `[::1]` 会被拒连；
-- Linux 构建走 `-tags gtk3`（对应 WebKitGTK 4.1，勿用默认 GTK4）。
+- Linux 构建默认走 Wails v3 的 GTK4 + WebKitGTK 6.0 路径（v1.10.0 起），构建前需系统安装开发库（Ubuntu 24.04：`sudo apt install libgtk-4-dev libwebkitgtk-6.0-dev libx11-dev libxi-dev pkg-config`）；运行环境需 GTK4 与 WebKitGTK 6.0 运行库；
+- legacy 回退：`-tags gtk3`（GTK3 + WebKitGTK 4.1，对应旧发行版如 Ubuntu 22.04）仍保留可构建，但不再是默认路径。
 
 联调 harness：`go run ./cmd/calltest --help`（入房通话）、`go run ./cmd/audioloop --help`（音频回环）。
