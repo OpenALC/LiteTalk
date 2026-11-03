@@ -59,6 +59,9 @@ RHEL 10 系先 `dnf install epel-release`。
 （Ubuntu 22.04 的 GTK4 还停留在 4.6），无法运行 v1.10.0 及以后的 Linux 客户端；
 需要继续使用请停留在 v1.9.x 及更早版本。
 
+v1.10.0-alpha 的 Linux GTK4 客户端暂不提供 `destroy` 休眠选项。已有配置若选择了
+`destroy`，运行时按 `hibernate` 处理，配置文件中的原值不会被覆盖；Windows 不受这一降级影响。
+
 中文界面依赖系统 CJK 字体，最小化安装建议补装 `fonts-noto-cjk`（Ubuntu/Debian）、
 `google-noto-sans-cjk-fonts`（Fedora）或 `google-noto-sans-cjk-ttc-fonts`（RHEL 系），
 否则界面文字可能显示为方框。

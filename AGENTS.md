@@ -75,7 +75,7 @@ GH="/c/Users/Yang/AppData/Local/Microsoft/WinGet/Packages/GitHub.cli_Microsoft.W
 - Windows 上手动 `go build` 必须加 `-ldflags "-H=windowsgui"`，否则启动时会附带一个控制台窗口。
 - 构建标签：
   - Windows / macOS：`production`（选正式版 runtime.js）；
-  - **正式 Linux 链路仍用 `gtk3`**（对应 WebKitGTK 4.1），打包用 `gtk3,production`。GTK4 迁移实验分支按任务书使用默认 GTK4 路径（检查不加 `gtk3`，打包用 `production`）；门禁与用户审查通过前不切正式默认。不要用 `server` 标签做 Linux 检查。
+  - Linux 默认使用 GTK4 + WebKitGTK 6.0：检查不加 `gtk3`，生产构建用 `production`。`-tags gtk3` 仅保留配置兼容测试，不作为完整旧版客户端的构建或发布门禁。不要用 `server` 标签做 Linux 检查。
 - 热重载开发：在 `client/` 下执行 `wails3 dev`（**不是** `wails dev`，那是 v2 CLI，会报找不到 `wails.json`）。Windows 的 Taskfile 通过 `CC` 指定 mingw gcc，默认路径是 `C:/tools/mingw64/bin`，可用 `LITETALK_MINGW` 覆盖。go-task 在 Windows 上设置 `env.PATH` 不会影响命令查找，所以不要改成通过 PATH 注入。
 - 改动 `client/Taskfile.yml`、`client/build/**/Taskfile.yml` 或 `build/config.yml` 后，必须在**没有手动设置 PATH 和 CGO_ENABLED 的干净 shell** 里实际跑一次 `wails3 dev`，并跑一次 `wails3 task --dry package VERSION=v0.0.0`，确认版本号确实注入了。CI 不覆盖这部分。
 - mingw ld 的 `claims to have 0xffff relocs` 警告无害。
@@ -101,7 +101,7 @@ cd client/frontend && pnpm run type-check && pnpm test && pnpm run build
 go mod tidy        # 并确认 go mod tidy -diff 输出为空
 
 # 改了 .github/workflows 时
-go run github.com/rhysd/actionlint/cmd/actionlint@latest
+go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
 ```
 
 `gofmt -l` 的输出必须为空，否则 CI 失败。
@@ -122,8 +122,8 @@ git checkout -- .
 | 检查 | `check-tag` | 只在标签推送时 | 是 | 校验标签符合版本规范 |
 | 检查 | `check-server` | 每次 push 和 PR | 是 | gofmt、`go mod tidy -diff`、vet、`test -race`、build |
 | 检查 | `check-frontend` | 每次 push 和 PR | 是 | `pnpm install --frozen-lockfile`、type-check、vitest、build，产出 `frontend-dist` artifact |
-| 检查 | `check-client-linux` | 每次 push 和 PR | 是 | gofmt、tidy、vet、`test -race`、build；正式链路用 `-tags gtk3`，`gtk` 迁移分支用默认 GTK4，并额外以 `-tags gtk3` 测 `core/config` |
-| 检查 | `smoke-client-linux-install` | `gtk` 迁移分支的 push、PR 与标签 | 是 | Ubuntu 24.04、Debian 13、Fedora 40、AlmaLinux 10 安装及启动检查；必须有前端挂载后的原生绑定就绪信号，只有进程存活或早期启动日志不算通过；该分支的 release 依赖此门禁 |
+| 检查 | `check-client-linux` | 每次 push 和 PR | 是 | gofmt、tidy、vet、默认 GTK4 的 `test -race` 与 build；额外以 `-tags gtk3` 仅测 `core/config` |
+| 检查 | `smoke-client-linux-install` | 各分支 push、PR 与标签 | 是 | Ubuntu 24.04、Debian 13、Fedora 40、AlmaLinux 10 安装及启动检查；必须有前端挂载后的原生绑定就绪信号，只有进程存活或早期启动日志不算通过；release 依赖此门禁 |
 | 检查 | `check-client-windows` | 每次 push 和 PR | 是 | vet、`test -race`、production GUI build。**这是真实 cgo Opus、DPAPI、WASAPI 唯一被测试的地方** |
 | 检查 | `check-contract` | 每次 push 和 PR | 是 | 契约 ↔ 实现双向比对（`server/api/tests`，AST + 运行时注册表 + kin-openapi）、Go 生成物新鲜度、schemathesis 模糊测试（锁版本，固定 seed，断言无 5xx 与形状违约）。**阻塞发版** |
 | 打包 | `package-server` | 标签 | 是 | linux amd64/arm64，tar.gz 内含二进制；`migrations/` 已 embed 进二进制（#18），不再随包分发 |
@@ -169,7 +169,7 @@ git checkout -- .
 - 实施由 SubAgent 在各自 worktree 完成；**实现代理负责提交、推送与 CI 监控**，主会话只负责派活、验收、合并与发版，**不亲自写实现代码**（节省主上下文）。代理推送独立 `feat/#N-*` / `fix/#N-*` 分支并跑该分支 CI，报告 run id 与结果；主会话验收后再合入 `dev`，合入后的 `dev` CI 仍由同一代理监控。代理不直接改 `main`/`dev`。
 - 主会话逐项验收后按任务书顺序合入 `dev`（批次 7 用 `--no-ff`）；这次集成 CI 全绿后再合下一项。纯文档 push 按 CI 过滤规则单独记录。
 - 版本或批次审查 PR 按交付范围列提交段并链接 issue；审查修正继续在独立分支交付后合入 `dev`。不因旧版本曾要求“中途不开 PR”而跳过当前审查。
-- GTK4 迁移与批次 7 加固分开交付：批次 7 合入 `dev`，GTK4 合入专用 `gtk`，以实际 `origin` 为远端（2026-11-02 用户确认，覆盖旧 fork 计划）。实现代理交付独立分支，主会话逐项验收后合入对应集成分支，每次集成 CI 全绿后再继续；不把 `dev` 未发布的加固混入 GTK4。迁移期不推标签。
+- 本轮 GTK4 收口顺序为 `gtk` → `dev` → `main`，每次集成按精确 head 等 CI 全绿；`dev` 上已验收的未发布加固随本版进入 `main`。发布安全收口后归档停用 `gtk` 迁移分支，后续 v1.10.x 继续在 `dev` 集成。
 
 ### Issue 跟踪（路线图功能已全部建单）
 - 路线图（`docs/演进建议.md`）与批三范围的每个功能都对应一个 issue，标签分三轴：目标版本（`v1.2.0`…`v2.0.0`/`backlog`）、优先级（`P0`/`P1`/`P2`）、领域（`area/client`、`area/server` 等）。
@@ -177,13 +177,13 @@ git checkout -- .
 - **提交信息引用单号**：在摘要后加 `(#N)`，例：`feat(client): 全局热键与按键说话——三平台钩子与 PTT 门控 (#4)`。一次提交只关一个单；跨多个单的改动拆开提交。
 - **关闭时机**：该 issue 所属交付**已被用户审查通过且合并到 main** 后才 `gh issue close N --repo OpenALC/LiteTalk`。CI 全绿只说明可以进审查，不是关单条件；集中跟进单还要逐项对账，不能随其中一项完成就关整单。
 - 复现不出来或决定不做的单，在 issue 里写结论再关，**不留说不清的 open 单**。
-- 版本号以用户批准的执行计划为准，不要按 `docs/演进建议.md` §10 的旧表推断。**2026-11-02 决策：v1.10.0 只做 GTK4 迁移（#5）**，旧 v2.0.0 排期失效；屏幕共享/摄像头（#48）与 HTTP/3 顺延到 v1.11.0 起，具体范围另定。**移动端延期不排期**（#55，backlog）。
+- 版本号以用户批准的执行计划为准，不要按 `docs/演进建议.md` §10 的旧表推断。v1.10.0-alpha 以 GTK4 迁移（#5）为主，并包含本轮已验收的加固；不单发 v1.9.8-alpha。屏幕共享/摄像头（#48）与 HTTP/3 顺延到 v1.11.0 起，具体范围另定；移动端（#55）仍为 backlog。
 
 ### 节奏（强制，不再逐次请示用户）
 1. 每完成一个功能：实现代理提交并推送独立分支，**等这次 push 的 CI 全绿**，主会话验收后合入 `dev`，再等集成 CI 全绿。CI 红了先修，不能带着红灯继续；纯文档 push 按过滤规则记录。
 2. 每完成一个版本：该版本最后一次 push 的 CI 必须全绿，才能进入下一个版本。
 3. 所有版本完成后：本地做一次全量验证（第 3 节全部命令），并确认 `dev` 上最新的 CI 是绿的。
-4. 发版须同时满足本次任务书的验收、审查与用户授权；历史发版不构成新标签的授权。**批次 7 的 v1.9.8-alpha 仍待用户批准发布**；本次规范与记忆同步不打标签、不部署。获准发版后核对下列资产，并等标签 CI 成功：
+4. 发版须满足当次任务书的验收、审查与用户授权；本轮 v1.10.0-alpha 的有条件授权及未通过/缺测项见共享记忆和本地任务书，不能写成门禁已通过。旧暂停约定不阻挡本轮，后续标签仍需另获授权。获准发版后核对下列资产，并等标签 CI 成功：
    - Windows：setup.exe、portable.zip
    - Linux amd64/arm64：portable.tar.gz、deb、rpm
    - 服务端：amd64/arm64 tar.gz
@@ -243,7 +243,7 @@ git checkout -- .
 
 - destroy 休眠依赖最后一窗关闭后进程仍存活。Windows、Linux 已设置 `DisableQuitOnLastWindowClosed: true`；macOS 使用相反语义的 `ApplicationShouldTerminateAfterLastWindowClosed: false`。维护窗口生命周期时保留这些设置，不要跨平台照抄字段。
 - 关窗拦截用 `window.RegisterHook(events.Common.WindowClosing, ...)` 加 `e.Cancel()`。所有放行路径都要显式调用 quit。
-- 销毁窗口或重建渲染进程时，`recreating` 标志必须在重建完成后复位。
+- Windows 的程序化关窗标记按窗口实例保存；旧窗口的迟到关闭/最小化事件不得影响新窗口。托盘与单实例唤醒共享一次重建认领，Wails 的 `Show`/`Close` 调用在 `winMu` 锁外执行；其它平台仍需在重建后复位 `recreating`。
 - 前端 `Events.On` 的回调参数是 WailsEvent，载荷在 `.data` 里。
 - 拖拽区域属性仍然是 `--wails-draggable`。
 - `window.Reload()` 替代了 v2 的 WindowReloadApp；`window.Restore()` 替代了 WindowUnminimise。
@@ -264,4 +264,4 @@ git checkout -- .
 - [ ] 协议或 REST 改动两侧同步
 - [ ] 没有 UI 约束违规（头像、emoji 图标、主题色）
 - [ ] 提交信息符合规范，没有 attribution 尾注，没有本地材料混入
-- [ ] push 后 CI 全绿（macOS 除外，它本来就只在标签时运行，而且不阻塞）
+- [ ] 代码 push 后 CI 全绿；纯文档 push 若被过滤，记录“未触发”（macOS 只在标签时运行且不阻塞）

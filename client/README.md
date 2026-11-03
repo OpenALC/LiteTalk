@@ -24,11 +24,14 @@ Go + Wails v3 桌面端：音频采集/降噪/Opus 编解码、WebRTC 通话、V
 
 ## 最小化休眠（省内存）
 
-设置 → 常规 →「最小化时休眠界面」，默认关闭。开启后最小化或关闭到托盘时：
+设置 → 常规 →「最小化时休眠界面」。新配置在 Windows/macOS 默认关闭，Linux v1.10.0 起默认使用 `hibernate`；已有显式设置保留。启用后最小化或关闭到托盘时：
 
 - 前端切换休眠态：卸载三栏业务组件、解除事件订阅、停止定时器
 - 语音连接由 Go 后端保活，不受影响
 - 托盘唤起或窗口重新获得焦点时自动恢复
+
+Linux GTK4 构建暂不提供 `destroy`（彻底卸载窗口）选项；旧配置若选择了 `destroy`，
+运行时按 `hibernate` 处理，不改写原配置值。Windows 的休眠选项不受影响。
 
 ## 音频设备热切换
 
@@ -77,6 +80,6 @@ wails3 dev               # 需 wails v3 CLI：go install github.com/wailsapp/wai
 - 系统里的 `wails`（v2 CLI）不兼容 v3 项目（报 `wails.json` 找不到即为此），必须用 `wails3`；
 - vite 显式绑 `127.0.0.1`：wails v3 Windows 的 asset 代理地址是 `wails.localhost`（解析 IPv4），vite 默认只绑 IPv6 `[::1]` 会被拒连；
 - Linux 构建默认走 Wails v3 的 GTK4 + WebKitGTK 6.0 路径（v1.10.0 起），构建前需系统安装开发库（Ubuntu 24.04：`sudo apt install libgtk-4-dev libwebkitgtk-6.0-dev libx11-dev libxi-dev pkg-config`）；运行环境需 GTK4 与 WebKitGTK 6.0 运行库；
-- legacy 回退：`-tags gtk3`（GTK3 + WebKitGTK 4.1，对应旧发行版如 Ubuntu 22.04）仍保留可构建，但不再是默认路径。
+- legacy GTK3 标签仅保留配置兼容边界：CI 以 `go test -race -count=1 -tags gtk3 ./core/config` 检查，不构建或发布完整 GTK3 客户端；旧发行版继续使用 v1.9.x。
 
 联调 harness：`go run ./cmd/calltest --help`（入房通话）、`go run ./cmd/audioloop --help`（音频回环）。
