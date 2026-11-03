@@ -458,7 +458,17 @@ sudo cp -a /www/wwwroot/LiteTalk.bak-<时间戳>/. /www/wwwroot/LiteTalk/
 切换完成后再按 §9 装更新器、放行 TCP 8088 并配 webhook，用 ping + Redeliver 做演练；
 `/status` 用 SSH 端口转发查看。
 
-## 11. 应用内 Webhook（入站投递）
+## 11. 应用内 Webhook
+
+出站订阅的目标 `url` 可能在路径或查询串携带第三方投递凭证。默认保持已发布
+API 行为：持 `ManageServer` 的成员从列表和 PATCH 响应取得完整地址。
+部署者可在 `/etc/litetalk.env` 设置 `LITETALK_WEBHOOK_REDACT_URL=1`（或 `true`）
+并重启服务：订阅创建者和服务器 owner 仍取得完整地址，其他管理者只见
+`scheme://host/…`。这个值仅供展示；用它创建或修改订阅会返回 `400 bad_url`，
+且不会修改原订阅。启用前请检查依赖列表完整 URL 的管理脚本。关闭开关后
+仍拒绝回写这种展示占位符，避免跨配置复制损坏投递目标。
+
+### 入站投递
 
 除 §9 的 GitHub 自动更新 webhook 外，服务端还有面向外部系统的频道入站入口：
 经客户端或 API 创建（`POST /api/v1/channels/{id}/inbound-webhooks`，需 ManageChannels），

@@ -134,7 +134,8 @@ type Server struct {
 	webhooks *webhook.Dispatcher
 	// webhookURLCheck 出站 URL 的 SSRF 校验（New 补默认 linkpreview.CheckDialable；
 	// 测试注入放行桩以对 httptest 目标建订阅）。
-	webhookURLCheck func(string) error
+	webhookURLCheck  func(string) error
+	webhookRedactURL bool // 部署者开启后，非创建者/服主的 url 仅展示掩码
 	// oidc OIDC 依赖方（#54）。nil = 未配置，功能关闭：/auth/oidc/* 一律 404，
 	// 不做 discovery、不建状态表（零副作用）。
 	oidc *auth.OIDCProvider
@@ -202,6 +203,8 @@ type Config struct {
 	// WebhookURLCheck 出站 URL 的 SSRF 校验；nil 用 linkpreview.CheckDialable
 	//（测试注入放行桩，httptest 目标是 127.0.0.1，默认校验会拒绝）。
 	WebhookURLCheck func(string) error
+	// WebhookRedactURL 默认 false，保持已发布的完整 url 响应；开启后非创建者/服主看到掩码。
+	WebhookRedactURL bool
 	// OIDC 登录配置（#54）。nil 或不完整 = 功能关闭（端点 404，零副作用）；
 	// 完整性由 cmd/server 启动校验把关，这里对不完整配置只记日志并关闭。
 	OIDC *auth.OIDCConfig
@@ -279,6 +282,7 @@ func New(cfg Config) *Server {
 		push:              cfg.Push,
 		webhooks:          cfg.Webhooks,
 		webhookURLCheck:   urlCheck,
+		webhookRedactURL:  cfg.WebhookRedactURL,
 		oidc:              oidcProv,
 		oidcStates:        oidcSt,
 	}

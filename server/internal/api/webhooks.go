@@ -124,8 +124,8 @@ func (s *Server) ListServerWebhooks(ctx context.Context, request ListServerWebho
 	if err != nil {
 		return nil, s.writeStoreErr(ctx, err)
 	}
-	// url 的路径/查询串常内嵌第三方服务凭证，只对创建者与服主回传完整值；
-	// 其余 ManageServer 成员看到 scheme://host/…（见 webhookURLVisibleTo）。
+	// url 的路径/查询串常内嵌第三方服务凭证；部署者开启脱敏时，仅创建者与服主
+	// 回传完整值，其余 ManageServer 成员看到 scheme://host/…（见 webhookURLVisibleTo）。
 	var ownerID int64
 	out := make([]OutboundWebhook, 0, len(rows))
 	for i := range rows {
@@ -316,8 +316,8 @@ func (s *Server) PatchServerWebhook(ctx context.Context, request PatchServerWebh
 			TargetType: "webhook", TargetID: ptrID(w.ID), Detail: "{}",
 		})
 	}
-	// 与列表同一口径：非创建者/非 owner 的 PATCH 响应里 url 同样掩码，否则
-	// 「改个 enabled 再看响应」就能绕过列表掩码读到完整地址。
+	// 与列表同一口径：开启脱敏时，非创建者/非 owner 的 PATCH 响应也要掩码，
+	// 否则「改个 enabled 再看响应」就能绕过列表掩码读到完整地址。
 	var ownerID int64
 	fullURL, err := s.webhookURLVisibleTo(ctx, request.Id, c.UserID, w.CreatorID, &ownerID)
 	if err != nil {
@@ -668,6 +668,11 @@ func (s *Server) checkWebhookURL(_ context.Context, rawURL string) *apiErr {
 	if rawURL == "" || len(rawURL) > 2048 {
 		return errf(http.StatusBadRequest, "bad_url", "url 不合法")
 	}
+	// 列表中的脱敏展示值不是投递目标。无论当前开关状态如何都拒绝回写，
+	// 避免切换配置后旧客户端把占位符落库；只拦截完整的 /… 形态。
+	if isMaskedWebhookURL(rawURL) {
+		return errf(http.StatusBadRequest, "bad_url", "脱敏展示地址不能作为投递目标，请填写完整 url")
+	}
 	if err := s.webhookURLCheck(rawURL); err != nil {
 		return errf(http.StatusBadRequest, "bad_url", "url 不被允许（内网/保留地址或格式非法）")
 	}
@@ -807,12 +812,15 @@ func inboundDeliveryPath(id int64, secret string) string {
 	return "/api/v1/webhooks/" + strconv.FormatInt(id, 10) + "/" + secret
 }
 
-// webhookURLVisibleTo 完整出站 url 只回传给订阅创建者与服务器 owner。
-// ManageServer 是「管理订阅」的权限，不该附赠他人投递地址里的第三方凭证
+// webhookURLVisibleTo 开关关闭时保持已发布的完整 url 响应；开启时只回传给
+// 订阅创建者与服务器 owner。ManageServer 是「管理订阅」的权限，不该附赠第三方凭证
 // （Discord/Slack 等 webhook 的 token 就在路径/查询串里）。creator_id 为 0 的
 // 旧行按 owner 代持（与投递侧 creatorVisible 的兜底语义一致）。
 // ownerID 是懒加载缓存（0 = 未查）：列表里多个订阅共享一次查询。
 func (s *Server) webhookURLVisibleTo(ctx context.Context, serverID, userID, creatorID int64, ownerID *int64) (bool, error) {
+	if !s.webhookRedactURL {
+		return true, nil
+	}
 	if creatorID == userID {
 		return true, nil
 	}
@@ -835,6 +843,16 @@ func maskWebhookURL(raw string) string {
 		return "…"
 	}
 	return u.Scheme + "://" + u.Host + "/…"
+}
+
+// isMaskedWebhookURL 只认本服务端可能返回的整段占位路径；百分号编码的同一
+// Unicode 字符也视为占位符，不扩大到包含省略号的其它真实路径。
+func isMaskedWebhookURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.Opaque != "" {
+		return false
+	}
+	return u.Path == "/…" && u.RawQuery == "" && !u.ForceQuery && u.Fragment == "" && !strings.Contains(raw, "#")
 }
 
 // notifyWebhookEvent REST 层出站事件派发（#52）：hub 事件流只看得到
