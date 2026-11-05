@@ -265,12 +265,12 @@ func BenchmarkSFURoutingContended(b *testing.B) {
 						}
 					}
 				}()
+				close(start)
+				<-ready
 				matched := 0
 				b.ResetTimer()
 				b.ReportAllocs()
 				b.StartTimer()
-				close(start)
-				<-ready
 				for i := 0; i < b.N; i++ {
 					br.room.mu.RLock()
 					for uid, p := range br.room.peers {
@@ -286,14 +286,15 @@ func BenchmarkSFURoutingContended(b *testing.B) {
 					}
 					br.room.mu.RUnlock()
 				}
-				close(stop)
 				b.StopTimer()
+				close(stop)
 				writes := <-done
 				benchRouteMatches = matched
 				if matched != b.N*receivers {
 					b.Fatalf("竞争下路由命中 %d，期望 %d", matched, b.N*receivers)
 				}
-				b.ReportMetric(float64(writes)/float64(b.N), "writer_ops/op")
+				// 含开表前预热与停表后收尾，只证明写者活跃，不是严格测量窗内的速率。
+				b.ReportMetric(float64(writes), "writer_ops_total")
 			})
 		}
 	}
