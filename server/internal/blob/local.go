@@ -4,16 +4,39 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 )
 
 // localStore 本地目录实现：一个 key 一个文件，直接放在根目录下（key 不含分隔符）。
 type localStore struct {
-	dir string
+	dir        string
+	scanMu     sync.Mutex
+	scanFile   *os.File
+	scanOffset int
+}
+
+func (*localStore) RestartAfterDelete() bool { return true }
+
+func (l *localStore) CloseScan() error {
+	l.scanMu.Lock()
+	defer l.scanMu.Unlock()
+	return l.closeScanLocked()
+}
+
+func (l *localStore) closeScanLocked() error {
+	if l.scanFile == nil {
+		return nil
+	}
+	err := l.scanFile.Close()
+	l.scanFile, l.scanOffset = nil, 0
+	return err
 }
 
 func newLocal(cfg Config, lg *log.Logger) (Store, string, error) {
@@ -121,4 +144,109 @@ func (l *localStore) Delete(ctx context.Context, key string) error {
 		return fmt.Errorf("blob: 删除对象: %w", err)
 	}
 	return nil
+}
+
+// Scan 用目录流分批读取，内存始终不超过 limit；游标是本轮目录枚举偏移。
+// 目录变化可能使本轮漏项，下轮从头枚举补齐。
+func (l *localStore) Scan(ctx context.Context, after string, limit int) ([]ObjectInfo, string, bool, error) {
+	l.scanMu.Lock()
+	defer l.scanMu.Unlock()
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	offset := 0
+	if after != "" {
+		n, err := strconv.Atoi(after)
+		if err != nil || n < 0 {
+			return nil, "", false, fmt.Errorf("blob: 无效本地扫描游标")
+		}
+		offset = n
+	}
+	if l.scanFile == nil || l.scanOffset != offset {
+		if err := l.closeScanLocked(); err != nil {
+			return nil, "", false, err
+		}
+		f, err := os.Open(l.dir)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, "", true, nil
+		}
+		if err != nil {
+			return nil, "", false, err
+		}
+		l.scanFile = f
+		left := offset
+		for left > 0 {
+			if err := ctx.Err(); err != nil {
+				_ = l.closeScanLocked()
+				return nil, "", false, err
+			}
+			n := left
+			if n > 500 {
+				n = 500
+			}
+			entries, err := l.scanFile.ReadDir(n)
+			left -= len(entries)
+			if err == io.EOF {
+				_ = l.closeScanLocked()
+				return nil, "", true, nil
+			}
+			if err != nil {
+				_ = l.closeScanLocked()
+				return nil, "", false, err
+			}
+		}
+		l.scanOffset = offset
+	}
+	entries, err := l.scanFile.ReadDir(limit)
+	if err != nil && err != io.EOF {
+		_ = l.closeScanLocked()
+		return nil, "", false, err
+	}
+	l.scanOffset += len(entries)
+	out := make([]ObjectInfo, 0, len(entries))
+	for _, e := range entries {
+		if err := ctx.Err(); err != nil {
+			_ = l.closeScanLocked()
+			return nil, "", false, err
+		}
+		if !e.Type().IsRegular() {
+			continue
+		}
+		info, eerr := e.Info()
+		if eerr != nil {
+			_ = l.closeScanLocked()
+			return nil, "", false, eerr
+		}
+		out = append(out, ObjectInfo{Key: e.Name(), Modified: info.ModTime(), Size: info.Size()})
+	}
+	next := strconv.Itoa(offset + len(entries))
+	done := err == io.EOF || len(entries) < limit
+	if done {
+		_ = l.closeScanLocked()
+	}
+	return out, next, done, nil
+}
+
+func (l *localStore) Stat(ctx context.Context, key string) (ObjectInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return ObjectInfo{}, err
+	}
+	p, err := l.path(key)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	info, err := os.Lstat(p)
+	if errors.Is(err, fs.ErrNotExist) {
+		return ObjectInfo{}, ErrNotFound
+	}
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	if !info.Mode().IsRegular() {
+		return ObjectInfo{}, fmt.Errorf("blob: 对象不是普通文件")
+	}
+	return ObjectInfo{Key: key, Modified: info.ModTime(), Size: info.Size(), Owned: true}, nil
 }

@@ -32,9 +32,9 @@ const attachmentColsAliased = `a.id, a.uploader_id, COALESCE(a.message_id, 0), a
 const orphanAttachmentsSQL = `SELECT ` + attachmentColsAliased + `
 	FROM attachments a
 	LEFT JOIN messages m ON m.id = a.message_id
-	WHERE (a.message_id IS NULL AND a.created_at < ?)
+	WHERE a.id > ? AND ((a.message_id IS NULL AND a.created_at < ?)
 	   OR (m.id IS NULL AND a.message_id IS NOT NULL)
-	   OR m.deleted_at IS NOT NULL
+	   OR m.deleted_at IS NOT NULL)
 	ORDER BY a.id ASC
 	LIMIT ?`
 
@@ -51,8 +51,12 @@ func clampAttachmentLimit(limit int) int {
 
 // queryOrphanAttachments 双方言共用执行体。
 func queryOrphanAttachments(ctx context.Context, db *sql.DB, unclaimedBefore time.Time, limit int) ([]Attachment, error) {
+	return queryOrphanAttachmentsAfter(ctx, db, unclaimedBefore, 0, limit)
+}
+
+func queryOrphanAttachmentsAfter(ctx context.Context, db *sql.DB, unclaimedBefore time.Time, afterID int64, limit int) ([]Attachment, error) {
 	limit = clampAttachmentLimit(limit)
-	rows, err := db.QueryContext(ctx, orphanAttachmentsSQL, unclaimedBefore, limit)
+	rows, err := db.QueryContext(ctx, orphanAttachmentsSQL, afterID, unclaimedBefore, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -66,6 +70,104 @@ func queryOrphanAttachments(ctx context.Context, db *sql.DB, unclaimedBefore tim
 		out = append(out, *a)
 	}
 	return out, rows.Err()
+}
+
+func reserveOrphanAttachment(ctx context.Context, db *sql.DB, id int64, before time.Time) (*Attachment, bool, error) {
+	// 只改变已过期或已失去消息的行；在此 UPDATE 赢过消息事务前绝不删对象。
+	res, err := db.ExecContext(ctx, `UPDATE attachments SET message_id = -id WHERE id = ? AND
+		((message_id IS NULL AND created_at < ?) OR (message_id > 0 AND
+		 (NOT EXISTS (SELECT 1 FROM messages WHERE id = attachments.message_id) OR
+		  EXISTS (SELECT 1 FROM messages WHERE id = attachments.message_id AND deleted_at IS NOT NULL))))`, id, before)
+	if err != nil {
+		return nil, false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, false, err
+	}
+	if n == 0 {
+		// 其它 GC 实例的负标记也可幂等接手；对象键只属于此附件 ID。
+		var marked int64
+		err := db.QueryRowContext(ctx, `SELECT message_id FROM attachments WHERE id = ? AND message_id < 0`, id).Scan(&marked)
+		if err == sql.ErrNoRows {
+			return nil, false, nil
+		}
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	a, err := scanAttachment(db.QueryRowContext(ctx, `SELECT `+attachmentCols+` FROM attachments WHERE id = ? AND message_id < 0`, id))
+	if err == sql.ErrNoRows {
+		return nil, false, nil
+	}
+	return a, err == nil, err
+}
+
+func finishOrphanAttachment(ctx context.Context, db *sql.DB, id int64) (bool, error) {
+	res, err := db.ExecContext(ctx, `DELETE FROM attachments WHERE id = ? AND message_id < 0`, id)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
+func attachmentKeyExists(ctx context.Context, db *sql.DB, key string) (bool, error) {
+	var one int
+	err := db.QueryRowContext(ctx, `SELECT 1 FROM attachments WHERE storage_key = ? OR thumb_key = ? LIMIT 1`, key, key).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func pruneOrphanReadStatesAfter(ctx context.Context, db *sql.DB, afterUserID, afterChannelID int64, limit int) (nextUserID, nextChannelID int64, done bool, removed int, err error) {
+	limit = clampAttachmentLimit(limit)
+	rows, err := db.QueryContext(ctx, `SELECT rs.user_id, rs.channel_id, c.id FROM read_states rs LEFT JOIN channels c ON c.id = rs.channel_id WHERE rs.user_id > ? OR (rs.user_id = ? AND rs.channel_id > ?) ORDER BY rs.user_id, rs.channel_id LIMIT ?`, afterUserID, afterUserID, afterChannelID, limit)
+	if err != nil {
+		return 0, 0, false, 0, err
+	}
+	type pair struct {
+		userID, channelID int64
+		orphan            bool
+	}
+	var ids []pair
+	for rows.Next() {
+		var p pair
+		var channel sql.NullInt64
+		if err := rows.Scan(&p.userID, &p.channelID, &channel); err != nil {
+			rows.Close()
+			return 0, 0, false, 0, err
+		}
+		p.orphan = !channel.Valid
+		ids = append(ids, p)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return 0, 0, false, 0, err
+	}
+	if len(ids) == 0 {
+		return 0, 0, true, 0, nil
+	}
+	last := ids[len(ids)-1]
+	nextUserID, nextChannelID = last.userID, last.channelID
+	done = len(ids) < limit
+	for _, p := range ids {
+		if !p.orphan {
+			continue
+		}
+		res, err := db.ExecContext(ctx, `DELETE FROM read_states WHERE user_id = ? AND channel_id = ? AND NOT EXISTS (SELECT 1 FROM channels WHERE id = ?)`, p.userID, p.channelID, p.channelID)
+		if err != nil {
+			return nextUserID, nextChannelID, done, removed, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return nextUserID, nextChannelID, done, removed, err
+		}
+		removed += int(n)
+	}
+	return nextUserID, nextChannelID, done, removed, nil
 }
 
 // deleteAttachmentRowsByIDs 按批删除，单条 SQL 的参数数量不超过 MaxAttachmentBatch；
