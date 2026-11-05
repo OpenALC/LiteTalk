@@ -19,6 +19,7 @@ import { cleanErrorText } from '../utils/errorText'
 import { withAudioDefaults } from '../utils/audioSettings'
 import { useWindowOverlay, type OverlayState } from '../utils/windowOverlay'
 import { useHibernateDestroyAvailability } from '../utils/hibernateAvailability'
+import { GC_LEVEL_LABELS, useGCSettings } from '../utils/gcSettings'
 import { LevelMonitorScope } from '../utils/levelMonitorScope'
 import ServerConnPanel from '../components/ServerConnPanel.vue'
 import NetworkDiagPanel from '../components/NetworkDiagPanel.vue'
@@ -29,6 +30,19 @@ const auth = useAuthStore()
 const settings = useSettingsStore()
 const hibernateStore = useHibernateStore()
 const version = ref('dev')
+const gc = useGCSettings({
+  GetGCSettings: () => goApp().GetGCSettings(),
+  SetGCLevel: (level) => goApp().SetGCLevel(level),
+})
+const gcStatusShown = computed(() => !!(
+  gc.error.value || gc.loading.value || gc.saving.value ||
+  !gc.settings.value?.supported || gc.settings.value.gogc_overridden ||
+  gc.settings.value.memory_limit_overridden
+))
+
+function setGCLevel(e: Event) {
+  void gc.setLevel(Number((e.target as HTMLInputElement).value))
+}
 
 // 登出确认弹层（文案克制：「退出登录？」/「取消」「退出」）
 const confirmLogout = ref(false)
@@ -179,6 +193,7 @@ function applyDenoiseIdx(i: number) {
 }
 
 onMounted(async () => {
+  void gc.load()
   version.value = await goApp().GetVersion()
   hibMode.value = (await goApp().GetHibernateMode()) as typeof hibMode.value
   await loadHibernateDestroyAvailability()
@@ -473,6 +488,32 @@ function bindRecording(spec: string) {
 
       <section class="s-sec">
         <h3>常规</h3>
+        <div class="s-row gc-row">
+          <label class="k" for="gc-level">GC 强度</label>
+          <div class="gc-control">
+            <input id="gc-level" type="range" min="1" max="5" step="1"
+                   :value="gc.level.value" :disabled="gc.disabled.value || gc.loading.value"
+                   :aria-valuetext="gc.label.value" :aria-describedby="gcStatusShown ? 'gc-help gc-status' : 'gc-help'"
+                   @input="setGCLevel">
+            <div class="gc-marks" aria-hidden="true">
+              <span v-for="(mark, i) in GC_LEVEL_LABELS" :key="mark" :class="{ 'gc-default': i === 2 }">{{ mark }}</span>
+            </div>
+          </div>
+          <span class="v gc-current">{{ gc.settings.value?.supported ? gc.label.value : '—' }}</span>
+        </div>
+        <p id="gc-help" class="s-note">回收越频繁，CPU开销可能增加</p>
+        <p id="gc-status" v-if="gc.error.value" class="s-note s-warn" role="alert">
+          <CircleAlert :size="13" />{{ gc.error.value }}
+        </p>
+        <p id="gc-status" v-else-if="gc.loading.value" class="s-note" role="status">正在读取 GC 强度…</p>
+        <p id="gc-status" v-else-if="!gc.settings.value?.supported" class="s-note" role="status">GC 强度仅桌面端可用</p>
+        <p id="gc-status" v-else-if="gc.settings.value.gogc_overridden && gc.settings.value.memory_limit_overridden" class="s-note s-warn" role="status">
+          <CircleAlert :size="13" />GOGC 与 GOMEMLIMIT 均由环境变量覆盖，无法调整；当前 GOGC {{ gc.settings.value.effective_gogc }}，内存限制 {{ gc.settings.value.effective_memory_limit }}
+        </p>
+        <p id="gc-status" v-else-if="gc.settings.value.gogc_overridden || gc.settings.value.memory_limit_overridden" class="s-note s-warn" role="status">
+          <CircleAlert :size="13" />{{ gc.settings.value.gogc_overridden ? 'GOGC' : 'GOMEMLIMIT' }} 由环境变量覆盖，部分档位效果可能相同；当前 GOGC {{ gc.settings.value.effective_gogc }}，内存限制 {{ gc.settings.value.effective_memory_limit }}{{ gc.saving.value ? '；正在保存…' : '' }}
+        </p>
+        <p id="gc-status" v-else-if="gc.saving.value" class="s-note" role="status">正在保存…</p>
         <div class="s-row">
           <div class="k">最小化时</div>
           <div class="seg-mini">
@@ -795,6 +836,17 @@ select {
 }
 .s-row { flex-wrap: wrap; }
 input[type="range"] { flex: 0 0 140px; accent-color: var(--brand-500); }
+.gc-row { align-items: flex-start; }
+.gc-row .k { padding-top: 2px; }
+.gc-control { flex: 0 1 240px; min-width: 180px; }
+.gc-control input[type="range"] { display: block; width: 100%; margin: 0; }
+.gc-control input[type="range"]:disabled { opacity: 0.45; }
+.gc-marks { display: grid; grid-template-columns: repeat(5, 1fr); margin-top: 4px; color: var(--ink-400); font-size: 10px; }
+.gc-marks span { text-align: center; }
+.gc-marks span:first-child { text-align: left; }
+.gc-marks span:last-child { text-align: right; }
+.gc-marks .gc-default { color: var(--brand-700); font-weight: 700; }
+.gc-current { min-width: 26px; padding-top: 2px; text-align: right; }
 .switch { position: relative; width: 36px; height: 20px; flex: none; }
 .switch.disabled { opacity: 0.45; cursor: not-allowed; }
 .switch.disabled i { cursor: not-allowed; }

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"runtime/metrics"
 	"strconv"
 	"strings"
 	"sync"
@@ -74,6 +75,8 @@ type App struct {
 
 	// cfg 本地配置（config.json：服务器地址 / 休眠模式持久化）。
 	cfg *config.Manager
+	// gcMu 让并发绑定的保存与 runtime 热应用保持同一顺序。
+	gcMu sync.Mutex
 
 	// forceQuit 托盘「退出」或「退出程序」置位后 OnBeforeClose 放行真正关闭。
 	forceQuit atomic.Bool
@@ -233,15 +236,9 @@ func initLogging() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 }
 
-// 运行时内存默认值（#96）。GOMEMLIMIT 是 Go 堆的软上限，不是进程 RSS：
-// Wails/WebView2、cgo 音频缓冲与设备驱动占用都不计入其中。
-// 默认走低 CPU 档：关闭基于堆增长的 GC（等价 GOGC=off），回收仅在堆接近
-// 18MiB 软上限时触发。实测 core 语音全链路 live heap 约 6–12MB，18MiB 留有
-// 余量；上一版 GOGC=50 + 15MiB 压得过低，GC 频繁触发导致 CPU 抖动。
-// 若 live heap 逼近软上限，runtime 会连续强制回收——此时应调高上限或显式设 GOGC。
+// GOMEMLIMIT 约束 Go runtime 管理的内存，不是进程 RSS；WebView/cgo 不计入。
+// 第三档保留 #96 的 off + 18MiB；强档只调 GOGC，不重用曾导致抖动的 15MiB。
 const (
-	defaultMemoryLimit = 18 << 20
-
 	// gcKeep：GOGC 已显式设置，保持 runtime 当前值，不覆盖。
 	gcKeep = -1
 	// gcOff：GOGC 未设置，关闭基于堆增长的 GC（SetGCPercent(-1)）。
@@ -250,13 +247,17 @@ const (
 	memLimitKeep = -1
 )
 
-// runtimeMemoryPolicy 决定启动时要补的默认值，只看环境变量是否存在、不解析
+// runtimeMemoryPolicy 决定档位要应用的参数，只看环境变量是否存在、不解析
 // 内容：显式设置的 GOGC/GOMEMLIMIT（含空值和非法值）一律不覆盖，交由 runtime
 // 按自己的规则处理，避免这里与 runtime 的校验规则漂移。
 // 返回的 gcPercent：非负数为 GOGC 百分比，gcOff 表示关闭，gcKeep 表示保持；
 // memLimit：>0 为字节软上限，memLimitKeep 表示不覆盖。
-func runtimeMemoryPolicy(lookupEnv func(string) (string, bool)) (gcPercent int, memLimit int64) {
-	gcPercent, memLimit = gcOff, defaultMemoryLimit
+func runtimeMemoryPolicy(level int, lookupEnv func(string) (string, bool)) (gcPercent int, memLimit int64) {
+	profile := config.GCProfileFor(level)
+	gcPercent, memLimit = profile.GOGC, profile.MemoryLimit
+	if gcPercent < 0 {
+		gcPercent = gcOff
+	}
 	if _, ok := lookupEnv("GOGC"); ok {
 		gcPercent = gcKeep
 	}
@@ -266,37 +267,67 @@ func runtimeMemoryPolicy(lookupEnv func(string) (string, bool)) (gcPercent int, 
 	return gcPercent, memLimit
 }
 
-// applyRuntimeMemoryDefaults 补齐未显式设置的内存策略，返回写进 app.log 的
-// 生效值描述。SetGCPercent/SetMemoryLimit 是进程级全局状态，ServiceStartup
-// 早于会话与音频初始化，调用一次即覆盖整个进程生命周期。
-func applyRuntimeMemoryDefaults() string {
-	gcPercent, memLimit := runtimeMemoryPolicy(os.LookupEnv)
+// applyRuntimeMemoryPolicy 只改未被环境变量覆盖的维度，不启动定时回收任务。
+func applyRuntimeMemoryPolicy(level int, lookupEnv func(string) (string, bool)) {
+	gcPercent, memLimit := runtimeMemoryPolicy(level, lookupEnv)
 	switch gcPercent {
 	case gcOff:
-		debug.SetGCPercent(-1) // 关闭基于堆增长的 GC，回收交给软上限
+		debug.SetGCPercent(-1)
 	case gcKeep:
-		// 显式 GOGC 已由 runtime 在启动时处理，不再覆盖
+		// 显式 GOGC 已由 runtime 处理，不再覆盖
 	default:
 		debug.SetGCPercent(gcPercent)
 	}
 	if memLimit > 0 {
 		debug.SetMemoryLimit(memLimit)
 	}
-	return formatRuntimeMemoryLog(os.LookupEnv)
 }
 
-// formatRuntimeMemoryLog 生成生效值描述：显式设置时打印环境变量原值，未设置
-// 时打印默认值。与 apply 分离，测试格式化不会改测试进程的全局 GC 状态。
-func formatRuntimeMemoryLog(lookupEnv func(string) (string, bool)) string {
-	gogc := "off"
-	if v, ok := lookupEnv("GOGC"); ok {
-		gogc = v
+// RuntimeGCSettings 同时返回已选档位、环境覆盖与 runtime 当前实际参数。
+type RuntimeGCSettings struct {
+	Supported             bool   `json:"supported"`
+	Level                 int    `json:"level"`
+	GOGCOverridden        bool   `json:"gogc_overridden"`
+	MemoryLimitOverridden bool   `json:"memory_limit_overridden"`
+	EffectiveGOGC         string `json:"effective_gogc"`
+	EffectiveMemoryLimit  string `json:"effective_memory_limit"`
+}
+
+func readRuntimeGCSettings(level int, lookupEnv func(string) (string, bool)) RuntimeGCSettings {
+	samples := []metrics.Sample{{Name: "/gc/gogc:percent"}, {Name: "/gc/gomemlimit:bytes"}}
+	metrics.Read(samples)
+	_, gogcOverridden := lookupEnv("GOGC")
+	_, limitOverridden := lookupEnv("GOMEMLIMIT")
+	status := RuntimeGCSettings{
+		Supported: true, Level: config.NormalizeGCLevel(level),
+		GOGCOverridden: gogcOverridden, MemoryLimitOverridden: limitOverridden,
 	}
-	limit := strconv.FormatInt(defaultMemoryLimit, 10)
-	if v, ok := lookupEnv("GOMEMLIMIT"); ok {
-		limit = v
+	if samples[0].Value.Kind() == metrics.KindUint64 {
+		v := samples[0].Value.Uint64()
+		if v == ^uint64(0) {
+			status.EffectiveGOGC = "off"
+		} else {
+			status.EffectiveGOGC = strconv.FormatUint(v, 10)
+		}
 	}
-	return fmt.Sprintf("runtime memory: GOGC=%s GOMEMLIMIT=%s", gogc, limit)
+	if samples[1].Value.Kind() == metrics.KindUint64 {
+		v := samples[1].Value.Uint64()
+		switch {
+		case v == 1<<63-1:
+			status.EffectiveMemoryLimit = "无上限"
+		case v%(1<<20) == 0:
+			status.EffectiveMemoryLimit = fmt.Sprintf("%dMiB", v>>20)
+		default:
+			status.EffectiveMemoryLimit = fmt.Sprintf("%dB", v)
+		}
+	}
+	return status
+}
+
+func formatRuntimeMemoryLog(status RuntimeGCSettings) string {
+	return fmt.Sprintf("runtime memory: GOGC=%s GOMEMLIMIT=%s level=%d override(GOGC=%t,GOMEMLIMIT=%t)",
+		status.EffectiveGOGC, status.EffectiveMemoryLimit, status.Level,
+		status.GOGCOverridden, status.MemoryLimitOverridden)
 }
 
 // startPprofIfEnabled 按 LITETALK_PPROF 启动本地诊断端口，默认关闭。
@@ -381,7 +412,12 @@ func (a *App) LogFromWeb(level, msg string) {
 func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) error {
 	initLogging()
 	// 内存策略在会话/音频/托盘初始化前生效；显式环境变量优先，日志落 app.log。
-	log.Print(applyRuntimeMemoryDefaults())
+	a.gcMu.Lock()
+	level := a.cfg.GCLevel()
+	applyRuntimeMemoryPolicy(level, os.LookupEnv)
+	gcStatus := readRuntimeGCSettings(level, os.LookupEnv)
+	a.gcMu.Unlock()
+	log.Print(formatRuntimeMemoryLog(gcStatus))
 	startPprofIfEnabled()
 	log.Printf("=== LiteTalk %s 启动 (pid=%d) ===", version, os.Getpid())
 	r := a.cfg.Resolve()
@@ -865,6 +901,26 @@ func (a *App) HibernateDestroyAvailable() bool { return config.HibernateDestroyA
 
 // SetHibernateMode 持久化休眠模式（校验 off/hibernate/destroy）。
 func (a *App) SetHibernateMode(mode string) error { return a.cfg.SetHibernateMode(mode) }
+
+// GetGCSettings 返回当前持久化档位与 runtime 实际参数；两个环境变量分别优先。
+func (a *App) GetGCSettings() RuntimeGCSettings {
+	a.gcMu.Lock()
+	defer a.gcMu.Unlock()
+	return readRuntimeGCSettings(a.cfg.GCLevel(), os.LookupEnv)
+}
+
+// SetGCLevel 落盘成功后才热应用；同一锁保证并发设置与实际参数顺序一致。
+func (a *App) SetGCLevel(level int) (RuntimeGCSettings, error) {
+	a.gcMu.Lock()
+	defer a.gcMu.Unlock()
+	if err := a.cfg.SetGCLevel(level); err != nil {
+		return RuntimeGCSettings{}, err
+	}
+	applyRuntimeMemoryPolicy(level, os.LookupEnv)
+	status := readRuntimeGCSettings(level, os.LookupEnv)
+	log.Print(formatRuntimeMemoryLog(status))
+	return status, nil
+}
 
 // GetVersion 返回客户端版本号
 func (a *App) GetVersion() string { return version }
