@@ -127,11 +127,12 @@ func TestEmailKeysSQLiteUpgradeRollbackAndIntegrity(t *testing.T) {
 	ctx := context.Background()
 	sq := openTestSQLite(t)
 	full := findMigrationsSQLite(t)
+	through0023 := migrationsBefore(t, full, "0024")
 	if err := sq.Migrate(ctx, migrationsBefore(t, full, "0023")); err != nil {
 		t.Fatal(err)
 	}
 	seedOldEmailUser(t, sq.DB(), 92001, "Δ.Test@Example.COM")
-	if err := sq.Migrate(ctx, full); err != nil {
+	if err := sq.Migrate(ctx, through0023); err != nil {
 		t.Fatal(err)
 	}
 	assertEmailKeyCounts(t, sq.DB(), 1)
@@ -139,16 +140,40 @@ func TestEmailKeysSQLiteUpgradeRollbackAndIntegrity(t *testing.T) {
 	if err != nil || got.ID != 92001 || got.Email != "Δ.Test@Example.COM" {
 		t.Fatalf("旧邮箱原值或规范键查询改变: %+v %v", got, err)
 	}
-	if err := sq.RollbackLast(ctx, full); err != nil {
+	if err := sq.RollbackLast(ctx, through0023); err != nil {
 		t.Fatal(err)
 	}
 	if sq.emailKeysReady.Load() {
-		t.Fatal("down 后仍启用键表")
+		t.Fatal("0023 down 后仍启用键表")
 	}
-	if err := sq.Migrate(ctx, full); err != nil {
+	var n int
+	if err := sq.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'user_email_keys'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("0023 down 后键表应不存在: %d %v", n, err)
+	}
+	if err := sq.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM schema_migrations WHERE version = ?`, emailKeysVersion).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("0023 down 后版本标记应移除: %d %v", n, err)
+	}
+	var original string
+	if err := sq.DB().QueryRowContext(ctx, `SELECT email FROM users WHERE id = 92001`).Scan(&original); err != nil || original != "Δ.Test@Example.COM" {
+		t.Fatalf("0023 down 不得改变账号原值: %q %v", original, err)
+	}
+	if err := sq.Migrate(ctx, through0023); err != nil {
 		t.Fatal(err)
 	}
 	assertEmailKeyCounts(t, sq.DB(), 1)
+	if got, err := sq.UserByEmail(ctx, "δ.test@example.com"); err != nil || got.ID != 92001 {
+		t.Fatalf("0023 重迁移后规范键应恢复: %+v %v", got, err)
+	}
+	if err := sq.Migrate(ctx, full); err != nil {
+		t.Fatalf("完整迁移组合失败: %v", err)
+	}
+	assertEmailKeyCounts(t, sq.DB(), 1)
+	if err := sq.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM schema_migrations WHERE version = '0024_attachment_gc_keys'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("完整迁移应包含 0024: %d %v", n, err)
+	}
 	if _, err := sq.DB().Exec(`DROP TABLE user_email_keys`); err != nil {
 		t.Fatal(err)
 	}
@@ -198,6 +223,7 @@ func TestEmailKeysMySQLReentryAndRollback(t *testing.T) {
 	ctx := context.Background()
 	m := openRolesMySQL(t)
 	full := findMigrations(t)
+	through0023 := migrationsBefore(t, full, "0024")
 	if err := m.Migrate(ctx, migrationsBefore(t, full, "0023")); err != nil {
 		t.Fatal(err)
 	}
@@ -214,17 +240,44 @@ func TestEmailKeysMySQLReentryAndRollback(t *testing.T) {
 	if _, err := m.DB().ExecContext(ctx, stmts[0]); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Migrate(ctx, full); err != nil {
+	if err := m.Migrate(ctx, through0023); err != nil {
 		t.Fatal(err)
 	}
 	assertEmailKeyCounts(t, m.DB(), 1)
-	if err := m.RollbackLast(ctx, full); err != nil {
+	if err := m.RollbackLast(ctx, through0023); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Migrate(ctx, full); err != nil {
+	if m.emailKeysReady.Load() {
+		t.Fatal("0023 down 后仍启用键表")
+	}
+	var n int
+	if err := m.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.tables
+		WHERE table_schema = DATABASE() AND table_name = 'user_email_keys'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("0023 down 后键表应不存在: %d %v", n, err)
+	}
+	if err := m.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM schema_migrations WHERE version = ?`, emailKeysVersion).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("0023 down 后版本标记应移除: %d %v", n, err)
+	}
+	var original string
+	if err := m.DB().QueryRowContext(ctx, `SELECT email FROM users WHERE id = 93001`).Scan(&original); err != nil || original != "Legacy.Mixed@Example.COM" {
+		t.Fatalf("0023 down 不得改变账号原值: %q %v", original, err)
+	}
+	if err := m.Migrate(ctx, through0023); err != nil {
 		t.Fatal(err)
 	}
 	assertEmailKeyCounts(t, m.DB(), 1)
+	if got, err := m.UserByEmail(ctx, "legacy.mixed@example.com"); err != nil || got.ID != 93001 {
+		t.Fatalf("0023 重迁移后规范键应恢复: %+v %v", got, err)
+	}
+	if err := m.Migrate(ctx, full); err != nil {
+		t.Fatalf("完整迁移组合失败: %v", err)
+	}
+	assertEmailKeyCounts(t, m.DB(), 1)
+	if err := m.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM schema_migrations WHERE version = '0024_attachment_gc_keys'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("完整迁移应包含 0024: %d %v", n, err)
+	}
 }
 
 func TestEmailKeysMySQLConcurrentCreate(t *testing.T) {
