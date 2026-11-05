@@ -363,6 +363,12 @@ func main() {
 
 	// 附件二进制存储（#41 B2）：local（默认，$DATA_DIR/uploads）或 S3 兼容对象存储。
 	// 只校验配置不探测连通性：S3 暂时不可达不应挡住整个服务启动。
+	if strings.EqualFold(cfg.upload.Driver, "s3") {
+		cfg.upload.OwnerID, err = st.BlobOwnerID(context.Background())
+		if err != nil {
+			log.Fatalf("附件归属初始化失败: %v", err)
+		}
+	}
 	blobStore, blobDriver, err := blob.New(cfg.upload, log.Default())
 	if err != nil {
 		log.Fatalf("附件存储不可用: %v", err)

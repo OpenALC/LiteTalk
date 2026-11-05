@@ -1161,7 +1161,7 @@ export interface paths {
         head?: never;
         /**
          * 改出站订阅（ManageServer；Merge Patch）
-         * @description JSON Merge Patch（RFC 7396）：url / events / enabled / reset_secret 四个可选键， 缺省不改。reset_secret=true 换新 secret 并只在本次响应返回明文， 旧 secret 立即失效（URL 泄露的可重置途径）；enabled=true 手动重新启用并 清零连续失败计数（熔断停用后的唯一恢复途径），enabled=false 手动停用。 url / events 更新与创建同规则校验（bad_url / bad_events）。 响应里的 url 与列表同口径：默认完整；设置 LITETALK_WEBHOOK_REDACT_URL=1 后仅订阅创建者与服务器 owner 得到完整值，其余调用者得到 scheme://host/… 展示掩码（改址后调用方成为创建者，返回其刚提交的完整地址）。 展示掩码不能回写为创建或修改目标，提交时返回 400 bad_url。 归属不符（wid 不属于该服务器）与不存在统一 404。 频控键 wh:patch:<uid>。code：bad_url、bad_events；401；403；404 not_found； 429 rate_limited；5xx internal。
+         * @description JSON Merge Patch（RFC 7396）：url / events / enabled / reset_secret 四个可选键， 缺省不改。reset_secret=true 换新 secret 并只在本次响应返回明文， 旧 secret 立即失效（URL 泄露的可重置途径）；enabled=true 手动重新启用并 清零连续失败计数（熔断停用后的唯一恢复途径），enabled=false 手动停用。 url / events 更新与创建同规则校验（bad_url / bad_events）。 响应里的 url 与列表同口径：默认完整；设置 LITETALK_WEBHOOK_REDACT_URL=1 后仅订阅创建者与服务器 owner 得到完整值，其余调用者得到 scheme://host/… 展示掩码（改址后调用方成为创建者，返回其刚提交的完整地址）。 展示掩码不能回写为创建或修改目标，提交时返回 400 bad_url。 归属不符（wid 不属于该服务器）与不存在统一 404。 只改 events 时仍按原创建者判定频道可见性；原创建者无可见订阅频道时 返回 409 webhook_events_needs_creator：订阅原创建者已无频道可见性， 请由创建者或服主修改事件，或先改址将创建者变更为自己。 真正改址时仍按改址者判定可见性，未通过则返回 403。 频控键 wh:patch:<uid>。code：bad_url、bad_events；401；403；404 not_found； 409 webhook_events_needs_creator； 429 rate_limited；5xx internal。
          */
         patch: operations["patchServerWebhook"];
         trace?: never;
@@ -2175,7 +2175,7 @@ export interface components {
                 "application/problem+json": components["schemas"]["Problem"];
             };
         };
-        /** @description 资源冲突（body.code：conflict / email_taken / already_friends / request_exists / bad_state / code_exhausted / category_not_empty 等） */
+        /** @description 资源冲突（body.code：conflict / email_taken / already_friends / request_exists / bad_state / code_exhausted / category_not_empty / webhook_events_needs_creator 等；后者需由创建者或服主修改事件，或先改址将创建者变更为自己） */
         Conflict: {
             headers: {
                 [name: string]: unknown;
@@ -4475,6 +4475,7 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             429: components["responses"]["RateLimited"];
             default: components["responses"]["Internal"];
         };

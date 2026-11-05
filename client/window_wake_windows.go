@@ -27,6 +27,7 @@ func (a *App) interceptCloseForWindow(target *application.WebviewWindow) bool {
 		a.emitHibernate()
 		return true
 	default:
+		// 首次身份检查后可能并发销毁并重建；旧窗迟到的关闭不得退出新窗。
 		if a.isCurrentWindow(target) {
 			a.quitAfterClose()
 		}

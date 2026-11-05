@@ -3,21 +3,15 @@ package auth
 import (
 	"context"
 	"errors"
-	"strings"
 	"time"
+
+	"github.com/OpenALC/LiteTalk/server/internal/emailnorm"
 )
 
-// NormalizeEmail 邮箱统一口径：去掉空格/制表符并转小写。用户查询、验证码键、
-// OIDC 绑定都必须先过这里——MySQL 的 utf8mb4_unicode_ci 唯一索引本就大小写
-// 不敏感，SQLite 的二进制索引不是，入口口径不一致会建出重复账号。
+// NormalizeEmail 邮箱统一口径：用户查询、验证码键、OIDC 绑定和数据库规范键
+// 共用 emailnorm 的规则；保留该入口供已有调用方使用。
 func NormalizeEmail(s string) string {
-	out := make([]rune, 0, len(s))
-	for _, r := range s {
-		if r != ' ' && r != '\t' {
-			out = append(out, r)
-		}
-	}
-	return strings.ToLower(string(out))
+	return emailnorm.Normalize(s)
 }
 
 // 验证码策略（§8）：6 位 / 10min 有效 / 错误 5 次作废 / 60s 重发间隔 / 同邮箱 5 次每日。

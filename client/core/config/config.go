@@ -43,6 +43,7 @@ type Config struct {
 	ServerBase          string           `json:"server_base,omitempty"`           // 服务端基址，如 https://example.com
 	HibernateOnMinimize *bool            `json:"hibernate_on_minimize,omitempty"` // 最小化时休眠界面（旧版布尔，已由 HibernateMode 取代，保留读取做迁移）
 	HibernateMode       string           `json:"hibernate_mode,omitempty"`        // 休眠模式：off 不休眠 / hibernate 卸载业务组件 / destroy 整页重载（缺省见 HibernateModeDefault：Linux v1.10.0 起 hibernate，其余 off；GTK4 构建 destroy 读路径强降 hibernate）
+	GCLevel             int              `json:"gc_level,omitempty"`              // Go runtime 回收强度 1–5；缺省或非法值按中档 3 读取
 	CloseToTray         *bool            `json:"close_to_tray,omitempty"`         // 关闭窗口时最小化到托盘（默认 true；false=退出程序）
 	SavedEmail          string           `json:"saved_email,omitempty"`           // 记住的登录邮箱
 	EncPassword         string           `json:"enc_password,omitempty"`          // 记住的密码密文（Windows DPAPI base64；Linux keyring 命中时恒空，旧版 base64 仅保留读取迁移；其余平台恒空）
@@ -344,6 +345,11 @@ func (m *Manager) read() Config {
 func (m *Manager) Save(c Config) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.saveLocked(c)
+}
+
+// saveLocked 由 Save/Update 共用；调用方须持 m.mu，避免读改写之间丢掉其它设置。
+func (m *Manager) saveLocked(c Config) error {
 	dir := filepath.Dir(m.path)
 	// 0700：配置目录含令牌文件（Linux 回落明文存储），同用户外不可进。
 	// 旧版本用 0755 建的目录在此收紧（issue #10）。
@@ -376,15 +382,15 @@ func (m *Manager) Get() Config {
 	return m.cfg
 }
 
-// Update 读-改-写配置（f 返回 false 则放弃保存）。
+// Update 在同一把锁内读-改-写；f 返回错误则不保存，回调不得重入 Manager。
 func (m *Manager) Update(f func(*Config) error) error {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	c := m.cfg
-	m.mu.Unlock()
 	if err := f(&c); err != nil {
 		return err
 	}
-	return m.Save(c)
+	return m.saveLocked(c)
 }
 
 // Resolved 服务器地址解析结果。

@@ -8,9 +8,9 @@ LiteTalk 是 OpenALC 组织的开源桌面语音开黑软件，SFU 架构，服�
 - 服务端：Go 单体（REST `/api/v1` + WS 信令 + 自研 Pion SFU，ICE-Lite UDP mux :7845），默认 SQLite（含持久化 KV）+ 内置 TURN/TLS；可选 MySQL、Redis、coturn 或前置反代。
 
 本地规划文档在 `docs/`（**不进仓库**），动手前先读：
+- `docs/2026-11-05-下一阶段规划.md`：当前执行入口。功能冻结，后续只做缺陷、效果、性能、资源与视觉优化；性能/资源改动须有基准、样本或日志等可测依据。
 - `docs/优化完善方案.md`：已知缺陷清单与修复批次。修 bug 前先查这里有没有登记，按里面的定位和方案做。
-- `docs/演进建议.md`：架构方向与路线图。新功能先对照这份文档，不要与之冲突。
-- 当前执行范围以用户最近确认的任务书为准：批次 7 看 `docs/批次7-任务流程单.md`，GTK4 看 `docs/v1.10.0-GTK4迁移计划书.md` 与 `docs/gtk4-基线数据.md`；旧路线图的版本表、历史待办不覆盖后续决策。
+- `docs/演进建议.md` 与 `docs/archive/` 中的批次 7、GTK4 等资料只作架构与验收历史参考；具体范围以当前规划和用户最近确认的任务书为准。
 
 ### 长期记忆（与 Claude Code 共用）
 
@@ -58,6 +58,7 @@ LiteTalk 是 OpenALC 组织的开源桌面语音开黑软件，SFU 架构，服�
   - 例：`v1.6.0-alpha`（#35）→ `v1.6.1-alpha`（#36）→ `v1.6.2-alpha`（#37）……；下一功能集从 `v1.7.0-alpha` 开始。
 - CI 的 `check-tag` job 会用正则校验标签格式，不合规直接失败。
 - 已推送的标签不改写、不重打。打包失败就递增修复段重新发（先例：v1.0.0-alpha 失败后发了 v1.0.1-alpha）。
+- 当前 v1.10.x 功能段冻结在 1.10，修复交付递增修复段；新增功能须用户单独解冻，不按旧路线图自动排期。
 
 ---
 
@@ -76,7 +77,7 @@ GH="/c/Users/Yang/AppData/Local/Microsoft/WinGet/Packages/GitHub.cli_Microsoft.W
 - 构建标签：
   - Windows / macOS：`production`（选正式版 runtime.js）；
   - Linux 默认使用 GTK4 + WebKitGTK 6.0：检查不加 `gtk3`，生产构建用 `production`。`-tags gtk3` 仅保留配置兼容测试，不作为完整旧版客户端的构建或发布门禁。不要用 `server` 标签做 Linux 检查。
-- 热重载开发：在 `client/` 下执行 `wails3 dev`（**不是** `wails dev`，那是 v2 CLI，会报找不到 `wails.json`）。Windows 的 Taskfile 通过 `CC` 指定 mingw gcc，默认路径是 `C:/tools/mingw64/bin`，可用 `LITETALK_MINGW` 覆盖。go-task 在 Windows 上设置 `env.PATH` 不会影响命令查找，所以不要改成通过 PATH 注入。
+- 热重载开发：在 `client/` 下执行 `wails3 dev`（**不是** `wails dev`，那是 v2 CLI，会报找不到 `wails.json`）。Windows 的 Taskfile 通过 `CC`/`CXX` 指定 mingw gcc/g++，默认路径是 `C:/tools/mingw64/bin`，可用 `LITETALK_MINGW` 覆盖。go-task 在 Windows 上设置 `env.PATH` 不会影响命令查找，所以不要改成通过 PATH 注入。
 - 改动 `client/Taskfile.yml`、`client/build/**/Taskfile.yml` 或 `build/config.yml` 后，必须在**没有手动设置 PATH 和 CGO_ENABLED 的干净 shell** 里实际跑一次 `wails3 dev`，并跑一次 `wails3 task --dry package VERSION=v0.0.0`，确认版本号确实注入了。CI 不覆盖这部分。
 - mingw ld 的 `claims to have 0xffff relocs` 警告无害。
 - 在 PowerShell 里跑基准测试时，模式参数必须加引号：`-bench="."`。
@@ -121,6 +122,7 @@ git checkout -- .
 |---|---|---|---|---|
 | 检查 | `check-tag` | 只在标签推送时 | 是 | 校验标签符合版本规范 |
 | 检查 | `check-server` | 每次 push 和 PR | 是 | gofmt、`go mod tidy -diff`、vet、`test -race`、build |
+| 检查 | `check-mysql` | 每次 push 和 PR、标签 | 是 | MySQL 8.4.13 service、每测试独立 schema、Store 真库 `test -race`；缺 DSN 或 MySQL 用例跳过即失败，`release` 显式依赖 |
 | 检查 | `check-frontend` | 每次 push 和 PR | 是 | `pnpm install --frozen-lockfile`、type-check、vitest、build，产出 `frontend-dist` artifact |
 | 检查 | `check-client-linux` | 每次 push 和 PR | 是 | gofmt、tidy、vet、默认 GTK4 的 `test -race` 与 build；额外以 `-tags gtk3` 仅测 `core/config` |
 | 检查 | `smoke-client-linux-install` | 各分支 push、PR 与标签 | 是 | Ubuntu 24.04、Debian 13、Fedora 40、AlmaLinux 10 安装及启动检查；必须有前端挂载后的原生绑定就绪信号，只有进程存活或早期启动日志不算通过；release 依赖此门禁 |
@@ -134,6 +136,7 @@ git checkout -- .
 
 规则：
 - **macOS 永远不阻塞发版**：`release` 的 `if` 条件里**不准**加入 macOS job 的结果，macOS job 必须保留 `continue-on-error: true`。
+- MySQL 真库检查是阻塞门禁：`release` 的 `needs` 与 `if` 都必须要求 `check-mysql` 成功，不能以缺 DSN 或 `t.Skip` 放行。
 - 前端只在 `check-frontend` 构建一次，其他 job 通过 `download-artifact` 获取 `frontend-dist`。**不要在其他 job 里重复构建前端**；新增需要 embed 的 job 时，同样通过 `needs: check-frontend` 下载产物。
 - 只改 `*.md` 或 `LICENSE` 的 **push** 不触发 CI（paths-ignore）；PR 仍触发检查，标签推送不受这个过滤影响。文档 push 被过滤时记录“未触发”，不能把旧 run 当成本次全绿。
 - 同一 ref 的新提交会取消旧的检查运行；标签运行不会被取消。
@@ -143,7 +146,7 @@ git checkout -- .
 
 ### 监控 CI
 ```bash
-"$GH" run list --repo OpenALC/LiteTalk --branch main --limit 3
+"$GH" run list --repo OpenALC/LiteTalk --branch dev --limit 3
 "$GH" run watch <run-id> --repo OpenALC/LiteTalk --exit-status
 "$GH" run view <run-id> --repo OpenALC/LiteTalk --log-failed     # 失败时只看失败步骤的日志
 ```
@@ -165,25 +168,25 @@ git checkout -- .
 - 协议或信令变更、数据库迁移、跨批次大改动，以及用户要求评审的改动，按任务书提 PR；用户审查通过后再合入 `main`，合并方式用 squash。
 
 ### dev 集成与审查工作流
-- v1.3.0 → v1.5.0 的连续开发、暂不发版约定已结束，不再作为后续版本的永久禁令。当前批次的范围、审查时点与发版授权以用户确认的任务书为准。
+- 当前按 `docs/2026-11-05-下一阶段规划.md` 与用户最近确认的任务书实施；历史批次的审查与发版授权不沿用到后续标签。
 - 实施由 SubAgent 在各自 worktree 完成；**实现代理负责提交、推送与 CI 监控**，主会话只负责派活、验收、合并与发版，**不亲自写实现代码**（节省主上下文）。代理推送独立 `feat/#N-*` / `fix/#N-*` 分支并跑该分支 CI，报告 run id 与结果；主会话验收后再合入 `dev`，合入后的 `dev` CI 仍由同一代理监控。代理不直接改 `main`/`dev`。
-- 主会话逐项验收后按任务书顺序合入 `dev`（批次 7 用 `--no-ff`）；这次集成 CI 全绿后再合下一项。纯文档 push 按 CI 过滤规则单独记录。
+- 主会话逐项验收后按当前任务书指定的顺序和合并方式集成至 `dev`；这次集成 CI 全绿后再合下一项。纯文档 push 按 CI 过滤规则单独记录。
 - 版本或批次审查 PR 按交付范围列提交段并链接 issue；审查修正继续在独立分支交付后合入 `dev`。不因旧版本曾要求“中途不开 PR”而跳过当前审查。
-- 本轮 GTK4 收口顺序为 `gtk` → `dev` → `main`，每次集成按精确 head 等 CI 全绿；`dev` 上已验收的未发布加固随本版进入 `main`。发布安全收口后归档停用 `gtk` 迁移分支，后续 v1.10.x 继续在 `dev` 集成。
+- GTK4 代码已交付，`gtk` 迁移分支已退役；后续 v1.10.x 继续在 `dev` 集成，进入 `main` 与发版另按当次审查和授权执行。
 
 ### Issue 跟踪（路线图功能已全部建单）
-- 路线图（`docs/演进建议.md`）与批三范围的每个功能都对应一个 issue，标签分三轴：目标版本（`v1.2.0`…`v2.0.0`/`backlog`）、优先级（`P0`/`P1`/`P2`）、领域（`area/client`、`area/server` 等）。
+- 每项工作以 GitHub issue 的范围和验收为准，标签仍按目标版本、优先级、领域三轴维护；旧路线图的功能单保持 backlog，不因已有 issue 就自动解冻。
 - **动手前先认领**：从 issue 的"要点/验收"出发实现，不要在没单的情况下自行扩大范围。
 - **提交信息引用单号**：在摘要后加 `(#N)`，例：`feat(client): 全局热键与按键说话——三平台钩子与 PTT 门控 (#4)`。一次提交只关一个单；跨多个单的改动拆开提交。
 - **关闭时机**：该 issue 所属交付**已被用户审查通过且合并到 main** 后才 `gh issue close N --repo OpenALC/LiteTalk`。CI 全绿只说明可以进审查，不是关单条件；集中跟进单还要逐项对账，不能随其中一项完成就关整单。
 - 复现不出来或决定不做的单，在 issue 里写结论再关，**不留说不清的 open 单**。
-- 版本号以用户批准的执行计划为准，不要按 `docs/演进建议.md` §10 的旧表推断。v1.10.0-alpha 以 GTK4 迁移（#5）为主，并包含本轮已验收的加固；不单发 v1.9.8-alpha。屏幕共享/摄像头（#48）与 HTTP/3 顺延到 v1.11.0 起，具体范围另定；移动端（#55）仍为 backlog。
+- 版本号以用户批准的执行计划为准，不按 `docs/演进建议.md` 的旧表推断；屏幕共享/摄像头（#48）、移动端（#55）等新增功能仍在 backlog。
 
 ### 节奏（强制，不再逐次请示用户）
 1. 每完成一个功能：实现代理提交并推送独立分支，**等这次 push 的 CI 全绿**，主会话验收后合入 `dev`，再等集成 CI 全绿。CI 红了先修，不能带着红灯继续；纯文档 push 按过滤规则记录。
 2. 每完成一个版本：该版本最后一次 push 的 CI 必须全绿，才能进入下一个版本。
 3. 所有版本完成后：本地做一次全量验证（第 3 节全部命令），并确认 `dev` 上最新的 CI 是绿的。
-4. 发版须满足当次任务书的验收、审查与用户授权；本轮 v1.10.0-alpha 的有条件授权及未通过/缺测项见共享记忆和本地任务书，不能写成门禁已通过。旧暂停约定不阻挡本轮，后续标签仍需另获授权。获准发版后核对下列资产，并等标签 CI 成功：
+4. 发版须满足当次任务书的验收、审查与用户对该标签的授权；已消费的旧授权不复用，未通过或缺测项如实记录。获准发版后核对下列资产，并等标签 CI 成功：
    - Windows：setup.exe、portable.zip
    - Linux amd64/arm64：portable.tar.gz、deb、rpm
    - 服务端：amd64/arm64 tar.gz

@@ -20,8 +20,9 @@ const maxS3GetBytes = 64 << 20
 
 // s3Store S3 兼容对象存储实现（AWS S3 / MinIO / Ceph 等，支持路径风格）。
 type s3Store struct {
-	cli    *minio.Client
-	bucket string
+	cli     *minio.Client
+	bucket  string
+	ownerID string
 }
 
 func newS3(cfg Config, lg *log.Logger) (Store, string, error) {
@@ -38,6 +39,8 @@ func newS3(cfg Config, lg *log.Logger) (Store, string, error) {
 		return nil, "", errors.New("blob: s3 驱动缺少 AccessKey")
 	case secretKey == "":
 		return nil, "", errors.New("blob: s3 驱动缺少 SecretKey")
+	case !validOwnerID(cfg.OwnerID):
+		return nil, "", errors.New("blob: s3 驱动缺少数据库归属值")
 	}
 	lookup := minio.BucketLookupAuto
 	if cfg.PathStyle {
@@ -56,7 +59,21 @@ func newS3(cfg Config, lg *log.Logger) (Store, string, error) {
 	if lg != nil {
 		lg.Printf("[blob] s3 endpoint=%s bucket=%s path_style=%v", endpoint, bucket, cfg.PathStyle)
 	}
-	return &s3Store{cli: cli, bucket: bucket}, "s3", nil
+	return &s3Store{cli: cli, bucket: bucket, ownerID: cfg.OwnerID}, "s3", nil
+}
+
+func validOwnerID(id string) bool {
+	if len(id) != 64 {
+		return false
+	}
+	for _, c := range id {
+		if c < '0' || c > '9' {
+			if c < 'a' || c > 'f' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // Put 上传对象（同 key 覆盖）。
@@ -68,7 +85,7 @@ func (s *s3Store) Put(ctx context.Context, key string, data []byte, contentType 
 		contentType = "application/octet-stream"
 	}
 	if _, err := s.cli.PutObject(ctx, s.bucket, key, bytes.NewReader(data), int64(len(data)),
-		minio.PutObjectOptions{ContentType: contentType}); err != nil {
+		minio.PutObjectOptions{ContentType: contentType, UserMetadata: map[string]string{"litetalk-attachment": s.ownerID}}); err != nil {
 		return fmt.Errorf("blob: 上传对象 %q: %w", key, err)
 	}
 	return nil
@@ -108,6 +125,41 @@ func (s *s3Store) Delete(ctx context.Context, key string) error {
 		return fmt.Errorf("blob: 删除对象 %q: %w", key, err)
 	}
 	return nil
+}
+
+func (s *s3Store) Scan(ctx context.Context, after string, limit int) ([]ObjectInfo, string, bool, error) {
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	listCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	ch := s.cli.ListObjects(listCtx, s.bucket, minio.ListObjectsOptions{Recursive: true, StartAfter: after, MaxKeys: limit + 1})
+	out := make([]ObjectInfo, 0, limit)
+	for obj := range ch {
+		if obj.Err != nil {
+			return nil, "", false, fmt.Errorf("blob: 枚举 S3 对象: %w", obj.Err)
+		}
+		if len(out) == limit {
+			return out, out[len(out)-1].Key, false, nil
+		}
+		out = append(out, ObjectInfo{Key: obj.Key, Modified: obj.LastModified, Size: obj.Size, ETag: obj.ETag})
+	}
+	return out, "", true, nil
+}
+
+func (s *s3Store) Stat(ctx context.Context, key string) (ObjectInfo, error) {
+	if err := validateKey(key); err != nil {
+		return ObjectInfo{}, err
+	}
+	info, err := s.cli.StatObject(ctx, s.bucket, key, minio.StatObjectOptions{})
+	if err != nil {
+		return ObjectInfo{}, s3Error(key, err)
+	}
+	return ObjectInfo{Key: key, Modified: info.LastModified, Size: info.Size, ETag: info.ETag,
+		Owned: info.Metadata.Get("X-Amz-Meta-Litetalk-Attachment") == s.ownerID}, nil
 }
 
 // s3Error 把对象不存在归一成 ErrNotFound，其余错误保留原始链。
