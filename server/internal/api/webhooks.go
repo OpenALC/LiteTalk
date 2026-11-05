@@ -168,7 +168,7 @@ func (s *Server) CreateServerWebhook(ctx context.Context, request CreateServerWe
 	}
 	// 可见性门按订阅的事件判定（见 requireSubscribedChannelView）：只有频道维度
 	// 事件才要求调用者能看见至少一个能产生该事件的频道。
-	if e := s.requireSubscribedChannelView(ctx, request.Id, c.UserID, events); e != nil {
+	if e, _ := s.requireSubscribedChannelView(ctx, request.Id, c.UserID, events); e != nil {
 		return nil, e
 	}
 	secret, e := s.newWebhookSecret()
@@ -270,8 +270,12 @@ func (s *Server) PatchServerWebhook(ctx context.Context, request PatchServerWebh
 		if urlChanged {
 			gateUserID = c.UserID
 		}
-		if e := s.requireSubscribedChannelView(ctx, request.Id, gateUserID,
+		if e, noView := s.requireSubscribedChannelView(ctx, request.Id, gateUserID,
 			strings.Fields(w.Events)); e != nil {
+			if eventsChanged && !urlChanged && noView {
+				return nil, errf(http.StatusConflict, "webhook_events_needs_creator",
+					"需由创建者或服主修改事件")
+			}
 			return nil, e
 		}
 	}
@@ -579,13 +583,14 @@ func (s *Server) DeliverInboundWebhook(ctx context.Context, request DeliverInbou
 //
 // 旧实现按「任一频道可见」放行：创建者只看得见语音频道时也能建 message.created
 // 订阅，而该事件永远不会投递；反过来 member.* 订阅却被无关的频道可见性卡住。
-// events 必须是已通过 webhook.ValidEvents 的集合。
+// events 必须是已通过 webhook.ValidEvents 的集合。第二返回值只在确实没有可见频道
+// 时为 true，存储或权限查询错误即便映射为 403 也不能当作可见性失败。
 //
 // 口径与投递过滤一致走纯角色判定（RoleCanInServer，不做 scope 交集）：订阅按创建者
 // **账号**的实时角色可见性收窄，PAT/bot 令牌的 scope 只限制令牌主体自身的 API 能力，
 // 不改变其账号的频道可见性；若这里用 scope 交集，持有 ManageServer scope 而无
 // messages.read 的令牌将被误拒。
-func (s *Server) requireSubscribedChannelView(ctx context.Context, serverID, userID int64, events []string) *apiErr {
+func (s *Server) requireSubscribedChannelView(ctx context.Context, serverID, userID int64, events []string) (*apiErr, bool) {
 	needText, needAny := false, false
 	for _, ev := range events {
 		switch ev {
@@ -596,28 +601,28 @@ func (s *Server) requireSubscribedChannelView(ctx context.Context, serverID, use
 		}
 	}
 	if !needText && !needAny {
-		return nil // 仅 member.*：无频道维度，投递不经过可见性闸
+		return nil, false // 仅 member.*：无频道维度，投递不经过可见性闸
 	}
 	if userID == 0 {
 		// 0022 前的旧行 creator_id=0 由服务器 owner 代持，与投递侧一致。
 		srv, err := s.store.ServerByID(ctx, serverID)
 		if err != nil {
-			return s.writeStoreErr(ctx, err)
+			return s.writeStoreErr(ctx, err), false
 		}
 		userID = srv.OwnerID
 	}
 	if s.authz == nil {
-		return errf(http.StatusInternalServerError, "internal", "权限服务未就绪")
+		return errf(http.StatusInternalServerError, "internal", "权限服务未就绪"), false
 	}
 	chans, err := s.store.ChannelsOfServer(ctx, serverID)
 	if err != nil {
-		return s.writeStoreErr(ctx, err)
+		return s.writeStoreErr(ctx, err), false
 	}
 	textOK, anyOK := false, false
 	for i := range chans {
 		ok, err := s.authz.RoleCanInServer(ctx, userID, serverID, chans[i].ID, store.ViewChannel)
 		if err != nil {
-			return s.writeStoreErr(ctx, err)
+			return s.writeStoreErr(ctx, err), false
 		}
 		if !ok {
 			continue
@@ -629,13 +634,13 @@ func (s *Server) requireSubscribedChannelView(ctx context.Context, serverID, use
 	}
 	if needText && !textOK {
 		return errf(http.StatusForbidden, "forbidden",
-			"调用者对服务器内所有文字频道均无查看权限，message.created 订阅不会投递")
+			"调用者对服务器内所有文字频道均无查看权限，message.created 订阅不会投递"), true
 	}
 	if needAny && !anyOK {
 		return errf(http.StatusForbidden, "forbidden",
-			"调用者对服务器内所有频道均无查看权限，频道事件订阅不会投递")
+			"调用者对服务器内所有频道均无查看权限，频道事件订阅不会投递"), true
 	}
-	return nil
+	return nil, false
 }
 
 // inboundChannel 入站管理的频道门：频道存在（404）、服务器作用域且为文字频道

@@ -1139,7 +1139,7 @@ func TestWebhookPatchURLEventsGateUsesNewEvents(t *testing.T) {
 
 // TestWebhookPatchEventsUsesEffectiveCreator 仅改事件不改地址时，判定主体仍是
 // 原订阅创建者，不能拿执行 PATCH 的管理员角色或令牌 scope 代替；旧行 creator_id=0
-// 由服主代持。403 不应改动库行，允许修改也不应改绑创建者。
+// 由服主代持。无可见性时 409 不应改动库行，允许修改也不应改绑创建者。
 func TestWebhookPatchEventsUsesEffectiveCreator(t *testing.T) {
 	t.Run("创建者不可见但操作者可见时拒绝且不落库", func(t *testing.T) {
 		f := newRebindFixture(t)
@@ -1148,11 +1148,22 @@ func TestWebhookPatchEventsUsesEffectiveCreator(t *testing.T) {
 		hookID := asID(created["id"])
 		before := *f.row(t, hookID)
 		f.setViewDeny(t, f.pubID, true) // M 已看不到任何文字频道；服主 O 仍可见
+		resp := patchJSON(t, f.h, f.hookPath(hookID), f.accO,
+			map[string]any{"events": []string{"message.created"}, "enabled": false, "reset_secret": true},
+			http.StatusConflict)
+		if resp["code"] != "webhook_events_needs_creator" || resp["message"] != "需由创建者或服主修改事件" {
+			t.Fatalf("创建者失去可见性应返回专用冲突: %v", resp)
+		}
+		if row := *f.row(t, hookID); row != before {
+			t.Fatalf("409 后订阅行不得变化: before=%+v after=%+v", before, row)
+		}
+
+		// 同次真正改址按 O 判定，事件门通过并将投递创建者改绑为 O。
+		newURL := "https://hooks.example.com/o"
 		patchJSON(t, f.h, f.hookPath(hookID), f.accO,
-			map[string]any{"events": []string{"message.created"}}, http.StatusForbidden)
-		if row := f.row(t, hookID); row.URL != before.URL || row.Events != before.Events ||
-			row.CreatorID != before.CreatorID || row.UpdatedAt != before.UpdatedAt {
-			t.Fatalf("403 后订阅行不得变化: before=%+v after=%+v", before, row)
+			map[string]any{"url": newURL, "events": []string{"message.created"}}, http.StatusOK)
+		if row := f.row(t, hookID); row.URL != newURL || row.Events != "message.created" || row.CreatorID != f.uidO {
+			t.Fatalf("改址应按改址者可见性放行并改绑: %+v", row)
 		}
 	})
 
@@ -1185,6 +1196,52 @@ func TestWebhookPatchEventsUsesEffectiveCreator(t *testing.T) {
 			t.Fatalf("旧行应按服主权限更新事件且保持旧创建者字段: %+v", row)
 		}
 	})
+}
+
+type failingWebhookChannelListStore struct {
+	*store.Mem
+	err error
+}
+
+func (s *failingWebhookChannelListStore) ChannelsOfServer(context.Context, int64) ([]store.Channel, error) {
+	return nil, s.err
+}
+
+func TestWebhookPatchEventsKeepsChannelQueryErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want int
+		code string
+	}{
+		{"forbidden", store.ErrForbidden, http.StatusForbidden, "forbidden"},
+		{"internal", fmt.Errorf("频道查询失败"), http.StatusInternalServerError, "internal"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRebindFixture(t)
+			created := postJSON(t, f.h, fmt.Sprintf("/api/v1/servers/%d/webhooks", f.serverID), f.accO,
+				map[string]any{"url": "https://hooks.example.com/o", "events": []string{"member.joined"}},
+				http.StatusCreated)
+			hookID := asID(created["id"])
+			before := *f.row(t, hookID)
+			srv := New(Config{
+				Store: &failingWebhookChannelListStore{Mem: f.mem, err: tc.err},
+				JWT:   auth.NewJWT("test-secret"), Refresh: auth.NewRefreshStore(f.mem),
+				Codes: auth.NewEmailCodes(f.mem), Limits: auth.NewRateLimit(f.mem),
+				Session: auth.NewSessionIndex(f.mem, f.mem), Presence: f.mem,
+				Authz: f.az, Webhooks: f.disp,
+				WebhookURLCheck: func(string) error { return nil },
+			})
+			resp := patchJSON(t, srv.Handler(), f.hookPath(hookID), f.accM,
+				map[string]any{"events": []string{"message.created"}}, tc.want)
+			if resp["code"] != tc.code {
+				t.Fatalf("查询失败应保持原错误 %s: %v", tc.code, resp)
+			}
+			if row := *f.row(t, hookID); row != before {
+				t.Fatalf("查询失败后订阅行不得变化: before=%+v after=%+v", before, row)
+			}
+		})
+	}
 }
 
 // TestWebhookPatchURLWritesAudit 改址写审计 webhook.update_url：记旧/新创建者，

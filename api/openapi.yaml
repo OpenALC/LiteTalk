@@ -2397,7 +2397,11 @@ paths:
         scheme://host/… 展示掩码（改址后调用方成为创建者，返回其刚提交的完整地址）。
         展示掩码不能回写为创建或修改目标，提交时返回 400 bad_url。
         归属不符（wid 不属于该服务器）与不存在统一 404。
+        只改 events 时仍按原创建者判定频道可见性；原创建者无可见订阅频道时
+        返回 409 webhook_events_needs_creator，需由创建者或服主修改事件。
+        真正改址时仍按改址者判定可见性，未通过则返回 403。
         频控键 wh:patch:<uid>。code：bad_url、bad_events；401；403；404 not_found；
+        409 webhook_events_needs_creator；
         429 rate_limited；5xx internal。
       tags: [webhooks]
       parameters:
@@ -2427,6 +2431,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '429':
           $ref: '#/components/responses/RateLimited'
         default:
