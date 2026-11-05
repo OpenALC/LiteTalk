@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -329,30 +330,35 @@ func (r *Room) forward(src *Peer, srcTrack *webrtc.TrackRemote, levelExtID uint8
 		if whisper == nil && !src.fwdActive.Load() {
 			continue
 		}
-		r.mu.RLock()
-		for uid, p := range r.peers {
-			if uid == src.userID {
-				continue
-			}
-			if whisper != nil {
-				if _, ok := (*whisper)[uid]; !ok {
-					continue
-				}
-			}
-			p.mu.Lock()
-			route := p.outbound[src.userID]
-			p.mu.Unlock()
-			// 按实例核对（#23）：同名 uid 已换成新实例的路由时，旧 forward 循环
-			// 不得把旧轨道的包写进新实例的 track。
-			if route == nil || route.src != src {
-				continue
-			}
-			// pion 只改写绑定侧 SSRC/PT，Seq/TS 与 payload 原样透传；写失败（如对端
-			// 正在重协商、路由已被摘除）丢包即可
-			_ = route.track.WriteRTP(pkt)
-		}
-		r.mu.RUnlock()
+		r.fanoutPacket(src, pkt, whisper)
 	}
+}
+
+// fanoutPacket 是 forward 门控后的扇出热段；锁覆盖与路由实例核对保持原序。
+func (r *Room) fanoutPacket(src *Peer, pkt *rtp.Packet, whisper *map[string]struct{}) {
+	r.mu.RLock()
+	for uid, p := range r.peers {
+		if uid == src.userID {
+			continue
+		}
+		if whisper != nil {
+			if _, ok := (*whisper)[uid]; !ok {
+				continue
+			}
+		}
+		p.mu.Lock()
+		route := p.outbound[src.userID]
+		p.mu.Unlock()
+		// 按实例核对（#23）：同名 uid 已换成新实例的路由时，旧 forward 循环
+		// 不得把旧轨道的包写进新实例的 track。
+		if route == nil || route.src != src {
+			continue
+		}
+		// pion 只改写绑定侧 SSRC/PT，Seq/TS 与 payload 原样透传；写失败（如对端
+		// 正在重协商、路由已被摘除）丢包即可
+		_ = route.track.WriteRTP(pkt)
+	}
+	r.mu.RUnlock()
 }
 
 // SetWhisperTargets 设置/清除某成员的悄悄话目标集合（#45）。active=false 表示
