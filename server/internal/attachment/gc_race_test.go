@@ -47,6 +47,60 @@ type failReserveStore struct {
 	failed bool
 }
 
+type failQueuedRowStore struct {
+	store.Store
+	id                      int64
+	reserveFail, finishFail bool
+}
+
+func (s *failQueuedRowStore) ReserveOrphanAttachment(ctx context.Context, id int64, before time.Time) (*store.Attachment, bool, error) {
+	if id == s.id && s.reserveFail {
+		return nil, false, errors.New("reserve permanently failed")
+	}
+	return s.Store.ReserveOrphanAttachment(ctx, id, before)
+}
+func (s *failQueuedRowStore) FinishOrphanAttachment(ctx context.Context, id int64) (bool, error) {
+	if id == s.id && s.finishFail {
+		return false, errors.New("finish permanently failed")
+	}
+	return s.Store.FinishOrphanAttachment(ctx, id)
+}
+func TestGCRowRetryStageErrorStillScansNewRows(t *testing.T) {
+	e := newGCEnv(t)
+	first := e.attachment(t, 1725, 0, false)
+	st := &failQueuedRowStore{Store: e.st, id: first.ID}
+	bl := &failDeleteBlob{Store: e.bl, failKey: first.StorageKey}
+	g := newExpiredGC(st, bl)
+	g.Batch = 1
+	if _, _, err := g.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if g.LastSweepStats().PendingRows != 1 {
+		t.Fatal("失败行应入队")
+	}
+	bl.setFailKey("")
+	st.reserveFail = true
+	second := e.attachment(t, 1726, 0, false)
+	rows, _, err := g.Sweep(context.Background())
+	if err == nil || rows != 1 {
+		t.Fatalf("Reserve重试失败仍需处理新行: rows=%d err=%v", rows, err)
+	}
+	assertAttachmentGone(t, e.st, second.ID)
+	st.reserveFail = false
+	st.finishFail = true
+	for _, id := range []int64{1727, 1728} {
+		next := e.attachment(t, id, 0, false)
+		rows, _, err = g.Sweep(context.Background())
+		if err == nil || rows != 1 || g.LastSweepStats().PendingRows != 1 {
+			t.Fatalf("Finish重试持续失败仍需处理新行: rows=%d stats=%+v err=%v", rows, g.LastSweepStats(), err)
+		}
+		assertAttachmentGone(t, e.st, next.ID)
+	}
+	if _, err := e.st.AttachmentByID(context.Background(), first.ID); err != nil {
+		t.Fatalf("失败行须保留重试: %v", err)
+	}
+}
+
 func (s *failReserveStore) ReserveOrphanAttachment(ctx context.Context, id int64, before time.Time) (*store.Attachment, bool, error) {
 	if id == s.failID && !s.failed {
 		s.failed = true
@@ -261,13 +315,14 @@ func TestGCUntrackedLocalDryRunAndTTL(t *testing.T) {
 
 type fakeScanner struct {
 	blob.Store
-	mu          sync.Mutex
-	objects     []blob.ObjectInfo
-	failed      bool
-	statHook    func(string)
-	statFailKey string
-	statFails   int
-	statFailAll bool
+	mu            sync.Mutex
+	objects       []blob.ObjectInfo
+	failed        bool
+	statHook      func(string)
+	statFailKey   string
+	statFails     int
+	statFailAll   bool
+	statPermanent map[string]bool
 }
 
 func (f *fakeScanner) Scan(_ context.Context, after string, limit int) ([]blob.ObjectInfo, string, bool, error) {
@@ -296,6 +351,9 @@ func (f *fakeScanner) Scan(_ context.Context, after string, limit int) ([]blob.O
 	return append([]blob.ObjectInfo(nil), f.objects[start:end]...), f.objects[end-1].Key, end == len(f.objects), nil
 }
 func (f *fakeScanner) Stat(ctx context.Context, key string) (blob.ObjectInfo, error) {
+	if f.statPermanent[key] {
+		return blob.ObjectInfo{}, errors.New("stat permanently failed")
+	}
 	if f.statFailAll {
 		return blob.ObjectInfo{}, errors.New("stat down")
 	}
@@ -315,6 +373,36 @@ func (f *fakeScanner) Stat(ctx context.Context, key string) (blob.ObjectInfo, er
 		}
 	}
 	return blob.ObjectInfo{}, blob.ErrNotFound
+}
+
+func TestGCThreePermanentObjectRetriesStillScanNewObjects(t *testing.T) {
+	e := newGCEnv(t)
+	old := time.Now().Add(-72 * time.Hour)
+	f := &fakeScanner{Store: e.bl, statPermanent: map[string]bool{"3231.bin": true, "3232.bin": true, "3233.bin": true}}
+	add := func(id int) {
+		key := fmt.Sprintf("%d.bin", id)
+		if err := e.bl.Put(context.Background(), key, []byte("x"), "application/octet-stream"); err != nil {
+			t.Fatal(err)
+		}
+		f.objects = append(f.objects, blob.ObjectInfo{Key: key, Modified: old, Owned: true})
+	}
+	for id := 3231; id <= 3233; id++ {
+		add(id)
+	}
+	g := newTestGC(e.st, f, 24*time.Hour)
+	g.Batch = 1
+	if _, _, err := g.SweepUntracked(context.Background(), false); err == nil || g.LastSweepStats().PendingObjects != 3 {
+		t.Fatalf("三失败键应排队并止损: stats=%+v err=%v", g.LastSweepStats(), err)
+	}
+	g.Batch = 3 // 重试预算足以在同一轮触发三次连续错误。
+	for _, id := range []int{3234, 3235} {
+		add(id)
+		_, deleted, err := g.SweepUntracked(context.Background(), false)
+		if err == nil || deleted != 1 || g.LastSweepStats().ObjectRetriesAttempted != 3 || g.LastSweepStats().ObjectPages == 0 {
+			t.Fatalf("重试阶段止损后主扫描仍应清理%d: deleted=%d stats=%+v err=%v", id, deleted, g.LastSweepStats(), err)
+		}
+		assertBlobGone(t, e.bl, fmt.Sprintf("%d.bin", id))
+	}
 }
 
 func TestGCQueuedObjectRetryWhileNewObjectsKeepArriving(t *testing.T) {

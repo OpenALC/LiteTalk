@@ -102,6 +102,8 @@ func (g *GC) Sweep(ctx context.Context) (rows, blobs int, err error) {
 	g.sweepMu.Lock()
 	defer g.sweepMu.Unlock()
 	stats := SweepStats{}
+	var retryErr error
+	defer func() { err = errors.Join(err, retryErr) }()
 	defer func() {
 		stats.PendingRows = len(g.rowRetries)
 		stats.PendingObjects = len(g.objectRetries)
@@ -124,7 +126,11 @@ func (g *GC) Sweep(ctx context.Context) (rows, blobs int, err error) {
 		owned, ok, rerr := g.Store.ReserveOrphanAttachment(ctx, id, before)
 		if rerr != nil {
 			g.rowRetries = append(g.rowRetries, id)
-			return rows, blobs, rerr
+			if ctx.Err() != nil {
+				return rows, blobs, ctx.Err()
+			}
+			retryErr = fmt.Errorf("附件行重试阶段 Reserve(%d): %w", id, rerr)
+			break
 		}
 		if !ok {
 			delete(g.rowRetrySet, id)
@@ -142,7 +148,11 @@ func (g *GC) Sweep(ctx context.Context) (rows, blobs int, err error) {
 		deleted, derr := g.Store.FinishOrphanAttachment(ctx, id)
 		if derr != nil {
 			g.rowRetries = append(g.rowRetries, id)
-			return rows, blobs, derr
+			if ctx.Err() != nil {
+				return rows, blobs, ctx.Err()
+			}
+			retryErr = fmt.Errorf("附件行重试阶段 Finish(%d): %w", id, derr)
+			break
 		}
 		delete(g.rowRetrySet, id)
 		if deleted {
@@ -271,6 +281,8 @@ func (g *GC) SweepUntracked(ctx context.Context, dryRun bool) (found, deleted in
 }
 
 func (g *GC) sweepUntracked(ctx context.Context, dryRun bool, stats *SweepStats) (found, deleted int, err error) {
+	var retryErr error
+	defer func() { err = errors.Join(err, retryErr) }()
 	if g.Store == nil || g.Blob == nil {
 		return 0, 0, errors.New("attachment: GC 缺少 Store 或 Blob")
 	}
@@ -322,7 +334,11 @@ func (g *GC) sweepUntracked(ctx context.Context, dryRun bool, stats *SweepStats)
 			if serr != nil {
 				g.objectRetries = append(g.objectRetries, key)
 				if fatal := objectError(serr); fatal != nil {
-					return found, deleted, fatal
+					if ctx.Err() != nil {
+						return found, deleted, ctx.Err()
+					}
+					retryErr = fmt.Errorf("对象重试阶段 Stat(%s): %w", key, fatal)
+					break
 				}
 				continue
 			}
@@ -330,7 +346,11 @@ func (g *GC) sweepUntracked(ctx context.Context, dryRun bool, stats *SweepStats)
 			if rerr != nil {
 				g.objectRetries = append(g.objectRetries, key)
 				if fatal := objectError(rerr); fatal != nil {
-					return found, deleted, fatal
+					if ctx.Err() != nil {
+						return found, deleted, ctx.Err()
+					}
+					retryErr = fmt.Errorf("对象重试阶段复核(%s): %w", key, fatal)
+					break
 				}
 				continue
 			}
@@ -349,6 +369,8 @@ func (g *GC) sweepUntracked(ctx context.Context, dryRun bool, stats *SweepStats)
 			}
 		}
 	}
+	// 重试阶段达到止损阈值不挡住主扫描；主扫描仍有独立的三次错误预算。
+	consecutiveErrors = 0
 	for page := 0; page < maxGCBatchesPerSweep; page++ {
 		objects, next, done, err := scanner.Scan(ctx, cursor, g.batch())
 		if err != nil {
