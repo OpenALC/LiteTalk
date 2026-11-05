@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # measure-window.sh — LiteTalk 窗口生命周期测量（GTK3/GTK4 基线，任务卡 W0-1 / #5）
+# 仅诊断，非构建/发版路径。
 #
 # 对指定 LiteTalk 客户端二进制做可复跑的窗口生命周期与资源测量，输出机器可读 TSV
 # （stdout 与 --out 文件，二者内容一致）。测量在隔离环境进行：私有 D-Bus 会话总线、
