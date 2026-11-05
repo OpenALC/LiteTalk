@@ -2,56 +2,110 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
 	"io/fs"
 	"math"
 	"os"
-	"strconv"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/OpenALC/LiteTalk/server/migrations"
+	mysqldrv "github.com/go-sql-driver/mysql"
 )
 
-// openTestMySQL 连接真库；DSN 不可用时返回 nil（测试 t.Skip）。
-func openTestMySQL(t *testing.T) *MySQL {
+// 没有配置 DSN 的本地测试可跳过；CI 必须显式要求真库。
+func testMySQLDSN(t *testing.T) string {
 	t.Helper()
 	dsn := os.Getenv("LITETALK_MYSQL_DSN")
 	if dsn == "" {
-		dsn = "root:@tcp(127.0.0.1:3306)/?parseTime=true&multiStatements=true"
+		if os.Getenv("LITETALK_MYSQL_REQUIRED") == "1" {
+			t.Fatal("真库测试要求 LITETALK_MYSQL_DSN")
+		}
+		t.Skip("未配置 LITETALK_MYSQL_DSN，跳过可选真库测试")
 	}
-	m, err := OpenMySQL(dsn)
+	if _, err := mysqldrv.ParseDSN(dsn); err != nil {
+		t.Fatalf("解析 MySQL DSN 失败: %v", err)
+	}
+	return dsn
+}
+
+// openTestMySQL 为每个调用方提供独立真库，保留既有辅助函数签名。
+func openTestMySQL(t *testing.T) *MySQL {
+	t.Helper()
+	return openTestMySQLSchema(t, "default")
+}
+
+// openTestMySQLSchema 为单个测试创建随机库；连接池的 DSN 显式带库名。
+// 不经 OpenMySQL，避免生产读取环境变量的覆盖规则把连接导向基准库。
+func openTestMySQLSchema(t *testing.T, schemaHint string) *MySQL {
+	t.Helper()
+	if !regexp.MustCompile(`^[a-z][a-z0-9_]{0,24}$`).MatchString(schemaHint) {
+		t.Fatalf("不安全的测试库名前缀: %q", schemaHint)
+	}
+	cfg, err := mysqldrv.ParseDSN(testMySQLDSN(t))
 	if err != nil {
-		t.Skipf("MySQL 不可用，跳过真库测试: %v", err)
+		t.Fatalf("解析 MySQL DSN 失败: %v", err)
 	}
+	var nonce [8]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		t.Fatalf("生成临时库名失败: %v", err)
+	}
+	schema := "litetalk_ci_" + schemaHint + "_" + hex.EncodeToString(nonce[:])
+	cfg.DBName = ""
+	admin, err := sql.Open("mysql", cfg.FormatDSN())
+	if err != nil {
+		t.Fatalf("打开 MySQL 连接失败: %v", err)
+	}
+	defer admin.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := admin.PingContext(ctx); err != nil {
+		t.Fatalf("MySQL Ping 失败: %v", err)
+	}
+	if _, err := admin.ExecContext(ctx, "CREATE DATABASE `"+schema+"` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"); err != nil {
+		t.Fatalf("创建临时库失败: %v", err)
+	}
+	cfg.DBName = schema
+	db, err := sql.Open("mysql", cfg.FormatDSN())
+	if err == nil {
+		err = db.PingContext(ctx)
+	}
+	if err != nil {
+		if db != nil {
+			_ = db.Close()
+		}
+		_, _ = admin.ExecContext(ctx, "DROP DATABASE `"+schema+"`")
+		t.Fatalf("连接临时库失败: %v", err)
+	}
+	db.SetMaxOpenConns(20)
+	db.SetMaxIdleConns(5)
+	m := &MySQL{db: db}
+	t.Cleanup(func() {
+		_ = m.Close()
+		cfg.DBName = ""
+		cleanup, err := sql.Open("mysql", cfg.FormatDSN())
+		if err != nil {
+			t.Errorf("打开临时库清理连接失败: %v", err)
+			return
+		}
+		defer cleanup.Close()
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		if _, err := cleanup.ExecContext(cleanupCtx, "DROP DATABASE `"+schema+"`"); err != nil {
+			t.Errorf("清理临时库失败: %v", err)
+		}
+	})
 	return m
 }
 
 // TestMySQLMigrateAndCRUD 真库：建库→迁移→回滚→再迁移→基础 CRUD。
 func TestMySQLMigrateAndCRUD(t *testing.T) {
-	m := openTestMySQL(t)
-	defer m.Close()
+	m := openTestMySQLSchema(t, "migrate")
 	ctx := context.Background()
-
-	// 建独立测试库，避免污染。
-	if _, err := m.DB().ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS litetalk_test"); err != nil {
-		t.Fatalf("建测试库失败: %v", err)
-	}
-	if _, err := m.DB().ExecContext(ctx, "USE litetalk_test"); err != nil {
-		t.Fatal(err)
-	}
-	// 清理历史。必须覆盖每条迁移建过的表（否则跨运行不幂等：上一轮留下的表会让
-	// 下一轮 CREATE TABLE 直接 1050）——新增迁移建表要同步这张清单。
-	for _, tbl := range []string{
-		"attachments", "read_states", "invites", "messages", "message_mentions", "channel_members", "channels", "categories", "server_members",
-		"servers", "friendships", "users", "user_sessions", "kv", "schema_migrations",
-		"audit_log", "channel_overwrites", "member_roles", "roles", "api_tokens",
-		"push_devices",
-		"webhook_deliveries", "inbound_webhooks", "webhooks",
-		"oidc_identities",
-	} {
-		_, _ = m.DB().ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl)
-	}
 
 	migFS := findMigrations(t)
 	if err := m.Migrate(ctx, migFS); err != nil {
@@ -78,7 +132,7 @@ func TestMySQLMigrateAndCRUD(t *testing.T) {
 		}
 	}
 	var cnt int
-	if err := m.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='litetalk_test' AND table_name='users'").Scan(&cnt); err != nil || cnt != 0 {
+	if err := m.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='users'").Scan(&cnt); err != nil || cnt != 0 {
 		t.Fatalf("回滚后 users 表应消失 cnt=%d err=%v", cnt, err)
 	}
 	// 再迁移回来。
@@ -185,21 +239,13 @@ func TestMySQLMigrateAndCRUD(t *testing.T) {
 // 大小写邮箱也能被规范化邮箱命中，且大小写变体重复建号冲突（SQLite 靠
 // lower() 兜底，两边语义对齐）。
 func TestMySQLUserByEmailCaseInsensitive(t *testing.T) {
-	m := openTestMySQL(t)
-	defer m.Close()
+	m := openTestMySQLSchema(t, "email")
 	ctx := context.Background()
-	if _, err := m.DB().ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS litetalk_test"); err != nil {
-		t.Fatalf("建测试库失败: %v", err)
-	}
-	if _, err := m.DB().ExecContext(ctx, "USE litetalk_test"); err != nil {
-		t.Fatal(err)
-	}
 	if err := m.Migrate(ctx, findMigrations(t)); err != nil {
 		t.Fatalf("迁移失败: %v", err)
 	}
-	suffix := strconv.FormatInt(time.Now().UnixNano()%1e9, 10)
-	email := "Legacy.Mixed." + suffix + "@Example.COM"
-	mixed := &User{Email: email, Nickname: "ci" + suffix, Tag: "0001", PasswordHash: "h"}
+	email := "Legacy.Mixed@Example.COM"
+	mixed := &User{Email: email, Nickname: "ci", Tag: "0001", PasswordHash: "h"}
 	if err := m.CreateUser(ctx, mixed); err != nil {
 		t.Fatalf("CreateUser: %v", err)
 	}
@@ -208,7 +254,7 @@ func TestMySQLUserByEmailCaseInsensitive(t *testing.T) {
 		t.Fatalf("规范化邮箱应命中存量混合大小写行: %+v %v", got, err)
 	}
 	if err := m.CreateUser(ctx, &User{
-		Email: strings.ToLower(email), Nickname: "dup" + suffix, Tag: "0002",
+		Email: strings.ToLower(email), Nickname: "dup", Tag: "0002",
 	}); err != ErrConflict {
 		t.Fatalf("ci 排序下大小写变体的同一邮箱应 ErrConflict，实际 %v", err)
 	}

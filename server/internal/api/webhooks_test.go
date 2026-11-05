@@ -715,6 +715,15 @@ func newRebindFixture(t *testing.T, redactURL ...bool) *rebindFixture {
 	return f
 }
 
+// newRebindFixtureWithoutDispatch 用于只测 PATCH 管理门的用例。建订阅前停稳投递器，
+// 避免先前入服事件在后台更新 FailCount，干扰「拒绝后整行未写入」断言。
+func newRebindFixtureWithoutDispatch(t *testing.T, redactURL ...bool) *rebindFixture {
+	t.Helper()
+	f := newRebindFixture(t, redactURL...)
+	f.disp.Close()
+	return f
+}
+
 // setViewDeny 给 M 装/撤指定频道的成员级 deny ViewChannel 覆盖，并失效快照。
 func (f *rebindFixture) setViewDeny(t *testing.T, channelID int64, deny bool) {
 	t.Helper()
@@ -913,7 +922,7 @@ func TestWebhookPatchWithoutURLKeepsCreator(t *testing.T) {
 // 频道都无 ViewChannel 时，改址 403 且行不变；不改址的 PATCH 不受门影响；
 // 恢复可见后改址成功并改绑。
 func TestWebhookPatchURLRequiresChannelView(t *testing.T) {
-	f := newRebindFixture(t)
+	f := newRebindFixtureWithoutDispatch(t)
 	oT, mT := &hookTarget{}, &hookTarget{}
 	oSrv := httptest.NewServer(oT.handler())
 	defer oSrv.Close()
@@ -1039,7 +1048,7 @@ func TestOutboundWebhookRejectsRedactedURLWrites(t *testing.T) {
 }
 
 func testOutboundWebhookRejectsRedactedURLWrites(t *testing.T, enabled bool) {
-	f := newRebindFixture(t, enabled)
+	f := newRebindFixtureWithoutDispatch(t, enabled)
 	const fullURL = "https://hooks.example.com/services/T/B/secret?key=abc"
 	hookID, _ := f.createHook(t, f.accO, fullURL)
 	listPath := fmt.Sprintf("/api/v1/servers/%d/webhooks", f.serverID)
@@ -1096,7 +1105,7 @@ func testOutboundWebhookRejectsRedactedURLWrites(t *testing.T, enabled bool) {
 // 同时改址并改成 message.created 必须 403（否则改址成功后才改事件即可绕过门）；
 // 改址 + 保留无频道维度的 events 则放行并改绑。
 func TestWebhookPatchURLEventsGateUsesNewEvents(t *testing.T) {
-	f := newRebindFixture(t)
+	f := newRebindFixtureWithoutDispatch(t)
 	oSrv := httptest.NewServer((&hookTarget{}).handler())
 	defer oSrv.Close()
 	mSrv := httptest.NewServer((&hookTarget{}).handler())
@@ -1142,7 +1151,7 @@ func TestWebhookPatchURLEventsGateUsesNewEvents(t *testing.T) {
 // 由服主代持。无可见性时 409 不应改动库行，允许修改也不应改绑创建者。
 func TestWebhookPatchEventsUsesEffectiveCreator(t *testing.T) {
 	t.Run("创建者不可见但操作者可见时拒绝且不落库", func(t *testing.T) {
-		f := newRebindFixture(t)
+		f := newRebindFixtureWithoutDispatch(t)
 		created := postJSON(t, f.h, fmt.Sprintf("/api/v1/servers/%d/webhooks", f.serverID), f.accM,
 			map[string]any{"url": "https://hooks.example.com/m", "events": []string{"member.joined"}}, http.StatusCreated)
 		hookID := asID(created["id"])
@@ -1168,7 +1177,7 @@ func TestWebhookPatchEventsUsesEffectiveCreator(t *testing.T) {
 	})
 
 	t.Run("创建者和操作者都不可见仍返回冲突且不落库", func(t *testing.T) {
-		f := newRebindFixture(t)
+		f := newRebindFixtureWithoutDispatch(t)
 		created := postJSON(t, f.h, fmt.Sprintf("/api/v1/servers/%d/webhooks", f.serverID), f.accM,
 			map[string]any{"url": "https://hooks.example.com/m", "events": []string{"member.joined"}}, http.StatusCreated)
 		hookID := asID(created["id"])
@@ -1210,7 +1219,7 @@ func TestWebhookPatchEventsUsesEffectiveCreator(t *testing.T) {
 	})
 
 	t.Run("操作者先改址再单独改事件", func(t *testing.T) {
-		f := newRebindFixture(t)
+		f := newRebindFixtureWithoutDispatch(t)
 		created := postJSON(t, f.h, fmt.Sprintf("/api/v1/servers/%d/webhooks", f.serverID), f.accM,
 			map[string]any{"url": "https://hooks.example.com/m", "events": []string{"member.joined"}}, http.StatusCreated)
 		hookID := asID(created["id"])
@@ -1229,7 +1238,7 @@ func TestWebhookPatchEventsUsesEffectiveCreator(t *testing.T) {
 	})
 
 	t.Run("创建者可见但操作者不可见时允许且不改绑", func(t *testing.T) {
-		f := newRebindFixture(t)
+		f := newRebindFixtureWithoutDispatch(t)
 		created := postJSON(t, f.h, fmt.Sprintf("/api/v1/servers/%d/webhooks", f.serverID), f.accO,
 			map[string]any{"url": "https://hooks.example.com/o", "events": []string{"member.joined"}}, http.StatusCreated)
 		hookID := asID(created["id"])
@@ -1244,7 +1253,7 @@ func TestWebhookPatchEventsUsesEffectiveCreator(t *testing.T) {
 	})
 
 	t.Run("旧行按服主代持且不补写创建者", func(t *testing.T) {
-		f := newRebindFixture(t)
+		f := newRebindFixtureWithoutDispatch(t)
 		legacy := &store.OutboundWebhook{ServerID: f.serverID, URL: "https://hooks.example.com/legacy",
 			Secret: "s", Events: "member.joined"}
 		if err := f.mem.CreateOutboundWebhook(context.Background(), legacy); err != nil {
@@ -1279,7 +1288,7 @@ func TestWebhookPatchEventsKeepsChannelQueryErrors(t *testing.T) {
 		{"internal", fmt.Errorf("频道查询失败"), http.StatusInternalServerError, "internal"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := newRebindFixture(t)
+			f := newRebindFixtureWithoutDispatch(t)
 			created := postJSON(t, f.h, fmt.Sprintf("/api/v1/servers/%d/webhooks", f.serverID), f.accO,
 				map[string]any{"url": "https://hooks.example.com/o", "events": []string{"member.joined"}},
 				http.StatusCreated)
