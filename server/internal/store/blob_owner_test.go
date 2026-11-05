@@ -2,10 +2,13 @@ package store
 
 import (
 	"context"
-	"os"
+	"database/sql"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"testing"
+
+	mysqldrv "github.com/go-sql-driver/mysql"
 )
 
 func TestBlobOwnerMemDeploymentIsolation(t *testing.T) {
@@ -78,22 +81,41 @@ func TestBlobOwnerMySQLConcurrentRestart(t *testing.T) {
 	if err := a.Migrate(context.Background(), findMigrations(t)); err != nil {
 		t.Fatal(err)
 	}
-	dsn := os.Getenv("LITETALK_MYSQL_DSN")
-	b, err := OpenMySQL(dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer b.Close()
+	b := openBlobOwnerMySQLPeer(t, a)
 	ids := concurrentBlobOwners(t, a, b)
-	restarted, err := OpenMySQL(dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer restarted.Close()
+	restarted := openBlobOwnerMySQLPeer(t, a)
 	again, err := restarted.BlobOwnerID(context.Background())
 	if err != nil || again != ids[0] {
 		t.Fatalf("MySQL 重连后归属漂移")
 	}
+}
+
+func openBlobOwnerMySQLPeer(t *testing.T, source *MySQL) *MySQL {
+	t.Helper()
+	var schema string
+	if err := source.DB().QueryRow(`SELECT DATABASE()`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	if !regexp.MustCompile(`^litetalk_ci_roles_[0-9a-f]{16}$`).MatchString(schema) {
+		t.Fatalf("非临时测试库: %q", schema)
+	}
+	cfg, err := mysqldrv.ParseDSN(testMySQLDSN(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.DBName = schema
+	db, err := sql.Open("mysql", cfg.FormatDSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PingContext(context.Background()); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(20)
+	m := &MySQL{db: db}
+	t.Cleanup(func() { _ = m.Close() })
+	return m
 }
 
 func concurrentBlobOwners(t *testing.T, a, b Store) [2]string {
