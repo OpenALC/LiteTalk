@@ -3,6 +3,7 @@ package attachment
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -89,6 +90,85 @@ func TestGCFailedHeadProgressesAcrossSweepBudget(t *testing.T) {
 		t.Fatalf("一圈后重试失败首项: %d %v", rows, err)
 	}
 	assertAttachmentGone(t, e.st, first.ID)
+}
+
+func TestGCQueuedRowRetryWhileNewRowsKeepArriving(t *testing.T) {
+	e := newGCEnv(t)
+	first := e.attachment(t, 3000, 0, false)
+	for i := 1; i < 60; i++ {
+		e.attachment(t, int64(3000+i), 0, false)
+	}
+	f := &failDeleteBlob{Store: e.bl, failKey: first.StorageKey}
+	g := newExpiredGC(e.st, f)
+	g.Batch = 1
+	if _, _, err := g.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if g.LastSweepStats().PendingRows != 1 || g.afterID == 0 {
+		t.Fatalf("首轮应保留重试项并跨预算: %+v cursor=%d", g.LastSweepStats(), g.afterID)
+	}
+	firstCursor := g.afterID
+	for i := 60; i < 110; i++ {
+		e.attachment(t, int64(3000+i), 0, false)
+	}
+	f.setFailKey("")
+	if _, _, err := g.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	assertAttachmentGone(t, e.st, first.ID)
+	if g.afterID <= firstCursor || g.LastSweepStats().RowRetriesAttempted != 1 {
+		t.Fatalf("持续新增时应先重试旧行且主游标继续: %+v cursor=%d", g.LastSweepStats(), g.afterID)
+	}
+}
+
+type failAllDeleteBlob struct {
+	blob.Store
+	fail atomic.Bool
+}
+type cancelDeleteBlob struct {
+	blob.Store
+	cancel context.CancelFunc
+}
+
+func (b *cancelDeleteBlob) Delete(ctx context.Context, key string) error {
+	b.cancel()
+	return ctx.Err()
+}
+func TestGCCancellationDoesNotQueueRow(t *testing.T) {
+	e := newGCEnv(t)
+	e.attachment(t, 3121, 0, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	g := newExpiredGC(e.st, &cancelDeleteBlob{Store: e.bl, cancel: cancel})
+	_, _, err := g.Sweep(ctx)
+	if !errors.Is(err, context.Canceled) || g.LastSweepStats().PendingRows != 0 {
+		t.Fatalf("取消应直接返回并保留主游标: stats=%+v err=%v", g.LastSweepStats(), err)
+	}
+}
+
+func (b *failAllDeleteBlob) Delete(ctx context.Context, key string) error {
+	if b.fail.Load() {
+		return errors.New("delete down")
+	}
+	return b.Store.Delete(ctx, key)
+}
+func TestGCRowRetryQueueOverflowIsExplicit(t *testing.T) {
+	e := newGCEnv(t)
+	a := e.attachment(t, 3111, 0, false)
+	b := e.attachment(t, 3112, 0, false)
+	f := &failAllDeleteBlob{Store: e.bl}
+	f.fail.Store(true)
+	g := newExpiredGC(e.st, f)
+	g.Batch = 1
+	g.retryLimit = 1
+	if _, _, err := g.Sweep(context.Background()); err == nil || g.LastSweepStats().RetryOverflow != 1 || g.LastSweepStats().PendingRows != 1 {
+		t.Fatalf("队列满必须显式失败: stats=%+v err=%v", g.LastSweepStats(), err)
+	}
+	f.fail.Store(false)
+	if _, _, err := g.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	assertAttachmentGone(t, e.st, a.ID)
+	assertAttachmentGone(t, e.st, b.ID)
 }
 
 type blockFirstDelete struct {
@@ -187,6 +267,7 @@ type fakeScanner struct {
 	statHook    func(string)
 	statFailKey string
 	statFails   int
+	statFailAll bool
 }
 
 func (f *fakeScanner) Scan(_ context.Context, after string, limit int) ([]blob.ObjectInfo, string, bool, error) {
@@ -215,6 +296,9 @@ func (f *fakeScanner) Scan(_ context.Context, after string, limit int) ([]blob.O
 	return append([]blob.ObjectInfo(nil), f.objects[start:end]...), f.objects[end-1].Key, end == len(f.objects), nil
 }
 func (f *fakeScanner) Stat(ctx context.Context, key string) (blob.ObjectInfo, error) {
+	if f.statFailAll {
+		return blob.ObjectInfo{}, errors.New("stat down")
+	}
 	if key == f.statFailKey && f.statFails > 0 {
 		f.statFails--
 		return blob.ObjectInfo{}, errors.New("stat failed")
@@ -231,6 +315,121 @@ func (f *fakeScanner) Stat(ctx context.Context, key string) (blob.ObjectInfo, er
 		}
 	}
 	return blob.ObjectInfo{}, blob.ErrNotFound
+}
+
+func TestGCQueuedObjectRetryWhileNewObjectsKeepArriving(t *testing.T) {
+	e := newGCEnv(t)
+	old := time.Now().Add(-72 * time.Hour)
+	f := &fakeScanner{Store: e.bl, statFailKey: "3200.bin", statFails: 1}
+	add := func(start, end int) {
+		for i := start; i < end; i++ {
+			key := fmt.Sprintf("%d.bin", i)
+			if err := e.bl.Put(context.Background(), key, []byte("x"), "application/octet-stream"); err != nil {
+				t.Fatal(err)
+			}
+			f.objects = append(f.objects, blob.ObjectInfo{Key: key, Modified: old, Owned: true})
+		}
+	}
+	add(3200, 3260)
+	g := newTestGC(e.st, f, 24*time.Hour)
+	g.Batch = 1
+	if _, _, err := g.SweepUntracked(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	if g.LastSweepStats().PendingObjects != 1 || g.blobCursor == "" {
+		t.Fatalf("首轮应保留失败键且主扫描未到底: %+v cursor=%q", g.LastSweepStats(), g.blobCursor)
+	}
+	firstCursor := g.blobCursor
+	add(3260, 3310)
+	if _, _, err := g.SweepUntracked(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	assertBlobGone(t, e.bl, "3200.bin")
+	if g.blobCursor <= firstCursor || g.LastSweepStats().ObjectRetriesAttempted != 1 {
+		t.Fatalf("持续新增时应先重试旧键且主扫描继续: %+v cursor=%q", g.LastSweepStats(), g.blobCursor)
+	}
+}
+
+func TestGCFreshUntrackedObjectMaturesWithContinuousListing(t *testing.T) {
+	e := newGCEnv(t)
+	now := time.Now()
+	old := now.Add(-72 * time.Hour)
+	f := &fakeScanner{Store: e.bl}
+	add := func(start, end int) {
+		for i := start; i < end; i++ {
+			key := fmt.Sprintf("%d.bin", i)
+			if err := e.bl.Put(context.Background(), key, []byte("x"), "application/octet-stream"); err != nil {
+				t.Fatal(err)
+			}
+			at := old
+			if i == 3400 {
+				at = now
+			}
+			f.objects = append(f.objects, blob.ObjectInfo{Key: key, Modified: at, Owned: true})
+		}
+	}
+	add(3400, 3460)
+	g := newTestGC(e.st, f, 24*time.Hour)
+	g.Batch = 1
+	g.now = func() time.Time { return now }
+	if _, _, err := g.SweepUntracked(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	assertBlobExists(t, e.bl, "3400.bin")
+	if g.LastSweepStats().PendingObjects != 1 || g.blobCursor == "" {
+		t.Fatalf("新对象应等TTL并独立重试: %+v", g.LastSweepStats())
+	}
+	firstCursor := g.blobCursor
+	add(3460, 3510)
+	g.now = func() time.Time { return now.Add(72 * time.Hour) }
+	if _, _, err := g.SweepUntracked(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	assertBlobGone(t, e.bl, "3400.bin")
+	if g.blobCursor <= firstCursor {
+		t.Fatal("主扫描仍应向前推进")
+	}
+}
+
+func TestGCObjectRetryQueueOverflowIsExplicit(t *testing.T) {
+	e := newGCEnv(t)
+	old := time.Now().Add(-72 * time.Hour)
+	f := &fakeScanner{Store: e.bl, statFailAll: true}
+	for i := 3211; i <= 3212; i++ {
+		key := fmt.Sprintf("%d.bin", i)
+		if err := e.bl.Put(context.Background(), key, []byte("x"), "application/octet-stream"); err != nil {
+			t.Fatal(err)
+		}
+		f.objects = append(f.objects, blob.ObjectInfo{Key: key, Modified: old, Owned: true})
+	}
+	g := newTestGC(e.st, f, 24*time.Hour)
+	g.Batch = 1
+	g.retryLimit = 1
+	if _, _, err := g.SweepUntracked(context.Background(), false); err == nil || g.LastSweepStats().RetryOverflow != 1 || g.LastSweepStats().PendingObjects != 1 {
+		t.Fatalf("对象队列满必须显式失败: stats=%+v err=%v", g.LastSweepStats(), err)
+	}
+	f.statFailAll = false
+	if _, _, err := g.SweepUntracked(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	assertBlobGone(t, e.bl, "3211.bin")
+	assertBlobGone(t, e.bl, "3212.bin")
+}
+
+func TestGCCancellationDoesNotQueueObject(t *testing.T) {
+	e := newGCEnv(t)
+	key := "3221.bin"
+	if err := e.bl.Put(context.Background(), key, []byte("x"), "application/octet-stream"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	f := &fakeScanner{Store: e.bl, objects: []blob.ObjectInfo{{Key: key, Modified: time.Now().Add(-72 * time.Hour), Owned: true}}}
+	f.statHook = func(string) { cancel() }
+	g := newTestGC(e.st, f, 24*time.Hour)
+	_, _, err := g.SweepUntracked(ctx, false)
+	if !errors.Is(err, context.Canceled) || g.LastSweepStats().PendingObjects != 0 {
+		t.Fatalf("取消应直接返回并保留主游标: stats=%+v err=%v", g.LastSweepStats(), err)
+	}
 }
 
 func TestGCStatFailureDoesNotStarveNextPage(t *testing.T) {
