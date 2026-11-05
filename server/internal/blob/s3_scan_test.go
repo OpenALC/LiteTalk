@@ -12,12 +12,13 @@ import (
 )
 
 func TestS3ScanPagesAndStat(t *testing.T) {
+	owner := strings.Repeat("a", 64)
 	keys := []string{"1901.bin", "1902.bin", "1903.thumb.jpg"}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
 			w.Header().Set("Last-Modified", "Wed, 05 Nov 2025 00:00:00 GMT")
 			w.Header().Set("ETag", `"etag"`)
-			w.Header().Set("X-Amz-Meta-Litetalk-Attachment", "1")
+			w.Header().Set("X-Amz-Meta-Litetalk-Attachment", owner)
 			w.Header().Set("Content-Length", "1")
 			return
 		}
@@ -42,7 +43,7 @@ func TestS3ScanPagesAndStat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, _, err := newS3(Config{Endpoint: u.Host, Bucket: "test", AccessKey: "test", SecretKey: "test", Region: "us-east-1", PathStyle: true}, nil)
+	st, _, err := newS3(Config{Endpoint: u.Host, Bucket: "test", AccessKey: "test", SecretKey: "test", Region: "us-east-1", PathStyle: true, OwnerID: owner}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,6 +63,7 @@ func TestS3ScanPagesAndStat(t *testing.T) {
 }
 
 func TestS3PutMarksOwnership(t *testing.T) {
+	owner := strings.Repeat("a", 64)
 	var marked atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
@@ -69,7 +71,7 @@ func TestS3PutMarksOwnership(t *testing.T) {
 			w.WriteHeader(400)
 			return
 		}
-		marked.Store(r.Header.Get("X-Amz-Meta-Litetalk-Attachment") == "1")
+		marked.Store(r.Header.Get("X-Amz-Meta-Litetalk-Attachment") == owner)
 		w.Header().Set("ETag", `"etag"`)
 	}))
 	defer srv.Close()
@@ -77,7 +79,7 @@ func TestS3PutMarksOwnership(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, _, err := newS3(Config{Endpoint: u.Host, Bucket: "test", AccessKey: "test", SecretKey: "test", Region: "us-east-1", PathStyle: true}, nil)
+	st, _, err := newS3(Config{Endpoint: u.Host, Bucket: "test", AccessKey: "test", SecretKey: "test", Region: "us-east-1", PathStyle: true, OwnerID: owner}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,5 +88,53 @@ func TestS3PutMarksOwnership(t *testing.T) {
 	}
 	if !marked.Load() {
 		t.Fatal("S3 写入缺少归属标记")
+	}
+}
+
+func TestS3SharedBucketOwnerIsolation(t *testing.T) {
+	ownerA, ownerB := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	var marker atomic.Value
+	marker.Store(ownerA)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Last-Modified", "Wed, 05 Nov 2025 00:00:00 GMT")
+		w.Header().Set("Content-Length", "1")
+		w.Header().Set("ETag", `"etag"`)
+		w.Header().Set("X-Amz-Meta-Litetalk-Attachment", marker.Load().(string))
+	}))
+	defer srv.Close()
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := Config{Endpoint: u.Host, Bucket: "shared", AccessKey: "test", SecretKey: "test", Region: "us-east-1", PathStyle: true, OwnerID: ownerA}
+	aStore, _, err := newS3(config, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.OwnerID = ownerB
+	bStore, _, err := newS3(config, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		marker     string
+		ownA, ownB bool
+	}{{ownerA, true, false}, {ownerB, false, true}, {"1", false, false}, {"", false, false}} {
+		marker.Store(tc.marker)
+		a, err := aStore.(*s3Store).Stat(context.Background(), "2001.bin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := bStore.(*s3Store).Stat(context.Background(), "2001.bin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a.Owned != tc.ownA || b.Owned != tc.ownB {
+			t.Fatalf("标记 %q 归属错误: A=%v B=%v", tc.marker, a.Owned, b.Owned)
+		}
 	}
 }

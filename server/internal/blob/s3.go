@@ -20,8 +20,9 @@ const maxS3GetBytes = 64 << 20
 
 // s3Store S3 兼容对象存储实现（AWS S3 / MinIO / Ceph 等，支持路径风格）。
 type s3Store struct {
-	cli    *minio.Client
-	bucket string
+	cli     *minio.Client
+	bucket  string
+	ownerID string
 }
 
 func newS3(cfg Config, lg *log.Logger) (Store, string, error) {
@@ -38,6 +39,8 @@ func newS3(cfg Config, lg *log.Logger) (Store, string, error) {
 		return nil, "", errors.New("blob: s3 驱动缺少 AccessKey")
 	case secretKey == "":
 		return nil, "", errors.New("blob: s3 驱动缺少 SecretKey")
+	case !validOwnerID(cfg.OwnerID):
+		return nil, "", errors.New("blob: s3 驱动缺少数据库归属值")
 	}
 	lookup := minio.BucketLookupAuto
 	if cfg.PathStyle {
@@ -56,7 +59,21 @@ func newS3(cfg Config, lg *log.Logger) (Store, string, error) {
 	if lg != nil {
 		lg.Printf("[blob] s3 endpoint=%s bucket=%s path_style=%v", endpoint, bucket, cfg.PathStyle)
 	}
-	return &s3Store{cli: cli, bucket: bucket}, "s3", nil
+	return &s3Store{cli: cli, bucket: bucket, ownerID: cfg.OwnerID}, "s3", nil
+}
+
+func validOwnerID(id string) bool {
+	if len(id) != 64 {
+		return false
+	}
+	for _, c := range id {
+		if c < '0' || c > '9' {
+			if c < 'a' || c > 'f' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // Put 上传对象（同 key 覆盖）。
@@ -68,7 +85,7 @@ func (s *s3Store) Put(ctx context.Context, key string, data []byte, contentType 
 		contentType = "application/octet-stream"
 	}
 	if _, err := s.cli.PutObject(ctx, s.bucket, key, bytes.NewReader(data), int64(len(data)),
-		minio.PutObjectOptions{ContentType: contentType, UserMetadata: map[string]string{"litetalk-attachment": "1"}}); err != nil {
+		minio.PutObjectOptions{ContentType: contentType, UserMetadata: map[string]string{"litetalk-attachment": s.ownerID}}); err != nil {
 		return fmt.Errorf("blob: 上传对象 %q: %w", key, err)
 	}
 	return nil
@@ -142,7 +159,7 @@ func (s *s3Store) Stat(ctx context.Context, key string) (ObjectInfo, error) {
 		return ObjectInfo{}, s3Error(key, err)
 	}
 	return ObjectInfo{Key: key, Modified: info.LastModified, Size: info.Size, ETag: info.ETag,
-		Owned: info.Metadata.Get("X-Amz-Meta-Litetalk-Attachment") == "1"}, nil
+		Owned: info.Metadata.Get("X-Amz-Meta-Litetalk-Attachment") == s.ownerID}, nil
 }
 
 // s3Error 把对象不存在归一成 ErrNotFound，其余错误保留原始链。

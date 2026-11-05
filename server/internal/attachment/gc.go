@@ -57,6 +57,7 @@ type SweepStats struct {
 	ObjectsListed        int
 	UntrackedFound       int
 	UntrackedUnowned     int
+	ObjectErrors         int
 }
 
 func (g *GC) LastSweepStats() SweepStats {
@@ -107,12 +108,12 @@ func (g *GC) Sweep(ctx context.Context) (rows, blobs int, err error) {
 		}
 		stats.AttachmentCandidates += len(list)
 		for i := range list {
-			g.afterID = list[i].ID
 			owned, ok, rerr := g.Store.ReserveOrphanAttachment(ctx, list[i].ID, before)
 			if rerr != nil {
 				return rows, blobs, rerr
 			}
 			if !ok {
+				g.afterID = list[i].ID
 				continue
 			}
 			n, ok := g.deleteBlobs(ctx, owned, lg)
@@ -126,6 +127,7 @@ func (g *GC) Sweep(ctx context.Context) (rows, blobs int, err error) {
 					rows++
 				}
 			}
+			g.afterID = list[i].ID
 		}
 		if len(list) < batch {
 			g.afterID = 0
@@ -169,6 +171,19 @@ func (g *GC) sweepUntracked(ctx context.Context, dryRun bool, stats *SweepStats)
 	}
 	before := g.timeNow().Add(-2 * g.unclaimedTTL())
 	cursor := g.blobCursor
+	consecutiveErrors := 0
+	// 单项故障让游标继续；连续故障视为后端整体不可用，限制本轮失败请求数。
+	objectError := func(err error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		stats.ObjectErrors++
+		consecutiveErrors++
+		if consecutiveErrors >= 3 {
+			return err
+		}
+		return nil
+	}
 	for page := 0; page < maxGCBatchesPerSweep; page++ {
 		objects, next, done, err := scanner.Scan(ctx, cursor, g.batch())
 		if err != nil {
@@ -183,42 +198,61 @@ func (g *GC) sweepUntracked(ctx context.Context, dryRun bool, stats *SweepStats)
 			}
 			exists, err := g.Store.AttachmentKeyExists(ctx, obj.Key)
 			if err != nil {
-				return found, deleted, err
+				if fatal := objectError(err); fatal != nil {
+					return found, deleted, fatal
+				}
+				continue
 			}
 			if exists {
+				consecutiveErrors = 0
 				continue
 			}
 			current, err := scanner.Stat(ctx, obj.Key)
 			if errors.Is(err, blob.ErrNotFound) {
+				consecutiveErrors = 0
 				continue
 			}
 			if err != nil {
-				return found, deleted, err
+				if fatal := objectError(err); fatal != nil {
+					return found, deleted, fatal
+				}
+				continue
 			}
 			if !current.Modified.Equal(obj.Modified) || current.Size != obj.Size || current.ETag != obj.ETag || !current.Modified.Before(before) {
+				consecutiveErrors = 0
 				continue
 			}
 			exists, err = g.Store.AttachmentKeyExists(ctx, obj.Key)
 			if err != nil {
-				return found, deleted, err
+				if fatal := objectError(err); fatal != nil {
+					return found, deleted, fatal
+				}
+				continue
 			}
 			if exists {
+				consecutiveErrors = 0
 				continue
 			}
 			found++
 			stats.UntrackedFound++
 			if dryRun {
+				consecutiveErrors = 0
 				continue
 			}
 			if !current.Owned {
 				// S3 共享桶内旧对象没有本应用标记；只报告，不按键名猜所有权。
 				stats.UntrackedUnowned++
+				consecutiveErrors = 0
 				continue
 			}
 			if err := g.Blob.Delete(ctx, obj.Key); err != nil && !errors.Is(err, blob.ErrNotFound) {
 				g.logger().Printf("附件回收: 删除无行对象 %s 失败: %v", obj.Key, err)
+				if fatal := objectError(err); fatal != nil {
+					return found, deleted, fatal
+				}
 				continue
 			}
+			consecutiveErrors = 0
 			deleted++
 			pageDeleted++
 		}
@@ -275,8 +309,8 @@ func (g *GC) sweep(ctx context.Context) {
 		return
 	}
 	stats := g.LastSweepStats()
-	g.logger().Printf("附件回收: 清理 %d 行 / %d 个对象；候选 %d 行、已读 %d 批/%d 孤儿、对象 %d 页/%d 个（无行候选 %d、归属未证 %d）；耗时 %s",
-		rows, blobs, stats.AttachmentCandidates, stats.ReadBatches, stats.ReadPruned, stats.ObjectPages, stats.ObjectsListed, stats.UntrackedFound, stats.UntrackedUnowned, time.Since(started).Round(time.Millisecond))
+	g.logger().Printf("附件回收: 清理 %d 行 / %d 个对象；候选 %d 行、已读 %d 批/%d 孤儿、对象 %d 页/%d 个（无行候选 %d、归属未证 %d、单项错误 %d）；耗时 %s",
+		rows, blobs, stats.AttachmentCandidates, stats.ReadBatches, stats.ReadPruned, stats.ObjectPages, stats.ObjectsListed, stats.UntrackedFound, stats.UntrackedUnowned, stats.ObjectErrors, time.Since(started).Round(time.Millisecond))
 }
 
 // deleteBlobs 删一个附件的全部对象。任一对象删除失败即停止并返回 false，

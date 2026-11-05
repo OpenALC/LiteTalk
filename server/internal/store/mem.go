@@ -13,7 +13,8 @@ import (
 // 语义与 MySQL 实现一致（唯一约束、外键式删除级联在 API 层处理）。
 // KV 部分经嵌入 MemKV 提供（拆分后 NewMemKV 可单独作为进程内 KV）。
 type Mem struct {
-	mu sync.Mutex
+	mu          sync.Mutex
+	blobOwnerID string
 
 	users       map[int64]*User
 	friendships map[int64]*Friendship

@@ -365,6 +365,8 @@ type AuditLog struct {
 
 // Store 数据访问接口（MySQL 与内存实现共同契约）。
 type Store interface {
+	// BlobOwnerID 是数据库持久的附件对象归属值；同库多实例一致，异库隔离。
+	BlobOwnerID(ctx context.Context) (string, error)
 	// users
 	CreateUser(ctx context.Context, u *User) error
 	UserByID(ctx context.Context, id int64) (*User, error)

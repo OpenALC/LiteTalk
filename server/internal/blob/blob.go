@@ -52,8 +52,9 @@ type Config struct {
 	AccessKey string
 	SecretKey string
 	Region    string
-	UseSSL    bool // 端点是否走 https
-	PathStyle bool // true = 路径风格（MinIO/Ceph 等），false = 虚拟主机风格
+	UseSSL    bool   // 端点是否走 https
+	PathStyle bool   // true = 路径风格（MinIO/Ceph 等），false = 虚拟主机风格
+	OwnerID   string // S3 对象归属：由数据库 BlobOwnerID 生成，非环境变量。
 }
 
 // New 按配置构造存储实现，返回实现与驱动名（"local"/"s3"）。

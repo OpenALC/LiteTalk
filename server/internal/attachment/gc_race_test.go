@@ -40,6 +40,57 @@ func TestGCFailedBatchHeadDoesNotStarveLaterRows(t *testing.T) {
 	}
 }
 
+type failReserveStore struct {
+	store.Store
+	failID int64
+	failed bool
+}
+
+func (s *failReserveStore) ReserveOrphanAttachment(ctx context.Context, id int64, before time.Time) (*store.Attachment, bool, error) {
+	if id == s.failID && !s.failed {
+		s.failed = true
+		return nil, false, errors.New("reserve failed")
+	}
+	return s.Store.ReserveOrphanAttachment(ctx, id, before)
+}
+func TestGCReserveErrorRetriesSameCursor(t *testing.T) {
+	e := newGCEnv(t)
+	a := e.attachment(t, 1720, 0, false)
+	st := &failReserveStore{Store: e.st, failID: a.ID}
+	g := newExpiredGC(st, e.bl)
+	if _, _, err := g.Sweep(context.Background()); err == nil {
+		t.Fatal("Reserve 错误应返回")
+	}
+	rows, _, err := g.Sweep(context.Background())
+	if err != nil || rows != 1 {
+		t.Fatalf("错误后应从同一ID重试: %d %v", rows, err)
+	}
+}
+func TestGCFailedHeadProgressesAcrossSweepBudget(t *testing.T) {
+	e := newGCEnv(t)
+	first := e.attachment(t, 1730, 0, false)
+	for i := 1; i < 55; i++ {
+		e.attachment(t, int64(1730+i), 0, false)
+	}
+	f := &failDeleteBlob{Store: e.bl, failKey: first.StorageKey}
+	g := newExpiredGC(e.st, f)
+	g.Batch = 1
+	rows, _, err := g.Sweep(context.Background())
+	if err != nil || rows != 49 {
+		t.Fatalf("第一轮预算内进度: %d %v", rows, err)
+	}
+	rows, _, err = g.Sweep(context.Background())
+	if err != nil || rows != 5 {
+		t.Fatalf("跨预算续扫: %d %v", rows, err)
+	}
+	f.setFailKey("")
+	rows, _, err = g.Sweep(context.Background())
+	if err != nil || rows != 1 {
+		t.Fatalf("一圈后重试失败首项: %d %v", rows, err)
+	}
+	assertAttachmentGone(t, e.st, first.ID)
+}
+
 type blockFirstDelete struct {
 	blob.Store
 	entered chan struct{}
@@ -130,10 +181,12 @@ func TestGCUntrackedLocalDryRunAndTTL(t *testing.T) {
 
 type fakeScanner struct {
 	blob.Store
-	mu       sync.Mutex
-	objects  []blob.ObjectInfo
-	failed   bool
-	statHook func(string)
+	mu          sync.Mutex
+	objects     []blob.ObjectInfo
+	failed      bool
+	statHook    func(string)
+	statFailKey string
+	statFails   int
 }
 
 func (f *fakeScanner) Scan(_ context.Context, after string, limit int) ([]blob.ObjectInfo, string, bool, error) {
@@ -161,9 +214,16 @@ func (f *fakeScanner) Scan(_ context.Context, after string, limit int) ([]blob.O
 	}
 	return append([]blob.ObjectInfo(nil), f.objects[start:end]...), f.objects[end-1].Key, end == len(f.objects), nil
 }
-func (f *fakeScanner) Stat(_ context.Context, key string) (blob.ObjectInfo, error) {
+func (f *fakeScanner) Stat(ctx context.Context, key string) (blob.ObjectInfo, error) {
+	if key == f.statFailKey && f.statFails > 0 {
+		f.statFails--
+		return blob.ObjectInfo{}, errors.New("stat failed")
+	}
 	if f.statHook != nil {
 		f.statHook(key)
+	}
+	if _, err := f.Store.Get(ctx, key); err != nil {
+		return blob.ObjectInfo{}, err
 	}
 	for _, x := range f.objects {
 		if x.Key == key {
@@ -171,6 +231,98 @@ func (f *fakeScanner) Stat(_ context.Context, key string) (blob.ObjectInfo, erro
 		}
 	}
 	return blob.ObjectInfo{}, blob.ErrNotFound
+}
+
+func TestGCStatFailureDoesNotStarveNextPage(t *testing.T) {
+	e := newGCEnv(t)
+	old := time.Now().Add(-72 * time.Hour)
+	objects := []blob.ObjectInfo{{Key: "1811.bin", Modified: old, Owned: true}, {Key: "1812.bin", Modified: old, Owned: true}}
+	for _, x := range objects {
+		if err := e.bl.Put(context.Background(), x.Key, []byte("x"), "application/octet-stream"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f := &fakeScanner{Store: e.bl, objects: objects, statFailKey: objects[0].Key, statFails: 1}
+	g := newTestGC(e.st, f, 24*time.Hour)
+	g.Batch = 1
+	found, deleted, err := g.SweepUntracked(context.Background(), false)
+	if err != nil || found != 1 || deleted != 1 || g.LastSweepStats().ObjectErrors != 1 {
+		t.Fatalf("首项Stat失败: found=%d deleted=%d stats=%+v err=%v", found, deleted, g.LastSweepStats(), err)
+	}
+	assertBlobExists(t, e.bl, objects[0].Key)
+	assertBlobGone(t, e.bl, objects[1].Key)
+	found, deleted, err = g.SweepUntracked(context.Background(), false)
+	if err != nil || found != 1 || deleted != 1 {
+		t.Fatalf("失败项次轮重试: %d/%d %v", found, deleted, err)
+	}
+	assertBlobGone(t, e.bl, objects[0].Key)
+}
+
+type failKeyLookup struct {
+	store.Store
+	key      string
+	failures int
+	calls    int
+}
+
+func (s *failKeyLookup) AttachmentKeyExists(ctx context.Context, key string) (bool, error) {
+	s.calls++
+	if key == s.key && s.failures > 0 {
+		s.failures--
+		return false, errors.New("key query failed")
+	}
+	return s.Store.AttachmentKeyExists(ctx, key)
+}
+func TestGCKeyLookupFailureDoesNotStarveNextPage(t *testing.T) {
+	e := newGCEnv(t)
+	old := time.Now().Add(-72 * time.Hour)
+	objects := []blob.ObjectInfo{{Key: "1821.bin", Modified: old, Owned: true}, {Key: "1822.bin", Modified: old, Owned: true}}
+	for _, x := range objects {
+		if err := e.bl.Put(context.Background(), x.Key, []byte("x"), "application/octet-stream"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f := &fakeScanner{Store: e.bl, objects: objects}
+	st := &failKeyLookup{Store: e.st, key: objects[0].Key, failures: 1}
+	g := newTestGC(st, f, 24*time.Hour)
+	g.Batch = 1
+	_, deleted, err := g.SweepUntracked(context.Background(), false)
+	if err != nil || deleted != 1 {
+		t.Fatalf("首项DB查询失败不应阻挡后继: %d %v", deleted, err)
+	}
+	assertBlobGone(t, e.bl, objects[1].Key)
+	_, deleted, err = g.SweepUntracked(context.Background(), false)
+	if err != nil || deleted != 1 {
+		t.Fatalf("失败项次轮重试: %d %v", deleted, err)
+	}
+	assertBlobGone(t, e.bl, objects[0].Key)
+}
+
+func TestGCGlobalKeyLookupFailureStopsAfterThree(t *testing.T) {
+	e := newGCEnv(t)
+	old := time.Now().Add(-72 * time.Hour)
+	objects := []blob.ObjectInfo{{Key: "1831.bin", Modified: old, Owned: true}, {Key: "1832.bin", Modified: old, Owned: true}, {Key: "1833.bin", Modified: old, Owned: true}, {Key: "1834.bin", Modified: old, Owned: true}}
+	for _, x := range objects {
+		if err := e.bl.Put(context.Background(), x.Key, []byte("x"), "application/octet-stream"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st := &failAllKeyLookup{Store: e.st}
+	g := newTestGC(st, &fakeScanner{Store: e.bl, objects: objects}, 24*time.Hour)
+	g.Batch = 1
+	if _, _, err := g.SweepUntracked(context.Background(), false); err == nil || st.calls != 3 {
+		t.Fatalf("全局DB故障应在三次查询停止: calls=%d err=%v", st.calls, err)
+	}
+}
+
+type failAllKeyLookup struct {
+	store.Store
+	calls int
+}
+
+func (s *failAllKeyLookup) AttachmentKeyExists(context.Context, string) (bool, error) {
+	s.calls++
+	return false, errors.New("db down")
 }
 func TestGCUntrackedPagedScannerRetryAndLateMetadata(t *testing.T) {
 	e := newGCEnv(t)
