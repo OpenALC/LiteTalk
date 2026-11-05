@@ -274,7 +274,7 @@ func (s *Server) PatchServerWebhook(ctx context.Context, request PatchServerWebh
 			strings.Fields(w.Events)); e != nil {
 			if eventsChanged && !urlChanged && noView {
 				return nil, errf(http.StatusConflict, "webhook_events_needs_creator",
-					"需由创建者或服主修改事件")
+					"订阅原创建者已无频道可见性，请由创建者或服主修改事件，或先改址将创建者变更为自己")
 			}
 			return nil, e
 		}

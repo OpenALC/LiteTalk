@@ -4,16 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
-
-	mysqldrv "github.com/go-sql-driver/mysql"
 )
-
-// rolesTestDB MySQL 专用角色契约库：每次用例重建，避免与同包其它用例互相污染。
-const rolesTestDB = "litetalk_roles_test"
 
 // rolesSeq 保证同一二进制内用户/服务器的 email、name 唯一。
 var rolesSeq atomic.Int64
@@ -844,39 +838,10 @@ func TestRolesContractSQLite(t *testing.T) {
 	runRolesContract(t, sq)
 }
 
-// openRolesMySQL 建专用、干净的 MySQL 测试库（DSN 不可用时 t.Skip）。
+// openRolesMySQL 为每个角色契约测试建立独立库。
 func openRolesMySQL(t *testing.T) *MySQL {
 	t.Helper()
-	base := openTestMySQL(t)
-	dsn := os.Getenv("LITETALK_MYSQL_DSN")
-	if dsn == "" {
-		dsn = "root:@tcp(127.0.0.1:3306)/?parseTime=true&multiStatements=true"
-	}
-	cfg, err := mysqldrv.ParseDSN(dsn)
-	if err != nil {
-		base.Close()
-		t.Fatalf("解析 MySQL DSN 失败: %v", err)
-	}
-	ctx := context.Background()
-	if _, err := base.DB().ExecContext(ctx, "DROP DATABASE IF EXISTS "+rolesTestDB); err != nil {
-		base.Close()
-		t.Fatalf("清理专用测试库失败: %v", err)
-	}
-	if _, err := base.DB().ExecContext(ctx,
-		"CREATE DATABASE "+rolesTestDB+" CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"); err != nil {
-		base.Close()
-		t.Fatalf("建专用测试库失败: %v", err)
-	}
-	base.Close()
-
-	cfg.DBName = rolesTestDB
-	t.Setenv("LITETALK_MYSQL_DSN", cfg.FormatDSN())
-	m, err := OpenMySQL(cfg.FormatDSN())
-	if err != nil {
-		t.Fatalf("连接专用测试库失败: %v", err)
-	}
-	t.Cleanup(func() { _ = m.Close() })
-	return m
+	return openTestMySQLSchema(t, "roles")
 }
 
 func TestRolesContractMySQL(t *testing.T) {
