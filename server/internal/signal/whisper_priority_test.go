@@ -33,6 +33,15 @@ func negotiate(t *testing.T, c *wsClient, max int64) int64 {
 	return d.Version
 }
 
+// waitWhisperHandled 用同连接的重复协商应答确认前一条 voice.whisper 已处理完。
+// 只等 room.whisper 快照会抢在收件范围纠正之前触发说话广播，造成非目标收到迟到的 false 纠正。
+func waitWhisperHandled(t *testing.T, c *wsClient) {
+	t.Helper()
+	if got := negotiate(t, c, 3); got != 3 {
+		t.Fatalf("悄悄话处理屏障的协议版本 = %d，期望 3", got)
+	}
+}
+
 // makeAdmin 把 uid 设为管理员角色（builtin admin），用于优先发言判定。
 func makeAdmin(t *testing.T, f *chatFixture, uid int64) {
 	t.Helper()
@@ -156,7 +165,7 @@ func recvUntilNo(t *testing.T, c *wsClient, want, forbidden string) Envelope {
 			env = c.readOne()
 		}
 		if env.Type == forbidden {
-			t.Fatalf("不应收到 %s（user=%s）", forbidden, c.user)
+			t.Fatalf("不应收到 %s（user=%s，ts=%d，data=%s）", forbidden, c.user, env.TS, env.Data)
 		}
 		if env.Type == want {
 			return env
@@ -253,6 +262,7 @@ func TestWhisperSpeakingScopedV2(t *testing.T) {
 
 	a.send(TypeVoiceWhisper, VoiceWhisperData{Targets: []string{"2"}})
 	waitHubWhisper(t, f.hub, vchID, "1", true, "2")
+	waitWhisperHandled(t, a)
 
 	f.hub.broadcastVoiceSpeaking(vchID, "1", true)
 	want := VoiceSpeakingData{ChannelID: vchID, UserID: "1", Speaking: true}
@@ -321,6 +331,7 @@ func TestWhisperSpeakingScopedLegacy(t *testing.T) {
 
 	a.send(TypeVoiceWhisper, VoiceWhisperData{Targets: []string{"2"}})
 	waitHubWhisper(t, f.hub, vchID, "1", true, "2")
+	waitWhisperHandled(t, a)
 
 	f.hub.broadcastVoiceSpeaking(vchID, "1", true)
 	var d VoiceStateData

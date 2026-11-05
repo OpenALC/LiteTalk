@@ -10,14 +10,18 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
+
+	"github.com/OpenALC/LiteTalk/server/internal/emailnorm"
 
 	_ "github.com/go-sql-driver/mysql"
 )
 
 // MySQL 是 Store 的 MySQL 实现（database/sql，SQL 全参数化）。
 type MySQL struct {
-	db *sql.DB
+	db             *sql.DB
+	emailKeysReady atomic.Bool
 }
 
 // OpenMySQL 连接 MySQL。dsn 形如 user:pass@tcp(127.0.0.1:3306)/litetalk?parseTime=true。
@@ -74,6 +78,18 @@ func (m *MySQL) Migrate(ctx context.Context, fsys fs.FS) error {
 		)`); err != nil {
 		return fmt.Errorf("create schema_migrations: %w", err)
 	}
+	hasEmailKeys, err := emailKeysApplied(ctx, conn)
+	if err != nil {
+		return err
+	}
+	if hasEmailKeys {
+		if err := verifyEmailKeySchemaMySQL(ctx, conn); err != nil {
+			return err
+		}
+		if err := verifyEmailKeyRows(ctx, conn); err != nil {
+			return err
+		}
+	}
 	entries, err := fs.ReadDir(fsys, ".")
 	if err != nil {
 		return err
@@ -95,6 +111,13 @@ func (m *MySQL) Migrate(ctx context.Context, fsys fs.FS) error {
 		if n > 0 {
 			continue
 		}
+		var keys []emailKeyRow
+		if version == emailKeysVersion {
+			keys, err = collectEmailKeys(ctx, conn)
+			if err != nil {
+				return err
+			}
+		}
 		body, err := fs.ReadFile(fsys, name)
 		if err != nil {
 			return err
@@ -102,6 +125,39 @@ func (m *MySQL) Migrate(ctx context.Context, fsys fs.FS) error {
 		stmts, err := splitSQL(string(body))
 		if err != nil {
 			return fmt.Errorf("parse %s: %w", name, err)
+		}
+		if version == emailKeysVersion {
+			if len(stmts) != 1 {
+				return fmt.Errorf("apply %s: 0023 只允许单条可重入建表语句", name)
+			}
+			if _, err := conn.ExecContext(ctx, stmts[0]); err != nil {
+				return fmt.Errorf("apply %s: %w", name, err)
+			}
+			if err := verifyEmailKeySchemaMySQL(ctx, conn); err != nil {
+				return err
+			}
+			tx, err := conn.BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			if err := insertEmailKeys(ctx, tx, keys); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+			if err := verifyEmailKeyRows(ctx, tx); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO schema_migrations (version) VALUES (?)`, version); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+			if err := tx.Commit(); err != nil {
+				return err
+			}
+			hasEmailKeys = true
+			continue
 		}
 		// MySQL 驱动不支持多语句 Exec，逐条执行。
 		for _, stmt := range stmts {
@@ -114,6 +170,7 @@ func (m *MySQL) Migrate(ctx context.Context, fsys fs.FS) error {
 			return err
 		}
 	}
+	m.emailKeysReady.Store(hasEmailKeys)
 	return nil
 }
 
@@ -142,6 +199,9 @@ func (m *MySQL) RollbackLast(ctx context.Context, fsys fs.FS) error {
 		}
 	}
 	_, err = m.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version = ?`, version)
+	if err == nil && version == emailKeysVersion {
+		m.emailKeysReady.Store(false)
+	}
 	return err
 }
 
@@ -254,6 +314,9 @@ var createTriggerRe = regexp.MustCompile(`(?is)^create\s+(?:or\s+replace\s+)?(?:
 // ---- users ----
 
 func (m *MySQL) CreateUser(ctx context.Context, u *User) error {
+	if m.emailKeysReady.Load() {
+		return createUserWithEmailKey(ctx, m.db, u, isDup)
+	}
 	u.ID = newID(u.ID)
 	_, err := m.db.ExecContext(ctx,
 		`INSERT INTO users (id, email, nickname, tag, password_hash, email_verified, is_guest, is_bot, status)
@@ -288,9 +351,13 @@ func (m *MySQL) UserByID(ctx context.Context, id int64) (*User, error) {
 	return m.scanUser(m.db.QueryRowContext(ctx, `SELECT `+userCols+` FROM users WHERE id = ?`, id))
 }
 
-// UserByEmail 依赖 utf8mb4_unicode_ci（0001 迁移）：等值比较本身大小写不敏感，
-// 存量大小写混合账号无需 lower() 也能命中，且走唯一索引 uk_users_email。
+// UserByEmail 在 0023 后走规范键；早期迁移的测试库仍用 0001 的 ci 索引。
 func (m *MySQL) UserByEmail(ctx context.Context, email string) (*User, error) {
+	if m.emailKeysReady.Load() {
+		return m.scanUser(m.db.QueryRowContext(ctx,
+			`SELECT `+userCols+` FROM users WHERE id =
+			 (SELECT user_id FROM user_email_keys WHERE email_key = ?)`, []byte(emailnorm.Normalize(email))))
+	}
 	return m.scanUser(m.db.QueryRowContext(ctx, `SELECT `+userCols+` FROM users WHERE email = ?`, email))
 }
 
@@ -500,6 +567,9 @@ func (m *MySQL) DeleteServer(ctx context.Context, id int64) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM read_states WHERE channel_id IN (SELECT id FROM channels WHERE server_id = ?)`, id); err != nil {
+		return err
+	}
 	// 提及没有外键，必须先于 messages 删除，否则留下孤儿行（#39）。
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM message_mentions WHERE message_id IN (
@@ -726,6 +796,9 @@ func (m *MySQL) DeleteChannel(ctx context.Context, id int64) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM read_states WHERE channel_id = ? OR channel_id IN (SELECT id FROM channels WHERE parent_id = ?)`, id, id); err != nil {
+		return err
+	}
 	// 提及没有外键，必须先于 messages 删除（含子频道消息，#39）。
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM message_mentions WHERE message_id IN (
@@ -1036,6 +1109,9 @@ func (m *MySQL) DeleteCategoryWithChannels(ctx context.Context, id int64) error 
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM read_states WHERE channel_id IN (SELECT id FROM channels WHERE category_id = ? UNION SELECT id FROM channels WHERE parent_id IN (SELECT id FROM channels WHERE category_id = ?))`, id, id); err != nil {
+		return err
+	}
 	// 提及没有外键，必须先于 messages 删除（#39）。
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM message_mentions WHERE message_id IN (
@@ -1492,6 +1568,21 @@ func (m *MySQL) AttachmentsByMessageIDs(ctx context.Context, messageIDs []int64)
 // OrphanAttachments 见 Store 接口；三类孤儿由共用 SQL 一次查出。
 func (m *MySQL) OrphanAttachments(ctx context.Context, unclaimedBefore time.Time, limit int) ([]Attachment, error) {
 	return queryOrphanAttachments(ctx, m.db, unclaimedBefore, limit)
+}
+func (m *MySQL) OrphanAttachmentsAfter(ctx context.Context, before time.Time, afterID int64, limit int) ([]Attachment, error) {
+	return queryOrphanAttachmentsAfter(ctx, m.db, before, afterID, limit)
+}
+func (m *MySQL) ReserveOrphanAttachment(ctx context.Context, id int64, before time.Time) (*Attachment, bool, error) {
+	return reserveOrphanAttachment(ctx, m.db, id, before)
+}
+func (m *MySQL) FinishOrphanAttachment(ctx context.Context, id int64) (bool, error) {
+	return finishOrphanAttachment(ctx, m.db, id)
+}
+func (m *MySQL) AttachmentKeyExists(ctx context.Context, key string) (bool, error) {
+	return attachmentKeyExists(ctx, m.db, key)
+}
+func (m *MySQL) PruneOrphanReadStatesAfter(ctx context.Context, uid, cid int64, limit int) (int64, int64, bool, int, error) {
+	return pruneOrphanReadStatesAfter(ctx, m.db, uid, cid, limit)
 }
 
 // DeleteAttachmentRows 批量删除元数据行；不存在的 id 忽略，空入参 no-op。

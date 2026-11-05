@@ -4,16 +4,18 @@ import (
 	"context"
 	"slices"
 	"sort"
-	"strings"
 	"sync"
 	"time"
+
+	"github.com/OpenALC/LiteTalk/server/internal/emailnorm"
 )
 
 // Mem 是 Store + KV 的内存实现。供 API 层测试与无数据库环境使用；
 // 语义与 MySQL 实现一致（唯一约束、外键式删除级联在 API 层处理）。
 // KV 部分经嵌入 MemKV 提供（拆分后 NewMemKV 可单独作为进程内 KV）。
 type Mem struct {
-	mu sync.Mutex
+	mu          sync.Mutex
+	blobOwnerID string
 
 	users       map[int64]*User
 	friendships map[int64]*Friendship
@@ -97,9 +99,8 @@ func (m *Mem) CreateUser(_ context.Context, u *User) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, x := range m.users {
-		// 与 MySQL 的 ci 排序、SQLite 的 lower() 兜底同语义：邮箱唯一性与
-		// 查询都大小写不敏感。
-		if strings.EqualFold(x.Email, u.Email) {
+		// 与 SQL 规范键用同一规则，避免内存测试掩盖 Unicode/空白冲突。
+		if emailnorm.Normalize(x.Email) == emailnorm.Normalize(u.Email) {
 			return ErrConflict
 		}
 		if x.Nickname == u.Nickname && x.Tag == u.Tag {
@@ -129,7 +130,7 @@ func (m *Mem) UserByEmail(_ context.Context, email string) (*User, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, u := range m.users {
-		if strings.EqualFold(u.Email, email) {
+		if emailnorm.Normalize(u.Email) == emailnorm.Normalize(email) {
 			cp := *u
 			return &cp, nil
 		}
@@ -165,6 +166,7 @@ func (m *Mem) UpdateUser(_ context.Context, u *User) error {
 	}
 	u.UpdatedAt = time.Now()
 	cp := *u
+	cp.Email = old.Email // SQL UpdateUser 不写邮箱，保持三实现一致。
 	m.users[u.ID] = &cp
 	return nil
 }
@@ -362,6 +364,7 @@ func (m *Mem) DeleteServer(_ context.Context, id int64) error {
 	}
 	for cid, c := range m.channels {
 		if c.ServerID == id {
+			m.deleteReadStatesOfChannelLocked(cid)
 			delete(m.channels, cid)
 			for mid, msg := range m.messages {
 				if msg.ChannelID == cid {
@@ -551,6 +554,7 @@ func (m *Mem) DeleteChannel(_ context.Context, id int64) error {
 	// 子频道行级联（#37）：消息/覆盖/会话成员一并清，与 SQL 实现同语义。
 	for cid, c := range m.channels {
 		if c.ParentID != nil && *c.ParentID == id {
+			m.deleteReadStatesOfChannelLocked(cid)
 			delete(m.channels, cid)
 			m.deleteOverwritesOfChannelLocked(cid)
 			delete(m.channelMembers, cid)
@@ -563,6 +567,7 @@ func (m *Mem) DeleteChannel(_ context.Context, id int64) error {
 		}
 	}
 	delete(m.channels, id)
+	m.deleteReadStatesOfChannelLocked(id)
 	m.deleteOverwritesOfChannelLocked(id)
 	delete(m.channelMembers, id)
 	for mid, msg := range m.messages {
@@ -844,6 +849,7 @@ func (m *Mem) DeleteCategoryWithChannels(_ context.Context, id int64) error {
 		}
 	}
 	for cid := range inCat {
+		m.deleteReadStatesOfChannelLocked(cid)
 		delete(m.channels, cid)
 		m.deleteOverwritesOfChannelLocked(cid)
 		for mid, msg := range m.messages {
@@ -855,6 +861,15 @@ func (m *Mem) DeleteCategoryWithChannels(_ context.Context, id int64) error {
 	}
 	delete(m.categories, id)
 	return nil
+}
+
+func (m *Mem) deleteReadStatesOfChannelLocked(channelID int64) {
+	for uid, states := range m.readStates {
+		delete(states, channelID)
+		if len(states) == 0 {
+			delete(m.readStates, uid)
+		}
+	}
 }
 
 func (m *Mem) UpdateCategory(_ context.Context, c *Category) error {
@@ -1216,11 +1231,18 @@ func (m *Mem) AttachmentsByMessageIDs(_ context.Context, messageIDs []int64) (ma
 // OrphanAttachments 见 Store 接口；与 SQL 实现同口径：未认领超期、消息行不存在、
 // 消息已软删。Map 遍历无序，排序后再截断。
 func (m *Mem) OrphanAttachments(_ context.Context, unclaimedBefore time.Time, limit int) ([]Attachment, error) {
+	return m.OrphanAttachmentsAfter(context.Background(), unclaimedBefore, 0, limit)
+}
+
+func (m *Mem) OrphanAttachmentsAfter(_ context.Context, unclaimedBefore time.Time, afterID int64, limit int) ([]Attachment, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	limit = clampAttachmentLimit(limit)
 	out := make([]Attachment, 0, limit)
 	for _, a := range m.attachments {
+		if a.ID <= afterID {
+			continue
+		}
 		var orphan bool
 		if a.MessageID == 0 {
 			orphan = a.CreatedAt.Before(unclaimedBefore)
@@ -1237,6 +1259,81 @@ func (m *Mem) OrphanAttachments(_ context.Context, unclaimedBefore time.Time, li
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+func (m *Mem) ReserveOrphanAttachment(_ context.Context, id int64, before time.Time) (*Attachment, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a := m.attachments[id]
+	if a == nil {
+		return nil, false, nil
+	}
+	if a.MessageID == 0 {
+		if !a.CreatedAt.Before(before) {
+			return nil, false, nil
+		}
+	} else if a.MessageID > 0 {
+		msg := m.messages[a.MessageID]
+		if msg != nil && msg.DeletedAt == nil {
+			return nil, false, nil
+		}
+	}
+	a.MessageID = -a.ID
+	cp := *a
+	return &cp, true, nil
+}
+
+func (m *Mem) FinishOrphanAttachment(_ context.Context, id int64) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if a := m.attachments[id]; a != nil && a.MessageID < 0 {
+		delete(m.attachments, id)
+		return true, nil
+	}
+	return false, nil
+}
+
+func (m *Mem) AttachmentKeyExists(_ context.Context, key string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, a := range m.attachments {
+		if a.StorageKey == key || a.ThumbKey == key {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (m *Mem) PruneOrphanReadStatesAfter(_ context.Context, afterUserID, afterChannelID int64, limit int) (nextUserID, nextChannelID int64, done bool, removed int, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	limit = clampAttachmentLimit(limit)
+	for checked := 0; checked < limit; checked++ {
+		found := false
+		var uidMin, cidMin int64
+		for uid, states := range m.readStates {
+			for cid := range states {
+				if uid < afterUserID || (uid == afterUserID && cid <= afterChannelID) {
+					continue
+				}
+				if !found || uid < uidMin || (uid == uidMin && cid < cidMin) {
+					uidMin, cidMin, found = uid, cid, true
+				}
+			}
+		}
+		if !found {
+			return 0, 0, true, removed, nil
+		}
+		afterUserID, afterChannelID = uidMin, cidMin
+		if _, ok := m.channels[cidMin]; !ok {
+			delete(m.readStates[uidMin], cidMin)
+			if len(m.readStates[uidMin]) == 0 {
+				delete(m.readStates, uidMin)
+			}
+			removed++
+		}
+	}
+	return afterUserID, afterChannelID, false, removed, nil
 }
 
 // DeleteAttachmentRows 批量删除元数据行；不存在的 id 忽略，空入参 no-op。

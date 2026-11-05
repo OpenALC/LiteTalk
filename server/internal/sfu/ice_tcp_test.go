@@ -74,16 +74,6 @@ func TestTCPPortDisabled(t *testing.T) {
 	}
 }
 
-// selectedProtocol 取 ICE 选中候选对的传输协议；未选出时返回 ICEProtocolUnknown。
-func selectedProtocol(t *testing.T, pc *webrtc.PeerConnection) webrtc.ICEProtocol {
-	t.Helper()
-	pair, err := pc.SCTP().Transport().ICETransport().GetSelectedCandidatePair()
-	if err != nil || pair == nil {
-		return webrtc.ICEProtocolUnknown
-	}
-	return pair.Local.Protocol
-}
-
 // TestForwardOverICETCP 禁 UDP 场景（#25 核心验收）：两端只启用 TCP 网络类型，
 // 必须经 ICE-TCP 候选建连并互通 RTP。建不了连或选中 UDP 都算失败——不许跳过。
 func TestForwardOverICETCP(t *testing.T) {
@@ -102,21 +92,13 @@ func TestForwardOverICETCP(t *testing.T) {
 	alice := newTestClientNet(t, s, "c1", "alice", true)
 	bob := newTestClientNet(t, s, "c1", "bob", true)
 
-	// 等 ICE 选中候选对，断言走的是 TCP（客户端禁 UDP，选中 UDP 即实现有问题）
-	deadline := time.Now().Add(10 * time.Second)
-	proto := webrtc.ICEProtocolUnknown
-	for time.Now().Before(deadline) {
-		proto = selectedProtocol(t, alice.pc)
-		if proto != webrtc.ICEProtocolUnknown {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if proto == webrtc.ICEProtocolUnknown {
+	// 等连接完成后再读 Pion 候选对：在 StartContext 初始化期间读取会触发 race。
+	pair := waitSelectedPair(alice.pc, 10*time.Second)
+	if pair == nil {
 		t.Fatal("10s 内未选出 ICE 候选对（ICE-TCP 未建连）")
 	}
-	if proto != webrtc.ICEProtocolTCP {
-		t.Fatalf("选中候选协议 = %v，客户端已禁 UDP，必须是 TCP", proto)
+	if pair.Local.Protocol != webrtc.ICEProtocolTCP {
+		t.Fatalf("选中候选协议 = %v，客户端已禁 UDP，必须是 TCP", pair.Local.Protocol)
 	}
 	t.Log("ICE 选中 TCP 候选对（禁 UDP 网络下 ICE-TCP 直连成立）")
 

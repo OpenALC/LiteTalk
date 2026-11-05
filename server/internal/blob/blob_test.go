@@ -128,6 +128,7 @@ func TestNewS3Validation(t *testing.T) {
 		SecretKey: "sk",
 		Region:    "us-east-1",
 		PathStyle: true,
+		OwnerID:   strings.Repeat("a", 64),
 	}
 	st, driver, err := New(valid, nil)
 	if err != nil || driver != "s3" || st == nil {
@@ -139,6 +140,7 @@ func TestNewS3Validation(t *testing.T) {
 		"缺 bucket":   func() Config { c := valid; c.Bucket = ""; return c }(),
 		"缺 access":   func() Config { c := valid; c.AccessKey = ""; return c }(),
 		"缺 secret":   func() Config { c := valid; c.SecretKey = ""; return c }(),
+		"缺归属值":       func() Config { c := valid; c.OwnerID = ""; return c }(),
 	}
 	for name, cfg := range cases {
 		if _, _, err := New(cfg, nil); err == nil {

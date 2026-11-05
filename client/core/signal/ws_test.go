@@ -608,7 +608,6 @@ func TestWSHeartbeat(t *testing.T) {
 // （令牌刷新后重连必须带新令牌，否则服务端按旧令牌鉴权永远 401）。
 func TestWSTokenFuncPerDial(t *testing.T) {
 	stub := newStubServer(t)
-	stub.dropOnce.Store(true)
 
 	var tok atomic.Value // string
 	tok.Store("dev-first")
@@ -626,25 +625,50 @@ func TestWSTokenFuncPerDial(t *testing.T) {
 	defer c.Close()
 
 	var connects atomic.Int32
-	c.cfg.OnConnect = func(*Client) { connects.Add(1) }
+	firstConnected := make(chan struct{})
+	c.cfg.OnConnect = func(*Client) {
+		if connects.Add(1) == 1 {
+			// 回调与下一轮拨号同在 Run goroutine；先更新再断线，重拨不能读到旧令牌。
+			tok.Store("dev-second")
+			_ = c.currentConn().CloseNow()
+			close(firstConnected)
+		}
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go c.Run(ctx)
+	runDone := make(chan error, 1)
+	go func() { runDone <- c.Run(ctx) }()
 
-	waitFor(t, "first connect", 3*time.Second, func() bool { return connects.Load() >= 1 })
-
-	// 首连后换令牌。桩的 dropOnce 在收到首条上行（client.hello）时即掐线，
-	// 本条 Send 只是业务面探活：可能正撞断线窗口，ErrNotConnected 与重连无关
-	//（重连由桩掐线触发），其余错误才是真失败。
-	tok.Store("dev-second")
-	if err := c.Send(TypeChannelJoin, ChannelJoinData{ChannelID: "x"}); err != nil && !errors.Is(err, ErrNotConnected) {
-		t.Fatalf("Send: %v", err)
+	select {
+	case <-firstConnected:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting first connect")
 	}
 	waitFor(t, "reconnect with new token", 5*time.Second, func() bool {
-		return stub.connCount() >= 2 && stub.lastToken() == "dev-second"
+		return connects.Load() >= 2 && stub.connCount() >= 2 && stub.lastToken() == "dev-second"
 	})
-	if n := calls.Load(); n < 2 {
-		t.Fatalf("TokenFunc calls = %d, want >= 2 (one per dial)", n)
+	c.Close()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run after Close: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting Run to stop")
+	}
+	stub.mu.Lock()
+	tokens := append([]string(nil), stub.tokens...)
+	stub.mu.Unlock()
+	if len(tokens) < 2 || tokens[0] != "dev-first" {
+		t.Fatalf("dial tokens = %v, want first dev-first and later dev-second", tokens)
+	}
+	for _, got := range tokens[1:] {
+		if got != "dev-second" {
+			t.Fatalf("dial tokens = %v, want first dev-first and later dev-second", tokens)
+		}
+	}
+	if n := calls.Load(); n != int32(len(tokens)) {
+		t.Fatalf("TokenFunc calls = %d, successful dials = %d (want one per dial)", n, len(tokens))
 	}
 }
 
