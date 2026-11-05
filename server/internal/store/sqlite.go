@@ -149,7 +149,13 @@ func (s *SQLite) Migrate(ctx context.Context, fsys fs.FS) error {
 			}
 		}
 		if version == emailKeysVersion {
+			if err := verifyEmailKeySchemaSQLite(ctx, tx); err != nil {
+				return err
+			}
 			if err := insertEmailKeys(ctx, tx, keys); err != nil {
+				return err
+			}
+			if err := verifyEmailKeyRows(ctx, tx); err != nil {
 				return err
 			}
 		}
@@ -166,7 +172,10 @@ func (s *SQLite) Migrate(ctx context.Context, fsys fs.FS) error {
 		return err
 	}
 	if applied {
-		if err := verifyEmailKeys(ctx, s.db); err != nil {
+		if err := verifyEmailKeySchemaSQLite(ctx, s.db); err != nil {
+			return err
+		}
+		if err := verifyEmailKeyRows(ctx, s.db); err != nil {
 			return err
 		}
 	}

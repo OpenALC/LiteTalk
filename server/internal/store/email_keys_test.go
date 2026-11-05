@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/OpenALC/LiteTalk/server/migrations"
+	mysqldrv "github.com/go-sql-driver/mysql"
 )
 
 func seedOldEmailUser(t *testing.T, db *sql.DB, id int64, email string) {
@@ -266,5 +267,168 @@ func TestEmailKeysMySQLConflictAborts(t *testing.T) {
 	}
 	if err := m.DB().QueryRow(`SELECT COUNT(*) FROM users WHERE id IN (94001, 94002)`).Scan(&n); err != nil || n != 2 {
 		t.Fatalf("冲突后账号不应变化: %d %v", n, err)
+	}
+}
+
+func TestEmailKeysSQLiteRejectsSameNameWrongSchema(t *testing.T) {
+	cases := map[string]string{
+		"缺主键": `CREATE TABLE user_email_keys (
+			email_key BLOB NOT NULL, user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE)`,
+		"缺用户唯一键": `CREATE TABLE user_email_keys (
+			email_key BLOB NOT NULL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE)`,
+		"缺外键": `CREATE TABLE user_email_keys (
+			email_key BLOB NOT NULL PRIMARY KEY, user_id INTEGER NOT NULL UNIQUE)`,
+		"非二进制列": `CREATE TABLE user_email_keys (
+			email_key TEXT NOT NULL PRIMARY KEY, user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE)`,
+	}
+	for name, ddl := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			sq := openTestSQLite(t)
+			full := findMigrationsSQLite(t)
+			if err := sq.Migrate(ctx, migrationsBefore(t, full, "0023")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := sq.DB().ExecContext(ctx, ddl); err != nil {
+				t.Fatal(err)
+			}
+			if err := sq.Migrate(ctx, full); err == nil || !strings.Contains(err.Error(), "结构不符") {
+				t.Fatalf("同名错表应拒绝: %v", err)
+			}
+			var n int
+			if err := sq.DB().QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM schema_migrations WHERE version = ?`, emailKeysVersion).Scan(&n); err != nil || n != 0 {
+				t.Fatalf("错表不应标记版本: %d %v", n, err)
+			}
+		})
+	}
+}
+
+func TestEmailKeysSQLiteRejectsAppliedCorruption(t *testing.T) {
+	for name, mutation := range map[string]string{
+		"缺表": `DROP TABLE user_email_keys`,
+		"无键": `DELETE FROM user_email_keys`,
+		"错键": `UPDATE user_email_keys SET email_key = x'77726f6e67'`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			sq := openTestSQLite(t)
+			full := findMigrationsSQLite(t)
+			if err := sq.Migrate(ctx, full); err != nil {
+				t.Fatal(err)
+			}
+			id := int64(97001)
+			seed := &User{ID: id, Email: "Name@Example.com", Nickname: "name", Tag: "0001"}
+			if err := sq.CreateUser(ctx, seed); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := sq.DB().ExecContext(ctx, mutation); err != nil {
+				t.Fatal(err)
+			}
+			err := sq.Migrate(ctx, full)
+			if err == nil || name != "缺表" && !strings.Contains(err.Error(), "97001") {
+				t.Fatalf("0023 已标记但内容损坏应拒绝且只报 ID: %v", err)
+			}
+			if strings.Contains(err.Error(), "Name@") || strings.Contains(err.Error(), "name@") {
+				t.Fatalf("损坏错误不得暴露邮箱: %v", err)
+			}
+			if name == "缺表" {
+				createErr := sq.CreateUser(ctx, &User{Email: "secret@example.com", Nickname: "new", Tag: "0002"})
+				if createErr == nil || !strings.Contains(createErr.Error(), "sqlite code=") ||
+					strings.Contains(createErr.Error(), "secret") {
+					t.Fatalf("写键失败应保留安全错误号且不泄露邮箱: %v", createErr)
+				}
+				var count int
+				if err := sq.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&count); err != nil || count != 1 {
+					t.Fatalf("写键失败应回滚用户插入: %d %v", count, err)
+				}
+			}
+		})
+	}
+}
+
+func TestEmailKeysMySQLRejectsSameNameWrongSchema(t *testing.T) {
+	cases := map[string]string{
+		"缺主键": `CREATE TABLE user_email_keys (
+			email_key VARBINARY(1020) NOT NULL, user_id BIGINT NOT NULL UNIQUE,
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE) ENGINE=InnoDB`,
+		"缺用户唯一键": `CREATE TABLE user_email_keys (
+			email_key VARBINARY(1020) NOT NULL PRIMARY KEY, user_id BIGINT NOT NULL,
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE) ENGINE=InnoDB`,
+		"缺外键": `CREATE TABLE user_email_keys (
+			email_key VARBINARY(1020) NOT NULL PRIMARY KEY, user_id BIGINT NOT NULL UNIQUE) ENGINE=InnoDB`,
+		"非二进制列": `CREATE TABLE user_email_keys (
+			email_key VARCHAR(255) NOT NULL PRIMARY KEY, user_id BIGINT NOT NULL UNIQUE,
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE) ENGINE=InnoDB`,
+	}
+	for name, ddl := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			m := openRolesMySQL(t)
+			full := findMigrations(t)
+			if err := m.Migrate(ctx, migrationsBefore(t, full, "0023")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := m.DB().ExecContext(ctx, ddl); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.Migrate(ctx, full); err == nil || !strings.Contains(err.Error(), "结构不符") {
+				t.Fatalf("同名错表应拒绝: %v", err)
+			}
+			var n int
+			if err := m.DB().QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM schema_migrations WHERE version = ?`, emailKeysVersion).Scan(&n); err != nil || n != 0 {
+				t.Fatalf("错表不应标记版本: %d %v", n, err)
+			}
+		})
+	}
+}
+
+func TestEmailKeysMySQLRejectsAppliedCorruption(t *testing.T) {
+	for name, mutation := range map[string]string{
+		"缺表": `DROP TABLE user_email_keys`,
+		"无键": `DELETE FROM user_email_keys`,
+		"错键": `UPDATE user_email_keys SET email_key = x'77726f6e67'`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			m := openRolesMySQL(t)
+			full := findMigrations(t)
+			if err := m.Migrate(ctx, full); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.CreateUser(ctx, &User{ID: 98001, Email: "Name@Example.com", Nickname: "name", Tag: "0001"}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := m.DB().ExecContext(ctx, mutation); err != nil {
+				t.Fatal(err)
+			}
+			err := m.Migrate(ctx, full)
+			if err == nil || name != "缺表" && !strings.Contains(err.Error(), "98001") {
+				t.Fatalf("0023 已标记但内容损坏应拒绝且只报 ID: %v", err)
+			}
+			if strings.Contains(err.Error(), "Name@") || strings.Contains(err.Error(), "name@") {
+				t.Fatalf("损坏错误不得暴露邮箱: %v", err)
+			}
+			if name == "缺表" {
+				createErr := m.CreateUser(ctx, &User{Email: "secret@example.com", Nickname: "new", Tag: "0002"})
+				if createErr == nil || !strings.Contains(createErr.Error(), "mysql errno=") ||
+					strings.Contains(createErr.Error(), "secret") {
+					t.Fatalf("写键失败应保留安全错误号且不泄露邮箱: %v", createErr)
+				}
+				var count int
+				if err := m.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&count); err != nil || count != 1 {
+					t.Fatalf("写键失败应回滚用户插入: %d %v", count, err)
+				}
+			}
+		})
+	}
+}
+
+func TestSafeEmailDBErrorOmitsDuplicateKey(t *testing.T) {
+	err := &mysqldrv.MySQLError{Number: 1062, Message: "duplicate email secret@example.com"}
+	got := safeEmailDBError(err)
+	if !strings.Contains(got, "1062") || strings.Contains(got, "secret") || strings.Contains(got, "example.com") {
+		t.Fatalf("诊断只允许错误号/SQLSTATE: %q", got)
 	}
 }

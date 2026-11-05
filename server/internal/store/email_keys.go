@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -8,6 +9,8 @@ import (
 	"sort"
 
 	"github.com/OpenALC/LiteTalk/server/internal/emailnorm"
+	mysqldrv "github.com/go-sql-driver/mysql"
+	"modernc.org/sqlite"
 )
 
 const emailKeysVersion = "0023_user_email_keys"
@@ -23,6 +26,7 @@ type emailKeyRow struct {
 
 type emailKeyQueryer interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
 type emailKeyExecer interface {
@@ -33,7 +37,7 @@ type emailKeyExecer interface {
 func collectEmailKeys(ctx context.Context, q emailKeyQueryer) ([]emailKeyRow, error) {
 	rows, err := q.QueryContext(ctx, `SELECT id, email FROM users ORDER BY id`)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("邮箱预检查询失败: %s", safeEmailDBError(err))
 	}
 	defer rows.Close()
 	var all []emailKeyRow
@@ -42,7 +46,7 @@ func collectEmailKeys(ctx context.Context, q emailKeyQueryer) ([]emailKeyRow, er
 		var id int64
 		var email string
 		if err := rows.Scan(&id, &email); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("邮箱预检读取失败: %s", safeEmailDBError(err))
 		}
 		key := emailnorm.Normalize(email)
 		if len(key) > maxEmailKeyBytes {
@@ -52,7 +56,7 @@ func collectEmailKeys(ctx context.Context, q emailKeyQueryer) ([]emailKeyRow, er
 		all = append(all, emailKeyRow{id: id, key: []byte(key)})
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("邮箱预检读取失败: %s", safeEmailDBError(err))
 	}
 	var conflicts [][]int64
 	for _, ids := range groups {
@@ -71,23 +75,63 @@ func insertEmailKeys(ctx context.Context, q emailKeyExecer, rows []emailKeyRow) 
 	for _, row := range rows {
 		if _, err := q.ExecContext(ctx,
 			`INSERT INTO user_email_keys (email_key, user_id) VALUES (?, ?)`, row.key, row.id); err != nil {
-			return fmt.Errorf("回填邮箱规范键失败，用户 ID: %d", row.id)
+			return fmt.Errorf("回填邮箱规范键失败，用户 ID: %d，%s", row.id, safeEmailDBError(err))
 		}
 	}
 	return nil
 }
 
-// verifyEmailKeys 在标记已应用时拒绝缺表或无键用户，不静默退回预查路径。
-func verifyEmailKeys(ctx context.Context, db *sql.DB) error {
-	var missing int64
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users u
-		LEFT JOIN user_email_keys k ON k.user_id = u.id WHERE k.user_id IS NULL`).Scan(&missing); err != nil {
-		return fmt.Errorf("邮箱规范键表检查失败: %w", err)
+// verifyEmailKeyRows 比对每个用户的 Go 规范键；错误只含内部 ID。
+func verifyEmailKeyRows(ctx context.Context, q emailKeyQueryer) error {
+	rows, err := q.QueryContext(ctx, `SELECT u.id, u.email, k.user_id, k.email_key
+		FROM users u LEFT JOIN user_email_keys k ON k.user_id = u.id ORDER BY u.id`)
+	if err != nil {
+		return fmt.Errorf("邮箱规范键行检查失败: %s", safeEmailDBError(err))
 	}
-	if missing != 0 {
-		return fmt.Errorf("邮箱规范键缺失用户行: %d", missing)
+	var users int64
+	for rows.Next() {
+		var id int64
+		var email string
+		var keyUser sql.NullInt64
+		var key []byte
+		if err := rows.Scan(&id, &email, &keyUser, &key); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("邮箱规范键行读取失败: %s", safeEmailDBError(err))
+		}
+		if !keyUser.Valid || !bytes.Equal(key, []byte(emailnorm.Normalize(email))) {
+			_ = rows.Close()
+			return fmt.Errorf("邮箱规范键缺失或错误，用户 ID: %d", id)
+		}
+		users++
+	}
+	err = rows.Err()
+	_ = rows.Close()
+	if err != nil {
+		return fmt.Errorf("邮箱规范键行读取失败: %s", safeEmailDBError(err))
+	}
+	var keys int64
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_email_keys`).Scan(&keys); err != nil {
+		return fmt.Errorf("邮箱规范键计数失败: %s", safeEmailDBError(err))
+	}
+	if keys != users {
+		return fmt.Errorf("邮箱规范键行数不符: users=%d keys=%d", users, keys)
 	}
 	return nil
+}
+
+func safeEmailDBError(err error) string {
+	var my *mysqldrv.MySQLError
+	if errors.As(err, &my) {
+		if my.SQLState != [5]byte{} {
+			return fmt.Sprintf("mysql errno=%d sqlstate=%s", my.Number, string(my.SQLState[:]))
+		}
+		return fmt.Sprintf("mysql errno=%d", my.Number)
+	}
+	var sq *sqlite.Error
+	if errors.As(err, &sq) {
+		return fmt.Sprintf("sqlite code=%d", sq.Code())
+	}
+	return fmt.Sprintf("type=%T", err)
 }
 
 func emailKeysApplied(ctx context.Context, db *sql.DB) (bool, error) {
@@ -116,14 +160,14 @@ func createUserWithEmailKey(ctx context.Context, db *sql.DB, u *User, isDuplicat
 		if isDuplicate(err) {
 			return ErrConflict
 		}
-		return err
+		return fmt.Errorf("创建用户失败，用户 ID: %d，%s", u.ID, safeEmailDBError(err))
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO user_email_keys (email_key, user_id) VALUES (?, ?)`, []byte(key), u.ID); err != nil {
 		if isDuplicate(err) {
 			return ErrConflict
 		}
-		return fmt.Errorf("创建邮箱规范键失败，用户 ID: %d", u.ID)
+		return fmt.Errorf("创建邮箱规范键失败，用户 ID: %d，%s", u.ID, safeEmailDBError(err))
 	}
 	if err := tx.Commit(); err != nil {
 		return err

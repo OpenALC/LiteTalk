@@ -121,11 +121,18 @@ func (m *MySQL) Migrate(ctx context.Context, fsys fs.FS) error {
 			if _, err := conn.ExecContext(ctx, stmts[0]); err != nil {
 				return fmt.Errorf("apply %s: %w", name, err)
 			}
+			if err := verifyEmailKeySchemaMySQL(ctx, conn); err != nil {
+				return err
+			}
 			tx, err := conn.BeginTx(ctx, nil)
 			if err != nil {
 				return err
 			}
 			if err := insertEmailKeys(ctx, tx, keys); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+			if err := verifyEmailKeyRows(ctx, tx); err != nil {
 				_ = tx.Rollback()
 				return err
 			}
@@ -155,7 +162,10 @@ func (m *MySQL) Migrate(ctx context.Context, fsys fs.FS) error {
 		return err
 	}
 	if applied {
-		if err := verifyEmailKeys(ctx, m.db); err != nil {
+		if err := verifyEmailKeySchemaMySQL(ctx, m.db); err != nil {
+			return err
+		}
+		if err := verifyEmailKeyRows(ctx, m.db); err != nil {
 			return err
 		}
 	}
