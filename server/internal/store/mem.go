@@ -4,9 +4,10 @@ import (
 	"context"
 	"slices"
 	"sort"
-	"strings"
 	"sync"
 	"time"
+
+	"github.com/OpenALC/LiteTalk/server/internal/emailnorm"
 )
 
 // Mem 是 Store + KV 的内存实现。供 API 层测试与无数据库环境使用；
@@ -97,9 +98,8 @@ func (m *Mem) CreateUser(_ context.Context, u *User) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, x := range m.users {
-		// 与 MySQL 的 ci 排序、SQLite 的 lower() 兜底同语义：邮箱唯一性与
-		// 查询都大小写不敏感。
-		if strings.EqualFold(x.Email, u.Email) {
+		// 与 SQL 规范键用同一规则，避免内存测试掩盖 Unicode/空白冲突。
+		if emailnorm.Normalize(x.Email) == emailnorm.Normalize(u.Email) {
 			return ErrConflict
 		}
 		if x.Nickname == u.Nickname && x.Tag == u.Tag {
@@ -129,7 +129,7 @@ func (m *Mem) UserByEmail(_ context.Context, email string) (*User, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, u := range m.users {
-		if strings.EqualFold(u.Email, email) {
+		if emailnorm.Normalize(u.Email) == emailnorm.Normalize(email) {
 			cp := *u
 			return &cp, nil
 		}
@@ -165,6 +165,7 @@ func (m *Mem) UpdateUser(_ context.Context, u *User) error {
 	}
 	u.UpdatedAt = time.Now()
 	cp := *u
+	cp.Email = old.Email // SQL UpdateUser 不写邮箱，保持三实现一致。
 	m.users[u.ID] = &cp
 	return nil
 }
