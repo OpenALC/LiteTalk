@@ -511,6 +511,17 @@ type Store interface {
 	// unclaimedBefore；或 message_id 非空但消息行已不存在（频道/分类/服务器/会话硬删）；
 	// 或消息已软删。按 id 升序，limit 夹到 [1, MaxAttachmentBatch]。
 	OrphanAttachments(ctx context.Context, unclaimedBefore time.Time, limit int) ([]Attachment, error)
+	// OrphanAttachmentsAfter 为后台回收提供游标；afterID=0 从头开始。
+	OrphanAttachmentsAfter(ctx context.Context, unclaimedBefore time.Time, afterID int64, limit int) ([]Attachment, error)
+	// ReserveOrphanAttachment 在数据库内重新验证孤儿状态并原子占有回收权。
+	// 负 message_id 是持久回收标记，CreateMessage 只认领 NULL，因此崩溃后可重试。
+	ReserveOrphanAttachment(ctx context.Context, id int64, unclaimedBefore time.Time) (*Attachment, bool, error)
+	// FinishOrphanAttachment 只删除已由回收器占有的行。
+	FinishOrphanAttachment(ctx context.Context, id int64) (bool, error)
+	// AttachmentKeyExists 核查对象键是否仍被任意行引用。
+	AttachmentKeyExists(ctx context.Context, key string) (bool, error)
+	// PruneOrphanReadStatesAfter 按主键游标核对至多 limit 行，避免每轮全表找孤儿。
+	PruneOrphanReadStatesAfter(ctx context.Context, afterUserID, afterChannelID int64, limit int) (nextUserID, nextChannelID int64, done bool, removed int, err error)
 	// DeleteAttachmentRows 批量删除附件元数据行；空入参 no-op，不存在的 id 忽略。
 	// 调用方（后台 GC）必须先删 blob 再删行，避免删行后对象无法定位。
 	DeleteAttachmentRows(ctx context.Context, ids []int64) error

@@ -75,22 +75,6 @@ func (s *Server) UploadAttachment(ctx context.Context, request UploadAttachmentR
 
 	id := snowflake.Next()
 	storageKey, thumbKey := attachment.Keys(id)
-	if err := s.blob.Put(ctx, storageKey, proc.Data, proc.ContentType); err != nil {
-		s.log.Printf("[500] POST /api/v1/attachments: 写附件对象失败: %v", err)
-		return nil, errf(http.StatusInternalServerError, "storage_error", "附件保存失败，请稍后重试")
-	}
-	written := []string{storageKey}
-	thumbWritten := false
-	if len(proc.Thumb) > 0 {
-		if err := s.blob.Put(ctx, thumbKey, proc.Thumb, "image/jpeg"); err != nil {
-			s.log.Printf("[500] POST /api/v1/attachments: 写缩略图对象失败: %v", err)
-			s.deleteBlobs(ctx, written)
-			return nil, errf(http.StatusInternalServerError, "storage_error", "附件保存失败，请稍后重试")
-		}
-		written = append(written, thumbKey)
-		thumbWritten = true
-	}
-
 	rec := &store.Attachment{
 		ID:          id,
 		UploaderID:  u.UserID,
@@ -103,13 +87,24 @@ func (s *Server) UploadAttachment(ctx context.Context, request UploadAttachmentR
 		AccessKey:   proc.AccessKey,
 		SHA256:      proc.SHA256,
 	}
-	if thumbWritten {
+	if len(proc.Thumb) > 0 {
 		rec.ThumbKey = thumbKey
 	}
 	if err := s.store.CreateAttachment(ctx, rec); err != nil {
 		s.log.Printf("[500] POST /api/v1/attachments: 写元数据失败: %v", err)
-		s.deleteBlobs(ctx, written)
 		return nil, errf(http.StatusInternalServerError, "storage_error", "附件保存失败，请稍后重试")
+	}
+	// 先落元数据再写对象：进程崩溃只会留下有行孤儿，GC 可定位；
+	// 反过来会留下无法关联的无行对象。失败行保留给 TTL 回收。
+	if err := s.blob.Put(ctx, storageKey, proc.Data, proc.ContentType); err != nil {
+		s.log.Printf("[500] POST /api/v1/attachments: 写附件对象失败: %v", err)
+		return nil, errf(http.StatusInternalServerError, "storage_error", "附件保存失败，请稍后重试")
+	}
+	if len(proc.Thumb) > 0 {
+		if err := s.blob.Put(ctx, thumbKey, proc.Thumb, "image/jpeg"); err != nil {
+			s.log.Printf("[500] POST /api/v1/attachments: 写缩略图对象失败: %v", err)
+			return nil, errf(http.StatusInternalServerError, "storage_error", "附件保存失败，请稍后重试")
+		}
 	}
 	return UploadAttachment201JSONResponse(attachmentView(rec)), nil
 }

@@ -20,6 +20,7 @@ import (
 type gcEnv struct {
 	st        *store.Mem
 	bl        blob.Store
+	dir       string
 	userID    int64
 	channelID int64
 }
@@ -40,11 +41,12 @@ func newGCEnv(t *testing.T) *gcEnv {
 	if err := st.CreateChannel(ctx, ch); err != nil {
 		t.Fatalf("CreateChannel: %v", err)
 	}
-	bl, _, err := blob.New(blob.Config{Driver: "local", Dir: t.TempDir()}, discardLogger())
+	dir := t.TempDir()
+	bl, _, err := blob.New(blob.Config{Driver: "local", Dir: dir}, discardLogger())
 	if err != nil {
 		t.Fatalf("blob.New: %v", err)
 	}
-	return &gcEnv{st: st, bl: bl, userID: u.ID, channelID: ch.ID}
+	return &gcEnv{st: st, bl: bl, dir: dir, userID: u.ID, channelID: ch.ID}
 }
 
 func discardLogger() *log.Logger { return log.New(io.Discard, "", 0) }

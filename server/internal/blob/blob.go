@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 )
 
 // ErrNotFound 对象不存在（Get 用；Delete 对不存在视为成功，保持幂等）。
@@ -22,6 +23,22 @@ type Store interface {
 	Get(ctx context.Context, key string) ([]byte, error)
 	// Delete 删除对象；不存在视为成功（幂等）。
 	Delete(ctx context.Context, key string) error
+}
+
+// ObjectInfo 供 GC 枚举并在删除前二次核对对象身份。
+type ObjectInfo struct {
+	Key      string
+	Modified time.Time
+	Size     int64
+	ETag     string
+	Owned    bool // Stat 已验证属于本应用；S3 旧无标记对象不能自动删除。
+}
+
+// Scanner 每次至多返回 limit 个对象；next 是不透明游标，done 表示已到末尾。
+// 与 Store 分离，已有自定义存储实现可继续运行有行回收。
+type Scanner interface {
+	Scan(ctx context.Context, after string, limit int) (objects []ObjectInfo, next string, done bool, err error)
+	Stat(ctx context.Context, key string) (ObjectInfo, error)
 }
 
 // Config 存储配置。Driver 为空或 "local" 用 Dir；"s3" 用 Endpoint/Bucket/凭证。

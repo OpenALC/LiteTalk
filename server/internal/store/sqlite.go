@@ -441,6 +441,9 @@ func (s *SQLite) DeleteServer(ctx context.Context, id int64) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM read_states WHERE channel_id IN (SELECT id FROM channels WHERE server_id = ?)`, id); err != nil {
+		return err
+	}
 	// 提及没有外键，必须先于 messages 删除，否则留下孤儿行（#39）。
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM message_mentions WHERE message_id IN (
@@ -675,6 +678,9 @@ func (s *SQLite) DeleteChannel(ctx context.Context, id int64) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM read_states WHERE channel_id = ? OR channel_id IN (SELECT id FROM channels WHERE parent_id = ?)`, id, id); err != nil {
+		return err
+	}
 	// 提及没有外键，必须先于 messages 删除（含子频道消息，#39）。
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM message_mentions WHERE message_id IN (
@@ -984,6 +990,9 @@ func (s *SQLite) DeleteCategoryWithChannels(ctx context.Context, id int64) error
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM read_states WHERE channel_id IN (SELECT id FROM channels WHERE category_id = ? UNION SELECT id FROM channels WHERE parent_id IN (SELECT id FROM channels WHERE category_id = ?))`, id, id); err != nil {
+		return err
+	}
 	// 提及没有外键，必须先于 messages 删除（#39）。
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM message_mentions WHERE message_id IN (
@@ -1469,6 +1478,21 @@ func (s *SQLite) AttachmentsByMessageIDs(ctx context.Context, messageIDs []int64
 // OrphanAttachments 见 Store 接口；三类孤儿由共用 SQL 一次查出。
 func (s *SQLite) OrphanAttachments(ctx context.Context, unclaimedBefore time.Time, limit int) ([]Attachment, error) {
 	return queryOrphanAttachments(ctx, s.db, unclaimedBefore, limit)
+}
+func (s *SQLite) OrphanAttachmentsAfter(ctx context.Context, before time.Time, afterID int64, limit int) ([]Attachment, error) {
+	return queryOrphanAttachmentsAfter(ctx, s.db, before, afterID, limit)
+}
+func (s *SQLite) ReserveOrphanAttachment(ctx context.Context, id int64, before time.Time) (*Attachment, bool, error) {
+	return reserveOrphanAttachment(ctx, s.db, id, before)
+}
+func (s *SQLite) FinishOrphanAttachment(ctx context.Context, id int64) (bool, error) {
+	return finishOrphanAttachment(ctx, s.db, id)
+}
+func (s *SQLite) AttachmentKeyExists(ctx context.Context, key string) (bool, error) {
+	return attachmentKeyExists(ctx, s.db, key)
+}
+func (s *SQLite) PruneOrphanReadStatesAfter(ctx context.Context, uid, cid int64, limit int) (int64, int64, bool, int, error) {
+	return pruneOrphanReadStatesAfter(ctx, s.db, uid, cid, limit)
 }
 
 // DeleteAttachmentRows 批量删除元数据行；不存在的 id 忽略，空入参 no-op。
