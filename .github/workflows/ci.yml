@@ -128,7 +128,7 @@ jobs:
           set -o pipefail
           test -n "$LITETALK_MYSQL_DSN"
           go test -race -count=1 -json ./internal/store | tee "$RUNNER_TEMP/mysql-tests.jsonl"
-          if jq -e 'select(.Action == "skip" and ((.Test // "") | contains("MySQL")))' "$RUNNER_TEMP/mysql-tests.jsonl" >/dev/null; then
+          if jq -e 'select(.Action == "skip" and ((.Test // "") | ascii_downcase | contains("mysql")))' "$RUNNER_TEMP/mysql-tests.jsonl" >/dev/null; then
             echo '::error::MySQL 真库测试出现跳过'
             exit 1
           fi
