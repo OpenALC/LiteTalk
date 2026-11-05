@@ -6,8 +6,7 @@
 > 三者都带 `--enable-dred`（#44）。`opusfile/`、`ogg/` 为 Windows x86_64 /
 > UCRT64 预编译包，来源为清华 TUNA MSYS2 仓库；`webrtc-apm/` 为仓库内构建的
 > WebRTC APM 1.3 静态库（Windows amd64 / Linux amd64 / Linux arm64 三套），
-> 构建细节见各自的 README。详细构建环境说明见仓库根 docs/M1-环境前置.md
-> （本地文档，不入库）。
+> 各库的构建步骤和工具链要求见对应目录的 README；本机 cgo 工具链配置见根目录 AGENTS.md 第 2 节。
 
 | 目录 | 库 | 版本 | 来源包 | 许可 |
 |---|---|---|---|---|
