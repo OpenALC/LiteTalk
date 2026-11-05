@@ -78,6 +78,18 @@ func (m *MySQL) Migrate(ctx context.Context, fsys fs.FS) error {
 		)`); err != nil {
 		return fmt.Errorf("create schema_migrations: %w", err)
 	}
+	hasEmailKeys, err := emailKeysApplied(ctx, conn)
+	if err != nil {
+		return err
+	}
+	if hasEmailKeys {
+		if err := verifyEmailKeySchemaMySQL(ctx, conn); err != nil {
+			return err
+		}
+		if err := verifyEmailKeyRows(ctx, conn); err != nil {
+			return err
+		}
+	}
 	entries, err := fs.ReadDir(fsys, ".")
 	if err != nil {
 		return err
@@ -144,6 +156,7 @@ func (m *MySQL) Migrate(ctx context.Context, fsys fs.FS) error {
 			if err := tx.Commit(); err != nil {
 				return err
 			}
+			hasEmailKeys = true
 			continue
 		}
 		// MySQL 驱动不支持多语句 Exec，逐条执行。
@@ -157,19 +170,7 @@ func (m *MySQL) Migrate(ctx context.Context, fsys fs.FS) error {
 			return err
 		}
 	}
-	applied, err := emailKeysApplied(ctx, m.db)
-	if err != nil {
-		return err
-	}
-	if applied {
-		if err := verifyEmailKeySchemaMySQL(ctx, m.db); err != nil {
-			return err
-		}
-		if err := verifyEmailKeyRows(ctx, m.db); err != nil {
-			return err
-		}
-	}
-	m.emailKeysReady.Store(applied)
+	m.emailKeysReady.Store(hasEmailKeys)
 	return nil
 }
 

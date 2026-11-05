@@ -106,6 +106,18 @@ func (s *SQLite) Migrate(ctx context.Context, fsys fs.FS) error {
 		)`); err != nil {
 		return fmt.Errorf("create schema_migrations: %w", err)
 	}
+	hasEmailKeys, err := emailKeysApplied(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if hasEmailKeys {
+		if err := verifyEmailKeySchemaSQLite(ctx, tx); err != nil {
+			return err
+		}
+		if err := verifyEmailKeyRows(ctx, tx); err != nil {
+			return err
+		}
+	}
 	entries, err := fs.ReadDir(fsys, ".")
 	if err != nil {
 		return err
@@ -163,23 +175,14 @@ func (s *SQLite) Migrate(ctx context.Context, fsys fs.FS) error {
 			`INSERT INTO schema_migrations (version) VALUES (?)`, version); err != nil {
 			return err
 		}
+		if version == emailKeysVersion {
+			hasEmailKeys = true
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	applied, err := emailKeysApplied(ctx, s.db)
-	if err != nil {
-		return err
-	}
-	if applied {
-		if err := verifyEmailKeySchemaSQLite(ctx, s.db); err != nil {
-			return err
-		}
-		if err := verifyEmailKeyRows(ctx, s.db); err != nil {
-			return err
-		}
-	}
-	s.emailKeysReady.Store(applied)
+	s.emailKeysReady.Store(hasEmailKeys)
 	return nil
 }
 

@@ -134,9 +134,9 @@ func safeEmailDBError(err error) string {
 	return fmt.Sprintf("type=%T", err)
 }
 
-func emailKeysApplied(ctx context.Context, db *sql.DB) (bool, error) {
+func emailKeysApplied(ctx context.Context, q emailKeyQueryer) (bool, error) {
 	var n int
-	err := db.QueryRowContext(ctx,
+	err := q.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM schema_migrations WHERE version = ?`, emailKeysVersion).Scan(&n)
 	return n != 0, err
 }

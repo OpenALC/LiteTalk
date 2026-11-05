@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/fstest"
 
 	"github.com/OpenALC/LiteTalk/server/migrations"
 	mysqldrv "github.com/go-sql-driver/mysql"
@@ -430,5 +431,67 @@ func TestSafeEmailDBErrorOmitsDuplicateKey(t *testing.T) {
 	got := safeEmailDBError(err)
 	if !strings.Contains(got, "1062") || strings.Contains(got, "secret") || strings.Contains(got, "example.com") {
 		t.Fatalf("诊断只允许错误号/SQLSTATE: %q", got)
+	}
+}
+
+func emailKeySentinelMigrations() fs.FS {
+	return fstest.MapFS{
+		"0024_sentinel.up.sql": &fstest.MapFile{Data: []byte(`CREATE TABLE email_migration_sentinel (id INTEGER PRIMARY KEY);
+			INSERT INTO email_migration_sentinel (id) VALUES (1);`)},
+		"0024_sentinel.down.sql": &fstest.MapFile{Data: []byte(`DROP TABLE email_migration_sentinel;`)},
+	}
+}
+
+func TestEmailKeysSQLiteCorruptionBlocksLaterMigration(t *testing.T) {
+	ctx := context.Background()
+	sq := openTestSQLite(t)
+	if err := sq.Migrate(ctx, findMigrationsSQLite(t)); err != nil {
+		t.Fatal(err)
+	}
+	if err := sq.CreateUser(ctx, &User{ID: 99001, Email: "Name@Example.com", Nickname: "name", Tag: "0001"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sq.DB().ExecContext(ctx, `UPDATE user_email_keys SET email_key = x'77726f6e67'`); err != nil {
+		t.Fatal(err)
+	}
+	err := sq.Migrate(ctx, emailKeySentinelMigrations())
+	if err == nil || !strings.Contains(err.Error(), "99001") || strings.Contains(err.Error(), "Example") {
+		t.Fatalf("应在 0024 前拒绝 0023 错键，且只报 ID: %v", err)
+	}
+	var n int
+	if err := sq.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'email_migration_sentinel'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("后续 0024 DDL 不得执行: %d %v", n, err)
+	}
+	if err := sq.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM schema_migrations WHERE version = '0024_sentinel'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("后续 0024 不得记版本: %d %v", n, err)
+	}
+}
+
+func TestEmailKeysMySQLCorruptionBlocksLaterMigration(t *testing.T) {
+	ctx := context.Background()
+	m := openRolesMySQL(t)
+	if err := m.Migrate(ctx, findMigrations(t)); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.CreateUser(ctx, &User{ID: 99002, Email: "Name@Example.com", Nickname: "name", Tag: "0001"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.DB().ExecContext(ctx, `UPDATE user_email_keys SET email_key = x'77726f6e67'`); err != nil {
+		t.Fatal(err)
+	}
+	err := m.Migrate(ctx, emailKeySentinelMigrations())
+	if err == nil || !strings.Contains(err.Error(), "99002") || strings.Contains(err.Error(), "Example") {
+		t.Fatalf("应在 0024 前拒绝 0023 错键，且只报 ID: %v", err)
+	}
+	var n int
+	if err := m.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.tables
+		WHERE table_schema = DATABASE() AND table_name = 'email_migration_sentinel'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("后续 0024 DDL 不得执行: %d %v", n, err)
+	}
+	if err := m.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM schema_migrations WHERE version = '0024_sentinel'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("后续 0024 不得记版本: %d %v", n, err)
 	}
 }
