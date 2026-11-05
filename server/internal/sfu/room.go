@@ -300,7 +300,8 @@ func (r *Room) ensureRoute(target, src *Peer, track *webrtc.TrackRemote) error {
 //
 // #33：每包先读 RFC 6464 电平写原子（说话判定循环侧消费），再过活跃门——
 // 非活跃源整包丢弃但 track 保持挂载（Phase 1 包级门控；RemoveTrack 会触发
-// 重协商风暴，#23 踩过，这里禁止）。循环内不加锁不分配（pion ReadRTP 除外）。
+// 重协商风暴，#23 踩过，这里禁止）。门控读取原子状态；放行后扇出仍持有
+// 房间读锁并短暂持有目标 Peer 锁。直接测扇出的软件基准不含 ReadRTP 成本。
 func (r *Room) forward(src *Peer, srcTrack *webrtc.TrackRemote, levelExtID uint8) {
 	for {
 		pkt, _, err := srcTrack.ReadRTP()
