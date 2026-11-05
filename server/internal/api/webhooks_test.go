@@ -1151,7 +1151,7 @@ func TestWebhookPatchEventsUsesEffectiveCreator(t *testing.T) {
 		resp := patchJSON(t, f.h, f.hookPath(hookID), f.accO,
 			map[string]any{"events": []string{"message.created"}, "enabled": false, "reset_secret": true},
 			http.StatusConflict)
-		if resp["code"] != "webhook_events_needs_creator" || resp["message"] != "需由创建者或服主修改事件" {
+		if resp["code"] != "webhook_events_needs_creator" || resp["message"] != "订阅原创建者已无频道可见性，请由创建者或服主修改事件，或先改址将创建者变更为自己" {
 			t.Fatalf("创建者失去可见性应返回专用冲突: %v", resp)
 		}
 		if row := *f.row(t, hookID); row != before {
@@ -1164,6 +1164,67 @@ func TestWebhookPatchEventsUsesEffectiveCreator(t *testing.T) {
 			map[string]any{"url": newURL, "events": []string{"message.created"}}, http.StatusOK)
 		if row := f.row(t, hookID); row.URL != newURL || row.Events != "message.created" || row.CreatorID != f.uidO {
 			t.Fatalf("改址应按改址者可见性放行并改绑: %+v", row)
+		}
+	})
+
+	t.Run("创建者和操作者都不可见仍返回冲突且不落库", func(t *testing.T) {
+		f := newRebindFixture(t)
+		created := postJSON(t, f.h, fmt.Sprintf("/api/v1/servers/%d/webhooks", f.serverID), f.accM,
+			map[string]any{"url": "https://hooks.example.com/m", "events": []string{"member.joined"}}, http.StatusCreated)
+		hookID := asID(created["id"])
+		f.setViewDeny(t, f.pubID, true) // 创建者 M 已看不到任何频道
+
+		accN, _ := registerUser(t, f.h, f.mem, "r1-125-n@ex.com", "r1N", "password123")
+		invite := postJSON(t, f.h, fmt.Sprintf("/api/v1/servers/%d/invites", f.serverID), f.accO,
+			map[string]any{"max_uses": 1}, http.StatusCreated)
+		postJSON(t, f.h, "/api/v1/servers/join", accN,
+			map[string]string{"code": invite["code"].(string)}, http.StatusOK)
+		uidN := asID(getJSON(t, f.h, "/api/v1/users/me", accN, http.StatusOK).(map[string]any)["id"])
+		role := &store.Role{ServerID: f.serverID, Name: "mgrN", Permissions: store.ManageServer}
+		ctx := context.Background()
+		if err := f.mem.CreateRole(ctx, role); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.mem.SetMemberRoles(ctx, f.serverID, uidN, []int64{role.ID}, 0); err != nil {
+			t.Fatal(err)
+		}
+		for _, channelID := range []int64{f.pubID, f.secretID} {
+			if err := f.mem.SetChannelOverwrite(ctx, &store.ChannelOverwrite{
+				ChannelID: channelID, TargetType: store.OverwriteTargetMember, TargetID: uidN,
+				Deny: store.ViewChannel,
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f.az.InvalidateServer(f.serverID)
+
+		before := *f.row(t, hookID)
+		resp := patchJSON(t, f.h, f.hookPath(hookID), accN,
+			map[string]any{"events": []string{"message.created"}}, http.StatusConflict)
+		if resp["code"] != "webhook_events_needs_creator" {
+			t.Fatalf("两主体均不可见应返回专用冲突: %v", resp)
+		}
+		if row := *f.row(t, hookID); row != before {
+			t.Fatalf("409 后订阅行不得变化: before=%+v after=%+v", before, row)
+		}
+	})
+
+	t.Run("操作者先改址再单独改事件", func(t *testing.T) {
+		f := newRebindFixture(t)
+		created := postJSON(t, f.h, fmt.Sprintf("/api/v1/servers/%d/webhooks", f.serverID), f.accM,
+			map[string]any{"url": "https://hooks.example.com/m", "events": []string{"member.joined"}}, http.StatusCreated)
+		hookID := asID(created["id"])
+		f.setViewDeny(t, f.pubID, true) // 原创建者 M 不可见，操作者 O 可见
+		newURL := "https://hooks.example.com/o"
+		patchJSON(t, f.h, f.hookPath(hookID), f.accO,
+			map[string]any{"url": newURL}, http.StatusOK)
+		if row := f.row(t, hookID); row.URL != newURL || row.Events != "member.joined" || row.CreatorID != f.uidO {
+			t.Fatalf("首个请求应仅改址并改绑: %+v", row)
+		}
+		patchJSON(t, f.h, f.hookPath(hookID), f.accO,
+			map[string]any{"events": []string{"message.created"}}, http.StatusOK)
+		if row := f.row(t, hookID); row.URL != newURL || row.Events != "message.created" || row.CreatorID != f.uidO {
+			t.Fatalf("改址后第二个请求应按新创建者更新事件: %+v", row)
 		}
 	})
 

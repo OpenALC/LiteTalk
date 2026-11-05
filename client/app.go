@@ -3292,14 +3292,12 @@ func (a *App) GetVoiceMembers() []voice.PeerView {
 // ServiceShutdown v3 服务关闭回调：退出清理。
 func (a *App) ServiceShutdown() error {
 	// 先挡住迟到的唤醒与建窗登记；后续停流可能按 levelMu → winMu 加锁。
-	a.winMu.Lock()
-	a.forceQuit.Store(true)
-	a.wakePending = false
-	a.wakePendingFocus = false
-	a.windowCloseFlags = nil
-	a.winMu.Unlock()
+	a.markForceQuit()
 	// 设置页监视持独立声卡设备；不能依赖正在退出的 WebView 异步停流。
 	a.shutdownLevelMonitor()
+	a.winMu.Lock()
+	a.windowCloseFlags = nil
+	a.winMu.Unlock()
 	// 再停悬浮层：Stop 会等待窗口线程退出，保证后续拆会话时没有快照回调
 	// 还在访问 Session。
 	a.stopWindowOverlay()
