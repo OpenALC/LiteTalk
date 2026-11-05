@@ -6,13 +6,8 @@ package store
 
 import (
 	"context"
-	"database/sql"
-	"os"
 	"sync"
 	"testing"
-	"time"
-
-	mysqlDriver "github.com/go-sql-driver/mysql"
 )
 
 // assertOutboundWebhookCreatorRoundTrip 两种后端共用的断言体。
@@ -117,28 +112,10 @@ func TestOutboundWebhookCreatorRoundTrip(t *testing.T) {
 	})
 }
 
-// TestOutboundWebhookCreatorRoundTripMySQL 真库矩阵（MySQL 不可用自动跳过，与既有真库测试同口径）。
+// TestOutboundWebhookCreatorRoundTripMySQL 真库矩阵。
 func TestOutboundWebhookCreatorRoundTripMySQL(t *testing.T) {
-	m := openTestMySQL(t)
-	defer m.Close()
+	m := openTestMySQLSchema(t, "webhook_creator")
 	ctx := context.Background()
-	if _, err := m.DB().ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS litetalk_test"); err != nil {
-		t.Fatalf("建测试库失败: %v", err)
-	}
-	if _, err := m.DB().ExecContext(ctx, "USE litetalk_test"); err != nil {
-		t.Fatal(err)
-	}
-	// 清理历史：与 TestBotsAmongMySQL 同清单（webhooks 三表在列）。
-	for _, tbl := range []string{
-		"attachments", "read_states", "invites", "messages", "message_mentions", "channel_members", "channels", "categories", "server_members",
-		"servers", "friendships", "users", "user_sessions", "kv", "schema_migrations",
-		"audit_log", "channel_overwrites", "member_roles", "roles", "api_tokens",
-		"push_devices",
-		"webhook_deliveries", "inbound_webhooks", "webhooks",
-		"oidc_identities",
-	} {
-		_, _ = m.DB().ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl)
-	}
 	if err := m.Migrate(ctx, findMigrations(t)); err != nil {
 		t.Fatalf("迁移失败: %v", err)
 	}
@@ -269,59 +246,11 @@ func TestRecordWebhookDeliveryConcurrent(t *testing.T) {
 	})
 }
 
-// openTestMySQLSchema 打开已选中 schema 的 MySQL 连接池。并发用例不能靠
-// "USE litetalk_test"：USE 只作用于连接池里的某条连接，新开的连接没有默认库。
-// 把库名写进 DSN，池里每条连接都带着它。MySQL 不可用时 skip。
-func openTestMySQLSchema(t *testing.T, schema string) *MySQL {
-	t.Helper()
-	dsn := os.Getenv("LITETALK_MYSQL_DSN")
-	if dsn == "" {
-		dsn = "root:@tcp(127.0.0.1:3306)/?parseTime=true&multiStatements=true"
-	}
-	cfg, err := mysqlDriver.ParseDSN(dsn)
-	if err != nil {
-		t.Skipf("MySQL DSN 不可解析，跳过真库测试: %v", err)
-	}
-	cfg.DBName = schema
-	db, err := sql.Open("mysql", cfg.FormatDSN())
-	if err != nil {
-		t.Skipf("MySQL 不可用，跳过真库测试: %v", err)
-	}
-	db.SetMaxOpenConns(20)
-	db.SetMaxIdleConns(5)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := db.PingContext(ctx); err != nil {
-		_ = db.Close()
-		t.Skipf("MySQL 不可用，跳过真库测试: %v", err)
-	}
-	return &MySQL{db: db}
-}
-
 // TestRecordWebhookDeliveryConcurrentMySQL 真库矩阵：多连接并发写同一订阅，
-// 原子自增下计数精确。MySQL 不可用自动跳过（与既有真库测试同口径；CI 的
-// check-server 也没有 MySQL service，故该用例在 CI 上同样 skip）。
+// 原子自增下计数精确。
 func TestRecordWebhookDeliveryConcurrentMySQL(t *testing.T) {
-	boot := openTestMySQL(t)
+	m := openTestMySQLSchema(t, "webhook_breaker")
 	ctx := context.Background()
-	if _, err := boot.DB().ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS litetalk_test"); err != nil {
-		boot.Close()
-		t.Fatalf("建测试库失败: %v", err)
-	}
-	boot.Close()
-	m := openTestMySQLSchema(t, "litetalk_test")
-	defer m.Close()
-	// 清理历史：与 TestOutboundWebhookCreatorRoundTripMySQL 同清单。
-	for _, tbl := range []string{
-		"attachments", "read_states", "invites", "messages", "message_mentions", "channel_members", "channels", "categories", "server_members",
-		"servers", "friendships", "users", "user_sessions", "kv", "schema_migrations",
-		"audit_log", "channel_overwrites", "member_roles", "roles", "api_tokens",
-		"push_devices",
-		"webhook_deliveries", "inbound_webhooks", "webhooks",
-		"oidc_identities",
-	} {
-		_, _ = m.DB().ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl)
-	}
 	if err := m.Migrate(ctx, findMigrations(t)); err != nil {
 		t.Fatalf("迁移失败: %v", err)
 	}

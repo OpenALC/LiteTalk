@@ -4,10 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"os"
 	"testing"
-
-	mysqldrv "github.com/go-sql-driver/mysql"
 )
 
 // runNicknameCaseContract 三个 Store 共用的昵称大小写契约（#24 P2）：
@@ -79,44 +76,10 @@ func TestNicknameCaseContractSQLite(t *testing.T) {
 	runNicknameCaseContract(t, m)
 }
 
-// nicknameTestDB MySQL 专用昵称契约库：每次用例重建，避免与同包其它用例互相污染。
-const nicknameTestDB = "litetalk_nickname_test"
-
-// openNicknameMySQL 建一个专用、干净的 MySQL 测试库（做法同 openFriendshipMySQL）。
-// DSN 里带库名而不是靠 USE：连接池会新开连接，USE 只影响执行它的那条连接。
+// openNicknameMySQL 为每个昵称契约测试建立独立库。
 func openNicknameMySQL(t *testing.T) *MySQL {
 	t.Helper()
-	base := openTestMySQL(t) // DSN 不可用时跳过
-	dsn := os.Getenv("LITETALK_MYSQL_DSN")
-	if dsn == "" {
-		dsn = "root:@tcp(127.0.0.1:3306)/?parseTime=true&multiStatements=true"
-	}
-	cfg, err := mysqldrv.ParseDSN(dsn)
-	if err != nil {
-		base.Close()
-		t.Fatalf("解析 MySQL DSN 失败: %v", err)
-	}
-	ctx := context.Background()
-	if _, err := base.DB().ExecContext(ctx, "DROP DATABASE IF EXISTS "+nicknameTestDB); err != nil {
-		base.Close()
-		t.Fatalf("清理专用测试库失败: %v", err)
-	}
-	if _, err := base.DB().ExecContext(ctx,
-		"CREATE DATABASE "+nicknameTestDB+" CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"); err != nil {
-		base.Close()
-		t.Fatalf("建专用测试库失败: %v", err)
-	}
-	base.Close()
-
-	cfg.DBName = nicknameTestDB
-	// OpenMySQL 优先读环境变量；t.Setenv 让后续连接也指向专用库，用例结束自动还原。
-	t.Setenv("LITETALK_MYSQL_DSN", cfg.FormatDSN())
-	m, err := OpenMySQL(cfg.FormatDSN())
-	if err != nil {
-		t.Fatalf("连接专用测试库失败: %v", err)
-	}
-	t.Cleanup(func() { _ = m.Close() })
-	return m
+	return openTestMySQLSchema(t, "nickname")
 }
 
 func TestNicknameCaseContractMySQL(t *testing.T) {
