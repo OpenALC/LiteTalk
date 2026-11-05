@@ -469,12 +469,7 @@ func (a *App) buildWindow(opts application.WebviewWindowOptions) *application.We
 	win := a.wails.Window.NewWithOptions(opts)
 	var programmaticClose atomic.Bool
 	if runtime.GOOS == "windows" {
-		a.winMu.Lock()
-		if a.windowCloseFlags == nil {
-			a.windowCloseFlags = make(map[*application.WebviewWindow]*atomic.Bool)
-		}
-		a.windowCloseFlags[win] = &programmaticClose
-		a.winMu.Unlock()
+		a.registerWindowCloseFlag(win, &programmaticClose)
 	}
 
 	// 关窗拦截：默认隐藏到托盘而非退出（见 interceptClose）。
@@ -506,6 +501,19 @@ func (a *App) buildWindow(opts application.WebviewWindowOptions) *application.We
 	})
 
 	return win
+}
+
+func (a *App) registerWindowCloseFlag(win *application.WebviewWindow, flag *atomic.Bool) {
+	a.winMu.Lock()
+	defer a.winMu.Unlock()
+	if a.forceQuit.Load() {
+		// 建窗返回可能晚于关机清表，退出后不能重新创建标记表。
+		return
+	}
+	if a.windowCloseFlags == nil {
+		a.windowCloseFlags = make(map[*application.WebviewWindow]*atomic.Bool)
+	}
+	a.windowCloseFlags[win] = flag
 }
 
 // destroyRenderProcess 销毁渲染进程（里程碑②，destroy 休眠模式的真实实现）：
@@ -3283,6 +3291,13 @@ func (a *App) GetVoiceMembers() []voice.PeerView {
 
 // ServiceShutdown v3 服务关闭回调：退出清理。
 func (a *App) ServiceShutdown() error {
+	// 先挡住迟到的唤醒与建窗登记；后续停流可能按 levelMu → winMu 加锁。
+	a.winMu.Lock()
+	a.forceQuit.Store(true)
+	a.wakePending = false
+	a.wakePendingFocus = false
+	a.windowCloseFlags = nil
+	a.winMu.Unlock()
 	// 设置页监视持独立声卡设备；不能依赖正在退出的 WebView 异步停流。
 	a.shutdownLevelMonitor()
 	// 再停悬浮层：Stop 会等待窗口线程退出，保证后续拆会话时没有快照回调

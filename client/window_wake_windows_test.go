@@ -287,3 +287,54 @@ func TestWindowsQuitCancelsPendingWake(t *testing.T) {
 		t.Fatal("退出期间排队或后到的唤醒不得重建窗口")
 	}
 }
+
+func TestWindowsServiceShutdownReleasesWindowCloseFlags(t *testing.T) {
+	a := newAppWithConfig(config.NewWithPath(filepath.Join(t.TempDir(), "config.json")))
+	a.registerWindowCloseFlag(&application.WebviewWindow{}, &atomic.Bool{})
+	a.registerWindowCloseFlag(&application.WebviewWindow{}, &atomic.Bool{})
+	a.QuitApp()
+	if err := a.ServiceShutdown(); err != nil {
+		t.Fatal(err)
+	}
+	a.winMu.Lock()
+	defer a.winMu.Unlock()
+	if a.windowCloseFlags != nil {
+		t.Fatalf("退出后应释放全部窗口关闭标志，剩余 %d 条", len(a.windowCloseFlags))
+	}
+}
+
+func TestWindowsServiceShutdownDoesNotReviveWindowCloseFlagsDuringBuild(t *testing.T) {
+	a := newAppWithConfig(config.NewWithPath(filepath.Join(t.TempDir(), "config.json")))
+	win := &application.WebviewWindow{}
+	enteredBuild := make(chan struct{})
+	releaseBuild := make(chan struct{})
+	done := make(chan struct{})
+	var closeFlag atomic.Bool
+	var closes, activations atomic.Int32
+	a.wakeBuild = func(application.WebviewWindowOptions) *application.WebviewWindow {
+		close(enteredBuild)
+		<-releaseBuild
+		a.registerWindowCloseFlag(win, &closeFlag)
+		return win
+	}
+	a.destroyClose = func(target *application.WebviewWindow) {
+		if target != win {
+			t.Errorf("退出时关闭了非本次建造的窗口")
+		}
+		closes.Add(1)
+	}
+	a.wakeActivate = func(*application.WebviewWindow, bool, bool, bool) { activations.Add(1) }
+	go func() { a.showFromTrayWindows(false); close(done) }()
+	waitWakeDone(t, enteredBuild)
+	if err := a.ServiceShutdown(); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseBuild)
+	waitWakeDone(t, done)
+	a.showFromTrayWindows(true)
+	a.winMu.Lock()
+	defer a.winMu.Unlock()
+	if a.windowCloseFlags != nil || a.window != nil || closes.Load() != 1 || activations.Load() != 0 {
+		t.Fatalf("退出后的在途建窗不得重新登记或显示: flags=%d closes=%d activations=%d", len(a.windowCloseFlags), closes.Load(), activations.Load())
+	}
+}
