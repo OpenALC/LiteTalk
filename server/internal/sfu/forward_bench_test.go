@@ -1,6 +1,7 @@
 package sfu
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 
@@ -9,16 +10,17 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
-// 这些基准只量静态路由表的扇出热段。写轨使用真实的 Pion WriteRTP 与 Bind，
-// 同步接收汇消费每次写入；不含 TrackRemote.ReadRTP、SRTP、UDP 或调度开销。
-// 真实连接、离房/重入和悄悄话语义仍由同包的集成测试验证。
+// 路由-only 基准是诊断镜像，不会随生产代码自动更新，不能用于优化收益验收。
+// 写轨使用真实的 Pion WriteRTP 与 Bind，同步接收汇消费每次写入；不含
+// TrackRemote.ReadRTP、SRTP、UDP 或调度开销。真实转发语义由集成测试验证。
 type benchTrackWriter struct {
-	calls uint64
-	bytes uint64
+	expectedSSRC webrtc.SSRC
+	calls        uint64
+	bytes        uint64
 }
 
 func (w *benchTrackWriter) WriteRTP(h *rtp.Header, payload []byte) (int, error) {
-	if h.Version != 2 || h.SSRC == 0 || h.PayloadType != 111 {
+	if h.Version != 2 || h.SSRC != uint32(w.expectedSSRC) || h.PayloadType != 111 || len(payload) != 80 {
 		panic("Pion 写轨未使用有效的绑定参数")
 	}
 	w.calls++
@@ -53,11 +55,12 @@ func (c benchTrackContext) ID() string                                          
 func (benchTrackContext) RTCPReader() interceptor.RTCPReader                     { return nil }
 
 type benchRoutes struct {
-	room    *Room
-	src     *Peer
-	tracks  []*webrtc.TrackLocalStaticRTP
-	writers []*benchTrackWriter
-	pkt     *rtp.Packet
+	room     *Room
+	src      *Peer
+	tracks   []*webrtc.TrackLocalStaticRTP
+	writers  []*benchTrackWriter
+	pkt      *rtp.Packet
+	original []byte
 }
 
 func newBenchRoutes(b *testing.B, receivers int) *benchRoutes {
@@ -72,6 +75,11 @@ func newBenchRoutes(b *testing.B, receivers int) *benchRoutes {
 	for i := range br.pkt.Payload {
 		br.pkt.Payload[i] = byte(i)
 	}
+	var err error
+	br.original, err = br.pkt.Marshal()
+	if err != nil {
+		b.Fatal(err)
+	}
 	for i := 0; i < receivers; i++ {
 		uid := fmt.Sprintf("dst%d", i)
 		track, err := webrtc.NewTrackLocalStaticRTP(
@@ -81,9 +89,9 @@ func newBenchRoutes(b *testing.B, receivers int) *benchRoutes {
 		if err != nil {
 			b.Fatal(err)
 		}
-		writer := &benchTrackWriter{}
+		writer := &benchTrackWriter{expectedSSRC: webrtc.SSRC(1000 + i)}
 		if _, err := track.Bind(benchTrackContext{
-			id: uid, ssrc: webrtc.SSRC(1000 + i), writer: writer,
+			id: uid, ssrc: writer.expectedSSRC, writer: writer,
 		}); err != nil {
 			b.Fatal(err)
 		}
@@ -98,6 +106,7 @@ func newBenchRoutes(b *testing.B, receivers int) *benchRoutes {
 		br.tracks = append(br.tracks, track)
 		br.writers = append(br.writers, writer)
 	}
+	br.checkPacketUnchanged(b)
 	return br
 }
 
@@ -199,6 +208,97 @@ func BenchmarkSFURoutingRoomPeerLocks(b *testing.B) {
 	}
 }
 
+// BenchmarkSFURoutingContended 只量路由查找在写锁竞争下的成本，不写 RTP。
+// 写者持续修改与被测路由无关的状态，拓扑和命中数保持不变；这是锁压力诊断，
+// 写者也占 CPU，不能把 ns/op 的增量直接解释成锁本身的耗时。
+func BenchmarkSFURoutingContended(b *testing.B) {
+	for _, receivers := range []int{1, 4, 9} {
+		for _, peerWriter := range []bool{false, true} {
+			name := "room-writer"
+			if peerWriter {
+				name = "peer-writer"
+			}
+			b.Run(fmt.Sprintf("%s/receivers=%d", name, receivers), func(b *testing.B) {
+				b.StopTimer()
+				br := newBenchRoutes(b, receivers)
+				stop := make(chan struct{})
+				start := make(chan struct{})
+				ready := make(chan struct{})
+				done := make(chan uint64, 1)
+				var writeOnce func()
+				if peerWriter {
+					target := br.room.peers["dst0"]
+					other := &Peer{userID: "other-src"}
+					a, c := &outRoute{src: other}, &outRoute{src: other}
+					target.outbound[other.userID] = a
+					flip := false
+					writeOnce = func() {
+						target.mu.Lock()
+						if flip {
+							target.outbound[other.userID] = a
+						} else {
+							target.outbound[other.userID] = c
+						}
+						flip = !flip
+						target.mu.Unlock()
+					}
+				} else {
+					writeOnce = func() {
+						br.room.mu.Lock()
+						br.room.peers[br.src.userID] = br.src
+						br.room.mu.Unlock()
+					}
+				}
+				go func() {
+					<-start
+					writeOnce()
+					close(ready)
+					writes := uint64(1)
+					for {
+						select {
+						case <-stop:
+							done <- writes
+							return
+						default:
+							writeOnce()
+							writes++
+						}
+					}
+				}()
+				matched := 0
+				b.ResetTimer()
+				b.ReportAllocs()
+				b.StartTimer()
+				close(start)
+				<-ready
+				for i := 0; i < b.N; i++ {
+					br.room.mu.RLock()
+					for uid, p := range br.room.peers {
+						if uid == br.src.userID {
+							continue
+						}
+						p.mu.Lock()
+						route := p.outbound[br.src.userID]
+						p.mu.Unlock()
+						if route != nil && route.src == br.src {
+							matched++
+						}
+					}
+					br.room.mu.RUnlock()
+				}
+				close(stop)
+				b.StopTimer()
+				writes := <-done
+				benchRouteMatches = matched
+				if matched != b.N*receivers {
+					b.Fatalf("竞争下路由命中 %d，期望 %d", matched, b.N*receivers)
+				}
+				b.ReportMetric(float64(writes)/float64(b.N), "writer_ops/op")
+			})
+		}
+	}
+}
+
 // BenchmarkSFUBoundPionWrite 只量已绑定的 Pion WriteRTP 与同步接收汇。
 func BenchmarkSFUBoundPionWrite(b *testing.B) {
 	for _, receivers := range []int{1, 4, 9} {
@@ -218,13 +318,14 @@ func BenchmarkSFUBoundPionWrite(b *testing.B) {
 			}
 			b.StopTimer()
 			br.checkWrites(b, receivers)
+			br.checkPacketUnchanged(b)
 		})
 	}
 }
 
-// BenchmarkSFUFanoutKernel 合并当前房间路由热段和已绑定 Pion 写轨。
+// BenchmarkSFUFanoutPacket 直接调用生产 Room.fanoutPacket。
 // 它没有 TrackRemote.ReadRTP 和网络收发，不能冒充完整 SFU CPU 或音质。
-func BenchmarkSFUFanoutKernel(b *testing.B) {
+func BenchmarkSFUFanoutPacket(b *testing.B) {
 	for _, receivers := range []int{1, 4, 9} {
 		b.Run(fmt.Sprintf("receivers=%d", receivers), func(b *testing.B) {
 			b.StopTimer()
@@ -234,26 +335,11 @@ func BenchmarkSFUFanoutKernel(b *testing.B) {
 			b.SetBytes(int64(receivers * len(br.pkt.Payload)))
 			b.StartTimer()
 			for i := 0; i < b.N; i++ {
-				br.room.mu.RLock()
-				for uid, p := range br.room.peers {
-					if uid == br.src.userID {
-						continue
-					}
-					p.mu.Lock()
-					route := p.outbound[br.src.userID]
-					p.mu.Unlock()
-					if route == nil || route.src != br.src {
-						continue
-					}
-					if err := route.track.WriteRTP(br.pkt); err != nil {
-						br.room.mu.RUnlock()
-						b.Fatal(err)
-					}
-				}
-				br.room.mu.RUnlock()
+				br.room.fanoutPacket(br.src, br.pkt, nil)
 			}
 			b.StopTimer()
 			br.checkWrites(b, receivers)
+			br.checkPacketUnchanged(b)
 		})
 	}
 }
@@ -270,5 +356,13 @@ func (br *benchRoutes) checkWrites(b *testing.B, receivers int) {
 	}
 	if calls != uint64(b.N*receivers) || bytes != uint64(b.N*receivers*len(br.pkt.Payload)) {
 		b.Fatalf("扇出不完整: calls=%d bytes=%d", calls, bytes)
+	}
+}
+
+func (br *benchRoutes) checkPacketUnchanged(b *testing.B) {
+	b.Helper()
+	after, err := br.pkt.Marshal()
+	if err != nil || !bytes.Equal(after, br.original) {
+		b.Fatalf("WriteRTP 改动了原包头或载荷: %v", err)
 	}
 }
