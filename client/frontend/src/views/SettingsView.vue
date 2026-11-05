@@ -47,7 +47,7 @@ async function doLogout() {
 //   hibernate 最小化/关窗时卸载界面组件——webview 进程仍在，内存下降有限
 //   destroy  最小化/关窗时销毁渲染进程（里程碑②，Wails v3）——真正释放内存，
 //            唤醒经托盘「显示主界面」自动重建界面，语音等后台不受影响
-const HIB_LABELS = ['不休眠', '休眠界面', '彻底卸载（推荐省内存）'] as const
+const HIB_LABELS = ['不休眠', '休眠界面', '彻底卸载'] as const
 const HIB_MODES = ['off', 'hibernate', 'destroy'] as const
 const hibMode = ref<'off' | 'hibernate' | 'destroy'>('off')
 // GTK4 构建的 destroy 已被 Go 读路径强降；能力未确认时先隐藏选项。
@@ -484,14 +484,14 @@ function bindRecording(spec: string) {
         <!-- 休眠界面=卸载界面组件（webview 进程保留）；彻底卸载=销毁渲染进程。
              两种模式都由托盘「显示主界面」唤醒，语音通话等后台不受影响。
              能力未确认时不显示 destroy；失败与明确不支持分别提示。 -->
-        <p v-if="hibDestroyState === 'available'" class="s-note">休眠界面保留 webview 进程（内存下降有限）；彻底卸载销毁渲染进程，唤醒时自动重建</p>
+        <p v-if="hibDestroyState === 'available'" class="s-note">休眠界面保留窗口；彻底卸载会在唤醒时重建窗口</p>
         <p v-else-if="hibDestroyState === 'unavailable'" class="s-note">
-          <CircleAlert :size="13" />彻底卸载暂不可用：销毁窗口有内存泄漏，已自动改用休眠界面
+          <CircleAlert :size="13" />彻底卸载暂不可用；原选此模式时按休眠界面运行
         </p>
         <p v-else-if="hibDestroyState === 'error'" class="s-note">
-          <CircleAlert :size="13" />暂无法确认彻底卸载是否可用，请重新打开设置页重试
+          <CircleAlert :size="13" />暂无法确认彻底卸载是否可用；重开设置页重试
         </p>
-        <p v-else class="s-note">休眠界面保留 webview 进程，只卸载界面组件</p>
+        <p v-else class="s-note">休眠界面保留窗口</p>
         <!-- 关闭窗口时：最小化到托盘（默认）/ 退出程序（问题 4b，用户可选） -->
         <div class="s-row">
           <div class="k">关闭窗口时</div>
