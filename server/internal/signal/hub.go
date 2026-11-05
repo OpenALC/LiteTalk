@@ -43,7 +43,7 @@ const (
 	shutdownPollEvery   = 20 * time.Millisecond
 )
 
-// Hub WS 信令 hub：连接管理、房间登记与广播（docs/落地方案.md §5.3）。
+// Hub WS 信令 hub：连接管理、房间登记与广播。
 // 与 SFU 的桥接：channel.join 在 WS 层登记成员；PeerConnection 建立由 rtc.* 消息驱动。
 // 多设备会话（v1.1.0）：conns 按 uid+dev 单连接索引，同设备顶替/踢线与 SFU 归属核对见 §0。
 type Hub struct {

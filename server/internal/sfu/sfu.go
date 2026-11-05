@@ -1,4 +1,4 @@
-// Package sfu 实现 LiteTalk 自研 Pion SFU（docs/落地方案.md §5.2）。
+// Package sfu 实现 LiteTalk 自研 Pion SFU。
 // 要点：ICE-Lite + 单 UDP mux（默认 7845）+ 仅注册 Opus + RTP 透传不解码。
 package sfu
 

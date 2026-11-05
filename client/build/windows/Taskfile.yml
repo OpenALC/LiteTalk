@@ -1,7 +1,7 @@
 version: '3'
 
 # Windows 平台构建。cgo（libopus/malgo/WASAPI）需要 mingw64 gcc：
-# 默认用 C:/tools/mingw64/bin/gcc.exe（docs/M1-环境前置.md 的安装位置），
+# 默认用 C:/tools/mingw64/bin/gcc.exe（项目约定的本机安装位置），
 # 环境变量 LITETALK_MINGW 可改为其他 bin 目录。经 CC 指定而非改 PATH——
 # go-task 的 env.PATH 在 Windows 上不会被 sh 解释器用于查找命令。
 
