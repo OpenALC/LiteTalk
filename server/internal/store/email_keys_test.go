@@ -77,6 +77,7 @@ func assertEmailUpdateRace(t *testing.T, st Store, db *sql.DB) {
 	}
 	update := *before
 	update.Email = "other@example.com"
+	update.Nickname = "race-updated" // 让 MySQL UpdateUser 实际改行；仅改邮箱会是原有无操作路径。
 	var wg sync.WaitGroup
 	var updateErr, createErr error
 	wg.Add(2)
@@ -90,7 +91,8 @@ func assertEmailUpdateRace(t *testing.T, st Store, db *sql.DB) {
 		t.Fatalf("UpdateUser/注册并发失败: %v / %v", updateErr, createErr)
 	}
 	assertEmailKeyCounts(t, db, 2)
-	if after, err := st.UserByEmail(ctx, before.Email); err != nil || after.ID != before.ID || after.Email != before.Email {
+	if after, err := st.UserByEmail(ctx, before.Email); err != nil || after.ID != before.ID ||
+		after.Email != before.Email || after.Nickname != update.Nickname {
 		t.Fatalf("UpdateUser 不应改变旧邮箱键: %+v %v", after, err)
 	}
 }
