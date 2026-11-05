@@ -62,29 +62,10 @@ func TestBotsAmong(t *testing.T) {
 	})
 }
 
-// TestBotsAmongMySQL 真库矩阵（MySQL 不可用自动跳过，与既有真库测试同口径）。
+// TestBotsAmongMySQL 真库矩阵。
 func TestBotsAmongMySQL(t *testing.T) {
-	m := openTestMySQL(t)
-	defer m.Close()
+	m := openTestMySQLSchema(t, "bots")
 	ctx := context.Background()
-	if _, err := m.DB().ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS litetalk_test"); err != nil {
-		t.Fatalf("建测试库失败: %v", err)
-	}
-	if _, err := m.DB().ExecContext(ctx, "USE litetalk_test"); err != nil {
-		t.Fatal(err)
-	}
-	// 清理历史：必须覆盖每条迁移建过的表（同 TestMySQLMigrateAndCRUD 清单），
-	// 否则上一轮测试留下的表会让 CREATE TABLE 直接 1050。
-	for _, tbl := range []string{
-		"attachments", "read_states", "invites", "messages", "message_mentions", "channel_members", "channels", "categories", "server_members",
-		"servers", "friendships", "users", "user_sessions", "kv", "schema_migrations",
-		"audit_log", "channel_overwrites", "member_roles", "roles", "api_tokens",
-		"push_devices",
-		"webhook_deliveries", "inbound_webhooks", "webhooks",
-		"oidc_identities",
-	} {
-		_, _ = m.DB().ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl)
-	}
 	if err := m.Migrate(ctx, findMigrations(t)); err != nil {
 		t.Fatalf("迁移失败: %v", err)
 	}
