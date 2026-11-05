@@ -5,17 +5,11 @@ import (
 	"database/sql"
 	"errors"
 	"io/fs"
-	"os"
 	"strings"
 	"sync"
 	"testing"
 	"testing/fstest"
-
-	mysqldrv "github.com/go-sql-driver/mysql"
 )
-
-// friendshipTestDB MySQL 专用好友契约库：每次用例重建，避免与同包其它用例互相污染。
-const friendshipTestDB = "litetalk_friendship_test"
 
 // runFriendshipContract 三个实现共用的好友关系契约（#76）。
 // 每个子用例使用独立的用户 id 段，互不依赖执行顺序。
@@ -164,42 +158,10 @@ func TestFriendshipContractSQLite(t *testing.T) {
 	runFriendshipContract(t, m)
 }
 
-// openFriendshipMySQL 建一个专用、干净的 MySQL 测试库。
-// DSN 里带上库名而不是靠 USE：连接池会新开连接，USE 只影响执行它的那条连接，
-// 并发用例会因此落到无库连接上。
+// openFriendshipMySQL 为每个好友契约测试建立独立库。
 func openFriendshipMySQL(t *testing.T) *MySQL {
 	t.Helper()
-	base := openTestMySQL(t) // DSN 不可用时跳过
-	dsn := os.Getenv("LITETALK_MYSQL_DSN")
-	if dsn == "" {
-		dsn = "root:@tcp(127.0.0.1:3306)/?parseTime=true&multiStatements=true"
-	}
-	cfg, err := mysqldrv.ParseDSN(dsn)
-	if err != nil {
-		base.Close()
-		t.Fatalf("解析 MySQL DSN 失败: %v", err)
-	}
-	ctx := context.Background()
-	if _, err := base.DB().ExecContext(ctx, "DROP DATABASE IF EXISTS "+friendshipTestDB); err != nil {
-		base.Close()
-		t.Fatalf("清理专用测试库失败: %v", err)
-	}
-	if _, err := base.DB().ExecContext(ctx,
-		"CREATE DATABASE "+friendshipTestDB+" CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"); err != nil {
-		base.Close()
-		t.Fatalf("建专用测试库失败: %v", err)
-	}
-	base.Close()
-
-	cfg.DBName = friendshipTestDB
-	// OpenMySQL 优先读环境变量；t.Setenv 让后续连接也指向专用库，用例结束自动还原。
-	t.Setenv("LITETALK_MYSQL_DSN", cfg.FormatDSN())
-	m, err := OpenMySQL(cfg.FormatDSN())
-	if err != nil {
-		t.Fatalf("连接专用测试库失败: %v", err)
-	}
-	t.Cleanup(func() { _ = m.Close() })
-	return m
+	return openTestMySQLSchema(t, "friendship")
 }
 
 func TestFriendshipContractMySQL(t *testing.T) {
