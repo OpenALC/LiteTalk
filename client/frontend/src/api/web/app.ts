@@ -305,6 +305,16 @@ export const webApp: GoApp = {
     throw new Error(DESKTOP_ONLY)
   },
 
+  async GetGCSettings() {
+    return {
+      supported: false, level: 3, gogc_overridden: false,
+      memory_limit_overridden: false, effective_gogc: '', effective_memory_limit: '',
+    }
+  },
+  async SetGCLevel(_level: number) {
+    throw new Error('GC 强度仅桌面端可用')
+  },
+
   async GetServerConfig(): Promise<ConnConfigView> {
     // web 客户端与服务端同源部署：地址固定不可改。
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'

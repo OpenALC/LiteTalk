@@ -394,7 +394,8 @@ jobs:
           set +e
           # dbus-run-session 必需：v3 单实例锁走会话总线，无总线时
           # application.New 直接 fatal（exit 1），与真实桌面环境不符。
-          dbus-run-session -- xvfb-run -a timeout 10 litetalk > smoke.log 2>&1
+          # Xvfb 先建立 DISPLAY/XAUTHORITY，D-Bus 激活的 portal GTK 服务才可继承显示环境。
+          xvfb-run -a dbus-run-session -- timeout 10 litetalk > smoke.log 2>&1
           code=$?
           set -e
           cat smoke.log

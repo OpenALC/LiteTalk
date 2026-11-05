@@ -4,6 +4,7 @@
 // node 环境无 window/DOM：用最小 FakeWindow（EventTarget 子类）顶替。
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { __resetBridgeForTest, goApp, isNative, isNativeInitFailed, whenNativeReady } from './bridge'
+import { webApp } from './web/app'
 
 class FakeWindow extends EventTarget {
   _wails?: { flags?: Record<string, unknown> }
@@ -63,6 +64,25 @@ describe('whenNativeReady', () => {
     await p
     expect(isNative()).toBe(true)
     expect(isNativeInitFailed()).toBe(false)
+  })
+})
+
+describe('GC 桥接降级', () => {
+  afterEach(() => {
+    delete (globalThis as Record<string, unknown>).window
+    env.DEV = true
+  })
+
+  it('浏览器预览不假装控制桌面 GC', async () => {
+    installWindow()
+    const gc = await goApp().GetGCSettings()
+    expect(gc).toMatchObject({ supported: false, level: 3 })
+    await expect(goApp().SetGCLevel(5)).rejects.toThrow('仅桌面端可用')
+  })
+
+  it('服务端托管 Web 实现也明确禁用桌面 GC', async () => {
+    await expect(webApp.GetGCSettings()).resolves.toMatchObject({ supported: false, level: 3 })
+    await expect(webApp.SetGCLevel(5)).rejects.toThrow('仅桌面端可用')
   })
 })
 

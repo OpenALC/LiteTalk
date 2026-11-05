@@ -13,6 +13,15 @@ import { webEventsOff, webEventsOn } from './web/events'
 // 依赖 window._wails 注入时序的一切等待/降级逻辑都必须在此短路。
 const IS_WEB_BUILD = import.meta.env.MODE === 'web'
 
+export interface RuntimeGCSettings {
+  supported: boolean
+  level: number
+  gogc_overridden: boolean
+  memory_limit_overridden: boolean
+  effective_gogc: string
+  effective_memory_limit: string
+}
+
 export type GoApp = {
   GetVersion(): Promise<string>
   GetAuthConfig(): Promise<ServerConfig>
@@ -22,6 +31,8 @@ export type GoApp = {
   // 设置页据此裁剪该选项；gtk3/Windows/macOS 恒 true。
   HibernateDestroyAvailable(): Promise<boolean>
   SetHibernateMode(mode: string): Promise<void>
+  GetGCSettings(): Promise<RuntimeGCSettings>
+  SetGCLevel(level: number): Promise<RuntimeGCSettings>
   GetServerConfig(): Promise<ConnConfigView>
   SetServerConfig(baseURL: string): Promise<void>
   TestServerConnection(baseURL: string): Promise<ConnTestResult>
@@ -289,6 +300,13 @@ const mockApp: GoApp = {
     }
   },
   async SetAudioSettings() {},
+  async GetGCSettings() {
+    return {
+      supported: false, level: 3, gogc_overridden: false,
+      memory_limit_overridden: false, effective_gogc: '', effective_memory_limit: '',
+    }
+  },
+  async SetGCLevel() { throw new Error('GC 强度仅桌面端可用') },
   // 浏览器预览没有 C++ APM，但保持 Beta 区可见可操作（落盘为 no-op）。
   async APMSupported() { return true },
   // 浏览器预览没有真实编码器：报告支持，让 DRED 开关保持可操作（落盘为 no-op）。
