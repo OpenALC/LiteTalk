@@ -10,7 +10,10 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
+
+	"github.com/OpenALC/LiteTalk/server/internal/emailnorm"
 
 	_ "modernc.org/sqlite" // 纯 Go 驱动（无 cgo），CGO_ENABLED=0 可构建
 )
@@ -19,7 +22,8 @@ import (
 // 与 MySQL 的 DML 方言差异各写各的：isDupSQLite 判 UNIQUE 约束、upsert 用
 // ON CONFLICT DO UPDATE、时间比较用 CURRENT_TIMESTAMP、迁移互斥靠 BEGIN IMMEDIATE。
 type SQLite struct {
-	db *sql.DB
+	db             *sql.DB
+	emailKeysReady atomic.Bool
 }
 
 // sqliteDSN 统一连接参数：
@@ -102,6 +106,18 @@ func (s *SQLite) Migrate(ctx context.Context, fsys fs.FS) error {
 		)`); err != nil {
 		return fmt.Errorf("create schema_migrations: %w", err)
 	}
+	hasEmailKeys, err := emailKeysApplied(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if hasEmailKeys {
+		if err := verifyEmailKeySchemaSQLite(ctx, tx); err != nil {
+			return err
+		}
+		if err := verifyEmailKeyRows(ctx, tx); err != nil {
+			return err
+		}
+	}
 	entries, err := fs.ReadDir(fsys, ".")
 	if err != nil {
 		return err
@@ -123,6 +139,13 @@ func (s *SQLite) Migrate(ctx context.Context, fsys fs.FS) error {
 		if n > 0 {
 			continue
 		}
+		var keys []emailKeyRow
+		if version == emailKeysVersion {
+			keys, err = collectEmailKeys(ctx, tx)
+			if err != nil {
+				return err
+			}
+		}
 		body, err := fs.ReadFile(fsys, name)
 		if err != nil {
 			return err
@@ -137,12 +160,30 @@ func (s *SQLite) Migrate(ctx context.Context, fsys fs.FS) error {
 				return fmt.Errorf("apply %s: %w", name, err)
 			}
 		}
+		if version == emailKeysVersion {
+			if err := verifyEmailKeySchemaSQLite(ctx, tx); err != nil {
+				return err
+			}
+			if err := insertEmailKeys(ctx, tx, keys); err != nil {
+				return err
+			}
+			if err := verifyEmailKeyRows(ctx, tx); err != nil {
+				return err
+			}
+		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO schema_migrations (version) VALUES (?)`, version); err != nil {
 			return err
 		}
+		if version == emailKeysVersion {
+			hasEmailKeys = true
+		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.emailKeysReady.Store(hasEmailKeys)
+	return nil
 }
 
 // RollbackLast 执行最近一个已应用版本的 *.down.sql（验证 down 迁移用）。
@@ -178,12 +219,21 @@ func (s *SQLite) RollbackLast(ctx context.Context, fsys fs.FS) error {
 		`DELETE FROM schema_migrations WHERE version = ?`, version); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if version == emailKeysVersion {
+		s.emailKeysReady.Store(false)
+	}
+	return nil
 }
 
 // ---- users ----
 
 func (s *SQLite) CreateUser(ctx context.Context, u *User) error {
+	if s.emailKeysReady.Load() {
+		return createUserWithEmailKey(ctx, s.db, u, isDupSQLite)
+	}
 	u.ID = newID(u.ID)
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO users (id, email, nickname, tag, password_hash, email_verified, is_guest, is_bot, status)
@@ -218,11 +268,14 @@ func (s *SQLite) UserByID(ctx context.Context, id int64) (*User, error) {
 	return s.scanUser(s.db.QueryRowContext(ctx, `SELECT `+sqUserCols+` FROM users WHERE id = ?`, id))
 }
 
-// UserByEmail 先走等值查询（命中唯一索引 uk_users_email，新账号邮箱全部小写
-// 写入，常规路径不回退索引）；未命中再用 lower() 兼容存量大小写混合行。
-// lower(email) 无法走索引，只会在旧数据/未注册邮箱上发生一次扫描——不加
-// 表达式索引是因为存量数据变更需要迁移，不在本改动的授权范围内。
+// UserByEmail 在 0023 后走规范键；早期迁移的测试库仍走旧等值索引和
+// lower(email) 兜底，以便验证旧版本升级路径。
 func (s *SQLite) UserByEmail(ctx context.Context, email string) (*User, error) {
+	if s.emailKeysReady.Load() {
+		return s.scanUser(s.db.QueryRowContext(ctx,
+			`SELECT `+sqUserCols+` FROM users WHERE id =
+			 (SELECT user_id FROM user_email_keys WHERE email_key = ?)`, []byte(emailnorm.Normalize(email))))
+	}
 	u, err := s.scanUser(s.db.QueryRowContext(ctx, `SELECT `+sqUserCols+` FROM users WHERE email = ?`, email))
 	if err == nil || !errors.Is(err, ErrNotFound) {
 		return u, err
